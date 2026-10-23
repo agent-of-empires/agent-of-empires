@@ -242,18 +242,21 @@ mod tests {
                 })
                 .unwrap();
 
+            let stale = inst.clone();
             let state = crate::server::test_support::build_test_app_state(vec![inst]);
             let read_epoch = state
                 .mutation_epoch
                 .load(std::sync::atomic::Ordering::SeqCst);
-            let stale = crate::server::reload::load_all_instances(&state.file_watch);
+            let metadata = state.canonical_metadata.read().await.clone();
             persist_selector(&state, &id, selector, value).await;
             crate::server::reload::reload_state_instances_from_disk(
                 &state,
-                stale,
+                (vec![stale]).into(),
                 vec![],
                 crate::server::state::StatusSource::DiskOnly,
                 read_epoch,
+                Ok(metadata),
+                std::collections::HashMap::new(),
             )
             .await;
 
@@ -264,7 +267,8 @@ mod tests {
             };
             assert_eq!(
                 field(&state.instances.read().await[0]).as_deref(),
-                Some(value)
+                Some(value),
+                "a stale reload must not replace the selector"
             );
             let reloaded = crate::session::Storage::new_unwatched("default")
                 .unwrap()
@@ -283,13 +287,16 @@ mod tests {
             let epoch = state
                 .mutation_epoch
                 .load(std::sync::atomic::Ordering::SeqCst);
-            let fresh = crate::server::reload::load_all_instances(&state.file_watch);
+            let (fresh, fresh_metadata) =
+                crate::server::reload::load_profiles_for_reload(&state.file_watch);
             crate::server::reload::reload_state_instances_from_disk(
                 &state,
                 fresh,
                 vec![],
                 crate::server::state::StatusSource::DiskOnly,
                 epoch,
+                fresh_metadata,
+                Default::default(),
             )
             .await;
             let live = state.instances.read().await;

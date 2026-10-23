@@ -192,6 +192,47 @@ pub(crate) fn attest_observed_default_store(
     true
 }
 
+/// A Claude `--store` must be the config root holding the transcript. When it
+/// does not, a `projects` directory (or `projects/<encoded cwd>`) is the likely
+/// mistake, so the error names the root to use instead.
+fn ensure_claude_store_root(
+    store: &std::path::Path,
+    cwd: &std::path::Path,
+    sid: &str,
+) -> Result<()> {
+    let store = crate::session::capture::canonicalize_or_raw(store);
+    let store = store.as_path();
+    if !crate::session::capture::claude_host_transcript_confirmed_absent(
+        &cwd.to_string_lossy(),
+        sid,
+        &[],
+        Some(store),
+    ) {
+        return Ok(());
+    }
+    let named_projects = |p: Option<&std::path::Path>| {
+        p.and_then(std::path::Path::file_name)
+            .is_some_and(|n| n == "projects")
+    };
+    let root = if named_projects(Some(store)) {
+        store.parent()
+    } else if named_projects(store.parent()) {
+        store.parent().and_then(std::path::Path::parent)
+    } else {
+        None
+    };
+    match root {
+        Some(root) => anyhow::bail!(
+            "--store must be the Claude config root (the directory containing projects/), not a projects subdirectory; use {}",
+            root.display()
+        ),
+        None => anyhow::bail!(
+            "no transcript for this conversation under {}/projects; --store must be the Claude config root (the directory containing projects/)",
+            store.display()
+        ),
+    }
+}
+
 /// Whether a reserved (`Preallocated`) Claude id has its transcript in the
 /// binding's own store, which proves it names a resumable conversation.
 ///
@@ -2556,6 +2597,7 @@ pub(super) fn validate_managed_arguments(
                     "--yolo",
                     "--search",
                     "--no-alt-screen",
+                    "--no-daemon",
                     "--verbose",
                 ],
             ),
@@ -2763,7 +2805,7 @@ impl Instance {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ConversationState {
     pub(crate) tool: String,
     pub(crate) session_id: Option<String>,
@@ -2925,6 +2967,7 @@ impl Instance {
                 store.is_absolute(),
                 "--store must be an absolute native store path"
             );
+            ensure_claude_store_root(store, &execution.cwd, sid)?;
             *primary = crate::session::capture::canonicalize_or_raw(
                 store.to_str().context("store path must be UTF-8")?,
             );
@@ -2984,6 +3027,53 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_store_must_be_the_config_root_holding_the_transcript() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let sid = "11111111-2222-3333-4444-555555555555";
+        let encoded = crate::session::capture::encode_claude_project_path(
+            &crate::session::capture::canonicalize_or_raw(cwd.path()).to_string_lossy(),
+        );
+        let canonical = crate::session::capture::canonicalize_or_raw(root.path());
+        let projects = root.path().join("projects");
+        let project_dir = projects.join(&encoded);
+        let check = |store: &std::path::Path| ensure_claude_store_root(store, cwd.path(), sid);
+
+        let missing = check(root.path()).unwrap_err().to_string();
+        assert!(missing.contains("no transcript"), "{missing}");
+
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(project_dir.join(format!("{sid}.jsonl")), "{}\n").unwrap();
+        check(root.path()).unwrap();
+
+        for wrong in [&projects, &project_dir] {
+            let err = check(wrong).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("use {}", canonical.display())),
+                "{err}"
+            );
+        }
+
+        // A symlink to the projects dir is judged by where it resolves.
+        #[cfg(unix)]
+        {
+            let link = root.path().join("link");
+            std::os::unix::fs::symlink(&projects, &link).unwrap();
+            let err = check(&link).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("use {}", canonical.display())),
+                "{err}"
+            );
+        }
+
+        // A projects dir that really holds the transcript is a working root.
+        let nested = project_dir.join("projects").join(&encoded);
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join(format!("{sid}.jsonl")), "{}\n").unwrap();
+        check(&project_dir).unwrap();
+    }
 
     #[cfg(unix)]
     #[test]
@@ -3774,6 +3864,33 @@ mod tests {
     }
 
     #[test]
+    fn hermes_yaml_aliases_and_merges_preserve_namespace_refusals() {
+        let (root, mut inputs, _database) = hermes_fixture();
+        inputs.environment.insert(
+            "HERMES_MANAGED_DIR".into(),
+            root.path().join("managed").display().to_string(),
+        );
+        for (config, accepted) in [
+            ("terminal: {backend: local, cwd: '.'}\n", true),
+            ("remote: &remote {backend: ssh}\nterminal: *remote\n", false),
+            ("remote: &remote {backend: ssh}\nterminal: {<<: *remote}\n", false),
+            ("remote: &remote {backend: ssh}\nterminal: {<<: *remote, backend: local}\n", true),
+            ("local: &local {backend: local}\nremote: &remote {backend: ssh}\nterminal: {<<: [*local, *remote]}\n", true),
+            ("local: &local {backend: local}\nremote: &remote {backend: ssh}\nterminal: {<<: [*remote, *local]}\n", false),
+            ("outside: &outside {cwd: /foreign-store}\nterminal: {<<: *outside, backend: local}\n", false),
+            ("external: &external {enabled: true}\nsecrets: {vault: *external}\n", false),
+            ("secrets: {vault: {enabled: True}}\n", false),
+            ("secrets: {vault: {enabled: 'true'}}\n", true),
+            ("secrets: {vault: {enabled: false}}\n", true),
+            ("terminal: {<<: 17}\n", false),
+            ("terminal: [", false),
+        ] {
+            std::fs::write(root.path().join("config.yaml"), config).unwrap();
+            assert_eq!(inputs.validate_hermes_namespace(root.path()).is_ok(), accepted, "{config:?}");
+        }
+    }
+
+    #[test]
     fn hermes_native_lineage_preserves_selection_and_conversation_boundaries() {
         for (name, requested, sql, expected) in [
             ("compression priority", "S", "INSERT INTO sessions(id,parent_session_id,end_reason,started_at) VALUES ('S',NULL,'compression',1),('A','S','compression',2),('B','S',NULL,4),('T','A',NULL,3),('foreign',NULL,NULL,100); INSERT INTO messages VALUES ('B',99),('T',3),('foreign',100);", Some("T")),
@@ -3928,6 +4045,27 @@ mod tests {
             assert!(
                 validate_managed_arguments(agent, &[String::from("--verbose=x")]).is_err(),
                 "{name} must refuse a valued verbosity override"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_codex_no_daemon_does_not_admit_context_overrides() {
+        let agent = crate::agents::get_agent("codex").unwrap();
+        for (arguments, allowed) in [
+            ("--no-daemon", true),
+            ("--no-daemon=true", false),
+            ("-- 'prompt'", false),
+            ("resume --last", false),
+            ("fork --last", false),
+            ("-C outside", false),
+            ("--remote=ws://localhost:9000", false),
+        ] {
+            let words = shell_words::split(arguments).unwrap();
+            assert_eq!(
+                validate_managed_arguments(agent, &words).is_ok(),
+                allowed,
+                "{arguments}"
             );
         }
     }

@@ -77,13 +77,17 @@ function commitText(input: HTMLInputElement, value: string) {
   fireEvent.blur(input);
 }
 
-it("LoggingTargetsWidget removes one runtime override without losing another", () => {
-  const { save, rerender } = mount(LoggingTargetsWidget, "Targets", { "runtime.uds": "warn" });
-  fireEvent.change(control("runtime.ws", "select"), { target: { value: "debug" } });
-  expect(save).toHaveBeenLastCalledWith({ "runtime.uds": "warn", "runtime.ws": "debug" });
-  rerender({ "runtime.uds": "warn", "runtime.ws": "debug" });
-  fireEvent.change(control("runtime.ws", "select"), { target: { value: "" } });
-  expect(save).toHaveBeenLastCalledWith({ "runtime.uds": "warn" });
+it("LoggingTargetsWidget clears one area without losing unrelated overrides", () => {
+  const initial = { "runtime.uds": "warn", "plugin:external": "error" };
+  const { save, rerender } = mount(LoggingTargetsWidget, "Targets", initial);
+  fireEvent.change(control("server.lifecycle", "select"), { target: { value: "debug" } });
+  expect(save).toHaveBeenLastCalledWith({ ...initial, "server.lifecycle": "debug" });
+  rerender({ ...initial, "server.lifecycle": "debug" });
+  fireEvent.change(control("migrations.v043", "select"), { target: { value: "info" } });
+  expect(save).toHaveBeenLastCalledWith({ ...initial, "server.lifecycle": "debug", "migrations.v043": "info" });
+  rerender({ ...initial, "server.lifecycle": "debug", "migrations.v043": "info" });
+  fireEvent.change(control("migrations.v043", "select"), { target: { value: "" } });
+  expect(save).toHaveBeenLastCalledWith({ ...initial, "server.lifecycle": "debug" });
 });
 
 describe("ThemeNameWidget", () => {

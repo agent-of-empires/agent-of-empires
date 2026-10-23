@@ -86,6 +86,26 @@ use self::runner::spawn_runner_detached;
 #[cfg(debug_assertions)]
 use self::runner::take_injected_fresh_handshake_failure;
 use self::spawn::spawn_subprocess;
+const CONNECTION_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+struct ShutdownTask<'a> {
+    task: Option<tokio::task::JoinHandle<()>>,
+    slot: &'a std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl Drop for ShutdownTask<'_> {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            if !task.is_finished() {
+                let mut slot = self.slot.lock().expect("connection task mutex poisoned");
+                if slot.is_none() {
+                    *slot = Some(task);
+                }
+            }
+        }
+    }
+}
 
 pub struct AcpClient {
     pub session_id: AcpSessionId,
@@ -99,7 +119,23 @@ pub struct AcpClient {
     /// The detached runner this client launched, which its lease owns.
     runner_pid: Option<u32>,
     pub(crate) native_store: Option<crate::session::ExecutionBinding>,
+    connection_shutdown: tokio_util::sync::CancellationToken,
+    connection_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     _prime_runtime: Option<crate::process::prime::PrimeCleanupGuard>,
+}
+
+impl Drop for AcpClient {
+    fn drop(&mut self) {
+        self.connection_shutdown.cancel();
+        if let Some(task) = self
+            .connection_task
+            .get_mut()
+            .expect("connection task mutex poisoned")
+            .take()
+        {
+            task.abort();
+        }
+    }
 }
 
 /// What the connection task needs to serve agent fs/* and terminal/* requests.
@@ -159,6 +195,8 @@ struct Launch {
     default_mode: Option<String>,
     default_model: Option<String>,
     mcp_servers: Vec<McpServer>,
+    claude_home: Option<PathBuf>,
+    cancellation: tokio_util::sync::CancellationToken,
 }
 
 impl Launch {
@@ -177,6 +215,7 @@ impl Launch {
     {
         let (cmd_tx, cmd_rx) = mpsc::channel::<ClientCmd>(16);
         let (ready_tx, ready_rx) = oneshot::channel();
+        let shutdown = tokio_util::sync::CancellationToken::new();
         let pending_responders: PendingResponders = Arc::new(Mutex::new(HashMap::new()));
         let label = self.session_id.0.clone();
         let params = ConnectionParams {
@@ -199,10 +238,13 @@ impl Launch {
             default_mode: self.default_mode,
             default_model: self.default_model,
             mcp_servers: self.mcp_servers,
+            claude_home: self.claude_home,
             runner,
+            cancellation: self.cancellation.clone(),
+            shutdown: shutdown.clone(),
         };
         let span = tracing::info_span!("acp_session", session = %label);
-        tokio::spawn(run_connection_task(transport, params).instrument(span));
+        let task = tokio::spawn(run_connection_task(transport, params).instrument(span));
         let client = AcpClient {
             session_id: self.session_id,
             inbound: Some(event_rx),
@@ -211,6 +253,8 @@ impl Launch {
             _child: child,
             runner_pid: None,
             native_store: None,
+            connection_shutdown: shutdown,
+            connection_task: std::sync::Mutex::new(Some(task)),
             _prime_runtime: None,
         };
         (client, ready_rx)
@@ -231,6 +275,8 @@ impl AcpClient {
             _child: None,
             runner_pid: None,
             native_store: None,
+            connection_shutdown: tokio_util::sync::CancellationToken::new(),
+            connection_task: std::sync::Mutex::new(None),
             _prime_runtime: None,
         };
         (client, event_tx)
@@ -249,6 +295,38 @@ impl AcpClient {
             }
         });
         Self::fake(session_id, Some(cmd_tx))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fake_for_test_held_close(
+        session_id: AcpSessionId,
+    ) -> (
+        Self,
+        oneshot::Receiver<oneshot::Sender<CloseSessionOutcome>>,
+        oneshot::Receiver<String>,
+    ) {
+        let (entered, close) = oneshot::channel();
+        let (deleted, deletion) = oneshot::channel();
+        let mut entered = Some(entered);
+        let mut deleted = Some(deleted);
+        let (client, _) = Self::fake_with_consumer(session_id, move |cmd| match cmd {
+            ClientCmd::CloseSession(response) => {
+                if let Some(entered) = entered.take() {
+                    let _ = entered.send(response);
+                }
+            }
+            ClientCmd::DeleteSession {
+                acp_session_id,
+                respond_to,
+            } => {
+                if let Some(deleted) = deleted.take() {
+                    let _ = deleted.send(acp_session_id);
+                }
+                let _ = respond_to.send(DeleteSessionOutcome::UnsupportedMethod);
+            }
+            _ => {}
+        });
+        (client, close, deletion)
     }
 
     #[cfg(test)]
@@ -327,6 +405,7 @@ impl AcpClient {
                 ClientCmd::SetMode(_) => "set_mode",
                 ClientCmd::SetConfigOption { .. } => "set_config_option",
                 ClientCmd::ResumeBackgroundTailing(_) => "resume_background_tailing",
+                ClientCmd::ResumeTaskTailing(_) => "resume_task_tailing",
                 ClientCmd::DeleteSession { respond_to, .. } => {
                     let _ = respond_to.send(DeleteSessionOutcome::UnsupportedMethod);
                     "delete_session"
@@ -375,6 +454,15 @@ impl AcpClient {
     /// Launch an agent: a detached runner when `socket_path` is set, else an
     /// in-proc stdio subprocess (tests).
     pub async fn spawn(config: SpawnConfig, session_id: AcpSessionId) -> Result<Self, AcpError> {
+        if config
+            .launch_lease
+            .as_ref()
+            .is_some_and(|lease| lease.cancellation().is_cancelled())
+        {
+            return Err(AcpError::Spawn(
+                "launch cancelled before preparation".into(),
+            ));
+        }
         // A missing cwd would ENOENT like a missing binary and misdirect the
         // user to reinstalling the adapter (#1089).
         if !config.cwd.exists() {
@@ -396,7 +484,16 @@ impl AcpClient {
             }
             None => None,
         };
-        let launch = |sandbox| Launch {
+        let cancellation = config
+            .launch_lease
+            .as_ref()
+            .map_or_else(tokio_util::sync::CancellationToken::new, |lease| {
+                lease.cancellation().child_token()
+            });
+        if cancellation.is_cancelled() {
+            return Err(AcpError::Spawn("launch cancelled before spawning".into()));
+        }
+        let launch = |sandbox, native_store: &Option<crate::session::ExecutionBinding>| Launch {
             mode: ConnectMode::Fresh {
                 stored_acp_session_id: config.stored_acp_session_id.clone(),
                 seed_history_replay: config.seed_history_replay,
@@ -414,6 +511,12 @@ impl AcpClient {
             default_mode: config.default_mode.clone(),
             default_model: config.default_model.clone(),
             mcp_servers: config.mcp_servers.clone(),
+            claude_home: native_store
+                .as_ref()
+                .filter(|binding| binding.agent == "claude" && binding.filesystem == "host")
+                .and_then(|binding| binding.stores.first())
+                .cloned(),
+            cancellation: cancellation.clone(),
         };
 
         if let Some(socket_path) = config.socket_path.clone() {
@@ -422,11 +525,15 @@ impl AcpClient {
             crate::process::worker_registry::terminate_and_wait(&session_id.0)
                 .await
                 .map_err(|e| AcpError::Spawn(format!("previous runtime cleanup: {e}")))?;
+            if cancellation.is_cancelled() {
+                return Err(AcpError::Spawn("launch cancelled before spawning".into()));
+            }
             let runner_sandbox = sandbox.as_ref().map(|(handle, _)| handle);
             let (runner_pid, native_store) =
                 spawn_runner_detached(&config, &socket_path, session_id.0.clone(), runner_sandbox)
                     .await?;
-            let mut client = Self::connect_via_socket(socket_path, launch(sandbox)).await?;
+            let mut client =
+                Self::connect_via_socket(socket_path, launch(sandbox, &native_store), None).await?;
             client.runner_pid = Some(runner_pid);
             client.native_store = native_store;
             return Ok(client);
@@ -442,7 +549,7 @@ impl AcpClient {
             .take()
             .ok_or_else(|| AcpError::Spawn("no stdout handle".into()))?;
         let child = Arc::new(Mutex::new(child));
-        let launch = launch(sandbox);
+        let launch = launch(sandbox, &native_store);
         let (label, install_binary) = (launch.session_id.0.clone(), launch.install_binary.clone());
         let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
         let events = mpsc::channel(64);
@@ -451,7 +558,12 @@ impl AcpClient {
             guard.1 = Some(child.clone());
             guard
         });
-        wait_for_handshake(&label, ready_rx, Some(&child), &install_binary).await?;
+        if let Err(error) =
+            wait_for_handshake(&label, ready_rx, Some(&child), &install_binary, None).await
+        {
+            let _ = client.shutdown().await;
+            return Err(error);
+        }
         client.native_store = native_store;
         Ok(client)
     }
@@ -459,7 +571,11 @@ impl AcpClient {
     /// Dial a runner's control socket, which carries the whole transport
     /// (#2977). The runner owns the agent, so dropping this client leaves the
     /// worker running.
-    async fn connect_via_socket(socket_path: PathBuf, launch: Launch) -> Result<Self, AcpError> {
+    async fn connect_via_socket(
+        socket_path: PathBuf,
+        launch: Launch,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Self, AcpError> {
         let control_path = crate::process::worker::control_socket_sibling(&socket_path);
         // Debug-only #1890 hook: fail a fresh handshake after the runner is up.
         #[cfg(debug_assertions)]
@@ -482,15 +598,17 @@ impl AcpClient {
             }
         )));
         let events = mpsc::channel(64);
-        let (control, crate_transport) = connect_runner_control_v3(
-            &control_path,
-            events.0.clone(),
-            label.clone(),
-            terminal_claim.clone(),
-            prompt_in_flight.clone(),
-        )
-        .await
-        .map_err(|error| {
+        let connected = tokio::select! {
+            biased;
+            _ = launch.cancellation.cancelled() => {
+                return Err(AcpError::Spawn("runner construction cancelled".into()));
+            }
+            connected = connect_runner_control_v3(
+                &control_path, events.0.clone(), label.clone(),
+                terminal_claim.clone(), prompt_in_flight.clone(),
+            ) => connected,
+        };
+        let (control, crate_transport) = connected.map_err(|error| {
             AcpError::Spawn(format!(
                 "runner control attach failed at {}: {error:#}",
                 control_path.display()
@@ -507,7 +625,12 @@ impl AcpClient {
             prompt_in_flight,
         };
         let (client, ready_rx) = launch.start(events, transport, None, Some(runner));
-        wait_for_handshake(&label, ready_rx, None, &install_binary).await?;
+        if let Err(error) =
+            wait_for_handshake(&label, ready_rx, None, &install_binary, deadline).await
+        {
+            let _ = client.shutdown().await;
+            return Err(error);
+        }
         handshake_control.0.take();
         Ok(client)
     }
@@ -528,6 +651,9 @@ impl AcpClient {
         sandbox: Option<(SessionSandbox, SandboxPathMap)>,
         agent_key: String,
         source_profile: Option<String>,
+        deadline: Option<tokio::time::Instant>,
+        launch_lease: Option<crate::acp::runner_lifecycle::Lease>,
+        claude_home: Option<PathBuf>,
     ) -> Result<Self, AcpError> {
         // The binary name keeps the compatibility gate active on reattach; an
         // unknown agent maps to `Other` anyway.
@@ -553,8 +679,14 @@ impl AcpClient {
             default_mode: None,
             default_model: None,
             mcp_servers: Vec::new(),
+            claude_home,
+            cancellation: launch_lease
+                .as_ref()
+                .map_or_else(tokio_util::sync::CancellationToken::new, |lease| {
+                    lease.cancellation().child_token()
+                }),
         };
-        Self::connect_via_socket(socket_path, launch).await
+        Self::connect_via_socket(socket_path, launch, deadline).await
     }
 
     async fn send_cmd(&self, cmd: ClientCmd) -> Result<(), AcpError> {
@@ -651,6 +783,19 @@ impl AcpClient {
                     .map(|l| (l.agent_id, l.output_file))
                     .collect(),
             ))
+            .await
+            .map_err(|_| AcpError::AgentExited)
+    }
+
+    /// Spawn transcript tailers for background tasks that survived a daemon
+    /// restart. Errors like [`Self::resume_background_tailing`].
+    pub async fn resume_task_tailing(
+        &self,
+        tasks: Vec<crate::acp::state::BackgroundTaskLaunch>,
+    ) -> Result<(), AcpError> {
+        let cmd_tx = self.cmd_tx.as_ref().ok_or(AcpError::NotRunning)?;
+        cmd_tx
+            .send(ClientCmd::ResumeTaskTailing(tasks))
             .await
             .map_err(|_| AcpError::AgentExited)
     }
@@ -804,8 +949,46 @@ impl AcpClient {
         if native.is_some() {
             let _ = self.close_session().await;
         }
-        let cmd_tx = self.cmd_tx.as_ref().ok_or(AcpError::NotRunning)?;
-        let _ = cmd_tx.send(ClientCmd::Shutdown).await;
+        self.connection_shutdown.cancel();
+        let task = self
+            .connection_task
+            .lock()
+            .expect("connection task mutex poisoned")
+            .take();
+        let connection_result = if let Some(task) = task {
+            let mut owned = ShutdownTask {
+                task: Some(task),
+                slot: &self.connection_task,
+            };
+            let task = owned.task.as_mut().expect("taken connection task");
+            match tokio::time::timeout(CONNECTION_SHUTDOWN_GRACE, &mut *task).await {
+                Ok(result) => {
+                    owned.task.take();
+                    result.map_err(|error| {
+                        AcpError::Spawn(format!("connection task failed: {error}"))
+                    })
+                }
+                Err(_) => {
+                    task.abort();
+                    if tokio::time::timeout(CONNECTION_SHUTDOWN_GRACE, &mut *task)
+                        .await
+                        .is_ok()
+                    {
+                        owned.task.take();
+                    }
+                    Err(AcpError::Spawn("connection shutdown timed out".into()))
+                }
+            }
+        } else {
+            if let Some(cmd_tx) = &self.cmd_tx {
+                let _ = tokio::time::timeout(
+                    CONNECTION_SHUTDOWN_GRACE,
+                    cmd_tx.send(ClientCmd::Shutdown),
+                )
+                .await;
+            }
+            Ok(())
+        };
         if let Some(runtime) = native {
             if let Some(child) = &self._child {
                 let mut child = child.lock().await;
@@ -820,6 +1003,7 @@ impl AcpClient {
                 .map_err(|error| AcpError::Transport(error.to_string()))?
                 .map_err(|error| AcpError::Transport(error.to_string()))?;
         }
+        connection_result?;
         Ok(())
     }
 
@@ -830,5 +1014,57 @@ impl AcpClient {
 
     pub fn take_inbound(&mut self) -> Option<mpsc::Receiver<Event>> {
         self.inbound.take()
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    struct OnDrop(Option<oneshot::Sender<()>>);
+    impl Drop for OnDrop {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_bounds_a_full_event_queue_and_abort_on_waiter_drop() {
+        for cancel_waiter in [false, true] {
+            let (client, events) = AcpClient::fake(AcpSessionId("blocked".into()), None);
+            for _ in 0..64 {
+                events
+                    .send(Event::Stopped {
+                        reason: "filled".into(),
+                    })
+                    .await
+                    .unwrap();
+            }
+            let (entered, blocked) = oneshot::channel();
+            let (dropped, observed_drop) = oneshot::channel();
+            let task = tokio::spawn(async move {
+                let _drop = OnDrop(Some(dropped));
+                entered.send(()).unwrap();
+                events
+                    .send(Event::Stopped {
+                        reason: "blocked".into(),
+                    })
+                    .await
+                    .unwrap();
+            });
+            *client.connection_task.lock().unwrap() = Some(task);
+            blocked.await.unwrap();
+            let mut shutdown = Box::pin(client.shutdown());
+            assert!(futures_util::poll!(&mut shutdown).is_pending());
+            if cancel_waiter {
+                drop(shutdown);
+            } else {
+                tokio::time::advance(CONNECTION_SHUTDOWN_GRACE).await;
+                assert!(shutdown.await.is_err());
+            }
+            observed_drop.await.unwrap();
+        }
     }
 }

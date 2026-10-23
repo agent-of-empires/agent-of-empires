@@ -55,34 +55,68 @@ pub(super) mod test_support {
 }
 
 /// Outcome of `start_with_resume_fallback`.
+///
+/// Tmux/process failures propagate as `Err` so callers keep the existing
+/// `Status::Error` + `last_error` path. Resume-probe death is represented
+/// explicitly as `ResumeFailed` because it preserves durable state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartOutcome {
     /// Session ID was set and resume succeeded; pane is alive.
     Resumed,
-    /// Resume was attempted, but the pane died during the probe before AoE observed an explicit
-    /// invalid-resume signal.
+    /// Resume was attempted, but the pane died during the probe before AoE
+    /// observed an explicit invalid-resume signal. The sid was preserved and
+    /// marked so startup recovery does not retry it automatically.
     ResumeFailed { sid: String },
-    /// No resume cascade ran.
+    /// No resume cascade ran. Either no prior sid, the agent doesn't support
+    /// resume, the sid was invalid, the session is structured view-mode (no tmux
+    /// pane), or the tmux session was already alive when entered (so
+    /// `start_with_size_opts` was a no-op and the probe had nothing to
+    /// detect). The pane is alive on return; whether a fresh launch
+    /// actually occurred this call depends on the caller having killed
+    /// any pre-existing pane first.
     Fresh,
-    /// A resume was skipped, and the session started fresh instead, because `sid` already failed a
-    /// resume probe once before.
+    /// A resume was skipped, and the session started fresh instead, because
+    /// `sid` already failed a resume probe once before. Retrying the
+    /// identical sid would only reproduce the original `ResumeFailed`
+    /// forever, so this launch routes through `ResumeIntent::Cleared`
+    /// instead (same as a manual `aoe session set-session-id ""`): a fresh
+    /// sid is assigned and `sid` is not carried forward. Distinct from
+    /// `Fresh` so callers can tell the user their conversation did not
+    /// resume, instead of silently starting a blank session; the prior
+    /// conversation is still reachable through the agent's own resume/
+    /// history picker. See #2609.
     FreshAfterFailedResume { sid: String },
 }
 
 /// What `start_with_size_opts` did with the agent's session id this call.
+/// `start_with_resume_fallback` matches on `Existing` to gate the Tier-1
+/// settle probe; without the gate, fresh Claude launches mislabel as
+/// `StartOutcome::Resumed` because `acquire_session_id` always assigns a
+/// UUID for Claude. `Fresh` carries its own probe gate for the launches that
+/// pin an already-stored id (see `pinned_prior_sid`).
 #[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchSidOutcome {
-    /// `acquire_session_id` reused a prior sid: `ResumeIntent::Use(sid)`, observed
-    /// `agent_session_id`, or retroactive-capture hit.
+    /// `acquire_session_id` reused a prior sid: `ResumeIntent::Use(sid)`,
+    /// observed `agent_session_id`, or retroactive-capture hit. The launch
+    /// command embedded the agent's resume flag.
     Existing { sid: String },
+
     Fresh {
-        /// Set when the fresh launch pinned an id the session already had stored, rather than a
-        /// UUID minted for a brand-new conversation.
+        /// Set when the fresh launch pinned an id the session already had
+        /// stored, rather than a UUID minted for a brand-new conversation:
+        /// the #2700 empty-thread downgrade (`--session-id <sid>`) and a fork
+        /// (whose child id is pre-generated at creation). Both can die on the
+        /// spot, for a live id or an unresolvable parent, so both are worth
+        /// probing; a genuinely new session cannot and skips the probe.
+        /// See #3399.
         pinned_prior_sid: Option<String>,
     },
-    /// `start_with_size_opts` short-circuited before `apply_session_flags` ran: structured
-    /// view-mode session, or a pre-existing tmux pane that is still alive (kill_clean cache race).
+    /// `start_with_size_opts` short-circuited before `apply_session_flags`
+    /// ran: structured view-mode session, or a pre-existing tmux pane that is
+    /// still alive (kill_clean cache race). `agent_session_id` was not mutated
+    /// this call. A pre-existing *dead* pane is not skipped; it is torn down
+    /// and relaunched (#3399).
     Skipped,
 }
 
@@ -110,73 +144,522 @@ impl Instance {
         let profile = self.effective_profile();
         let storage = crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
             .context("failed to open lifecycle lock storage")?;
+        self.start_with_size_opts_in(size, skip_on_launch, &storage, false, None)
+    }
+
+    fn start_with_size_opts_in(
+        &mut self,
+        size: Option<(u16, u16)>,
+        skip_on_launch: bool,
+        storage: &dyn crate::session::SessionStore,
+        require_tracked_row: bool,
+        mut handoff: Option<(TerminalHandoffKey, bool)>,
+    ) -> Result<LaunchSidOutcome> {
+        storage.check_available()?;
 
         let title_lock = crate::session::storage::acquire_session_title_lock(&self.id)
             .context("failed to acquire instance launch title lock")?;
         let lifecycle_lock = storage
+            .storage()
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to acquire instance launch lock")?;
-        self.reconcile_from_disk();
+        if require_tracked_row {
+            self.reconcile_from_store(storage)?;
+        }
+        if handoff.is_none() && self.terminal_handoff.is_some() {
+            return Err(LifecycleReservationError::Busy(LifecycleOperation::Launch).into());
+        }
+        if let Some((key, _)) = handoff {
+            self.validate_terminal_handoff(storage, key)?;
+        }
         if self.is_structured() {
             return Ok(LaunchSidOutcome::Skipped);
         }
+        // Archived and trashed rows never launch, from any entry point. The
+        // durable recheck after the pre-launch hooks (which run without this
+        // lock) lives in `reacquire_launch_locks_after_hooks`.
         self.ensure_startable()?;
+        // A remain-on-exit corpse still owns its physical name and must be recreated.
         let session = self.tmux_session()?;
-        let corpse_pane = if session.exists() {
+        let corpse_pane = if session.exists_live() {
             if !session.is_pane_dead() {
+                if let Some((key, _)) = handoff {
+                    self.complete_terminal_handoff_live_in(storage, key)?;
+                }
                 return Ok(LaunchSidOutcome::Skipped);
+            }
+            if let Some((key, _)) = handoff {
+                if let Some(launch) = self
+                    .validate_terminal_handoff(storage, key)?
+                    .launch
+                    .as_ref()
+                {
+                    Self::ensure_terminal_handoff_pane_matches(session.name(), key, launch)?;
+                }
             }
             true
         } else {
             false
         };
-        self.acquire_lifecycle_reservation(
-            &storage,
-            LifecycleOperation::Launch,
-            Some(Status::Starting),
-        )?;
+        if !require_tracked_row {
+            // A default-store no-op on a live pane needs no durable launch row.
+            // A real launch still requires and rechecks its authoritative row.
+            self.reconcile_from_store(storage)?;
+            if self.is_structured() {
+                return Ok(LaunchSidOutcome::Skipped);
+            }
+            self.ensure_startable()?;
+        }
+        if let Some((key, allow_retry)) = handoff {
+            anyhow::ensure!(allow_retry || !self.validate_terminal_handoff(storage, key)?.launch_started,
+                "previous terminal launch did not remain live; retry disable explicitly after correcting its error");
+            self.prepare_terminal_handoff_retry_in(storage, key)?;
+            self.validate_terminal_handoff_target(storage, key)?;
+        }
+        let generation = if let Some((key, allow_retry)) = handoff {
+            let generation = self.acquire_terminal_handoff_launch_reservation(storage, key)?;
+            handoff = Some((
+                TerminalHandoffKey {
+                    id: key.id,
+                    generation,
+                },
+                allow_retry,
+            ));
+            generation
+        } else {
+            self.acquire_lifecycle_reservation(
+                storage,
+                LifecycleOperation::Launch,
+                Some(Status::Starting),
+            )?
+        };
 
-        // The durable reservation excludes peer launches while user hooks run. Both flocks must be
-        // absent because a hook may invoke aoe for this same session.
+        // Hooks may invoke aoe; retain the token, not the flocks, across them.
         drop(lifecycle_lock);
         drop(title_lock);
-        let hook_result = self.run_pre_launch_hooks(skip_on_launch, &profile);
+        let hook_result = self.run_pre_launch_hooks(skip_on_launch, storage, None);
         let (_title_lock, _lifecycle_lock) =
-            self.reacquire_launch_locks_after_hooks(&storage, hook_result)?;
-        self.reconcile_sidecar_into_disk();
-        let expected = self.apply_fresh_launch_intent();
+            self.reacquire_launch_locks_after_hooks(storage, generation, hook_result)?;
+        if let Some((key, _)) = handoff {
+            self.validate_terminal_handoff_target(storage, key)?;
+        }
+        self.reconcile_sidecar_into_disk_in(storage)?;
+        let expected = self.apply_fresh_launch_intent_in(storage);
 
-        let mut prepared = match self.prepare_launch_command(expected) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                self.fail_reserved_launch(&storage, &error, false);
-                return Err(error);
-            }
-        };
+        let mut prepared =
+            match self.prepare_launch_command_in(CaptureStorage::Scoped(storage), expected) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.fail_reserved_launch(storage, generation, &error, false);
+                    return Err(error);
+                }
+            };
         let result = (|| {
             if corpse_pane {
                 let publication = self.prime_root_publication(true);
                 self.kill_clean_locked()?;
-                prepared =
-                    self.refresh_prepared_prime_launch_after_pane_stop(prepared, publication)?;
+                prepared = self.refresh_prepared_prime_launch_after_pane_stop_in(
+                    CaptureStorage::Scoped(storage),
+                    prepared,
+                    publication,
+                )?;
             }
-            let outcome = self.spawn_prepared_launch(size, &profile, prepared)?;
-            self.commit_lifecycle_launch(&storage, false)?;
+            let outcome = self.spawn_prepared_launch(size, storage, prepared)?;
+            self.commit_lifecycle_launch(storage, generation, false)?;
             Ok(outcome)
         })();
         if let Err(error) = result {
-            self.fail_reserved_launch(&storage, &error, true);
+            self.fail_reserved_launch(storage, generation, &error, handoff.is_none());
             return Err(error);
         }
         result
     }
 
-    pub(super) fn apply_fresh_launch_intent(&mut self) -> ConversationState {
+    pub(crate) fn start_terminal_handoff_in(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+        key: TerminalHandoffKey,
+        driver: &crate::session::TerminalHandoffDriver,
+        allow_retry: bool,
+    ) -> Result<()> {
+        crate::session::validate_instance_id(&self.id)?;
+        anyhow::ensure!(
+            driver.session_id() == self.id.as_str(),
+            LifecycleReservationError::Superseded
+        );
+        self.start_with_size_opts_in(None, false, storage, true, Some((key, allow_retry)))
+            .map(|_| ())
+    }
+
+    fn validate_terminal_handoff(
+        &self,
+        storage: &dyn crate::session::SessionStore,
+        key: TerminalHandoffKey,
+    ) -> Result<&TerminalHandoffIntent> {
+        let intent = self
+            .terminal_handoff
+            .as_ref()
+            .ok_or(LifecycleReservationError::Superseded)?;
+        anyhow::ensure!(
+            self.view == View::Terminal
+                && self.lifecycle_generation == key.generation
+                && intent.id == key.id
+                && intent.generation == key.generation
+                && intent.target_generation <= key.generation
+                && intent.stage == TerminalHandoffStage::TerminalLaunchOwed
+                && intent.profile == storage.storage().profile()
+                && intent.profile_identity == storage.storage().bound_profile_identity()?,
+            LifecycleReservationError::Superseded
+        );
+        anyhow::ensure!(
+            intent.final_event_seq.is_some(),
+            "terminal handoff has no completed original retirement"
+        );
+        intent.ensure_original_stopped(&self.id)?;
+        Ok(intent)
+    }
+
+    fn normalized_handoff_launch_state(&self, launch: &TerminalHandoffLaunch) -> ConversationState {
+        let mut desired = launch.launched.clone();
+        if matches!(
+            desired.intent,
+            ResumeIntent::Cleared | ResumeIntent::Fork { .. }
+        ) || (matches!(desired.intent, ResumeIntent::Use(_))
+            && self.launch_has_session_publisher())
+        {
+            desired.intent = ResumeIntent::Default;
+            desired.resume_binding = None;
+        }
+        desired
+    }
+
+    fn prepare_terminal_handoff_retry_in(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+        key: TerminalHandoffKey,
+    ) -> Result<()> {
+        let intent = self.validate_terminal_handoff(storage, key)?.clone();
+        let Some(launch) = intent.launch else {
+            if matches!(intent.context, TerminalHandoffContext::Keep { .. }) {
+                anyhow::ensure!(
+                    matches!(self.resume_intent, ResumeIntent::Use(_))
+                        && !self.force_fresh_next_launch,
+                    "kept handoff requires its explicit native resume target"
+                );
+            }
+            return Ok(());
+        };
+        if launch.generation < intent.target_generation {
+            let target = intent
+                .terminal
+                .as_ref()
+                .ok_or(LifecycleReservationError::Superseded)?;
+            anyhow::ensure!(target.matches(self), LifecycleReservationError::Superseded);
+            return Ok(());
+        }
+        let normalized = self.normalized_handoff_launch_state(&launch);
+        let current_execution = launch.launched.active.is_some()
+            && self.runs(&launch.launched.tool, launch.launched.active.as_ref());
+        anyhow::ensure!(
+            launch.prior.matches(self)
+                || launch.launched.matches(self)
+                || normalized.matches(self)
+                || current_execution,
+            LifecycleReservationError::Superseded
+        );
+        let observed = if current_execution {
+            self.agent_session_id
+                .as_ref()
+                .zip(self.agent_session_binding.as_ref())
+                .filter(|(sid, binding)| {
+                    binding.session_id.as_str() == sid.as_str()
+                        && binding.is_known()
+                        && binding
+                            .execution
+                            .as_ref()
+                            .zip(self.active_execution.as_ref())
+                            .is_some_and(|(binding, active)| {
+                                Self::execution_identity_matches(binding, &active.binding)
+                            })
+                })
+                .map(|(sid, binding)| {
+                    let mut state = self.conversation_state();
+                    state.intent = ResumeIntent::Use(sid.clone());
+                    state.resume_binding = Some(binding.clone());
+                    state
+                })
+        } else {
+            None
+        };
+        let mut target = match (observed, intent.context) {
+            (Some(observed), _) => observed,
+
+            (None, TerminalHandoffContext::Keep { .. }) => intent
+                .terminal
+                .ok_or_else(|| anyhow::anyhow!("kept handoff has no native target"))?,
+            (None, TerminalHandoffContext::Discard) => {
+                let ambiguous = "terminal launch outcome has no proven exact native target; use aoe session set-session-id SESSION ID --store /absolute/store, or aoe session set-session-id SESSION \"\" to explicitly authorize a fresh terminal launch";
+                let sid = launch.launched.session_id.as_ref().context(ambiguous)?;
+                let binding = launch
+                    .launched
+                    .binding
+                    .as_ref()
+                    .filter(|binding| {
+                        binding.session_id.as_str() == sid.as_str()
+                            && binding.is_known()
+                            && binding
+                                .execution
+                                .as_ref()
+                                .zip(launch.launched.active.as_ref())
+                                .is_some_and(|(binding, active)| {
+                                    Self::execution_identity_matches(binding, &active.binding)
+                                })
+                    })
+                    .context(ambiguous)?;
+                let mut exact = launch.launched.clone();
+                exact.intent = ResumeIntent::Use(sid.clone());
+                exact.resume_binding = Some(binding.clone());
+                exact
+            }
+        };
+        target.active = self.active_execution.clone();
+        let profile = storage.storage().profile().to_owned();
+        let identity = storage.storage().bound_profile_identity()?;
+        storage.update(|rows, _| {
+            let row = rows
+                .iter_mut()
+                .find(|row| row.id == self.id)
+                .ok_or(LifecycleReservationError::Superseded)?;
+            let pending = row
+                .terminal_handoff
+                .as_ref()
+                .ok_or(LifecycleReservationError::Superseded)?;
+            anyhow::ensure!(
+                row.lifecycle_generation == key.generation
+                    && pending.id == key.id
+                    && pending.generation == key.generation
+                    && pending.profile == profile
+                    && pending.profile_identity == identity
+                    && pending.stage == TerminalHandoffStage::TerminalLaunchOwed
+                    && (launch.prior.matches(row)
+                        || launch.launched.matches(row)
+                        || normalized.matches(row)
+                        || (current_execution
+                            && row.runs(&self.tool, self.active_execution.as_ref())
+                            && self.conversation_state().matches(row))),
+                LifecycleReservationError::Superseded
+            );
+            row.adopt_conversation_state(target.clone());
+            row.terminal_handoff
+                .as_mut()
+                .expect("validated handoff")
+                .terminal = Some(target.clone());
+            Ok(())
+        })?;
+        self.adopt_conversation_state(target);
+        Ok(())
+    }
+
+    fn acquire_terminal_handoff_launch_reservation(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+        key: TerminalHandoffKey,
+    ) -> Result<u64> {
+        self.validate_terminal_handoff(storage, key)?;
+        let id = self.id.clone();
+        let profile = storage.storage().profile().to_owned();
+        let identity = storage.storage().bound_profile_identity()?;
+        let mut candidate = None;
+        let result = storage.update(|rows, _| {
+            let row = rows
+                .iter_mut()
+                .find(|row| row.id == id)
+                .ok_or(LifecycleReservationError::Superseded)?;
+            let pending = row
+                .terminal_handoff
+                .as_ref()
+                .ok_or(LifecycleReservationError::Superseded)?;
+            anyhow::ensure!(
+                row.lifecycle_generation == key.generation
+                    && pending.id == key.id
+                    && pending.generation == key.generation
+                    && pending.profile == profile
+                    && pending.profile_identity == identity
+                    && pending.stage == TerminalHandoffStage::TerminalLaunchOwed,
+                LifecycleReservationError::Superseded
+            );
+            row.ensure_startable()?;
+            let generation = row
+                .lifecycle_generation
+                .checked_add(1)
+                .ok_or(LifecycleReservationError::GenerationOverflow)?;
+            row.lifecycle_generation = generation;
+            row.lifecycle_reservation = Some(LifecycleReservation {
+                op: LifecycleOperation::Launch,
+                generation,
+                at: Utc::now(),
+            });
+            row.status = Status::Starting;
+            row.idle_entered_at = None;
+            let pending = row.terminal_handoff.as_mut().expect("validated handoff");
+            pending.generation = generation;
+            pending.launch_started = true;
+            candidate = Some(generation);
+            Ok(())
+        });
+        let landed = match &result {
+            Ok(()) => true,
+            Err(error) if error.is::<crate::session::SessionCommitApplied>() => true,
+            Err(_) => {
+                crate::migrations::ensure_schema_supported().is_ok()
+                    && candidate.is_some_and(|generation| {
+                        storage
+                            .storage()
+                            .load_complete_with_groups()
+                            .is_ok_and(|(rows, _)| {
+                                rows.iter().any(|row| {
+                                    row.id == id
+                                        && row.lifecycle_reservation_is_owned(
+                                            LifecycleOperation::Launch,
+                                            generation,
+                                        )
+                                        && row.terminal_handoff.as_ref().is_some_and(|pending| {
+                                            pending.id == key.id
+                                                && pending.generation == generation
+                                                && pending.profile == profile
+                                                && pending.profile_identity == identity
+                                        })
+                                })
+                            })
+                    })
+            }
+        };
+        if landed {
+            self.lifecycle_generation =
+                candidate.ok_or_else(|| anyhow::anyhow!("launch mutation not invoked"))?;
+        }
+        result?;
+        self.reconcile_from_store(storage)?;
+        Ok(self.lifecycle_generation)
+    }
+
+    pub(crate) fn ensure_terminal_handoff_pane_matches(
+        session_name: &str,
+        key: TerminalHandoffKey,
+        launch: &TerminalHandoffLaunch,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            launch.generation <= key.generation,
+            LifecycleReservationError::Superseded
+        );
+        let id = key.id.to_string();
+        let generation = launch.generation.to_string();
+        anyhow::ensure!(
+            crate::tmux::env::get_env(session_name, crate::tmux::env::AOE_TERMINAL_HANDOFF_ID_KEY)
+                .as_deref()
+                == Some(id.as_str())
+                && crate::tmux::env::get_env(
+                    session_name,
+                    crate::tmux::env::AOE_TERMINAL_HANDOFF_GENERATION_KEY
+                )
+                .as_deref()
+                    == Some(generation.as_str()),
+            "pane does not match the original terminal handoff attempt; replacement retained"
+        );
+        if let Some(metadata) = launch.omp_capture_metadata.as_ref() {
+            anyhow::ensure!(
+                crate::tmux::env::get_env(session_name, crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY)
+                    .as_deref()
+                    == Some(metadata.launch_id.as_str()),
+                "pane has different OMP launch identity"
+            );
+        }
+        Ok(())
+    }
+
+    fn complete_terminal_handoff_live_in(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+        key: TerminalHandoffKey,
+    ) -> Result<()> {
+        let intent = self.validate_terminal_handoff(storage, key)?;
+        let Some(launch) = intent.launch.clone() else {
+            return Ok(());
+        };
+        anyhow::ensure!(launch.generation >= intent.target_generation,
+        "previous handoff pane is live but does not apply the explicitly selected target; pane retained");
+        let session = self.tmux_session()?;
+        Self::ensure_terminal_handoff_pane_matches(session.name(), key, &launch)?;
+        let normalized = self.normalized_handoff_launch_state(&launch);
+        if launch.prior.matches(self) || launch.launched.matches(self) {
+            self.adopt_conversation_state(launch.launched.clone());
+            self.capture_started_at = launch.capture_started_at;
+            self.finalize_launch_with_store(
+                session.name(),
+                storage,
+                &launch.prior,
+                launch.omp_capture_metadata,
+                launch.confirm_desired_conversation,
+            )?;
+        } else {
+            anyhow::ensure!(
+                normalized.matches(self)
+                    || (launch.launched.active.is_some()
+                        && self.runs(&launch.launched.tool, launch.launched.active.as_ref())),
+                LifecycleReservationError::Superseded
+            );
+            self.capture_started_at = launch.capture_started_at;
+            self.maybe_start_poller_since_in(CaptureStorage::Scoped(storage))?;
+        }
+        if self.lifecycle_reservation_is_owned(LifecycleOperation::Launch, key.generation) {
+            self.commit_lifecycle_launch(storage, key.generation, false)?;
+        }
+        Ok(())
+    }
+
+    fn validate_terminal_handoff_target(
+        &self,
+        storage: &dyn crate::session::SessionStore,
+        key: TerminalHandoffKey,
+    ) -> Result<()> {
+        let intent = self.validate_terminal_handoff(storage, key)?;
+        let target = intent
+            .terminal
+            .as_ref()
+            .ok_or(LifecycleReservationError::Superseded)?;
+        anyhow::ensure!(
+            target.tool == self.tool,
+            LifecycleReservationError::Superseded
+        );
+        if matches!(intent.context, TerminalHandoffContext::Keep { .. })
+            || matches!(&target.intent, ResumeIntent::Use(_))
+        {
+            anyhow::ensure!(
+                matches!(&self.resume_intent, ResumeIntent::Use(id)
+                if matches!(&target.intent, ResumeIntent::Use(target_id) if target_id == id))
+                    && self.resume_binding == target.resume_binding
+                    && !self.force_fresh_next_launch,
+                "exact terminal handoff target changed; set an explicit native target to recover"
+            );
+        }
+        Ok(())
+    }
+    pub(super) fn apply_fresh_launch_intent_in(
+        &mut self,
+        _storage: &dyn crate::session::SessionStore,
+    ) -> ConversationState {
         let expected = self.conversation_state();
         if std::mem::take(&mut self.force_fresh_next_launch) {
             self.resume_intent = ResumeIntent::Cleared;
         }
         expected
+    }
+
+    #[cfg(test)]
+    pub(super) fn apply_fresh_launch_intent(&mut self) -> ConversationState {
+        let storage =
+            crate::session::storage::Storage::new_unwatched(&self.effective_profile()).unwrap();
+        self.apply_fresh_launch_intent_in(&storage)
     }
 
     /// The conversation a fresh launch abandons, for the capture-exclusion log.
@@ -213,11 +696,19 @@ impl Instance {
     pub(super) fn spawn_prepared_launch(
         &mut self,
         size: Option<(u16, u16)>,
-        profile: &str,
+        storage: &dyn crate::session::SessionStore,
         mut prepared: PreparedLaunch,
     ) -> Result<LaunchSidOutcome> {
+        let profile = storage.storage().profile();
+        let handoff_key = self
+            .terminal_handoff
+            .as_ref()
+            .map(|intent| TerminalHandoffKey {
+                id: intent.id,
+                generation: self.lifecycle_generation,
+            });
         let session = self.tmux_session()?;
-        if session.exists() {
+        if session.exists_live() {
             anyhow::bail!(
                 "session {} gained a tmux pane before its reserved launch",
                 self.id
@@ -229,7 +720,7 @@ impl Instance {
         self.stop_poller();
         self.session_id_poller = None;
         if !self.is_sandboxed() {
-            self.install_agent_status_hooks(self.status_agent(), prepared.execution.as_ref());
+            self.install_agent_status_hooks(self.status_agent());
         }
         self.report_store_override(prepared.execution.as_ref());
         let canonicalized = prepared.canonical_conversation.is_some();
@@ -259,7 +750,7 @@ impl Instance {
 
         self.clear_pane_identity_sidecar();
 
-        let mut omp_capture_metadata = if let Some(plan) = prepared.omp_capture_plan {
+        let mut omp_capture_metadata = if let Some(plan) = prepared.omp_capture_plan.take() {
             let launched_at_ms = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .context("system clock predates UNIX_EPOCH during OMP launch")
@@ -278,11 +769,11 @@ impl Instance {
         } else {
             None
         };
-        let omp_generation_published = self.publish_omp_launch_generation(
-            profile,
+        let omp_generation_published = self.publish_omp_launch_generation_with_store(
+            storage,
             omp_capture_metadata.as_ref(),
             prepared.expected_prior_omp_generation.as_deref(),
-        );
+        )?;
         if let Some(metadata) = omp_capture_metadata.as_ref() {
             // The launch preamble (`wrap_omp_launch`) rewrites OMP's breadcrumb and writes the
             // capture marker only if the store's terminal-sessions directory already exists.
@@ -310,6 +801,77 @@ impl Instance {
             );
         }
         self.capture_started_at = Some(SystemTime::now());
+        let handoff_launch = if let Some(key) = handoff_key {
+            self.validate_terminal_handoff(storage, key)?;
+            anyhow::ensure!(
+                omp_capture_metadata.is_none() || omp_generation_published,
+                "handoff OMP launch generation was not durably published"
+            );
+            self.apply_prepared_launch_state(&mut prepared, omp_capture_metadata.as_ref());
+            prepared.launch_env.pane.push(tmux::PaneEnvMutation::set(
+                crate::tmux::env::AOE_TERMINAL_HANDOFF_ID_KEY.to_owned(),
+                key.id.to_string(),
+            ));
+            prepared.launch_env.pane.push(tmux::PaneEnvMutation::set(
+                crate::tmux::env::AOE_TERMINAL_HANDOFF_GENERATION_KEY.to_owned(),
+                key.generation.to_string(),
+            ));
+            Some(TerminalHandoffLaunch {
+                generation: key.generation,
+                prior: prepared.expected_conversation.clone(),
+                launched: self.conversation_state(),
+                capture_started_at: self.capture_started_at,
+                omp_capture_metadata: omp_capture_metadata.clone(),
+                confirm_desired_conversation: canonicalized
+                    || prepared.require_conversation_publication,
+            })
+        } else {
+            None
+        };
+        let scope = crate::process::systemd::scope_prefix_for(&self.id, profile);
+        let recorded_scopes = self.terminal_scopes.clone();
+        let resolved_scopes = match recorded_scopes.as_deref() {
+            Some(scopes)
+                if !scopes
+                    .contains(&crate::process::worker_registry::ScopeOwnership::Unresolved) =>
+            {
+                None
+            }
+            recorded => crate::process::systemd::resolve_unknown_scopes(&self.id, recorded).ok(),
+        };
+        let generation = self.lifecycle_generation;
+        self.terminal_scopes = Some(storage.update(|rows, _| {
+            let row = rows
+                .iter_mut()
+                .find(|row| row.id == self.id)
+                .ok_or(LifecycleReservationError::Superseded)?;
+            anyhow::ensure!(
+                row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation),
+                LifecycleReservationError::Superseded
+            );
+            if let Some(key) = handoff_key {
+                row.validate_terminal_handoff(storage, key)?;
+                row.terminal_handoff
+                    .as_mut()
+                    .expect("validated handoff")
+                    .launch = handoff_launch;
+            }
+            if let Some(resolved) = resolved_scopes.as_ref() {
+                if row.terminal_scopes == recorded_scopes {
+                    row.terminal_scopes = Some(resolved.clone());
+                }
+            }
+            let scopes = row.terminal_scopes.get_or_insert_with(|| {
+                vec![crate::process::worker_registry::ScopeOwnership::Unresolved]
+            });
+            if let Some(scope) = &scope {
+                let owned = scope.ownership();
+                if !scopes.contains(&owned) {
+                    scopes.push(owned);
+                }
+            }
+            Ok(scopes.clone())
+        })?);
         session.create_with_size_env_and_container_env(
             &self.project_path,
             prepared.command.as_deref(),
@@ -317,7 +879,7 @@ impl Instance {
             profile,
             &prepared.launch_env.pane,
             &prepared.launch_env.container,
-            Some(&self.id),
+            scope.as_ref(),
         )?;
         if let Some((_, transactions)) = prepared.sandbox_context_reset.as_ref() {
             crate::migrations::v033_isolate_sandbox_content::acknowledge_context_reset(
@@ -339,6 +901,33 @@ impl Instance {
             }
         }
 
+        if handoff_key.is_none() {
+            self.apply_prepared_launch_state(&mut prepared, omp_capture_metadata.as_ref());
+        }
+        #[cfg(test)]
+        test_support::observe(self, test_support::FinalizePhase::Before);
+
+        self.finalize_launch_with_store(
+            session.name(),
+            storage,
+            &prepared.expected_conversation,
+            omp_capture_metadata,
+            canonicalized || prepared.require_conversation_publication,
+        )?;
+
+        #[cfg(test)]
+        test_support::observe(self, test_support::FinalizePhase::After);
+        Ok(match launch_sid {
+            Some(sid) => LaunchSidOutcome::Existing { sid },
+            None => LaunchSidOutcome::Fresh { pinned_prior_sid },
+        })
+    }
+
+    fn apply_prepared_launch_state(
+        &mut self,
+        prepared: &mut PreparedLaunch,
+        omp_capture_metadata: Option<&OmpCaptureMetadata>,
+    ) {
         if let Some(canonical) = prepared.canonical_conversation.take() {
             self.adopt_conversation_state(canonical);
         }
@@ -349,7 +938,7 @@ impl Instance {
                 binding: execution.binding.clone(),
                 capture: execution
                     .capture
-                    .or_else(|| omp_capture_metadata.clone().map(CaptureContext::Omp)),
+                    .or_else(|| omp_capture_metadata.cloned().map(CaptureContext::Omp)),
                 container: execution.inputs.container,
             });
 
@@ -418,25 +1007,7 @@ impl Instance {
                 }
             }
         }
-        #[cfg(test)]
-        test_support::observe(self, test_support::FinalizePhase::Before);
-
-        self.finalize_launch(
-            session.name(),
-            profile,
-            &prepared.expected_conversation,
-            omp_capture_metadata,
-            canonicalized || prepared.require_conversation_publication,
-        )?;
-
-        #[cfg(test)]
-        test_support::observe(self, test_support::FinalizePhase::After);
-        Ok(match launch_sid {
-            Some(sid) => LaunchSidOutcome::Existing { sid },
-            None => LaunchSidOutcome::Fresh { pinned_prior_sid },
-        })
     }
-
     /// Name both stores when a recorded one outranks what a new session would
     /// use. Reported at the launch, not in the resolver, because a restart
     /// resolves twice and only the launch is one event.
@@ -458,14 +1029,15 @@ impl Instance {
     }
 
     /// Post-launch setup: persist state, start pollers, and apply tmux options.
-    pub(super) fn finalize_launch(
+    pub(super) fn finalize_launch_with_store(
         &mut self,
         session_name: &str,
-        profile: &str,
+        storage: &dyn crate::session::SessionStore,
         expected: &ConversationState,
-        mut omp_capture_metadata: Option<OmpCaptureMetadata>,
+        omp_capture_metadata: Option<OmpCaptureMetadata>,
         confirm_desired_conversation: bool,
     ) -> Result<()> {
+        let profile = storage.storage().profile();
         if let Some(metadata) = omp_capture_metadata.as_ref() {
             let published = serde_json::to_string(metadata).ok().and_then(|encoded| {
                 crate::tmux::env::set_hidden_env(
@@ -482,9 +1054,7 @@ impl Instance {
                 })
                 .ok()
             });
-            if published.is_none() {
-                omp_capture_metadata = None;
-            }
+            let _ = published;
         }
 
         let desired = confirm_desired_conversation.then(|| {
@@ -503,17 +1073,25 @@ impl Instance {
             }
             desired
         });
-        let outcome = self.persist_session_id(profile, expected);
+        let outcome = self.persist_session_id_with_storage(storage, expected);
         if desired.is_some_and(|desired| {
             !matches!(outcome, SidPersistOutcome::Published) || !desired.matches(self)
         }) {
-            self.reconcile_from_disk();
+            self.reconcile_from_store(storage)?;
             anyhow::bail!("durable publication was not confirmed; durable reconciliation was attempted but may be unavailable, and the pane may remain if reservation verification or teardown fails");
         }
 
         // Skip outcomes leave AOE_CAPTURED_SESSION_ID untouched: this path
         // runs before any poller publish, so env is empty for fresh sessions.
         let publish_sid = matches!(outcome, SidPersistOutcome::Published);
+        let previous_captured = if publish_sid {
+            None
+        } else {
+            crate::tmux::env::get_hidden_env(
+                session_name,
+                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+            )
+        };
         let captured_sid: Option<String> = if publish_sid {
             self.agent_session_id.clone()
         } else {
@@ -537,6 +1115,13 @@ impl Instance {
             tracing::warn!(target: "session.store",
             "Failed to set tmux env keys [{}] at finalize_launch: {}", keys.join(", "), e);
         }
+        if let Some(previous) = previous_captured {
+            let _ = crate::tmux::env::set_hidden_env(
+                session_name,
+                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+                &previous,
+            );
+        }
 
         if publish_sid && self.agent_session_id.is_none() {
             if let Err(e) = crate::tmux::env::remove_hidden_env(
@@ -552,7 +1137,7 @@ impl Instance {
         // A launch re-evaluates the row, so its schedule goes. Clearing the working copy is not
         // enough: the live row keeps its own until the relaunch merge sees the stamp below.
         self.poller_repair.reset();
-        self.maybe_start_poller_since(omp_capture_metadata);
+        self.maybe_start_poller_since_in(CaptureStorage::Scoped(storage))?;
 
         self.status = Status::Starting;
         self.last_start_time = Some(std::time::Instant::now());
@@ -592,7 +1177,6 @@ impl Instance {
         }
         Ok(())
     }
-
     /// The store route this launch actually applied, as a binding the stamp
     /// helper accepts (#4127).
     fn attested_claude_store_route(
@@ -611,8 +1195,26 @@ impl Instance {
             ..execution.binding.clone()
         })
     }
-}
 
+    #[cfg(test)]
+    pub(super) fn finalize_launch(
+        &mut self,
+        session_name: &str,
+        profile: &str,
+        expected: &ConversationState,
+        omp_capture_metadata: Option<OmpCaptureMetadata>,
+        confirm_desired_conversation: bool,
+    ) -> Result<()> {
+        let storage = crate::session::storage::Storage::new_unwatched(profile)?;
+        self.finalize_launch_with_store(
+            session_name,
+            &storage,
+            expected,
+            omp_capture_metadata,
+            confirm_desired_conversation,
+        )
+    }
+}
 /// The store route a terminal launch attested, read off the routing table the
 /// worker is about to be launched with (#4127).
 ///
@@ -1009,6 +1611,57 @@ else:
         assert_eq!(outcome, LaunchSidOutcome::Skipped);
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_start_requires_a_tracked_row_even_for_a_preexisting_live_pane(
+    ) -> anyhow::Result<()> {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir()?;
+        let mut row = Instance::new(
+            "native tracked-row admission",
+            project.path().to_str().unwrap(),
+        );
+        row.source_profile = "default".into();
+        let storage = crate::session::Storage::new_unwatched(&row.source_profile)?;
+        assert!(storage.load()?.is_empty());
+        let name = crate::tmux::Session::generate_name(&row.id, &row.title);
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(name.clone());
+        row.tmux_session()?.create(
+            project.path().to_str().unwrap(),
+            Some("exec cat"),
+            "default",
+        )?;
+        let before = crate::tmux::test_helpers::pane_field(&name, "#{pane_pid}");
+        assert!(!before.is_empty());
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let result = tokio::task::spawn_blocking(move || {
+            let native = crate::server::session_store::NativeSessionStore::open(
+                state,
+                &row.source_profile,
+                Some(row.id.clone()),
+            )?;
+            row.start_with_size_opts_in(None, false, &native, true, None)
+                .map(|_| ())
+        })
+        .await?;
+        let error = result.unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<LifecycleReservationError>(),
+                Some(LifecycleReservationError::Superseded)
+            ),
+            "{error:#}"
+        );
+        assert_eq!(
+            crate::tmux::test_helpers::pane_field(&name, "#{pane_pid}"),
+            before,
+            "native admission refusal does not respawn the live pane"
+        );
+        assert!(storage.load()?.is_empty());
+        Ok(())
+    }
+
     /// #4116: every launch funnel rereads the row and refuses an archived or
     /// trashed session, even when the caller holds a stale live copy.
     #[test]
@@ -1061,6 +1714,50 @@ else:
                 assert!(!inst.tmux_session().unwrap().exists(), "{label}");
             }
         }
+    }
+
+    /// #4118: a row that a peer archived or trashed must not reach the
+    /// pre-launch hooks, even when the caller still holds a live in-memory
+    /// copy. The hooks start containers and can have side effects, so this
+    /// watches the hook actually running rather than only the error code.
+    #[test]
+    #[serial_test::serial]
+    fn start_refuses_a_stored_shelved_row_before_the_pre_launch_hooks() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp.path());
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .expect("acknowledge the agent hook paths");
+        let witness = temp.path().join("before-session-ran");
+        crate::session::config::update_config(|global| {
+            global.host_hooks.before_session = vec![format!(": > '{}'", witness.display())];
+        })
+        .expect("install before_session hook");
+
+        let profile = "start-shelved-stored-row";
+        let mut inst = Instance::new("start", "/tmp/x");
+        inst.source_profile = profile.to_string();
+        crate::session::instance::test_helpers::seed_disk_for_sidecar_test(profile, &inst);
+        // Only the stored row is shelved: the instance keeps a live copy, which
+        // is the state a daemon cache holds when a peer shelves behind it.
+        crate::session::storage::Storage::new_unwatched(profile)
+            .unwrap()
+            .update(|rows, _| {
+                crate::session::instance::Instance::archive(&mut rows[0]);
+                Ok(())
+            })
+            .unwrap();
+
+        let blocked = inst
+            .start_with_size_opts(None, false)
+            .err()
+            .and_then(|error| error.downcast_ref::<StartBlocked>().copied());
+        assert_eq!(blocked, Some(StartBlocked::Archived));
+        assert!(
+            !witness.exists(),
+            "the pre-launch hook ran for a row already shelved in the store"
+        );
     }
 
     fn instance_with_id(id: &str) -> Instance {

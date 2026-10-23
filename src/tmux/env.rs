@@ -8,6 +8,8 @@ pub const AOE_CAPTURED_SESSION_ID_KEY: &str = "AOE_CAPTURED_SESSION_ID";
 pub const AOE_OMP_CAPTURE_META_KEY: &str = "AOE_OMP_CAPTURE_META";
 pub const AOE_OMP_LAUNCH_ID_KEY: &str = "AOE_OMP_LAUNCH_ID";
 pub const AOE_OMP_CAPTURE_READY_KEY: &str = "AOE_OMP_CAPTURE_READY";
+pub const AOE_TERMINAL_HANDOFF_ID_KEY: &str = "AOE_TERMINAL_HANDOFF_ID";
+pub const AOE_TERMINAL_HANDOFF_GENERATION_KEY: &str = "AOE_TERMINAL_HANDOFF_GENERATION";
 
 pub fn set_hidden_env(session_name: &str, key: &str, value: &str) -> anyhow::Result<()> {
     let output = crate::tmux::tmux_command()

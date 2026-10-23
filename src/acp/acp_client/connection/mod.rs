@@ -25,6 +25,7 @@ use agent_client_protocol::schema::v1::{
     WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -81,7 +82,10 @@ pub(super) struct ConnectionParams {
     pub(super) default_mode: Option<String>,
     pub(super) default_model: Option<String>,
     pub(super) mcp_servers: Vec<McpServer>,
+    pub(super) claude_home: Option<PathBuf>,
     pub(super) runner: Option<RunnerLink>,
+    pub(super) cancellation: tokio_util::sync::CancellationToken,
+    pub(super) shutdown: tokio_util::sync::CancellationToken,
 }
 
 /// Handlers compute an answer without knowing whether the request arrived over
@@ -147,7 +151,10 @@ pub(super) async fn run_connection_task<W, R>(
         default_mode,
         default_model,
         mcp_servers,
+        claude_home,
         runner,
+        cancellation,
+        shutdown,
     } = params;
     let label = resources.label.clone();
     let (lifecycle_tx, lifecycle_rx) = mpsc::channel(128);
@@ -159,6 +166,7 @@ pub(super) async fn run_connection_task<W, R>(
             Arc::new(AtomicBool::new(false)),
         ),
     };
+    let _control_shutdown = super::control::ShutdownControlOnDrop(control.clone());
     // A runner owns identity across daemons, so its ingress is the one that
     // already holds the adopted session.
     let ingress = control
@@ -185,6 +193,7 @@ pub(super) async fn run_connection_task<W, R>(
         prompt_in_flight,
         resources.sandbox.as_ref(),
         ingress.clone(),
+        claude_home,
     ));
     let ready_tx = Arc::new(Mutex::new(Some(ready_tx)));
 
@@ -366,9 +375,16 @@ pub(super) async fn run_connection_task<W, R>(
             transport,
             move |connection: ConnectionTo<Agent>| async move {
                 tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => Ok(()),
                     error = ingress.failed() => Err(error),
                     result = async move {
-                        match establish::establish(connection, establish_ctx).await? {
+                        let session = tokio::select! {
+                            biased;
+                            _ = cancellation.cancelled() => Ok(None),
+                            established = establish::establish(connection, establish_ctx) => established,
+                        }?;
+                        match session {
                             Some(session) => session.run().await,
                             None => Ok(()),
                         }
@@ -382,11 +398,6 @@ pub(super) async fn run_connection_task<W, R>(
         report_connection_error(e, &shared, &ready_tx).await;
     } else {
         info!(target: "acp.protocol", session = %label, "ACP connection task ended cleanly");
-    }
-    // Bridge tasks hold socket clones, so a runner's accept loop is only
-    // released by shutting the control socket down explicitly.
-    if let Some(control) = control.as_ref() {
-        control.shutdown();
     }
     if let Some(child) = child.as_ref() {
         let mut guard = child.lock().await;

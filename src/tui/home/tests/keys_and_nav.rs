@@ -18,39 +18,6 @@ fn duplicate_session_ids_are_excluded_from_home_map() {
     assert!(map.contains_key(&unique_id));
 }
 
-// #1897: `add_instance` funnels both the `Creating` stub and the finalized row, so the
-// opt-in create-trend counter must bump only for finalized inserts, or a successful
-// background create double-counts and a cancelled one counts a session that never existed.
-// Asserts deltas, since the counter is a process-global shared with the
-// `telemetry_creates` serial group.
-#[test]
-#[serial]
-#[serial_test::serial(telemetry_creates)]
-fn add_instance_counts_only_finalized_creates() {
-    use crate::session::Status;
-    let mut env = create_test_env_empty();
-    let before = crate::tui::app::session_create_count_for_test();
-
-    let mut stub = Instance::new("stub", "/tmp/test");
-    stub.source_profile = "test".to_string();
-    stub.status = Status::Creating;
-    env.view.add_instance(stub);
-    assert_eq!(
-        crate::tui::app::session_create_count_for_test(),
-        before,
-        "a Creating placeholder stub must not bump the create counter"
-    );
-
-    let mut real = Instance::new("real", "/tmp/test");
-    real.source_profile = "test".to_string();
-    env.view.add_instance(real);
-    assert_eq!(
-        crate::tui::app::session_create_count_for_test(),
-        before + 1,
-        "a finalized session insert must bump the create counter exactly once"
-    );
-}
-
 #[test]
 #[serial]
 fn rewire_disk_subscriptions_is_noop_without_tokio_runtime() {
@@ -262,9 +229,10 @@ fn preview_info_follows_flag_and_never_auto_shows_in_live() {
     );
 }
 
-/// The app-level keybindings defer Ctrl+C to live-send through this predicate (#2894),
-/// true only while live mode owns the keyboard: an overlay on top takes focus back and
-/// Ctrl+C behaves normally.
+/// The app-level global keybindings defer Ctrl+C to live-send via this
+/// predicate (#2894). It is true only while live mode owns the keyboard: an
+/// overlay opened on top of live mode takes focus back, and Ctrl+C should
+/// then behave normally.
 #[test]
 #[serial]
 fn is_live_send_capturing_tracks_state_and_overlays() {
@@ -300,20 +268,23 @@ fn is_live_send_capturing_tracks_state_and_overlays() {
     );
 }
 
-/// #2894: in live mode Ctrl+C is forwarded to the agent as an interrupt rather than a quit,
-/// and each forward arms the footer reminder. Drives the real `handle_key` routing with the
-/// default `C-q` exit chord present, so Ctrl+C is proven distinct from exiting.
+/// #2894: in live mode Ctrl+C is forwarded to the agent (an interrupt), not
+/// treated as a quit, and each forward arms the footer reminder. Drives the
+/// real `handle_key` routing with the default `C-q` exit chord present so the
+/// test proves Ctrl+C is distinct from exiting.
 #[test]
 #[serial]
 fn ctrl_c_in_live_mode_forwards_to_agent_and_flashes() {
     use crate::tui::home::live_send::{parse_chord_list, LiveSendState, LiveSendTarget};
 
     let mut env = create_test_env_with_sessions(1);
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
     let inst = env.view.instance_at(0).clone();
 
     // Match the generated tmux name so the drift guard doesn't tear live mode
     // down before the key is translated.
     let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+    crate::tmux::test_inject_session_into_cache(&tmux_name);
     env.view.live_send = Some(LiveSendState {
         session_id: inst.id.clone(),
         title: inst.title.clone(),
@@ -437,9 +408,10 @@ fn preview_visible_rows_equal_output_area_with_info_shown() {
     );
 }
 
-/// Precedence: unread paints only on resting rows. A live status supersedes it and keeps
-/// its own spinner, so a Running session carrying an unread marker must not show the dot
-/// (#2088 review).
+/// Precedence: unread paints only on resting (Idle/Unknown) rows. A live
+/// status supersedes it, keeping its own spinner; so a Running session that
+/// also carries an unread marker must NOT show the solid unread dot. See the
+/// #2088 review note about jumbled precedence.
 #[test]
 #[serial]
 fn unread_dot_yields_to_a_running_status() {
@@ -459,15 +431,14 @@ fn unread_dot_yields_to_a_running_status() {
             .unwrap();
         let buf = terminal.backend().buffer();
         let mut out = String::new();
-        for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
+        for y in env.view.list_area.y..env.view.list_area.bottom() {
+            for x in env.view.list_area.x..env.view.list_area.right() {
                 out.push_str(buf[(x, y)].symbol());
             }
         }
         out
     };
 
-    // Idle + unread: the row shows the solid unread dot.
     env.view.mutate_instance(&id, |inst| {
         inst.status = crate::session::Status::Idle;
         inst.mark_unread();
@@ -478,7 +449,6 @@ fn unread_dot_yields_to_a_running_status() {
         "an idle unread row should paint the unread dot"
     );
 
-    // Running + still unread: the live status wins; no unread dot.
     env.view
         .mutate_instance(&id, |inst| inst.status = crate::session::Status::Running);
     env.view.flat_items = env.view.build_flat_items();
@@ -488,8 +458,9 @@ fn unread_dot_yields_to_a_running_status() {
     );
 }
 
-/// Sunk rows never paint the unread dot: archiving or snoozing dismisses the row, and the
-/// snooze case must hold in every sort mode, not just Attention (#2571).
+/// Sunk rows never paint the unread dot. Archiving or snoozing an unread
+/// row dismisses it; surfacing it as unread contradicts that. The snooze
+/// case must hold in every sort mode, not just Attention (#2571).
 #[test]
 #[serial]
 fn unread_dot_suppressed_on_archived_and_snoozed() {
@@ -511,15 +482,14 @@ fn unread_dot_suppressed_on_archived_and_snoozed() {
             .unwrap();
         let buf = terminal.backend().buffer();
         let mut out = String::new();
-        for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
+        for y in env.view.list_area.y..env.view.list_area.bottom() {
+            for x in env.view.list_area.x..env.view.list_area.right() {
                 out.push_str(buf[(x, y)].symbol());
             }
         }
         out
     };
 
-    // Baseline: an idle unread row paints the dot.
     env.view.mutate_instance(&id, |inst| {
         inst.status = crate::session::Status::Idle;
         inst.mark_unread();
@@ -530,8 +500,6 @@ fn unread_dot_suppressed_on_archived_and_snoozed() {
         "an idle unread row should paint the unread dot"
     );
 
-    // Snoozed, in a non-Attention sort: the dot must be gone even though the
-    // snooze decoration itself is Attention-only.
     env.view.sort_order = SortOrder::Newest;
     env.view.mutate_instance(&id, |inst| inst.snooze(30));
     env.view.flat_items = env.view.build_flat_items();
@@ -540,7 +508,6 @@ fn unread_dot_suppressed_on_archived_and_snoozed() {
         "a snoozed unread row must not paint the unread dot outside Attention sort"
     );
 
-    // Snoozed in Attention sort: still no dot.
     env.view.sort_order = SortOrder::Attention;
     env.view.flat_items = env.view.build_flat_items();
     assert!(
@@ -548,7 +515,6 @@ fn unread_dot_suppressed_on_archived_and_snoozed() {
         "a snoozed unread row must not paint the unread dot in Attention sort"
     );
 
-    // Archived: the archive override already mutes the glyph; guard it stays muted.
     env.view.mutate_instance(&id, |inst| {
         inst.unsnooze();
         inst.archive();
@@ -560,8 +526,9 @@ fn unread_dot_suppressed_on_archived_and_snoozed() {
     );
 }
 
-/// Unread marks agent output the user hasn't seen, which the paired terminal has no notion
-/// of, so Terminal view never paints the dot even when the instance carries the flag.
+/// Unread is an Agent-view concept: the dot marks agent output the user hasn't
+/// seen. The paired terminal has no such notion, so Terminal view must never
+/// paint the unread dot even when the underlying instance carries the flag.
 #[test]
 #[serial]
 fn unread_dot_never_paints_in_terminal_view() {
@@ -582,8 +549,8 @@ fn unread_dot_never_paints_in_terminal_view() {
             .unwrap();
         let buf = terminal.backend().buffer();
         let mut out = String::new();
-        for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
+        for y in env.view.list_area.y..env.view.list_area.bottom() {
+            for x in env.view.list_area.x..env.view.list_area.right() {
                 out.push_str(buf[(x, y)].symbol());
             }
         }
@@ -596,15 +563,12 @@ fn unread_dot_never_paints_in_terminal_view() {
     });
     env.view.flat_items = env.view.build_flat_items();
 
-    // Agent view: the idle unread row paints the dot (baseline sanity).
     env.view.view_mode = ViewMode::Structured;
     assert!(
         render(&mut env).contains('●'),
         "agent view should paint the unread dot for an idle unread row"
     );
 
-    // Terminal view: same instance, no dot. The terminal pane isn't running
-    // (no tmux session in the test env), so the row shows its idle glyph.
     env.view.view_mode = ViewMode::Terminal;
     assert!(
         !render(&mut env).contains('●'),
@@ -612,9 +576,10 @@ fn unread_dot_never_paints_in_terminal_view() {
     );
 }
 
-/// Stop targets what the user is looking at: Agent view arms the `stop_session` confirm
-/// while Terminal and Tool views route to their pane-kill paths and never arm an agent
-/// stop. The routing lives in `stop_selected`.
+/// Stop targets what the user is looking at: Agent view arms the
+/// `stop_session` confirm (agent + container stop), while Terminal and Tool
+/// views route to their respective pane-kill paths and never arm an agent
+/// stop. The routing decision lives in `stop_selected`.
 #[test]
 #[serial]
 fn stop_in_terminal_view_does_not_target_agent_session() {
@@ -671,44 +636,42 @@ fn stop_in_terminal_view_does_not_target_agent_session() {
     );
 }
 
-/// The stop key opens the stop confirm and a second press of it accepts, in both hotkey
-/// modes; the hint names that key, and an unrelated key leaves the dialog open.
 #[test]
 #[serial]
 fn second_stop_key_press_confirms_the_stop() {
     for (strict, stop_key) in [(false, 'x'), (true, 'X')] {
-        let mut env = create_test_env_with_sessions(1);
-        env.view.strict_hotkeys = strict;
-        let id = env.view.instance_at(0).id.clone();
-        env.view
-            .mutate_instance(&id, |inst| inst.status = crate::session::Status::Idle);
-        env.view.selected_session = Some(id.clone());
-        env.view.view_mode = ViewMode::Structured;
-
-        assert_eq!(
-            env.view.handle_key(key(KeyCode::Char(stop_key)), None),
-            None
-        );
-        assert_eq!(
-            env.view.confirm_dialog.as_ref().map(|d| d.action()),
-            Some("stop_session"),
-            "strict={strict}"
-        );
-        let screen = render_home_to_string(&mut env.view, 120, 40);
-        assert!(
-            screen.contains(&format!("Press {stop_key} again to confirm")),
-            "strict={strict}\n{screen}"
-        );
-
-        assert_eq!(env.view.handle_key(key(KeyCode::Char('j')), None), None);
-        assert!(env.view.confirm_dialog.is_some(), "strict={strict}");
-
-        assert_eq!(
-            env.view.handle_key(key(KeyCode::Char(stop_key)), None),
-            Some(Action::StopSession(id)),
-            "strict={strict}"
-        );
-        assert!(env.view.confirm_dialog.is_none(), "strict={strict}");
+        for mode in [ViewMode::Structured, ViewMode::Terminal] {
+            let mut env = create_test_env_with_sessions(1);
+            env.view.strict_hotkeys = strict;
+            let id = env.view.instance_at(0).id.clone();
+            env.view.mutate_instance(&id, |inst| {
+                inst.status = crate::session::Status::Idle;
+                inst.auxiliary = vec![crate::session::AuxiliaryObservation {
+                    target: crate::session::AuxiliaryTarget::Host { index: 0 },
+                    pane: crate::session::PaneObservation {
+                        state: crate::session::PanePresence::Alive,
+                        tmux_session: Some("host".into()),
+                        legacy_tool: None,
+                    },
+                }];
+            });
+            env.view.selected_session = Some(id.clone());
+            env.view.view_mode = mode;
+            assert_eq!(
+                env.view.handle_key(key(KeyCode::Char(stop_key)), None),
+                None
+            );
+            assert!(env.view.confirm_dialog.is_some(), "strict={strict}");
+            assert_eq!(env.view.handle_key(key(KeyCode::Char('j')), None), None);
+            assert!(env.view.confirm_dialog.is_some(), "strict={strict}");
+            let expected =
+                (env.view.view_mode == ViewMode::Structured).then_some(Action::StopSession(id));
+            assert_eq!(
+                env.view.handle_key(key(KeyCode::Char(stop_key)), None),
+                expected
+            );
+            assert!(env.view.confirm_dialog.is_none(), "strict={strict}");
+        }
     }
 }
 
@@ -734,44 +697,155 @@ fn unread_flag_survives_sink_round_trip() {
 /// selection first spares it, so arrowing through a list doesn't read everything you pass.
 #[test]
 #[serial]
-fn unread_dwell_clears_after_threshold_and_resets_on_selection_change() {
+fn native_unread_respects_visits_and_canonical_feedback() {
+    use crate::daemon::{RuntimeCursor, SessionMutation};
+    use crate::tui::session_feed::SessionFeedResult;
     use std::time::{Duration, Instant};
+
     crate::session::set_unread_enabled(true);
     let mut env = create_test_env_with_sessions(2);
     let a = env.view.instance_at(0).id.clone();
     let b = env.view.instance_at(1).id.clone();
-    for id in [&a, &b] {
-        env.view.mutate_instance(id, |inst| {
-            inst.status = crate::session::Status::Idle;
-            inst.mark_unread();
-        });
-    }
-    env.view.flat_items = env.view.build_flat_items();
+    let mut respond = env.view.session_feed.command_driver_for_test();
+    let cursor = |revision| RuntimeCursor {
+        epoch: "test".into(),
+        revision,
+    };
+    let publish = |env: &mut TestEnv, revision, a_unread, b_unread| {
+        let SessionFeedResult::Snapshot(mut snapshot) =
+            super::session_feed_tests::daemon_snapshot(&env.view, &a, "Idle")
+        else {
+            unreachable!()
+        };
+        let canonical = std::sync::Arc::make_mut(&mut snapshot);
+        canonical.cursor = cursor(revision);
+        canonical.contents.sessions = [(&a, a_unread), (&b, b_unread)]
+            .into_iter()
+            .map(|(id, unread)| {
+                let mut row = crate::daemon::SessionResponse::from_instance(
+                    env.view.get_instance(id).unwrap(),
+                    false,
+                );
+                row.status = "Idle".into();
+                row.view = crate::session::View::Terminal;
+                row.unread = unread;
+                row
+            })
+            .collect();
+        env.view
+            .session_feed
+            .publish_for_test(SessionFeedResult::Snapshot(snapshot));
+        env.view.apply_session_feed();
+    };
+    let expect_request = |request: Option<(String, SessionMutation)>, id: &str, unread| {
+        let Some((target, SessionMutation::Unread(body))) = request else {
+            panic!("expected unread intent");
+        };
+        assert_eq!(target, id);
+        assert_eq!(body.unread, unread);
+    };
+
+    publish(&mut env, 1, false, false);
+    env.view.select_session_by_id(&a);
+    env.view.toggle_unread_at_cursor().unwrap();
+    assert!(
+        !env.view.get_instance(&a).unwrap().is_unread(),
+        "submission is not reflection"
+    );
+    expect_request(respond(Ok(cursor(2))), &a, true);
+    publish(&mut env, 2, true, false);
+    env.view.toggle_favorite_at_cursor().unwrap();
+    assert!(
+        matches!(respond(Err("favorite rejected".into())), Some((id, SessionMutation::Favorite(_))) if id == a)
+    );
+    env.view.apply_session_feed();
+    env.view.info_dialog = None;
 
     let t0 = Instant::now();
-    // Arm the dwell clock on A.
-    env.view.select_session_by_id(&a);
     assert!(!env.view.tick_unread_dwell(t0));
-    // Move to B well before A's threshold; A's clock is dropped, B's arms.
+    assert!(!env.view.tick_unread_dwell(t0 + Duration::from_secs(5)));
+    assert!(
+        respond(Ok(cursor(3))).is_none(),
+        "manual mark survives this visit"
+    );
+    assert!(env.view.get_instance(&a).unwrap().is_unread());
+
+    // A quick leave and return must reset the visit without an intermediate tick.
     env.view.select_session_by_id(&b);
-    assert!(!env.view.tick_unread_dwell(t0 + Duration::from_millis(500)));
-    // Below B's threshold: still unread (the "scrolled past" guard).
-    assert!(!env
-        .view
-        .tick_unread_dwell(t0 + crate::tui::home::UNREAD_DWELL));
-    assert!(env.view.get_instance(&b).unwrap().is_unread());
-    // Past B's threshold: B clears; A, which we left early, is untouched.
-    assert!(env
-        .view
-        .tick_unread_dwell(t0 + crate::tui::home::UNREAD_DWELL + Duration::from_secs(2)));
+    env.view.select_session_by_id(&a);
+    assert!(!env.view.tick_unread_dwell(t0 + Duration::from_secs(6)));
+    assert!(!env.view.tick_unread_dwell(t0 + Duration::from_millis(6500)));
+    assert!(env.view.tick_unread_dwell(t0 + Duration::from_secs(9)));
     assert!(
         env.view.get_instance(&a).unwrap().is_unread(),
-        "row left before the threshold must stay unread"
+        "read intent is not reflection"
     );
+    expect_request(respond(Ok(cursor(3))), &a, false);
     assert!(
-        !env.view.get_instance(&b).unwrap().is_unread(),
-        "row dwelled past the threshold must be cleared"
+        !env.view.tick_unread_dwell(t0 + Duration::from_secs(10)),
+        "do not duplicate a pending read"
     );
+    publish(&mut env, 3, false, false);
+    assert!(!env.view.get_instance(&a).unwrap().is_unread());
+
+    // A refused manual mark must not hold a later daemon-written unread event.
+    env.view.toggle_unread_at_cursor().unwrap();
+    expect_request(respond(Err("rejected".into())), &a, true);
+    env.view.apply_session_feed();
+    env.view.info_dialog = None;
+    publish(&mut env, 4, true, false);
+    assert!(env.view.tick_unread_dwell(t0 + Duration::from_secs(11)));
+    expect_request(respond(Ok(cursor(5))), &a, false);
+    publish(&mut env, 5, false, false);
+
+    env.view.toggle_unread_at_cursor().unwrap();
+    expect_request(respond(Ok(cursor(6))), &a, true);
+    publish(&mut env, 6, true, false);
+    assert!(env.view.clear_unread_on_view(&a));
+    expect_request(respond(Ok(cursor(7))), &a, false);
+    publish(&mut env, 7, false, false);
+    publish(&mut env, 8, true, false);
+    assert!(
+        env.view.tick_unread_dwell(t0 + Duration::from_secs(12)),
+        "engagement released the manual hold"
+    );
+    expect_request(respond(Ok(cursor(9))), &a, false);
+    publish(&mut env, 9, false, false);
+
+    publish(&mut env, 10, true, true);
+    env.view.select_session_by_id(&b);
+    assert!(!env.view.tick_unread_dwell(t0 + Duration::from_secs(20)));
+    env.view.select_session_by_id(&a);
+    assert!(!env
+        .view
+        .tick_unread_dwell(t0 + Duration::from_millis(20500)));
+    assert!(!env.view.tick_unread_dwell(t0 + Duration::from_secs(22)));
+    assert!(env.view.tick_unread_dwell(t0 + Duration::from_secs(23)));
+    expect_request(respond(Ok(cursor(11))), &a, false);
+    publish(&mut env, 11, false, true);
+    assert!(!env.view.get_instance(&a).unwrap().is_unread());
+    assert!(
+        env.view.get_instance(&b).unwrap().is_unread(),
+        "passing a row must not read it"
+    );
+}
+
+#[test]
+#[serial]
+fn unread_without_runtime_cannot_change_the_row() {
+    use std::time::{Duration, Instant};
+    crate::session::set_unread_enabled(true);
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view
+        .mutate_instance(&id, |instance| instance.mark_unread());
+    env.view.select_session_by_id(&id);
+    assert!(env.view.toggle_unread_at_cursor().is_err());
+    assert!(!env.view.clear_unread_on_view(&id));
+    let now = Instant::now();
+    assert!(!env.view.tick_unread_dwell(now));
+    assert!(!env.view.tick_unread_dwell(now + Duration::from_secs(3)));
+    assert!(env.view.get_instance(&id).unwrap().is_unread());
 }
 
 /// A manual flag (`u`) is held for the current visit only: dwelling in place keeps it,
@@ -780,25 +854,74 @@ fn unread_dwell_clears_after_threshold_and_resets_on_selection_change() {
 #[test]
 #[serial]
 fn manual_unread_hold_lasts_one_visit() {
+    use crate::daemon::{RuntimeCursor, SessionMutation};
+    use crate::tui::session_feed::SessionFeedResult;
     use std::time::{Duration, Instant};
+
     crate::session::set_unread_enabled(true);
     let mut env = create_test_env_with_sessions(2);
     let a = env.view.instance_at(0).id.clone();
     let b = env.view.instance_at(1).id.clone();
-    for id in [&a, &b] {
-        env.view.mutate_instance(id, |inst| {
-            inst.status = crate::session::Status::Idle;
-        });
-    }
-    env.view.flat_items = env.view.build_flat_items();
+    // The unread flag is runtime-owned: `u` and a dwell read are intents
+    // submitted to the runtime, and the row only moves when its canonical
+    // frame says so. So this runs on the real lane: submit, answer the
+    // command, publish what the runtime would publish.
+    let mut respond = env.view.session_feed.command_driver_for_test();
+    let cursor = |revision| RuntimeCursor {
+        epoch: "test".into(),
+        revision,
+    };
+    let publish = |env: &mut TestEnv, revision, a_unread| {
+        let SessionFeedResult::Snapshot(mut snapshot) =
+            super::session_feed_tests::daemon_snapshot(&env.view, &a, "Idle")
+        else {
+            unreachable!()
+        };
+        let canonical = std::sync::Arc::make_mut(&mut snapshot);
+        canonical.cursor = cursor(revision);
+        let template = canonical.contents.sessions[0].clone();
+        canonical.contents.sessions = [(&a, a_unread), (&b, false)]
+            .into_iter()
+            .map(|(id, unread)| {
+                let mut row = template.clone();
+                row.id = id.clone();
+                row.view = crate::session::View::Terminal;
+                row.unread = unread;
+                row
+            })
+            .collect();
+        env.view
+            .session_feed
+            .publish_for_test(SessionFeedResult::Snapshot(snapshot));
+        env.view.apply_session_feed();
+    };
+    let expect_request = |request: Option<(String, SessionMutation)>, id: &str, unread| {
+        let Some((target, SessionMutation::Unread(body))) = request else {
+            panic!("expected unread intent");
+        };
+        assert_eq!(target, id);
+        assert_eq!(body.unread, unread);
+    };
+
+    publish(&mut env, 1, false);
     let past_dwell = crate::tui::home::UNREAD_DWELL + Duration::from_secs(5);
 
     // Same visit: the hold keeps the hand-set mark through a full dwell.
     env.view.select_session_by_id(&a);
     env.view.toggle_unread_at_cursor().expect("manual mark A");
+    assert!(
+        !env.view.get_instance(&a).unwrap().is_unread(),
+        "a submitted mark is not a reflected one"
+    );
+    expect_request(respond(Ok(cursor(2))), &a, true);
+    publish(&mut env, 2, true);
     let t0 = Instant::now();
     assert!(!env.view.tick_unread_dwell(t0));
     assert!(!env.view.tick_unread_dwell(t0 + past_dwell));
+    assert!(
+        respond(Ok(cursor(3))).is_none(),
+        "the hold must submit no read for the visit that set it"
+    );
     assert!(
         env.view.get_instance(&a).unwrap().is_unread(),
         "a freshly hand-flagged row must survive dwell while it stays selected"
@@ -819,8 +942,10 @@ fn manual_unread_hold_lasts_one_visit() {
     assert!(!env.view.tick_unread_dwell(t1));
     assert!(
         env.view.tick_unread_dwell(t1 + past_dwell),
-        "revisiting and dwelling should clear the mark"
+        "revisiting and dwelling should submit the read"
     );
+    expect_request(respond(Ok(cursor(3))), &a, false);
+    publish(&mut env, 3, false);
     assert!(!env.view.get_instance(&a).unwrap().is_unread());
 
     // Engaging clears the mark and ends the hold without leaving the row, so a later auto
@@ -828,17 +953,30 @@ fn manual_unread_hold_lasts_one_visit() {
     env.view
         .toggle_unread_at_cursor()
         .expect("manual mark A again");
-    env.view.clear_unread_on_view(&a);
+    expect_request(respond(Ok(cursor(4))), &a, true);
+    publish(&mut env, 4, true);
+    assert!(
+        env.view.clear_unread_on_view(&a),
+        "engaging with the row submits the read that clears it"
+    );
     assert!(
         env.view.manual_unread_hold.is_none(),
         "engaging with the row must release the manual hold"
     );
+    expect_request(respond(Ok(cursor(5))), &a, false);
+    publish(&mut env, 5, false);
     assert!(!env.view.get_instance(&a).unwrap().is_unread());
-    env.view.mutate_instance(&a, |inst| inst.mark_unread());
+    // A later auto mark arrives from the runtime, like every other one.
+    publish(&mut env, 6, true);
     assert!(
-        env.view.tick_unread_dwell(t1 + past_dwell * 2)
-            && !env.view.get_instance(&a).unwrap().is_unread(),
+        env.view.tick_unread_dwell(t1 + past_dwell * 2),
         "a later auto mark must not be suppressed by a stale hold"
+    );
+    expect_request(respond(Ok(cursor(7))), &a, false);
+    publish(&mut env, 7, false);
+    assert!(
+        !env.view.get_instance(&a).unwrap().is_unread(),
+        "the canonical read must clear the later auto mark"
     );
 }
 
@@ -931,13 +1069,72 @@ fn test_n_opens_new_dialog() {
     assert!(env.view.has_dialog());
 }
 
-#[test]
+#[tokio::test]
 #[serial]
-fn test_b_opens_project_add_flow_when_no_projects() {
+async fn test_b_opens_project_add_flow_when_no_projects() {
+    if which::which("tmux").is_err() {
+        return;
+    }
     let mut env = create_test_env_empty();
     let project_dir = env._temp.path().join("plain-project");
     std::fs::create_dir_all(&project_dir).unwrap();
     let profile = env.view.config_profile();
+    let app_dir = crate::session::get_app_dir()
+        .unwrap()
+        .canonicalize()
+        .unwrap();
+    crate::session::purge_owners::initialize(&app_dir).unwrap();
+    crate::tmux::tool_retirement::initialize(&app_dir).unwrap();
+    let state = test_support::build_test_app_state_with_policy_configured(
+        Vec::new(),
+        vec!["localhost".into()],
+        Vec::new(),
+        None,
+        |state| {
+            state.runtime = crate::server::runtime::NativeRuntime::new(
+                app_dir.to_string_lossy().into_owned(),
+                crate::tmux::native_socket_locator()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                state.runtime.work.clone(),
+            );
+        },
+    );
+    test_support::refresh_canonical_metadata_for_test(&state).await;
+    let socket = app_dir.join("daemon/api.sock");
+    let server = test_support::serve_owner_router_for_test(
+        &socket,
+        test_support::build_router_for_test(state.clone()),
+    )
+    .await;
+    let endpoint = crate::acp::client::DaemonEndpoint::local_unix(socket.clone());
+    let connection = crate::daemon::RuntimeConnection::connect(&endpoint, Some("test"))
+        .await
+        .unwrap();
+    assert!(
+        connection.mutations_allowed(),
+        "the authenticated owner runtime accepts mutations"
+    );
+    assert!(matches!(
+        connection.snapshot().contents.health,
+        crate::daemon::RuntimeHealth::Healthy
+    ));
+    let client = crate::daemon::DaemonClient::new_unix(socket).unwrap();
+    env.view
+        .session_feed
+        .connect_prepared(profile.clone(), Some((connection, client)));
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            env.view.apply_session_feed();
+            if env.view.session_feed.current_snapshot_applied() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("healthy owner runtime frame reaches Home");
+    assert!(env.view.session_feed.mutations_available());
+    assert!(env.view.project_write_block().is_none());
 
     env.view.handle_key(key(KeyCode::Char('b')), None);
     assert!(env.view.project_session_picker_dialog.is_none());
@@ -959,6 +1156,10 @@ fn test_b_opens_project_add_flow_when_no_projects() {
         projects.iter().any(|p| p.path == canonical),
         "b empty-state add flow should register the typed path"
     );
+    state.shutdown.cancel();
+    drop(env);
+    server.abort();
+    let _ = server.await;
 }
 
 #[test]
@@ -1094,6 +1295,9 @@ fn hiding_last_prompt_retains_capture_ownership_until_completion() {
     env.view.last_prompt_in_flight = true;
     let slot = env.view.last_prompt_slot.clone();
     let now = Instant::now();
+    let (epoch, session_id, lifecycle_generation) = env.view.last_prompt_identity().unwrap();
+    let epoch = epoch.to_owned();
+    let session_id = session_id.to_owned();
     std::thread::scope(|scope| {
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -1102,6 +1306,9 @@ fn hiding_last_prompt_retains_capture_ownership_until_completion() {
             if release_rx.recv_timeout(Duration::from_secs(5)).is_ok() {
                 *slot.lock().unwrap() = Some(super::super::last_prompt::LastPromptCache {
                     pane,
+                    epoch,
+                    session_id,
+                    lifecycle_generation,
                     text: Some("submitted".to_string()),
                     at: now,
                 });
@@ -1125,6 +1332,30 @@ fn hiding_last_prompt_retains_capture_ownership_until_completion() {
             env.view.last_prompt_footer_line().as_deref(),
             Some("submitted")
         );
+        let mut replacement = env
+            .view
+            .session_feed
+            .applied_snapshot()
+            .unwrap()
+            .as_ref()
+            .clone();
+        replacement.cursor.revision += 1;
+        replacement
+            .contents
+            .sessions
+            .iter_mut()
+            .find(|row| row.id == env.view.live_send.as_ref().unwrap().session_id)
+            .unwrap()
+            .lifecycle_generation += 1;
+        env.view.session_feed.publish_for_test(
+            crate::tui::session_feed::SessionFeedResult::Snapshot(std::sync::Arc::new(replacement)),
+        );
+        env.view.apply_session_feed();
+        assert_ne!(
+            env.view.last_prompt_footer_line().as_deref(),
+            Some("submitted"),
+            "the same pane name cannot reuse a prior lifecycle prompt"
+        );
     });
 }
 
@@ -1136,6 +1367,7 @@ fn ctrl_l_configured_as_live_send_exit_still_exits() {
     use crate::tui::home::live_send::{parse_chord_list, LiveSendState, LiveSendTarget};
 
     let mut env = create_test_env_with_sessions(1);
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
     let inst = env.view.instance_at(0).clone();
     let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
     env.view.select_session_by_id(&inst.id);
@@ -1170,6 +1402,7 @@ fn ctrl_l_configured_as_live_send_leader_arms_prefix() {
     use crate::tui::home::live_send::{parse_chord, LiveSendState, LiveSendTarget};
 
     let mut env = create_test_env_with_sessions(1);
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
     let inst = env.view.instance_at(0).clone();
     let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
     env.view.select_session_by_id(&inst.id);

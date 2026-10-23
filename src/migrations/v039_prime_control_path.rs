@@ -15,16 +15,17 @@ fn pin(runtime: &mut Value, workers: &Path) -> Result<bool> {
     if object.contains_key("proof_path") {
         return Ok(false);
     }
-    let mut route: crate::process::prime::PrimeRuntime =
-        match serde_json::from_value(runtime.clone()) {
-            Ok(route) => route,
-            Err(error) => {
-                tracing::warn!(%error, "v039: preserving an unreadable Prime route");
-                return Ok(false);
-            }
-        };
+    let mut route: crate::process::prime::PrimeRuntime = match serde_json::from_value(
+        runtime.clone(),
+    ) {
+        Ok(route) => route,
+        Err(error) => {
+            tracing::warn!(target: "migrations.v039", %error, "v039: preserving an unreadable Prime route");
+            return Ok(false);
+        }
+    };
     if let Err(error) = route.attest_control_path(workers) {
-        tracing::warn!(directory = %route.directory.display(), %error, "v039: Prime control path remains unattested");
+        tracing::warn!(target: "migrations.v039", directory = %route.directory.display(), %error, "v039: Prime control path remains unattested");
     }
     runtime["proof_path"] = serde_json::to_value(route.proof_path)?;
     Ok(true)
@@ -35,7 +36,7 @@ fn read_json(path: &Path) -> Result<Option<Value>> {
     match serde_json::from_slice(&content) {
         Ok(value) => Ok(Some(value)),
         Err(error) => {
-            tracing::warn!(path = %path.display(), %error, "v039: preserving unreadable persisted data");
+            tracing::warn!(target: "migrations.v039", path = %path.display(), %error, "v039: preserving unreadable persisted data");
             Ok(None)
         }
     }

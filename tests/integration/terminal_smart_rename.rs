@@ -1,9 +1,5 @@
-//! End-to-end coverage for terminal (non-ACP) smart rename (issue #2222).
-//!
-//! Exercises the detached `run_terminal_rename` runner against a real tmux pane
-//! and a fake `claude` one-shot shim: a still-civ-named session is renamed from
-//! its first turn (user story 1), and a manually-named session is never touched
-//! (user story 2).
+//! Terminal smart rename and forced retry with deterministic tmux context
+//! and one-shot output.
 
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
@@ -15,7 +11,7 @@ use agent_of_empires::tmux;
 use serial_test::serial;
 use tempfile::TempDir;
 
-use crate::common::{setup_temp_home, tmux_socket};
+use crate::common::{disable_systemd_scopes, setup_temp_home, tmux_socket};
 
 fn tmux_available() -> bool {
     Command::new("tmux")
@@ -82,8 +78,9 @@ fn install_fake_claude(title: &str) -> FakeAgent {
     }
 }
 
-/// Seed one claude session into the (temp-home) default profile and return it.
+/// Seed a terminal session without depending on the host's user manager.
 fn seed_instance(title: &str) -> Instance {
+    disable_systemd_scopes(&agent_of_empires::session::get_app_dir().expect("app dir"));
     let storage = Storage::new_unwatched("default").expect("storage");
     let mut inst = Instance::new(title, "/tmp");
     inst.tool = "claude".to_string();
@@ -97,31 +94,30 @@ fn seed_instance(title: &str) -> Instance {
     seeded
 }
 
-/// Create a real tmux pane and type a line into it (no Enter, so it is not run
-/// as a shell command) so the capture has first-turn text.
+/// Print the task under a noninteractive shell and keep the pane alive.
 fn create_pane(name: &str, typed: &str) {
     let status = Command::new("tmux")
         .arg("-S")
         .arg(tmux_socket())
-        .args(["new-session", "-d", "-s", name])
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            name,
+            "/bin/sh",
+            "-c",
+            r#"printf '%s\n' "$1"; exec /bin/cat"#,
+            "sh",
+            typed,
+        ])
         .status()
         .expect("tmux new-session");
     assert!(status.success(), "tmux new-session failed for {name}");
-    let send = Command::new("tmux")
-        .arg("-S")
-        .arg(tmux_socket())
-        .args(["send-keys", "-t", name, "-l", typed])
-        .output()
-        .expect("tmux send-keys");
-    assert!(
-        send.status.success(),
-        "tmux send-keys failed for {name}: {}",
-        String::from_utf8_lossy(&send.stderr)
-    );
 
     let mut pane = String::new();
     let mut ready = false;
-    for _ in 0..40 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
         let output = Command::new("tmux")
             .arg("-S")
             .arg(tmux_socket())
@@ -130,11 +126,11 @@ fn create_pane(name: &str, typed: &str) {
             .output()
             .expect("tmux capture-pane");
         pane = String::from_utf8_lossy(&output.stdout).into_owned();
-        if output.status.success() && pane.contains(typed) {
+        if output.status.success() && pane.lines().any(|line| line.trim_end() == typed) {
             ready = true;
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::yield_now();
     }
     assert!(
         ready,

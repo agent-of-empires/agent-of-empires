@@ -5,8 +5,7 @@ use std::sync::Arc;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 
-use super::AppState;
-use super::{api_error, read_only_response};
+use super::{api_error, AppState};
 
 // --- Clone repository ---
 
@@ -20,9 +19,10 @@ pub struct CloneRepoBody {
     pub bare: bool,
 }
 
-/// Returns true if `url` looks like a git clone URL this endpoint accepts:
-/// https, http, git, ssh or file schemes, or scp-style (`user@host:path`).
-/// Anything else is rejected with a 400 before reaching `git clone`.
+/// Returns true if `url` looks like a git clone URL accepted by this
+/// endpoint. Recognised forms: https, http, git, ssh, file schemes, and
+/// scp-style (`user@host:path`). Anything else is rejected with a 400
+/// before reaching `git clone`.
 fn looks_like_git_url(url: &str) -> bool {
     url.starts_with("https://")
         || url.starts_with("http://")
@@ -32,8 +32,8 @@ fn looks_like_git_url(url: &str) -> bool {
         || (url.contains('@') && url.contains(':') && !url.contains(' '))
 }
 
-/// Expand a leading `~` to the user's home directory, or leave the path alone
-/// when no home dir is available.
+/// Expand a leading `~` or `~/` to the user's home directory.
+/// Leaves the path unchanged when no home dir is available.
 fn expand_tilde(path: &str) -> std::path::PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
@@ -47,7 +47,13 @@ fn expand_tilde(path: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(path)
 }
 
-/// Extract a repository name from an HTTPS, SSH or scp-style git URL.
+/// Extract a repository name from a git URL.
+///
+/// Handles HTTPS, SSH, and scp-style URLs:
+///   https://github.com/user/repo.git       -> repo
+///   git@github.com:user/repo.git           -> repo
+///   ssh://git@host/user/repo               -> repo
+///   ssh://git@host:2222/user/repo.git      -> repo
 fn repo_name_from_url(url: &str) -> Option<String> {
     // Scheme-based URLs take the last path segment; scp-style splits on ':'
     // and takes the last segment of the path.
@@ -72,7 +78,7 @@ pub async fn clone_repo(
     body: Result<Json<CloneRepoBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return read_only_response();
+        return super::read_only_response();
     }
     // Cloning writes to $HOME and fetches from the network; the CityHall
     // "Clone URL" action is hidden, so close the endpoint too.
@@ -86,13 +92,11 @@ pub async fn clone_repo(
 
     let url = body.url.trim().to_string();
     if url.is_empty() {
-        return (
+        return api_error(
             StatusCode::BAD_REQUEST,
-            Json(
-                serde_json::json!({"error": "validation_failed", "message": "URL cannot be empty"}),
-            ),
-        )
-            .into_response();
+            "validation_failed",
+            "URL cannot be empty",
+        );
     }
 
     if !looks_like_git_url(&url) {
@@ -111,6 +115,7 @@ pub async fn clone_repo(
         );
     }
 
+    // Resolve destination path
     let destination = if let Some(ref dest) = body.destination {
         let dest = dest.trim();
         if dest.is_empty() {
@@ -207,8 +212,9 @@ pub async fn clone_repo(
 #[derive(Deserialize)]
 pub struct BranchesQuery {
     pub path: String,
-    /// Include remote-only branches, so the wizard's base-branch picker can
-    /// base a worktree off a teammate's not-yet-fetched branch (#948).
+    /// Include remote-only branches alongside local ones. Used by the
+    /// new-session wizard's base-branch picker so users can base a new
+    /// worktree off a teammate's not-yet-fetched branch. See #948.
     #[serde(default)]
     pub include_remote: bool,
 }
@@ -217,8 +223,8 @@ pub struct BranchesQuery {
 pub struct BranchInfo {
     pub name: String,
     pub is_current: bool,
-    /// Set when the branch only exists on the remote. Omitted on responses
-    /// where every branch is local.
+    /// Set when the branch only exists on the remote (no local copy).
+    /// Omitted on responses where every branch is local.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub remote_only: bool,
 }
@@ -336,10 +342,11 @@ pub struct IsRepoQuery {
 }
 
 /// Reports whether `path` is a git repository, using the same
-/// `GitWorktree::is_git_repo` gate the session builder enforces, so the wizard
-/// can disable the worktree toggle for a plain folder. A transient failure
-/// surfaces as a non-200, so the client can stay optimistic rather than
-/// misreport a real repo.
+/// `GitWorktree::is_git_repo` gate the session builder enforces (`builder.rs`
+/// single-worktree path). The new-session wizard probes this to disable the
+/// worktree toggle for a plain folder. Returns 200 `{ "is_git_repo": bool }`;
+/// a transient failure surfaces as a non-200 so the client can stay optimistic
+/// rather than misreport a real repo as a non-repo.
 pub async fn is_git_repo(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<IsRepoQuery>,
@@ -394,10 +401,10 @@ mod tests {
         }
     }
 
-    /// Pins `$HOME` so the read inside `expand_tilde` cannot see a value
-    /// another test set. `isolate_home` holds the process-global env lock for
-    /// the guard's lifetime; `#[serial]` alone does not exclude the writers that
-    /// go through the guard.
+    /// Pins `$HOME` so the read inside `expand_tilde` cannot see a value another
+    /// test set. `isolate_home` holds the process-global env lock for the guard's
+    /// lifetime and restores `$HOME` on Drop, before the tempdir is deleted;
+    /// `#[serial]` alone does not exclude the writers that go through the guard.
     #[test]
     #[serial_test::serial]
     fn expand_tilde_expands_only_home_prefixes() {

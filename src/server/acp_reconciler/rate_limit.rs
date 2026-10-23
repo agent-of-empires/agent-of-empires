@@ -106,6 +106,15 @@ pub(crate) async fn install_rate_limit_continuation(
     id: &str,
     _submission: tokio::sync::OwnedMutexGuard<()>,
 ) -> ContinuationOutcome {
+    if state
+        .instances
+        .read()
+        .await
+        .iter()
+        .any(|row| row.id == id && row.terminal_handoff.is_some())
+    {
+        return ContinuationOutcome::Stands;
+    }
     let Some(interrupted) = query_store(
         &state.acp_event_store,
         id,
