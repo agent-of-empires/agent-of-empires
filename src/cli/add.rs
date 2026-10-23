@@ -628,6 +628,9 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         crate::session::View::Terminal
     };
 
+    // Set when the adapter isn't found but an on_create hook may install it, which holds only if
+    // the hook still runs once trust is decided.
+    let mut adapter_awaits_hooks: Option<String> = None;
     if instance.is_structured() {
         let (mut spec, spec_from_registry) = match registry.get(&agent_name) {
             Some(spec) => (spec.clone(), true),
@@ -680,12 +683,16 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             || containers::get_container_runtime().is_available(),
             // Trust is asked later, so without --trust-hooks the repository's hooks may still run.
             || {
-                crate::session::builder::structured::create_hooks_apply(
+                let apply = crate::session::builder::structured::create_hooks_apply(
                     &crate::session::config::profile_config::resolve_config_or_warn(profile).hooks,
                     &original_project_path,
                     args.scratch,
                     args.trust_hooks.then_some(true),
-                )
+                );
+                if apply {
+                    adapter_awaits_hooks = Some(spec.command.clone());
+                }
+                apply
             },
         ) {
             let hint = crate::acp::install_hints::install_hint_for(&spec.command)
@@ -890,6 +897,8 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 }
             }
         };
+
+        refuse_adapter_without_hooks(adapter_awaits_hooks.as_deref(), resolved_hooks.as_ref())?;
 
         if let Some(resolved) = resolved_hooks {
             let commands = &resolved.hooks().on_create;
@@ -1327,6 +1336,28 @@ fn cleanup_partial_session(
             let _ = std::fs::remove_dir_all(scratch);
         }
     }
+}
+
+/// Once trust is decided, refuse the adapter the first check let through for an `on_create`
+/// hook if declining trust left no such hook to run.
+fn refuse_adapter_without_hooks(
+    adapter_awaits_hooks: Option<&str>,
+    resolved: Option<&repo_config::ResolvedHooks>,
+) -> Result<()> {
+    let Some(command) = adapter_awaits_hooks else {
+        return Ok(());
+    };
+    if resolved.is_some_and(|resolved| !resolved.hooks().on_create.is_empty()) {
+        return Ok(());
+    }
+    let hint = crate::acp::install_hints::install_hint_for(command)
+        .unwrap_or("install via your package manager and re-run");
+    bail!(
+        "ACP adapter `{command}` is not installed or not on $PATH, and no on_create hook will \
+         run to install it (the repository's hooks weren't trusted).\n\
+         Install: {hint}\n\
+         Or re-run with --trust-hooks, or use the terminal view: drop --agent / --structured-view."
+    )
 }
 
 /// Whether a structured `aoe add` must refuse, or fall back, for its adapter. A sandboxed
@@ -1929,6 +1960,36 @@ mod tests {
                 Some(Commands::Add(args)) => (profile, *args),
                 _ => panic!("expected an add invocation"),
             }
+        }
+
+        /// After trust is decided, an adapter the first check let through for an on_create
+        /// hook is refused when no such hook will run.
+        #[test]
+        #[serial]
+        fn declined_trust_refuses_an_adapter_waiting_on_hooks() {
+            use crate::session::config::repo_config::ResolvedHooks;
+            let _home = crate::session::test_support::isolate_app_dir();
+            let repo = tempfile::tempdir().unwrap();
+            let installing = ResolvedHooks::with_repo(
+                "default",
+                repo.path(),
+                crate::session::HooksConfig {
+                    on_create: vec!["npm install".into()],
+                    ..Default::default()
+                },
+            );
+            assert!(installing.is_some());
+            let refuse = super::super::refuse_adapter_without_hooks;
+            assert!(refuse(None, None).is_ok(), "nothing waited on hooks");
+            assert!(
+                refuse(Some("my-acp"), installing.as_ref()).is_ok(),
+                "a hook will run"
+            );
+            let refused = refuse(Some("my-acp"), None).unwrap_err().to_string();
+            assert!(
+                refused.contains("`my-acp`") && refused.contains("--trust-hooks"),
+                "{refused}"
+            );
         }
 
         /// `aoe add` skips the host adapter check only for a sandbox the runtime can start,
