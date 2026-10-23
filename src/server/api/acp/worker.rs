@@ -1646,12 +1646,14 @@ mod tests {
         let mut inst = crate::session::Instance::new("claude", project.path().to_str().unwrap());
         inst.view = crate::session::View::Structured;
         inst.status = crate::session::Status::Idle;
+        inst.source_profile = profile.to_string();
         inst.agent_name = Some("claude".to_string());
         inst.acp_effort = Some("high".to_string());
         let id = inst.id.clone();
         support::seed_instances_on_disk_for_test(profile, vec![inst.clone()]);
         let state =
             support::build_test_app_state_with_launcher(vec![inst], support::succeeding_launcher());
+        support::refresh_canonical_metadata_for_test(&state).await;
         state.acp_supervisor.test_insert_worker(&id).await;
         let switch = || async {
             switch_acp_agent(
@@ -1711,6 +1713,8 @@ mod tests {
         assert_eq!(stored[0].acp_effort.as_deref(), Some("high"));
 
         drop(failure);
+        // The failed commit left the store degraded until the next reload.
+        support::accept_runtime_read_cache_for_test(&state).await;
         let resp = switch().await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(switched(), 1);

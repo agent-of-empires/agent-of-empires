@@ -458,12 +458,14 @@ mod tests {
         let mut inst = crate::session::Instance::new("t", project.path().to_str().unwrap());
         inst.view = crate::session::View::Structured;
         inst.status = crate::session::Status::Idle;
+        inst.source_profile = "default".to_string();
         inst.agent_name = Some("claude".to_string());
         inst.agent_model = Some("old-model".to_string());
         let id = inst.id.clone();
         support::seed_instances_on_disk_for_test("default", vec![inst.clone()]);
         let state =
             support::build_test_app_state_with_launcher(vec![inst], support::succeeding_launcher());
+        support::refresh_canonical_metadata_for_test(&state).await;
         let pick = || async {
             acp_set_config_option(
                 State(state.clone()),

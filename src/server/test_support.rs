@@ -680,7 +680,7 @@ pub(crate) fn succeeding_launcher() -> crate::acp::supervisor::Launcher {
 /// Fails every `sessions.json` write while the guard lives, leaving rows loadable.
 /// The failpoint is process-wide, so the test must be serial.
 #[cfg(test)]
-pub(crate) fn fail_session_writes_for_test(profile: &str) -> crate::session::storage::WriteFailureGuard {
+pub(crate) fn fail_session_writes_for_test(profile: &str) -> impl Drop {
     Storage::new_unwatched(profile)
         .expect("storage")
         .fail_writes_for_test()
