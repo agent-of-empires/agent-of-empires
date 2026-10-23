@@ -358,6 +358,18 @@ describe("SessionWizard hooks trust", () => {
 });
 
 describe("SessionWizard rows", () => {
+  // resolved.rs asserts text-primary on the group's surface-950 and text-on-brand on brand-600.
+  it("labels an inactive View segment in the asserted readable token", async () => {
+    renderWizard();
+    const terminal = await screen.findByRole("radio", { name: "Terminal view" });
+    expect(terminal.getAttribute("aria-checked")).toBe("false");
+    expect(terminal.className).toContain("text-text-primary");
+    expect(terminal.className).not.toContain("text-text-secondary");
+    const structured = screen.getByRole("radio", { name: "Structured view" });
+    expect(structured.className).toContain("bg-brand-600");
+    expect(structured.className).toContain("text-text-on-brand");
+  });
+
   it.each([
     ["sandbox_enabled", "Sandbox unavailable: settl runs on the host only"],
     ["worktree_enabled", "Worktree unavailable: settl runs on the host only"],

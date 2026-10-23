@@ -183,7 +183,7 @@ export function SegmentedRow<T extends string>({
               // Re-picking the selected option must not overwrite a choice the row is overriding.
               onClick={() => option.value !== value && onChange(option.value)}
               className={`min-h-8 rounded px-2 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
-                selected ? "bg-surface-700 text-text-primary" : "text-text-secondary hover:text-text-primary"
+                selected ? "bg-brand-600 text-text-on-brand" : "text-text-primary hover:bg-surface-800"
               }`}
             >
               {option.label}
