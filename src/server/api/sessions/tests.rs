@@ -8042,6 +8042,15 @@ async fn post_create(
     state: &std::sync::Arc<AppState>,
     body: serde_json::Value,
 ) -> (axum::http::StatusCode, serde_json::Value) {
+    let (status, bytes) = post_create_bytes(state, body).await;
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+/// [`post_create`] without assuming a JSON body.
+async fn post_create_bytes(
+    state: &std::sync::Arc<AppState>,
+    body: serde_json::Value,
+) -> (axum::http::StatusCode, axum::body::Bytes) {
     use axum::response::IntoResponse;
     let response = create_session(
         axum::extract::State(state.clone()),
@@ -8055,7 +8064,7 @@ async fn post_create(
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap())
+    (status, bytes)
 }
 
 /// [`post_create`] plus the `aoe-error-code` header, which is the only thing
@@ -8091,6 +8100,7 @@ async fn scratch_create_resolves_profile_before_publication_and_purge() {
     use axum::response::IntoResponse;
 
     let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
     crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     crate::session::config::update_config(|config| {
@@ -8215,6 +8225,7 @@ async fn a_dropped_create_finishes_and_its_retry_returns_the_same_session() {
     use crate::server::test_support as support;
     for native_origin in [false, true] {
         let _home = crate::session::test_support::isolate_app_dir();
+        let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
         crate::session::config::update_app_state(|state| {
             state.has_acknowledged_agent_hooks = true;
         })
@@ -8349,6 +8360,7 @@ async fn a_dropped_create_finishes_and_its_retry_returns_the_same_session() {
 async fn a_failed_create_is_replayed_to_a_same_key_retry() {
     use crate::server::test_support as support;
     let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
     crate::session::config::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
     })
@@ -8382,6 +8394,7 @@ async fn a_failed_create_is_replayed_to_a_same_key_retry() {
 async fn a_full_failure_map_replays_its_oldest_key_and_refuses_new_ones() {
     use crate::server::test_support as support;
     let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
     crate::session::config::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
     })
@@ -8449,6 +8462,7 @@ async fn a_full_failure_map_replays_its_oldest_key_and_refuses_new_ones() {
 async fn a_retry_across_a_daemon_restart_never_reruns_a_failed_create() {
     use crate::server::test_support as support;
     let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
     crate::session::config::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
     })
@@ -8508,6 +8522,7 @@ async fn a_retry_across_a_daemon_restart_never_reruns_a_failed_create() {
 async fn a_retry_across_a_restart_is_fenced_before_profile_validation() {
     use crate::server::test_support as support;
     let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
     crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     crate::session::config::update_app_state(|state| {
@@ -8571,6 +8586,7 @@ async fn a_retry_across_a_restart_is_fenced_before_profile_validation() {
 async fn a_trust_changed_refusal_does_not_freeze_its_idempotency_key() {
     use crate::server::test_support as support;
     let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
     crate::session::config::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
     })
@@ -8633,6 +8649,7 @@ async fn a_trust_changed_refusal_does_not_freeze_its_idempotency_key() {
 async fn a_cancelled_create_does_not_freeze_its_idempotency_key() {
     use crate::server::test_support as support;
     let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
     crate::session::config::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
     })
@@ -9427,7 +9444,9 @@ async fn create_refuses_a_structured_session_without_its_adapter() {
         serde_json::json!({ "view": "terminal" }),
     ];
     for extra in exempt {
-        let (_, body) = post_create(&state, base(extra.clone())).await;
+        // Past the check the create may fail later with no JSON body; only the code matters here.
+        let (_, bytes) = post_create_bytes(&state, base(extra.clone())).await;
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
         assert_ne!(body["error"], "acp_adapter_missing", "{extra}: {body}");
     }
 }
