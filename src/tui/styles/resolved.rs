@@ -620,6 +620,13 @@ mod tests {
             );
             // Status error text, and the session notices strip's body text, sit on
             // these solid surfaces.
+            // The wizard's inactive View segments: labels on the group's surface-950. The selected
+            // one is text-on-brand on brand-600, asserted above.
+            let segment = contrast_ratio(var("--color-text-primary"), var("--color-surface-950"));
+            assert!(
+                segment >= TEXT_CONTRAST_RATIO,
+                "{name}: --color-text-primary on --color-surface-950 is {segment:.2}, below body-text AA"
+            );
             for fg in [
                 "--color-status-error-text",
                 "--color-text-primary",
