@@ -46,21 +46,24 @@ async function mockApis(
   options: { rowTag?: "none" | "auto" | "profile" | "sandbox" | "branch" } = {},
 ) {
   let rowTag = options.rowTag ?? "branch";
-  await mockStaticApis(page);
+  await mockStaticApis(page, { profiles: [{ name: "default", is_default: true }] });
   await page.route("**/api/settings**", (r) => {
     const pathname = new URL(r.request().url()).pathname;
     if (pathname === "/api/settings/schema") return r.fulfill({ json: ROW_TAG_SCHEMA });
-    if (pathname === "/api/settings") return r.fulfill({ json: { session: { row_tag: rowTag } } });
+    if (pathname === "/api/settings") {
+      if (r.request().method() === "GET") return r.fulfill({ json: { session: { row_tag: rowTag } } });
+      if (r.request().method() === "PATCH") {
+        const body = r.request().postDataJSON() as { session?: { row_tag?: typeof rowTag } };
+        rowTag = body.session?.row_tag ?? rowTag;
+        return r.fulfill({ json: { ok: true } });
+      }
+    }
     return r.fulfill({ status: 404 });
-  });
-  await page.route("**/api/profiles/*/settings", async (r) => {
-    const body = r.request().postDataJSON() as { session?: { row_tag?: typeof rowTag } };
-    rowTag = body.session?.row_tag ?? rowTag;
-    return r.fulfill({ json: { ok: true } });
   });
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
     return r.fulfill({
+      headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
       json: {
         sessions: sessions.map((s) => sessionResponse({ ...s })),
         workspace_ordering: [],
@@ -177,15 +180,34 @@ test.describe("Sidebar multi-session (#956)", () => {
     await expect(row.getByTestId("sidebar-session-row-tag")).toHaveText("[a]");
 
     await page.goto("/settings/session");
-    await expect(page.getByText("Row Tag", { exact: true })).toBeVisible();
-    const refreshedSettings = page.waitForResponse((response) => {
+    const rowTagSelect = page
+      .locator("label", { hasText: /^Row Tag$/ })
+      .locator("..")
+      .getByRole("combobox");
+    await expect(rowTagSelect).toHaveValue("branch");
+    const savedSettings = page.waitForResponse((response) => {
       const request = response.request();
-      return request.method() === "GET" && new URL(response.url()).pathname === "/api/settings";
+      const url = new URL(response.url());
+      return (
+        request.method() === "PATCH" &&
+        url.pathname === "/api/settings" &&
+        url.searchParams.get("profile") === "default"
+      );
     });
-    await page.getByRole("combobox").last().selectOption("none");
+    const refreshedSettings = page.waitForResponse(async (response) => {
+      const url = new URL(response.url());
+      if (response.request().method() !== "GET" || url.pathname !== "/api/settings" || url.search) return false;
+      const settings = (await response.json()) as { session?: { row_tag?: string } };
+      return settings.session?.row_tag === "none";
+    });
+    await rowTagSelect.selectOption("none");
+    const saved = await savedSettings;
+    expect(saved.ok()).toBe(true);
+    expect(saved.request().postDataJSON()).toEqual({ session: { row_tag: "none" } });
     await refreshedSettings;
     await page.getByRole("button", { name: "Go to dashboard" }).click();
-    await expect(page.getByRole("link", { name: /Italians/i }).getByTestId("sidebar-session-row-tag")).toHaveCount(0);
+    await expect(row).toBeVisible();
+    await expect(row.getByTestId("sidebar-session-row-tag")).toHaveCount(0);
   });
 
   test("project group context menu opens from the keyboard and stores alias and background color", async ({ page }) => {

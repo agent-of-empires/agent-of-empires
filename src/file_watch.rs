@@ -41,7 +41,7 @@ pub struct FileEvent {
     pub source: EventSource,
 }
 
-/// Within a debounce window `Upserted` wins over `Removed`.
+/// Debounce preserves `Upserted` over `Removed` and `Local` over `Kernel`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileEventKind {
     Upserted,
@@ -886,7 +886,7 @@ fn deliver(sink: &mpsc::Sender<FileEvent>, ev: FileEvent, id: SubscriptionId) {
     }
 }
 
-/// Older slots become stale and self-evict via the `fire_at` check.
+/// New deadlines invalidate older slots.
 fn arm_debounce(svc: &Arc<FileWatchService>, id: SubscriptionId, ev: FileEvent, window: Duration) {
     let fire_at = Instant::now() + window;
     let key = (id, ev.path.clone());
@@ -898,8 +898,11 @@ fn arm_debounce(svc: &Arc<FileWatchService>, id: SubscriptionId, ev: FileEvent, 
             pending: ev.clone(),
             fire_at,
         });
-    if entry.pending.kind == FileEventKind::Removed && ev.kind == FileEventKind::Upserted {
-        entry.pending = ev;
+    if ev.kind == FileEventKind::Upserted {
+        entry.pending.kind = FileEventKind::Upserted;
+    }
+    if ev.source == EventSource::Local {
+        entry.pending.source = EventSource::Local;
     }
     entry.fire_at = fire_at;
     inner.slots.entry(fire_at).or_default().push(key);
@@ -1297,6 +1300,52 @@ mod tests {
             ];
             received.sort();
             assert_eq!(received, paths);
+        }
+    }
+
+    #[test]
+    fn debounce_local_origin_survives_kernel_events_in_either_order() {
+        for kernel_kind in [FileEventKind::Upserted, FileEventKind::Removed] {
+            for local_first in [false, true] {
+                let svc = FileWatchService::noop();
+                let dir = PathBuf::from("/watched");
+                let target = dir.join("coalesced");
+                let id = SubscriptionId(1);
+                let (tx, mut rx) = mpsc::channel(2);
+                let spec = WatchSpec {
+                    debounce: Some(Duration::ZERO),
+                    ..spec(&dir, FileMatcher::Exact(target.clone()))
+                };
+                svc.inner
+                    .lock()
+                    .unwrap()
+                    .subscriptions
+                    .insert(id, Subscription { spec, sink: tx });
+                let local = (FileEventKind::Upserted, EventSource::Local);
+                let kernel = (kernel_kind, EventSource::Kernel);
+                let events = if local_first {
+                    [local, kernel]
+                } else {
+                    [kernel, local]
+                };
+                for (kind, source) in events {
+                    dispatch_path(&svc, &target, kind, source);
+                }
+                fire_due(&svc);
+
+                let delivered = rx.try_recv().expect("coalesced event delivered");
+                assert_eq!(delivered.path, target);
+                assert_eq!(delivered.kind, FileEventKind::Upserted);
+                assert_eq!(
+                    delivered.source,
+                    EventSource::Local,
+                    "kernel_kind={kernel_kind:?}, local_first={local_first}"
+                );
+                assert!(matches!(
+                    rx.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ));
+            }
         }
     }
 

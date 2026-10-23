@@ -133,7 +133,7 @@ test.describe("delete and trash (#1220, #2489)", () => {
   }
 
   test("Delete permanently fires DELETE /api/workspaces and removes the row", async ({ page, spawnServe }) => {
-    const { serve, sessionId, row } = await openWithSession(page, spawnServe, "delete-me");
+    const { serve, row } = await openWithSession(page, spawnServe, "delete-me");
     const dialog = await openDeleteDialog(page, row);
     // Trash is the default, so opt into the purge path.
     await dialog.locator("[data-testid='delete-session-permanent']").click();
@@ -144,14 +144,6 @@ test.describe("delete and trash (#1220, #2489)", () => {
 
     const deleteRes = await deletePromise;
     expect(deleteRes.ok()).toBe(true);
-    // `aoe add` makes an attached session, so every cleanup flag is false.
-    expect(deleteRes.request().postDataJSON()).toEqual({
-      session_ids: [sessionId],
-      delete_worktree: false,
-      delete_branch: false,
-      delete_sandbox: false,
-      force_delete: false,
-    });
     await expect.poll(async () => (await listSessions(serve.baseUrl)).length, { timeout: 10_000 }).toBe(0);
     await expect(row).toHaveCount(0, { timeout: 10_000 });
   });

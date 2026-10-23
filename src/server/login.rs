@@ -817,11 +817,18 @@ pub(super) async fn issue_session(
 /// POST /api/login
 pub async fn login_handler(
     State(state): State<Arc<AppState>>,
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    peer: super::peer::ConnectionPeer,
     headers: axum::http::HeaderMap,
     login_body: Result<Json<LoginRequest>, axum::extract::rejection::JsonRejection>,
 ) -> axum::response::Response {
-    let client_ip = resolve_client_ip(addr, &headers);
+    let super::peer::ConnectionPeer::Tcp(addr) = peer else {
+        return (
+            StatusCode::CONFLICT,
+            "Local owner authentication does not use browser login",
+        )
+            .into_response();
+    };
+    let client_ip = resolve_client_ip(addr, &headers, state.behind_tunnel);
 
     if !state.login_manager.is_enabled() {
         return (
@@ -835,7 +842,11 @@ pub async fn login_handler(
     }
 
     // Rate limit check
-    if let Some(remaining) = state.rate_limiter.check_locked(client_ip).await {
+    if let Some(remaining) = state
+        .rate_limiter
+        .check_locked(client_ip, super::rate_limit::AuthBudget::Passphrase)
+        .await
+    {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [("Retry-After", remaining.to_string())],
@@ -884,11 +895,17 @@ pub async fn login_handler(
     );
 
     if state.login_manager.verify_passphrase(&login_req.passphrase) {
-        state.rate_limiter.record_success(client_ip).await;
+        state
+            .rate_limiter
+            .record_success(client_ip, super::rate_limit::AuthBudget::Passphrase)
+            .await;
         tracing::info!(target: "auth.passphrase", ip = %client_ip, "passphrase login successful");
         issue_session(&state, &binding_bytes, client_ip, &headers).await
     } else {
-        let locked = state.rate_limiter.record_failure(client_ip).await;
+        let locked = state
+            .rate_limiter
+            .record_failure(client_ip, super::rate_limit::AuthBudget::Passphrase)
+            .await;
         tracing::warn!(
             target: "auth.passphrase",
             ip = %client_ip,
@@ -916,10 +933,17 @@ pub struct ElevateRequest {
 /// POST /api/login/elevate
 pub async fn elevate_handler(
     State(state): State<Arc<AppState>>,
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    peer: super::peer::ConnectionPeer,
     request: axum::extract::Request,
 ) -> axum::response::Response {
-    let client_ip = resolve_client_ip(addr, request.headers());
+    let super::peer::ConnectionPeer::Tcp(addr) = peer else {
+        return (
+            StatusCode::CONFLICT,
+            "Local owner authentication does not use browser elevation",
+        )
+            .into_response();
+    };
+    let client_ip = resolve_client_ip(addr, request.headers(), state.behind_tunnel);
 
     if !state.login_manager.is_enabled() {
         return (
@@ -960,7 +984,11 @@ pub async fn elevate_handler(
             .into_response();
     }
 
-    if let Some(remaining) = state.rate_limiter.check_locked(client_ip).await {
+    if let Some(remaining) = state
+        .rate_limiter
+        .check_locked(client_ip, super::rate_limit::AuthBudget::Passphrase)
+        .await
+    {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [("Retry-After", remaining.to_string())],
@@ -991,7 +1019,10 @@ pub async fn elevate_handler(
         .login_manager
         .verify_passphrase(&elevate_req.passphrase)
     {
-        let ip_locked = state.rate_limiter.record_failure(client_ip).await;
+        let ip_locked = state
+            .rate_limiter
+            .record_failure(client_ip, super::rate_limit::AuthBudget::Passphrase)
+            .await;
         let session_locked = state
             .login_manager
             .record_elevation_failure(&session_id)
@@ -1014,7 +1045,10 @@ pub async fn elevate_handler(
             .into_response();
     }
 
-    state.rate_limiter.record_success(client_ip).await;
+    state
+        .rate_limiter
+        .record_success(client_ip, super::rate_limit::AuthBudget::Passphrase)
+        .await;
     let elevated = state.login_manager.elevate_session(&session_id).await;
     if !elevated {
         return (
@@ -1133,6 +1167,17 @@ pub async fn login_status_handler(
     axum::extract::Query(query): axum::extract::Query<LoginStatusQuery>,
     request: axum::extract::Request,
 ) -> Json<serde_json::Value> {
+    if matches!(
+        request
+            .extensions()
+            .get::<super::auth::LocalAuthorization>(),
+        Some(super::auth::LocalAuthorization::UnixOwner(_))
+    ) {
+        return Json(serde_json::json!({
+            "required": false, "authenticated": true, "elevated": true,
+            "elevated_until_secs": null, "principal": "local_owner"
+        }));
+    }
     let required = state.login_manager.is_enabled();
 
     if !required {

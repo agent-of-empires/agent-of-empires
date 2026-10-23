@@ -1,13 +1,21 @@
-//! Per-profile disk watches.
+//! Per-profile disk watches: wiring them up, tearing them down, and the
+//! reload the watcher consumer drives.
 
 use crate::file_watch::{FileMatcher, WatchSpec};
 use std::sync::Arc;
 
-use super::reload::{load_all_instances, reload_state_instances_from_disk};
+#[cfg(test)]
+use super::reload::load_all_profiles;
+use super::reload::reload_state_instances_from_disk;
 use super::state::{AppState, DiskWatchEntry, StatusSource};
 use super::structured_repair::live_structured_worker_records;
 
-/// Build a per-profile disk-watch entry.
+/// Build a per-profile disk-watch entry: register a `subscribe_channel`
+/// against `<profile_dir>/{sessions,groups}.json` and spawn a forwarder
+/// task that drains the receiver into `state.disk_changed`. Returns
+/// `None` when the profile dir cannot be resolved or `subscribe_channel`
+/// fails; both cases are logged. Polling stays canonical, so a `None`
+/// here degrades propagation to the 2s tick rather than failing closed.
 pub(super) async fn build_disk_watch_entry(
     state: &Arc<AppState>,
     profile: &str,
@@ -81,8 +89,10 @@ pub(super) async fn build_disk_watch_entry(
     })
 }
 
-/// Test-only barrier installed inside `build_disk_watch_entry` to deterministically pin a
-/// building task at a known point so a concurrent same-profile remove can run against it.
+/// Test-only barrier installed inside `build_disk_watch_entry` to
+/// deterministically pin a building task at a known point so a
+/// concurrent same-profile remove can run against it. Not compiled
+/// into production builds.
 #[cfg(any(test, debug_assertions))]
 pub(crate) struct DiskWatchBuildBarrier {
     pub(crate) entered: tokio::sync::Notify,
@@ -99,7 +109,9 @@ pub(crate) fn disk_watch_build_barrier(
     BARRIER.get_or_init(|| std::sync::Mutex::new(None))
 }
 
-/// RAII guard for the test barrier slot.
+/// RAII guard for the test barrier slot: installs on construction and
+/// clears unconditionally on drop, so a panicking test cannot leave
+/// the slot armed for subsequent tests in the same process.
 #[cfg(test)]
 pub(crate) struct DiskWatchBuildBarrierGuard;
 
@@ -118,15 +130,25 @@ impl Drop for DiskWatchBuildBarrierGuard {
     }
 }
 
-/// Drop the subscription handle FIRST so the dispatcher stops queuing events on this id,
-/// then abort the forwarder; aborting first would race a buffered `try_send`.
+/// Drop the subscription handle FIRST so the dispatcher stops queuing
+/// events on this id, then abort the forwarder; aborting first would
+/// race a buffered `try_send`. Centralized so every teardown path keeps
+/// the same canonical order.
 pub(super) fn drop_disk_watch_entry(entry: DiskWatchEntry) {
     let DiskWatchEntry { handle, forwarder } = entry;
     drop(handle);
     forwarder.abort();
 }
 
-/// Install a disk-watch subscription for `profile` under one critical section.
+/// Install a disk-watch subscription for `profile` under one critical
+/// section. If a prior entry exists for the same name, it is replaced
+/// (drop handle, abort forwarder, then install the new entry).
+///
+/// Holding `disk_watch_handles` across `build_disk_watch_entry` is the
+/// linearisation point: a concurrent `remove_profile_disk_watch` for
+/// the same name cannot interleave between "subscription created" and
+/// "entry installed" and silently leave a stale watcher behind for a
+/// profile that was just removed.
 pub(crate) async fn add_profile_disk_watch(state: &Arc<AppState>, profile: &str) {
     let mut handles = state.disk_watch_handles.lock().await;
     let Some(entry) = build_disk_watch_entry(state, profile).await else {
@@ -158,7 +180,13 @@ pub(crate) async fn remove_profile_disk_watch(state: &Arc<AppState>, profile: &s
     }
 }
 
-/// Swap the disk-watch subscription from `old` to `new` under one critical section.
+/// Swap the disk-watch subscription from `old` to `new` under one
+/// critical section. Concurrent same-name add/remove cannot interleave
+/// between the two halves; this is concurrent-atomic, not
+/// failure-atomic. On `build_disk_watch_entry` failure the `old` entry
+/// is still removed because the production caller (rename_profile) has
+/// already moved the on-disk directory and the old kernel watch points
+/// at a path that no longer exists.
 pub(crate) async fn rename_profile_disk_watch(state: &Arc<AppState>, old: &str, new: &str) {
     if old == new {
         return;
@@ -184,6 +212,13 @@ pub(crate) async fn rename_profile_disk_watch(state: &Arc<AppState>, old: &str, 
 }
 
 /// Wire up disk-watch subscriptions for every currently-active profile.
+/// Called during startup before request serving begins so the initial
+/// watcher set is in place before any handler mutates storage. Per-profile
+/// `subscribe_channel` errors are logged and skipped; polling stays
+/// canonical so propagation degrades to the 2s tick rather than failing
+/// closed. Emits one bootstrap wake at the end so any write that landed
+/// while we were walking the profile list is reconciled immediately once
+/// the consumer begins awaiting `disk_changed`.
 pub(crate) async fn init_disk_watch_subscriptions(state: Arc<AppState>) {
     init_disk_watch_subscriptions_inner(state, |_: &str| {}, false).await;
 }
@@ -221,7 +256,10 @@ pub(super) async fn init_disk_watch_subscriptions_inner<F>(
     );
 }
 
-/// Background task.
+/// Background task: reload `state.instances` from disk on every wake of
+/// `state.disk_changed`. Mirrors `status_poll_loop`'s lock-acquisition
+/// pattern but does NOT touch tmux or `state.status_tx`. Polling stays
+/// canonical; this task is pure latency reduction.
 pub(super) async fn disk_watcher_consumer(state: Arc<AppState>) {
     loop {
         tokio::select! {
@@ -229,6 +267,8 @@ pub(super) async fn disk_watcher_consumer(state: Arc<AppState>) {
             _ = state.disk_changed.notified() => {}
         }
         let started = std::time::Instant::now();
+        let namespace = state.profile_namespace.read().await;
+        let reload_lane = state.reload_lane.lock().await;
         let lifecycle_turn = state.lifecycle.lock_reads().await;
         let snapshot_guard = state.session_service.disk_reload_guard().await;
         let read_epoch = state
@@ -237,7 +277,7 @@ pub(super) async fn disk_watcher_consumer(state: Arc<AppState>) {
         let lifecycle_since = state.lifecycle.commit_generation();
         let file_watch_for_load = state.file_watch.clone();
         let loaded = match tokio::task::spawn_blocking(move || {
-            let fresh = load_all_instances(&file_watch_for_load);
+            let fresh = super::reload::load_profiles_for_reload(&file_watch_for_load);
             drop(snapshot_guard);
             (fresh, live_structured_worker_records())
         })
@@ -250,10 +290,16 @@ pub(super) async fn disk_watcher_consumer(state: Arc<AppState>) {
                     error = %e,
                     "spawn_blocking joined with error"
                 );
+                state
+                    .mark_reload_failure(crate::daemon::RuntimeHealth::Degraded {
+                        code: crate::daemon::ReloadFailureCode::Metadata,
+                        profiles: Vec::new(),
+                    })
+                    .await;
                 continue;
             }
         };
-        let (fresh, live_worker_records) = loaded;
+        let ((fresh, metadata), live_worker_records) = loaded;
         // Diff before the reload consumes the rows. A session missing once is only a suspect,
         // and a snapshot a commit overtook is dropped, so look again shortly rather than
         // waiting for the next file event.
@@ -273,8 +319,12 @@ pub(super) async fn disk_watcher_consumer(state: Arc<AppState>) {
             live_worker_records,
             StatusSource::DiskOnly,
             read_epoch,
+            metadata,
+            Default::default(),
         )
         .await;
+        drop(reload_lane);
+        drop(namespace);
         tracing::trace!(
             target: "server.file_watch",
             latency_us = started.elapsed().as_micros() as u64,
@@ -291,17 +341,6 @@ mod tests {
     use crate::server::test_support;
     use crate::session::Instance;
 
-    /// These tests assert on live subscription counts, so the state needs a real
-    /// `FileWatchService` rather than the test harness's noop.
-    fn state_with_live_watch() -> Arc<AppState> {
-        let state = test_support::build_test_app_state(Vec::new());
-        let mut state = Arc::try_unwrap(state)
-            .map_err(|_| ())
-            .expect("unique state");
-        state.file_watch = FileWatchService::new().expect("live svc");
-        Arc::new(state)
-    }
-
     #[tokio::test]
     #[serial_test::serial]
     async fn init_disk_watch_subscriptions_bootstraps_one_reload_after_wiring() {
@@ -316,7 +355,13 @@ mod tests {
             })
             .expect("seed write");
 
-        let state = state_with_live_watch();
+        let state = test_support::build_test_app_state(Vec::new());
+        let live = FileWatchService::new().expect("live svc");
+        let mut state_mut = Arc::try_unwrap(state)
+            .map_err(|_| ())
+            .expect("unique state");
+        state_mut.file_watch = live;
+        let state = Arc::new(state_mut);
 
         let wake = {
             let signal = state.disk_changed.clone();
@@ -338,9 +383,13 @@ mod tests {
             "startup wiring must leave exactly one live subscription for the single profile"
         );
     }
-
-    // Concurrent same-profile rewires must converge to a single consistent map entry and
-    // matching live subscription count.
+    // Concurrent same-profile rewires must converge to a single
+    // consistent map entry and matching live subscription count. The
+    // unified helper holds `disk_watch_handles` through the full
+    // teardown-then-install transition, so the lock-acquisition order
+    // alone decides which call wins; an interleaved unsubscribe and
+    // subscribe across two callers cannot leave a half-state where the
+    // map and the dispatcher disagree.
     #[tokio::test]
     #[serial_test::serial]
     async fn add_remove_profile_disk_watch_serializes_concurrent_add_and_remove() {
@@ -348,7 +397,10 @@ mod tests {
         let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
         let _ = crate::session::get_profile_dir("rewire-race").expect("profile dir");
 
-        let state = state_with_live_watch();
+        let live = FileWatchService::new().expect("live svc");
+        let state = test_support::build_test_app_state_configured(Vec::new(), |state| {
+            test_support::replace_file_watch(state, live);
+        });
 
         let mut joins = Vec::new();
         for i in 0..50 {
@@ -398,7 +450,10 @@ mod tests {
         let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
         let _ = crate::session::get_profile_dir("race-fix").expect("profile dir");
 
-        let state = state_with_live_watch();
+        let live = FileWatchService::new().expect("live svc");
+        let state = test_support::build_test_app_state_configured(Vec::new(), |state| {
+            test_support::replace_file_watch(state, live);
+        });
 
         let barrier = Arc::new(DiskWatchBuildBarrier {
             entered: tokio::sync::Notify::new(),
@@ -458,7 +513,10 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
         let _ = crate::session::get_profile_dir("lifecycle-p1").expect("profile dir");
-        let state = state_with_live_watch();
+        let live = FileWatchService::new().expect("live svc");
+        let state = test_support::build_test_app_state_configured(Vec::new(), |state| {
+            test_support::replace_file_watch(state, live);
+        });
         let mut rx = state.lifecycle.subscribe();
         state.lifecycle.observe_disk(
             state.lifecycle.commit_generation(),
@@ -518,7 +576,10 @@ mod tests {
             .expect("seed p1");
         let _ = crate::session::get_profile_dir("init-gap-p2").expect("p2 dir");
 
-        let state = state_with_live_watch();
+        let live = FileWatchService::new().expect("live svc");
+        let state = test_support::build_test_app_state_configured(Vec::new(), |state| {
+            test_support::replace_file_watch(state, live);
+        });
 
         init_disk_watch_subscriptions_with_hook(state.clone(), |profile| {
             if profile == "init-gap-p1" {
@@ -547,15 +608,18 @@ mod tests {
             .mutation_epoch
             .load(std::sync::atomic::Ordering::SeqCst);
         let file_watch = state.file_watch.clone();
-        let fresh = tokio::task::spawn_blocking(move || load_all_instances(&file_watch))
+        let fresh = tokio::task::spawn_blocking(move || load_all_profiles(&file_watch))
             .await
-            .expect("join");
+            .expect("join")
+            .expect("load profiles");
         reload_state_instances_from_disk(
             &state,
-            fresh,
+            fresh.instances.into(),
             Vec::new(),
             StatusSource::DiskOnly,
             read_epoch,
+            Ok(fresh.metadata),
+            Default::default(),
         )
         .await;
 
@@ -592,12 +656,15 @@ mod tests {
             .mutation_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
+        let metadata = state.canonical_metadata.read().await.clone();
         reload_state_instances_from_disk(
             &state,
             stale_snapshot.into(),
             Vec::new(),
             StatusSource::DiskOnly,
             read_epoch,
+            Ok(metadata),
+            Default::default(),
         )
         .await;
 
@@ -630,14 +697,21 @@ mod tests {
             .mutation_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        reload_state_instances_from_disk(
-            &state,
-            stale_snapshot.clone().into(),
-            Vec::new(),
-            StatusSource::DiskOnly,
-            0,
+        let metadata = state.canonical_metadata.read().await.clone();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            reload_state_instances_from_disk(
+                &state,
+                stale_snapshot.clone().into(),
+                Vec::new(),
+                StatusSource::DiskOnly,
+                0,
+                Ok(metadata),
+                Default::default(),
+            ),
         )
-        .await;
+        .await
+        .expect("stale create reload did not finish within 30 seconds");
 
         let titles: Vec<String> = state
             .instances
@@ -657,14 +731,21 @@ mod tests {
         let unbumped = test_support::build_test_app_state(vec![existing.clone(), created.clone()]);
         let mut current_snapshot = stale_snapshot;
         current_snapshot.push(Instance::new("created-elsewhere", "/tmp/elsewhere"));
-        reload_state_instances_from_disk(
-            &unbumped,
-            current_snapshot.into(),
-            Vec::new(),
-            StatusSource::DiskOnly,
-            0,
+        let metadata = unbumped.canonical_metadata.read().await.clone();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            reload_state_instances_from_disk(
+                &unbumped,
+                current_snapshot.into(),
+                Vec::new(),
+                StatusSource::DiskOnly,
+                0,
+                Ok(metadata),
+                Default::default(),
+            ),
         )
-        .await;
+        .await
+        .expect("current create reload did not finish within 30 seconds");
         let titles: Vec<String> = unbumped
             .instances
             .read()
@@ -697,12 +778,15 @@ mod tests {
 
         let reload_state = Arc::clone(&state);
         let reload = async move {
+            let metadata = reload_state.canonical_metadata.read().await.clone();
             reload_state_instances_from_disk(
                 &reload_state,
                 stale_snapshot.into(),
                 Vec::new(),
                 StatusSource::DiskOnly,
                 read_epoch,
+                Ok(metadata),
+                Default::default(),
             )
             .await;
         };

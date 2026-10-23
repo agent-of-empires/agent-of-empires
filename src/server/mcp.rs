@@ -19,9 +19,9 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use super::api::sessions::{list_sessions_envelope, SessionFilter};
+use super::api::sessions::{list_sessions_envelope, SessionFilter, SessionsView};
 use super::state::AppState;
-use crate::daemon::{SessionResponse, SessionsEnvelope};
+use crate::daemon::SessionResponse;
 use crate::session::SessionScope;
 
 #[derive(Debug, Default, Clone, Copy, Deserialize, JsonSchema)]
@@ -64,7 +64,7 @@ impl McpServer {
     async fn list_sessions(
         &self,
         Parameters(params): Parameters<ListSessionsParams>,
-    ) -> Json<SessionsEnvelope> {
+    ) -> Result<Json<SessionsView>, rmcp::ErrorData> {
         let filter = SessionFilter {
             scope: Some(match params.state {
                 StateFilter::Live => SessionScope::Live,
@@ -73,8 +73,10 @@ impl McpServer {
             group: params.group,
             children_of: params.children_of,
         };
-        // A read-only tool that agents may poll must not persist the dashboard's ordering.
-        Json(list_sessions_envelope(&self.state, &filter, false).await)
+        list_sessions_envelope(&self.state, filter)
+            .await
+            .map(Json)
+            .map_err(|_| rmcp::ErrorData::internal_error("Session snapshot unavailable", None))
     }
 
     #[rmcp::tool(
@@ -121,18 +123,22 @@ mod tests {
 
     const TOKEN: &str = "mcp-test-token";
 
-    fn app(mcp_enabled: bool, prior: Vec<Instance>) -> axum::Router {
-        let mut state = test_support::build_test_app_state_with_policy(
+    fn app_with_state(
+        mcp_enabled: bool,
+        prior: Vec<Instance>,
+    ) -> (axum::Router, std::sync::Arc<crate::server::AppState>) {
+        let state = test_support::build_test_app_state_with_policy_configured(
             prior,
             vecs(&["localhost"]),
             Vec::new(),
             Some(TOKEN.to_string()),
+            |state| state.web_config.mcp_enabled = mcp_enabled,
         );
-        std::sync::Arc::get_mut(&mut state)
-            .expect("unique test state")
-            .web_config
-            .mcp_enabled = mcp_enabled;
-        test_support::build_router_for_test(state)
+        (test_support::build_router_for_test(state.clone()), state)
+    }
+
+    fn app(mcp_enabled: bool, prior: Vec<Instance>) -> axum::Router {
+        app_with_state(mcp_enabled, prior).0
     }
 
     async fn send(
@@ -257,16 +263,18 @@ mod tests {
     #[tokio::test]
     async fn login_wall_answers_mcp_with_401_not_a_redirect() {
         for token in [None, Some(TOKEN)] {
-            let mut state = test_support::build_test_app_state_with_policy(
+            let state = test_support::build_test_app_state_with_policy_configured(
                 Vec::new(),
                 vecs(&["localhost"]),
                 Vec::new(),
                 token.map(str::to_string),
+                |state| {
+                    state.web_config.mcp_enabled = true;
+                    state.login_manager = std::sync::Arc::new(
+                        crate::server::login::LoginManager::new(Some("passphrase")),
+                    );
+                },
             );
-            let state_mut = std::sync::Arc::get_mut(&mut state).expect("unique test state");
-            state_mut.web_config.mcp_enabled = true;
-            state_mut.login_manager =
-                std::sync::Arc::new(crate::server::login::LoginManager::new(Some("passphrase")));
             let app = test_support::build_router_for_test(state);
 
             let mut req = Request::builder()
@@ -305,6 +313,42 @@ mod tests {
         for token in [None, Some("wrong-token")] {
             let (status, _) = rpc(&app, token, body.clone()).await;
             assert_eq!(status, StatusCode::UNAUTHORIZED, "token {token:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_reads_work_but_cityhall_denies_mcp() {
+        for cityhall in [false, true] {
+            let state = test_support::build_test_app_state_with_policy_configured(
+                vec![],
+                vecs(&["localhost"]),
+                Vec::new(),
+                Some(TOKEN.to_string()),
+                |state| {
+                    state.web_config.mcp_enabled = true;
+                    state.read_only = true;
+                    state.cityhall_mode = cityhall;
+                },
+            );
+            let app = test_support::build_router_for_test(state);
+            let (status, message) = rpc(
+                &app,
+                Some(TOKEN),
+                json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": "list_sessions", "arguments": {}}
+                }),
+            )
+            .await;
+            if cityhall {
+                assert_eq!(status, StatusCode::FORBIDDEN);
+            } else {
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(
+                    message.unwrap()["result"]["structuredContent"]["sessions"],
+                    json!([])
+                );
+            }
         }
     }
 
@@ -356,8 +400,12 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn list_sessions_honours_state_group_and_children_of() {
-        // The writable listing path persists workspace ordering into the app dir.
         let _guard = crate::session::test_support::isolate_app_dir();
+        let ordering_path = crate::session::get_app_dir()
+            .unwrap()
+            .join("workspace-ordering.json");
+        let ordering_bytes = br#"{"order":["manual-last"]}"#;
+        std::fs::write(&ordering_path, ordering_bytes).unwrap();
         let parent = session_in("parent", "work", None);
         let child = session_in("child", "work/sub", Some(&parent.id));
         let other = session_in("other", "elsewhere", None);
@@ -365,7 +413,10 @@ mod tests {
         let mut trashed = session_in("trashed", "work", None);
         trashed.trash();
         let (parent_id, child_id) = (parent.id.clone(), child.id.clone());
-        let app = app(true, vec![parent, child, other, lookalike, trashed]);
+        let (app, state) = app_with_state(true, vec![parent, child, other, lookalike, trashed]);
+        let canonical = state.runtime.snapshot(&state).await.unwrap();
+        let unpublished = session_in("unpublished", "work/sub", Some(&parent_id));
+        state.instances.write().await.push(unpublished);
 
         let titles = |envelope: Value| -> Vec<String> {
             let mut titles: Vec<String> = envelope["sessions"]
@@ -396,14 +447,35 @@ mod tests {
         ];
         for (arguments, expected) in cases {
             let envelope = call(&app, "list_sessions", arguments.clone()).await;
+            assert_eq!(
+                envelope["workspace_ordering"],
+                json!(canonical.value.contents.workspace_ordering),
+                "filters retain the published workspace ordering",
+            );
             assert_eq!(titles(envelope), expected, "{arguments}");
         }
-        assert!(
-            crate::session::load_workspace_ordering()
-                .unwrap()
-                .order
-                .is_empty(),
-            "listing through MCP must not persist the dashboard's workspace ordering"
+        let request = Request::builder()
+            .uri("/api/sessions?state=all")
+            .header(header::HOST, "localhost")
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = send(&app, request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rest: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            call(&app, "list_sessions", json!({"state": "all"})).await,
+            rest
         );
+        state.runtime.publish(&state).await.unwrap();
+        assert_eq!(
+            titles(call(&app, "list_sessions", json!({"children_of": parent_id})).await),
+            ["child", "unpublished"],
+            "a new published revision makes the child visible",
+        );
+        assert_eq!(std::fs::read(ordering_path).unwrap(), ordering_bytes);
     }
 }

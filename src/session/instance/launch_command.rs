@@ -167,9 +167,7 @@ fn apply_first_launch_agent_name(
     }
 }
 
-/// Keep a host agent's app server in its own process so its hooks run under this pane's env.
-/// Withheld unless the launch's own executable and environment can be probed; the launch then
-/// runs that executable.
+/// Keep a directly attested host agent's app server under this pane's environment.
 fn apply_no_daemon_flag(
     cmd: &mut String,
     agent: Option<&crate::agents::AgentDef>,
@@ -179,35 +177,39 @@ fn apply_no_daemon_flag(
     let Some(agent) = agent else {
         return;
     };
-    let Some(command) = inst.host_agent_command(agent, execution) else {
+    let Some(execution) = execution.filter(|execution| {
+        execution.inputs.container.is_none() && execution.agent.name == agent.name
+    }) else {
         return;
     };
+    let Some(invocation) = parse_launch_command(inst.get_tool_command()) else {
+        return;
+    };
+    if invocation.words.first().map(String::as_str) != Some(agent.binary) {
+        return;
+    }
     let Ok(mut words) = shell_words::split(cmd) else {
         return;
     };
-    if words.is_empty() {
+    if words.first().map(String::as_str) != execution.program.to_str() {
         return;
     }
     // Past `--` every word is a positional, so only the options before it count.
     let options_end = words.iter().position(|w| w == "--").unwrap_or(words.len());
     let options = &words[1..options_end];
-    let Some(flag) = agent.supported_no_daemon_flag(&command, options) else {
+    let Some(flag) = agent.supported_no_daemon_flag(&execution.host_command(), options) else {
         return;
     };
     if options.iter().any(|w| w == flag) {
         return;
     }
-    // The pane runs this through a login shell whose startup files may change PATH, so name the
-    // executable that was probed.
-    let Some(program) = command.get_program().to_str() else {
-        return;
-    };
-    words[0] = program.to_owned();
     words.insert(options_end, flag.to_owned());
     *cmd = shell_words::join(words);
 }
 
 /// Write the Pi session-id extension into the app dir and return its path.
+///
+/// Rewritten when the content differs so an upgrade ships its own version.
 pub(super) fn session_identity_extension_path() -> Result<PathBuf> {
     const SOURCE: &str = crate::session::instance::SESSION_IDENTITY_EXTENSION;
     let root = crate::session::get_app_dir()?;
@@ -219,7 +221,9 @@ pub(super) fn session_identity_extension_path() -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Whether a host `environment` list assigns `PATH`.
+/// Whether a host `environment` list assigns `PATH`. Entries are either `KEY`
+/// (pass AoE's own value through, which cannot redirect a binary lookup) or
+/// `KEY=VALUE`, so only the assigning form counts.
 pub(super) fn environment_defines_path(environment: &[String]) -> bool {
     environment.iter().any(|entry| {
         entry
@@ -422,6 +426,12 @@ pub(super) fn append_resume_flags(
 }
 
 /// Prepend agent-specific environment overrides to a launch command.
+///
+/// Some terminal agents inherit the parent tmux env, which can carry
+/// `NO_COLOR=1` and silently disable their terminal palettes even though the
+/// web renderer handles ANSI fine. Unsetting `NO_COLOR` and advertising
+/// `TERM=xterm-256color` plus `COLORTERM=truecolor` at launch keeps color on
+/// without pinning tools to a specific `FORCE_COLOR` depth.
 fn apply_agent_launch_env(cmd: &mut String, agent: Option<&'static crate::agents::AgentDef>) {
     if !matches!(agent.map(|a| a.name), Some("antigravity" | "codex")) {
         return;
@@ -433,8 +443,10 @@ fn apply_agent_launch_env(cmd: &mut String, agent: Option<&'static crate::agents
     );
 }
 
-/// Run a script through a dedicated descriptor so its size is not constrained by the per-argument
-/// exec limit and the launched agent retains the pane TTY on standard input.
+/// Run a script through a dedicated descriptor so its size is not constrained
+/// by the per-argument exec limit and the launched agent retains the pane TTY
+/// on standard input. The delimiter grows until it cannot close a here-document
+/// present in user-controlled command text.
 pub(super) fn shell_stdin_command(shell: &str, login: bool, script: &str, stem: &str) -> String {
     let delimiter = heredoc_delimiter(script, stem);
     let flag = if login { "-l " } else { "" };
@@ -747,8 +759,9 @@ impl Instance {
         self.has_command_override()
     }
 
-    /// True only when the launch command differs from the agent's default binary (ignores
-    /// extra_args).
+    /// True only when the launch command differs from the agent's default
+    /// binary (ignores extra_args). Use this for status-detection and
+    /// restart guards where only a wrapper script matters.
     pub fn has_command_override(&self) -> bool {
         if self.command.is_empty() {
             return false;
@@ -772,7 +785,10 @@ impl Instance {
         }
     }
 
-    /// The text searched for a user-selected `--agent NAME` flag.
+    /// The text searched for a user-selected `--agent NAME` flag: both the
+    /// command override (where a custom command like `kiro-cli chat --agent x`
+    /// may live) and the extra-args field (the usual place). Joined so a flag
+    /// in either is found.
     pub(super) fn selected_agent_args(&self) -> String {
         if self.command.is_empty() {
             self.extra_args.clone()
@@ -783,7 +799,10 @@ impl Instance {
         }
     }
 
-    /// Launch command including any agent `launch_subcommand` (e.g. `kiro-cli chat`).
+    /// Launch command including any agent `launch_subcommand` (e.g.
+    /// `kiro-cli chat`). A user command override takes precedence verbatim and
+    /// the subcommand is not applied to it. Used when assembling the launch
+    /// command so subcommand-scoped flags (yolo, resume) parse correctly.
     fn get_launch_command(&self) -> String {
         if self.command.is_empty() {
             crate::agents::get_agent(&self.tool)
@@ -794,8 +813,18 @@ impl Instance {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn prepare_launch_command(
         &mut self,
+        expected_conversation: ConversationState,
+    ) -> Result<PreparedLaunch> {
+        let file_watch = crate::file_watch::FileWatchService::noop();
+        self.prepare_launch_command_in(CaptureStorage::Profiles(&file_watch), expected_conversation)
+    }
+
+    pub(super) fn prepare_launch_command_in(
+        &mut self,
+        stores: CaptureStorage<'_>,
         expected_conversation: ConversationState,
     ) -> Result<PreparedLaunch> {
         let sandbox_context_reset = match self.resolved_agent() {
@@ -815,7 +844,7 @@ impl Instance {
         let prior_probe_failed_sid = self.resume_probe_failed_sid.clone();
         let preparation = (|| -> Result<_> {
             if matches!(self.resume_intent, ResumeIntent::Default) {
-                if let Some(observation) = self.capture_freshest_conversation() {
+                if let Some(observation) = self.capture_freshest_conversation_in(stores) {
                     self.apply_conversation_observation(&observation);
                 }
             }
@@ -896,8 +925,11 @@ impl Instance {
             } else {
                 None
             };
-            let parts =
-                self.build_launch_command(execution.as_ref(), &mut expected_conversation)?;
+            let parts = self.build_launch_command_in(
+                stores,
+                execution.as_ref(),
+                &mut expected_conversation,
+            )?;
             if (managed || parts.is_existing) && validate_target {
                 if let Some(execution) = execution.as_ref() {
                     self.validate_conversation_target(
@@ -969,9 +1001,24 @@ impl Instance {
         })
     }
 
-    /// Carry the last authoritative root across native daemon shutdown.
+    /// Carry a captured native Prime root across pane teardown.
+    #[cfg(test)]
     pub(super) fn refresh_prepared_prime_launch_after_pane_stop(
         &mut self,
+        prepared: PreparedLaunch,
+        publication: Option<PrimeRootPublication>,
+    ) -> Result<PreparedLaunch> {
+        let file_watch = crate::file_watch::FileWatchService::noop();
+        self.refresh_prepared_prime_launch_after_pane_stop_in(
+            CaptureStorage::Profiles(&file_watch),
+            prepared,
+            publication,
+        )
+    }
+
+    pub(super) fn refresh_prepared_prime_launch_after_pane_stop_in(
+        &mut self,
+        stores: CaptureStorage<'_>,
         prepared: PreparedLaunch,
         publication: Option<PrimeRootPublication>,
     ) -> Result<PreparedLaunch> {
@@ -984,7 +1031,8 @@ impl Instance {
             );
         }
         self.absorb_published_prime_session(publication);
-        let mut refreshed = self.prepare_launch_command(prepared.expected_conversation)?;
+        let mut refreshed =
+            self.prepare_launch_command_in(stores, prepared.expected_conversation)?;
         refreshed.require_conversation_publication |= prepared.require_conversation_publication;
         refreshed.expected_prior_omp_generation = prepared.expected_prior_omp_generation;
         Ok(refreshed)
@@ -992,8 +1040,19 @@ impl Instance {
 
     /// Construct the command only after hook execution has completed. Keeping this phase hook-free
     /// prevents a revalidation retry from replaying user code while the lifecycle lock is held.
+    #[cfg(test)]
     pub(super) fn build_launch_command(
         &mut self,
+        execution: Option<&super::execution::NativeExecution>,
+        expected: &mut ConversationState,
+    ) -> Result<LaunchCommandParts> {
+        let file_watch = crate::file_watch::FileWatchService::noop();
+        self.build_launch_command_in(CaptureStorage::Profiles(&file_watch), execution, expected)
+    }
+
+    pub(super) fn build_launch_command_in(
+        &mut self,
+        stores: CaptureStorage<'_>,
         execution: Option<&super::execution::NativeExecution>,
         expected: &mut ConversationState,
     ) -> Result<LaunchCommandParts> {
@@ -1144,9 +1203,9 @@ impl Instance {
             if let Some((ref flag, _)) = identity_extension {
                 tool_cmd.push_str(flag);
             }
-            let is_existing = self.apply_session_flags(
+            let is_existing = self.apply_session_flags_in(
+                stores,
                 &mut tool_cmd,
-                "sandboxed",
                 agent,
                 execution,
                 launch_context,
@@ -1222,7 +1281,7 @@ impl Instance {
                 },
             }
         } else {
-            let mut result = self.build_host_command(agent, execution, expected)?;
+            let mut result = self.build_host_command_in(stores, agent, execution, expected)?;
             result.launch_env.pane = if execution.is_none() {
                 crate::session::environment::resolve_host_environment_pairs(
                     &self.resolved_host_environment(),
@@ -1240,8 +1299,25 @@ impl Instance {
 
     /// Build the tmux command for a host session after all launch hooks have
     /// completed.
+    #[cfg(test)]
     fn build_host_command(
         &mut self,
+        agent: Option<&'static crate::agents::AgentDef>,
+        execution: Option<&super::execution::NativeExecution>,
+        expected: &mut ConversationState,
+    ) -> Result<LaunchCommandParts> {
+        let file_watch = crate::file_watch::FileWatchService::noop();
+        self.build_host_command_in(
+            CaptureStorage::Profiles(&file_watch),
+            agent,
+            execution,
+            expected,
+        )
+    }
+
+    fn build_host_command_in(
+        &mut self,
+        stores: CaptureStorage<'_>,
         agent: Option<&'static crate::agents::AgentDef>,
         execution: Option<&super::execution::NativeExecution>,
         expected: &mut ConversationState,
@@ -1253,7 +1329,8 @@ impl Instance {
         let identity_extension = execution
             .and_then(|execution| execution.inputs.identity_extension.as_ref())
             .or(fallback_identity.as_ref());
-        self.build_host_command_with_identity_extension(
+        self.build_host_command_with_identity_extension_in(
+            stores,
             agent,
             identity_extension,
             execution,
@@ -1261,8 +1338,27 @@ impl Instance {
         )
     }
 
+    #[cfg(test)]
     fn build_host_command_with_identity_extension(
         &mut self,
+        agent: Option<&'static crate::agents::AgentDef>,
+        identity_extension: Option<&(String, String)>,
+        execution: Option<&super::execution::NativeExecution>,
+        expected: &mut ConversationState,
+    ) -> Result<LaunchCommandParts> {
+        let file_watch = crate::file_watch::FileWatchService::noop();
+        self.build_host_command_with_identity_extension_in(
+            CaptureStorage::Profiles(&file_watch),
+            agent,
+            identity_extension,
+            execution,
+            expected,
+        )
+    }
+
+    fn build_host_command_with_identity_extension_in(
+        &mut self,
+        stores: CaptureStorage<'_>,
         agent: Option<&'static crate::agents::AgentDef>,
         identity_extension: Option<&(String, String)>,
         execution: Option<&super::execution::NativeExecution>,
@@ -1338,9 +1434,9 @@ impl Instance {
                             apply_yolo_mode(&mut cmd, yolo, false);
                         }
                     }
-                    let is_existing = self.apply_session_flags(
+                    let is_existing = self.apply_session_flags_in(
+                        stores,
                         &mut cmd,
-                        "host agent",
                         agent,
                         execution,
                         launch_context,
@@ -1433,9 +1529,9 @@ impl Instance {
                     apply_yolo_mode(&mut cmd, yolo, false);
                 }
             }
-            let is_existing = self.apply_session_flags(
+            let is_existing = self.apply_session_flags_in(
+                stores,
                 &mut cmd,
-                "host custom",
                 agent,
                 execution,
                 launch_context,
@@ -1530,6 +1626,13 @@ mod tests {
             .unwrap()
     }
 
+    fn owned_codex_namespace(home: &std::path::Path) -> EnvGuard {
+        let store = home.join(".codex");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("auth.json"), r#"{"OPENAI_API_KEY":"test"}"#).unwrap();
+        EnvGuard::set(&[("CODEX_HOME", &store), ("CODEX_SQLITE_HOME", &store)])
+    }
+
     const CLAUDE_HELP_WITH_NAME: &str = "  -n, --name <name>  Set a display name";
 
     /// A `claude` on PATH whose `--help` prints `help` and leaves a mark in `probed`.
@@ -1579,7 +1682,7 @@ mod tests {
         ]);
         inst.sandbox_info = Some(sandbox);
         admit_sandbox_fixture(&inst);
-        let config = inst.build_container_config().unwrap();
+        let config = inst.build_container_config_for_test().unwrap();
         let _transport =
             install_container_transport(temp_home.path(), "aoe-pi-argv", &config.volumes);
         std::fs::copy(
@@ -1865,7 +1968,6 @@ mod tests {
         let mut cmd = "codex --some-flag".to_string();
         inst.apply_session_flags(
             &mut cmd,
-            "test",
             crate::agents::get_agent("codex"),
             None,
             &super::execution::AgentLaunchContext::host(
@@ -1932,7 +2034,6 @@ mod tests {
         let error = inst
             .apply_session_flags(
                 &mut cmd,
-                "test",
                 crate::agents::get_agent("pi"),
                 None,
                 &super::execution::AgentLaunchContext::host(
@@ -2000,7 +2101,6 @@ mod tests {
             assert!(
                 inst.apply_session_flags(
                     &mut cmd,
-                    "test",
                     inst.resolved_agent(),
                     None,
                     &super::execution::AgentLaunchContext::host(
@@ -2034,7 +2134,6 @@ mod tests {
         assert!(wrapper
             .apply_session_flags(
                 &mut cmd,
-                "test",
                 wrapper.resolved_agent(),
                 None,
                 &super::execution::AgentLaunchContext::host(
@@ -2062,7 +2161,6 @@ mod tests {
         assert!(launcher
             .apply_session_flags(
                 &mut launcher_cmd,
-                "test",
                 launcher.resolved_agent(),
                 None,
                 &super::execution::AgentLaunchContext::host(
@@ -2528,6 +2626,50 @@ mod tests {
                 "legacy profile={profile} store={store:?}"
             );
         }
+
+        let source = temp.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        declare("source", source.to_str().unwrap());
+        let mut parent = Instance::new("parent", "/tmp");
+        parent.tool = "claude".into();
+        parent.source_profile = "source".into();
+        let (_, parent_execution) = routed(&parent);
+        assert_eq!(parent_execution.exported_default_store, Some(false));
+        let parent_sid = "22222222-2222-4222-8222-222222222222";
+        let relative = transcripts
+            .strip_prefix(&work)
+            .unwrap()
+            .join(format!("{parent_sid}.jsonl"));
+        std::fs::create_dir_all(source.join(relative.parent().unwrap())).unwrap();
+        std::fs::write(source.join(&relative), "{}\n").unwrap();
+        let mut child = Instance::new("fork", "/tmp");
+        child.tool = "claude".into();
+        child.source_profile = "alias".into();
+        child.agent_session_id = Some("33333333-3333-4333-8333-333333333333".into());
+        child.resume_intent = ResumeIntent::Fork {
+            from: parent_sid.into(),
+        };
+        child.resume_binding = Some(crate::session::ConversationBinding {
+            session_id: parent_sid.into(),
+            execution: Some(parent_execution),
+            provenance: crate::session::ConversationProvenance::Observed,
+            transcript_path: None,
+        });
+        crate::session::conversation_carry::carry_fork_parent(&mut child).unwrap();
+        assert_eq!(routed(&child).0, Some(work.clone()));
+        assert_eq!(
+            std::fs::read_to_string(work.join(&relative)).unwrap(),
+            "{}\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(source.join(&relative)).unwrap(),
+            "{}\n"
+        );
+        assert_eq!(
+            child.agent_session_id.as_deref(),
+            Some("33333333-3333-4333-8333-333333333333")
+        );
+        assert!(matches!(&child.resume_intent, ResumeIntent::Fork { from } if from == parent_sid));
     }
 
     #[test]
@@ -2558,7 +2700,7 @@ mod tests {
             container_workdir: Some("/workspace/project".into()),
             before_start_env: Vec::new(),
         });
-        let config = inst.build_container_config().unwrap();
+        let config = inst.build_container_config_for_test().unwrap();
         let _transport = super::super::test_helpers::install_container_transport(
             temp.path(),
             "claude-sandbox",
@@ -3121,6 +3263,7 @@ mod tests {
     fn codex_runs_its_own_app_server_only_where_the_selected_install_has_the_flag() {
         let temp_home = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_home(temp_home.path());
+        let _namespace = owned_codex_namespace(temp_home.path());
         let project = temp_home.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let stub = |help: &str| {
@@ -3160,18 +3303,31 @@ mod tests {
 
         install_at(&ambient, with_flag);
         crate::agents::forget_agent_help_for_test();
-        let command = host_command(&mut codex);
+        if crate::process::HAS_CODEX_MANAGED_PREFERENCES {
+            let error = codex
+                .resolve_native_execution(None)
+                .err()
+                .expect("unattested managed preferences must refuse");
+            assert!(
+                error
+                    .to_string()
+                    .contains("Codex managed preferences cannot be attested"),
+                "{error:#}"
+            );
+            return;
+        }
+        let command = attested_host_command(&mut codex);
         assert_eq!(command.matches("--no-daemon").count(), 1, "{command}");
 
         codex.extra_args = "--no-daemon".into();
-        let command = host_command(&mut codex);
+        let command = attested_host_command(&mut codex);
         assert_eq!(command.matches("--no-daemon").count(), 1, "{command}");
         codex.extra_args = String::new();
 
         install_at(&profile, without_flag);
         select_profile_path(&codex);
         crate::agents::forget_agent_help_for_test();
-        let command = host_command(&mut codex);
+        let command = attested_host_command(&mut codex);
         assert!(
             !command.contains("--no-daemon"),
             "the profile selects an older install: {command}"
@@ -3180,7 +3336,7 @@ mod tests {
         install_at(&ambient, without_flag);
         install_at(&profile, with_flag);
         crate::agents::forget_agent_help_for_test();
-        let command = host_command(&mut codex);
+        let command = attested_host_command(&mut codex);
         assert_eq!(
             command.matches("--no-daemon").count(),
             1,
@@ -3194,6 +3350,7 @@ mod tests {
     fn codex_no_daemon_flag_lands_before_an_argument_terminator() {
         let temp_home = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_home(temp_home.path());
+        let _namespace = owned_codex_namespace(temp_home.path());
         let project = temp_home.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         crate::agents::forget_agent_help_for_test();
@@ -3202,21 +3359,44 @@ mod tests {
             "codex",
             "#!/bin/sh\ncase \"$1\" in --help) echo '      --no-daemon  Run without the daemon';; esac\nexit 0\n",
         );
-        let launch_words = |command: &str| {
-            let exec = command.lines().find(|l| l.starts_with("exec ")).unwrap();
-            shell_words::split(exec).unwrap()
-        };
-        let mut codex = tool_instance("codex", project.to_str().unwrap());
-
-        codex.extra_args = "-- 'fix the build'".into();
-        let words = launch_words(&host_command(&mut codex));
+        let codex = tool_instance("codex", project.to_str().unwrap());
+        if crate::process::HAS_CODEX_MANAGED_PREFERENCES {
+            let error = codex
+                .resolve_native_execution(None)
+                .err()
+                .expect("unattested managed preferences must refuse");
+            assert!(
+                error
+                    .to_string()
+                    .contains("Codex managed preferences cannot be attested"),
+                "{error:#}"
+            );
+            return;
+        }
+        let execution = codex.resolve_native_execution(None).unwrap();
+        // Test insertion policy, not admission of managed user arguments after `--`.
+        let program = shell_escape(execution.program.to_str().unwrap());
+        let mut command = format!("{program} -- 'fix the build'");
+        apply_no_daemon_flag(
+            &mut command,
+            Some(execution.agent),
+            &codex,
+            Some(&execution),
+        );
+        let words = shell_words::split(&command).unwrap();
         let terminator = words.iter().position(|w| w == "--").unwrap();
         let flag = words.iter().position(|w| w == "--no-daemon").unwrap();
         assert!(flag < terminator, "{words:?}");
         assert_eq!(&words[terminator..], ["--", "fix the build"], "{words:?}");
 
-        codex.extra_args = "-- --no-daemon".into();
-        let words = launch_words(&host_command(&mut codex));
+        let mut command = format!("{program} -- --no-daemon");
+        apply_no_daemon_flag(
+            &mut command,
+            Some(execution.agent),
+            &codex,
+            Some(&execution),
+        );
+        let words = shell_words::split(&command).unwrap();
         let terminator = words.iter().position(|w| w == "--").unwrap();
         assert_eq!(
             words.iter().filter(|w| *w == "--no-daemon").count(),
@@ -3243,7 +3423,12 @@ mod tests {
             "codex",
             "#!/bin/sh\ncase \"$1\" in --help) echo '      --no-daemon  Run without the daemon';; esac\nexit 0\n",
         );
-        let mut codex = tool_instance("codex", project.to_str().unwrap());
+        let agent = crate::agents::get_agent("codex").unwrap();
+        let mut command = std::process::Command::new(which::which("codex").unwrap());
+        command
+            .current_dir(&project)
+            .env_clear()
+            .envs(std::env::vars_os());
 
         for (extra_args, injected) in [
             ("", true),
@@ -3276,12 +3461,17 @@ mod tests {
             ("review", false),
             ("mcp list", false),
         ] {
-            codex.extra_args = extra_args.into();
-            let command = host_command(&mut codex);
+            let words = shell_words::split(extra_args).unwrap();
+            let options_end = words
+                .iter()
+                .position(|word| word == "--")
+                .unwrap_or(words.len());
             assert_eq!(
-                command.contains("--no-daemon"),
+                agent
+                    .supported_no_daemon_flag(&command, &words[..options_end])
+                    .is_some(),
                 injected,
-                "extra_args {extra_args:?}: {command}"
+                "extra_args {extra_args:?}"
             );
         }
     }
@@ -3293,6 +3483,7 @@ mod tests {
     fn codex_no_daemon_runs_the_probed_install_despite_a_login_shell_path() {
         let temp_home = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_home(temp_home.path());
+        let _namespace = owned_codex_namespace(temp_home.path());
         let project = temp_home.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let ran = temp_home.path().join("ran");
@@ -3330,7 +3521,20 @@ mod tests {
         ]);
         crate::agents::forget_agent_help_for_test();
         let mut codex = tool_instance("codex", project.to_str().unwrap());
-        let command = host_command(&mut codex);
+        if crate::process::HAS_CODEX_MANAGED_PREFERENCES {
+            let error = codex
+                .resolve_native_execution(None)
+                .err()
+                .expect("unattested managed preferences must refuse");
+            assert!(
+                error
+                    .to_string()
+                    .contains("Codex managed preferences cannot be attested"),
+                "{error:#}"
+            );
+            return;
+        }
+        let command = attested_host_command(&mut codex);
 
         let status = std::process::Command::new("/bin/sh")
             .arg("-c")
@@ -3342,10 +3546,26 @@ mod tests {
             .unwrap();
         assert!(status.success(), "{command}");
         let ran = std::fs::read_to_string(&ran).unwrap();
+        let (install, args) = ran.trim().split_once(": ").unwrap();
+        assert_eq!(install, probed.to_str().unwrap(), "{command}");
+        let words = shell_words::split(args).unwrap();
         assert_eq!(
-            ran.trim(),
-            format!("{}: --no-daemon", probed.display()),
+            words.iter().filter(|word| *word == "--no-daemon").count(),
+            1,
             "{command}"
+        );
+        let sqlite = format!(
+            "sqlite_home={}",
+            temp_home
+                .path()
+                .join(".codex")
+                .canonicalize()
+                .unwrap()
+                .display()
+        );
+        assert!(
+            words.iter().any(|word| word == &sqlite),
+            "native namespace must reach the selected program: {ran}"
         );
     }
 
@@ -3464,7 +3684,7 @@ mod tests {
             container_workdir: Some("/workspace/project".into()),
             before_start_env: Vec::new(),
         });
-        let config = inst.build_container_config().unwrap();
+        let config = inst.build_container_config_for_test().unwrap();
         let _transport = super::super::test_helpers::install_container_transport(
             temp.path(),
             "claude-sandbox",

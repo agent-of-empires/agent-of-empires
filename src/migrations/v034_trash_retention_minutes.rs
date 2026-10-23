@@ -89,7 +89,9 @@ mod tests {
                 ),
                 // An invalid minutes value yields to the carried days.
                 (
-                    Some("[session]\ntrash_retention_days = 0\ntrash_retention_minutes = \"invalid\"\n"),
+                    Some(
+                        "[session]\ntrash_retention_days = 0\ntrash_retention_minutes = \"invalid\"\n",
+                    ),
                     Some("[session]\ntrash_retention_minutes = 0\n"),
                 ),
                 (

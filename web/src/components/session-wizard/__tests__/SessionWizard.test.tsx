@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { StrictMode } from "react";
+import { StrictMode, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
@@ -11,13 +11,22 @@ import {
   fetchDockerStatus,
   fetchIsGitRepo,
   fetchProfiles,
+  fetchProjects,
   fetchSettings,
+  type SettingsResponse,
 } from "../../../lib/api";
 import { agent } from "./fixtures";
 import { toastBus } from "../../../lib/toastBus";
 import { startPendingCreates } from "../../../lib/pendingCreates";
 
 const createSession = vi.fn();
+const reviewCreationTrust = vi.fn();
+const FINGERPRINT = {
+  project_path: "/tmp/proj",
+  base_hooks_hash: "base",
+  hooks_hash: "repo",
+  mcp_hash: null,
+};
 
 vi.mock("../../../lib/api", () => ({
   fetchCreateProgress: vi.fn().mockResolvedValue(null),
@@ -36,8 +45,21 @@ vi.mock("../../../lib/api", () => ({
     projects: [{ path: "/tmp/proj", display_name: "proj", tool: "claude", last_used_at: "2026-01-01T00:00:00Z" }],
   }),
   fetchProjects: vi.fn().mockResolvedValue([]),
-  fetchProjectRegistry: vi.fn().mockResolvedValue([]),
+  listImportableSessions: vi.fn().mockResolvedValue({
+    ok: true,
+    truncated: false,
+    sessions: [
+      {
+        session_id: "native",
+        cwd: "/tmp/proj",
+        title: "Native title",
+        updated_at: "2020-01-01T00:00:00Z",
+        cwd_exists: true,
+      },
+    ],
+  }),
   createSession: (...args: unknown[]) => createSession(...args),
+  reviewCreationTrust: (...args: unknown[]) => reviewCreationTrust(...args),
 }));
 
 const INSTRUCTION_KEY = "aoe-new-session-last-instruction";
@@ -46,7 +68,22 @@ beforeEach(() => {
   vi.clearAllMocks();
   localStorage.clear();
   createSession.mockResolvedValue({ ok: true, session: { id: "s1" } });
+  reviewCreationTrust.mockResolvedValue({
+    ok: true,
+    review: {
+      fingerprint: FINGERPRINT,
+      merged_hooks: {
+        on_create: ["bash scripts/setup-worktree.sh"],
+        on_launch: ["npm start"],
+      },
+      repo_hooks: {},
+      mcp_summaries: [],
+      hooks_need_trust: true,
+      mcp_need_trust: false,
+    },
+  });
   vi.mocked(fetchIsGitRepo).mockImplementation(async (path) => path !== "/tmp/plain");
+  vi.mocked(fetchProjects).mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -54,12 +91,13 @@ afterEach(() => {
   localStorage.clear();
 });
 
-function renderWizard(prefill: WizardPrefill = { path: "/tmp/proj", tool: "claude" }) {
+function renderWizard(prefill: WizardPrefill = { path: "/tmp/proj", tool: "claude" }, servedProfile = "default") {
   const onCreated = vi.fn();
   const onClose = vi.fn();
   const onCreatedInBackground = vi.fn();
   render(
     <SessionWizard
+      servedProfile={servedProfile}
       onClose={onClose}
       onCreated={onCreated}
       onCreatedInBackground={onCreatedInBackground}
@@ -76,6 +114,60 @@ const launch = async () => {
   fireEvent.click(button);
 };
 const payload = (call = 0) => createSession.mock.calls[call]![0];
+
+describe("SessionWizard native import late defaults", () => {
+  it.each([true, false])(
+    "keeps a native import on the host after the original registry settles (success %s)",
+    async (success) => {
+      let resolveProjects!: (projects: Awaited<ReturnType<typeof fetchProjects>>) => void;
+      let resolveSettings!: (settings: Awaited<ReturnType<typeof fetchSettings>>) => void;
+      vi.mocked(fetchProjects).mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveProjects = resolve;
+          }),
+      );
+      vi.mocked(fetchSettings).mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveSettings = resolve;
+          }),
+      );
+      vi.mocked(fetchAgents).mockResolvedValueOnce([agent("claude", { acp_installed: true })]);
+      renderWizard({ path: "/tmp/proj", worktreeEnabled: true, sandboxEnabled: true });
+      fireEvent.click(screen.getByText("Project"));
+      fireEvent.click(await screen.findByRole("button", { name: "Import session" }));
+      fireEvent.click((await screen.findByText("Native title")).closest("button")!);
+      await act(async () => {
+        resolveProjects(
+          success
+            ? [
+                {
+                  name: "proj",
+                  path: "/tmp/proj",
+                  scope: "global",
+                  pinned: false,
+                  overrides: { worktree_enabled: true, sandbox_enabled: true },
+                },
+              ]
+            : null,
+        );
+        resolveSettings({ worktree: { enabled: true }, sandbox: { enabled_by_default: true } });
+      });
+      await launch();
+      await waitFor(() => expect(createSession).toHaveBeenCalledOnce());
+      expect(payload()).toMatchObject({
+        import_acp_session_id: "native",
+        path: "/tmp/proj",
+        sandbox: false,
+        worktree_enabled: false,
+      });
+      expect(payload().worktree_branch).toBeUndefined();
+      expect(payload().extra_repo_paths).toBeUndefined();
+      expect(payload().base_branch).toBeUndefined();
+    },
+  );
+});
 
 describe("SessionWizard structured view payload", () => {
   it.each([
@@ -162,6 +254,29 @@ describe("SessionWizard hooks trust", () => {
     await waitFor(() => expect(screen.getByTestId("hooks-trust-dialog")).toBeTruthy());
   };
 
+  it("renders redacted MCP summaries as inert review text", async () => {
+    const summary = 'project-search <img src=x onerror="window.__mcpXss=true">';
+    createSession.mockResolvedValueOnce(REFUSAL);
+    reviewCreationTrust.mockResolvedValueOnce({
+      ok: true,
+      review: {
+        fingerprint: FINGERPRINT,
+        merged_hooks: { on_create: [] },
+        repo_hooks: {},
+        mcp_summaries: [summary],
+        hooks_need_trust: false,
+        mcp_need_trust: true,
+      },
+    });
+    renderWizard();
+    await openDialog();
+
+    const list = screen.getByTestId("hooks-trust-list");
+    expect(list.textContent).toContain(summary);
+    expect(list.querySelector("img")).toBeNull();
+    expect((window as Window & { __mcpXss?: boolean }).__mcpXss).toBeUndefined();
+  });
+
   it("pauses on the trust dialog, then resubmits with trust_hooks on Proceed", async () => {
     createSession.mockResolvedValueOnce(REFUSAL).mockResolvedValueOnce({ ok: true, session: { id: "s1" } });
     const { onCreated } = renderWizard();
@@ -171,8 +286,56 @@ describe("SessionWizard hooks trust", () => {
     expect(payload()).not.toHaveProperty("trust_hooks", true);
     fireEvent.click(screen.getByTestId("hooks-trust-proceed"));
     await waitFor(() => expect(createSession).toHaveBeenCalledTimes(2));
-    expect(payload(1)).toMatchObject({ trust_hooks: true });
+    expect(payload(1)).toMatchObject({ trust_hooks: true, trust_review: FINGERPRINT });
     await waitFor(() => expect(onCreated).toHaveBeenCalledWith({ id: "s1" }));
+  });
+
+  it("re-reviews after creation_trust_changed instead of auto-approving", async () => {
+    const changed = {
+      ok: false,
+      error: "Repository hook configuration changed; review it again",
+      trustChanged: true,
+    };
+    createSession.mockResolvedValueOnce(REFUSAL).mockResolvedValueOnce(changed);
+    reviewCreationTrust
+      .mockResolvedValueOnce({
+        ok: true,
+        review: {
+          fingerprint: FINGERPRINT,
+          merged_hooks: { on_create: ["old"] },
+          repo_hooks: {},
+          mcp_summaries: [],
+          hooks_need_trust: true,
+          mcp_need_trust: false,
+        },
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        review: {
+          fingerprint: { ...FINGERPRINT, hooks_hash: "new" },
+          merged_hooks: { on_create: ["new reviewed command"] },
+          repo_hooks: {},
+          mcp_summaries: [],
+          hooks_need_trust: true,
+          mcp_need_trust: false,
+        },
+      });
+    renderWizard();
+    await openDialog();
+    fireEvent.click(screen.getByTestId("hooks-trust-proceed"));
+    await waitFor(() => expect(reviewCreationTrust).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByTestId("hooks-trust-list").textContent).toContain("new reviewed command"));
+    expect(createSession).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not submit an approval when the canonical review fails", async () => {
+    createSession.mockResolvedValueOnce(REFUSAL);
+    reviewCreationTrust.mockResolvedValueOnce({ ok: false, error: "review unavailable" });
+    renderWizard();
+    await launch();
+    await waitFor(() => expect(screen.getByText("review unavailable")).toBeTruthy());
+    expect(createSession).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId("hooks-trust-dialog")).toBeNull();
   });
 
   it("Cancel dismisses the dialog without a second submit", async () => {
@@ -195,6 +358,25 @@ describe("SessionWizard hooks trust", () => {
 });
 
 describe("SessionWizard rows", () => {
+  it.each([
+    ["sandbox_enabled", "Sandbox unavailable: settl runs on the host only"],
+    ["worktree_enabled", "Worktree unavailable: settl runs on the host only"],
+  ])("refuses a host-only agent with a seeded %s project override", async (field, message) => {
+    vi.mocked(fetchAgents).mockResolvedValueOnce([agent("settl", { host_only: true })]);
+    vi.mocked(fetchProjects).mockResolvedValueOnce([
+      {
+        name: "proj",
+        path: "/tmp/proj",
+        scope: "global",
+        pinned: false,
+        overrides: { [field]: true },
+      },
+    ]);
+    renderWizard({ path: "/tmp/proj", tool: "settl" });
+    await launch();
+    await screen.findByText(message + ". Turn it off to launch.");
+    expect(createSession).not.toHaveBeenCalled();
+  });
   const viewSwitch = () => screen.getByRole("switch", { name: "Use structured view" }) as HTMLButtonElement;
 
   it.each([
@@ -327,6 +509,7 @@ describe("SessionWizard under StrictMode", () => {
     render(
       <StrictMode>
         <SessionWizard
+          servedProfile="default"
           onClose={vi.fn()}
           onCreated={onCreated}
           onCreatedInBackground={onCreatedInBackground}
@@ -520,6 +703,7 @@ describe("SessionWizard unknown create outcome", () => {
     const onCreatedInBackground = vi.fn();
     const view = render(
       <SessionWizard
+        servedProfile="default"
         onClose={() => view.unmount()}
         onCreated={vi.fn()}
         onCreatedInBackground={onCreatedInBackground}
@@ -562,6 +746,189 @@ describe("SessionWizard unknown create outcome", () => {
   });
 });
 
+describe("SessionWizard served-profile authority", () => {
+  const profiles = [
+    { name: "Main", is_default: true },
+    { name: "Alpha", is_default: false },
+    { name: "Beta", is_default: false },
+  ];
+  const settings = (profile: string) => ({
+    session: { yolo_mode_default: profile === "Beta", agent_command_override: { claude: profile + "-claude" } },
+    worktree: { enabled: true },
+    acp: { default_new_session_view: "terminal" },
+  });
+  const open = (label: string) => fireEvent.click(screen.getByText(label).closest("button")!);
+  const chooseProfile = async (profile: string) => {
+    open("Profile");
+    fireEvent.click(screen.getByRole("radio", { name: profile === "" ? /Server default/ : new RegExp(profile) }));
+    await waitFor(() =>
+      expect(screen.getByRole("switch", { name: "Auto-approve actions" }).getAttribute("aria-checked")).toBe(
+        profile === "Beta" ? "true" : "false",
+      ),
+    );
+  };
+
+  it("scopes settings, remembered registry overrides, project and extra-repo suggestions to Alpha, including after Beta -> implicit", async () => {
+    vi.mocked(fetchProfiles).mockResolvedValueOnce(profiles as never);
+    vi.mocked(fetchSettings).mockImplementation(async (profile) => settings(profile ?? "Alpha"));
+    vi.mocked(fetchProjects).mockImplementation(
+      async ({ profile }) =>
+        [
+          {
+            name: profile + "-only-project",
+            path: "/" + profile.toLowerCase(),
+            scope: "profile",
+            pinned: false,
+          },
+        ] as never,
+    );
+    renderWizard({ path: "/tmp/proj", tool: "claude" }, "Alpha");
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("Alpha"));
+    await waitFor(() => expect(screen.getByText("Profile")).toBeTruthy());
+    await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith({ profile: "Alpha" }));
+    for (const profile of ["Alpha", "Beta", "Alpha"]) {
+      if (profile === "Beta") await chooseProfile("Beta");
+      else if (vi.mocked(fetchSettings).mock.calls.some(([p]) => p === "Beta")) await chooseProfile("");
+      fireEvent.click(screen.getByTestId("wizard-project-row"));
+      expect(await screen.findByText(profile + "-only-project")).toBeTruthy();
+      expect(screen.queryByText("Main-only-project")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Back", exact: true }));
+      open("Extra repos");
+      expect(await screen.findByText(profile + "-only-project")).toBeTruthy();
+      expect(screen.queryByText("Main-only-project")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Back", exact: true }));
+      fireEvent.click(screen.getByTestId("wizard-agent-row"));
+      expect(await screen.findByText(new RegExp(profile + "-claude"))).toBeTruthy();
+      fireEvent.click(screen.getByRole("button", { name: "Back", exact: true }));
+    }
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalled());
+    expect(payload().profile).toBeUndefined();
+    expect(payload().yolo_mode).toBe(false);
+    expect(vi.mocked(fetchSettings).mock.calls.some(([profile]) => profile === "Main")).toBe(false);
+    expect(vi.mocked(fetchProjects).mock.calls.some(([context]) => context.profile === "Main")).toBe(false);
+  });
+
+  it("does not let a delayed Alpha seed overwrite Beta selection, and keeps explicit prefill authority", async () => {
+    vi.mocked(fetchProfiles).mockResolvedValueOnce(profiles as never);
+    const seed = Promise.withResolvers<Awaited<ReturnType<typeof fetchSettings>>>();
+    vi.mocked(fetchSettings).mockImplementation(async (profile) =>
+      profile === "Alpha" ? seed.promise : settings(profile!),
+    );
+    renderWizard({ path: "/tmp/proj", tool: "claude" }, "Alpha");
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("Alpha"));
+    await waitFor(() => expect(screen.getByText("Profile")).toBeTruthy());
+    await chooseProfile("Beta");
+    await act(async () => seed.resolve(settings("Alpha")));
+    expect(screen.getByRole("switch", { name: "Auto-approve actions" }).getAttribute("aria-checked")).toBe("true");
+    await launch();
+    expect(payload()).toMatchObject({ profile: "Beta", yolo_mode: true });
+    cleanup();
+    createSession.mockClear();
+    renderWizard(
+      { path: "/tmp/proj", tool: "claude", profile: "Beta", yoloMode: false, worktreeEnabled: false },
+      "Alpha",
+    );
+    await launch();
+    expect(payload()).toMatchObject({ profile: "Beta", yolo_mode: false, worktree_enabled: false });
+  });
+
+  it("waits for served registry scope instead of guessing the machine default", async () => {
+    vi.mocked(fetchProfiles).mockResolvedValueOnce(profiles as never);
+    vi.mocked(fetchSettings).mockResolvedValue({});
+    const view = render(<SessionWizard onClose={() => {}} onCreated={() => {}} />);
+    await waitFor(() => expect(fetchProfiles).toHaveBeenCalled());
+    expect(fetchSettings).not.toHaveBeenCalled();
+    expect(fetchProjects).not.toHaveBeenCalled();
+    view.rerender(<SessionWizard servedProfile="Alpha" onClose={() => {}} onCreated={() => {}} />);
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("Alpha"));
+    await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith({ profile: "Alpha" }));
+  });
+
+  it("recovers a single served profile after an initial failure without reseeding dirty choices", async () => {
+    vi.mocked(fetchProfiles).mockResolvedValueOnce([{ name: "Alpha", is_default: false }] as never);
+    vi.mocked(fetchSettings).mockImplementation(async (profile) => settings(profile!));
+    let publish!: (profile: string) => void;
+    let attempts = 0;
+    const retry = vi.fn(async () => {
+      if (++attempts > 1) publish("Alpha");
+    });
+    function Harness() {
+      const [served, setServed] = useState<string>();
+      publish = setServed;
+      return (
+        <SessionWizard
+          servedProfile={served}
+          onRetryServedProfile={retry}
+          prefill={{ path: "/tmp/proj", tool: "claude" }}
+          onClose={() => {}}
+          onCreated={() => {}}
+        />
+      );
+    }
+    render(<Harness />);
+    const retryButton = await screen.findByRole("button", { name: "Retry server profile" });
+    await waitFor(() => expect(retryButton.hasAttribute("disabled")).toBe(false));
+    expect(screen.getByText(/Launch session/).closest("button")!.disabled).toBe(true);
+    expect(fetchSettings).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("switch", { name: "Auto-approve actions" }));
+    fireEvent.click(retryButton);
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalled());
+    expect(payload()).toMatchObject({ yolo_mode: true });
+    expect(payload().profile).toBeUndefined();
+    expect(fetchProjects).toHaveBeenCalledWith({ profile: "Alpha" });
+    expect(vi.mocked(fetchSettings).mock.calls.some(([profile]) => profile === "Main")).toBe(false);
+  });
+
+  it.each([false, true])(
+    "resolves Server default after explicit Beta and preserves newer view edits (%s)",
+    async (editWhilePending) => {
+      const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+      try {
+        vi.mocked(fetchProfiles).mockResolvedValueOnce(profiles as never);
+        const pending = Promise.withResolvers<SettingsResponse | null>();
+        vi.mocked(fetchSettings).mockImplementation(async (profile) =>
+          profile === "Alpha" ? pending.promise : settings(profile!),
+        );
+        let publish!: (profile: string) => void;
+        const retry = async () => publish("Alpha");
+        function Harness() {
+          const [served, setServed] = useState<string>();
+          publish = setServed;
+          return (
+            <SessionWizard
+              servedProfile={served}
+              onRetryServedProfile={retry}
+              prefill={{ path: "/tmp/proj", tool: "claude", profile: "Beta", yoloMode: true }}
+              onClose={() => {}}
+              onCreated={() => {}}
+            />
+          );
+        }
+        render(<Harness />);
+        const view = () => screen.getByRole("switch", { name: "Use structured view" });
+        await waitFor(() => expect(view().getAttribute("aria-checked")).toBe("false"));
+        fireEvent.click(view());
+        open("Profile");
+        fireEvent.click(screen.getByRole("radio", { name: /Server default/ }));
+        await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("Alpha"));
+        if (editWhilePending) {
+          fireEvent.click(view());
+          fireEvent.click(view());
+        }
+        await act(async () => pending.resolve(settings("Alpha")));
+        await launch();
+        await waitFor(() => expect(createSession).toHaveBeenCalled());
+        expect(payload()).toMatchObject({ yolo_mode: false, view: editWhilePending ? "structured" : "terminal" });
+        expect(payload().profile).toBeUndefined();
+        expect(confirmSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        confirmSpy.mockRestore();
+      }
+    },
+  );
+});
 // #4517: only a sandboxed launch has to wait on the Docker probe.
 describe("SessionWizard Docker readiness", () => {
   const launchButton = () => screen.getByText(/Launch session/).closest("button") as HTMLButtonElement;

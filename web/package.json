@@ -8,7 +8,7 @@
     "build": "tsc -b && vite build",
     "format": "oxfmt .",
     "format:check": "oxfmt --check .",
-    "lint": "eslint .",
+    "lint": "eslint . && node scripts/check-env-isolation.mjs",
     "typecheck:tests": "tsc -p tsconfig.tests.json",
     "preview": "vite preview",
     "test": "playwright test",

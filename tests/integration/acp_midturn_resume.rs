@@ -67,6 +67,9 @@ async fn attach_in_flight_synthesizes_reattach_idle_stopped() {
         None,
         "claude".into(),
         None,
+        None,
+        None,
+        None,
     )
     .await
     .expect("attach in_flight=true");
@@ -109,6 +112,9 @@ async fn attach_idle_session_does_not_synthesize_stopped() {
         AcpSessionId("midturn-false".into()),
         None,
         "claude".into(),
+        None,
+        None,
+        None,
         None,
     )
     .await
@@ -172,6 +178,9 @@ async fn attach_in_flight_disarms_after_first_inbound_notification() {
         AcpSessionId("midturn-disarm".into()),
         None,
         "claude".into(),
+        None,
+        None,
+        None,
         None,
     )
     .await
@@ -324,6 +333,9 @@ async fn replay_completion_after_disconnect(session: &str, in_flight_turn: bool)
         None,
         "claude".into(),
         None,
+        None,
+        None,
+        None,
     )
     .await
     .expect("resume after detached completion");
@@ -345,6 +357,9 @@ async fn replay_completion_after_disconnect(session: &str, in_flight_turn: bool)
         AcpSessionId(session.into()),
         None,
         "claude".into(),
+        None,
+        None,
+        None,
         None,
     )
     .await

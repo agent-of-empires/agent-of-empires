@@ -23,6 +23,8 @@ use crate::cli::status::{self, VERBOSE_GROUPS};
 pub(crate) struct Projection {
     pub stdout: String,
     pub session_table: bool,
+    pub stderr: Option<String>,
+    pub exit: i32,
 }
 
 impl Projection {
@@ -30,6 +32,8 @@ impl Projection {
         Self {
             stdout,
             session_table: false,
+            stderr: None,
+            exit: 0,
         }
     }
 }
@@ -153,30 +157,48 @@ fn render_list(
         if !snapshot.profiles.iter().any(|profile| profile.listed) {
             return Ok(Projection::text("No profiles found.\n".into()));
         }
+        let mut stderr = String::new();
         if args.json {
             let systemd_active = local_peer && list::systemd_scopes_active();
             let mut rows = Vec::new();
-            for profile in snapshot
-                .profiles
-                .iter()
-                .filter(|profile| profile.listed && profile_sessions_healthy(profile))
-            {
+            for profile in snapshot.profiles.iter().filter(|profile| profile.listed) {
+                if !profile_sessions_healthy(profile) {
+                    let _ = writeln!(
+                        stderr,
+                        "warning: profile '{}': unavailable for this listing",
+                        terminal_text(&profile.name)
+                    );
+                    continue;
+                }
                 for session in sessions_for_profile(snapshot, &profile.name)
                     .filter(|session| matches_state(session.state, state))
                 {
                     rows.push(session_json(session, &profile.name, systemd_active)?);
                 }
             }
-            return json_lines(&rows).map(Projection::text);
+            let incomplete = !stderr.is_empty();
+            if incomplete {
+                stderr.push_str("Error: the listing is incomplete\n");
+            }
+            return Ok(Projection {
+                stdout: json_lines(&rows)?,
+                session_table: false,
+                stderr: incomplete.then_some(stderr),
+                exit: i32::from(incomplete),
+            });
         }
         let show_state = state == StateFilter::All;
         let mut output = String::new();
         let mut total = 0usize;
-        for profile in snapshot
-            .profiles
-            .iter()
-            .filter(|profile| profile.listed && profile_sessions_healthy(profile))
-        {
+        for profile in snapshot.profiles.iter().filter(|profile| profile.listed) {
+            if !profile_sessions_healthy(profile) {
+                let _ = writeln!(
+                    stderr,
+                    "warning: profile '{}': unavailable for this listing",
+                    terminal_text(&profile.name)
+                );
+                continue;
+            }
             let sessions: Vec<&SessionRead> = sessions_for_profile(snapshot, &profile.name)
                 .filter(|session| matches_state(session.state, state))
                 .collect();
@@ -205,7 +227,12 @@ fn render_list(
             "\n═══════════════════════════════════════\nTotal: {total} sessions across {} profiles\n",
             snapshot.profiles.iter().filter(|profile| profile.listed).count()
         ));
-        return Ok(Projection::text(output));
+        return Ok(Projection {
+            stdout: output,
+            session_table: false,
+            stderr: (!stderr.is_empty()).then_some(stderr),
+            exit: 0,
+        });
     }
 
     let (profile_name, profile) = selected_profile(snapshot, source)?;
@@ -244,6 +271,8 @@ fn render_list(
     Ok(Projection {
         stdout: output,
         session_table: true,
+        stderr: None,
+        exit: 0,
     })
 }
 
@@ -381,6 +410,8 @@ fn render_status(
         return Ok(Projection {
             stdout: output,
             session_table: true,
+            stderr: None,
+            exit: 0,
         });
     }
     let summary = if counts.stopped > 0 {
@@ -397,6 +428,8 @@ fn render_status(
     Ok(Projection {
         stdout: summary,
         session_table: true,
+        stderr: None,
+        exit: 0,
     })
 }
 
@@ -1135,7 +1168,6 @@ mod tests {
         std::fs::write(manager.path().join("systemd/private"), "").unwrap();
         let _env = crate::session::test_support::EnvGuard::unset(&["DBUS_SESSION_BUS_ADDRESS"])
             .and_set("XDG_RUNTIME_DIR", manager.path());
-        crate::session::config::update_config(|config| config.systemd.enabled = true).unwrap();
         let cases = [
             (WireStatus::Running, WireState::Live, true),
             (WireStatus::Stopped, WireState::Live, false),
@@ -1155,35 +1187,41 @@ mod tests {
             })
             .collect();
         let value = snapshot(rows);
-        for all in [false, true] {
-            for local in [false, true] {
-                let args = ListArgs {
-                    json: true,
-                    all,
-                    state: StateFilter::All,
-                };
-                let projection = evaluate(
-                    &ScopedCommand::List(&args),
-                    &value,
-                    &source(),
-                    local.then_some(Path::new("/owned-home")),
-                )
+        for enabled in [false, true] {
+            crate::session::config::update_config(|config| config.systemd.enabled = enabled)
                 .unwrap();
-                let rendered: serde_json::Value = serde_json::from_str(&projection.stdout).unwrap();
-                for (index, (_, _, eligible)) in cases.iter().enumerate() {
-                    assert_eq!(
-                        rendered[index]
-                            .get("systemd_unit")
-                            .and_then(serde_json::Value::as_str),
-                        (local && *eligible)
-                            .then(|| format!("aoe-session-row{index}-*.scope"))
-                            .as_deref(),
-                        "all={all}, local={local}, row={index}"
-                    );
+            for all in [false, true] {
+                for local in [false, true] {
+                    let args = ListArgs {
+                        json: true,
+                        all,
+                        state: StateFilter::All,
+                    };
+                    let projection = evaluate(
+                        &ScopedCommand::List(&args),
+                        &value,
+                        &source(),
+                        local.then_some(Path::new("/owned-home")),
+                    )
+                    .unwrap();
+                    let rendered: serde_json::Value =
+                        serde_json::from_str(&projection.stdout).unwrap();
+                    for (index, (_, _, eligible)) in cases.iter().enumerate() {
+                        assert_eq!(
+                            rendered[index]
+                                .get("systemd_unit")
+                                .and_then(serde_json::Value::as_str),
+                            (enabled && local && *eligible)
+                                .then(|| format!("aoe-session-row{index}-*.scope"))
+                                .as_deref(),
+                            "all={all}, local={local}, row={index}"
+                        );
+                    }
                 }
             }
         }
     }
+
     #[test]
     fn status_flags_preserve_json_then_quiet_then_verbose_precedence() {
         use clap::Parser;
@@ -1685,7 +1723,7 @@ mod tests {
         ProjectRead {
             name: name.into(),
             path: path.to_string_lossy().to_string(),
-            merge_key: crate::session::projects::canonical_key(&path.to_string_lossy()),
+            merge_key: crate::session::projects::canonical_key(path.to_string_lossy()),
             scope,
             default_base_branch: None,
             registered: true,
@@ -1699,14 +1737,21 @@ mod tests {
         for row in &mut rows {
             row.source_profile = profile.into();
         }
-        recorded_rows(&rows)
+        recorded_rows(&rows, crate::server::runtime_ws::RecordedOwner::Remote)
     }
 
-    fn recorded_rows(rows: &[crate::session::Instance]) -> SnapshotData {
-        use crate::server::runtime_ws::{record_exchange, RecordedOwner, RecordingPins};
+    fn recorded_rows(
+        rows: &[crate::session::Instance],
+        owner: crate::server::runtime_ws::RecordedOwner,
+    ) -> SnapshotData {
+        use crate::server::runtime_ws::{record_exchange, RecordingPins};
+        let expected_uid = match owner {
+            crate::server::runtime_ws::RecordedOwner::Local { uid } => Some(uid),
+            crate::server::runtime_ws::RecordedOwner::Remote => None,
+        };
         let frames = record_exchange(
             rows,
-            RecordedOwner::Remote,
+            owner,
             &RecordingPins {
                 runtime_epoch: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
                 prebind_instance_id: "bbbbbbbb-cccc-dddd-eeee-ffffffffffff".into(),
@@ -1718,7 +1763,7 @@ mod tests {
         let snapshot = super::super::dto::parse_snapshot(&frames.snapshot).unwrap();
         super::super::dto::validate_hello(&hello).unwrap();
         super::super::dto::validate_snapshot(&snapshot).unwrap();
-        super::super::dto::validate_cross_message(&hello, &snapshot, None).unwrap();
+        super::super::dto::validate_cross_message(&hello, &snapshot, expected_uid).unwrap();
         snapshot
     }
 
@@ -1912,7 +1957,7 @@ mod tests {
             .to_path_buf();
         std::os::unix::fs::symlink(outside.path(), root.join("outside")).unwrap();
         std::os::unix::fs::symlink(outside.path(), root.join("outside-other")).unwrap();
-        let external = crate::session::Storage::open_unwatched("outside").unwrap();
+        let external = crate::session::Storage::open_reference("outside").unwrap();
         let mut rows = Vec::new();
         for (profile, storage, status, path) in [
             ("main", main, crate::session::Status::Waiting, "/canonical"),
@@ -1960,7 +2005,7 @@ mod tests {
             }
             rows.extend(loaded);
         }
-        let value = recorded_rows(&rows);
+        let value = recorded_rows(&rows, crate::server::runtime_ws::RecordedOwner::Remote);
         let args = ListArgs {
             json: true,
             all: false,

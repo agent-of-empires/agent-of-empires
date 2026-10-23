@@ -6,9 +6,7 @@ mod split;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use crate::file_watch::FileWatchService;
 use crate::git::diff::{
     check_merge_base_status, compute_changed_files, compute_file_contents, compute_file_diff,
     get_default_base_ref, list_branches, DiffFile, FileContents, FileDiff, FileStatus,
@@ -102,13 +100,17 @@ pub struct DiffView {
     /// Warning dialog shown when merge-base can't be computed
     pub(crate) warning_dialog: Option<InfoDialog>,
 
-    /// Override that has been persisted to disk but not yet propagated
-    /// back to HomeView's in-memory `Instance.base_branch_override`.
-    /// HomeView consumes this after each key event via
-    /// `take_pending_override` and applies it to its cache; without
-    /// this hand-off, HomeView's next `commit` would overwrite the
-    /// disk value with its stale memory copy. See #1175.
+    /// Staged for HomeView to submit through the runtime after keyboard or mouse input.
     pub(crate) pending_override: Option<(String, Option<String>)>,
+    pub(crate) saved_base_branch: String,
+    pub(crate) base_save_epoch: Option<String>,
+    pub(crate) base_save_branch: Option<String>,
+    pub(crate) base_save: Option<
+        tokio::sync::oneshot::Receiver<
+            Result<crate::daemon::RuntimeCursor, crate::tui::session_feed::CommandFailure>,
+        >,
+    >,
+    pub(crate) base_unsaved: bool,
 
     /// Inner rect of the file-list panel, captured during `render`.
     /// Lets a click on a file row select it and a hover highlight it
@@ -119,11 +121,6 @@ pub struct DiffView {
     /// Keeps keyboard selection and mouse clicks aligned when the file list is
     /// taller than the visible panel.
     pub(crate) file_list_scroll_offset: usize,
-
-    /// Process-wide file-watch primitive, threaded through to per-session
-    /// `Storage` writes so the local in-process Local fast path fires when
-    /// the diff view persists a `base_branch_override`.
-    pub(crate) file_watch: Arc<FileWatchService>,
 }
 
 impl DiffView {
@@ -131,23 +128,21 @@ impl DiffView {
     /// branch through the picker only mutates in-memory state. Callers
     /// that have a session id should use `new_for_session` so the
     /// override persists.
-    pub fn new(repo_path: PathBuf, file_watch: Arc<FileWatchService>) -> anyhow::Result<Self> {
-        Self::new_for_session(repo_path, None, String::new(), None, None, file_watch)
+    pub fn new(repo_path: PathBuf) -> anyhow::Result<Self> {
+        Self::new_for_session(repo_path, None, String::new(), None, None)
     }
 
     /// Create a diff view bound to a session. `base_override` (the
     /// session's persisted `base_branch_override`) wins over the
     /// worktree's recorded base branch (`worktree_base`), which wins
-    /// over the profile default and auto-detection. Subsequent calls
-    /// to `select_branch` persist the new ref back to the session
-    /// record.
+    /// over the profile default and auto-detection. A later
+    /// `select_branch` stages the new ref for the owner to persist.
     pub fn new_for_session(
         repo_path: PathBuf,
         session_id: Option<String>,
         profile: String,
         base_override: Option<String>,
         worktree_base: Option<String>,
-        file_watch: Arc<FileWatchService>,
     ) -> anyhow::Result<Self> {
         // Use the profile-merged config so a per-profile Diff override (e.g.
         // split_view) is honored on open. The session-agnostic path (empty
@@ -184,7 +179,7 @@ impl DiffView {
             repo_path,
             session_id,
             profile,
-            base_branch,
+            base_branch: base_branch.clone(),
             files: Vec::new(),
             selected_file: 0,
             diff_cache: HashMap::new(),
@@ -203,9 +198,13 @@ impl DiffView {
             file_list_width: config.app_state.diff_file_list_width.unwrap_or(35),
             warning_dialog,
             pending_override: None,
+            saved_base_branch: base_branch,
+            base_save_epoch: None,
+            base_save_branch: None,
+            base_save: None,
+            base_unsaved: false,
             file_list_inner: ratatui::layout::Rect::default(),
             file_list_scroll_offset: 0,
-            file_watch,
         };
 
         view.refresh_files()?;
@@ -361,42 +360,80 @@ impl DiffView {
     /// comparison. Persistence failures only surface as a soft error
     /// message; the in-memory switch still applies. See #970.
     pub fn select_branch(&mut self, branch: String) {
+        self.base_unsaved = self.session_id.is_some();
         self.base_branch = branch;
         self.branch_select = None;
         self.warning_dialog = check_merge_base_status(&self.repo_path, &self.base_branch)
             .map(|msg| InfoDialog::new("Warning", &msg));
-        if let Err(e) = self.persist_base_override() {
-            self.error_message = Some(format!("Failed to persist base branch: {e}"));
+        if let Err(e) = self.stage_base_override() {
+            self.error_message = Some(format!("Failed to stage base branch: {e}"));
         }
         if let Err(e) = self.refresh_files() {
             self.error_message = Some(format!("Failed to refresh: {}", e));
         }
     }
 
-    fn persist_base_override(&mut self) -> anyhow::Result<()> {
+    /// Stage a base branch for HomeView; this view never writes session storage.
+    fn stage_base_override(&mut self) -> anyhow::Result<()> {
         let Some(session_id) = self.session_id.clone() else {
             return Ok(());
         };
-        let storage = crate::session::Storage::new(&self.profile, self.file_watch.clone())?;
-        let new_override = Some(self.base_branch.clone());
-        let id_for_closure = session_id.clone();
-        let new_override_for_closure = new_override.clone();
-        storage.update(|instances, _groups| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == id_for_closure) {
-                inst.base_branch_override = new_override_for_closure;
-            }
-            Ok(())
-        })?;
-        self.pending_override = Some((session_id, new_override));
+        self.pending_override = Some((session_id, Some(self.base_branch.clone())));
         Ok(())
     }
 
-    /// Drain a pending base-branch override that was just persisted to
-    /// disk. HomeView calls this after each key event so its in-memory
-    /// `Instance.base_branch_override` stays consistent with disk;
-    /// otherwise its next `commit` would overwrite the persisted value.
+    /// Consume the staged override exactly once for runtime submission.
     pub fn take_pending_override(&mut self) -> Option<(String, Option<String>)> {
         self.pending_override.take()
+    }
+    pub(crate) fn base_not_saved(&mut self, message: &str) {
+        self.base_unsaved = true;
+        self.warning_dialog = Some(InfoDialog::sized_to_fit(
+            "Diff Base Not Saved",
+            &format!("{message}\n\nComparison remains an unsaved draft. Choose the branch again to save after resolving the refusal."),
+        ));
+    }
+
+    pub(crate) fn poll_base_save(
+        &mut self,
+        epoch: Option<&str>,
+        canonical_base: Option<&str>,
+    ) -> bool {
+        let Some(receiver) = &mut self.base_save else {
+            return false;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return false,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Err(
+                crate::tui::session_feed::CommandFailure::Unknown("Save interrupted; outcome unknown. Resolve the row quarantine before submitting again.".into()),
+            ),
+        };
+        self.base_save = None;
+        match result {
+            Ok(cursor)
+                if self.base_save_epoch.as_deref() == Some(cursor.epoch.as_str())
+                    && epoch == Some(cursor.epoch.as_str()) =>
+            {
+                if let Some(branch) = self.base_save_branch.take() {
+                    self.saved_base_branch = branch;
+                }
+                self.base_unsaved = self.base_branch != self.saved_base_branch
+                    || canonical_base != Some(self.saved_base_branch.as_str());
+            }
+            Ok(_) => {
+                self.base_not_saved("Runtime epoch changed; save confirmation cannot be used.")
+            }
+            Err(crate::tui::session_feed::CommandFailure::Rejected(message)) => {
+                self.base_not_saved(&message)
+            }
+            Err(crate::tui::session_feed::CommandFailure::Unknown(message)) => {
+                self.base_not_saved(&format!("Outcome unknown: {message}"))
+            }
+        }
+        self.base_save_epoch = None;
+        self.base_save_branch = None;
+        true
     }
 
     pub fn next_file(&mut self) {
@@ -536,9 +573,13 @@ impl DiffView {
             file_list_width: 35,
             warning_dialog: None,
             pending_override: None,
+            saved_base_branch: "main".to_string(),
+            base_save_epoch: None,
+            base_save_branch: None,
+            base_save: None,
+            base_unsaved: false,
             file_list_inner: ratatui::layout::Rect::default(),
             file_list_scroll_offset: 0,
-            file_watch: FileWatchService::noop(),
         }
     }
 }

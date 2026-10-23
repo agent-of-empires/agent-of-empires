@@ -5,11 +5,12 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test, expect } from "../helpers/liveTest";
-import { SYSTEMD_OFF, appDirFor, listSessions, resolveAoeBinary, waitForView } from "../helpers/aoeServe";
+import { SYSTEMD_OFF, appDirFor, listSessions, resolveAoeBinary } from "../helpers/aoeServe";
 import {
   postAcp,
   replayJson,
   seedAcpSession,
+  waitForAcpReady,
   spawnAcpAgent,
   startAcpSession,
   waitForReplayContains,
@@ -52,20 +53,34 @@ test("view switch round-trips between tmux and structured view", async ({ spawnS
   }
 });
 
-test("DELETE /acp shuts the worker down with 204 / 404", async ({ spawnServe }) => {
+test("DELETE /acp refuses terminal view and durably stops a structured worker", async ({ spawnServe }) => {
   const { serve, sessionId } = await seedAcpSession(spawnServe, { title: "acp-shutdown" });
   const shutdown = () => fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp`, { method: "DELETE" });
-  // A boot-time reconcile may already have a pending spawn, so either status is valid before enable.
-  expect([204, 404]).toContain((await shutdown()).status);
+  expect((await shutdown()).status).toBe(409);
+  expect(await isStructured(serve.baseUrl, sessionId)).toBeFalsy();
 
-  // Enable spawns asynchronously; retry until the worker entry exists.
-  await postAcp(serve.baseUrl, sessionId, "/enable");
-  await expect.poll(async () => (await shutdown()).status, { timeout: 5_000, intervals: [200] }).toBe(204);
+  expect((await postAcp(serve.baseUrl, sessionId, "/enable")).ok).toBeTruthy();
+  await waitForAcpReady(serve.baseUrl, sessionId, 30_000, serve.home);
+  expect((await shutdown()).status).toBe(204);
 
-  // Unlike disable, shutdown keeps the structured view flag.
-  await waitForView(serve.baseUrl, sessionId, "structured");
-  // The reconciler may respawn a structured session, so a repeat can be either.
-  expect([204, 404]).toContain((await shutdown()).status);
+  const stoppedState = async () => {
+    const session = (await listSessions(serve.baseUrl)).find((s) => s.id === sessionId);
+    return { view: session?.view, status: session?.status, worker: session?.acp_worker_state };
+  };
+  const stopped = { view: "structured", status: "Stopped", worker: "absent" };
+  await expect.poll(stoppedState).toEqual(stopped);
+
+  // User stop survives daemon reconstruction; only an explicit start may resume it.
+  await serve.restart();
+  await expect.poll(stoppedState).toEqual(stopped);
+  expect((await shutdown()).status).toBe(204);
+  await expect.poll(stoppedState).toEqual(stopped);
+
+  const start = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/start`, { method: "POST" });
+  expect(start.ok).toBeTruthy();
+  await waitForAcpReady(serve.baseUrl, sessionId, 30_000, serve.home);
+  expect((await shutdown()).status).toBe(204);
+  await expect.poll(stoppedState).toEqual(stopped);
 });
 
 test("session/mode round-trips through the fake ACP agent", async ({ spawnServe }) => {
@@ -161,12 +176,6 @@ test("custom agent with agent_acp_cmd runs in structured view", async ({ spawnSe
         `[session.custom_agents]\n"oc-acp" = "true"\n"oc-terminal" = "true"\n\n[session.agent_acp_cmd]\n"oc-acp" = "true acp"\n\n${SYSTEMD_OFF}`,
       );
     },
-  });
-  // Guards against the master atomic not seeding from config at boot.
-  await fetch(`${serve.baseUrl}/api/acp/master`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ enabled: true }),
   });
 
   const agentsRes = await fetch(`${serve.baseUrl}/api/agents`);

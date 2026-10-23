@@ -13,23 +13,10 @@ impl HomeView {
     /// Switch the active profile filter in-place without destroying the view.
     /// Pass `None` for all-profiles mode, or `Some(name)` to filter to one profile.
     pub fn switch_profile(&mut self, new_profile: Option<String>) -> anyhow::Result<()> {
-        self.active_profile = new_profile;
-        if let Some(profile) = self.active_profile.clone() {
-            if !self.storages.contains_key(&profile) {
-                self.storages.insert(
-                    profile.clone(),
-                    Storage::new(&profile, self.file_watch.clone())?,
-                );
-            }
-            self.storages.retain(|name, _| name == &profile);
-            self.rewire_disk_subscriptions(std::slice::from_ref(&profile));
+        if self.active_profile != new_profile {
+            self.cancel_native_attachment();
         }
-        // Reconcile config-watch subscriptions explicitly so this contract
-        // is local to switch_profile rather than implicit through
-        // reload_storage_only's transitive call. Idempotent set-diff: the
-        // global subscription is install-once and per-profile entries
-        // converge to the on-disk profile set; redundant invocations are
-        // no-ops.
+        let previous_profile = std::mem::replace(&mut self.active_profile, new_profile);
         let config_targets = match crate::session::list_profiles() {
             Ok(profiles) => profiles,
             Err(e) => {
@@ -44,11 +31,33 @@ impl HomeView {
             }
         };
         self.rewire_config_subscriptions(&config_targets);
-        // Clear selection before reload so stale session/group refs don't linger
+        let projection = if let Some(snapshot) = self.session_feed.applied_snapshot() {
+            self.apply_canonical_projection(&snapshot, true)
+        } else {
+            // Before attachment there is no acknowledged runtime frame to reconstruct.
+            (|| -> anyhow::Result<()> {
+                if let Some(profile) = self.active_profile.clone() {
+                    if !self.storages.contains_key(&profile) {
+                        self.storages.insert(
+                            profile.clone(),
+                            Storage::open(&profile, self.file_watch.clone())?,
+                        );
+                    }
+                    self.storages.retain(|name, _| name == &profile);
+                    self.rewire_disk_subscriptions(std::slice::from_ref(&profile));
+                }
+                self.load_storage_projection()
+            })()
+        };
+        if let Err(error) = projection {
+            self.active_profile = previous_profile;
+            return Err(error);
+        }
         self.selected_session = None;
         self.selected_group = None;
         self.selected_group_profile = None;
-        self.reload()?;
+        self.rebuild_flat_items_keeping_cursor();
+        self.update_selected();
         self.refresh_from_config(ConfigRefreshOrigin::Interactive);
         // Invalidate preview caches since the visible sessions changed
         self.preview_cache = PreviewCache::default();

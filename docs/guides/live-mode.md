@@ -10,6 +10,12 @@ Control chords reach the agent: `Ctrl+C` interrupts it rather than quitting AoE,
 
 Live send works for the Terminal and Tool views too, not just the agent pane: whichever pane is on screen is what your keystrokes reach. Turning on **Auto Live-Send On View Switch** (Interaction settings, off by default) starts the relay as soon as you switch views.
 
+A foreground pane preparation may wait behind that session's accepted access
+stamp or unread clearing. It is submitted once after the write is acknowledged
+and current canonical state is applied. Changing context or authority cancels
+the continuation. Other pending lifecycle changes still refuse preparation;
+failed or unknown writes are not retried.
+
 Mouse input is forwarded when the pane on screen is a full-screen app that asked for it, so clicks, drags, and the wheel reach tools like lazygit and yazi, and an agent that tracks the pointer receives hover motion. Hold `Shift` to bypass forwarding and use AoE's own selection and copy.
 
 Links in the preview are underlined, and a plain click opens one in your browser, ahead of that forwarding, whenever the preview is on screen. Both a marked-up hyperlink and a bare URL count. Only web links open unless you allow more with [`preview_link_prefixes`](configuration.md#session): with `vscode://file/` allowed, a marked-up hyperlink to `vscode://file/<absolute path>` (optionally `:line` or `:line:column`) opens that file in VS Code. Resting the pointer on one shows its target in the status bar, which is worth a glance: a link's visible text is chosen by whatever is running in the pane. AoE also passes the link to your terminal, so hovering highlights it and your terminal's own gesture still works (and emulators that claim shifted clicks, such as WezTerm and iTerm2, take those before AoE sees them).

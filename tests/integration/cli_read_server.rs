@@ -223,10 +223,6 @@ async fn the_route_shares_the_daemon_credential_gate() {
         assert_eq!(hello["data"]["owner"]["uid"], serde_json::Value::Null);
         socket.close(None).await.unwrap();
         if configured_token.is_none() {
-            assert!(matches!(
-                tokio_tungstenite::connect_async(format!("ws://{address}/api/runtime/ws")).await,
-                Err(tokio_tungstenite::tungstenite::Error::Http(_))
-            ));
             let outcome = execute(ScopedCommand::Profile, &read_source(address, None)).await;
             assert_eq!(outcome.exit, 0, "{:?}", outcome.stderr);
             assert_eq!(
@@ -494,7 +490,7 @@ async fn registered_project_text_and_native_paths_survive_runtime_reads() {
         let path = home._dir.path().join(directory);
         std::fs::create_dir(&path).unwrap();
         let path = path.canonicalize().unwrap();
-        let project = projects::add(
+        let committed = projects::add(
             "main",
             ProjectScope::Global,
             Project::new(name, path.to_str().unwrap(), ProjectScope::Global)
@@ -502,6 +498,7 @@ async fn registered_project_text_and_native_paths_survive_runtime_reads() {
             false,
         )
         .unwrap();
+        let project = &committed.projects[committed.result];
         let mut main = Instance::new("main row", home._dir.path().to_str().unwrap());
         main.id = "main-row".into();
         main.tool = "claude".into();

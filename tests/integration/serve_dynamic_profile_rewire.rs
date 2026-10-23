@@ -15,12 +15,11 @@
 
 use std::path::PathBuf;
 use std::process::{Child, Command};
-use std::sync::Arc;
 use std::time::Duration;
 
 use agent_of_empires::server::test_support::{
-    add_profile_disk_watch, build_test_app_state, disk_watch_handle_count, has_disk_watch_handle,
-    rename_profile_disk_watch,
+    add_profile_disk_watch, build_test_app_state_configured, disk_watch_handle_count,
+    has_disk_watch_handle, rename_profile_disk_watch,
 };
 use serial_test::serial;
 use tempfile::TempDir;
@@ -35,11 +34,10 @@ async fn dynamic_profile_rewire_overwrite_replaces_existing_subscription() {
     let _home = set_temp_home(temp.path());
     let _ = agent_of_empires::session::get_profile_dir("rewire-profile").expect("profile dir");
 
-    let state = build_test_app_state(Vec::new());
     let live = agent_of_empires::file_watch::test_support::new_filewatch().expect("live svc");
-    let mut state_mut = Arc::try_unwrap(state).map_err(|_| ()).expect("unique");
-    agent_of_empires::server::test_support::replace_file_watch(&mut state_mut, live);
-    let state = Arc::new(state_mut);
+    let state = build_test_app_state_configured(Vec::new(), |state| {
+        agent_of_empires::server::test_support::replace_file_watch(state, live);
+    });
 
     add_profile_disk_watch(&state, "rewire-profile").await;
     assert_eq!(
@@ -73,11 +71,10 @@ async fn rewire_after_rename_drops_old_subscribes_new() {
     let _ = agent_of_empires::session::get_profile_dir("rename-old").expect("profile dir");
     let _ = agent_of_empires::session::get_profile_dir("rename-new").expect("profile dir");
 
-    let state = build_test_app_state(Vec::new());
     let live = agent_of_empires::file_watch::test_support::new_filewatch().expect("live svc");
-    let mut state_mut = Arc::try_unwrap(state).map_err(|_| ()).expect("unique");
-    agent_of_empires::server::test_support::replace_file_watch(&mut state_mut, live);
-    let state = Arc::new(state_mut);
+    let state = build_test_app_state_configured(Vec::new(), |state| {
+        agent_of_empires::server::test_support::replace_file_watch(state, live);
+    });
 
     add_profile_disk_watch(&state, "rename-old").await;
     assert!(
@@ -187,12 +184,206 @@ async fn list_profiles(client: &reqwest::Client, daemon: &ServeDaemon) -> Vec<St
     parsed.into_iter().map(|p| p.name).collect()
 }
 
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn permanent_scratch_delete_cancels_an_unanswered_initialize() {
+    use std::os::unix::fs::PermissionsExt;
+    let daemon = ServeDaemon::spawn_with_scopes(cfg!(target_os = "linux"));
+    let _home = set_temp_home(daemon.home.path());
+    agent_of_empires::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .unwrap();
+    let marker = daemon.home.path().join("initialize-observed");
+    let escaped_marker = daemon.home.path().join("escapee-pid");
+    let adapter = daemon.home.path().join("silent-acp-adapter");
+    std::fs::write(
+        &adapter,
+        format!(
+            "#!/bin/sh\nIFS= read -r request\nif [ '{}' = true ]; then setsid sleep 120 & printf '%s' \"$!\" > '{}'; fi\nprintf '%s\n' \"$request\" > '{}.pending'\nmv '{}.pending' '{}'\nexec sleep 120\n",
+            cfg!(target_os = "linux"), escaped_marker.display(), marker.display(), marker.display(), marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let client = reqwest::Client::new();
+    let profile = client
+        .post(daemon.url("/api/profiles"))
+        .json(&serde_json::json!({"name": "scratch-cancellation"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(profile.status().as_u16(), 201);
+    let created = client
+        .post(daemon.url("/api/sessions"))
+        .json(&serde_json::json!({
+            "title": "unanswered initialize", "path": "", "tool": "gemini", "view": "structured",
+            "scratch": true, "profile": "scratch-cancellation", "command_override": adapter,
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = created.status();
+    let created: serde_json::Value = created.json().await.unwrap();
+    assert_eq!(status.as_u16(), 201, "{created}");
+    let id = created["id"].as_str().unwrap();
+    let scratch = daemon.app_dir().join("scratch").join(id);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !marker.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the actual adapter must receive initialize");
+    let request = std::fs::read_to_string(&marker).unwrap();
+    assert!(request.contains("initialize"), "{request}");
+    let record = agent_of_empires::process::worker_registry::load(id)
+        .unwrap()
+        .unwrap();
+    struct RetireOnDrop {
+        pid: u32,
+        unit: Option<String>,
+        slice: Option<String>,
+    }
+    impl Drop for RetireOnDrop {
+        fn drop(&mut self) {
+            agent_of_empires::process::worker::kill_process_group(self.pid);
+            if let Some(unit) = &self.unit {
+                let mut stop = Command::new("systemctl");
+                stop.args(["--user", "stop", unit]);
+                if let Some(slice) = &self.slice {
+                    stop.arg(slice);
+                }
+                let _ = stop.output();
+            }
+        }
+    }
+    let unit = match &record.scope {
+        agent_of_empires::process::worker_registry::ScopeOwnership::Owned { unit } => {
+            Some(unit.clone())
+        }
+        _ => None,
+    };
+    let _runner = RetireOnDrop {
+        pid: record.pid,
+        unit: unit.clone(),
+        slice: daemon.scope_slice.clone(),
+    };
+    let escaped = if cfg!(target_os = "linux") {
+        let unit = unit
+            .as_ref()
+            .expect("available user manager must actually scope this native runner");
+        let escaped: u32 = std::fs::read_to_string(&escaped_marker)
+            .unwrap()
+            .parse()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(escaped as i32)))
+                .unwrap()
+                .as_raw()
+                == record.pid as i32
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the real child must actually escape its runner group");
+        for pid in [record.pid, escaped] {
+            let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
+            assert!(
+                cgroup.contains(unit) && cgroup.contains(daemon.scope_slice.as_ref().unwrap()),
+                "{pid}: {cgroup}"
+            );
+        }
+        Some(escaped)
+    } else {
+        None
+    };
+    assert!(scratch.is_dir());
+    assert!(agent_of_empires::process::worker::is_process_group_alive(
+        record.pid
+    ));
+    let response = client
+        .delete(daemon.url(&format!("/api/sessions/{id}")))
+        .json(&serde_json::json!({"force_delete": true, "keep_scratch": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let outcome: serde_json::Value = response.json().await.unwrap();
+    assert!(
+        outcome["cleanup_errors"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "{outcome}"
+    );
+    assert!(
+        !scratch.exists(),
+        "actual permanent DELETE retained scratch: {outcome}"
+    );
+    assert!(!agent_of_empires::process::worker::is_process_group_alive(
+        record.pid
+    ));
+    assert!(agent_of_empires::process::worker_registry::load(id)
+        .unwrap()
+        .is_none());
+    assert!(!record.socket_path.exists());
+    assert!(
+        !agent_of_empires::process::worker::control_socket_sibling(&record.socket_path).exists()
+    );
+    if let Some(escaped) = escaped {
+        assert!(
+            !agent_of_empires::process::worker::is_process_group_alive(escaped),
+            "scope escapee remained after permanent DELETE"
+        );
+        let output = Command::new("systemctl")
+            .args([
+                "--user",
+                "show",
+                "--property=ActiveState",
+                "--property=ControlGroup",
+                unit.as_ref().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        let state = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            state.lines().any(|line| line == "ActiveState=inactive")
+                && state.lines().any(|line| line == "ControlGroup="),
+            "{state}"
+        );
+    }
+    let rows: serde_json::Value = client
+        .get(daemon.url("/api/sessions"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(rows["sessions"].as_array().unwrap().is_empty());
+    assert!(
+        agent_of_empires::session::Storage::open_unwatched("scratch-cancellation")
+            .unwrap()
+            .load()
+            .unwrap()
+            .is_empty()
+    );
+    let journal: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(daemon.app_dir().join("pending-purge-owners.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(journal["owners"].as_array().unwrap().is_empty());
+}
+
 /// RAII guard around a foreground `aoe serve` subprocess scoped to an
 /// isolated `HOME`. `Drop` kills the child and waits, even on test panic.
 struct ServeDaemon {
     child: Option<Child>,
     port: u16,
     home: TempDir,
+    scope_slice: Option<String>,
 }
 
 impl ServeDaemon {
@@ -200,9 +391,33 @@ impl ServeDaemon {
     /// a fresh `HOME`. Panics on startup failure so the test gives a
     /// useful diagnostic.
     fn spawn() -> Self {
+        Self::spawn_with_scopes(false)
+    }
+
+    fn spawn_with_scopes(scoped: bool) -> Self {
         let aoe = env!("CARGO_BIN_EXE_aoe");
         let home = tempfile::tempdir().expect("home tempdir");
         let port = pick_free_port();
+        let app = if cfg!(any(target_os = "linux", target_os = "macos")) {
+            home.path()
+                .join(".config")
+                .join(agent_of_empires::session::APP_DIR_NAME_XDG)
+        } else {
+            home.path()
+                .join(agent_of_empires::session::APP_DIR_NAME_OTHER)
+        };
+        std::fs::create_dir_all(&app).unwrap();
+        let scope_slice = scoped.then(|| {
+            format!(
+                "background-aoe_integration_{}.slice",
+                uuid::Uuid::new_v4().simple()
+            )
+        });
+        let scope_config = match &scope_slice {
+            Some(slice) => format!("[systemd]\nenabled = true\nslice = '{slice}'\n"),
+            None => "[systemd]\nenabled = false\n".to_string(),
+        };
+        std::fs::write(app.join("config.toml"), scope_config).unwrap();
 
         let mut cmd = Command::new(aoe);
         cmd.args([
@@ -215,6 +430,10 @@ impl ServeDaemon {
         ]);
         cmd.env("HOME", home.path());
         cmd.env("XDG_CONFIG_HOME", home.path().join(".config"));
+        if !scoped {
+            cmd.env("XDG_RUNTIME_DIR", home.path().join("runtime"));
+            cmd.env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/dev/null");
+        }
         cmd.env_remove("AGENT_OF_EMPIRES_DEBUG");
 
         let mut child = cmd.spawn().expect("spawn aoe serve");
@@ -227,6 +446,7 @@ impl ServeDaemon {
             child: Some(child),
             port,
             home,
+            scope_slice,
         }
     }
 
@@ -254,6 +474,11 @@ impl Drop for ServeDaemon {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
+        }
+        if let Some(slice) = &self.scope_slice {
+            let _ = Command::new("systemctl")
+                .args(["--user", "stop", slice])
+                .output();
         }
     }
 }

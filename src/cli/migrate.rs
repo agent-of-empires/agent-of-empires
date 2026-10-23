@@ -99,34 +99,84 @@ pub fn stderr_reporter() -> Reporter {
     })
 }
 
-fn refuse_while_daemon_runs(status: DaemonStatus) -> Result<()> {
-    if let DaemonStatus::Verified(pid) = status {
-        bail!(
-            "aoe serve daemon is running (PID {pid}); migrations must not run alongside it.\n\n  \
-             Stop it with `aoe serve --stop`, then run `aoe migrate` again."
-        );
-    }
-    Ok(())
+#[derive(Debug, Default, clap::Args)]
+#[command(group(clap::ArgGroup::new("recovery_source").args(["restore_purge_journal", "restore_tool_journal"]).multiple(false)))]
+pub struct MigrateArgs {
+    /// Restore a complete original purge journal from a consistent application backup.
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with = "restore_tool_journal",
+        requires = "confirm_complete_original_authority"
+    )]
+    pub restore_purge_journal: Option<std::path::PathBuf>,
+    /// Restore complete original tool retirement receipts from a consistent application backup.
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with = "restore_purge_journal",
+        requires = "confirm_complete_original_authority"
+    )]
+    pub restore_tool_journal: Option<std::path::PathBuf>,
+    /// Attest that FILE contains all original authority, not a stale or partial copy.
+    #[arg(long, requires = "recovery_source")]
+    pub confirm_complete_original_authority: bool,
 }
 
-pub fn run() -> Result<()> {
+fn refuse_while_daemon_runs(status: DaemonStatus) -> Result<()> {
+    match status {
+        DaemonStatus::Absent => Ok(()),
+        DaemonStatus::Verified(pid) => bail!("aoe serve daemon is running (PID {pid}); stop it with `aoe serve --stop` before running aoe migrate"),
+        DaemonStatus::Unverified => bail!("Cannot verify the existing daemon; migration and recovery refused"),
+    }
+}
+
+pub async fn run(args: &MigrateArgs) -> Result<()> {
     refuse_while_daemon_runs(daemon_status())?;
-    // The status check can go stale; the lock keeps a daemon from starting mid-migration.
-    let Some(_serve_lock) = try_lock_serve()? else {
-        bail!("an aoe serve daemon is starting; retry `aoe migrate` once it is up and stopped");
+    let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
+    let Some(serve_lock) = try_lock_serve()? else {
+        bail!("an aoe serve daemon is starting; retry `aoe migrate` once it is stopped");
     };
+    crate::migrations::ensure_schema_supported()?;
+    if let Some(source) = &args.restore_purge_journal {
+        anyhow::ensure!(
+            args.confirm_complete_original_authority,
+            "Explicit complete original authority confirmation is required"
+        );
+        crate::cli::serve::with_inactive_serve_state(&transaction, Some(&serve_lock), |serve| {
+            crate::session::purge_owners::restore_from_complete_backup(source, &transaction, serve)
+        })?;
+        eprintln!(
+            "{PREFIX}restored complete original purge authority; no cleanup effects were run"
+        );
+        return Ok(());
+    }
+    if let Some(source) = &args.restore_tool_journal {
+        anyhow::ensure!(
+            args.confirm_complete_original_authority,
+            "Explicit complete original authority confirmation is required"
+        );
+        crate::cli::serve::with_inactive_serve_state(&transaction, Some(&serve_lock), |serve| {
+            crate::tmux::tool_retirement::restore_from_complete_backup(source, &transaction, serve)
+        })?;
+        eprintln!("{PREFIX}restored complete original tool retirement authority; no process effects were run");
+        return Ok(());
+    }
     if !crate::migrations::has_pending_migrations() {
         eprintln!("{PREFIX}data schema is current; retrying any deferred migration work");
     }
-    crate::migrations::run_migrations_announced(Some(stderr_reporter()))?;
+    crate::migrations::run_migrations_under_exclusion(
+        Some(stderr_reporter()),
+        true,
+        &transaction,
+        &serve_lock,
+    )?;
     if std::io::stderr().is_terminal() {
         eprint!("\r\x1b[2K");
     }
     match crate::migrations::v027_isolate_sandbox_stores::sessions_on_shared_store()? {
         0 => eprintln!("{PREFIX}migrations complete"),
-        left => eprintln!(
-            "{PREFIX}migrations complete, except {left} sandboxed session(s) still on a shared agent store"
-        ),
+        left => eprintln!("{PREFIX}migrations complete, except {left} sandboxed session(s) still on a shared agent store"),
     }
     Ok(())
 }
@@ -145,12 +195,13 @@ mod tests {
     }
 
     #[test]
-    fn only_a_verified_daemon_blocks_migrate() {
+    fn live_and_ambiguous_daemon_identities_block_migrate() {
         assert!(refuse_while_daemon_runs(DaemonStatus::Absent).is_ok());
-        assert!(refuse_while_daemon_runs(DaemonStatus::Unverified).is_ok());
-        let err = refuse_while_daemon_runs(DaemonStatus::Verified(4242)).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("PID 4242") && msg.contains("aoe serve --stop"));
+        assert!(refuse_while_daemon_runs(DaemonStatus::Unverified).is_err());
+        let error = refuse_while_daemon_runs(DaemonStatus::Verified(4242))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("PID 4242") && error.contains("aoe serve --stop"));
     }
 
     #[test]
