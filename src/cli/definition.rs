@@ -298,7 +298,7 @@ pub enum DaemonCommands {
     Start,
     /// Stop the running daemon (`aoe serve --stop`)
     Stop,
-    /// Print the daemon's PID, mode, URLs and log path (`aoe serve --status`)
+    /// Print the daemon's PID, mode, URLs and log path, or remote reachability with `AOE_DAEMON_URL` (`aoe serve --status`)
     Status,
     /// Restart the daemon with its persisted launch config (`aoe serve --restart`)
     Restart,

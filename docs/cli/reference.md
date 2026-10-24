@@ -1757,7 +1757,7 @@ Start the aoe daemon: REST/WebSocket API, plus the web dashboard in builds that 
 * `--tunnel-url <TUNNEL_URL>` — Hostname for a named tunnel (e.g., aoe.example.com)
 * `--daemon` — Run as a background daemon (detach from terminal)
 * `--stop` — Stop a running daemon
-* `--status` — Print the running daemon's PID, mode, URLs, and log path. Exits non-zero when no daemon is running. Useful for shell scripts that want to know whether a daemon is up without parsing `ps`.
+* `--status` — Print the local daemon's PID, mode, URLs, and log path. With `AOE_DAEMON_URL` set, report the remote daemon's reachability and token state instead. Exits non-zero when no daemon is running. Useful for shell scripts that want to know whether a daemon is up without parsing `ps`.
 
    `--status` is read-only and incompatible with every flag that would change daemon state (`--stop`, `--daemon`, `--remote`) or the bind config of a fresh daemon (`--no-auth`, `--auth`, `--behind-proxy`, `--read-only`, `--passphrase`, `--port`, `--tunnel-name`, `--no-tailscale`, `--tunnel-url`, `--open`, `--allowed-host`, `--allowed-origin`). Clap reports the misuse instead of silently ignoring the extras.
 * `--passphrase <PASSPHRASE>` — Require a passphrase for login (second-factor auth). Can also be set via AOE_SERVE_PASSPHRASE environment variable
@@ -1777,7 +1777,7 @@ Control the background aoe daemon; each verb is the matching `aoe serve` flag (`
 
 * `start` — Start the daemon in the background (`aoe serve --daemon`)
 * `stop` — Stop the running daemon (`aoe serve --stop`)
-* `status` — Print the daemon's PID, mode, URLs and log path (`aoe serve --status`)
+* `status` — Print the daemon's PID, mode, URLs and log path, or remote reachability with `AOE_DAEMON_URL` (`aoe serve --status`)
 * `restart` — Restart the daemon with its persisted launch config (`aoe serve --restart`)
 
 
@@ -1800,7 +1800,7 @@ Stop the running daemon (`aoe serve --stop`)
 
 ## `aoe daemon status`
 
-Print the daemon's PID, mode, URLs and log path (`aoe serve --status`)
+Print the daemon's PID, mode, URLs and log path, or remote reachability with `AOE_DAEMON_URL` (`aoe serve --status`)
 
 **Usage:** `aoe daemon status`
 
