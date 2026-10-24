@@ -393,7 +393,7 @@ function QuestionField({
                   </span>
                 </label>
                 {opt.preview && (
-                  <details className="mt-1 ml-6 text-[11px] text-text-dim">
+                  <details className="mt-1 ml-6 text-[11px] text-text-subtle">
                     <summary className="cursor-pointer">Preview</summary>
                     <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md border border-surface-700 bg-surface-900 p-2 font-mono">
                       {opt.preview}
