@@ -336,12 +336,9 @@ fn walk_directory(path: &Path, euid: u32, admission: bool) -> Result<OwnedFd, Tr
     if !path.is_absolute() {
         return Err(TrustedPathError::Invalid);
     }
-    let private_gid = admission
-        .then(|| crate::daemon::transport::user_private_gid(euid))
-        .flatten();
     let root = open_dir(Path::new("/"))?;
     if admission {
-        validate_directory_stat(&root, euid, private_gid, false, true, Path::new("/"))?;
+        validate_directory_stat(&root, euid, false, true, Path::new("/"))?;
     }
     let mut components = path.components().skip(1).peekable();
     if components.peek().is_none() {
@@ -367,7 +364,7 @@ fn walk_directory(path: &Path, euid: u32, admission: bool) -> Result<OwnedFd, Tr
             })?;
         // Connection trust is checked on opened objects, never on their pathnames.
         if admission {
-            validate_directory_stat(&next, euid, private_gid, final_component, true, &walked)?;
+            validate_directory_stat(&next, euid, final_component, true, &walked)?;
         }
         current = next;
     }
@@ -468,7 +465,6 @@ fn validate_directory_owner(
 fn validate_directory_stat(
     file: &OwnedFd,
     euid: u32,
-    private_gid: Option<u32>,
     final_component: bool,
     root_check: bool,
     path: &Path,
@@ -483,7 +479,7 @@ fn validate_directory_stat(
             "Inspect the existing path at {path}; select a directory without removing configuration.",
         )));
     }
-    if !group_other_writes_allowed(&stat, final_component, euid, private_gid) {
+    if !group_other_writes_allowed(&stat, final_component, euid) {
         return Err(TrustedPathError::Refused(RefusedComponent::new(
             path,
             mode,
@@ -516,21 +512,10 @@ fn validate_directory_stat(
     Ok(())
 }
 
-fn group_other_writes_allowed(
-    stat: &os::Stat,
-    final_component: bool,
-    owner: u32,
-    private_gid: Option<u32>,
-) -> bool {
+fn group_other_writes_allowed(stat: &os::Stat, final_component: bool, owner: u32) -> bool {
     stat.st_mode & 0o022 == 0
         || (!final_component
-            && crate::daemon::transport::trusted_ancestor(
-                stat.st_uid,
-                stat.st_gid,
-                stat.st_mode,
-                owner,
-                private_gid,
-            ))
+            && crate::daemon::transport::trusted_ancestor(stat.st_uid, stat.st_mode, owner))
 }
 
 async fn connect_admission(
@@ -1350,7 +1335,7 @@ mod tests {
     }
 
     #[test]
-    fn writable_ancestors_preserve_private_groups_and_final_directory_isolation() {
+    fn writable_ancestors_preserve_sticky_roots_and_final_directory_isolation() {
         let mut stat = os::Stat {
             st_mode: os::DIRECTORY | 0o777,
             st_uid: 0,
@@ -1361,25 +1346,24 @@ mod tests {
         };
 
         stat.st_uid = 0;
-        assert!(!group_other_writes_allowed(&stat, true, 1, None));
+        assert!(!group_other_writes_allowed(&stat, true, 1));
         stat.st_mode |= crate::process::runtime_io::STICKY;
-        assert!(group_other_writes_allowed(&stat, false, 1, None));
-        assert!(!group_other_writes_allowed(&stat, true, 1, None));
+        assert!(group_other_writes_allowed(&stat, false, 1));
+        assert!(!group_other_writes_allowed(&stat, true, 1));
 
         stat.st_uid = 1;
-        assert!(!group_other_writes_allowed(&stat, false, 1, None));
+        assert!(!group_other_writes_allowed(&stat, false, 1));
 
         stat.st_uid = 0;
         stat.st_mode = crate::process::runtime_io::DIRECTORY | 0o755;
-        assert!(group_other_writes_allowed(&stat, false, 1, None));
+        assert!(group_other_writes_allowed(&stat, false, 1));
         stat.st_mode = crate::process::runtime_io::DIRECTORY | 0o757;
-        assert!(!group_other_writes_allowed(&stat, false, 1, None));
+        assert!(!group_other_writes_allowed(&stat, false, 1));
         stat.st_uid = 1;
         stat.st_gid = 1;
         stat.st_mode = os::DIRECTORY | 0o775;
-        assert!(group_other_writes_allowed(&stat, false, 1, Some(1)));
-        assert!(!group_other_writes_allowed(&stat, true, 1, Some(1)));
-        assert!(!group_other_writes_allowed(&stat, false, 1, None));
+        assert!(!group_other_writes_allowed(&stat, false, 1));
+        assert!(!group_other_writes_allowed(&stat, true, 1));
         stat.st_uid = 1;
         stat.st_mode = os::DIRECTORY | 0o700;
         assert!(matches!(
