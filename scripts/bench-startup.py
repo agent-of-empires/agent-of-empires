@@ -137,7 +137,10 @@ def run(binary, env, wait_for_background, timeout):
                 try:
                     os.read(master, 65536)
                 except OSError:
-                    process.wait(timeout=max(0.01, deadline - time.perf_counter()))
+                    try:
+                        process.wait(timeout=max(0.01, deadline - time.perf_counter()))
+                    except subprocess.TimeoutExpired:
+                        raise RuntimeError("quit timed out after the first frame") from None
         if process.returncode != 0:
             raise RuntimeError(f"exited with status {process.returncode}")
         return first_frame, (time.perf_counter() - quit_started) * 1000
