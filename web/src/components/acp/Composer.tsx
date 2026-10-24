@@ -9,6 +9,7 @@ import { AtSign, Paperclip, Pencil, Slash } from "lucide-react";
 import { useFocusTerminalTarget } from "../../hooks/useFocusTerminalTarget";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import { useSkillIndex } from "../../hooks/useSkillIndex";
+import { consumeComposerPrefill, subscribeComposerPrefill } from "../../lib/composerPrefill";
 import { clearDraft } from "../../lib/acpDrafts";
 import type { AcpState, PromptAttachmentInput, PromptCapabilities, QueuedPrompt } from "../../lib/acpTypes";
 import { isIOS, isStandalone } from "../../lib/platform";
@@ -136,6 +137,17 @@ export function Composer(props: Props) {
   usePluginDraftOperations(sessionId, client, taRef);
   usePrimerPrefill(props.primerPrefill, loadText);
   useDraftPersistence(sessionId, client, composerText, draftTextRef, taRef);
+  useEffect(() => {
+    const consume = () => {
+      const text = consumeComposerPrefill(sessionId);
+      if (text === null) return;
+      const current = draftTextRef.current;
+      loadText(current ? `${current}\n\n${text}` : text);
+    };
+    const unsubscribe = subscribeComposerPrefill(consume);
+    consume();
+    return unsubscribe;
+  }, [sessionId, draftTextRef, loadText]);
   useInitialFocus(isMobile, taRef);
   // Sidebar session selection focuses the composer even when already mounted.
   useFocusTerminalTarget("composer", taRef, props.active);

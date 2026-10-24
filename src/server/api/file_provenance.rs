@@ -207,14 +207,24 @@ fn open_confined(
     Ok((file, meta))
 }
 
+/// A capped text read and the opened file's metadata.
+#[derive(Debug)]
+pub(super) struct FileRead {
+    pub content: String,
+    pub is_binary: bool,
+    pub truncated: bool,
+    pub valid_utf8: bool,
+    pub metadata: cap_std::fs::Metadata,
+}
+
 /// Read a confined target as text with a byte cap, reading at most `cap + 1`
 /// bytes to detect truncation. Binary content yields an empty string, matching
 /// the diff endpoint.
-pub fn read_confined(
+pub(super) fn read_confined(
     confined: &Confined,
     cap: usize,
-) -> Result<(String, bool, bool), (StatusCode, &'static str)> {
-    let (mut file, _) = open_confined(confined)?;
+) -> Result<FileRead, (StatusCode, &'static str)> {
+    let (mut file, metadata) = open_confined(confined)?;
 
     let mut bytes = Vec::new();
     file.by_ref()
@@ -222,6 +232,7 @@ pub fn read_confined(
         .read_to_end(&mut bytes)
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "read failed"))?;
 
+    let valid_utf8 = std::str::from_utf8(&bytes).is_ok();
     let truncated = bytes.len() > cap;
     if truncated {
         bytes.truncate(cap);
@@ -232,7 +243,13 @@ pub fn read_confined(
     } else {
         String::from_utf8_lossy(&bytes).into_owned()
     };
-    Ok((content, is_binary, truncated))
+    Ok(FileRead {
+        content,
+        is_binary,
+        truncated,
+        valid_utf8,
+        metadata,
+    })
 }
 
 /// Read a confined target's raw bytes, refusing a file over `cap` bytes rather
@@ -368,6 +385,7 @@ mod tests {
     ) -> Result<(String, bool, bool), (StatusCode, &'static str)> {
         let confined = confine_path(roots, || touched.clone(), requested)?;
         read_confined(&confined, 5_000_000)
+            .map(|file| (file.content, file.is_binary, file.truncated))
     }
 
     #[test]
@@ -466,8 +484,8 @@ mod tests {
 
         fs::write(root.join("big.md"), "abcdef").unwrap();
         let confined = confine_path(&roots, || touched.clone(), Path::new("big.md")).unwrap();
-        let (content, _, truncated) = read_confined(&confined, 3).unwrap();
-        assert!(truncated && content.len() == 3);
+        let file = read_confined(&confined, 3).unwrap();
+        assert!(file.truncated && file.content.len() == 3);
 
         // A directory is not a regular file.
         fs::create_dir(root.join("sub")).unwrap();
@@ -541,7 +559,7 @@ mod tests {
             canonical: root.join("ok.md"),
             root: root.clone(),
         };
-        assert_eq!(read_confined(&good, 5_000_000).unwrap().0, "fine");
+        assert_eq!(read_confined(&good, 5_000_000).unwrap().content, "fine");
 
         // The escaping symlink is refused at open time, not followed.
         let swapped = Confined {
@@ -552,7 +570,7 @@ mod tests {
         // rather than followed.
         let result = read_confined(&swapped, 5_000_000);
         assert!(
-            !matches!(&result, Ok((content, _, _)) if content == "KEY"),
+            !matches!(&result, Ok(file) if file.content == "KEY"),
             "capability open leaked the outside file"
         );
         assert_eq!(result.unwrap_err().0, StatusCode::NOT_FOUND);

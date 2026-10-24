@@ -1,5 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { getSessionFile } from "../../lib/api";
+import { Pencil } from "lucide-react";
+import { TextFileEditor } from "./TextFileEditor";
+import { requestComposerPrefill } from "../../lib/composerPrefill";
+import { getSessionFile, type SessionFileResponse } from "../../lib/api";
+import { fileDraftKey, getFileDraft } from "../../lib/fileEditGuard";
 import { useWebSettings } from "../../hooks/useWebSettings";
 import { extensionToLanguage } from "./comments/language";
 import { BinaryFileView } from "./BinaryFileView";
@@ -12,21 +16,27 @@ interface Props {
   /** The server confines which paths may be read. */
   filePath: string;
   onBack?: () => void;
-}
-
-interface Loaded {
-  content: string;
-  is_binary: boolean;
-  truncated: boolean;
+  structured?: boolean;
 }
 
 /** A session file: Markdown with a Rendered/Raw toggle, otherwise highlighted source. */
-export function FileContentViewer({ sessionId, filePath, onBack }: Props) {
+export function FileContentViewer(props: Props) {
+  return <SessionFileViewer key={fileDraftKey(props.sessionId, props.filePath)} {...props} />;
+}
+
+function SessionFileViewer({ sessionId, filePath, onBack, structured }: Props) {
   const { settings } = useWebSettings();
+  // The opened snapshot, frozen so a refetch cannot move the version under a draft.
+  // An unsaved draft from before a layout switch reopens the editor.
+  const [editing, setEditing] = useState<SessionFileResponse | null>(
+    () => getFileDraft(fileDraftKey(sessionId, filePath))?.original ?? null,
+  );
+  const [revision, setRevision] = useState(0);
+  const [saved, setSaved] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
   // Keyed by target so a stale response from a fast switch is ignored at render.
-  const key = `${sessionId} ${filePath}`;
-  const [loaded, setLoaded] = useState<{ key: string; data: Loaded | null; error: string | null }>({
+  const key = `${sessionId} ${filePath} ${revision}`;
+  const [loaded, setLoaded] = useState<{ key: string; data: SessionFileResponse | null; error: string | null }>({
     key,
     data: null,
     error: null,
@@ -34,7 +44,7 @@ export function FileContentViewer({ sessionId, filePath, onBack }: Props) {
 
   useEffect(() => {
     let cancelled = false;
-    getSessionFile(sessionId, filePath)
+    getSessionFile(sessionId, filePath, { editing: settings.fileEditing })
       .then((resp) => {
         if (cancelled) return;
         setLoaded({ key, data: resp ?? null, error: resp ? null : "Failed to load file" });
@@ -45,7 +55,7 @@ export function FileContentViewer({ sessionId, filePath, onBack }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [sessionId, filePath, key]);
+  }, [sessionId, filePath, key, settings.fileEditing]);
 
   const current = loaded.key === key ? loaded : { key, data: null, error: null };
   const data = current.data;
@@ -66,13 +76,71 @@ export function FileContentViewer({ sessionId, filePath, onBack }: Props) {
       tabIndex={-1}
       className="flex-1 flex flex-col bg-surface-900 overflow-hidden focus:outline-none"
     >
-      <div className="px-3 py-2 border-b border-surface-700/20 flex items-center gap-2 shrink-0">
-        {onBack && <BackButton label="Files" onClick={onBack} />}
-        <span className="font-mono text-[12px] text-text-primary truncate">{filePath}</span>
-        {isMarkdown && !data?.is_binary && <MarkdownToggle className="ml-auto" />}
-      </div>
+      {!editing && (
+        <div className="px-3 py-2 border-b border-surface-700/20 flex items-center gap-2 shrink-0">
+          {onBack && <BackButton label="Files" onClick={onBack} />}
+          <span className="font-mono text-[12px] text-text-primary truncate flex-1">{filePath}</span>
+          {isMarkdown && !data?.is_binary && <MarkdownToggle />}
+          {settings.fileEditing && data && (
+            <button
+              type="button"
+              disabled={!data.version || !!data.edit_disabled_reason}
+              title={data.edit_disabled_reason ?? undefined}
+              className="flex items-center gap-1 min-h-8 px-2 py-1 text-xs rounded-md border border-surface-700/50 text-text-secondary disabled:opacity-40 cursor-pointer"
+              onClick={() => {
+                setEditing(data);
+                setSaved(false);
+              }}
+            >
+              <Pencil size={13} aria-hidden="true" />
+              Edit
+            </button>
+          )}
+        </div>
+      )}
 
-      {loading ? (
+      {!editing && settings.fileEditing && data?.edit_disabled_reason && (
+        <div className="px-3 py-2 text-xs text-text-dim">{data.edit_disabled_reason}</div>
+      )}
+      {saved && (
+        <div role="status" className="px-3 py-2 text-xs text-text-secondary flex gap-2 items-center flex-wrap">
+          <span>File saved.</span>
+          {structured ? (
+            <button
+              type="button"
+              className="underline cursor-pointer"
+              onClick={() => {
+                requestComposerPrefill(
+                  sessionId,
+                  `I edited ${filePath} in the file viewer. Please review the changes before continuing.`,
+                );
+                setSaved(false);
+              }}
+            >
+              Draft a note to the agent
+            </button>
+          ) : (
+            <span>Let the agent know you changed {filePath} in its terminal.</span>
+          )}
+        </div>
+      )}
+      {editing ? (
+        <TextFileEditor
+          sessionId={sessionId}
+          filePath={filePath}
+          original={editing}
+          onBack={onBack}
+          onCancel={() => {
+            setEditing(null);
+            setRevision((value) => value + 1);
+          }}
+          onSaved={() => {
+            setEditing(null);
+            setSaved(true);
+            setRevision((value) => value + 1);
+          }}
+        />
+      ) : loading ? (
         <Centered>
           <span className="text-sm">Loading file...</span>
         </Centered>

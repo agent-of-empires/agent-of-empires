@@ -7,10 +7,11 @@ import { FileContextMenu, type PathMenuState } from "./diff/FileContextMenu";
 
 interface Props {
   sessionId: string | null;
+  structured?: boolean;
 }
 
 /** Browse the files under a session's project_path and view them. */
-export function FilesPane({ sessionId }: Props) {
+export function FilesPane({ sessionId, structured }: Props) {
   const { files, loading, error, reload } = useFilesIndex(sessionId ?? "");
   const [filter, setFilter] = useState("");
   const [selected, setSelected] = useState<string | null>(null);
@@ -42,7 +43,14 @@ export function FilesPane({ sessionId }: Props) {
   }
 
   if (selected) {
-    return <FileContentViewer sessionId={sessionId} filePath={selected} onBack={() => handleBack(selected)} />;
+    return (
+      <FileContentViewer
+        structured={structured}
+        sessionId={sessionId}
+        filePath={selected}
+        onBack={() => handleBack(selected)}
+      />
+    );
   }
 
   return (
