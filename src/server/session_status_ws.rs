@@ -1,6 +1,9 @@
 //! `GET /api/sessions/status/ws`: streams live status moves to the dashboard, plus a `sound_due`
 //! cue once a Waiting, Idle or Error status has held for its dwell. The server times the dwell
 //! because a hidden tab's timers are throttled but its WebSocket messages are not.
+//!
+//! A `status` frame goes out only after a snapshot publication that began after the move, and
+//! carries that snapshot's cursor, so a `GET /api/sessions` after the frame is never staler than it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,6 +17,8 @@ use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::time::Instant;
 
 use crate::session::Status;
+
+use crate::daemon::RuntimeCursor;
 
 use super::push::{NotificationEvent, StatusChange};
 use super::AppState;
@@ -83,9 +88,15 @@ impl Dwells {
     }
 }
 
-fn status_frame(change: &StatusChange) -> String {
-    json!({ "kind": "status", "id": change.instance_id, "status": change.new.wire_str() })
-        .to_string()
+fn status_frame(change: &StatusChange, cursor: &RuntimeCursor) -> String {
+    json!({
+        "kind": "status",
+        "id": change.instance_id,
+        "status": change.new.wire_str(),
+        "epoch": cursor.epoch,
+        "revision": cursor.revision.to_string(),
+    })
+    .to_string()
 }
 
 fn sound_due_frame(id: &str, event: NotificationEvent) -> String {
@@ -102,6 +113,8 @@ async fn send(socket: &mut WebSocket, message: Message) -> bool {
 #[derive(Debug, PartialEq)]
 enum Next {
     Frames(Vec<String>),
+    /// A move to publish before it is sent; awaited outside this cancellable future so it is not lost.
+    Change(StatusChange),
     /// Moves were dropped; the caller reseeds and resyncs outside this cancellable future.
     Lagged,
 }
@@ -121,7 +134,7 @@ async fn next_frames(
         recv = rx.recv() => match recv {
             Ok(change) => {
                 dwells.on_change(&change, Instant::now());
-                Some(Next::Frames(vec![status_frame(&change)]))
+                Some(Next::Change(change))
             }
             Err(RecvError::Lagged(skipped)) => {
                 tracing::warn!(target: "http.middleware", skipped, "session status ws lagged");
@@ -185,6 +198,13 @@ async fn serve(mut socket: WebSocket, state: Arc<AppState>) {
         };
         let frames = match next {
             Next::Frames(frames) => frames,
+            Next::Change(change) => match state.runtime.publish(&state).await {
+                Ok(published) => vec![status_frame(&change, &published.value.cursor)],
+                Err(error) => {
+                    tracing::error!(target: "server.runtime", %error, "status move not published");
+                    vec![json!({ "kind": "resync" }).to_string()]
+                }
+            },
             Next::Lagged => {
                 dwells = Dwells::seeded(&state).await;
                 vec![json!({ "kind": "resync" }).to_string()]
@@ -235,6 +255,13 @@ mod tests {
         assert_eq!(dwells.next_due(), None);
     }
 
+    fn cursor(revision: u64) -> RuntimeCursor {
+        RuntimeCursor {
+            epoch: "boot".to_string(),
+            revision,
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_queued_move_cancels_the_dwell_before_its_expired_cue() {
         let state = crate::server::test_support::build_test_app_state(Vec::new());
@@ -247,7 +274,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(6)).await;
 
         let frames = next_frames(&mut rx, &mut dwells).await;
-        assert_eq!(frames, Some(Next::Frames(vec![status_frame(&running)])));
+        assert_eq!(frames, Some(Next::Change(running)));
         let later =
             tokio::time::timeout(Duration::from_secs(30), next_frames(&mut rx, &mut dwells)).await;
         assert!(later.is_err(), "no cue for a session that moved on");
@@ -275,6 +302,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_move_is_published_before_its_frame_so_a_later_read_is_never_staler() {
+        let mut row = crate::session::Instance::new("m", "/tmp/aoe-ws-m");
+        row.status = Status::Running;
+        let id = row.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![row]);
+        let before = state.runtime.snapshot(&state).await.unwrap();
+        state
+            .instances
+            .write()
+            .await
+            .iter_mut()
+            .find(|inst| inst.id == id)
+            .unwrap()
+            .status = Status::Waiting;
+
+        let published = state.runtime.publish(&state).await.unwrap();
+        assert!(published.value.cursor.revision > before.value.cursor.revision);
+        let read = state.runtime.snapshot(&state).await.unwrap();
+        assert_eq!(read.value.cursor, published.value.cursor);
+        assert_eq!(
+            read.value
+                .contents
+                .sessions
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap()
+                .status,
+            "Waiting"
+        );
+    }
+
+    #[tokio::test]
     async fn a_lagged_receiver_reports_the_lag_for_the_caller_to_resync() {
         let (tx, mut rx) = broadcast::channel(2);
         for _ in 0..5 {
@@ -287,10 +346,12 @@ mod tests {
     #[test]
     fn frames_use_the_wire_spelling_the_session_list_uses() {
         let status: serde_json::Value =
-            serde_json::from_str(&status_frame(&change("a", Status::Waiting))).unwrap();
+            serde_json::from_str(&status_frame(&change("a", Status::Waiting), &cursor(7))).unwrap();
         assert_eq!(
             status,
-            json!({ "kind": "status", "id": "a", "status": "Waiting" })
+            json!({
+                "kind": "status", "id": "a", "status": "Waiting", "epoch": "boot", "revision": "7"
+            })
         );
         let cue: serde_json::Value =
             serde_json::from_str(&sound_due_frame("a", NotificationEvent::Error)).unwrap();

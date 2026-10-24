@@ -21,7 +21,7 @@ use tokio::sync::RwLock;
 use super::push_send::PUSH_TTL_SECS;
 
 /// Committed status transitions consumed by push, callbacks and plugin workers.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct StatusChange {
     pub instance_id: String,
     pub instance_title: String,
