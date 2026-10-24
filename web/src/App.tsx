@@ -427,8 +427,15 @@ function AppContent({
   const trashedWorkspaces = useMemo(() => workspaces.filter(workspaceIsTrashed), [workspaces]);
 
   const { unreadCount, waitingCount } = useAttentionCounts(sessions, activeSessionId);
-  const onSoundDue = useStatusSounds(sessions);
-  useSessionStatusStream({ onStatus: applyPushedStatus, onSoundDue, onResync: refreshSessions });
+  const { onSoundDue, cancelCue } = useStatusSounds(sessions);
+  const onPushedStatus = useCallback(
+    (id: string, status: SessionResponse["status"]) => {
+      cancelCue(id);
+      applyPushedStatus(id, status);
+    },
+    [cancelCue, applyPushedStatus],
+  );
+  useSessionStatusStream({ onStatus: onPushedStatus, onSoundDue, onResync: refreshSessions });
   const attentionBadgeColors = useMemo(() => getAttentionBadgeColors(resolvedTheme), [resolvedTheme]);
 
   // Remember the active session and restore it on a PWA relaunch (#2103).

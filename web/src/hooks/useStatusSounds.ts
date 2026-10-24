@@ -8,7 +8,10 @@ import { nextStatusSoundState, soundDueFor, type StatusSoundEvent, type StatusSo
 const COALESCE_MS = 500;
 
 /** Plays the waiting, idle and error sounds for every session, from each session list refresh. */
-export function useStatusSounds(sessions: readonly SessionResponse[]): (id: string, event: StatusSoundEvent) => void {
+export function useStatusSounds(sessions: readonly SessionResponse[]): {
+  onSoundDue: (id: string, event: StatusSoundEvent) => void;
+  cancelCue: (id: string) => void;
+} {
   const stateRef = useRef<StatusSoundState | null>(null);
   const sessionsRef = useLatestRef(sessions);
   const lastPlayedRef = useRef(new Map<StatusSoundEvent, number>());
@@ -47,8 +50,11 @@ export function useStatusSounds(sessions: readonly SessionResponse[]): (id: stri
     replayPending(sessions, now);
   }, [sessions, playOnce, replayPending]);
 
+  // A status push starts a new interval, so a cue held from the previous one must not sound.
+  const cancelCue = useCallback((id: string) => void pendingRef.current.delete(id), []);
+
   // The server times the dwell, so a cue sounds without waiting for a session-list refresh.
-  return useCallback(
+  const onSoundDue = useCallback(
     (id: string, event: StatusSoundEvent) => {
       const session = sessionsRef.current.find((x) => x.id === id);
       const { state, play } = soundDueFor(stateRef.current, session, event);
@@ -58,4 +64,5 @@ export function useStatusSounds(sessions: readonly SessionResponse[]): (id: stri
     },
     [sessionsRef, playOnce],
   );
+  return { onSoundDue, cancelCue };
 }
