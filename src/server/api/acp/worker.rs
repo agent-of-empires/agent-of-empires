@@ -340,6 +340,21 @@ pub async fn restart_acp(
 
     let was_resuming =
         state.acp_supervisor.worker_state(&id).await == crate::daemon::AcpWorkerState::Resuming;
+    // A running worker must finish its current submission before restart
+    // tears it down. Hold only this barrier here; the full launch exclusion
+    // also owns the instance lock and would block an external stop.
+    let submission = if was_resuming {
+        None
+    } else {
+        let Some(submission) = state
+            .session_service
+            .prompt_submission_for_session(&id)
+            .await
+        else {
+            return session_not_found();
+        };
+        Some(submission)
+    };
     // An in-flight resume cannot hold the submission barrier while waiting for
     // shutdown, so cancel its launch before waiting for the exclusion guards.
     let stop_request = if was_resuming {
@@ -359,11 +374,6 @@ pub async fn restart_acp(
         None
     };
 
-    let exclusion =
-        match crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &id, true).await {
-            Ok(exclusion) => exclusion,
-            Err(_) => return session_not_found(),
-        };
     if restart.is_cancelled() {
         return supervisor_error_response(
             "restart cancelled by a stop request",
@@ -446,7 +456,16 @@ pub async fn restart_acp(
             .into_response();
     }
     drop(stop_request);
+    drop(submission);
 
+    // Acquire the launch exclusion only after the old worker has stopped. It
+    // owns the submission mutex, so taking it before the stop barrier would
+    // prevent an external stop from completing while restart waits here.
+    let exclusion =
+        match crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &id, true).await {
+            Ok(exclusion) => exclusion,
+            Err(_) => return session_not_found(),
+        };
     let instance =
         match crate::server::api::sessions::resume_structured_stop(&state, instance).await {
             Ok(instance) => instance,
@@ -2223,11 +2242,17 @@ mod tests {
         );
 
         let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
-        let launcher: crate::acp::supervisor::Launcher = Arc::new(move |_config, _session_id| {
+        let launcher: crate::acp::supervisor::Launcher = Arc::new(move |config, _session_id| {
             let started = started_tx.clone();
             Box::pin(async move {
+                let lease = config
+                    .launch_lease
+                    .expect("supervisor retains launch lease");
                 started.send(()).expect("test receiver remains open");
-                std::future::pending().await
+                lease.cancellation().cancelled().await;
+                Err(crate::acp::acp_client::AcpError::Spawn(
+                    "launch cancelled before runner birth".into(),
+                ))
             })
         });
         let state = crate::server::test_support::build_test_app_state_with_launcher(
