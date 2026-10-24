@@ -1,12 +1,18 @@
 import { fetchSettings, fetchSounds, fetchSoundBlob } from "./api";
 import { onSettingsChanged } from "./settingsEvents";
+import type { DueSound } from "./statusSounds";
 
 export type SoundEvent = "approval" | "waiting" | "idle" | "error";
 
 interface SoundSettings {
   enabled?: boolean;
   browser_enabled?: boolean;
-  volume?: number;
+  browser_volume?: number;
+  browser_scope?: "all" | "other_sessions" | "hidden_tab";
+  browser_approval_enabled?: boolean;
+  browser_waiting_enabled?: boolean;
+  browser_idle_enabled?: boolean;
+  browser_error_enabled?: boolean;
   on_approval?: string | null;
   on_waiting?: string | null;
   on_idle?: string | null;
@@ -16,7 +22,12 @@ interface SoundSettings {
 const SETTINGS_KEYS = [
   "enabled",
   "browser_enabled",
-  "volume",
+  "browser_volume",
+  "browser_scope",
+  "browser_approval_enabled",
+  "browser_waiting_enabled",
+  "browser_idle_enabled",
+  "browser_error_enabled",
   "on_approval",
   "on_waiting",
   "on_idle",
@@ -107,18 +118,37 @@ function ensureSoundUrl(name: string): Promise<string | null> {
   return load;
 }
 
+export interface SoundContext {
+  sessionId?: string;
+  /** The session open in this tab, if any. */
+  activeSessionId?: string | null;
+}
+
+function inScope(sound: SoundSettings, { sessionId, activeSessionId }: SoundContext): boolean {
+  switch (sound.browser_scope) {
+    case "other_sessions":
+      return !sessionId || sessionId !== activeSessionId;
+    case "hidden_tab":
+      return document.hidden;
+    default:
+      return true;
+  }
+}
+
 /** Resolves true when the sound started playing. A settings save or cache clear mid-way drops it. */
-export async function playSoundFor(event: SoundEvent): Promise<boolean> {
+export async function playSoundFor(event: SoundEvent, context: SoundContext = {}): Promise<boolean> {
   const generation = cacheGeneration;
   const sound = await loadSettings();
   if (generation !== cacheGeneration) return false;
   if (!sound || !sound.enabled || sound.browser_enabled === false) return false;
+  if (sound[`browser_${event}_enabled` as const] === false || !inScope(sound, context)) return false;
   const name = await resolveSoundName(sound, event, generation);
   if (!name || generation !== cacheGeneration) return false;
   const url = await ensureSoundUrl(name);
-  if (!url || generation !== cacheGeneration) return false;
+  // The tab may have come back to the foreground while the sound loaded.
+  if (!url || generation !== cacheGeneration || !inScope(sound, context)) return false;
   const audio = new Audio(url);
-  const volume = typeof sound.volume === "number" ? sound.volume : 1.0;
+  const volume = typeof sound.browser_volume === "number" ? sound.browser_volume : 1.0;
   // The host scale tops out at 1.5; HTMLAudioElement at 1.0.
   audio.volume = Math.max(0, Math.min(1, volume));
   try {
@@ -128,6 +158,18 @@ export async function playSoundFor(event: SoundEvent): Promise<boolean> {
     // Autoplay blocked; the push and toast still notify.
     return false;
   }
+}
+
+/** Plays each due event once, for sessions the browser scope allows. */
+export async function playStatusSounds(due: readonly DueSound[], activeSessionId: string | null): Promise<void> {
+  if (due.length === 0) return;
+  const sound = await loadSettings();
+  if (!sound) return;
+  const bySession = new Map<SoundEvent, string>();
+  for (const d of due) {
+    if (!bySession.has(d.event) && inScope(sound, { sessionId: d.id, activeSessionId })) bySession.set(d.event, d.id);
+  }
+  await Promise.all([...bySession].map(([event, sessionId]) => playSoundFor(event, { sessionId, activeSessionId })));
 }
 
 // The status sound for a Waiting session would repeat the approval chime that just played.
