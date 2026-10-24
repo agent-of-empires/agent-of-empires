@@ -11,6 +11,8 @@ import { useRespawnSession } from "../../hooks/useRespawnSession";
 import { useWebSettings } from "../../hooks/useWebSettings";
 import { lastClearIndex } from "../../lib/acpHistoryWindow";
 import { visibleSessionNotices } from "../../lib/acpTypes";
+import { agentDisplayName } from "../../lib/agentDisplayName";
+import { isNewSessionStarting } from "./startupWait";
 import { AgentProfileProvider } from "../../lib/agentProfileContext";
 import { conversationFontSizeRem } from "../../lib/conversationFontSize";
 import type { FileRef, FileRefSession } from "../../lib/fileRef";
@@ -161,6 +163,9 @@ function AcpChrome({
 }: ChromeProps) {
   const { sessionId, acpWorkerState, acpAgent } = view;
   const { state, status } = ctx;
+  const startingAgent = isNewSessionStarting(state, status, ctx.hasEverOpened, acpWorkerState)
+    ? agentDisplayName(state.agent ?? acpAgent)
+    : null;
   // Neither can start until restored or unarchived, so nothing here may send (#4116).
   const readOnly = !!view.trashedAt || !!view.archivedAt;
   // Rows before the latest `/clear` divider are the hidden history.
@@ -239,6 +244,7 @@ function AcpChrome({
               onResumeRateLimit={() => void rateLimitResume.respawn()}
               rateLimitResumeState={rateLimitResume.state}
               rateLimitResumeError={rateLimitResume.error}
+              newSessionStarting={startingAgent !== null}
             />
           ) : null
         }
@@ -253,6 +259,7 @@ function AcpChrome({
         snoozedUntil={view.snoozedUntil}
         onRestore={view.onRestore}
         dismissError={ctx.dismissError}
+        startingAgent={startingAgent}
       />
 
       <ThreadPrimitive.Root className="flex flex-1 flex-col min-h-0">
@@ -361,6 +368,7 @@ function AcpChrome({
               collapsible={composerCollapsible}
               collapsed={composerCollapsed}
               onToggleCollapsed={() => setComposerCollapsed((v) => !v)}
+              startingAgent={startingAgent}
             />
           )}
         </div>
@@ -379,6 +387,7 @@ function ComposerDock({
   collapsible,
   collapsed,
   onToggleCollapsed,
+  startingAgent,
 }: {
   view: Props;
   ctx: AcpContext;
@@ -387,6 +396,8 @@ function ComposerDock({
   collapsible: boolean;
   collapsed: boolean;
   onToggleCollapsed: () => void;
+  /** Set while a new Session starts, as for the startup line. */
+  startingAgent: string | null;
 }) {
   const { sessionId, acpWorkerState, acpAgent, acpProvider } = view;
   const { state, status } = ctx;
@@ -403,6 +414,7 @@ function ComposerDock({
         pendingResume={
           status !== "open" || acpWorkerState !== "running" || state.workerStopped || state.workerRestarting
         }
+        waitingFor={startingAgent}
       />
 
       <RejectedPromptsStrip
@@ -455,6 +467,7 @@ function ComposerDock({
           sessionId={sessionId}
           currentAgent={state.agent ?? acpAgent}
           currentProvider={acpProvider}
+          waitingFor={startingAgent}
           availableModes={state.availableModes}
           currentModeId={state.currentModeId}
           legacyMode={state.mode}

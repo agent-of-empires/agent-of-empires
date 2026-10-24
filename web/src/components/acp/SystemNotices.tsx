@@ -62,6 +62,7 @@ export function SystemNotices({
   onResumeRateLimit,
   rateLimitResumeState = "idle",
   rateLimitResumeError = null,
+  newSessionStarting = false,
 }: {
   status: AcpContext["status"];
   lagged: boolean;
@@ -79,11 +80,15 @@ export function SystemNotices({
   onResumeRateLimit?: () => void;
   rateLimitResumeState?: RespawnState;
   rateLimitResumeError?: string | null;
+  /** The startup wait line already covers a new Session's first connection. */
+  newSessionStarting?: boolean;
 }) {
   const messages: { kind: "warn" | "info" | "muted"; text: string }[] = [];
   const warn = (text: string) => messages.push({ kind: "warn", text });
   const reconnectRetriesExhausted = status !== "open" && hasEverOpened && !reconnecting && retryCount >= maxRetries;
-  if (reconnecting && status !== "open") {
+  if (newSessionStarting && !hasEverOpened) {
+    // Shown once, by the startup wait line, including first-connection retries.
+  } else if (reconnecting && status !== "open") {
     const countdownPart = retryCountdown > 0 ? ` in ${retryCountdown}s` : "";
     warn(`Structured view disconnected. Reconnecting (${retryCount}/${maxRetries})${countdownPart}…`);
   } else if (status === "connecting") {

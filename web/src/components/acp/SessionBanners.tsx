@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 
 import { useRespawnSession } from "../../hooks/useRespawnSession";
 import type { AcpState } from "../../lib/acpTypes";
+import { RATTLES } from "../../lib/rattles";
 import { StartupErrorBanner } from "./StartupErrorBanner";
 import { pickWorkerStoppedVariant, showWorkerStoppingBanner } from "./workerStoppedBanner";
 
@@ -15,9 +16,12 @@ export function SessionBanners({
   snoozedUntil,
   onRestore,
   dismissError,
+  startingAgent,
 }: {
   sessionId: string;
   state: AcpState;
+  /** Set while a new Session starts: the Agent, as copy names it. */
+  startingAgent: string | null;
   acpWorkerState: "absent" | "resuming" | "running" | "stopping";
   trashedAt: string | null;
   archivedAt: string | null;
@@ -47,16 +51,18 @@ export function SessionBanners({
       {state.workerRestarting && !state.startupError && !state.workerStopped && (
         <WorkerRestartingBanner agentUnresponsive={state.agentUnresponsive} agentOrphaned={state.agentOrphaned} />
       )}
-      {acpWorkerState === "resuming" &&
+      {startingAgent ? (
+        <StartupWaitLine agent={startingAgent} />
+      ) : (
+        acpWorkerState === "resuming" &&
         healthy &&
-        (state.lastSeq === 0 ? (
-          <PulseBanner>Starting structured view worker for new session… this can take a few seconds.</PulseBanner>
-        ) : (
+        state.lastSeq > 0 && (
           <PulseBanner>
             Resuming structured view worker… cached transcript still available. Queued prompts will send once the agent
             is back online.
           </PulseBanner>
-        ))}
+        )
+      )}
       {showWorkerStoppingBanner({ acpWorkerState, startupError: state.startupError }) && <WorkerStoppingBanner />}
       {state.nextWakeupAt && idle && (
         <ScheduledWakeupBanner wakeAt={state.nextWakeupAt} reason={state.nextWakeupReason} />
@@ -68,6 +74,48 @@ export function SessionBanners({
       )}
       {state.lastError && <InteractionErrorBanner message={state.lastError} onDismiss={dismissError} />}
     </>
+  );
+}
+
+/** From this many seconds the line stops saying "You can type now" and only says it's still starting. */
+const STILL_STARTING_AFTER_S = 15;
+
+const reducedMotion = () => window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
+
+/** The one line shown while a new Session starts: the Agent, an elapsed count and
+ *  Starting's breathe glyph. Mounting starts the count; unmounting resets it. */
+export function StartupWaitLine({ agent }: { agent: string }) {
+  const [seconds, setSeconds] = useState(0);
+  const [frame, setFrame] = useState(0);
+  const [still] = useState(reducedMotion);
+  useEffect(() => {
+    const started = Date.now();
+    const tick = setInterval(() => setSeconds(Math.floor((Date.now() - started) / 1000)), 1000);
+    return () => clearInterval(tick);
+  }, []);
+  useEffect(() => {
+    if (still) return;
+    const spin = setInterval(() => setFrame((f) => (f + 1) % RATTLES.breathe.frames.length), RATTLES.breathe.interval);
+    return () => clearInterval(spin);
+  }, [still]);
+  const glyph = still ? "⣿" : RATTLES.breathe.frames[frame];
+  const elapsed = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+  return (
+    <div
+      data-testid="startup-wait-line"
+      // Right padding below md clears the header collapse toggle that overhangs this edge.
+      className="flex flex-wrap items-center gap-x-2 gap-y-0.5 border-b border-surface-700/60 bg-surface-850 py-2 pl-4 pr-12 text-xs text-text-muted md:pr-4"
+    >
+      <span aria-hidden className="w-3 shrink-0 font-mono text-text-secondary">
+        {glyph}
+      </span>
+      <span className="min-w-0 flex-1 wrap-anywhere">
+        {seconds < STILL_STARTING_AFTER_S ? `Starting ${agent}… You can type now.` : `Still starting ${agent}…`}
+      </span>
+      <span data-testid="startup-wait-elapsed" className="ml-auto shrink-0 font-mono tabular-nums">
+        {elapsed}
+      </span>
+    </div>
   );
 }
 
