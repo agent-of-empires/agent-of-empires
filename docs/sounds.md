@@ -17,6 +17,11 @@ on_error = "error"        # unset transitions play a random sound
 on_approval = "approval"  # structured view only; plays in the browser
 server_enabled = true     # play status sounds on the machine running aoe
 browser_enabled = true    # play status sounds in the web dashboard
+server_volume = 1.0       # 0.1 to 1.5
+browser_volume = 1.0      # 0.1 to 1.5, browsers cap at 1.0
+browser_scope = "all"     # all, other_sessions or hidden_tab
+server_idle_enabled = true    # also server_{start,running,waiting,error}_enabled
+browser_idle_enabled = true   # also browser_{approval,waiting,error}_enabled
 ```
 
 Each transition plays its per-transition override when one is set, and a random sound from your sounds directory otherwise, so setting the same file on every transition gives you one signature sound. Add your own `.wav` or `.ogg` files to the sounds directory and reference them by filename without the extension. A profile's `[sound]` section overrides the global one.
@@ -29,6 +34,8 @@ Status sounds play in two places, each with its own switch under the master `ena
 
 - **Server** (`server_enabled`): the machine running aoe, through `afplay` on macOS and `aplay` or `paplay` on Linux (`apt install alsa-utils pulseaudio-utils`). Only the TUI triggers these, and audio does not work over SSH.
 - **Browser** (`browser_enabled`): any open dashboard tab plays the waiting, idle and error sounds for every session, terminal or structured. Use this when `aoe serve` runs on a remote box. Start and running stay server-only. A tab ignores statuses that were already there when it loaded, and a status has to hold for a moment (5s for waiting, 2s for idle and error) before it sounds, so a flapping session stays quiet. A waiting sound is skipped right after the approval chime for the same session.
+
+Each event has an on/off switch per target (under Advanced in settings), all on by default. `browser_scope` limits which sessions sound in the browser: `other_sessions` stays silent for the session open in that tab, and `hidden_tab` sounds only while the tab is hidden. Both apply to the approval chime too.
 
 The browser uses the settings of the profile `aoe serve` runs under, so that profile's `[sound]` overrides apply there. Sessions you have muted for push notifications (`notify_on_*` set to false) stay silent in the browser too. If you run the TUI and a dashboard tab together, or two dashboard tabs, each plays its own sound; turn off `server_enabled` or `browser_enabled`, or close the extra tab. Status comes from the dashboard's 3-second session refresh, and browsers slow timers in tabs hidden for more than five minutes, so a long-hidden tab can sound up to a minute late. Browsers also enforce an autoplay policy, so the first sound after a page load may stay silent until you interact with the tab; the push notification still fires when no dashboard is in the foreground.
 

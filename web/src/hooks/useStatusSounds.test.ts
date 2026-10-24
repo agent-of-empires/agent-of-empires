@@ -22,7 +22,7 @@ import { notifySettingsChanged } from "../lib/settingsEvents";
 const ENABLED = {
   enabled: true,
   browser_enabled: true,
-  volume: 1,
+  browser_volume: 1,
   on_idle: "done",
   on_waiting: "ask",
   on_error: "bad",
@@ -30,6 +30,7 @@ const ENABLED = {
 
 let played: string[] = [];
 let view: RenderHookResult<void, { s: SessionResponse[] }>;
+let activeId: string | null = null;
 
 class FakeAudio {
   volume = 1;
@@ -48,7 +49,9 @@ const at = (id: string, status: SessionStatus, over: Partial<SessionResponse> = 
 
 /** Mounts the hook on `initial`; `step` then feeds one session list refresh, 3s later. */
 function mount(initial: SessionResponse[]) {
-  view = renderHook(({ s }: { s: SessionResponse[] }) => useStatusSounds(s), { initialProps: { s: initial } });
+  view = renderHook(({ s }: { s: SessionResponse[] }) => useStatusSounds(s, activeId), {
+    initialProps: { s: initial },
+  });
 }
 
 async function step(sessions: SessionResponse[]) {
@@ -79,6 +82,7 @@ describe("useStatusSounds", () => {
     vi.useFakeTimers();
     vi.setSystemTime(1_000_000);
     played = [];
+    activeId = null;
     fetchSettings.mockReset().mockResolvedValue({ sound: ENABLED });
     fetchSounds.mockReset().mockResolvedValue(["random"]);
     fetchSoundBlob.mockReset().mockImplementation(async (name: string) => new Blob([name]));
@@ -148,6 +152,26 @@ describe("useStatusSounds", () => {
     await step(idle);
     await step(idle);
     await expectOnlyProbeSounds(idle);
+  });
+
+  it("skips the open session under other_sessions and coalesces what is left", async () => {
+    fetchSettings.mockResolvedValue({ sound: { ...ENABLED, browser_scope: "other_sessions" } });
+    activeId = "a";
+    const changed = [at("a", "Idle"), at("b", "Idle"), at("c", "Idle"), at("d", "Error")];
+    mount(changed.map((s) => at(s.id, "Running")));
+    await step(changed);
+    await step(changed);
+    await vi.waitFor(() => expect(played).toHaveLength(2));
+    expect(fetchSoundBlob.mock.calls.map(([name]) => name).sort()).toEqual(["bad", "done"]);
+  });
+
+  it("stays silent under other_sessions when the only change is the open session", async () => {
+    fetchSettings.mockResolvedValue({ sound: { ...ENABLED, browser_scope: "other_sessions" } });
+    activeId = "a";
+    mount([at("a", "Running")]);
+    await step([at("a", "Idle")]);
+    await step([at("a", "Idle")]);
+    await expectOnlyProbeSounds([at("a", "Idle")]);
   });
 
   it("is silent for a session muted for this event", async () => {
