@@ -166,6 +166,9 @@ fn daemon_status_message(status: StatusCode, code: Option<ApiErrorCode>, body: &
         }
         Some(ApiErrorCode::StartFailed) => "Session start failed".into(),
         Some(ApiErrorCode::PurgeFailed) => "Session purge failed".into(),
+        Some(ApiErrorCode::LifecycleLocked) => {
+            "Session is busy with another operation; nothing changed, retry when it finishes".into()
+        }
         _ => format!("daemon returned HTTP {status}: {body}"),
     }
 }
@@ -1523,6 +1526,10 @@ mod tests {
                 } if status == StatusCode::CONFLICT && body.is_empty()
             ),
             "409 lifecycle_locked must map from status plus header with no body read, got: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("busy with another operation"),
+            "TUI-facing text must say the session is busy, got: {error}"
         );
         let captured = next_request(rx).await;
         assert_eq!(captured.path, "/api/sessions/sess-1/stop");
