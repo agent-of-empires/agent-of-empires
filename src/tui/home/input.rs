@@ -16,7 +16,6 @@ use crate::session::config::{
 };
 use crate::session::{list_profiles_for_display, Item, LifecycleOperation, Status};
 use crate::tui::app::Action;
-use crate::tui::dialogs::ServeAction;
 use crate::tui::dialogs::{
     builtin_commands, CommandPaletteDialog, ConfirmDialog, ContextMenuAction, ContextMenuDialog,
     DeleteDialogConfig, DialogResult, GroupDeleteOptions, GroupDeleteOptionsDialog,
@@ -25,6 +24,7 @@ use crate::tui::dialogs::{
     RenameMode, RepoTrustAction, RestartDialog, SendMessageDialog, TipsDialog, TipsOutcome,
     UnifiedDeleteDialog, WorktreeNameDialog,
 };
+use crate::tui::dialogs::{DashboardLaunch, ServeAction, ServeView};
 use crate::tui::diff::{DiffAction, DiffView};
 use crate::tui::responsive;
 use crate::tui::settings::{SettingsAction, SettingsView};
@@ -3731,7 +3731,11 @@ impl HomeView {
             ));
             return;
         }
-        self.serve_view = Some(crate::tui::dialogs::ServeView::new());
+        let launch = self.dashboard_launch.take();
+        self.dashboard_launch = launch
+            .clone()
+            .filter(|launch| matches!(launch, DashboardLaunch::Running { .. }));
+        self.serve_view = Some(launch.map_or_else(ServeView::new, ServeView::for_launch));
     }
 
     pub(super) fn open_settings(&mut self) {

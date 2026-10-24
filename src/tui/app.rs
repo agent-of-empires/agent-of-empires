@@ -3069,6 +3069,10 @@ impl App {
         self.home.session_feed.suspend_for_dashboard();
         self.home
             .set_sidebar_source(crate::tui::session_feed::SidebarSource::Connecting, None);
+        self.home.dashboard_launch = Some(crate::tui::dialogs::DashboardLaunch::Running {
+            target: request.target(),
+            started_at: std::time::Instant::now(),
+        });
         let (result, receiver) = tokio::sync::oneshot::channel();
         self.dashboard_launch = Some(receiver);
         tokio::spawn(async move {
@@ -3086,6 +3090,7 @@ impl App {
             Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Err("Dashboard startup was interrupted; no reconnect or mutation was replayed. Use aoe serve --status, then reconnect explicitly.".to_owned()),
         };
         self.dashboard_launch = None;
+        let launch = self.home.dashboard_launch.take();
         match result {
             Ok(prepared) if self.dashboard_stop_requested => {
                 drop(prepared);
@@ -3103,6 +3108,23 @@ impl App {
             Err(message) => {
                 if let Some(serve) = &mut self.home.serve_view {
                     serve.finish_launch(Err(message.clone()));
+                } else if let Some(crate::tui::dialogs::DashboardLaunch::Running {
+                    target, ..
+                }) = launch
+                {
+                    // Hidden with Esc; otherwise nothing on screen says the start failed.
+                    self.home.dashboard_launch =
+                        Some(crate::tui::dialogs::DashboardLaunch::Failed {
+                            target,
+                            message: message.clone(),
+                        });
+                    let what = if cfg!(feature = "web") {
+                        "Web dashboard"
+                    } else {
+                        "API server"
+                    };
+                    self.home
+                        .flash_status(format!("{what} didn't start. Press R for details."));
                 }
                 self.home.set_sidebar_source(
                     crate::tui::session_feed::SidebarSource::Disconnected,
@@ -4963,6 +4985,63 @@ mod tests {
         let (paste, enter) = App::split_trailing_enter("hi\n\n", &burst_keys);
         assert_eq!(paste, "hi\n");
         assert!(enter.is_some());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_launch_hidden_with_esc_stays_visible_and_its_failure_is_shown_once() {
+        use crate::tui::dialogs::{test_render, DashboardLaunch};
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let mut app = App::new(
+            "test",
+            AvailableTools::with_tools(&[]),
+            true,
+            false,
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        let open = KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT);
+        let drawn = |app: &App, needle: &str| {
+            let view = app.home.serve_view.as_ref().expect("serve view open");
+            let buffer = test_render::draw(110, 40, |frame, theme| {
+                view.render(frame, frame.area(), theme)
+            });
+            test_render::find(&buffer, needle);
+        };
+        // (view open when the launch fails, flashed)
+        for (view_open, flashed) in [(false, true), (true, false)] {
+            let started = std::time::Instant::now() - Duration::from_secs(30);
+            app.home.dashboard_launch = Some(DashboardLaunch::tunnel_for_test(started));
+            let (settle, launch) = tokio::sync::oneshot::channel();
+            app.dashboard_launch = Some(launch);
+
+            // Reopened mid-launch, it counts from the launch and leaves the bound to the App.
+            app.home.handle_key(open, None);
+            drawn(&app, "Elapsed: 30s");
+            assert!(app.home.serve_view.as_mut().is_some_and(|v| !v.tick()));
+            if !view_open {
+                app.home.handle_key(KeyEvent::from(KeyCode::Esc), None);
+                assert!(app.home.serve_view.is_none());
+            }
+
+            let reason = "Dashboard start failed. Check `aoe logs`.";
+            assert!(settle.send(Err(reason.into())).is_ok());
+            assert!(app.poll_dashboard_launch());
+            let flash = app.home.status_flash_text().unwrap_or_default().to_owned();
+            assert_eq!(
+                flash.ends_with("didn't start. Press R for details."),
+                flashed,
+                "{view_open}: {flash:?}"
+            );
+            if !view_open {
+                app.home.handle_key(open, None);
+            }
+            drawn(&app, "Dashboard start failed.");
+            app.home.handle_key(KeyEvent::from(KeyCode::Esc), None);
+            assert!(app.home.dashboard_launch.is_none(), "shown once");
+            app.home.status_flash = None;
+        }
     }
 
     #[tokio::test]

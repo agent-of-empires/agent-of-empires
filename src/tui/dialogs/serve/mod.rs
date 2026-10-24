@@ -17,7 +17,6 @@ use crate::tui::dialogs::{contains, hit, target_rects};
 use crate::tui::styles::Theme;
 use daemon::*;
 
-const TUNNEL_STARTUP_TIMEOUT_SECS: u64 = 60;
 const FLASH_TTL: Duration = Duration::from_millis(1500);
 const CONFIRM_TTL: Duration = Duration::from_secs(3);
 
@@ -34,7 +33,50 @@ pub struct ServeLaunchRequest {
     passphrase: Option<String>,
 }
 
+/// A dashboard launch the App runs, kept on Home so a view opened meanwhile shows it.
+#[derive(Clone)]
+pub enum DashboardLaunch {
+    Running {
+        target: LaunchTarget,
+        started_at: Instant,
+    },
+    /// Failed with no view open; the next view shows it, once.
+    Failed {
+        target: LaunchTarget,
+        message: String,
+    },
+}
+
+#[cfg(test)]
+impl DashboardLaunch {
+    pub(crate) fn tunnel_for_test(started_at: Instant) -> Self {
+        DashboardLaunch::Running {
+            target: LaunchTarget {
+                mode: ServeMode::Tunnel,
+                transport: Some(TunnelTransport::Tailscale),
+                passphrase: None,
+            },
+            started_at,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct LaunchTarget {
+    mode: ServeMode,
+    transport: Option<TunnelTransport>,
+    passphrase: Option<String>,
+}
+
 impl ServeLaunchRequest {
+    pub(crate) fn target(&self) -> LaunchTarget {
+        LaunchTarget {
+            mode: self.mode,
+            transport: self.transport,
+            passphrase: self.passphrase.clone(),
+        }
+    }
+
     pub(crate) async fn run(
         self,
         profile: String,
@@ -221,6 +263,18 @@ impl ServeViewState {
             tailscale,
             cloudflare,
             flash: None,
+        }
+    }
+
+    /// A start that failed, with the likely cause and the daemon's last log lines, which hold
+    /// the reason it gave.
+    fn start_failed(mode: ServeMode, transport: Option<TunnelTransport>, headline: &str) -> Self {
+        let tail = initial_log_tail();
+        let hint = diagnose_daemon_exit(&tail.join("\n"), mode);
+        ServeViewState::Error {
+            message: format!("{headline}{hint}{}", last_log_lines(&tail)),
+            mode,
+            transport,
         }
     }
 
@@ -513,6 +567,36 @@ impl ServeView {
         } else {
             ServeViewState::mode_picker()
         };
+        Self::with_state(state, pending_passphrase)
+    }
+
+    /// Opened while the App runs a launch, or after one failed with no view open.
+    pub fn for_launch(launch: DashboardLaunch) -> Self {
+        let pending_passphrase = load_or_generate_passphrase();
+        match launch {
+            DashboardLaunch::Running { target, started_at } => {
+                let mut view = Self::with_state(
+                    ServeViewState::Starting {
+                        mode: target.mode,
+                        transport: target.transport,
+                        passphrase: target.passphrase,
+                        started_at,
+                        log_offset: log_file_size(),
+                    },
+                    pending_passphrase,
+                );
+                // The App calls finish_launch on whichever view is open when the launch ends.
+                view.launch_in_flight = true;
+                view
+            }
+            DashboardLaunch::Failed { target, message } => Self::with_state(
+                ServeViewState::start_failed(target.mode, target.transport, &message),
+                pending_passphrase,
+            ),
+        }
+    }
+
+    fn with_state(state: ServeViewState, pending_passphrase: String) -> Self {
         Self {
             state,
             pending_passphrase,
@@ -764,11 +848,7 @@ impl ServeView {
         };
         self.state = match result {
             Ok(()) => ServeViewState::running(*mode, *transport, passphrase.clone(), *log_offset),
-            Err(message) => ServeViewState::Error {
-                message,
-                mode: *mode,
-                transport: *transport,
-            },
+            Err(message) => ServeViewState::start_failed(*mode, *transport, &message),
         };
     }
 
@@ -948,8 +1028,8 @@ impl ServeView {
                 mode,
                 transport,
                 passphrase,
-                started_at,
                 log_offset,
+                ..
             } => {
                 let log_grew = log_grew(log_offset);
                 let mode = *mode;
@@ -972,9 +1052,9 @@ impl ServeView {
                     };
                     return true;
                 }
+                // The Daemon bounds a Tunnel start itself, so this also catches its timeout.
                 if crate::cli::serve::daemon_pid().is_none() {
-                    let tail = initial_log_tail();
-                    let prefix = match mode {
+                    let headline = match mode {
                         ServeMode::Tunnel => {
                             "`aoe serve --remote --daemon` exited before the tunnel came up."
                         }
@@ -982,42 +1062,7 @@ impl ServeView {
                             "`aoe serve --daemon` exited before the server started."
                         }
                     };
-                    let hint = diagnose_daemon_exit(&tail.join("\n"), mode);
-                    self.state = ServeViewState::Error {
-                        message: format!("{prefix}{hint}{}", last_log_lines(&tail)),
-                        mode,
-                        transport: *transport,
-                    };
-                    return true;
-                }
-                if mode == ServeMode::Tunnel
-                    && started_at.elapsed() > Duration::from_secs(TUNNEL_STARTUP_TIMEOUT_SECS)
-                {
-                    // Stop it so a tunnel that never came up doesn't linger in the status bar.
-                    let stop_note = match stop_daemon() {
-                        Ok(()) => "Stuck daemon stopped.".to_string(),
-                        Err(e) => format!(
-                            "Daemon may still be running \
-                             (tried to stop: {}). Stop manually with `aoe serve --stop`.",
-                            e
-                        ),
-                    };
-                    let message = format!(
-                        "HTTPS tunnel did not announce a URL within {}s. \
-                         {}\n\n\
-                         Most likely cause: Tailscale Funnel needs HTTPS certs \
-                         or ACL approval, OR cloudflared is rate-limited / \
-                         offline. Re-run with AGENT_OF_EMPIRES_DEBUG=1 and \
-                         check debug.log for details.{}",
-                        TUNNEL_STARTUP_TIMEOUT_SECS,
-                        stop_note,
-                        last_log_lines(&initial_log_tail())
-                    );
-                    self.state = ServeViewState::Error {
-                        message,
-                        mode,
-                        transport: *transport,
-                    };
+                    self.state = ServeViewState::start_failed(mode, *transport, headline);
                     return true;
                 }
                 log_grew

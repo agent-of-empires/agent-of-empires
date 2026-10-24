@@ -367,6 +367,7 @@ pub struct HomeView {
     pub(super) command_palette: Option<CommandPaletteDialog>,
     pub(super) serve_view: Option<ServeView>,
     pub(super) pending_dashboard_launch: Option<super::dialogs::ServeLaunchRequest>,
+    pub(super) dashboard_launch: Option<super::dialogs::DashboardLaunch>,
     pub(super) update_confirm_dialog: Option<UpdateConfirmDialog>,
     /// One-time opt-in popup for users who finished the walkthrough before
     /// telemetry existed. Startup gating keeps it from rendering over the
