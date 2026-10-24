@@ -145,6 +145,7 @@ impl GitWorktree {
         // skips locked entries; siblings keep their locks.
         self.unlock_worktree(path);
         let t = Instant::now();
+        self.reap_abandoned_purges();
         self.prune_worktrees()?;
         tracing::info!(target: "git.worktree", "worktree create: prune done in {:?}", t.elapsed());
 
@@ -581,6 +582,185 @@ pub(super) mod tests {
             git_wt.fetch_branch("origin", "nonexistent-branch"),
             FetchOutcome::Failed(_)
         ));
+    }
+
+    #[test]
+    fn create_worktree_reaps_abandoned_purges() {
+        use std::os::unix::fs::PermissionsExt;
+        #[derive(Clone, Copy, PartialEq)]
+        enum Setup {
+            None,
+            LateEdit,
+            UnstattableCheckout,
+            CorruptIndex,
+        }
+        // (case, purge still claimed, row removed, force, setup, reaped, listed if kept)
+        for (label, live, row_removed, force, setup, reaped, listed) in [
+            (
+                "abandoned, row removed",
+                false,
+                true,
+                false,
+                Setup::None,
+                true,
+                false,
+            ),
+            ("live purge", true, true, true, Setup::None, false, false),
+            (
+                "row still retained",
+                false,
+                false,
+                false,
+                Setup::None,
+                false,
+                false,
+            ),
+            (
+                "checkout unstattable",
+                false,
+                true,
+                false,
+                Setup::UnstattableCheckout,
+                false,
+                false,
+            ),
+            (
+                "status unreadable",
+                false,
+                true,
+                false,
+                Setup::CorruptIndex,
+                false,
+                false,
+            ),
+            (
+                "unforced purge dirtied later",
+                false,
+                true,
+                false,
+                Setup::LateEdit,
+                false,
+                true,
+            ),
+            (
+                "forced purge dirtied later",
+                false,
+                true,
+                true,
+                Setup::LateEdit,
+                true,
+                false,
+            ),
+        ] {
+            let (dir, _repo) = init_repo();
+            let git_wt = GitWorktree::new(dir.path().to_path_buf()).unwrap();
+            let parent = TempDir::new().unwrap();
+            let aside = parent.path().join(".aoe-purge-x");
+            git_wt.create_worktree("feat", &aside, true, None).unwrap();
+            let admin = crate::git::cleanup::read_linked_worktree_gitdir(&aside).unwrap();
+            let terms = super::super::PurgeTerms { row_removed, force };
+            let claim = GitWorktree::mark_purging(&aside, terms).unwrap();
+            let _live = live.then_some(claim);
+            if !live {
+                super::super::tests::await_released(&aside);
+            }
+            let written = std::fs::read_to_string(admin.join(super::super::PURGE_MARKER));
+            assert_eq!(
+                GitWorktree::parse_purge_marker(&written.unwrap()),
+                terms,
+                "{label}"
+            );
+            match setup {
+                Setup::LateEdit => std::fs::write(aside.join("late-edit"), "").unwrap(),
+                Setup::CorruptIndex => std::fs::write(admin.join("index"), "not an index").unwrap(),
+                Setup::None | Setup::UnstattableCheckout => {}
+            }
+            let set_mode = |mode| {
+                std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(mode))
+                    .unwrap()
+            };
+            let unstattable = setup == Setup::UnstattableCheckout;
+            if unstattable {
+                set_mode(0o000);
+            }
+            let elsewhere = TempDir::new().unwrap();
+            let created =
+                git_wt.create_worktree("feat", &elsewhere.path().join("new"), false, None);
+            if unstattable {
+                set_mode(0o755);
+            }
+            assert_eq!(created.is_ok(), reaped, "{label}: {created:?}");
+            if !reaped {
+                assert_eq!(
+                    listed_on(&git_wt, "feat"),
+                    listed,
+                    "{label}: wrong visibility"
+                );
+                assert!(admin.join("locked").exists(), "{label}: left unlocked");
+            }
+            assert_eq!(aside.exists(), !reaped, "{label}");
+        }
+    }
+
+    /// A reaper that saw the marker before another reaper kept the checkout must not remove it
+    /// once it is adopted, and a held claim keeps a second reaper off the checkout.
+    #[test]
+    fn a_reaper_acts_only_on_the_marker_it_claims() {
+        let terms = super::super::PurgeTerms {
+            row_removed: true,
+            force: false,
+        };
+        for claim_held in [false, true] {
+            let (dir, _repo) = init_repo();
+            let git_wt = GitWorktree::new(dir.path().to_path_buf()).unwrap();
+            let parent = TempDir::new().unwrap();
+            let aside = parent.path().join(".aoe-purge-x");
+            git_wt.create_worktree("feat", &aside, true, None).unwrap();
+            let admin = crate::git::cleanup::read_linked_worktree_gitdir(&aside).unwrap();
+            let claim = GitWorktree::mark_purging(&aside, terms).unwrap();
+            let _held = claim_held.then_some(claim);
+            if !claim_held {
+                super::super::tests::await_released(&aside);
+            }
+            if !claim_held {
+                std::fs::write(aside.join("late-edit"), "").unwrap();
+                let (repo, kept) = (dir.path().to_path_buf(), aside.clone());
+                super::super::BEFORE_REAP_CLAIM.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move || {
+                        let first = GitWorktree::new(repo).unwrap();
+                        first.reap_abandoned_purges();
+                        assert!(listed_on(&first, "feat"), "first reaper did not keep it");
+                        let git = |args: &[&str]| {
+                            let status = std::process::Command::new("git")
+                                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                                .args(args)
+                                .current_dir(&kept)
+                                .status()
+                                .unwrap();
+                            assert!(status.success(), "git {args:?}");
+                        };
+                        git(&["add", "late-edit"]);
+                        git(&["commit", "-qm", "adopt"]);
+                    }));
+                });
+            }
+            git_wt.reap_abandoned_purges();
+            super::super::BEFORE_REAP_CLAIM.with(|slot| slot.borrow_mut().take());
+            assert!(aside.exists(), "claim held {claim_held}: checkout removed");
+            assert_eq!(
+                admin.join(super::super::PURGE_MARKER).exists(),
+                claim_held,
+                "claim held {claim_held}"
+            );
+        }
+    }
+
+    fn listed_on(git_wt: &GitWorktree, branch: &str) -> bool {
+        git_wt
+            .list_worktrees()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.branch.as_deref() == Some(branch))
     }
 
     #[test]

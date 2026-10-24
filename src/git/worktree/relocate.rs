@@ -357,7 +357,7 @@ impl GitWorktree {
 
     /// `git worktree repair`, which fixes both the checkout's `.git` pointer and
     /// the admin `gitdir` file, even when a relative pointer broke in the move.
-    fn repair_worktree(&self, path: &Path) -> Result<()> {
+    pub(crate) fn repair_worktree(&self, path: &Path) -> Result<()> {
         run_bounded(
             &self.repo_path,
             ["worktree", "repair", path_str(path)?],
