@@ -446,8 +446,6 @@ mod tests {
             include_str!("sessions/lifecycle.rs"),
             &[
                 "force_smart_rename",
-                "prepare_agent_session",
-                "prepare_agent_session_inner",
                 "restart_session",
                 "restore_session",
                 "start_session",
@@ -601,7 +599,20 @@ mod tests {
         (
             "acp/install.rs",
             include_str!("acp/install.rs"),
-            &["install_agent", "install_gate"],
+            &["install_agent"],
+        ),
+    ];
+
+    const MUTATION_AUDIT_HELPERS: &[(&str, &str, &[&str])] = &[
+        (
+            "sessions/lifecycle.rs",
+            include_str!("sessions/lifecycle.rs"),
+            &["prepare_agent_session", "prepare_agent_session_inner"],
+        ),
+        (
+            "acp/install.rs",
+            include_str!("acp/install.rs"),
+            &["install_gate"],
         ),
     ];
 
@@ -696,25 +707,25 @@ mod tests {
             "POST",
             "/mcp",
             "super::mcp::service(state.clone())",
-            "MCP currently exposes only session listing and caller identity.",
+            "Read-only tools pinned by server::mcp::tests::tools_list_advertises_both_tools; revisit this exemption when adding a tool.",
         ),
         (
             "PUT",
             "/mcp",
             "super::mcp::service(state.clone())",
-            "MCP currently exposes only session listing and caller identity.",
+            "Read-only tools pinned by server::mcp::tests::tools_list_advertises_both_tools; revisit this exemption when adding a tool.",
         ),
         (
             "PATCH",
             "/mcp",
             "super::mcp::service(state.clone())",
-            "MCP currently exposes only session listing and caller identity.",
+            "Read-only tools pinned by server::mcp::tests::tools_list_advertises_both_tools; revisit this exemption when adding a tool.",
         ),
         (
             "DELETE",
             "/mcp",
             "super::mcp::service(state.clone())",
-            "MCP currently exposes only session listing and caller identity.",
+            "Read-only tools pinned by server::mcp::tests::tools_list_advertises_both_tools; revisit this exemption when adding a tool.",
         ),
     ];
 
@@ -726,6 +737,21 @@ mod tests {
                 identity.strip_prefix("api::") == Some(*name)
             }
         })
+    }
+
+    fn unrouted_mutating_handlers<'a>(
+        routes: &[crate::server::access::MutatingRoute<'_>],
+        audited: &[&'a str],
+    ) -> Vec<&'a str> {
+        audited
+            .iter()
+            .copied()
+            .filter(|name| {
+                !routes
+                    .iter()
+                    .any(|route| audited_handler(route.handler, &[*name]))
+            })
+            .collect()
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -903,6 +929,33 @@ mod tests {
                 }]
             );
         }
+    }
+
+    #[test]
+    fn mutation_audit_rejects_unrouted_handlers_without_conflating_modules() {
+        use crate::server::access::MutatingRoute;
+
+        let routes = [
+            MutatingRoute {
+                method: "POST",
+                path: "/kept",
+                handler: "api::kept",
+                read_only_layer: false,
+            },
+            MutatingRoute {
+                method: "POST",
+                path: "/push",
+                handler: "push::subscribe",
+                read_only_layer: false,
+            },
+        ];
+        assert_eq!(
+            unrouted_mutating_handlers(
+                &routes,
+                &["kept", "removed", "push::subscribe", "subscribe"]
+            ),
+            vec!["removed", "subscribe"]
+        );
     }
 
     fn handler_source<'a>(source: &'a str, name: &str) -> Option<(&'a str, &'a str)> {
@@ -1232,7 +1285,12 @@ mod tests {
         let classification_failures =
             mutation_audit_failures(&routes, &audited, MUTATION_AUDIT_EXEMPTIONS);
         let mut failures = Vec::new();
-        for (file, source, handlers) in MUTATING_HANDLERS {
+        failures.extend(
+            unrouted_mutating_handlers(&routes, &audited)
+                .into_iter()
+                .map(|name| format!("audited handler `{name}` has no mutating route")),
+        );
+        for (file, source, handlers) in MUTATING_HANDLERS.iter().chain(MUTATION_AUDIT_HELPERS) {
             for name in *handlers {
                 let source_name = name.rsplit("::").next().expect("handler name");
                 let Some((signature, body)) = handler_source(source, source_name) else {
@@ -1300,10 +1358,11 @@ mod tests {
         assert!(preparation.contains("state.read_only"));
         let (_, body) = handler_source(include_str!("plugins.rs"), "invoke_plugin_action")
             .expect("invoke_plugin_action");
+        // Keep the no-elevation policy documented on `invoke_plugin_action`.
         for marker in ["mutation_gate", "is_elevated", "elevation_required"] {
             assert!(
                 !body.contains(marker),
-                "invoke_plugin_action: found `{marker}"
+                "invoke_plugin_action: found `{marker}`"
             );
         }
     }
