@@ -27,6 +27,7 @@ pub mod sandbox;
 pub mod send;
 pub mod serve;
 pub mod session;
+pub mod session_move;
 pub mod settings;
 pub mod skill;
 pub mod sounds;
