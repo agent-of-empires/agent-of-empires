@@ -4067,11 +4067,7 @@ mod tests {
             assert_eq!(fs::read_to_string(&path).unwrap(), "replacement registry");
             fs::remove_file(&path).unwrap();
             assert!(read_nonempty(&path).unwrap().is_none());
-            fs::write(
-                &path, " 
-	",
-            )
-            .unwrap();
+            fs::write(&path, [" ", "\n", "\t"].concat()).unwrap();
             assert!(read_nonempty(&path).unwrap().is_none());
             fs::remove_file(&path).unwrap();
             fs::create_dir(&path).unwrap();

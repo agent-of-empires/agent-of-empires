@@ -154,9 +154,8 @@ fn refuse_unresolved_adapter(
     ))
 }
 
-/// The runner owns the agent subprocess and outlives the daemon, so no `Child`
-/// handle is kept: the daemon reaches it over the unix socket, and the OS keeps
-/// it alive across `aoe serve` restarts.
+/// The runner owns the agent subprocess and outlives the daemon; its Child is
+/// transferred to the launch lease so teardown remains owned across cancellation.
 pub(super) async fn spawn_runner_detached(
     config: &SpawnConfig,
     socket_path: &std::path::Path,

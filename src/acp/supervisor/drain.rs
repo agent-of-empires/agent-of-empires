@@ -11,14 +11,13 @@ use tracing::{debug, info, warn};
 
 use super::agents::log_wrapper_substitution;
 use super::launch::{
-    apply_claude_store_pin, before_session_env, overlay_env, publish_rejection,
-    refresh_spawn_model_effort, resolve_mcp_servers,
+    apply_claude_store_pin, await_resume_to_completion, before_session_env, overlay_env,
+    publish_rejection, refresh_spawn_model_effort, resolve_mcp_servers,
 };
 use super::teardown::{settle_sweeping_if_owed, tear_down_runner, wait_for_exit};
 use super::{
-    lock_recover, next_seq, BroadcastSink, Launcher, PendingContextReset, ResumeReservation,
-    SeqMap, SharedSet, Supervisor, WorkerKind, Workers, MAX_RESPAWNS_IN_WINDOW, RESPAWN_BACKOFF,
-    RESTART_WINDOW,
+    lock_recover, next_seq, BroadcastSink, Launcher, PendingContextReset, SeqMap, SharedSet,
+    Supervisor, WorkerKind, Workers, MAX_RESPAWNS_IN_WINDOW, RESPAWN_BACKOFF, RESTART_WINDOW,
 };
 use crate::acp::acp_client::{AcpError, SpawnConfig};
 use crate::acp::runner_lifecycle::{
@@ -72,6 +71,18 @@ struct Drain<S> {
     pending_context_resets: SharedSet,
     context_reset: Option<PendingContextReset>,
     respawned_in_place: SharedSet,
+}
+
+impl<S> Drain<S> {
+    fn reservation_for_lease(&self, lease: Lease) -> super::ResumeReservation {
+        super::ResumeReservation {
+            lease,
+            expected_lifecycle_generation: None,
+            attach_record: None,
+            lifecycle: Arc::clone(&self.lifecycle),
+            notify: Arc::clone(&self.notify),
+        }
+    }
 }
 
 /// What a worker's event stream said before it closed.
@@ -489,17 +500,20 @@ impl<S: BroadcastSink> Drain<S> {
             );
             return None;
         };
-        let reservation = ResumeReservation {
-            lease: respawn_lease.clone(),
-            expected_lifecycle_generation: None,
-            attach_record: None,
-            lifecycle: Arc::clone(&self.lifecycle),
-            notify: Arc::clone(&self.notify),
-        };
+        let reservation = self.reservation_for_lease(respawn_lease.clone());
         config.generation = respawn_lease.epoch();
         config.launch_lease = Some(respawn_lease.clone());
 
-        tokio::time::sleep(RESPAWN_BACKOFF).await;
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep(RESPAWN_BACKOFF) => {}
+            _ = reservation.cancellation().cancelled() => {
+                if lock_recover(&self.lifecycle).convert_to_stopping(&respawn_lease) {
+                    self.finish_cancelled(&respawn_lease, previous).await;
+                }
+                return None;
+            }
+        }
         if worker_registry::stop_requested(session_id) {
             lock_recover(&self.lifecycle).begin_stop(session_id, "user_stopped", false);
         }
@@ -547,11 +561,30 @@ impl<S: BroadcastSink> Drain<S> {
             previous = None;
         }
         respawn_lease.record_prime(crate::acp::runner_lifecycle::PrimeOwnership::NotPrime);
-        Self::refresh_launch_env(&self.session_id, &mut config).await;
+        let refreshed = await_resume_to_completion(
+            reservation.cancellation(),
+            Self::refresh_launch_env(&self.session_id, &mut config),
+        )
+        .await
+        .is_ok();
+        if !refreshed {
+            if lock_recover(&self.lifecycle).convert_to_stopping(&respawn_lease) {
+                self.finish_cancelled(&respawn_lease, previous).await;
+            }
+            return None;
+        }
         if let Some((wrapper, base)) = &config.wrapper_substitution {
             log_wrapper_substitution(session_id, &config.tool, wrapper, base);
         }
-        let launched = (self.launcher)(config.clone(), AcpSessionId(session_id.clone())).await;
+        let launched = tokio::select! {
+            launched = (self.launcher)(config.clone(), AcpSessionId(session_id.clone())) => launched,
+            _ = reservation.cancellation().cancelled() => {
+                if lock_recover(&self.lifecycle).convert_to_stopping(&respawn_lease) {
+                    self.finish_cancelled(&respawn_lease, previous).await;
+                }
+                return None;
+            }
+        };
         let mut client = match launched {
             Ok(client) => client,
             Err(e) => {

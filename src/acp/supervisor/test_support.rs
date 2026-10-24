@@ -405,11 +405,20 @@ pub(super) fn gated_launcher(gate: &Gate, pid: u32) -> Launcher {
             lease.record_scope(worker_registry::ScopeOwnership::Unscoped);
             assert!(lease.record_runner(attested_test_identity(pid, config.generation)));
             entered.notify_one();
-            open.notified().await;
-            save_attested_test_record(&session_id.0, pid, config.generation);
-            let (client, tx) = AcpClient::fake_for_test(session_id);
-            senders.lock().unwrap().push(tx);
-            Ok(client.with_runner_pid(pid))
+            tokio::select! {
+                biased;
+                _ = lease.cancellation().cancelled() => {
+                    Err(crate::acp::acp_client::AcpError::Spawn(
+                        "constructor cancelled before registry publication".into(),
+                    ))
+                }
+                _ = open.notified() => {
+                    save_attested_test_record(&session_id.0, pid, config.generation);
+                    let (client, tx) = AcpClient::fake_for_test(session_id);
+                    senders.lock().unwrap().push(tx);
+                    Ok(client.with_runner_pid(pid))
+                }
+            }
         })
     })
 }
