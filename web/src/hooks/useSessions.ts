@@ -54,7 +54,10 @@ export function useSessions() {
       const floor = floorGet.current;
       if (abandonedEpochs.current.has(cursor.epoch)) return;
       if (floor?.epoch === cursor.epoch && cursor.revision < floor.revision) return;
-      if (floor && floor.epoch !== cursor.epoch) abandonedEpochs.current.add(floor.epoch);
+      if (floor && floor.epoch !== cursor.epoch) {
+        abandonedEpochs.current.add(floor.epoch);
+        pushedRef.current.clear();
+      }
       floorGet.current = cursor;
       const pushed = pushedRef.current;
       const present = new Set(data.sessions.map((s) => s.id));
@@ -122,7 +125,10 @@ export function useSessions() {
     };
   }, [applyResult]);
 
+  // Refetches the authoritative list after the stream (re)connected or lost events. A held status may stand for a
+  // transition whose follow-up was missed, and only pushes from this stream onward are recorded again.
   const refresh = useCallback(() => {
+    pushedRef.current.clear();
     void fetchSessions().then(applyResult);
   }, [applyResult]);
 

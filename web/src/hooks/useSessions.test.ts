@@ -39,10 +39,15 @@ describe("useSessions / loaded sentinel", () => {
 
 describe("useSessions / pushed status", () => {
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
   });
 
+  /** The next scheduled poll begins, after whatever the test did in between. */
+  const nextPoll = () => act(async () => void vi.advanceTimersByTime(3000));
+
   function mountWithReads() {
+    vi.useFakeTimers();
     const resolvers: ((value: api.SessionsEnvelope | null) => void)[] = [];
     vi.spyOn(api, "fetchSessions").mockImplementation(() => new Promise((r) => resolvers.push(r)));
     const envelope = (status: SessionResponse["status"], revision: bigint): api.SessionsEnvelope => ({
@@ -57,7 +62,7 @@ describe("useSessions / pushed status", () => {
     const { result, resolvers, envelope } = mountWithReads();
     await act(async () => resolvers[0]!(envelope("Running", 1n)));
     act(() => result.current.applyPushedStatus("a", "Waiting"));
-    act(() => result.current.refresh()); // begins after the push, but the cached snapshot predates it
+    await nextPoll(); // begins after the push, but the cached snapshot predates it
     await act(async () => resolvers[1]!(envelope("Running", 1n)));
     expect(result.current.sessions[0]!.status).toBe("Waiting");
   });
@@ -66,11 +71,31 @@ describe("useSessions / pushed status", () => {
     const { result, resolvers, envelope } = mountWithReads();
     await act(async () => resolvers[0]!(envelope("Running", 1n)));
     act(() => result.current.applyPushedStatus("a", "Waiting"));
-    act(() => result.current.refresh());
+    await nextPoll();
     await act(async () => resolvers[1]!(envelope("Waiting", 2n)));
     expect(result.current.sessions[0]!.status).toBe("Waiting");
-    act(() => result.current.refresh());
+    await nextPoll();
     await act(async () => resolvers[2]!(envelope("Running", 3n)));
+    expect(result.current.sessions[0]!.status).toBe("Running");
+  });
+
+  it("drops a held status on resync, so a transition missed while disconnected cannot stick", async () => {
+    const { result, resolvers, envelope } = mountWithReads();
+    await act(async () => resolvers[0]!(envelope("Running", 1n)));
+    act(() => result.current.applyPushedStatus("a", "Waiting"));
+    // The stream drops, the session returns to Running unseen, and the stream reconnects.
+    act(() => result.current.refresh());
+    await act(async () => resolvers[1]!(envelope("Running", 1n)));
+    expect(result.current.sessions[0]!.status).toBe("Running");
+  });
+
+  it("drops a held status when the runtime epoch changes", async () => {
+    const { result, resolvers, envelope } = mountWithReads();
+    await act(async () => resolvers[0]!(envelope("Running", 1n)));
+    act(() => result.current.applyPushedStatus("a", "Waiting"));
+    act(() => result.current.refresh());
+    act(() => result.current.applyPushedStatus("a", "Waiting"));
+    await act(async () => resolvers[1]!({ ...envelope("Running", 1n), cursor: { epoch: "restarted", revision: 1n } }));
     expect(result.current.sessions[0]!.status).toBe("Running");
   });
 });
