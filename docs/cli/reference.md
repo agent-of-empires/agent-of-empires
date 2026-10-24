@@ -424,7 +424,7 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `show` — Show session details
 * `wait` — Block until a session's agent activity status matches one of the `--until` values. Exits 0 on a match, 124 on timeout (like `timeout(1)`), and 1 if the session stops. Tmux sessions only
 * `rename` — Rename a session
-* `move` — Move stopped sessions to another profile. Each keeps its title, group and worktree; the target profile's config applies from the next start
+* `move` — Move sessions to another profile. Sessions that look active when the command starts are refused; one that starts mid-batch can still move. Each keeps its title, group and worktree; the target profile's config applies from the next start
 * `set-worktree-name` — Edit a managed worktree session's workdir directory name (and, optionally, its git branch). Moves the worktree directory in place; the session must not be running. See #1723
 * `capture` — Capture tmux pane output
 * `current` — Auto-detect current session
@@ -559,7 +559,7 @@ Rename a session
 
 ## `aoe session move`
 
-Move stopped sessions to another profile. Each keeps its title, group and worktree; the target profile's config applies from the next start
+Move sessions to another profile. Sessions that look active when the command starts are refused; one that starts mid-batch can still move. Each keeps its title, group and worktree; the target profile's config applies from the next start
 
 **Usage:** `aoe session move --to-profile <TO_PROFILE> <IDENTIFIERS>...`
 

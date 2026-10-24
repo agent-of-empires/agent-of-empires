@@ -35,8 +35,10 @@ pub enum SessionCommands {
     /// Rename a session
     Rename(RenameArgs),
 
-    /// Move stopped sessions to another profile. Each keeps its title, group
-    /// and worktree; the target profile's config applies from the next start.
+    /// Move sessions to another profile. Sessions that look active when the
+    /// command starts are refused; one that starts mid-batch can still move.
+    /// Each keeps its title, group and worktree; the target profile's config
+    /// applies from the next start.
     Move(super::session_move::MoveArgs),
 
     /// Edit a managed worktree session's workdir directory name (and,

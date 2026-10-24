@@ -33,7 +33,7 @@ pub async fn run(profile: &str, args: MoveArgs) -> Result<()> {
     }
 
     let source = if profile.is_empty() {
-        crate::session::config::resolve_default_profile()
+        client.default_profile().await?
     } else {
         profile.to_string()
     };
@@ -96,7 +96,7 @@ fn partial_report(error: &str, target: &str, ids: &[&str], moved: &[&str], faile
         ));
     }
     report.push_str(&format!(
-        "\nNot confirmed (check with `aoe session list`): {failed}"
+        "\nNot confirmed (check with `aoe list --all`): {failed}"
     ));
     if !untried.is_empty() {
         report.push_str(&format!("\nNot attempted: {}", untried.join(", ")));
@@ -238,18 +238,15 @@ mod tests {
         let ids = ["a", "b", "c"];
         let report = partial_report("boom", "work", &ids, &["a"], "b");
         assert!(report.contains("Already moved to 'work': a\n"));
-        assert!(report.contains("Not confirmed (check with `aoe session list`): b\n"));
+        assert!(report.contains("Not confirmed (check with `aoe list --all`): b\n"));
         assert!(report.ends_with("Not attempted: c"));
 
         let first = partial_report("boom", "work", &ids, &[], "a");
         assert!(!first.contains("Already moved"));
-        assert!(first.contains("Not confirmed (check with `aoe session list`): a\n"));
+        assert!(first.contains("Not confirmed (check with `aoe list --all`): a\n"));
         assert!(first.ends_with("Not attempted: b, c"));
 
         let only = partial_report("boom", "work", &["a"], &[], "a");
-        assert_eq!(
-            only,
-            "boom\nNot confirmed (check with `aoe session list`): a"
-        );
+        assert_eq!(only, "boom\nNot confirmed (check with `aoe list --all`): a");
     }
 }
