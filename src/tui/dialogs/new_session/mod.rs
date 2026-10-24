@@ -2136,12 +2136,29 @@ impl NewSessionDialog {
         }
         let profile = self.selected_profile().to_string();
         let config = self.resolve_config_for_path(&profile);
-        if let Err(msg) = crate::session::builder::structured::validate_structured_choice(
-            &self.available_tools[self.tool_index],
-            self.command_override.value(),
-            &config,
-        ) {
-            self.error_message = Some(msg);
+        let path = path_input::expand_tilde(self.path.value().trim());
+        let choice = crate::session::builder::structured::StructuredChoice {
+            tool: &self.available_tools[self.tool_index],
+            agent_name: None,
+            command_override: self.command_override.value(),
+            sandboxed: self.sandbox_enabled,
+            // A worktree or scratch session launches in a directory created later.
+            project_path: (!self.scratch && !self.worktree_enabled)
+                .then(|| std::path::Path::new(&path)),
+            // The dialog asks for hook trust itself, so an unapproved hook still counts here.
+            preparation_hooks: &|| {
+                crate::session::builder::structured::preparation_hooks_apply(
+                    &crate::session::config::profile_config::resolve_config_or_warn(&profile).hooks,
+                    std::path::Path::new(&path),
+                    self.scratch,
+                    None,
+                )
+            },
+        };
+        if let Err(e) =
+            crate::session::builder::structured::validate_structured_choice(&choice, &config)
+        {
+            self.error_message = Some(e.to_string());
             return false;
         }
         true

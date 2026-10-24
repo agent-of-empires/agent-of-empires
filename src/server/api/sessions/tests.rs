@@ -8042,6 +8042,15 @@ async fn post_create(
     state: &std::sync::Arc<AppState>,
     body: serde_json::Value,
 ) -> (axum::http::StatusCode, serde_json::Value) {
+    let (status, bytes) = post_create_bytes(state, body).await;
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+/// [`post_create`] without assuming a JSON body.
+async fn post_create_bytes(
+    state: &std::sync::Arc<AppState>,
+    body: serde_json::Value,
+) -> (axum::http::StatusCode, axum::body::Bytes) {
     use axum::response::IntoResponse;
     let response = create_session(
         axum::extract::State(state.clone()),
@@ -8055,7 +8064,7 @@ async fn post_create(
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap())
+    (status, bytes)
 }
 
 /// [`post_create`] plus the `aoe-error-code` header, which is the only thing
@@ -8091,6 +8100,7 @@ async fn scratch_create_resolves_profile_before_publication_and_purge() {
     use axum::response::IntoResponse;
 
     let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
     crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     crate::session::config::update_config(|config| {
@@ -8215,6 +8225,7 @@ async fn a_dropped_create_finishes_and_its_retry_returns_the_same_session() {
     use crate::server::test_support as support;
     for native_origin in [false, true] {
         let _home = crate::session::test_support::isolate_app_dir();
+        let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
         crate::session::config::update_app_state(|state| {
             state.has_acknowledged_agent_hooks = true;
         })
@@ -8349,6 +8360,7 @@ async fn a_dropped_create_finishes_and_its_retry_returns_the_same_session() {
 async fn a_failed_create_is_replayed_to_a_same_key_retry() {
     use crate::server::test_support as support;
     let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
     crate::session::config::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
     })
@@ -8382,6 +8394,7 @@ async fn a_failed_create_is_replayed_to_a_same_key_retry() {
 async fn a_full_failure_map_replays_its_oldest_key_and_refuses_new_ones() {
     use crate::server::test_support as support;
     let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
     crate::session::config::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
     })
@@ -8449,6 +8462,7 @@ async fn a_full_failure_map_replays_its_oldest_key_and_refuses_new_ones() {
 async fn a_retry_across_a_daemon_restart_never_reruns_a_failed_create() {
     use crate::server::test_support as support;
     let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
     crate::session::config::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
     })
@@ -8508,6 +8522,7 @@ async fn a_retry_across_a_daemon_restart_never_reruns_a_failed_create() {
 async fn a_retry_across_a_restart_is_fenced_before_profile_validation() {
     use crate::server::test_support as support;
     let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
     crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     crate::session::config::update_app_state(|state| {
@@ -8571,6 +8586,7 @@ async fn a_retry_across_a_restart_is_fenced_before_profile_validation() {
 async fn a_trust_changed_refusal_does_not_freeze_its_idempotency_key() {
     use crate::server::test_support as support;
     let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
     crate::session::config::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
     })
@@ -8633,6 +8649,7 @@ async fn a_trust_changed_refusal_does_not_freeze_its_idempotency_key() {
 async fn a_cancelled_create_does_not_freeze_its_idempotency_key() {
     use crate::server::test_support as support;
     let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
     crate::session::config::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
     })
@@ -8734,6 +8751,7 @@ done
         <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
     )
     .unwrap();
+    crate::session::test_support::write_stub_adapter(&bin, "claude-agent-acp");
     let path = std::env::join_paths(
         std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
     )
@@ -9357,4 +9375,95 @@ async fn workspace_trash_consent_follows_siblings_and_protects_the_shared_owner(
         }
     }
     Ok(())
+}
+
+/// A structured create whose adapter resolves nowhere is refused with a
+/// stable code before anything is provisioned; the cases the check exempts
+/// never get that code.
+#[tokio::test]
+#[serial_test::serial]
+async fn create_refuses_a_structured_session_without_its_adapter() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let adapter = format!("aoe-test-adapter-{}", std::process::id());
+    crate::session::config::update_config(|config| {
+        config
+            .session
+            .custom_agents
+            .insert("fake".into(), "true".into());
+        config
+            .session
+            .agent_acp_cmd
+            .insert("fake".into(), adapter.clone());
+    })
+    .unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let path = project.path().display().to_string();
+    let state = crate::server::test_support::build_test_app_state(Vec::new());
+    // Holds the only worker slot, so an exempt create that gets through never launches an agent.
+    state.acp_supervisor.test_insert_worker("occupant").await;
+    let base = |extra: serde_json::Value| {
+        let mut body = serde_json::json!({ "title": "no-adapter", "path": path, "tool": "fake" });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        body
+    };
+    let refused = [
+        serde_json::json!({ "view": "structured" }),
+        serde_json::json!({ "view": "structured", "scratch": true, "path": "" }),
+        // An import is structured whatever `view` says.
+        serde_json::json!({ "import_acp_session_id": "native-1" }),
+        serde_json::json!({ "view": "structured", "fork_from": "parent-1" }),
+        serde_json::json!({ "view": "structured", "tool": "claude", "agent_name": "fake" }),
+        // The session's command can't stand in for a custom agent's ACP command.
+        serde_json::json!({ "view": "structured", "command_override": "true acp" }),
+    ];
+    for extra in refused {
+        let (status, body) = post_create(&state, base(extra.clone())).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "{extra}: {body}"
+        );
+        assert_eq!(body["error"], "acp_adapter_missing", "{extra}: {body}");
+        let message = body["message"].as_str().unwrap();
+        assert!(
+            message.contains(&format!("ACP adapter `{adapter}` is not installed")),
+            "{extra}: {message}"
+        );
+        assert!(state.instances.read().await.is_empty(), "{extra}");
+        assert!(
+            crate::server::test_support::load_instances_from_disk_for_test("default").is_empty(),
+            "{extra}"
+        );
+    }
+    let exempt = [
+        serde_json::json!({ "view": "structured", "sandbox": true }),
+        // It replaces an adapter that is the agent's own CLI, so that's what is checked.
+        serde_json::json!({ "view": "structured", "tool": "gemini", "command_override": "/bin/sh" }),
+        serde_json::json!({ "view": "terminal" }),
+    ];
+    for extra in exempt {
+        // Past the check the create may fail later with no JSON body; only the code matters here.
+        let (_, bytes) = post_create_bytes(&state, base(extra.clone())).await;
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        assert_ne!(body["error"], "acp_adapter_missing", "{extra}: {body}");
+    }
+    // A repository on_create hook may install the adapter before launch, so it isn't refused,
+    // unless the create skips the repository's hooks.
+    let hooked = project_with_on_create_hooks(&["npm install"]);
+    let hooked_path = hooked.path().display().to_string();
+    for (trust_hooks, refused) in [(None, false), (Some(true), false), (Some(false), true)] {
+        let mut extra = serde_json::json!({ "view": "structured", "path": hooked_path });
+        if let Some(trust) = trust_hooks {
+            extra["trust_hooks"] = serde_json::json!(trust);
+        }
+        let (_, bytes) = post_create_bytes(&state, base(extra.clone())).await;
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        assert_eq!(
+            body["error"] == "acp_adapter_missing",
+            refused,
+            "{extra}: {body}"
+        );
+    }
 }

@@ -104,8 +104,27 @@ pub fn resolve_agent_command(
 }
 
 /// A plain name to look up, as opposed to a path or a `${placeholder}`.
-pub(super) fn is_bare_command(command: &str) -> bool {
+pub fn is_bare_command(command: &str) -> bool {
     !(command.contains('/') || command.contains('\\') || command.contains("${"))
+}
+
+/// Whether a bare `command` is on the PATH the adapter is launched with: the
+/// last `PATH` in `agent_environment`, else `inherited_path`, searched from
+/// `cwd` so relative entries such as `node_modules/.bin` resolve against the
+/// project, as they do for the spawned adapter.
+pub fn on_agent_path(
+    command: &str,
+    cwd: &std::path::Path,
+    agent_environment: &[(String, String)],
+    inherited_path: Option<&std::ffi::OsStr>,
+) -> bool {
+    agent_environment
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "PATH")
+        .map(|(_, path)| std::ffi::OsStr::new(path))
+        .or(inherited_path)
+        .is_some_and(|path| which::which_in(command, Some(path), cwd).is_ok())
 }
 
 /// The npm `.bin` shim is `#!/usr/bin/env node`, so the interpreter must also
