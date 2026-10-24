@@ -893,7 +893,12 @@
       "id": "notifications.status-sounds",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/lib/statusSounds.test.ts", "src/hooks/useStatusSounds.test.ts"],
+      "specs": [
+        "src/lib/statusSounds.test.ts",
+        "src/hooks/useStatusSounds.test.ts",
+        "src/hooks/useSessionStatusStream.test.ts",
+        "src/hooks/useSessions.test.ts"
+      ],
       "components": ["web/src/lib/statusSounds.ts", "web/src/hooks/useStatusSounds.ts", "web/src/lib/soundPlayer.ts"]
     },
     {

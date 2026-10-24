@@ -21,7 +21,7 @@ use tokio::sync::RwLock;
 use super::push_send::PUSH_TTL_SECS;
 
 /// Committed status transitions consumed by push, callbacks and plugin workers.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct StatusChange {
     pub instance_id: String,
     pub instance_title: String,
@@ -462,7 +462,24 @@ pub enum NotificationEvent {
 }
 
 impl NotificationEvent {
-    fn dwell_ms(self) -> u64 {
+    pub(crate) fn for_status(status: Status) -> Option<Self> {
+        match status {
+            Status::Waiting => Some(Self::Waiting),
+            Status::Idle => Some(Self::Idle),
+            Status::Error => Some(Self::Error),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Waiting => "waiting",
+            Self::Idle => "idle",
+            Self::Error => "error",
+        }
+    }
+
+    pub(crate) fn dwell_ms(self) -> u64 {
         match self {
             Self::Waiting => DWELL_WAITING_MS,
             _ => DWELL_TERMINAL_MS,

@@ -16,6 +16,7 @@ import { diffSelectionStale } from "./lib/diffSelection";
 import { useSessions } from "./hooks/useSessions";
 import { useAttentionCounts } from "./hooks/useAttentionCounts";
 import { useStatusSounds } from "./hooks/useStatusSounds";
+import { useSessionStatusStream } from "./hooks/useSessionStatusStream";
 import { useDashboardPresence } from "./hooks/useDashboardPresence";
 import { clearAcpCache } from "./hooks/useAcpSession";
 import { clearDraft, sweepOrphanDrafts } from "./lib/acpDrafts";
@@ -97,7 +98,7 @@ import {
   restoreSession,
   fetchPlugins,
 } from "./lib/api";
-import type { DeleteSessionOptions, ServerAbout, SettingsResponse } from "./lib/api";
+import type { DeleteSessionOptions, RuntimeCursor, ServerAbout, SettingsResponse } from "./lib/api";
 import { getClientCapabilities } from "./lib/clientCapabilities";
 import { normalizeProjectPathKey } from "./lib/registeredProjects";
 import { IdleDecayWindowContext, parseIdleDecayWindowMs } from "./lib/idleDecay";
@@ -398,6 +399,8 @@ function AppContent({
     applySessionMutation,
     observedById,
     runtimeEpoch,
+    refresh: refreshSessions,
+    applyPushedStatus,
   } = useSessions();
   const workspaces = useWorkspaces(sessions);
   // Creates whose outcome the wizard never learned keep reconciling here, past its unmount.
@@ -424,7 +427,15 @@ function AppContent({
   const trashedWorkspaces = useMemo(() => workspaces.filter(workspaceIsTrashed), [workspaces]);
 
   const { unreadCount, waitingCount } = useAttentionCounts(sessions, activeSessionId);
-  useStatusSounds(sessions);
+  const { onSoundDue, cancelCue } = useStatusSounds(sessions);
+  const onPushedStatus = useCallback(
+    (id: string, status: SessionResponse["status"], cursor: RuntimeCursor) => {
+      cancelCue(id);
+      applyPushedStatus(id, status, cursor);
+    },
+    [cancelCue, applyPushedStatus],
+  );
+  useSessionStatusStream({ onStatus: onPushedStatus, onSoundDue, onResync: refreshSessions });
   const attentionBadgeColors = useMemo(() => getAttentionBadgeColors(resolvedTheme), [resolvedTheme]);
 
   // Remember the active session and restore it on a PWA relaunch (#2103).

@@ -55,7 +55,7 @@ function closeQuietly(ws: WebSocket): void {
 const subscribeVisibility = (cb: () => void) => listen(cb, [document, "visibilitychange"], [window, "pageshow"]);
 const subscribeOnline = (cb: () => void) => listen(cb, [window, "online"], [window, "offline"]);
 
-function acpSocketProtocols(): string[] {
+export function acpSocketProtocols(): string[] {
   const token = getToken();
   let bindingSecret: string | null = null;
   try {
