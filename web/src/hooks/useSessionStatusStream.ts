@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import type { RuntimeCursor } from "../lib/api";
 import type { SessionResponse } from "../lib/types";
 import type { StatusSoundEvent } from "../lib/statusSounds";
 import { retryDelayMs } from "../lib/wsBackoff";
@@ -6,7 +7,8 @@ import { acpSocketProtocols } from "./acpSession/useAcpConnection";
 import { useLatestRef } from "./useLatestRef";
 
 export interface SessionStatusStreamHandlers {
-  onStatus: (id: string, status: SessionResponse["status"]) => void;
+  /** `cursor` is the snapshot that already includes the move. */
+  onStatus: (id: string, status: SessionResponse["status"], cursor: RuntimeCursor) => void;
   onSoundDue: (id: string, event: StatusSoundEvent) => void;
   /** The stream is (re)established or lost events; refetch the full list. */
   onResync: () => void;
@@ -29,7 +31,7 @@ export function useSessionStatusStream(handlers: SessionStatusStreamHandlers): v
       ws = new WebSocket(`${protocol}://${window.location.host}/api/sessions/status/ws`, acpSocketProtocols());
       ws.onmessage = (e) => {
         if (stopped) return;
-        let frame: { kind?: string; id?: string; status?: string; event?: string };
+        let frame: { kind?: string; id?: string; status?: string; event?: string; epoch?: string; revision?: string };
         try {
           frame = JSON.parse(String(e.data));
         } catch {
@@ -41,8 +43,17 @@ export function useSessionStatusStream(handlers: SessionStatusStreamHandlers): v
           h.onResync();
         } else if (frame.kind === "resync") {
           h.onResync();
-        } else if (frame.kind === "status" && frame.id && frame.status) {
-          h.onStatus(frame.id, frame.status as SessionResponse["status"]);
+        } else if (
+          frame.kind === "status" &&
+          frame.id &&
+          frame.status &&
+          frame.epoch &&
+          /^\d+$/.test(frame.revision ?? "")
+        ) {
+          h.onStatus(frame.id, frame.status as SessionResponse["status"], {
+            epoch: frame.epoch,
+            revision: BigInt(frame.revision!),
+          });
         } else if (frame.kind === "sound_due" && frame.id && SOUND_EVENTS.includes(frame.event ?? "")) {
           h.onSoundDue(frame.id, frame.event as StatusSoundEvent);
         }

@@ -47,7 +47,8 @@ describe("useSessionStatusStream", () => {
 
     act(() => {
       ws.push({ kind: "ready" });
-      ws.push({ kind: "status", id: "a", status: "Waiting" });
+      ws.push({ kind: "status", id: "a", status: "Waiting", epoch: "boot", revision: "7" });
+      ws.push({ kind: "status", id: "a", status: "Running" }); // no cursor
       ws.push({ kind: "sound_due", id: "a", event: "waiting" });
       ws.push({ kind: "sound_due", id: "a", event: "bogus" });
       ws.push({ kind: "status", id: "a" });
@@ -57,7 +58,7 @@ describe("useSessionStatusStream", () => {
 
     expect(handlers.onResync).toHaveBeenCalledTimes(2);
     expect(handlers.onStatus).toHaveBeenCalledOnce();
-    expect(handlers.onStatus).toHaveBeenCalledWith("a", "Waiting");
+    expect(handlers.onStatus).toHaveBeenCalledWith("a", "Waiting", { epoch: "boot", revision: 7n });
     expect(handlers.onSoundDue).toHaveBeenCalledOnce();
     expect(handlers.onSoundDue).toHaveBeenCalledWith("a", "waiting");
   });

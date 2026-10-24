@@ -38,76 +38,50 @@ describe("useSessions / loaded sentinel", () => {
 });
 
 describe("useSessions / pushed status", () => {
-  afterEach(() => {
-    vi.useRealTimers();
-    vi.restoreAllMocks();
-  });
-
-  /** The next scheduled poll begins, after whatever the test did in between. */
-  const nextPoll = () => act(async () => void vi.advanceTimersByTime(3000));
+  afterEach(() => vi.restoreAllMocks());
 
   function mountWithReads() {
-    vi.useFakeTimers();
     const resolvers: ((value: api.SessionsEnvelope | null) => void)[] = [];
     vi.spyOn(api, "fetchSessions").mockImplementation(() => new Promise((r) => resolvers.push(r)));
-    const envelope = (status: SessionResponse["status"], revision: bigint): api.SessionsEnvelope => ({
+    const envelope = (status: SessionResponse["status"], revision: bigint, epoch = "boot"): api.SessionsEnvelope => ({
       sessions: [{ id: "a", status } as SessionResponse],
       workspace_ordering: [],
-      cursor: { epoch: "boot", revision },
+      cursor: { epoch, revision },
     });
     return { resolvers, envelope, ...renderHook(() => useSessions()) };
   }
 
-  it("holds a pushed status against a poll the publication has not caught up with", async () => {
-    const { result, resolvers, envelope } = mountWithReads();
-    await act(async () => resolvers[0]!(envelope("Running", 1n)));
-    act(() => result.current.applyPushedStatus("a", "Waiting"));
-    await nextPoll(); // begins after the push, but the cached snapshot predates it
-    await act(async () => resolvers[1]!(envelope("Running", 1n)));
-    expect(result.current.sessions[0]!.status).toBe("Waiting");
-  });
+  const cursor = (revision: bigint, epoch = "boot") => ({ epoch, revision });
 
-  it("releases a pushed status once a snapshot shows it, so a later differing poll applies", async () => {
+  it("applies a pushed status and drops an older read that lands after it", async () => {
     const { result, resolvers, envelope } = mountWithReads();
     await act(async () => resolvers[0]!(envelope("Running", 1n)));
-    act(() => result.current.applyPushedStatus("a", "Waiting"));
-    await nextPoll();
-    await act(async () => resolvers[1]!(envelope("Waiting", 2n)));
+    act(() => result.current.applyPushedStatus("a", "Waiting", cursor(2n)));
     expect(result.current.sessions[0]!.status).toBe("Waiting");
-    await nextPoll();
+    act(() => result.current.refresh());
+    await act(async () => resolvers[1]!(envelope("Running", 1n))); // started before the push, resolves after
+    expect(result.current.sessions[0]!.status).toBe("Waiting");
+    act(() => result.current.refresh());
     await act(async () => resolvers[2]!(envelope("Running", 3n)));
     expect(result.current.sessions[0]!.status).toBe("Running");
   });
 
-  it("does not let a read that began before the push acknowledge it", async () => {
+  it("ignores a push already covered by a newer read, or from another epoch", async () => {
     const { result, resolvers, envelope } = mountWithReads();
-    await act(async () => resolvers[0]!(envelope("Running", 1n)));
-    await nextPoll(); // read A begins before any push
-    act(() => result.current.applyPushedStatus("a", "Waiting"));
-    act(() => result.current.applyPushedStatus("a", "Running"));
-    await act(async () => resolvers[1]!(envelope("Running", 2n))); // matches the override, but is older than the push
-    await nextPoll();
-    await act(async () => resolvers[2]!(envelope("Waiting", 3n)));
+    await act(async () => resolvers[0]!(envelope("Running", 5n)));
+    act(() => result.current.applyPushedStatus("a", "Waiting", cursor(4n)));
+    expect(result.current.sessions[0]!.status).toBe("Running");
+    act(() => result.current.applyPushedStatus("a", "Waiting", cursor(9n, "other")));
     expect(result.current.sessions[0]!.status).toBe("Running");
   });
 
-  it("drops a held status on resync, so a transition missed while disconnected cannot stick", async () => {
+  it("applies a push from the new epoch only after a read of that epoch installed it", async () => {
     const { result, resolvers, envelope } = mountWithReads();
-    await act(async () => resolvers[0]!(envelope("Running", 1n)));
-    act(() => result.current.applyPushedStatus("a", "Waiting"));
-    // The stream drops, the session returns to Running unseen, and the stream reconnects.
+    await act(async () => resolvers[0]!(envelope("Running", 5n)));
     act(() => result.current.refresh());
-    await act(async () => resolvers[1]!(envelope("Running", 1n)));
-    expect(result.current.sessions[0]!.status).toBe("Running");
-  });
-
-  it("drops a held status when the runtime epoch changes", async () => {
-    const { result, resolvers, envelope } = mountWithReads();
-    await act(async () => resolvers[0]!(envelope("Running", 1n)));
-    act(() => result.current.applyPushedStatus("a", "Waiting"));
-    act(() => result.current.refresh());
-    act(() => result.current.applyPushedStatus("a", "Waiting"));
-    await act(async () => resolvers[1]!({ ...envelope("Running", 1n), cursor: { epoch: "restarted", revision: 1n } }));
-    expect(result.current.sessions[0]!.status).toBe("Running");
+    act(() => result.current.applyPushedStatus("a", "Waiting", cursor(1n, "restarted"))); // before any epoch-B read
+    await act(async () => resolvers[1]!(envelope("Running", 1n, "restarted")));
+    act(() => result.current.applyPushedStatus("a", "Waiting", cursor(2n, "restarted")));
+    expect(result.current.sessions[0]!.status).toBe("Waiting");
   });
 });

@@ -31,11 +31,6 @@ export function useSessions() {
   // GET admission is global; only installed rows attest individual mutation receipts.
   const floorGet = useRef<RuntimeCursor | null>(null);
   const abandonedEpochs = useRef(new Set<string>());
-  // Pushed statuses by id. The snapshot behind GET /api/sessions is published after the push is broadcast, so a
-  // poll can legitimately still show the old status; a pushed status is held until a poll that began after the push
-  // shows it. Equal status alone is not an acknowledgement: an older read can match a newer override.
-  const pushedRef = useRef(new Map<string, { status: SessionResponse["status"]; seq: number }>());
-  const pushSeq = useRef(0);
 
   const injectSession = useCallback((session: SessionResponse) => {
     setState((prev) =>
@@ -47,7 +42,7 @@ export function useSessions() {
     lastLocalOrderingAtRef.current = Date.now();
   }, []);
 
-  const applyResult = useCallback((data: SessionsEnvelope | null, startSeq: number) => {
+  const applyResult = useCallback((data: SessionsEnvelope | null) => {
     setLoaded(true);
     if (data !== null) {
       setError(false);
@@ -56,25 +51,10 @@ export function useSessions() {
       const floor = floorGet.current;
       if (abandonedEpochs.current.has(cursor.epoch)) return;
       if (floor?.epoch === cursor.epoch && cursor.revision < floor.revision) return;
-      if (floor && floor.epoch !== cursor.epoch) {
-        abandonedEpochs.current.add(floor.epoch);
-        pushedRef.current.clear();
-      }
+      if (floor && floor.epoch !== cursor.epoch) abandonedEpochs.current.add(floor.epoch);
       floorGet.current = cursor;
-      const pushed = pushedRef.current;
-      const present = new Set(data.sessions.map((s) => s.id));
-      for (const id of pushed.keys()) if (!present.has(id)) pushed.delete(id);
-      const sessions = data.sessions.map((s) => {
-        const held = pushed.get(s.id);
-        if (held === undefined) return s;
-        if (s.status === held.status && startSeq >= held.seq) {
-          pushed.delete(s.id);
-          return s;
-        }
-        return { ...s, status: held.status };
-      });
       setState({
-        sessions,
+        sessions: data.sessions,
         observedById: Object.fromEntries(data.sessions.map((session) => [session.id, cursor])),
         epoch: cursor.epoch,
       });
@@ -100,14 +80,13 @@ export function useSessions() {
     };
     const tick = async () => {
       const mine = ++generation;
-      const startSeq = pushSeq.current;
       const request = new AbortController();
       controller = request;
       const requestDeadline = setTimeout(() => {
         if (cancelled || mine !== generation) return;
         generation++;
         request.abort();
-        applyResult(null, startSeq);
+        applyResult(null);
         scheduleNext();
       }, POLL_DEADLINE_MS);
       deadline = requestDeadline;
@@ -115,7 +94,7 @@ export function useSessions() {
       clearTimeout(requestDeadline);
       if (cancelled || mine !== generation) return;
       controller = undefined;
-      applyResult(data, startSeq);
+      applyResult(data);
       scheduleNext();
     };
     void tick();
@@ -128,16 +107,18 @@ export function useSessions() {
     };
   }, [applyResult]);
 
-  // Refetches the authoritative list after the stream (re)connected or lost events. A held status may stand for a
-  // transition whose follow-up was missed, and only pushes from this stream onward are recorded again.
+  // Refetches the authoritative list after the stream (re)connected or lost events.
   const refresh = useCallback(() => {
-    pushedRef.current.clear();
-    const startSeq = pushSeq.current;
-    void fetchSessions().then((data) => applyResult(data, startSeq));
+    void fetchSessions().then(applyResult);
   }, [applyResult]);
 
-  const applyPushedStatus = useCallback((id: string, status: SessionResponse["status"]) => {
-    pushedRef.current.set(id, { status, seq: ++pushSeq.current });
+  // The server sends a move only after publishing a snapshot that includes it, so its cursor is a read floor like
+  // any GET's: older reads are dropped and newer ones already contain the move.
+  const applyPushedStatus = useCallback((id: string, status: SessionResponse["status"], cursor: RuntimeCursor) => {
+    const floor = floorGet.current;
+    if (abandonedEpochs.current.has(cursor.epoch) || (floor && floor.epoch !== cursor.epoch)) return;
+    if (floor && cursor.revision < floor.revision) return;
+    floorGet.current = cursor;
     setState((prev) => ({ ...prev, sessions: prev.sessions.map((s) => (s.id === id ? { ...s, status } : s)) }));
   }, []);
 

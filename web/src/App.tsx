@@ -98,7 +98,7 @@ import {
   restoreSession,
   fetchPlugins,
 } from "./lib/api";
-import type { DeleteSessionOptions, ServerAbout, SettingsResponse } from "./lib/api";
+import type { DeleteSessionOptions, RuntimeCursor, ServerAbout, SettingsResponse } from "./lib/api";
 import { getClientCapabilities } from "./lib/clientCapabilities";
 import { normalizeProjectPathKey } from "./lib/registeredProjects";
 import { IdleDecayWindowContext, parseIdleDecayWindowMs } from "./lib/idleDecay";
@@ -429,9 +429,9 @@ function AppContent({
   const { unreadCount, waitingCount } = useAttentionCounts(sessions, activeSessionId);
   const { onSoundDue, cancelCue } = useStatusSounds(sessions);
   const onPushedStatus = useCallback(
-    (id: string, status: SessionResponse["status"]) => {
+    (id: string, status: SessionResponse["status"], cursor: RuntimeCursor) => {
       cancelCue(id);
-      applyPushedStatus(id, status);
+      applyPushedStatus(id, status, cursor);
     },
     [cancelCue, applyPushedStatus],
   );
