@@ -763,21 +763,25 @@ impl<S: BroadcastSink> Drain<S> {
         .await;
     }
 
-    /// Route an archived or trashed row through the stop path, so the cancellation retires the
-    /// replacement and the runner it replaces.
+    /// Route an archived, trashed or purged row through the stop path, so the cancellation retires
+    /// the replacement and the runner it replaces.
     async fn refuse_if_dismissed(&self, config: &SpawnConfig) {
-        match admit_stored_row(config.source_profile.as_deref(), &self.session_id).await {
-            Ok(()) => {}
-            Err(SupervisorError::Blocked(blocked)) => {
-                lock_recover(&self.lifecycle).begin_stop(&self.session_id, blocked.code(), false);
-            }
-            Err(error) => warn!(
-                target: "acp.supervisor",
-                session = %self.session_id,
-                error = %error,
-                "durable admission check failed on respawn; continuing without it"
-            ),
-        }
+        let refusal =
+            match admit_stored_row(config.source_profile.as_deref(), &self.session_id).await {
+                Ok(()) => return,
+                Err(SupervisorError::Blocked(blocked)) => blocked.code(),
+                Err(SupervisorError::SessionGone(_)) => "session_gone",
+                Err(error) => {
+                    warn!(
+                        target: "acp.supervisor",
+                        session = %self.session_id,
+                        error = %error,
+                        "durable admission check failed on respawn; continuing without it"
+                    );
+                    return;
+                }
+            };
+        lock_recover(&self.lifecycle).begin_stop(&self.session_id, refusal, false);
     }
 
     /// Report a failed relaunch and retire whatever runner this epoch left.
@@ -1752,59 +1756,64 @@ mod tests {
         (storage, profile)
     }
 
-    /// A crash respawn after an archive launches no replacement.
+    /// A crash respawn after an archive or a purge launches no replacement.
     #[tokio::test]
     #[serial_test::serial]
-    async fn a_respawn_for_an_archived_row_launches_nothing() {
-        let _home = isolate_home();
-        let control =
-            Arc::new(crate::acp::runner_lifecycle::test_support::FakeProcessControl::default());
-        control.alive(4242);
-        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let launcher: Launcher = {
-            let launches = Arc::clone(&launches);
-            Arc::new(move |_: SpawnConfig, _: AcpSessionId| {
-                launches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Box::pin(async { Err(AcpError::Spawn("must not launch".into())) })
-            })
-        };
-        let sink = VecSink::new();
-        let sup = Arc::new(
-            Supervisor::new(sink.clone())
-                .with_process_control(control.clone())
-                .with_launcher(launcher),
-        );
-        let (storage, profile) = seed_row("s-dismissed");
-        storage
-            .update(|rows, _| {
-                rows[0].archive();
-                Ok(())
-            })
-            .unwrap();
-        save_attested_test_record("s-dismissed", 4242, 0);
-        let socket = worker_registry::socket_path_for("s-dismissed").unwrap();
-        let mut config = runner_config(socket);
-        config.source_profile = Some(profile);
-        let lease = sup
-            .test_install_runner("s-dismissed", config, Some(attested_test_identity(4242, 0)))
-            .await;
-        let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
-        let drain = sup.start_drain_task("s-dismissed".into(), lease, inbound_rx, None);
-        drop(inbound_tx);
+    async fn a_respawn_for_a_dismissed_row_launches_nothing() {
+        type Dismiss = fn(&mut Vec<crate::session::Instance>);
+        let cases: [(&str, &str, Dismiss); 2] = [
+            ("s-archived", "session_archived", |rows| rows[0].archive()),
+            ("s-purged", "session_gone", |rows| rows.clear()),
+        ];
+        for (id, reason, dismiss) in cases {
+            let _home = isolate_home();
+            let control =
+                Arc::new(crate::acp::runner_lifecycle::test_support::FakeProcessControl::default());
+            control.alive(4242);
+            let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let launcher: Launcher = {
+                let launches = Arc::clone(&launches);
+                Arc::new(move |_: SpawnConfig, _: AcpSessionId| {
+                    launches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Box::pin(async { Err(AcpError::Spawn("must not launch".into())) })
+                })
+            };
+            let sink = VecSink::new();
+            let sup = Arc::new(
+                Supervisor::new(sink.clone())
+                    .with_process_control(control.clone())
+                    .with_launcher(launcher),
+            );
+            let (storage, profile) = seed_row(id);
+            storage
+                .update(|rows, _| {
+                    dismiss(rows);
+                    Ok(())
+                })
+                .unwrap();
+            save_attested_test_record(id, 4242, 0);
+            let socket = worker_registry::socket_path_for(id).unwrap();
+            let mut config = runner_config(socket);
+            config.source_profile = Some(profile);
+            let lease = sup
+                .test_install_runner(id, config, Some(attested_test_identity(4242, 0)))
+                .await;
+            let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
+            let drain = sup.start_drain_task(id.into(), lease, inbound_rx, None);
+            drop(inbound_tx);
 
-        tokio::time::timeout(Duration::from_secs(5), drain)
-            .await
-            .expect("drain task must finish")
-            .unwrap();
-        assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert_eq!(
-            stopped_reasons(&sink, "s-dismissed"),
-            ["session_archived".to_string()]
-        );
-        assert_eq!(
-            sup.worker_state("s-dismissed").await,
-            AcpWorkerState::Absent
-        );
+            tokio::time::timeout(Duration::from_secs(5), drain)
+                .await
+                .expect("drain task must finish")
+                .unwrap();
+            assert_eq!(
+                launches.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{id}"
+            );
+            assert_eq!(stopped_reasons(&sink, id), [reason.to_string()], "{id}");
+            assert_eq!(sup.worker_state(id).await, AcpWorkerState::Absent, "{id}");
+        }
     }
 
     /// A trash that lands during the respawn handshake retires the replacement uninstalled.
