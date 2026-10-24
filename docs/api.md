@@ -40,8 +40,18 @@ with `403 read_only`. Read endpoints work normally.
 Set `[web] mcp_enabled = true` in global `config.toml`, then restart the
 Daemon to enable Streamable HTTP at `/mcp`. The route is absent by default.
 It shares the existing API router and does not expose TCP or web assets when
-running core-only. TCP uses the API's token and login policy; the private
-`daemon/api.sock` accepts the authenticated same-UID owner peer without a token.
+running core-only. With token authentication, `/mcp` requires a valid token,
+sent as an `Authorization: Bearer` header (the form `aoe mcp config`
+generates), an `aoe_token` cookie, or a `?token=` query parameter, and returns
+`401` when it is missing or invalid. With passphrase authentication, a request
+needs a valid `aoe_session` login cookie, accepts no bearer token, and gets
+`401 login_required` without one. The login wall covers loopback callers as
+well as remote ones. A token-authenticated daemon that also has a passphrase,
+such as `--remote`, still requires that login session on `/mcp`, so a bearer
+token alone is not enough. A daemon running `--auth none` needs no credential.
+The private `daemon/api.sock` accepts the authenticated same-UID owner peer
+without a token. To connect an agent, see
+[Controlling AoE over MCP](guides/mcp-control.md).
 
 | Tool | Arguments | Returns |
 | --- | --- | --- |

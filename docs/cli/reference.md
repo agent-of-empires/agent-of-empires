@@ -100,6 +100,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe mcp add`↴](#aoe-mcp-add)
 * [`aoe mcp edit`↴](#aoe-mcp-edit)
 * [`aoe mcp remove`↴](#aoe-mcp-remove)
+* [`aoe mcp config`↴](#aoe-mcp-config)
 * [`aoe skill`↴](#aoe-skill)
 * [`aoe skill list`↴](#aoe-skill-list)
 * [`aoe skill view`↴](#aoe-skill-view)
@@ -1491,6 +1492,7 @@ Inspect the effective MCP server set (provenance, conflicts, drift)
 * `add` — Add an AoE-owned MCP server to the global mcp.json
 * `edit` — Edit an AoE-owned MCP server. Secrets you do not mention keep their stored value
 * `remove` — Remove an AoE-owned MCP server
+* `config` — Print an MCP client config for the running daemon's `/mcp` server, ready to paste into an agent's `mcpServers` (for example a Claude Code `.mcp.json`)
 
 
 
@@ -1565,6 +1567,14 @@ Remove an AoE-owned MCP server
 ###### **Arguments:**
 
 * `<NAME>` — Name of the AoE-owned server to remove
+
+
+
+## `aoe mcp config`
+
+Print an MCP client config for the running daemon's `/mcp` server, ready to paste into an agent's `mcpServers` (for example a Claude Code `.mcp.json`)
+
+**Usage:** `aoe mcp config`
 
 
 

@@ -797,6 +797,13 @@ fn launch_authorizes(launch: &ServeLaunch, pid: u32, instance_is_live: bool) -> 
     launch.pid == pid && !launch_contradicts(launch, pid, instance_is_live)
 }
 
+/// The launch settings of the daemon running as `pid`, when `serve.launch` belongs to it.
+pub(crate) fn running_launch(pid: u32) -> Option<ServeLaunch> {
+    read_serve_launch()
+        .ok()
+        .filter(|launch| launch_authorizes(launch, pid, instance_is_live(launch, pid)))
+}
+
 pub(crate) fn serve_launch_matches(pid: u32) -> bool {
     read_serve_launch()
         .is_ok_and(|launch| launch_authorizes(&launch, pid, instance_is_live(&launch, pid)))
