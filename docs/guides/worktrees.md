@@ -76,7 +76,7 @@ Bare repos are auto-detected and use `bare_repo_path_template` instead, so workt
 
 ### Submodules
 
-After `git worktree add`, a checkout with a `.gitmodules` file gets `git submodule update --init --recursive`. Set `init_submodules = false` (or pass `--no-submodules`) for repos vendoring deep submodule trees, where every new session would otherwise sit in `Creating…` for minutes. On delete, aoe runs `git submodule deinit -f --all` first, so the `Force` checkbox is not needed just because a worktree has submodules; if git still refuses, aoe clears `<main>/.git/worktrees/<name>/modules/` and prunes the stale entry itself.
+After `git worktree add`, a checkout with a `.gitmodules` file gets `git submodule update --init --recursive`. Set `init_submodules = false` (or pass `--no-submodules`) for repos vendoring deep submodule trees, where every new session would otherwise sit in `Creating…` for minutes. On delete, AoE runs `git worktree remove`. If Git refuses because of submodules, AoE removes `<main>/.git/worktrees/<name>/modules/` and the checkout, then prunes the stale entry.
 
 ## Cleanup
 
@@ -101,7 +101,7 @@ Force does not bypass this protection. Detection uses the bare repository's
 and `master` only when neither identifies a default. Use git explicitly if
 you intend to remove a protected checkout.
 
-An externally placed `git worktree lock` is not a deletion guard: aoe locks every worktree it creates and unlocks before each intentional remove or move, so it unlocks yours too.
+An external `git worktree lock` is not a deletion guard: AoE unlocks worktrees before intentional removal or moving, including external locks. AoE attempts to lock new worktrees; a lock failure warns without aborting creation.
 
 ## Warnings during create
 
@@ -115,8 +115,9 @@ Some repos install pre-commit hooks at the `post-checkout` stage (`uv-sync`, `np
 
 AoE fetches the selected branch before checkout. Network errors, missing
 remotes, SSH failures and timeouts surface as `git fetch <remote> <branch>
-failed for <repo>: <stderr>`. The session is still created from the available
-local ref, which may be stale. Multi-repo workspaces report each failed repo.
+failed for <repo>: <stderr>`. If a usable ref remains, creation can continue
+from it, although it may be stale. An explicit base with no usable ref fails
+with `BranchNotFound`. Multi-repo workspaces report each failed repo.
 
 ## File Locations
 

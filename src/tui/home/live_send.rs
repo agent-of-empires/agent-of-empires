@@ -407,9 +407,8 @@ pub(in crate::tui) struct LiveSendWorker {
 }
 
 impl LiveSendWorker {
-    /// `capture_wake`, when present, nudges the preview capture worker out of its
-    /// inter-capture wait after each dispatched batch, so typed echo is captured
-    /// immediately rather than a full cadence cycle later.
+    /// `capture_wake` requests an early preview capture after each dispatched batch.
+    /// The target process may not have echoed the input yet.
     pub(super) fn spawn(
         tmux_name: String,
         capture_wake: Option<LiveCaptureWake>,
@@ -777,9 +776,8 @@ impl<T: Send + Sync + 'static> PendingArm<T> {
     }
 }
 
-/// Cloneable handle that nudges a [`LiveCaptureWorker`] out of its inter-capture wait, so
-/// a dispatched keystroke batch captures the typed echo immediately. Backed by the same
-/// condvar as `set_live` / `set_target`, so a wake just runs one capture early.
+/// Wake signal shared with `set_live` and `set_target` for an early capture.
+/// Waking does not wait for the target process to echo dispatched input.
 type CaptureWake = std::sync::Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>;
 
 fn signal_capture_wake(wakeup: &CaptureWake) {
@@ -949,14 +947,8 @@ impl Drop for LiveCaptureWorker {
         }
     }
 }
-/// How often the worker re-asks how many panes its target window has and whether one is
-/// zoomed. The answer changes only on a manual split, close or zoom, so a lazy cadence is
-/// enough at one tiny `display-message` fork.
-///
-/// It also bounds a visible transient: the render-thread fallback probes `window_panes` in
-/// the same fork as its capture, so it composites as soon as the user splits while the
-/// worker keeps publishing single-pane frames until this elapses, and the preview
-/// alternates until they agree.
+/// Refresh cadence for `LiveCaptureWorker` pane-count and zoom observations.
+/// The tmux fallback probes `window_panes` in the same fork as capture.
 const PANE_COUNT_PROBE_MS: u64 = 1_000;
 
 /// Use the composite preview only for an unzoomed split window.

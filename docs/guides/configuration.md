@@ -19,9 +19,9 @@ A project registry entry can override `worktree.enabled`, `session.smart_rename`
 | Platform | Global config |
 |----------|--------------|
 | Linux | `$XDG_CONFIG_HOME/agent-of-empires/config.toml` (default `~/.config/agent-of-empires/`) |
-| macOS | `~/.agent-of-empires/config.toml`, or the XDG path when `XDG_CONFIG_HOME` is set or that directory already exists |
+| macOS | `~/.agent-of-empires/config.toml`, or the XDG path under the precedence below |
 
-On macOS, AoE uses `$XDG_CONFIG_HOME/agent-of-empires/` when `XDG_CONFIG_HOME` is set or that directory already exists. Nothing moves automatically: an existing `~/.agent-of-empires/` remains in use until you relocate it.
+`XDG_CONFIG_HOME` must be absolute; empty or relative values use `~/.config` as the XDG base. On macOS, AoE first uses an existing XDG app directory, then an existing `~/.agent-of-empires/`. If neither exists, an absolute `XDG_CONFIG_HOME` selects the XDG path; otherwise AoE uses `~/.agent-of-empires/`. Nothing moves automatically.
 
 ```
 ~/.agent-of-empires/
@@ -210,7 +210,7 @@ agent_detect_as = { "lenovo-claude" = "claude" }
 - **`agent_config_dir`** (optional): The config directory the wrapper points its CLI at, when that is not the built-in default (see below).
 - **`default_tool`** can select a custom-agent name for new sessions.
 
-Custom agents remain selectable even for remote or unmanaged commands. Maps are editable in config files or the TUI. Profile maps replace global maps; `agent_detect_as` also permits repo overrides. `agent_execution_as` and `agent_config_dir` are trusted global/profile declarations, never repo overrides. The web wizard can select a custom agent but never edits these command strings.
+Custom agents remain selectable even for remote or unmanaged commands. Maps are editable in config files or the TUI. Profile maps recursively merge with global maps; scalar and array values replace global values. `agent_detect_as` also permits repo overrides. `agent_execution_as` and `agent_config_dir` are trusted global/profile declarations, never repo overrides. The web wizard can select a custom agent but never edits these command strings.
 
 ### One CLI, two accounts
 
@@ -296,7 +296,7 @@ Give the agent an ACP launch command; it must speak the [Agent Client Protocol](
 "oc-superpowers" = "ocp run sp acp"
 ```
 
-The value is split into argv and executed with no shell, so wrap explicitly for shell features (`sh -lc '...'`). The name must match a `custom_agents` entry and cannot shadow a built-in.
+The value is split into argv and executed with no shell, so wrap explicitly for shell features (`sh -lc '...'`). A matching `custom_agents` entry is needed only for the agent picker, not for an explicit ACP switch target. Built-in names take precedence.
 
 A wrapper around a supported agent needs no `agent_acp_cmd` at all: map it with `agent_detect_as` and it inherits the base agent's ACP adapter, which also lights up **Switch to structured view** on an existing terminal session. **The wrapper binary is never executed** in that case, so anything it does outside the CLI (selecting an account, gateway, or profile by setting env) does not apply. Inheritance works only for bases with a built-in adapter (`claude`, `codex`, `opencode`, `gemini`, `vibe`, `pi`, `omp`, `kimi`, `prime-agent`).
 
