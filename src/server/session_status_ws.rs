@@ -21,6 +21,7 @@ use crate::session::Status;
 use crate::daemon::RuntimeCursor;
 
 use super::push::{NotificationEvent, StatusChange};
+use super::runtime::PublishedSnapshot;
 use super::AppState;
 
 const PING_INTERVAL: Duration = Duration::from_secs(25);
@@ -88,15 +89,27 @@ impl Dwells {
     }
 }
 
-fn status_frame(change: &StatusChange, cursor: &RuntimeCursor) -> String {
+fn status_frame(id: &str, status: &str, cursor: &RuntimeCursor) -> String {
     json!({
         "kind": "status",
-        "id": change.instance_id,
-        "status": change.new.wire_str(),
+        "id": id,
+        "status": status,
         "epoch": cursor.epoch,
         "revision": cursor.revision.to_string(),
     })
     .to_string()
+}
+
+/// The frame states the row as the snapshot it cites has it, so queued moves that share a revision
+/// agree and the last one sent is the current status. A row absent from the snapshot gets no frame.
+fn frame_for(change: &StatusChange, published: &PublishedSnapshot) -> Option<String> {
+    let row = published
+        .value
+        .contents
+        .sessions
+        .iter()
+        .find(|row| row.id == change.instance_id)?;
+    Some(status_frame(&row.id, &row.status, &published.value.cursor))
 }
 
 fn sound_due_frame(id: &str, event: NotificationEvent) -> String {
@@ -199,7 +212,7 @@ async fn serve(mut socket: WebSocket, state: Arc<AppState>) {
         let frames = match next {
             Next::Frames(frames) => frames,
             Next::Change(change) => match state.runtime.publish(&state).await {
-                Ok(published) => vec![status_frame(&change, &published.value.cursor)],
+                Ok(published) => frame_for(&change, &published).into_iter().collect(),
                 Err(error) => {
                     tracing::error!(target: "server.runtime", %error, "status move not published");
                     vec![json!({ "kind": "resync" }).to_string()]
@@ -334,6 +347,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_moves_sharing_a_snapshot_all_report_the_status_that_snapshot_has() {
+        let mut row = crate::session::Instance::new("q", "/tmp/aoe-ws-q");
+        row.status = Status::Running;
+        let id = row.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![row]);
+        // Waiting then Idle both commit before either broadcast is drained.
+        state
+            .instances
+            .write()
+            .await
+            .iter_mut()
+            .find(|inst| inst.id == id)
+            .unwrap()
+            .status = Status::Idle;
+        let waiting = change(&id, Status::Waiting);
+        let idle = change(&id, Status::Idle);
+
+        let first = state.runtime.publish(&state).await.unwrap();
+        let second = state.runtime.publish(&state).await.unwrap();
+        assert_eq!(first.value.cursor, second.value.cursor);
+        let frames: Vec<serde_json::Value> = [(&waiting, &first), (&idle, &second)]
+            .into_iter()
+            .map(|(c, p)| serde_json::from_str(&frame_for(c, p).unwrap()).unwrap())
+            .collect();
+        assert_eq!(frames[0], frames[1]);
+        assert_eq!(frames[1]["status"], "Idle");
+    }
+
+    #[tokio::test]
+    async fn a_move_for_a_row_missing_from_the_snapshot_sends_no_frame() {
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let published = state.runtime.publish(&state).await.unwrap();
+        assert_eq!(
+            frame_for(&change("gone", Status::Waiting), &published),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn a_lagged_receiver_reports_the_lag_for_the_caller_to_resync() {
         let (tx, mut rx) = broadcast::channel(2);
         for _ in 0..5 {
@@ -346,7 +398,7 @@ mod tests {
     #[test]
     fn frames_use_the_wire_spelling_the_session_list_uses() {
         let status: serde_json::Value =
-            serde_json::from_str(&status_frame(&change("a", Status::Waiting), &cursor(7))).unwrap();
+            serde_json::from_str(&status_frame("a", "Waiting", &cursor(7))).unwrap();
         assert_eq!(
             status,
             json!({
