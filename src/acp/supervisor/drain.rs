@@ -1819,6 +1819,91 @@ mod tests {
         }
     }
 
+    /// An archive or trash that lands while the `before_session` hook runs reaches no launcher.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_respawn_dismissed_during_the_hook_launches_nothing() {
+        type Dismiss = fn(&mut Vec<crate::session::Instance>);
+        let cases: [(&str, &str, Dismiss); 2] = [
+            ("s-hook-archived", "session_archived", |rows| {
+                rows[0].archive()
+            }),
+            ("s-hook-trashed", "session_trashed", |rows| rows[0].trash()),
+        ];
+        for (id, reason, dismiss) in cases {
+            let (_home, temp) = isolate_home();
+            let entered = temp.path().join("hook-entered");
+            let release = temp.path().join("hook-release");
+            let app_dir = crate::session::get_app_dir().unwrap();
+            std::fs::create_dir_all(&app_dir).unwrap();
+            std::fs::write(
+                app_dir.join("config.toml"),
+                format!(
+                    "[host_hooks]\nbefore_session = \"touch {entered}; while [ ! -e {release} ]; do sleep 0.02; done\"\n",
+                    entered = entered.display(),
+                    release = release.display(),
+                ),
+            )
+            .unwrap();
+            let control =
+                Arc::new(crate::acp::runner_lifecycle::test_support::FakeProcessControl::default());
+            control.alive(4242);
+            let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let launcher: Launcher = {
+                let launches = Arc::clone(&launches);
+                Arc::new(move |_: SpawnConfig, _: AcpSessionId| {
+                    launches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Box::pin(async { Err(AcpError::Spawn("must not launch".into())) })
+                })
+            };
+            let sink = VecSink::new();
+            let sup = Arc::new(
+                Supervisor::new(sink.clone())
+                    .with_process_control(control.clone())
+                    .with_launcher(launcher),
+            );
+            let (storage, profile) = seed_row(id);
+            save_attested_test_record(id, 4242, 0);
+            let socket = worker_registry::socket_path_for(id).unwrap();
+            let mut config = runner_config(socket);
+            config.source_profile = Some(profile);
+            let lease = sup
+                .test_install_runner(id, config, Some(attested_test_identity(4242, 0)))
+                .await;
+            let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
+            let drain = sup.start_drain_task(id.into(), lease, inbound_rx, None);
+            drop(inbound_tx);
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !entered.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("hook must start");
+            storage
+                .update(|rows, _| {
+                    dismiss(rows);
+                    Ok(())
+                })
+                .unwrap();
+            std::fs::write(&release, "").unwrap();
+
+            tokio::time::timeout(Duration::from_secs(5), drain)
+                .await
+                .expect("drain task must finish")
+                .unwrap();
+            assert_eq!(
+                launches.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{id}"
+            );
+            assert_eq!(stopped_reasons(&sink, id), [reason.to_string()], "{id}");
+            assert_eq!(sup.worker_state(id).await, AcpWorkerState::Absent, "{id}");
+            assert!(storage.load().unwrap()[0].ensure_startable().is_err());
+        }
+    }
+
     /// A trash that lands during the respawn handshake retires the replacement uninstalled.
     #[tokio::test]
     #[serial_test::serial]
