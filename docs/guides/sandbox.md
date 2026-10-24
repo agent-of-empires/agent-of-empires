@@ -1,10 +1,8 @@
 # Container Sandbox
 
-## Overview
-
 A sandboxed session runs its agent in a private container with the project mounted at `/workspace`. Agent credentials are seeded into a private per-session store; containers do not share writable agent history. Claude Code shares only its credential file; see [Shared credentials](#shared-credentials).
 
-Docker is the default. [Podman](podman.md) and [Apple Container](apple-containers.md) are alternatives.
+Docker is the default. Podman and Apple Container are alternatives.
 
 ## Creating one
 
@@ -18,7 +16,19 @@ aoe remove <session> --keep-container
 
 In the TUI or web wizard, enable the sandbox toggle when creating a session. The TUI shows it when a container runtime is available and cannot set a per-session image.
 
-## Default Configuration
+## Deleting a stopped sandbox
+
+AoE does not start a stopped managed container to remove its worktree. A
+host-writable worktree can be removed without starting the container. If
+root-owned files block removal, purge reports the container and worktree path
+and retains both for retry.
+
+Verify that exact worktree and repair the blocking ownership or permissions
+with elevated host permissions, then retry the same purge. Do not start the
+managed entrypoint merely to clean up files. Do not remove ownership journals
+or unrelated agent stores to bypass the refusal.
+
+## Configuration
 
 ```toml
 [sandbox]
@@ -29,10 +39,6 @@ cpu_limit = "4"
 memory_limit = "8g"
 environment = ["ANTHROPIC_API_KEY"]
 ```
-
-> **Note:** YOLO mode (skip permission prompts) is now configured under `[session]` instead of `[sandbox]`, since it works with or without Docker sandboxing. See `[session] yolo_mode_default` in the [configuration guide](configuration.md).
-
-## Configuration Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
@@ -54,13 +60,22 @@ environment = ["ANTHROPIC_API_KEY"]
 | `security_opt` | `[]` | Security options, e.g. `seccomp=unconfined` |
 | `extra_run_args` | `[]` | Extra arguments passed to container run, before the image |
 
-### Run Policy
+Docker and Podman honor every run-policy option. Apple Container honors `cap_add` / `cap_drop` and ignores `privileged` and `security_opt` with a warning; `extra_run_args` is passed through everywhere.
 
-Docker and Podman honor all run-policy options. Apple Container supports `cap_add` and `cap_drop`, but warns and ignores `privileged` and `security_opt`. `extra_run_args` is passed through on every runtime.
+## Volume mounts
 
-## Volume Mounts
+### Automatic mounts
 
-### Volume Ignores: Literal Paths and Glob Patterns
+| Host path | Container path | Mode |
+|-----------|----------------|------|
+| Project directory | `/workspace` | RW |
+| `~/.gitconfig` | `/root/.gitconfig` | RO |
+| `~/.ssh/` (with `mount_ssh`) | `/root/.ssh/` | RO |
+| The session's artifact dir | `/aoe/artifacts` | RW |
+| `<agent config>/sandbox-v2/<instance-id>/` | the agent's config path, e.g. `/root/.claude/` | RW |
+| `~/.claude/sandbox-v2/.credentials.json` | `/root/.claude/.credentials.json` | RW |
+
+### Volume ignores
 
 `volume_ignores` accepts literal paths relative to each workspace root, or glob patterns (`*`, `?`, `[` or `]`) expanded when the session is created. Literal mounts shadow paths even if they do not exist yet.
 
@@ -71,36 +86,20 @@ volume_ignores = ["node_modules", "target", "**/bin", "**/obj"]
 
 A glob is a point-in-time snapshot: directories created later inside the container are not shadowed. List known paths literally or recreate the session for new matches. The TUI and web dashboard confirm this once before sandbox creation.
 
-### Volume Ignores Strategy (macOS/VirtioFS)
+### Volume ignores strategy
 
-By default, `volume_ignores` paths are mounted as **anonymous volumes** (`volume_ignores_strategy = "anonymous"`). This works on Linux, but on macOS with Docker Desktop's VirtioFS, anonymous volumes may not reliably shadow bind-mount subdirectories, causing host-side directories like `.venv` or `node_modules` to remain visible inside the container.
+The default `"anonymous"` strategy can expose ignored host directories under
+macOS Docker Desktop's VirtioFS. Use `volume_ignores_strategy = "named"` for
+deterministic Docker/Podman volumes stored inside the VM. Apple Container falls
+back to anonymous volumes with a warning.
 
-To fix this on macOS, set `volume_ignores_strategy = "named"`. This mounts each `volume_ignores` path as a **deterministic named Docker/Podman volume** stored entirely inside the Docker VM, bypassing VirtioFS. Session deletion reclaims named volumes only after the container is removed or confirmed absent. A failed container removal retains them for a later retry.
+Named volumes follow their mount paths. Moving a worktree starts fresh caches;
+the next session start removes the volumes left at its old paths. Other
+orphaned volumes remain untouched. Inspect `docker volume ls -q --filter
+name=aoe-vi-` and remove only volumes you recognize.
 
-A volume's name is derived from its mount path, so moving a session's worktree changes it. The recreated container starts from an empty cache for the paths that moved, and the volumes those paths left behind are removed the next time the session starts.
-
-Moving a worktree therefore costs the cache in both directions: move it back and the volumes from the first location are already gone, so that side rebuilds cold too.
-
-The reclaim covers the paths that moved with the worktree, and nothing else. A volume orphaned any other way is left alone, because AoE cannot tell it apart from a cache you are still using: dropping an entry from `volume_ignores`, switching back to `"anonymous"`, or attaching a repo to a multi-repo workspace all strand a volume without a move it can recognize. Neither is anything already orphaned, including the leftovers from a move the session has since restarted after, so a volume that has been sitting there stays. To find what is left over, list them with `docker volume ls -q --filter name=aoe-vi-` and remove what you recognize; `docker volume prune` skips named volumes unless you pass `-a`.
-
-```toml
-[sandbox]
-volume_ignores = ["node_modules", ".venv", "target"]
-volume_ignores_strategy = "named"
-```
-
-> Named volumes are not supported on Apple Container. Setting `"named"` on Apple Container falls back to anonymous volume behavior with a warning.
-
-### Automatic Mounts
-
-| Host Path | Container Path | Mode | Purpose |
-|-----------|----------------|------|---------|
-| Project directory | `/workspace` | RW | Your code |
-| `~/.gitconfig` | `/root/.gitconfig` | RO | Git config |
-| `~/.ssh/` (with `mount_ssh`) | `/root/.ssh/` | RO | SSH keys |
-| `~/.config/opencode/` | `/root/.config/opencode/` | RO | OpenCode config |
-| `<agent config>/sandbox-v2/<instance-id>/` | the agent's config path, e.g. `/root/.claude/` | RW | [Per-session agent store](#per-session-agent-stores) |
-| `~/.claude/sandbox-v2/.credentials.json` | `/root/.claude/.credentials.json` | RW | [Shared Claude Code credential](#shared-credentials) |
+Session deletion reclaims named volumes only after their container is removed
+or confirmed absent. A failed container removal retains them for retry.
 
 ## Environment Variables
 
@@ -117,7 +116,7 @@ environment = [
 
 To mint a short-lived value on the host at launch instead, use [`host_hooks.before_start`](configuration.md#host-hooks). Host (non-sandboxed) sessions read the top-level [`environment`](configuration.md#host-environment) list instead; the two are disjoint.
 
-## Folder Trust
+## Folder trust
 
 Claude Code, Codex and Gemini need a trusted directory before launch. AoE pre-trusts the staged container config for Claude Code in every sandbox, and for Codex and Gemini only in YOLO mode.
 
@@ -125,7 +124,7 @@ Trust activates the repo's `.claude/settings.json`, including hooks and permissi
 
 Custom wrappers must keep the managed container config path and AoE's config-dir variables. `session.agent_config_dir` names the host root; each sandbox gets a private child. Do not shadow its managed mount with `sandbox.extra_volumes`; AoE warns about overlapping source paths during preparation. Host-only account selection stays outside the sandbox.
 
-## Available Images
+## Available images
 
 Two official images are available:
 
@@ -244,47 +243,17 @@ while a store move is in flight or an existing namespace has a missing,
 unreadable or unsupported purge-ownership journal. Failed irreversible purges
 retain their stores even when the session row no longer exists.
 
-A session still on the shared legacy store has no private store of its own, so
-deleting it removes its container but leaves that shared store to the
-migration. The Claude Code credential file at `sandbox-v2/.credentials.json`
-belongs to no session and is not reclaimed; remove it yourself once the last
-Claude Code sandbox is gone.
-
-## Worktrees and Sandboxing
+## Worktrees
 
 Git worktrees need the bare repo pattern so the container can reach the repo's git directory. See [Worktrees](worktrees.md#bare-repos).
 
 ## Troubleshooting
 
-### Container killed due to memory (OOM)
+### Container killed (OOM)
 
-**Symptoms:** Your sandboxed session exits unexpectedly, the container disappears, or you see "Killed" in the output. Running `docker inspect <container>` shows `OOMKilled: true`.
+A sandboxed session exits, the container disappears, and `docker inspect <container>` reports `OOMKilled: true`. Docker Desktop runs containers in a Linux VM with a configurable memory ceiling. The VM's kernel can kill containers when memory runs out.
 
-**Cause:** On macOS (and Windows), Docker runs inside a Linux VM with a fixed memory ceiling. Docker Desktop defaults to 2 GB for the entire VM. If a container tries to use more memory than the VM has available, the Linux OOM killer terminates it. This commonly happens with AI coding agents that load large language model contexts or process big codebases.
-
-**Fix:**
-
-1. **Increase Docker Desktop VM memory:**
-   Open Docker Desktop, go to **Settings > Resources > Advanced**, increase the **Memory** slider (8 GB+ recommended for AI coding agents), then click **Apply & Restart**.
-
-2. **Set a per-container memory limit** in your AOE config (`~/.agent-of-empires/config.toml`) so containers have an explicit allocation rather than competing for the VM's total memory:
-
-   ```toml
-   [sandbox]
-   memory_limit = "8g"
-   ```
-
-   The per-container limit must be less than or equal to the Docker Desktop VM memory. If you set `memory_limit = "8g"` but your VM only has 4 GB, the container will still be OOM-killed.
-
-3. **Verify the fix:** Start a new session and check the container's limit:
-
-   ```bash
-   docker stats --no-stream
-   ```
-
-   The `MEM LIMIT` column should reflect your configured value.
-
-**Note:** On Linux, Docker runs natively without a VM, so the memory ceiling is your host's physical RAM. You typically only need `memory_limit` on Linux to prevent a single container from consuming all system memory.
+Check Docker Desktop's configured VM memory under **Settings > Resources > Advanced** before choosing `[sandbox] memory_limit`. Raise the VM allocation if needed, and give each container an explicit limit no larger than the VM's available memory. `docker stats --no-stream` shows the limit a running container got. With Docker Engine running directly on Linux, there is no Desktop VM ceiling; a container limit can stop one container from taking all the host's RAM.
 
 ### Sandboxed OpenCode fails to start after a container-image upgrade
 

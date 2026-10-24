@@ -4,8 +4,6 @@ Monitor and drive agent sessions from any browser. Web serving is part of the `a
 
 ![The web dashboard on desktop: workspace sidebar, live agent terminal, and diff panel](../assets/web/dashboard.png)
 
-## In this section
-
 This page covers launch, access modes, security and PWA installation. Other surfaces have their own guides:
 
 - **[Dashboard & workspaces](web/dashboard.md)**: layout, session wizard, sorting, grouping, triage and mobile behavior.
@@ -18,12 +16,12 @@ The dashboard ships in release binaries. Source builds need the `web` Cargo feat
 ## Starting the server
 
 ```bash
-aoe serve                       # Localhost only (safe, default)
-aoe serve --remote              # Remote over HTTPS (Tailscale Funnel, else Cloudflare quick tunnel)
-aoe serve --host 0.0.0.0        # LAN/VPN access (HTTP, requires VPN)
-aoe serve --daemon              # Run in background
-aoe serve --open                # Open the URL in the default browser when ready
-aoe serve --remote --read-only  # Monitor without terminal input
+aoe serve                       # Localhost only (default)
+aoe serve --remote              # Remote over HTTPS (Tailscale Funnel, else Cloudflare)
+aoe serve --host 0.0.0.0        # LAN/VPN access over HTTP (use a VPN)
+aoe serve --daemon              # Run in the background (--stop to stop it)
+aoe serve --open                # Open the URL in a browser when ready
+aoe serve --remote --read-only  # Monitor without sending keystrokes
 ```
 
 From the TUI, press `R` (`Ctrl+R` with strict hotkeys), shown as `R Web` in the shortcut bar, to start a background server on your network or over a tunnel. While it runs, the entry reads `R ● Web` in green.
@@ -74,25 +72,23 @@ In `--remote` mode the token rotates every four hours. Use `aoe url` for the liv
    ```
 
 3. **Cloudflare quick tunnel:** the fallback requires [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) on the host. No domain or account is needed, but the URL changes on restart and breaks installed PWAs. AoE reports this fallback. Install PWAs from a stable Funnel or named-tunnel URL.
+
 ## Flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--port` | 8080 | Port to listen on |
-| `--host` | 127.0.0.1 | Bind address. Use `0.0.0.0` for LAN/VPN access |
-| `--auth` | `token` | Auth mode: `token` (URL token), `passphrase` (passphrase login wall only), `none` (no auth, loopback only unless `--behind-proxy`) |
-| `--passphrase` | | Passphrase for the login wall. Valid with `--auth=token` (token + passphrase) and `--auth=passphrase`. Also reads `AOE_SERVE_PASSPHRASE` |
-| `--behind-proxy` | off | Server sits behind an external reverse proxy that terminates TLS. Sets `; Secure` cookies and trusts `X-Forwarded-For` / `cf-connecting-ip` from loopback peers; does NOT spawn a tunnel. Requires at least one `--allowed-host` |
-| `--allowed-host` | | Extra `Host` value the DNS-rebinding gate accepts (repeatable). Add the public hostname behind a reverse proxy or custom tunnel, or a hostname/mDNS name when binding `0.0.0.0` (routable IP literals are trusted automatically). `--remote` tunnel hosts are added automatically |
-| `--allowed-origin` | | Extra browser `Origin` to accept (repeatable, full origin `scheme://host[:port]`). Needed only for a reverse proxy on a nonstandard port; standard 80/443 origins for `--allowed-host` entries are derived automatically |
-| `--no-auth` | off | Alias for `--auth=none` (kept for backwards compatibility) |
-| `--remote` | off | Expose over HTTPS tunnel (Tailscale Funnel if available, else Cloudflare quick tunnel) |
-| `--tunnel-name` | | Use a named Cloudflare tunnel (requires `--remote`; overrides Tailscale auto-detection) |
-| `--no-tailscale` | off | Skip Tailscale Funnel auto-detection and use Cloudflare (requires `--remote`) |
-| `--tunnel-url` | | Hostname for a named tunnel (requires `--tunnel-name`) |
-| `--read-only` | off | View terminals but cannot send keystrokes |
-| `--daemon` | off | Fork to background and detach from terminal |
-| `--stop` | | Stop a running daemon |
+| `--host` | 127.0.0.1 | Bind address; `0.0.0.0` for LAN/VPN access |
+| `--auth` | `token` | `token` (URL token), `passphrase` (login wall only), `none` (loopback only unless `--behind-proxy`). `--no-auth` is an alias for `none` |
+| `--passphrase` | | Passphrase for the login wall, also read from `AOE_SERVE_PASSPHRASE`. Valid with `--auth=token` and `--auth=passphrase` |
+| `--behind-proxy` | off | An external proxy terminates TLS: sets `; Secure` cookies and trusts `X-Forwarded-For` / `cf-connecting-ip` from loopback peers. Spawns no tunnel and requires at least one `--allowed-host` |
+| `--allowed-host` | | Extra `Host` the [DNS-rebinding gate](#dns-rebinding) accepts (repeatable) |
+| `--allowed-origin` | | Extra browser `Origin` to accept (repeatable, full `scheme://host[:port]`); only needed for a proxy on a nonstandard port |
+| `--remote` | off | Expose over an HTTPS tunnel |
+| `--tunnel-name` / `--tunnel-url` | | Use a named Cloudflare tunnel and its hostname (with `--remote`) |
+| `--no-tailscale` | off | Skip Tailscale auto-detection and use Cloudflare |
+| `--read-only` | off | View terminals but send no keystrokes |
+| `--daemon` / `--stop` | off | Fork to the background, or stop a running daemon |
 
 `--auth=passphrase` and `--auth=none` on a non-loopback bind require `--behind-proxy`. Passphrase mode requires `--passphrase` or `AOE_SERVE_PASSPHRASE`; combining a passphrase with `--auth=none` is refused. Public `--remote` tunnels require both token auth and a passphrase and refuse reduced-auth modes. See [Authentication](#authentication).
 
@@ -142,7 +138,7 @@ aoe serve \
 
 The upstream must set `X-Forwarded-For` (or `cf-connecting-ip`); aoe reads the last value as the client IP. The trust check fires only when the socket peer is loopback, so a misconfigured upstream that lets requests reach aoe directly cannot spoof the IP.
 
-With `--auth=passphrase --behind-proxy`, the passphrase wall applies to TCP loopback callers too. Proxied traffic arrives on a loopback TCP socket, so an upstream that forgets the header would otherwise hand visitors the same-host bypass. A browser on the same host signs in with the passphrase like any other TCP client. The local TUI and local `aoe acp` commands instead use the owner-verified Unix API; they do not read `serve.passphrase` or perform a login exchange. See [Cross-machine attach](../structured-view.md#cross-machine-attach) for explicit TCP and remote ACP authentication.
+The local TUI and local `aoe acp` commands use the owner-verified Unix API, not a browser login or `serve.passphrase`. See [Cross-machine attach](../structured-view.md#cross-machine-attach) for explicit TCP and remote ACP authentication.
 
 `--behind-proxy` requires at least one `--allowed-host <public-hostname>`: aoe cannot infer the hostname your proxy forwards, and the [DNS-rebinding gate](#dns-rebinding) rejects any `Host` it does not recognize. If the proxy listens on a nonstandard port, also pass the exact origin, e.g. `--allowed-origin https://aoe.example.com:8443`. The daemon refuses to start (with an explicit message) if `--behind-proxy` is set without `--allowed-host`.
 
@@ -156,6 +152,11 @@ With `--auth=passphrase --behind-proxy`, the passphrase wall applies to TCP loop
 
 ### Authentication
 
+**Compatibility:** TCP loopback no longer grants local-owner trust. With a
+passphrase configured, a same-host browser must sign in and confirm the
+passphrase again for sensitive writes, even without `--behind-proxy`. Only
+native clients on the owner-verified Unix API retain the local-owner exemption.
+
 - **Token auth** (`--auth=token`, default): a random 256-bit token, generated on startup and stored at `~/.config/agent-of-empires/serve.token` (Linux) or `~/.agent-of-empires/serve.token` (macOS). Passed via URL on first visit, then kept as an `HttpOnly; SameSite=Strict` cookie.
 - **Passphrase wall** (`--auth=passphrase`, or combined with token via `--passphrase`): an argon2-hashed passphrase gates `/login`. Sessions bind to a per-device secret in `localStorage`, so a leaked cookie alone is insufficient.
 - **Rate limiting**: 5 failed logins from an IP trigger a 15-minute lockout.
@@ -163,7 +164,7 @@ With `--auth=passphrase --behind-proxy`, the passphrase wall applies to TCP loop
 - **Device tracking**: connected devices (the signed-in login sessions, with browser, origin IP, and last seen) are visible in Settings > Web Dashboard > Connected Devices, where you can revoke one device or sign every device out.
 - **Session persistence**: login sessions are persisted to an owner-only `login_sessions.toml` in the app dir, so signed-in devices survive an `aoe serve` restart instead of being re-prompted for the passphrase. A passphrase change drops every persisted session; set `auth.persist_sessions = false` to force re-authentication on every restart.
 - **Passkeys**: with a passphrase configured, enrol one under Settings > Web Dashboard > Connected Devices. Sign-in needs HTTPS or `localhost` and an allowlisted origin; a passkey works only on its enrolled origin. Public keys live in owner-only `passkeys.json`. Changing the passphrase removes all passkeys and login sessions. Adding or removing a passkey requires step-up passphrase confirmation; passkey sign-in does not satisfy step-up.
-- **Step-up elevation**: a "Confirm passphrase" prompt appears on writes that can plant code for, or widen what is exposed to, the next session spawn. That covers the `sandbox` and `worktree` sections plus individual fields that carry the same risk, currently `acp.restrict_agents`, `skills.auto_propagate`, `session.smart_rename_model`, and `session.inherit_host_environment`; the gate is per field, so the rest of a section saves without it. Confirmation lasts 15 minutes. User-preference writes (theme, sound, notifications, etc.) save without it. Localhost browsers skip the prompt entirely; the same-host caller already passes the filesystem trust boundary. See [Security](#security) above.
+- **Step-up elevation**: writes that can plant code for, or widen, the next session spawn require passphrase confirmation valid for 15 minutes. This covers the `sandbox` and `worktree` sections plus `acp.restrict_agents`, `skills.auto_propagate`, `session.smart_rename_model`, and `session.inherit_host_environment`. The gate is per field; ordinary preference writes need no elevation. Passkey sign-in does not satisfy step-up.
 - **Local-only fields**: the agent-command surface and status-hook shell commands map names to arbitrary host commands, so the server rejects any PATCH touching them; they are editable only in the TUI on the host.
 
 The server also sets `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, and `Referrer-Policy: no-referrer` (the last prevents token leaks via Referer).
