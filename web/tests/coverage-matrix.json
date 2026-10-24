@@ -147,7 +147,7 @@
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/components/__tests__/DashboardUpdateBanner.test.tsx", "src/lib/webBuildId.test.ts"],
-      "components": ["web/src/components/DashboardUpdateBanner.tsx"]
+      "components": ["web/src/components/DashboardUpdateBanner.tsx", "web/src/hooks/useDashboardUpdate.ts"]
     },
     {
       "id": "app-shell.loading-skeleton",
@@ -2663,7 +2663,9 @@
         "web/src/components/DisconnectBanner.tsx",
         "web/src/components/UpdateBanner.tsx",
         "web/src/components/DashboardUpdateBanner.tsx",
-        "web/src/components/PushHealthBanner.tsx"
+        "web/src/components/PushHealthBanner.tsx",
+        "web/src/hooks/useConnectionBanner.ts",
+        "web/src/hooks/useUpdateBanner.ts"
       ]
     },
     {

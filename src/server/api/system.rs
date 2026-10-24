@@ -1988,6 +1988,11 @@ pub struct UpdateStatusResponse {
     /// dismissal sticks across devices and matches the TUI (#release-notes
     /// should only be acknowledged once, not per browser).
     pub dismissed_version: Option<String>,
+    /// How the Daemon's own binary was installed, so the banner can say how to update it;
+    /// `unknown` while update checks are off, since nothing is offered then.
+    pub install_method: crate::update::install::InstallKind,
+    /// What to run on the Daemon's machine to update.
+    pub update_command: &'static str,
 }
 
 pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<UpdateStatusResponse> {
@@ -1999,6 +2004,8 @@ pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<Updat
     let mode = cfg.updates.update_check_mode;
 
     if !mode.is_enabled() {
+        // No banner shows, so don't shell out to `brew` to detect the install method.
+        let install_method = crate::update::install::InstallKind::Unknown;
         return Json(UpdateStatusResponse {
             update_check_mode: mode,
             current_version: current,
@@ -2007,8 +2014,13 @@ pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<Updat
             release_url: None,
             error: None,
             dismissed_version: cfg.app_state.dismissed_update_version.clone(),
+            install_method,
+            update_command: install_method.update_command(),
         });
     }
+
+    let install_method = crate::update::install::install_kind().await;
+    let update_command = install_method.update_command();
 
     match crate::update::check_for_update(&current, false).await {
         Ok(info) => {
@@ -2032,6 +2044,8 @@ pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<Updat
                 release_url,
                 error: None,
                 dismissed_version: cfg.app_state.dismissed_update_version.clone(),
+                install_method,
+                update_command,
             })
         }
         Err(e) => Json(UpdateStatusResponse {
@@ -2042,6 +2056,8 @@ pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<Updat
             release_url: None,
             error: Some(e.to_string()),
             dismissed_version: cfg.app_state.dismissed_update_version.clone(),
+            install_method,
+            update_command,
         }),
     }
 }

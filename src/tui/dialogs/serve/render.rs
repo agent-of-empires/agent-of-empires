@@ -8,8 +8,8 @@ use ratatui::widgets::*;
 use crossterm::event::{KeyCode, KeyEvent};
 
 use super::{
-    funnel_reset_applies, Flash, PendingConfirm, ServeMode, ServeMouse, ServeView, ServeViewState,
-    TransportStatus, TunnelTransport, FLASH_TTL,
+    funnel_reset_applies, Flash, LinkChange, Logins, PendingConfirm, RestartEffect, ServeMode,
+    ServeMouse, ServeView, ServeViewState, TransportStatus, TunnelTransport, FLASH_TTL,
 };
 use crate::tui::components::hint_buttons::scan_spaced_hints;
 use crate::tui::components::hover::paint_hover_bg;
@@ -77,13 +77,15 @@ pub(super) fn render(view: &ServeView, frame: &mut Frame, area: Rect, theme: &Th
             started_at.elapsed(),
             false,
         ),
-        ServeViewState::Active { mode, .. } => {
+        ServeViewState::Active { mode, urls, .. } => {
             render_active(view, frame, area, theme, &mut mouse);
             if view.show_help {
                 // Any click closes the overlay, so nothing beneath is a target.
                 mouse.keys.clear();
                 mouse.copies.clear();
-                render_help_overlay(frame, area, theme, *mode);
+                let effect =
+                    RestartEffect::of(*mode, urls, &view.restart_probe, view.running_persists);
+                render_help_overlay(frame, area, theme, *mode, effect);
             }
         }
         ServeViewState::Error {
@@ -553,7 +555,8 @@ fn render_active(
     let [header, content, footer] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(10),
-        Constraint::Length(3),
+        // A pending confirm can wrap to three rows on a narrow terminal.
+        Constraint::Length(if view.pending_confirm.is_some() { 4 } else { 3 }),
     ])
     .areas(area);
 
@@ -687,13 +690,45 @@ fn render_active(
         .border_style(Style::default().fg(theme.border));
     let footer_inner = footer_block.inner(footer);
     frame.render_widget(footer_block, footer);
-    let footer_line = match view.pending_confirm.map(|(action, _)| action) {
+    let footer_text = match view.pending_confirm.map(|(action, _)| action) {
         Some(action) => {
-            let text = match action {
-                PendingConfirm::NewPassphrase => "Press G again to confirm new passphrase (clients will need it). Any other key cancels.",
-                PendingConfirm::Restart => "Press R again to confirm restart (clears all sessions). Any other key cancels.",
+            let effect = RestartEffect::of(*mode, urls, &view.restart_probe, view.running_persists);
+            let (first, effect_text) = match action {
+                PendingConfirm::NewPassphrase => (
+                    "Press G again for a new passphrase.",
+                    "Every Device signs out.",
+                ),
+                PendingConfirm::Restart if effect.link == LinkChange::Replaced => {
+                    ("Press R again to restart.", "Agents keep running.")
+                }
+                PendingConfirm::Restart => (
+                    "Press R again to restart.",
+                    match effect.logins {
+                        Logins::Kept => "Devices stay signed in; agents keep running.",
+                        Logins::Lost => "Every Device signs out; agents keep running.",
+                        Logins::Unknown => {
+                            "Devices may have to sign in again; agents keep running."
+                        }
+                    },
+                ),
             };
-            Line::styled(text, Style::default().fg(theme.waiting).bold())
+            let link = match effect.link {
+                LinkChange::Same => None,
+                LinkChange::Replaced if effect.passphrase => {
+                    Some("The link changes: re-scan and sign in again.")
+                }
+                LinkChange::Replaced | LinkChange::Moved => Some("The link changes: re-scan it."),
+            };
+            let rest = [effect_text]
+                .into_iter()
+                .chain(link)
+                .chain(["Any other key cancels."]);
+            let mut spans = vec![Span::styled(
+                first,
+                Style::default().fg(theme.waiting).bold(),
+            )];
+            spans.extend(rest.map(|s| Span::styled(format!(" {s}"), dimmed)));
+            Text::from(Line::from(spans))
         }
         None => {
             let mut keys = Vec::new();
@@ -709,24 +744,49 @@ fn render_active(
                 ("?", ": help  "),
                 ("Esc", ": close"),
             ]);
-            Line::from(
+            Text::from(Line::from(
                 keys.into_iter()
                     .flat_map(|(key, desc)| [Span::styled(key, accent), Span::styled(desc, dimmed)])
                     .collect::<Vec<_>>(),
-            )
+            ))
         }
     };
+    // A confirm may wrap onto the footer's second line.
     frame.render_widget(
-        Paragraph::new(footer_line).alignment(Alignment::Center),
+        Paragraph::new(footer_text)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true }),
         footer_inner,
     );
     record_hints(frame, mouse, footer_inner);
 }
 
-fn render_help_overlay(frame: &mut Frame, area: Rect, theme: &Theme, mode: ServeMode) {
+/// The help row for R, matching the confirm's sentences.
+fn restart_help(effect: RestartEffect) -> String {
+    let logins = match effect.logins {
+        Logins::Kept => "Devices stay signed in",
+        Logins::Lost => "every Device signs out",
+        Logins::Unknown => "Devices may have to sign in again",
+    };
+    let what = match effect.link {
+        LinkChange::Replaced if effect.passphrase => "new link, sign in again".to_string(),
+        LinkChange::Replaced => "new link".to_string(),
+        LinkChange::Moved => format!("new link; {logins}"),
+        LinkChange::Same => logins.to_string(),
+    };
+    format!("Restart the Daemon ({what}; agents keep running)")
+}
+
+fn render_help_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    mode: ServeMode,
+    effect: RestartEffect,
+) {
     let is_tunnel = mode == ServeMode::Tunnel;
     let width = 72.min(area.width.saturating_sub(4));
-    let height = (if is_tunnel { 20 } else { 14 }).min(area.height.saturating_sub(4));
+    let height = (if is_tunnel { 20 } else { 15 }).min(area.height.saturating_sub(4));
     let dialog_area = centered_rect(area, width, height);
 
     let heading = Style::default()
@@ -744,15 +804,16 @@ fn render_help_overlay(frame: &mut Frame, area: Rect, theme: &Theme, mode: Serve
     frame.render_widget(block, dialog_area);
 
     let text = Style::default().fg(theme.text);
+    let restart = restart_help(effect);
     let mut shortcuts = Vec::new();
     if is_tunnel {
-        shortcuts.push(("G", "New random passphrase and restart server"));
+        shortcuts.push(("G", "New passphrase (signs every Device out)"));
     }
     shortcuts.extend([
-        ("R", "Restart server (clears all client sessions)"),
-        ("S", "Stop server, return to mode picker"),
+        ("R", restart.as_str()),
+        ("S", "Stop the Daemon, return to mode picker"),
         ("Tab", "Cycle URLs (when multiple available)"),
-        ("Esc / q", "Close this view (server keeps running)"),
+        ("Esc / q", "Close this view (the Daemon keeps running)"),
         ("?", "Toggle this help"),
     ]);
 
@@ -761,12 +822,26 @@ fn render_help_overlay(frame: &mut Frame, area: Rect, theme: &Theme, mode: Serve
         Line::styled("Keyboard Shortcuts", heading),
         Line::from(""),
     ];
-    lines.extend(shortcuts.into_iter().map(|(key, desc)| {
-        Line::from(vec![
-            Span::styled(format!("  {:14}", key), Style::default().fg(theme.waiting)),
-            Span::styled(desc, text),
-        ])
-    }));
+    // A long description continues under itself, not under the key column.
+    const KEY_COL: u16 = 16;
+    for (key, desc) in shortcuts {
+        let mut rows = Vec::new();
+        crate::tui::markdown::wrap_line_into(
+            Line::styled(desc.to_string(), text),
+            inner.width.saturating_sub(KEY_COL),
+            &mut rows,
+        );
+        for (i, row) in rows.into_iter().enumerate() {
+            let lead = if i == 0 {
+                format!("  {key:14}")
+            } else {
+                " ".repeat(KEY_COL as usize)
+            };
+            let mut spans = vec![Span::styled(lead, Style::default().fg(theme.waiting))];
+            spans.extend(row.spans);
+            lines.push(Line::from(spans));
+        }
+    }
     lines.push(Line::from(""));
     if is_tunnel {
         lines.extend([
@@ -926,6 +1001,8 @@ mod tests {
             show_help: false,
             mouse: Default::default(),
             copied: None,
+            running_persists: Some(true),
+            restart_probe: Default::default(),
             pending_launch: None,
             launch_in_flight: false,
             stop_requested: false,
@@ -976,6 +1053,8 @@ mod tests {
             show_help: false,
             mouse: Default::default(),
             copied: None,
+            running_persists: Some(true),
+            restart_probe: Default::default(),
             pending_launch: None,
             launch_in_flight: false,
             stop_requested: false,
@@ -1058,6 +1137,317 @@ mod tests {
         view.show_help = true;
         draw(&view);
         assert_eq!(view.handle_click(0, 0).map(|k| k.code), Some(KeyCode::Esc));
+    }
+
+    /// The text drawn in `rect`, rows joined and box borders blanked, so a wrapped sentence matches.
+    fn text_in(buf: &ratatui::buffer::Buffer, rect: Rect) -> String {
+        let rows: Vec<String> = (rect.y..rect.bottom())
+            .map(|y| {
+                (rect.x..rect.right())
+                    .map(|x| buf[(x, y)].symbol())
+                    .map(|sym| {
+                        if "│─╭╮╰╯".contains(sym) {
+                            " "
+                        } else {
+                            sym
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        rows.join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn restart_and_passphrase_copy_say_what_happens_to_devices() {
+        use super::super::RestartProbe;
+        use PendingConfirm::{NewPassphrase as G, Restart as R};
+        use ServeMode::{Local, Tunnel};
+        let lan = "http://192.168.1.42:8080/?token=t";
+        let funnel = "https://host.tailnet.ts.net/?token=t";
+        let named = "https://aoe.example.com/?token=t";
+        let quick = "https://a-b-c.trycloudflare.com/?token=t";
+        let kept = "Devices stay signed in; agents keep running";
+        let link = "The link changes: re-scan and sign in again.";
+        let rescan = "The link changes: re-scan it.";
+        let moved = (
+            format!("Agents keep running. {link}"),
+            "new link, sign in again; agents keep running".to_string(),
+        );
+        let stays = (format!("{kept}."), kept.to_string());
+        let signs_out = (
+            "Every Device signs out; agents keep running.".to_string(),
+            "every Device signs out; agents keep running".to_string(),
+        );
+        let unknown = (
+            "Devices may have to sign in again; agents keep running.".to_string(),
+            "Devices may have to sign in again; agents keep running".to_string(),
+        );
+        let local_moved = (format!("{kept}. {rescan}"), format!("new link; {kept}"));
+        let on = Some(true);
+        // What the next start does: (takes the Funnel path, port it reuses (None = random),
+        // still has the link's LAN address, inherits AOE_SERVE_PASSPHRASE, persist_sessions,
+        // mints a new token).
+        let probe =
+            |on_funnel, port, same_host: bool, local_passphrase, persists, renews| RestartProbe {
+                on_funnel,
+                persists,
+                port,
+                local_hosts: vec![
+                    if same_host {
+                        "192.168.1.42"
+                    } else {
+                        "10.0.0.7"
+                    }
+                    .to_string(),
+                    "localhost".to_string(),
+                ],
+                local_passphrase,
+                local_token_renews: renews,
+            };
+        let tunnel = |on_funnel, persists| probe(on_funnel, None, true, false, persists, false);
+        // (mode, url, next start, running daemon's persist_sessions (None = reattached), key
+        //  pressed once, confirm after the first sentence, help R)
+        let cases = [
+            // Without a passphrase, Local signs in with the stable token in the link, so only
+            // the link itself can change.
+            (
+                Local,
+                lan,
+                probe(false, Some(8080), true, false, false, false),
+                None,
+                R,
+                stays.clone(),
+            ),
+            // A CLI-started Local daemon on another port, or no saved port, moves the link.
+            (
+                Local,
+                lan,
+                probe(false, Some(51234), true, false, false, false),
+                None,
+                R,
+                local_moved.clone(),
+            ),
+            (
+                Local,
+                lan,
+                probe(false, None, true, false, true, false),
+                on,
+                R,
+                local_moved.clone(),
+            ),
+            // The interface lost its address: the old host's cookie is never sent again.
+            (
+                Local,
+                lan,
+                probe(false, Some(8080), false, false, true, false),
+                on,
+                R,
+                (
+                    format!("Agents keep running. {rescan}"),
+                    "new link; agents keep running".to_string(),
+                ),
+            ),
+            (
+                Local,
+                lan,
+                probe(false, Some(8080), false, true, true, false),
+                on,
+                R,
+                moved.clone(),
+            ),
+            // A Local daemon behind AOE_SERVE_PASSPHRASE has LAN Devices sign in, so the same
+            // host and port keep them only when the sign-ins persist.
+            (
+                Local,
+                lan,
+                probe(false, Some(8080), true, true, false, false),
+                on,
+                R,
+                signs_out.clone(),
+            ),
+            (
+                Local,
+                lan,
+                probe(false, Some(8080), true, true, true, false),
+                Some(false),
+                R,
+                signs_out.clone(),
+            ),
+            (
+                Local,
+                lan,
+                probe(false, Some(8080), true, true, true, false),
+                None,
+                R,
+                unknown.clone(),
+            ),
+            (
+                Local,
+                lan,
+                probe(false, Some(8080), true, true, true, false),
+                on,
+                R,
+                stays.clone(),
+            ),
+            // The cookie isn't scoped by port, so a new port loses only what persistence loses.
+            (
+                Local,
+                lan,
+                probe(false, None, true, true, false, false),
+                on,
+                R,
+                (
+                    format!("Every Device signs out; agents keep running. {rescan}"),
+                    "new link; every Device signs out; agents keep running".to_string(),
+                ),
+            ),
+            // A Local daemon never refreshes serve.token, so a restart a day on mints a new
+            // one: a token-only Device's cookie stops matching, while a passphrase sign-in
+            // still lets it in.
+            (
+                Local,
+                lan,
+                probe(false, Some(8080), true, false, true, true),
+                on,
+                R,
+                (
+                    format!("Agents keep running. {rescan}"),
+                    "new link; agents keep running".to_string(),
+                ),
+            ),
+            (
+                Local,
+                lan,
+                probe(false, Some(8080), true, true, true, true),
+                on,
+                R,
+                local_moved,
+            ),
+            (Tunnel, funnel, tunnel(true, true), on, R, stays.clone()),
+            // Tailscale went away (or Cloudflare was picked): the restart opens a quick tunnel.
+            (Tunnel, funnel, tunnel(false, true), on, R, moved.clone()),
+            // spawn_daemon never re-creates a named tunnel, whether or not Funnel replaces it.
+            (Tunnel, named, tunnel(false, true), on, R, moved.clone()),
+            (Tunnel, named, tunnel(true, true), on, R, moved.clone()),
+            (Tunnel, quick, tunnel(false, true), on, R, moved.clone()),
+            (
+                Tunnel,
+                funnel,
+                tunnel(true, false),
+                on,
+                R,
+                signs_out.clone(),
+            ),
+            // Logins the running daemon held only in memory are gone, whatever the next start reads.
+            (
+                Tunnel,
+                funnel,
+                tunnel(true, true),
+                Some(false),
+                R,
+                signs_out,
+            ),
+            // A reattached daemon's persistence is unknown.
+            (Tunnel, funnel, tunnel(true, true), None, R, unknown),
+            (
+                Tunnel,
+                funnel,
+                tunnel(true, true),
+                on,
+                G,
+                ("Every Device signs out.".to_string(), kept.to_string()),
+            ),
+            (
+                Tunnel,
+                quick,
+                tunnel(false, true),
+                on,
+                G,
+                (format!("Every Device signs out. {link}"), String::new()),
+            ),
+        ];
+        let theme = crate::tui::styles::load_theme("empire");
+        for (mode, url, probe, running, key, (effects, help_restart)) in cases {
+            let case = format!("{mode:?} {url} {probe:?} running={running:?} {key:?}");
+            let mut view = view(ServeViewState::Active {
+                mode,
+                transport: None,
+                urls: vec![ServeUrl {
+                    label: None,
+                    url: url.to_string(),
+                }],
+                url_index: 0,
+                passphrase: (mode == Tunnel).then(|| "correct-horse".to_string()),
+                opened_at: Instant::now(),
+                log_offset: 0,
+            });
+            view.restart_probe = probe;
+            view.running_persists = running;
+            view.pending_confirm = Some((key, Instant::now()));
+            let first = match key {
+                G => "Press G again for a new passphrase.",
+                R => "Press R again to restart.",
+            };
+            // 60 columns wraps the longest confirm onto a third footer row.
+            for width in [60, 80, 120] {
+                let buf = crate::tui::dialogs::test_render::draw(width, 24, |f, theme| {
+                    render(&view, f, f.area(), theme)
+                });
+                let footer = text_in(&buf, Rect::new(0, 21, width, 3));
+                assert_eq!(
+                    footer,
+                    format!("{first} {effects} Any other key cancels."),
+                    "{case} at {width}"
+                );
+                let (x, y) = crate::tui::dialogs::test_render::find(&buf, first);
+                assert_eq!(buf[(x, y)].fg, theme.waiting, "{case}");
+                let (x, y) = crate::tui::dialogs::test_render::find(&buf, "cancels.");
+                assert_eq!(buf[(x, y)].fg, theme.dimmed, "{case}");
+            }
+
+            if help_restart.is_empty() {
+                continue;
+            }
+            view.pending_confirm = None;
+            view.show_help = true;
+            let buf = crate::tui::dialogs::test_render::draw(80, 24, |f, theme| {
+                render(&view, f, f.area(), theme)
+            });
+            let help = text_in(
+                &buf,
+                centered_rect(
+                    Rect::new(0, 0, 80, 24),
+                    72,
+                    if mode == Tunnel { 20 } else { 15 },
+                ),
+            );
+            for want in [
+                format!("R Restart the Daemon ({help_restart})"),
+                "Esc / q Close this view (the Daemon keeps running)".to_string(),
+                "Press any key to close".to_string(),
+            ] {
+                assert!(help.contains(&want), "{case}: {want:?}\n{help}");
+            }
+            // A wrapped description continues under its own column, not under the key.
+            let (desc_x, desc_y) =
+                crate::tui::dialogs::test_render::find(&buf, "Restart the Daemon");
+            let cell = |x: u16| buf[(x, desc_y + 1)].symbol().trim().to_string();
+            let wrapped =
+                crate::tui::dialogs::test_render::find(&buf, "Stop the Daemon").1 > desc_y + 1;
+            assert!(
+                !wrapped || (cell(desc_x - 1).is_empty() && !cell(desc_x).is_empty()),
+                "{case}\n{help}"
+            );
+            assert_eq!(
+                help.contains("G New passphrase (signs every Device out)"),
+                mode == Tunnel,
+                "{case}\n{help}"
+            );
+        }
     }
 
     #[test]
