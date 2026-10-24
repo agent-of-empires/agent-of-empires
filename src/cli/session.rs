@@ -677,6 +677,7 @@ async fn empty_trash(profile: &str) -> Result<()> {
     let mut kept_for_retry = 0usize;
     let mut being_restored_elsewhere = 0usize;
     let mut being_purged_elsewhere = 0usize;
+    let mut busy = Vec::new();
     for inst in &trashed {
         let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             profile,
@@ -710,6 +711,9 @@ async fn empty_trash(profile: &str) -> Result<()> {
                         being_restored_elsewhere += 1;
                     }
                     crate::session::deletion::DeletionDisposition::Busy => {
+                        busy.push(busy_line(inst, &result));
+                    }
+                    crate::session::deletion::DeletionDisposition::Superseded => {
                         being_purged_elsewhere += 1;
                     }
                     _ => {}
@@ -735,6 +739,9 @@ async fn empty_trash(profile: &str) -> Result<()> {
                 }
             }
             crate::session::deletion::DeletionDisposition::Busy => {
+                busy.push(busy_line(inst, &result));
+            }
+            crate::session::deletion::DeletionDisposition::Superseded => {
                 being_purged_elsewhere += 1;
             }
             crate::session::deletion::DeletionDisposition::Failed => kept_for_retry += 1,
@@ -763,9 +770,12 @@ async fn empty_trash(profile: &str) -> Result<()> {
             "{being_restored_elsewhere} being restored by another process"
         ));
     }
+    if !busy.is_empty() {
+        parts.push(format!("skipped {} busy", busy.len()));
+    }
     if being_purged_elsewhere > 0 {
         parts.push(format!(
-            "{being_purged_elsewhere} being purged by another process"
+            "{being_purged_elsewhere} changed during purge, rerun to retry"
         ));
     }
     if outcome.restored_after_teardown > 0 {
@@ -779,7 +789,24 @@ async fn empty_trash(profile: &str) -> Result<()> {
         parts.join(", "),
         storage.profile()
     );
+    if !busy.is_empty() {
+        for line in &busy {
+            eprintln!("{line}");
+        }
+        anyhow::bail!(
+            "{} session(s) were skipped because another operation holds them; nothing changed \
+             for those, retry once the operation finishes",
+            busy.len()
+        );
+    }
     Ok(())
+}
+
+fn busy_line(inst: &Instance, result: &crate::session::deletion::DeletionResult) -> String {
+    let reason = result
+        .conflict()
+        .map_or_else(|| "busy".to_owned(), |error| error.to_string());
+    format!("  Busy: {}  {} ({reason})", inst.id, inst.title)
 }
 
 async fn snooze_session(profile: &str, args: SnoozeArgs) -> Result<()> {

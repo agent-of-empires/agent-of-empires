@@ -13,7 +13,9 @@ use crate::git::GitWorktree;
 use crate::session::config::repo_config;
 use crate::session::path_identity::CleanupProtection;
 use crate::session::storage::StorageFlock;
-use crate::session::{Instance, LifecycleOperation, SessionStore, Storage};
+use crate::session::{
+    Instance, LifecycleOperation, LifecycleReservationError, SessionStore, Storage,
+};
 #[derive(Clone, Serialize, Deserialize)]
 pub struct DeletionRequest {
     pub session_id: String,
@@ -38,7 +40,10 @@ pub enum DeletionDisposition {
     Removed,
     KeptRestored,
     AlreadyGone,
+    /// Another lifecycle operation holds the session; nothing changed, retry later.
     Busy,
+    /// The selection changed after it was made; re-select before retrying.
+    Superseded,
     Failed,
 }
 
@@ -69,6 +74,22 @@ impl DeletionResult {
             disposition,
             retained_instance,
             teardown_started: false,
+        }
+    }
+
+    /// The reservation error for a `Busy` or `Superseded` result.
+    pub fn conflict(&self) -> Option<LifecycleReservationError> {
+        match self.disposition {
+            DeletionDisposition::Busy => Some(
+                self.retained_instance
+                    .as_ref()
+                    .and_then(|row| row.lifecycle_reservation.as_ref())
+                    .map_or(LifecycleReservationError::Superseded, |reservation| {
+                        LifecycleReservationError::Busy(reservation.op)
+                    }),
+            ),
+            DeletionDisposition::Superseded => Some(LifecycleReservationError::Superseded),
+            _ => None,
         }
     }
 }
@@ -335,7 +356,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
                     })
                 {
                     rejected = Some((
-                        DeletionDisposition::Busy,
+                        DeletionDisposition::Superseded,
                         "Session selection changed before purge".to_owned(),
                         Some(stored.clone()),
                     ));
@@ -556,7 +577,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
                 "Session was restored before teardown, so it was not purged",
             ),
             CompletionGate::Superseded => (
-                DeletionDisposition::Busy,
+                DeletionDisposition::Superseded,
                 "Session changed while purge was pending, so it was retained",
             ),
             CompletionGate::Proceed => unreachable!("proceed is not a terminal result"),

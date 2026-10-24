@@ -166,6 +166,9 @@ fn daemon_status_message(status: StatusCode, code: Option<ApiErrorCode>, body: &
         }
         Some(ApiErrorCode::StartFailed) => "Session start failed".into(),
         Some(ApiErrorCode::PurgeFailed) => "Session purge failed".into(),
+        Some(ApiErrorCode::LifecycleLocked) => {
+            "Session is busy with another operation; nothing changed, retry when it finishes".into()
+        }
         _ => format!("daemon returned HTTP {status}: {body}"),
     }
 }
