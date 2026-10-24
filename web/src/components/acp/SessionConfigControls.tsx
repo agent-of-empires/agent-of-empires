@@ -304,7 +304,7 @@ function EffortSegmented({ option, pending, onSelect }: SubProps) {
             data-testid={`config-option-${option.id}-value-${opt.value}`}
             className={[
               "rounded px-2 py-0.5 text-[11px] font-medium transition-colors",
-              isCurrent ? "bg-surface-700 text-text-primary" : "text-text-secondary hover:text-text-primary",
+              isCurrent ? "bg-brand-600/20 text-text-primary" : "text-text-secondary hover:text-text-primary",
               isPending ? "cursor-not-allowed opacity-50" : "",
             ].join(" ")}
           >
