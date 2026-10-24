@@ -37,7 +37,7 @@ fn migrate_file(path: &Path) -> Result<()> {
         return Ok(());
     };
     let mut invalid_rows = false;
-    for row in rows {
+    for (index, row) in rows.iter().enumerate() {
         let Some(object) = row.as_object() else {
             invalid_rows = true;
             continue;
@@ -46,10 +46,18 @@ fn migrate_file(path: &Path) -> Result<()> {
             .get("terminal_handoff")
             .filter(|value| !value.is_null())
         {
-            let intent: crate::session::TerminalHandoffIntent =
-                serde::Deserialize::deserialize(intent)
-                    .context("existing terminal handoff authority is malformed")?;
-            intent.validate_relationships()?;
+            (|| -> Result<()> {
+                let intent: crate::session::TerminalHandoffIntent =
+                    serde::Deserialize::deserialize(intent)
+                        .context("existing terminal handoff authority is malformed")?;
+                intent.validate_relationships()
+            })()
+            .with_context(|| {
+                format!(
+                    "invalid terminal handoff at session row {index} in {}",
+                    path.display()
+                )
+            })?;
         }
     }
     if invalid_rows {
@@ -62,6 +70,28 @@ fn migrate_file(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn optional_handoff_forms_preserve_bytes_and_unknown_fields() -> Result<()> {
+        for explicit_null in [false, true] {
+            let root = tempfile::tempdir()?;
+            let path = root.path().join("sessions.json");
+            let mut row = serde_json::to_value(crate::session::Instance::new("old", "/tmp/repo"))?;
+            row.as_object_mut().unwrap().remove("terminal_handoff");
+            if explicit_null {
+                row["terminal_handoff"] = Value::Null;
+            }
+            row["opaque"] = json!({"keep": 17});
+            let original = serde_json::to_vec_pretty(&json!([row]))?;
+            std::fs::write(&path, &original)?;
+            for _ in 0..2 {
+                migrate_file(&path)?;
+                assert_eq!(std::fs::read(&path)?, original);
+                assert!(crate::session::migration_backups(&path)?.is_empty());
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     #[serial_test::serial]
@@ -81,9 +111,6 @@ mod tests {
             let mut row = serde_json::to_value(crate::session::Instance::new("old", "/tmp/repo"))?;
             row["terminal_scopes"] = Value::Null;
             row["opaque"] = json!({"keep":17});
-            if invalid == b"{}" {
-                row["terminal_handoff"] = Value::Null;
-            }
             let original = serde_json::to_vec(&json!([row]))?;
             std::fs::write(healthy.sessions_path(), &original)?;
             std::fs::write(damaged.sessions_path(), invalid)?;
@@ -201,6 +228,15 @@ mod tests {
             assert_eq!(std::fs::read(&path)?, bytes);
             assert!(!app.join("sessions.corrupt.jsonl").exists());
         }
+        let mut undecodable = pending;
+        undecodable["title"] = json!(17);
+        let bytes = serde_json::to_vec(&json!([earlier, null, undecodable]))?;
+        std::fs::write(&path, &bytes)?;
+        let storage = crate::session::Storage::new_for_test_path("default", path.clone());
+        let error = storage.load().unwrap_err();
+        assert!(error.chain().any(|cause| cause.is::<serde_json::Error>()));
+        assert_eq!(std::fs::read(&path)?, bytes);
+        assert!(!app.join("sessions.corrupt.jsonl").exists());
         Ok(())
     }
 }

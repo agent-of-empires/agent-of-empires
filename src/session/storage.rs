@@ -2015,6 +2015,7 @@ impl Storage {
             "group",
             self.files.as_deref().map(|files| &files.groups),
             |_| Ok(()),
+            |_| Ok(()),
         )
     }
 
@@ -2023,6 +2024,15 @@ impl Storage {
             ReadPolicy::Recover | ReadPolicy::ReadOnly => self.files.as_deref(),
             ReadPolicy::Complete(files) => Some(files),
         }
+    }
+
+    fn on_corrupt_session(row: &serde_json::Value) -> Result<()> {
+        anyhow::ensure!(
+            !row.get("terminal_handoff")
+                .is_some_and(|intent| !intent.is_null()),
+            "row retains terminal handoff authority and cannot be decoded"
+        );
+        Ok(())
     }
 
     fn load_instances(&self, policy: ReadPolicy<'_>) -> Result<Vec<Instance>> {
@@ -2039,6 +2049,7 @@ impl Storage {
                 }
                 Ok(())
             },
+            Self::on_corrupt_session,
         )?;
         for instance in &mut instances {
             // `source_profile` is never persisted, so a loaded row
@@ -2057,6 +2068,7 @@ impl Storage {
         kind: &str,
         source: Option<&super::anchored_fs::ResolvedDataFile>,
         validate: impl Fn(&T) -> Result<()>,
+        on_corrupt: impl Fn(&serde_json::Value) -> Result<()>,
     ) -> Result<Vec<T>> {
         let result = (|| {
             let content = match source {
@@ -2086,15 +2098,10 @@ impl Storage {
                         valid.push(row);
                     }
                     Err(error) => {
-                        if kind == "session"
-                            && row
-                                .get("terminal_handoff")
-                                .is_some_and(|intent| !intent.is_null())
-                        {
-                            return Err(anyhow::Error::from(error).context(format!(
-                                "invalid retained terminal handoff at session row {index} in {}",
-                                path.display()
-                            )));
+                        if let Err(refusal) = on_corrupt(&row) {
+                            return Err(anyhow::Error::from(error).context(refusal).context(
+                                format!("cannot decode {kind} row {index} in {}", path.display()),
+                            ));
                         }
                         tracing::warn!(target: "session.store", profile = %self.profile, row = index, %error, %kind, path = %path.display(), "skipping corrupt stored row");
                         corrupt.push(row);
@@ -2243,6 +2250,7 @@ impl Storage {
             "group",
             Some(&files.groups),
             |_| Ok(()),
+            |_| Ok(()),
         )?;
         self.verify_bound_profile()?;
         Ok((rows, groups))
@@ -2271,6 +2279,7 @@ impl Storage {
             policy,
             "group",
             self.profile_files(policy).map(|files| &files.groups),
+            |_| Ok(()),
             |_| Ok(()),
         )?;
         Ok((instances, groups))
@@ -4921,6 +4930,50 @@ mod tests {
         let q = fs::read_to_string(&quarantine)?;
         assert_eq!(q.lines().count(), 1, "repeated load must not duplicate");
 
+        Ok(())
+    }
+
+    #[test]
+    fn retained_handoff_policy_does_not_depend_on_row_label() -> Result<()> {
+        for handoff in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!({"id": "retained"})),
+        ] {
+            let root = tempdir()?;
+            let path = root.path().join("sessions.json");
+            let storage = Storage::new_for_test_path("corrupt-row-policy", path.clone());
+            let healthy = Instance::new("healthy", "/tmp/healthy");
+            let mut corrupt = serde_json::to_value(Instance::new("corrupt", "/tmp/corrupt"))?;
+            corrupt["title"] = serde_json::json!(17);
+            let retained = handoff.as_ref().is_some_and(|value| !value.is_null());
+            if let Some(handoff) = handoff {
+                corrupt["terminal_handoff"] = handoff;
+            }
+            let bytes = serde_json::to_vec(&serde_json::json!([healthy, corrupt]))?;
+            fs::write(&path, &bytes)?;
+            let result: Result<Vec<Instance>> = storage.load_rows(
+                &path,
+                ReadPolicy::Recover,
+                "record",
+                None,
+                |_| Ok(()),
+                Storage::on_corrupt_session,
+            );
+            let quarantine = path.with_file_name("records.corrupt.jsonl");
+            if retained {
+                let error = result.unwrap_err();
+                assert!(error.chain().any(|cause| cause.is::<serde_json::Error>()));
+                assert!(!quarantine.exists());
+            } else {
+                let titles: Vec<_> = result?.into_iter().map(|row| row.title).collect();
+                assert_eq!(titles, vec!["healthy"]);
+                let preserved: serde_json::Value =
+                    serde_json::from_str(&fs::read_to_string(&quarantine)?)?;
+                assert_eq!(preserved, corrupt);
+            }
+            assert_eq!(fs::read(&path)?, bytes);
+        }
         Ok(())
     }
 

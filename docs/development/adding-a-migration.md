@@ -17,10 +17,7 @@ Migrations must be idempotent, use `tracing::info!`, gate platform-specific ones
 
 Do not reuse a published migration number for a different transformation. When integrating divergent schema histories, preserve the published meaning and add idempotent reconciliation steps newer than both histories. Test upgrades from each history and a second run over the migrated state.
 
-Adding an optional field whose missing and null forms mean the same thing does
-not require rewriting existing rows. Published migration numbers still remain
-reserved. Terminal-handoff authority is validated during migration and on load;
-malformed retained authority refuses the component before quarantine or writes.
+Adding an optional field whose missing and null forms mean the same thing does not require rewriting existing rows.
 
 Scope and process authority must remain exact. Missing legacy proof stays unresolved until complete authoritative inventory proves absence. Preserve captured units, process births, native runtime and producer identity. An unfinished constructor prevents discharge of unknown scope debt. Never overwrite readable malformed proof or infer launch or retirement authority from a missing field. Inventory selectors never authorize retirement, except units in the pre-custody naming format, which earlier releases stopped by the same glob.
 
