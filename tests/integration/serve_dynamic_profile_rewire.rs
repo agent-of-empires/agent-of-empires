@@ -260,7 +260,7 @@ async fn assert_scratch_delete_cancels_initialize(daemon: ServeDaemon) {
         fn drop(&mut self) {
             agent_of_empires::process::worker::kill_process_group(self.pid);
             if let Some(unit) = &self.unit {
-                let mut stop = manager_command("systemctl", &self.runtime);
+                let mut stop = manager_command("systemctl", &self.runtime, true);
                 stop.args(["--user", "stop", unit]);
                 if let Some(slice) = &self.slice {
                     stop.arg(slice);
@@ -348,7 +348,7 @@ async fn assert_scratch_delete_cancels_initialize(daemon: ServeDaemon) {
             !agent_of_empires::process::worker::is_process_group_alive(escaped),
             "scope escapee remained after permanent DELETE"
         );
-        let output = manager_command("systemctl", daemon._runtime.path())
+        let output = manager_command("systemctl", daemon._runtime.path(), true)
             .args([
                 "--user",
                 "show",
@@ -450,7 +450,7 @@ impl ServeDaemon {
         };
         std::fs::write(app.join("config.toml"), scope_config).unwrap();
 
-        let mut cmd = manager_command(aoe, daemon._runtime.path());
+        let mut cmd = manager_command(aoe, daemon._runtime.path(), daemon.scope_slice.is_some());
         cmd.args([
             "serve",
             "--no-auth",
@@ -499,7 +499,7 @@ impl Drop for ServeDaemon {
             let _ = child.wait();
         }
         if let Some(slice) = &self.scope_slice {
-            let _ = manager_command("systemctl", self._runtime.path())
+            let _ = manager_command("systemctl", self._runtime.path(), true)
                 .args(["--user", "stop", slice])
                 .output();
         }
@@ -518,7 +518,7 @@ fn scope_available(runtime: &std::path::Path, slice: &str) -> bool {
             std::os::unix::fs::symlink(source, runtime.join(name)).unwrap();
         }
     }
-    let mut probe = manager_command("systemd-run", runtime);
+    let mut probe = manager_command("systemd-run", runtime, true);
     probe
         .args([
             "--user",
@@ -542,7 +542,7 @@ fn scope_available(runtime: &std::path::Path, slice: &str) -> bool {
         Ok(Some(output)) if output.status.success() => true,
         result => {
             eprintln!("Scoped escapee coverage unavailable; unscoped cancellation was exercised: {result:?}");
-            let _ = manager_command("systemctl", runtime)
+            let _ = manager_command("systemctl", runtime, true)
                 .args(["--user", "stop", slice])
                 .output();
             false
@@ -550,8 +550,10 @@ fn scope_available(runtime: &std::path::Path, slice: &str) -> bool {
     }
 }
 
-fn manager_command(program: &str, runtime: &std::path::Path) -> Command {
-    let bus = if runtime.join("bus").exists() {
+fn manager_command(program: &str, runtime: &std::path::Path, scoped: bool) -> Command {
+    let bus = if !scoped {
+        "unix:path=/dev/null".to_string()
+    } else if runtime.join("bus").exists() {
         format!("unix:path={}/bus", runtime.display())
     } else {
         std::env::var("DBUS_SESSION_BUS_ADDRESS")

@@ -240,17 +240,15 @@ fn isolated_local_network() -> bool {
         let output = match output {
             Ok(output) => output,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                eprintln!("Skipping Local flow: bubblewrap is unavailable");
-                return false;
+                return local_network_unavailable("bubblewrap is unavailable");
             }
             Err(error) => panic!("launch confined Local flow: {error}"),
         };
         if !acknowledgment.exists() && !output.status.success() {
-            eprintln!(
-                "Skipping Local flow: network namespace setup unavailable: {}",
+            return local_network_unavailable(&format!(
+                "network namespace setup unavailable: {}",
                 String::from_utf8_lossy(&output.stderr)
-            );
-            return false;
+            ));
         }
         assert_eq!(std::fs::read_to_string(acknowledgment).unwrap(), test);
         assert!(
@@ -263,9 +261,17 @@ fn isolated_local_network() -> bool {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        eprintln!("Skipping Local flow: Linux network namespaces are required");
-        false
+        local_network_unavailable("Linux network namespaces are required")
     }
+}
+
+fn local_network_unavailable(reason: &str) -> bool {
+    assert!(
+        std::env::var_os("AOE_REQUIRE_LOCAL_NETWORK_TESTS").is_none(),
+        "Required Local restart coverage unavailable: {reason}"
+    );
+    eprintln!("Skipping Local flow: {reason}");
+    false
 }
 
 #[test]
@@ -2917,9 +2923,8 @@ fn tui_local_restart_preserves_the_gate_without_the_env_variable() {
     );
 }
 
-/// Issue #4896 also keeps the CLI restart contract: `aoe serve --restart`
-/// replays the recorded passphrase from disk without reading the caller's
-/// environment.
+/// CLI restart replays the recorded passphrase without requiring
+/// `AOE_SERVE_PASSPHRASE` in the caller's environment.
 #[test]
 #[parallel]
 fn cli_serve_restart_replays_the_recorded_passphrase_gate() {
