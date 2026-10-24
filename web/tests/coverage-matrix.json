@@ -2346,9 +2346,10 @@
         "web/src/components/diff/comments/SendCommentsDialog.tsx",
         "web/src/lib/paneLayout.ts",
         "web/src/components/ContentSplit.tsx",
-        "web/src/App.tsx"
+        "web/src/App.tsx",
+        "web/src/hooks/useDiffFiles.ts"
       ],
-      "notes": "Holding the first canonical session list through the diff-files effect leaves no persisted layout while the session is unknown. Releasing it pins Terminal but not Diff for a non-git session; explicitly opening Diff shows the neutral non-git message without a repository error."
+      "notes": "Holding the first canonical session list through the diff-files effect leaves no persisted layout while the session is unknown. Releasing it pins Terminal but not Diff for a non-git session; explicitly opening Diff shows the neutral non-git message without a repository error. useDiffFiles.test.ts holds the next session's response and asserts the previous session's repository state is cleared (#4847)."
     },
     {
       "id": "right-panel.markdown-viewer",
