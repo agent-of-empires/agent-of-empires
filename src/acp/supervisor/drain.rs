@@ -563,6 +563,7 @@ impl<S: BroadcastSink> Drain<S> {
         let mut client = match launched {
             Ok(client) => client,
             Err(e) => {
+                self.refuse_if_dismissed(&config).await;
                 self.fail_launch(&respawn_lease, previous, &config, e).await;
                 return None;
             }
@@ -1865,6 +1866,76 @@ mod tests {
         );
         assert_eq!(sup.worker_state("s-trashed").await, AcpWorkerState::Absent);
         assert!(storage.load().unwrap()[0].ensure_startable().is_err());
+    }
+
+    /// A trash that lands before the launcher fails reports the dismissal and retires the
+    /// predecessor, not a launch error.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_failed_respawn_after_a_trash_reports_the_dismissal() {
+        let _home = isolate_home();
+        let control =
+            Arc::new(crate::acp::runner_lifecycle::test_support::FakeProcessControl::default());
+        control.alive(4242);
+        let gate = Gate::default();
+        let launcher: Launcher = {
+            let entered = Arc::clone(&gate.entered);
+            let open = Arc::clone(&gate.open);
+            Arc::new(move |_: SpawnConfig, _: AcpSessionId| {
+                let entered = Arc::clone(&entered);
+                let open = Arc::clone(&open);
+                Box::pin(async move {
+                    entered.notify_one();
+                    open.notified().await;
+                    Err(AcpError::Spawn("dial deadline".into()))
+                })
+            })
+        };
+        let sink = VecSink::new();
+        let sup = Arc::new(
+            Supervisor::new(sink.clone())
+                .with_process_control(control.clone())
+                .with_launcher(launcher),
+        );
+        let (storage, profile) = seed_row("s-trash-failed");
+        save_attested_test_record("s-trash-failed", 4242, 0);
+        let socket = worker_registry::socket_path_for("s-trash-failed").unwrap();
+        let mut config = runner_config(socket);
+        config.source_profile = Some(profile);
+        let lease = sup
+            .test_install_runner(
+                "s-trash-failed",
+                config,
+                Some(attested_test_identity(4242, 0)),
+            )
+            .await;
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
+        let drain = sup.start_drain_task("s-trash-failed".into(), lease, inbound_rx, None);
+        drop(inbound_tx);
+
+        gate.entered.notified().await;
+        storage
+            .update(|rows, _| {
+                rows[0].trash();
+                Ok(())
+            })
+            .unwrap();
+        gate.open.notify_one();
+        control.terminated().await;
+        control.exit(4242);
+
+        tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .expect("drain task must finish")
+            .unwrap();
+        assert_eq!(
+            stopped_reasons(&sink, "s-trash-failed"),
+            ["session_trashed".to_string()]
+        );
+        assert_eq!(
+            sup.worker_state("s-trash-failed").await,
+            AcpWorkerState::Absent
+        );
     }
 
     /// The reconciler reads this flag to remind the agent its `Monitor` died.
