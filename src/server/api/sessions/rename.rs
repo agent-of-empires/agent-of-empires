@@ -765,7 +765,10 @@ pub async fn attach_session_project(
 /// Resolve the request's `project` field to a host path: an absolute path is
 /// taken as-is, anything else is looked up in the project registry so the web
 /// picker can send the name it displays.
-async fn resolve_project_input(profile: &str, raw: &str) -> Result<std::path::PathBuf, String> {
+pub(super) async fn resolve_project_input(
+    profile: &str,
+    raw: &str,
+) -> Result<std::path::PathBuf, String> {
     // `Path` here is axum's extractor, so std types are qualified.
     if std::path::Path::new(raw).is_absolute() {
         return Ok(std::path::PathBuf::from(raw));

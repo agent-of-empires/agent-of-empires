@@ -867,6 +867,7 @@ pub(crate) async fn start_server(
     state.session_service.bind_native_state(&state);
 
     let app = build_router(state.clone());
+    api::spawn_auto_create(state.clone());
 
     // Maintenance starts persisted ACP workers, including later CLI additions.
 

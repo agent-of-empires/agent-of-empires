@@ -14,6 +14,26 @@ Three equivalent surfaces:
 
 A plugin's enable-state lives under `[plugins."<id>"]` in `config.toml`.
 
+## Suggested sessions
+
+Suggestion providers add reviewable work to the TUI and dashboard. Review the
+reason, source and draft, then start with your normal session defaults or
+customize in the new-session form. Missing project mappings require selecting
+an exact registered project; they never create a scratch session.
+
+Dismissal and linked-session state survive restart within the selected
+profile. Repeated starts open the linked session unless you explicitly choose
+to create another. Disabling or uninstalling a provider hides its suggestions.
+Provider discovery errors retain its last successful snapshot.
+Each provider lists its sources (the kinds of suggestion it publishes) in the
+suggestions controls; switching one off hides that kind for the profile and
+spares the provider that query.
+
+Automatic creation is off by default. Enable it only after reviewing explicit
+provider-and-criterion rules in the suggestions controls. Normal repository
+trust, sandbox, worktree and agent restrictions still apply.
+
+
 ## Worker logs
 
 A plugin worker's stderr goes to `<app_dir>/plugin-workers/<plugin-id>_<worker-uuid>.log`, one file per worker start. `aoe plugin logs <id>` prints the path of the most recent one, which is the live worker's while it runs, so `tail -f "$(aoe plugin logs <id>)"` follows it. Workers only run under `aoe serve`, so a plugin that never ran has no log.

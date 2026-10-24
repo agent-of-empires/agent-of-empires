@@ -117,6 +117,14 @@ pub struct CreateSessionBody {
     /// whether it ran, so it refuses rather than run it, and its hooks, again.
     #[serde(default)]
     pub retry_origin: Option<String>,
+    #[serde(default)]
+    pub source_refs: Vec<String>,
+    #[serde(default)]
+    pub suggestion: Option<crate::plugin::suggestions::SuggestionIdentity>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub create_another: bool,
 }
 
 #[derive(Serialize, Deserialize)]

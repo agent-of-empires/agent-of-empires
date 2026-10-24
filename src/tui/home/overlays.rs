@@ -19,6 +19,7 @@ impl HomeView {
     /// Returns true when a redraw is needed.
     pub fn tick_dialog(&mut self) -> bool {
         let mut changed = false;
+        changed |= self.tick_suggestions();
 
         if let Some(dialog) = &mut self.new_dialog {
             if dialog.tick() {
@@ -94,6 +95,7 @@ impl HomeView {
         self.show_help
             || self.search_active
             || self.new_dialog.is_some()
+            || self.suggestions_view.is_some()
             || self.confirm_dialog.is_some()
             || self.unified_delete_dialog.is_some()
             || self.group_delete_options_dialog.is_some()

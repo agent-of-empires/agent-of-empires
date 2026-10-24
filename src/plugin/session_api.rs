@@ -525,6 +525,7 @@ async fn admit_and_create(
         // record below.
         callback_url: None,
         idempotency_key: None,
+        source_refs: Vec::new(),
         profile: deps.profile.clone(),
         created_by_plugin: None,
         plugin_create_idempotency: None,

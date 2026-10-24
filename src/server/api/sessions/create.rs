@@ -673,6 +673,9 @@ pub async fn create_session(
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
+    if let Err(response) = super::suggestion::normalize_suggestion(&state, &mut body).await {
+        return response;
+    }
 
     if let Some(key) = body.idempotency_key.as_deref() {
         if key.is_empty() || key.len() > IDEMPOTENCY_KEY_MAX_LEN {
@@ -694,12 +697,25 @@ pub async fn create_session(
         let guard = lock.lock_owned().await;
         let existing = {
             let instances = state.instances.read().await;
-            find_by_idempotency_key(&instances, key).map(|inst| {
-                (
-                    inst.id.clone(),
-                    inst.status == crate::session::Status::Creating,
-                )
-            })
+            find_by_idempotency_key(&instances, key)
+                .or_else(|| {
+                    body.suggestion
+                        .as_ref()
+                        .filter(|_| !body.create_another)
+                        .and_then(|_| {
+                            let served = state.served_profile();
+                            let profile = body.profile.as_deref().unwrap_or(&served);
+                            body.source_refs
+                                .iter()
+                                .find_map(|source| find_by_source_ref(&instances, profile, source))
+                        })
+                })
+                .map(|inst| {
+                    (
+                        inst.id.clone(),
+                        inst.status == crate::session::Status::Creating,
+                    )
+                })
         };
         if let Some((id, unfinished)) = existing {
             if unfinished {
@@ -708,7 +724,12 @@ pub async fn create_session(
             }
             return created_session_response(&state, &id, Vec::new(), StatusCode::OK).await;
         }
-        if let Some(failure) = state.create_progress.recent_failure(key) {
+        if body.suggestion.is_some() {
+            // Suggestion retries reuse this key to serialize starts and find a
+            // session already created for this source. Clear a failed attempt only
+            // after locking and checking for an existing session above.
+            state.create_progress.clear_failure(key);
+        } else if let Some(failure) = state.create_progress.recent_failure(key) {
             return api_error(failure.status, failure.code, failure.message);
         }
         if body
@@ -1081,6 +1102,8 @@ pub async fn create_session(
         )
     });
 
+    let initial_prompt = body.prompt;
+    let suggestion = body.suggestion;
     let spec = crate::server::session_spawn::StructuredSessionSpec {
         title: body.title,
         title_typed: body.title_typed,
@@ -1110,6 +1133,7 @@ pub async fn create_session(
         custom_instruction: body.custom_instruction,
         callback_url: body.callback_url,
         idempotency_key: body.idempotency_key.clone(),
+        source_refs: body.source_refs,
         profile,
         // Never decoded from the request body: only the plugin host path
         // stamps these, through create_structured_session (#2897).
@@ -1139,8 +1163,36 @@ pub async fn create_session(
         let _creation_profile = _creation_profile;
         let result = task_state
             .session_service
-            .create_structured_session(spec, None, None, None)
+            .create_structured_session(spec, None, None, initial_prompt.as_deref())
             .await;
+        let result = match result {
+            Ok((mut outcome, created)) => {
+                let instance = &outcome.instance;
+                if let (Some(host), Some(identity)) = (task_state.plugin_host.as_ref(), suggestion.as_ref()) {
+                    if let Err(error) = host.associate_suggestion(&instance.source_profile, identity, &instance.id) {
+                        tracing::error!(target: "http.api.sessions", %error, session_id = %instance.id, "failed to persist suggestion association");
+                    }
+                }
+                if instance.view == crate::session::View::Terminal {
+                    if let Some(prompt) = initial_prompt {
+                        let response = super::send::send_message(
+                            State(task_state.clone()), Path(instance.id.clone()),
+                            Ok(Json(SendMessageRequest { message: prompt, revive: true })),
+                        ).await.into_response();
+                        if response.status().is_success() {
+                            task_state.session_service.clear_pending_initial_turn(&instance.id).await;
+                        } else {
+                            let detail = axum::body::to_bytes(response.into_body(), 16 * 1024).await
+                                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                                .unwrap_or_else(|error| error.to_string());
+                            outcome.warnings.push(format!("Session created, but its initial prompt could not be delivered: {detail}"));
+                        }
+                    }
+                }
+                Ok((outcome, created))
+            }
+            Err(error) => Err(error),
+        };
         if let (Err(e), Some(key)) = (&result, &key) {
             if let Some(failure) = create_failure(e) {
                 task_state.create_progress.record_failure(key, failure);

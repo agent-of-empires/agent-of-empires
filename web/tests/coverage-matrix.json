@@ -3,6 +3,24 @@
   "description": "Surface/flow coverage matrix for the agent-of-empires web dashboard. Every component file under web/src/components/** must appear in at least one entry's `components` list (covered, deferred, or out-of-scope), or in coverage-matrix.exempt.json. CI validates this on every PR via tests/validate-coverage-matrix.mjs.",
   "surfaces": [
     {
+      "id": "suggestions.shared-session-review",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/__tests__/SuggestionsView.test.tsx",
+        "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
+        "src/lib/api.suggestions.test.ts"
+      ],
+      "components": ["web/src/components/SuggestionsView.tsx", "web/src/components/session-wizard/SessionWizard.tsx"]
+    },
+    {
+      "id": "suggestions.browser-review",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/suggestions-review.spec.ts"],
+      "components": ["web/src/components/SuggestionsView.tsx", "web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
       "id": "settings.dialog-escape",
       "kind": "mocked-playwright",
       "risk": "high",

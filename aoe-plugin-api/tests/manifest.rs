@@ -22,6 +22,64 @@ fn invalid(api_version: u32, body: &str) -> Vec<String> {
 }
 
 #[test]
+fn suggestions_require_current_schema_and_worker_without_session_grants() {
+    let body = "capabilities = [\"runtime.worker\"]\n[runtime]\nkind = \"command\"\ncommand = [\"./worker\"]\n[suggestions]\n[[suggestions.sources]]\ncriterion = \"review_requested\"\nlabel = \"Review requests\"\nvariables = [\"pr_number\", \"repo\"]\n[[suggestions.sources]]\ncriterion = \"ci_failed\"\nlabel = \"Failing checks\"\ndefault_enabled = false\n";
+    let parsed = parse(19, body);
+    let spec = parsed.suggestions.as_ref().expect("declared");
+    assert_eq!(spec.sources.len(), 2);
+    assert_eq!(spec.sources[0].criterion, "review_requested");
+    assert_eq!(spec.sources[0].variables, vec!["pr_number", "repo"]);
+    assert!(spec.sources[0].default_enabled);
+    assert!(!spec.sources[1].default_enabled);
+    assert_eq!(parsed.capabilities.len(), 1);
+    assert!(invalid(18, body)
+        .iter()
+        .any(|error| error.contains("api_version >= 19")));
+    assert!(invalid(
+        19,
+        "[suggestions]\n[[suggestions.sources]]\ncriterion = \"x\"\nlabel = \"X\"\n"
+    )
+    .iter()
+    .any(|error| error.contains("runtime worker")));
+    assert!(parse(18, "").suggestions.is_none());
+    let forged = serde_json::json!({
+        "id":"work", "title":"Work", "reason":"Assigned", "source_url":"https://example.com/1",
+        "source_ref":"https://example.com/1", "preview":"body", "criterion":"assigned",
+        "draft":{"title":"Work","prompt":"Do work"}, "provider_id":"forged"
+    });
+    assert!(serde_json::from_value::<aoe_plugin_api::Suggestion>(forged).is_err());
+    let with_variables = serde_json::json!({
+        "id":"work", "title":"Work", "reason":"Assigned", "source_url":"https://example.com/1",
+        "source_ref":"https://example.com/1", "preview":"body", "criterion":"assigned",
+        "variables":{"repo":"acme/widgets","pr_number":"42"},
+        "draft":{"title":"Work","prompt":"Do work"}
+    });
+    let item = serde_json::from_value::<aoe_plugin_api::Suggestion>(with_variables).unwrap();
+    assert_eq!(item.variables["repo"], "acme/widgets");
+}
+
+#[test]
+fn suggestion_sources_are_validated() {
+    let worker = "capabilities = [\"runtime.worker\"]\n[runtime]\nkind = \"command\"\ncommand = [\"./worker\"]\n";
+    let errors = invalid(19, &format!("{worker}[suggestions]\n"));
+    assert!(errors.iter().any(|e| e.contains("at least one source")));
+    let dup = format!(
+        "{worker}[[suggestions.sources]]\ncriterion = \"a\"\nlabel = \"A\"\n[[suggestions.sources]]\ncriterion = \"a\"\nlabel = \"Again\"\n"
+    );
+    assert!(invalid(19, &dup).iter().any(|e| e.contains("duplicate")));
+    let bad_variable = format!(
+        "{worker}[[suggestions.sources]]\ncriterion = \"a\"\nlabel = \"A\"\nvariables = [\"Pr-Number\"]\n"
+    );
+    assert!(invalid(19, &bad_variable)
+        .iter()
+        .any(|e| e.contains("[a-z0-9_]+")));
+    let no_label = format!("{worker}[[suggestions.sources]]\ncriterion = \"a\"\nlabel = \" \"\n");
+    assert!(invalid(19, &no_label)
+        .iter()
+        .any(|e| e.contains("needs a label")));
+}
+
+#[test]
 fn minimal_manifest_parses_and_round_trips() {
     let m = parse(1, "description = \"d\"");
     assert_eq!(m.id.as_str(), "acme.thing");

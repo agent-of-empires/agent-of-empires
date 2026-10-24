@@ -598,6 +598,10 @@ fn wizard_create_body(
         callback_url: None,
         idempotency_key: None,
         retry_origin: None,
+        source_refs: Vec::new(),
+        suggestion: None,
+        prompt: None,
+        create_another: false,
     }
 }
 

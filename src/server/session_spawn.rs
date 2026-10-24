@@ -39,6 +39,7 @@ pub(crate) struct StructuredSessionSpec {
     /// Idempotency key, persisted onto the created instance so a retry (even
     /// across a daemon restart) can be matched back to it. See #3156.
     pub idempotency_key: Option<String>,
+    pub source_refs: Vec<String>,
     /// Resolved source profile (request profile, else the server default).
     pub profile: String,
     /// Creating plugin id, when the caller is a plugin worker rather than a
@@ -136,6 +137,7 @@ pub(crate) async fn spawn_structured_session(
             custom_instruction,
             callback_url,
             idempotency_key,
+            source_refs,
             profile,
             created_by_plugin,
             plugin_create_idempotency,
@@ -256,6 +258,7 @@ pub(crate) async fn spawn_structured_session(
         instance.acp_mode_id = acp_mode_id;
         instance.callback_url = callback_url;
         instance.idempotency_key = idempotency_key;
+        instance.source_refs = source_refs;
 
         // Apply per-session sandbox overrides from the request body.
         if let Some(ref mut sandbox) = instance.sandbox_info {
@@ -969,6 +972,7 @@ mod tests {
             custom_instruction: None,
             callback_url: None,
             idempotency_key: None,
+            source_refs: Vec::new(),
             profile: profile.into(),
             created_by_plugin: None,
             plugin_create_idempotency: None,

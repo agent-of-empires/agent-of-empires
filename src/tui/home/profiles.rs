@@ -13,6 +13,8 @@ impl HomeView {
     /// Switch the active profile filter in-place without destroying the view.
     /// Pass `None` for all-profiles mode, or `Some(name)` to filter to one profile.
     pub fn switch_profile(&mut self, new_profile: Option<String>) -> anyhow::Result<()> {
+        self.suggestions_view = None;
+        self.pending_suggestion_customization = None;
         if self.active_profile != new_profile {
             self.cancel_native_attachment();
         }

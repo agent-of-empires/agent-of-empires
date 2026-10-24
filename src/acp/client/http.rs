@@ -117,6 +117,25 @@ impl HttpClient {
         })
     }
 
+    /// Daemon-wide JSON request used by the suggestions client. Global
+    /// scope: a 404 is an absent route, not a missing session.
+    pub(crate) async fn daemon_json<T: serde::de::DeserializeOwned>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<T, HttpError> {
+        let url = format!("{}{path}", self.endpoint.base_url);
+        let request = self.http.request(method, url);
+        let request = match body {
+            Some(body) => request.json(body),
+            None => request,
+        };
+        let res = self.execute(request).await?;
+        let res = check_global_status(res)?;
+        Ok(crate::daemon::decode_json::<T>(res).await?)
+    }
+
     /// `GET /api/sessions/{id}/acp/replay?since=N`. Unbounded fetch
     /// (no `limit`): the server still applies its default page bound, so
     /// this returns at most one page. Used by the status probe, which

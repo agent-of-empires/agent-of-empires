@@ -54,6 +54,18 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/workspaces",
             delete(api::delete_workspace).layer(read_only.clone()),
         )
+        .route("/api/suggestions", get(api::get_suggestions))
+        .route("/api/suggestions/refresh", post(api::refresh_suggestions))
+        .route("/api/suggestions/prepare", post(api::prepare_suggestion))
+        .route("/api/suggestions/action", post(api::suggestion_action))
+        .route(
+            "/api/suggestions/policy",
+            patch(api::update_suggestion_policy),
+        )
+        .route(
+            "/api/suggestions/sources",
+            patch(api::update_suggestion_source),
+        )
         // Unified MCP management surface (#1996)
         .route(
             "/api/mcp/servers",

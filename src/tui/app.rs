@@ -1727,6 +1727,14 @@ impl App {
                 }
                 needs_full_refresh = true;
             }
+            if let Some(result) = self.home.apply_suggestion_creation() {
+                needs_full_refresh = true;
+                if let Ok(session_id) = result {
+                    let reload_result = self.home.reload();
+                    handle_tick_reload_storage(reload_result, &mut self.home.reload_failure_state);
+                    self.dispatch_new_session_attach(&session_id, terminal)?;
+                }
+            }
 
             needs_full_refresh |= self.home.tick_dialog();
             needs_full_refresh |= self.home.tick_settings_status();

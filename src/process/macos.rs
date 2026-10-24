@@ -1261,7 +1261,14 @@ mod tests {
         let socket = root.path().join("daemon.sock");
         let mut child = OwnedChild(
             Command::new("sh")
-                .args(["-c", "printf 'ready\n'; IFS= read -r line"])
+                // System shells hide their environment from KERN_PROCARGS2.
+                // Attest this owned fixture through its exact control-socket argument.
+                .args([
+                    "-c",
+                    "printf 'ready\n'; IFS= read -r line",
+                    "prime-zombie-fixture",
+                ])
+                .arg(&socket)
                 .env("TMPDIR", root.path())
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())

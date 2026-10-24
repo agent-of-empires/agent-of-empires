@@ -161,6 +161,95 @@ impl PluginHost {
         }))
     }
 
+    pub fn suggestions_snapshot(&self, profile: &str) -> anyhow::Result<serde_json::Value> {
+        self.api.snapshot(profile)
+    }
+
+    pub async fn refresh_suggestions(&self, profile: &str) -> usize {
+        if profile != crate::session::config::effective_profile(self.api.profile()) {
+            return 0;
+        }
+        let ids: Vec<String> = crate::plugin::registry()
+            .active()
+            .filter(|p| p.manifest.suggestions.is_some() && p.manifest.runtime.is_some())
+            .map(|p| p.id().to_string())
+            .collect();
+        let mut sent = 0;
+        for id in ids {
+            if self
+                .notify_worker(&id, "suggestions.refresh", serde_json::json!({}))
+                .await
+            {
+                sent += 1;
+            }
+        }
+        sent
+    }
+
+    pub fn dismiss_suggestion(
+        &self,
+        profile: &str,
+        identity: &crate::plugin::suggestions::SuggestionIdentity,
+        dismissed: bool,
+    ) -> anyhow::Result<bool> {
+        self.api.set_dismissed(
+            profile,
+            &identity.provider_id,
+            &identity.id,
+            identity.revision,
+            dismissed,
+        )
+    }
+
+    pub fn prepare_suggestion(
+        &self,
+        profile: &str,
+        identity: &crate::plugin::suggestions::SuggestionIdentity,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        self.api.prepare_suggestion(
+            profile,
+            &identity.provider_id,
+            &identity.id,
+            identity.revision,
+        )
+    }
+
+    pub(crate) fn associate_suggestion(
+        &self,
+        profile: &str,
+        identity: &crate::plugin::suggestions::SuggestionIdentity,
+        session_id: &str,
+    ) -> anyhow::Result<bool> {
+        self.api.associate_suggestion(profile, identity, session_id)
+    }
+
+    pub fn update_suggestion_policy(
+        &self,
+        profile: &str,
+        enabled: bool,
+        rules: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        self.api.update_policy(profile, enabled, rules)
+    }
+
+    pub fn set_suggestion_source(
+        &self,
+        provider_id: &str,
+        criterion: &str,
+        enabled: bool,
+    ) -> anyhow::Result<()> {
+        self.api
+            .set_suggestion_source(provider_id, criterion, enabled)
+    }
+
+    pub fn set_suggestion_policy_error(
+        &self,
+        profile: &str,
+        error: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.api.set_policy_error(profile, error)
+    }
+
     /// The aggregated UI-state snapshot for the web to render. Read
     /// synchronously off the in-memory store; never awaits a worker.
     pub fn ui_snapshot(&self) -> crate::plugin::ui_state::UiSnapshot {
@@ -418,6 +507,16 @@ impl PluginHost {
         };
 
         self.teardown_workers(to_teardown).await;
+        let providers = registry
+            .active()
+            .filter(|plugin| {
+                plugin.manifest.runtime.is_some() && plugin.manifest.suggestions.is_some()
+            })
+            .map(|plugin| plugin.id().to_string())
+            .collect();
+        if let Err(error) = self.api.reconcile_suggestion_providers(&providers) {
+            tracing::warn!(target: "plugin.host", %error, "failed to reconcile suggestion providers");
+        }
     }
 
     /// Replace one plugin's worker so it runs the build now on disk, clearing its

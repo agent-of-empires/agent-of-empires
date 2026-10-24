@@ -37,6 +37,7 @@ pub enum ActionId {
     SearchStart,
     SearchNext,
     NewSession,
+    Suggestions,
     NewFromSelection,
     NewFromProject,
     AttachTerminal,
@@ -663,6 +664,21 @@ pub static BINDINGS: &[Binding] = &[
         }),
     },
     Binding {
+        id: ActionId::Suggestions,
+        non_strict: &[k('S')],
+        strict: &[ctrl('s')],
+        context: Context::Always,
+        help: Some(HelpMeta {
+            section: HelpSection::Actions,
+            desc: "Suggested sessions",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Suggested sessions",
+            keywords: &["suggestions", "issues", "review", "create"],
+            group: PaletteGroup::Actions,
+        }),
+    },
+    Binding {
         id: ActionId::NewFromSelection,
         non_strict: &[k('N')],
         strict: &[ctrl('n')],
@@ -1199,6 +1215,7 @@ pub static BINDINGS: &[Binding] = &[
 pub fn palette_id(id: ActionId) -> &'static str {
     match id {
         ActionId::NewSession => "new-session",
+        ActionId::Suggestions => "suggested-sessions",
         ActionId::NewFromSelection => "new-from-selection",
         ActionId::NewFromProject => "new-from-project",
         ActionId::AttachTerminal => "attach-terminal",

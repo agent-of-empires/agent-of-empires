@@ -60,6 +60,7 @@ import { isPluginPaneId, resolvePaneIcon, usePluginPanes, type PluginPane } from
 import { PluginPaneBody } from "./components/plugin/PluginPane";
 import { PluginPageView } from "./components/plugin/PluginPageView";
 import { PluginSessionMenu } from "./components/plugin/PluginSessionMenu";
+import { SuggestionsView } from "./components/SuggestionsView";
 import { TOUR_ANCHORS, tourAnchor } from "./lib/tourSteps";
 import {
   deleteWorkspaceSessions,
@@ -357,6 +358,7 @@ function AppContent({
   const settingsRootMatch = useMatch("/settings");
   const settingsTabMatch = useMatch("/settings/:tab");
   const profilesMatch = useMatch("/profiles");
+  const showSuggestions = useMatch("/suggestions") !== null;
   const pluginPageMatch = useMatch("/plugins/:pluginId/:pageId");
   // A plugin page's split pane shows `?session=` as the routed session, docks and all.
   const activeSessionId = sessionMatch?.params.sessionId ?? (pluginPageMatch ? searchParams.get("session") : null);
@@ -2124,6 +2126,19 @@ function AppContent({
         />
       );
     }
+    if (showSuggestions) {
+      return (
+        <SuggestionsView
+          profile={searchParams.get("profile") || undefined}
+          readOnly={serverAbout?.read_only}
+          onPrepare={(prefill) => {
+            setWizardPrefill(prefill);
+            setShowSessionWizard(true);
+          }}
+          onOpenSession={(id) => navigate(`/session/${id}`)}
+        />
+      );
+    }
     if (showSettings) {
       return (
         <SettingsView
@@ -2504,6 +2519,11 @@ function AppContent({
                 onNew={() => {
                   setWizardPrefill(undefined);
                   setShowSessionWizard(true);
+                }}
+                onSuggestions={() => {
+                  if (window.innerWidth < 768) setSidebarOpen(false);
+                  const profile = searchParams.get("profile");
+                  navigate(`/suggestions${profile ? `?profile=${encodeURIComponent(profile)}` : ""}`);
                 }}
                 onCreateSession={handleCreateSession}
                 onPinProject={projectsReady ? handlePinProject : undefined}

@@ -25,12 +25,13 @@ const STORAGE_MAX_KEY_BYTES: usize = 256;
 const STORAGE_MAX_VALUE_BYTES: usize = 64 * 1024;
 
 pub struct HostApiState {
-    events: Mutex<Connection>,
+    pub(crate) events: Mutex<Connection>,
     schema: Schema,
     retention: usize,
     profile: String,
     ui: UiStore,
     settings_revision: std::sync::atomic::AtomicU64,
+    suggestion_generations: Mutex<crate::plugin::suggestions::Generations>,
 }
 
 impl HostApiState {
@@ -51,6 +52,7 @@ impl HostApiState {
              );",
         )
         .context("create plugin_storage table")?;
+        crate::plugin::suggestions::initialize(&conn)?;
         Ok(Self {
             events: Mutex::new(conn),
             schema,
@@ -58,6 +60,7 @@ impl HostApiState {
             profile: profile.to_string(),
             ui: UiStore::new(),
             settings_revision: std::sync::atomic::AtomicU64::new(0),
+            suggestion_generations: Mutex::new(crate::plugin::suggestions::Generations::default()),
         })
     }
 
@@ -81,10 +84,15 @@ impl HostApiState {
     }
 
     pub fn begin_ui_generation(&self, plugin_id: &str) -> u64 {
-        self.ui.begin_generation(plugin_id)
+        let generation = self.ui.begin_generation(plugin_id);
+        self.lock_suggestion_generations()
+            .begin(plugin_id, generation);
+        generation
     }
 
     pub fn clear_ui(&self, plugin_id: &str, generation: u64) -> bool {
+        self.lock_suggestion_generations()
+            .clear(plugin_id, generation);
         self.ui.clear_plugin(plugin_id, generation)
     }
 
@@ -104,6 +112,22 @@ impl HostApiState {
         body: Option<String>,
     ) {
         let _ = self.ui.notify(plugin_id, tone, title, body, None, None);
+    }
+}
+
+impl HostApiState {
+    /// Suggestions are keyed by the effective profile so a daemon serving the
+    /// default profile (`""`) and the API, which resolves it, agree.
+    pub(crate) fn suggestion_profile(&self) -> String {
+        crate::session::config::effective_profile(&self.profile)
+    }
+
+    pub(crate) fn lock_suggestion_generations(
+        &self,
+    ) -> std::sync::MutexGuard<'_, crate::plugin::suggestions::Generations> {
+        self.suggestion_generations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 }
 
@@ -180,6 +204,22 @@ pub fn dispatch(
     params: &Value,
 ) -> Result<Value, DispatchError> {
     match method {
+        "suggestions.set" => {
+            ctx.require(CAP_WORKER)?;
+            suggestions_set(state, ctx, params)
+        }
+        "suggestions.error" => {
+            ctx.require(CAP_WORKER)?;
+            suggestions_error(state, ctx, params)
+        }
+        "suggestions.sources" => {
+            ctx.require(CAP_WORKER)?;
+            suggestions_sources(state, ctx)
+        }
+        "projects.list" => {
+            ctx.require(CAP_SESSION_READ)?;
+            projects_list(state)
+        }
         "events.publish" => {
             ctx.require(CAP_WORKER)?;
             events_publish(state, params)
@@ -261,6 +301,150 @@ fn optional_str_param<'a>(params: &'a Value, key: &str) -> Result<Option<&'a str
     }
 }
 
+fn suggestions_set(
+    state: &HostApiState,
+    ctx: &PluginRpcContext,
+    params: &Value,
+) -> Result<Value, DispatchError> {
+    let registry = crate::plugin::registry();
+    let provider_name = registry
+        .get(&ctx.plugin_id)
+        .filter(|p| p.active() && p.manifest.suggestions.is_some())
+        .map(|p| p.manifest.name.clone())
+        .ok_or_else(|| DispatchError {
+            code: codes::FORBIDDEN,
+            message: "plugin did not declare suggestions".into(),
+            data: None,
+        })?;
+    let request: aoe_plugin_api::SetSuggestions =
+        serde_json::from_value(params.clone()).map_err(|e| {
+            DispatchError::invalid_params(format!("invalid suggestions.set params: {e}"))
+        })?;
+    if request.items.len() > 500 {
+        return Err(DispatchError::invalid_params(
+            "suggestions.set accepts at most 500 items",
+        ));
+    }
+    if request.items.iter().any(|item| {
+        item.id.is_empty()
+            || item.id.len() > 256
+            || item.title.trim().is_empty()
+            || item.source_ref.trim().is_empty()
+    }) {
+        return Err(DispatchError::invalid_params(
+            "suggestion id, title, and source_ref must be non-empty; id is limited to 256 bytes",
+        ));
+    }
+    let sources = state
+        .suggestion_sources(&ctx.plugin_id)
+        .map_err(|e| DispatchError::internal(e.to_string()))?;
+    if let Some(item) = request.items.iter().find(|item| {
+        !sources
+            .iter()
+            .any(|(source, _)| source.criterion == item.criterion)
+    }) {
+        return Err(DispatchError::invalid_params(format!(
+            "undeclared suggestion criterion {:?}",
+            item.criterion
+        )));
+    }
+    // A switched-off criterion is dropped here too, so a worker that ignored
+    // `suggestions.sources` cannot surface it.
+    let items: Vec<_> = request
+        .items
+        .into_iter()
+        .filter(|item| {
+            sources
+                .iter()
+                .any(|(source, enabled)| *enabled && source.criterion == item.criterion)
+        })
+        .collect();
+    let applied = state
+        .publish_suggestions(&ctx.plugin_id, ctx.ui_generation, &provider_name, &items)
+        .map_err(|e| DispatchError::internal(e.to_string()))?;
+    if !applied {
+        return Err(DispatchError {
+            code: codes::FORBIDDEN,
+            message: "worker generation is no longer active".into(),
+            data: None,
+        });
+    }
+    Ok(json!({"ok": true}))
+}
+
+fn suggestions_sources(
+    state: &HostApiState,
+    ctx: &PluginRpcContext,
+) -> Result<Value, DispatchError> {
+    let declared = crate::plugin::registry()
+        .get(&ctx.plugin_id)
+        .is_some_and(|p| p.active() && p.manifest.suggestions.is_some());
+    if !declared {
+        return Err(DispatchError {
+            code: codes::FORBIDDEN,
+            message: "plugin did not declare suggestions".into(),
+            data: None,
+        });
+    }
+    let sources: Vec<Value> = state
+        .suggestion_sources(&ctx.plugin_id)
+        .map_err(|e| DispatchError::internal(e.to_string()))?
+        .into_iter()
+        .map(|(source, enabled)| json!({ "criterion": source.criterion, "enabled": enabled }))
+        .collect();
+    Ok(json!({ "sources": sources }))
+}
+
+fn projects_list(state: &HostApiState) -> Result<Value, DispatchError> {
+    let projects: Vec<Value> = crate::session::projects::load_merged(&state.suggestion_profile())
+        .map_err(|e| DispatchError::internal(e.to_string()))?
+        .into_iter()
+        .map(|project| json!({ "name": project.name, "path": project.path }))
+        .collect();
+    Ok(json!({ "projects": projects }))
+}
+
+fn suggestions_error(
+    state: &HostApiState,
+    ctx: &PluginRpcContext,
+    params: &Value,
+) -> Result<Value, DispatchError> {
+    let registry = crate::plugin::registry();
+    let provider_name = registry
+        .get(&ctx.plugin_id)
+        .filter(|p| p.active() && p.manifest.suggestions.is_some())
+        .map(|p| p.manifest.name.clone())
+        .ok_or_else(|| DispatchError {
+            code: codes::FORBIDDEN,
+            message: "plugin did not declare suggestions".into(),
+            data: None,
+        })?;
+    let request: aoe_plugin_api::SuggestionsError = serde_json::from_value(params.clone())
+        .map_err(|e| {
+            DispatchError::invalid_params(format!("invalid suggestions.error params: {e}"))
+        })?;
+    if request.message.len() > 4096 {
+        return Err(DispatchError::invalid_params(
+            "suggestions.error message is limited to 4096 bytes",
+        ));
+    }
+    let applied = state
+        .report_suggestion_error(
+            &ctx.plugin_id,
+            ctx.ui_generation,
+            &provider_name,
+            &request.message,
+        )
+        .map_err(|e| DispatchError::internal(e.to_string()))?;
+    if !applied {
+        return Err(DispatchError {
+            code: codes::FORBIDDEN,
+            message: "worker generation is no longer active".into(),
+            data: None,
+        });
+    }
+    Ok(json!({"ok": true}))
+}
 fn events_publish(state: &HostApiState, params: &Value) -> Result<Value, DispatchError> {
     let topic = str_param(params, "topic")?;
     let payload = params
@@ -1435,5 +1619,145 @@ mod tests {
             "voice",
         );
         dispatch(&state, &c, "ui.state.set", &action(true)).unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn suggestions_rpc_checks_provider_grant_and_host_owned_identity() {
+        use crate::session::config::{CapabilityGrant, PluginConfig};
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let dir = crate::plugin::plugins_dir().unwrap().join("acme.worker");
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = "id = \"acme.worker\"\nname = \"Trusted name\"\nversion = \"1.0.0\"\napi_version = 19\ncapabilities = [\"runtime.worker\"]\n[runtime]\nkind = \"command\"\ncommand = [\"./worker\"]\n[suggestions]\n[[suggestions.sources]]\ncriterion = \"assigned\"\nlabel = \"Assigned\"\n[[suggestions.sources]]\ncriterion = \"quiet\"\nlabel = \"Quiet\"\ndefault_enabled = false\n";
+        std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
+        crate::session::update_config(|config| {
+            config.plugins.insert(
+                "acme.worker".into(),
+                PluginConfig {
+                    grant: Some(CapabilityGrant {
+                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                            manifest.as_bytes(),
+                        ),
+                        capabilities: vec![CAP_WORKER.into()],
+                        granted_at: chrono::Utc::now(),
+                    }),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+        assert!(crate::plugin::reload_registry()
+            .get("acme.worker")
+            .unwrap()
+            .active());
+        let state = state(tmp.path());
+        let mut context = ctx(&[CAP_WORKER]);
+        context.ui_generation = state.begin_ui_generation(&context.plugin_id);
+        let request = json!({"items":[{
+            "id":"42","title":"Review","reason":"Assigned","source_url":"https://example.com/42",
+            "source_ref":"https://example.com/42","preview":"untrusted source",
+            "criterion":"assigned","draft":{"title":"Review","prompt":"Review work"}
+        }]});
+        assert_eq!(
+            dispatch(&state, &ctx(&[]), "suggestions.set", &request)
+                .unwrap_err()
+                .code,
+            codes::FORBIDDEN
+        );
+        dispatch(&state, &context, "suggestions.set", &request).unwrap();
+        let snapshot = state.snapshot("default").unwrap();
+        assert_eq!(snapshot["items"][0]["provider_id"], "acme.worker");
+        assert_eq!(snapshot["items"][0]["provider_name"], "Trusted name");
+        let mut forged = request.clone();
+        forged["items"][0]["revision"] = json!(99);
+        assert_eq!(
+            dispatch(&state, &context, "suggestions.set", &forged)
+                .unwrap_err()
+                .code,
+            codes::INVALID_PARAMS
+        );
+        // Sources: the manifest declares the criteria and their defaults; the
+        // worker reads the switches, an undeclared criterion is rejected and a
+        // switched-off one is dropped even if the worker sends it.
+        assert_eq!(
+            dispatch(&state, &ctx(&[]), "suggestions.sources", &json!({}))
+                .unwrap_err()
+                .code,
+            codes::FORBIDDEN
+        );
+        assert_eq!(
+            dispatch(&state, &context, "suggestions.sources", &json!({})).unwrap(),
+            json!({"sources":[
+                {"criterion":"assigned","enabled":true},
+                {"criterion":"quiet","enabled":false}
+            ]})
+        );
+        assert_eq!(snapshot["providers"][0]["sources"][1]["enabled"], false);
+        assert_eq!(snapshot["providers"][0]["sources"][1]["label"], "Quiet");
+        let mut undeclared = request.clone();
+        undeclared["items"][0]["criterion"] = json!("surprise");
+        assert_eq!(
+            dispatch(&state, &context, "suggestions.set", &undeclared)
+                .unwrap_err()
+                .code,
+            codes::INVALID_PARAMS
+        );
+        let mut quiet = request.clone();
+        quiet["items"][0]["criterion"] = json!("quiet");
+        quiet["items"][0]["id"] = json!("43");
+        dispatch(&state, &context, "suggestions.set", &quiet).unwrap();
+        assert!(state.snapshot("default").unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        state
+            .set_suggestion_source("acme.worker", "quiet", true)
+            .unwrap();
+        dispatch(&state, &context, "suggestions.set", &quiet).unwrap();
+        let republished = state.snapshot("default").unwrap();
+        assert_eq!(republished["items"][0]["criterion"], "quiet");
+        assert_eq!(republished["providers"][0]["sources"][1]["enabled"], true);
+
+        state.begin_ui_generation(&context.plugin_id);
+        assert_eq!(
+            dispatch(&state, &context, "suggestions.set", &json!({"items":[]}))
+                .unwrap_err()
+                .code,
+            codes::FORBIDDEN
+        );
+        assert_eq!(state.snapshot("default").unwrap(), republished);
+    }
+
+    #[test]
+    fn projects_list_exposes_registered_projects_to_session_readers() {
+        use crate::session::projects::{self, Project, ProjectScope};
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        projects::add(
+            "default",
+            ProjectScope::Global,
+            Project::new("gamma", "/repos/gamma", ProjectScope::Global),
+            false,
+        )
+        .unwrap();
+        let state = state(tmp.path());
+        assert_eq!(
+            dispatch(&state, &ctx(&[CAP_WORKER]), "projects.list", &json!({}))
+                .unwrap_err()
+                .code,
+            codes::FORBIDDEN
+        );
+        assert_eq!(
+            dispatch(
+                &state,
+                &ctx(&[CAP_SESSION_READ]),
+                "projects.list",
+                &json!({})
+            )
+            .unwrap(),
+            json!({"projects":[{"name":"gamma","path":"/repos/gamma"}]})
+        );
     }
 }

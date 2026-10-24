@@ -42,6 +42,7 @@ impl Instance {
             lifecycle_reservation: None,
             terminal_handoff: None,
             plugin_meta: std::collections::BTreeMap::new(),
+            source_refs: Vec::new(),
             created_by_plugin: None,
             plugin_create_idempotency: None,
             plugin_revival_pending: false,

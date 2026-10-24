@@ -241,6 +241,9 @@ pub struct NewSessionDialog {
     pub(super) available_projects: Vec<crate::session::Project>,
     pub(super) dir_picker: DirPicker,
     pub(super) error_message: Option<String>,
+    /// A suggested-session create is in flight on this dialog's data; keys
+    /// are held so the request cannot be abandoned and resubmitted.
+    pub(super) loading: bool,
     pub(super) show_help: bool,
     pub(super) path_invalid_flash_until: Option<Instant>,
     /// Ghost text completion for the path field (fish-shell style).
@@ -592,6 +595,7 @@ impl NewSessionDialog {
             extra_args: Input::new(extra_args_value),
             command_override: Input::new(command_override_value),
             error_message: None,
+            loading: false,
             show_help: false,
             path_invalid_flash_until: None,
             path_ghost: None,
@@ -776,10 +780,26 @@ impl NewSessionDialog {
             .unwrap_or("")
     }
 
+    pub fn set_loading(&mut self, loading: bool) {
+        self.loading = loading;
+        if loading {
+            self.error_message = None;
+        }
+    }
+
+    pub fn is_loading(&self) -> bool {
+        self.loading
+    }
+
+    pub fn set_error(&mut self, error: String) {
+        self.error_message = Some(error);
+    }
+
     /// Advance dialog timers (spinner and transient highlights).
     /// Returns true when visual state changed and the UI should redraw.
     pub fn tick(&mut self) -> bool {
-        let mut changed = false;
+        // rattles computes the spinner frame from elapsed time; just redraw.
+        let mut changed = self.loading;
         if let Some(until) = self.path_invalid_flash_until {
             if Instant::now() >= until {
                 self.path_invalid_flash_until = None;
@@ -1105,6 +1125,7 @@ impl NewSessionDialog {
             extra_args: Input::default(),
             command_override: Input::default(),
             error_message: None,
+            loading: false,
             show_help: false,
             path_invalid_flash_until: None,
             path_ghost: None,
@@ -1185,6 +1206,7 @@ impl NewSessionDialog {
             extra_args: Input::default(),
             command_override: Input::default(),
             error_message: None,
+            loading: false,
             show_help: false,
             path_invalid_flash_until: None,
             path_ghost: None,
@@ -1381,6 +1403,10 @@ impl NewSessionDialog {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<NewSessionData> {
+        if self.loading {
+            return DialogResult::Continue;
+        }
+
         if self.show_help {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
                 self.show_help = false;

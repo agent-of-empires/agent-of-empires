@@ -547,6 +547,8 @@ pub struct Instance {
     /// older `sessions.json` rows, so no migration is needed.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub plugin_meta: std::collections::BTreeMap<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_refs: Vec<String>,
 
     /// Id of the plugin that created this session through the host session
     /// service (#2897). `None` for user-created sessions, including every row

@@ -215,8 +215,14 @@ impl CreateProgressRegistry {
             .filter(|(at, _)| at.elapsed() < FAILURE_TTL)
             .map(|(_, failure)| failure.clone())
     }
-}
 
+    pub fn clear_failure(&self, key: &str) {
+        self.failures
+            .lock()
+            .expect("create failures poisoned")
+            .remove(key);
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,6 +258,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn clearing_a_failed_suggestion_allows_retry_and_releases_capacity() {
+        let registry = CreateProgressRegistry::default();
+        let failure = CreateFailure {
+            status: axum::http::StatusCode::BAD_REQUEST,
+            code: "create_failed",
+            message: "project unavailable".into(),
+        };
+        registry.record_failure("suggestion:key", failure);
+
+        registry.clear_failure("suggestion:key");
+
+        assert_eq!(registry.recent_failure("suggestion:key"), None);
+        assert!(registry.has_failure_capacity());
+    }
     #[test]
     fn progress_tracks_hooks_caps_output_and_unregisters_on_drop() {
         let registry = CreateProgressRegistry::default();

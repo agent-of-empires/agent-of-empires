@@ -4,6 +4,8 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 use tui_input::Input;
 
+use rattles::presets::prelude as spinners;
+
 use super::{NewSessionDialog, FIELD_HELP, HELP_DIALOG_WIDTH};
 use crate::tui::components::{
     focused_input_spans, input_scroll, profile_cycler_spans, render_text_field,
@@ -58,6 +60,11 @@ impl NewSessionDialog {
         self.list_entry_rects.clear();
         self.confirm_create_rects.clear();
         self.hover_rects.clear();
+
+        if self.loading {
+            self.render_loading(frame, area, theme);
+            return;
+        }
 
         if self.sandbox_config_mode {
             self.render_sandbox_config(frame, area, theme);
@@ -1239,6 +1246,28 @@ impl NewSessionDialog {
             Span::styled(" to close", Style::default().fg(theme.dimmed)),
         ]));
 
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    fn render_loading(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let dialog_area = crate::tui::dialogs::centered_rect(area, 50, 5);
+        frame.render_widget(Clear, dialog_area);
+        let block = crate::tui::dialogs::dialog_block(" Creating Session ", theme);
+        let inner = block.inner(dialog_area);
+        frame.render_widget(block, dialog_area);
+        let spinner = spinners::orbit()
+            .set_interval(std::time::Duration::from_millis(400))
+            .current_frame();
+        let lines = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(
+                    format!("  {spinner} "),
+                    Style::default().fg(theme.accent).bold(),
+                ),
+                Span::styled("Creating session...", Style::default().fg(theme.text)),
+            ]),
+        ];
         frame.render_widget(Paragraph::new(lines), inner);
     }
 }
