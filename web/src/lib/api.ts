@@ -1908,8 +1908,10 @@ export async function browseFilesystem(
   return { ...data, ok: true };
 }
 
-export async function fetchGroups(): Promise<GroupInfo[]> {
-  return (await fetchJson<GroupInfo[]>("/api/groups")) ?? [];
+/** The profile's groups, sorted by path; the served profile when omitted. */
+export async function fetchGroups(profile?: string): Promise<GroupInfo[]> {
+  const query = profile ? `?profile=${encodeURIComponent(profile)}` : "";
+  return (await fetchJson<GroupInfo[]>(`/api/groups${query}`)) ?? [];
 }
 
 /** Resolve a plugin `dynamic_select` widget's options from the host (#2897).
