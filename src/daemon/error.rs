@@ -25,6 +25,7 @@ pub enum ApiErrorCode {
     SmartRenameSkipped,
     SmartRenameFailed,
     SmartRenameTimeout,
+    GroupNotEmpty,
 }
 
 impl ApiErrorCode {
@@ -49,6 +50,7 @@ impl ApiErrorCode {
             Self::SmartRenameSkipped => "smart_rename_skipped",
             Self::SmartRenameFailed => "smart_rename_failed",
             Self::SmartRenameTimeout => "smart_rename_timeout",
+            Self::GroupNotEmpty => "group_not_empty",
         }
     }
 
@@ -65,7 +67,8 @@ impl ApiErrorCode {
             | Self::NoRevive
             | Self::CreationTrustChanged
             | Self::CreationCancelled
-            | Self::CreationNotPending => StatusCode::CONFLICT,
+            | Self::CreationNotPending
+            | Self::GroupNotEmpty => StatusCode::CONFLICT,
             Self::PendingTargetGone => StatusCode::NOT_FOUND,
             Self::TlsRequired => StatusCode::UPGRADE_REQUIRED,
             Self::CreateHookFailed => StatusCode::BAD_REQUEST,
@@ -111,6 +114,7 @@ impl ApiErrorCode {
             b"smart_rename_skipped" => Self::SmartRenameSkipped,
             b"smart_rename_failed" => Self::SmartRenameFailed,
             b"smart_rename_timeout" => Self::SmartRenameTimeout,
+            b"group_not_empty" => Self::GroupNotEmpty,
             _ => return None,
         };
         (status == code.status()).then_some(code)
@@ -178,6 +182,13 @@ mod tests {
                 false,
                 Some(ApiErrorCode::CreateHookFailed),
             ),
+            (
+                StatusCode::CONFLICT,
+                "group_not_empty",
+                false,
+                Some(ApiErrorCode::GroupNotEmpty),
+            ),
+            (StatusCode::FORBIDDEN, "group_not_empty", false, None),
         ] {
             let mut headers = HeaderMap::new();
             headers.insert(ERROR_CODE_HEADER, HeaderValue::from_static(value));

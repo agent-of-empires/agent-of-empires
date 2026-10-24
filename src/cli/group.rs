@@ -4,11 +4,9 @@ use anyhow::Result;
 use clap::{Args, Subcommand};
 use serde::Serialize;
 
-use reqwest::StatusCode;
-
 use crate::acp::client::require_daemon;
 use crate::daemon::{
-    DaemonClient, DaemonClientError, DeleteGroupBody, DeleteGroupMode, GroupLocation,
+    ApiErrorCode, DaemonClient, DaemonClientError, DeleteGroupBody, DeleteGroupMode, GroupLocation,
     RuntimeHealth, RUNTIME_PROTOCOL_VERSION,
 };
 use crate::session::config::resolve_default_profile;
@@ -189,11 +187,14 @@ async fn delete_group(profile: &str, args: GroupDeleteArgs) -> Result<()> {
     let receipt = client.delete_group(&body, &epoch).await.map_err(|e| {
         let not_empty = matches!(
             &e,
-            DaemonClientError::Status { status, .. } if *status == StatusCode::CONFLICT
+            DaemonClientError::Status {
+                code: Some(ApiErrorCode::GroupNotEmpty),
+                ..
+            }
         );
         if !force && not_empty {
             anyhow::Error::from(e).context(format!(
-                "Group '{name}' may contain sessions. Use --force to move them to default group."
+                "Group '{name}' is not empty. Use --force to move its sessions to default group."
             ))
         } else {
             e.into()
