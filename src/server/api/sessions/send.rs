@@ -232,11 +232,10 @@ impl IntoResponse for TerminalSendError {
     fn into_response(self) -> axum::response::Response {
         let mut response = match self.error {
             SendKeysError::NotFound | SendKeysError::Gone => bare_not_found(),
-            SendKeysError::NotRunning => (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({"error": "session_not_running"})),
-            )
-                .into_response(),
+            SendKeysError::NotRunning => crate::server::api::api_error_with_code_header(
+                crate::daemon::ApiErrorCode::SessionNotRunning,
+                "Terminal session is not running",
+            ),
             SendKeysError::Preparation { response, .. } => *response,
             SendKeysError::Transient(status) => (
                 StatusCode::CONFLICT,
@@ -697,6 +696,10 @@ mod send_output_tests {
         }
         .into_response();
         assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response.headers()[crate::daemon::ERROR_CODE_HEADER],
+            "session_not_running"
+        );
         assert_eq!(
             response.headers()[crate::daemon::RUNTIME_EPOCH_HEADER],
             "committed-epoch"
