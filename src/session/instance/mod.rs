@@ -267,6 +267,23 @@ pub(crate) struct TerminalHandoffKey {
 }
 
 impl TerminalHandoffIntent {
+    pub(crate) fn validate_relationships(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.target_generation <= self.generation,
+            "terminal handoff target generation exceeds ownership generation"
+        );
+        anyhow::ensure!(
+            self.launch
+                .as_ref()
+                .is_none_or(|launch| launch.generation <= self.generation),
+            "terminal handoff attempt generation exceeds ownership generation"
+        );
+        if self.unborn_fence.is_some() {
+            self.validate_unborn_fence()?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_unborn_fence(&self) -> Result<&TerminalHandoffUnbornFence> {
         let fence = self
             .unborn_fence
