@@ -135,9 +135,6 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
 
         match crate::session::trash::prepare_trashed_worktree(&mut inst) {
             crate::session::trash::RelocateOutcome::Relocated { warning, .. } => {
-                if let Some(warning) = warning {
-                    eprintln!("  Warning: {warning}");
-                }
                 // Atomic durable check-and-commit: a peer restore or purge can
                 // land between the teardown's pre-move re-check and this
                 // persist, so the decision is re-taken on the durable row
@@ -179,7 +176,15 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
                                 "  Note: a concurrent restore superseded the trash; could not move the worktree back ({reason})."
                             );
                         }
-                        _ => {
+                        crate::session::trash::RestoreOutcome::Restored { warning, .. } => {
+                            eprintln!(
+                                "  Note: a concurrent restore superseded the trash; the worktree was moved back."
+                            );
+                            if let Some(warning) = warning {
+                                eprintln!("  Warning: {warning}");
+                            }
+                        }
+                        crate::session::trash::RestoreOutcome::NoChange => {
                             eprintln!(
                                 "  Note: a concurrent restore superseded the trash; the worktree was left in place."
                             );
@@ -192,6 +197,9 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
                         "  Session was restored by another process; it was not moved to the trash."
                     );
                     return Ok(());
+                }
+                if let Some(warning) = warning {
+                    eprintln!("  Warning: {warning}");
                 }
             }
             crate::session::trash::RelocateOutcome::Failed { reason } => {
