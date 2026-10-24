@@ -79,6 +79,18 @@ describe("useSessions / pushed status", () => {
     expect(result.current.sessions[0]!.status).toBe("Running");
   });
 
+  it("does not let a read that began before the push acknowledge it", async () => {
+    const { result, resolvers, envelope } = mountWithReads();
+    await act(async () => resolvers[0]!(envelope("Running", 1n)));
+    await nextPoll(); // read A begins before any push
+    act(() => result.current.applyPushedStatus("a", "Waiting"));
+    act(() => result.current.applyPushedStatus("a", "Running"));
+    await act(async () => resolvers[1]!(envelope("Running", 2n))); // matches the override, but is older than the push
+    await nextPoll();
+    await act(async () => resolvers[2]!(envelope("Waiting", 3n)));
+    expect(result.current.sessions[0]!.status).toBe("Running");
+  });
+
   it("drops a held status on resync, so a transition missed while disconnected cannot stick", async () => {
     const { result, resolvers, envelope } = mountWithReads();
     await act(async () => resolvers[0]!(envelope("Running", 1n)));
