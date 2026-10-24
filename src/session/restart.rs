@@ -266,6 +266,63 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn restart_wake_does_not_send_to_a_superseded_generation() -> anyhow::Result<()> {
+        if !crate::tmux::is_tmux_available() {
+            return Ok(());
+        }
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir()?;
+        let input = project.path().join("input");
+        let ready = project.path().join("ready");
+        let closed = project.path().join("closed");
+        let mut row = Instance::new("stale-wake", project.path().to_str().unwrap());
+        row.source_profile = "stale-wake".into();
+        row.lifecycle_generation = 1;
+        let storage = crate::session::Storage::new_unwatched(&row.source_profile)?;
+        storage.update(|rows, _| {
+            rows.push(row.clone());
+            Ok(())
+        })?;
+        let session = row.tmux_session()?;
+        let _pane =
+            crate::tmux::test_helpers::TmuxTestSession::from_name(session.name().to_owned());
+        session.create(
+            project.path().to_str().unwrap(),
+            Some(&format!(
+                "bash -c 'touch {}; read -r -t 6 message; printf \"%s\" \"$message\" > {}; touch {}; exec sleep 60'",
+                ready.display(),
+                input.display(),
+                closed.display(),
+            )),
+            &row.source_profile,
+        )?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !ready.exists() {
+            anyhow::ensure!(std::time::Instant::now() < deadline, "reader did not start");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        spawn_wake_worker(
+            row.id,
+            row.title,
+            row.tool,
+            "must not reach replacement".into(),
+            Some((row.source_profile, 0)),
+        );
+        // The live reader covers the worker's full readiness window before closing.
+        while !closed.exists() {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "reader did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(std::fs::read_to_string(input)?, "");
+        Ok(())
+    }
+
     #[test]
     fn restart_wake_is_suppressed_for_resume_failed() {
         let outcome = Ok(StartOutcome::ResumeFailed {
