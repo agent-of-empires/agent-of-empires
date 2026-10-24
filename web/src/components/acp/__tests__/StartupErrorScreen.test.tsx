@@ -102,6 +102,24 @@ describe("StartupErrorScreen", () => {
     }
   });
 
+  it.each([
+    ["installable and sandboxed", incompatible(true), true, true],
+    ["installable with one-click install off", incompatible(true), false, false],
+    [
+      "not installable",
+      { kind: "unsupported_protocol_version" as const, expected: "V1", received: "V2" },
+      false,
+      false,
+    ],
+  ])("keeps every line on a validated text colour: %s", async (_label, detail, isSandboxed, allowInstall) => {
+    fetchSettings.mockResolvedValue({ acp: { allow_agent_install: allowInstall } });
+    const { getByTestId } = render(<StartupErrorScreen detail={detail} sessionId="s1" isSandboxed={isSandboxed} />);
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
+    const screen = getByTestId("startup-error-screen");
+    expect(screen.querySelectorAll(".text-text-secondary, .text-text-dim")).toHaveLength(0);
+    expect(screen.querySelectorAll(".text-text-subtle").length).toBeGreaterThan(0);
+  });
+
   it("Restart agent POSTs to /acp/spawn", async () => {
     const { getByTestId } = render(<StartupErrorScreen detail={incompatible()} sessionId="sess%2Fa" />);
     fireEvent.click(getByTestId("startup-error-restart"));
