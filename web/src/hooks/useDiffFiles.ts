@@ -4,6 +4,7 @@ import type { RepoBase, RichDiffFile } from "../lib/types";
 import { useLatestRef } from "./useLatestRef";
 
 const POLL_INTERVAL = 10_000;
+const DEFAULT_BASES: RepoBase[] = [{ base_branch: "main", repo_path: "" }];
 
 interface UseDiffFilesResult {
   files: RichDiffFile[];
@@ -16,7 +17,7 @@ interface UseDiffFilesResult {
 
 export function useDiffFiles(sessionId: string | null, enabled: boolean): UseDiffFilesResult {
   const [files, setFiles] = useState<RichDiffFile[]>([]);
-  const [perRepoBases, setPerRepoBases] = useState<RepoBase[]>([{ base_branch: "main", repo_path: "" }]);
+  const [perRepoBases, setPerRepoBases] = useState<RepoBase[]>(DEFAULT_BASES);
   const [warning, setWarning] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [revision, setRevision] = useState(0);
@@ -56,8 +57,10 @@ export function useDiffFiles(sessionId: string | null, enabled: boolean): UseDif
   const [trackedSessionId, setTrackedSessionId] = useState(sessionId);
   if (sessionId !== trackedSessionId) {
     setTrackedSessionId(sessionId);
+    setFiles([]);
+    setPerRepoBases(DEFAULT_BASES);
+    setWarning(null);
     if (sessionId === null) {
-      setFiles([]);
       setLoading(false);
       setRevision(0);
     } else {
