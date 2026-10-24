@@ -199,7 +199,7 @@ export function ProfilesSection({ readOnly, onRenamed }: Props) {
               type="button"
               onClick={() => selectProfile(p.name)}
               className={`flex items-center justify-between rounded-md px-3 py-2 text-sm text-left cursor-pointer ${
-                p.name === selected ? "bg-surface-700 text-text-primary" : "text-text-secondary hover:bg-surface-800"
+                p.name === selected ? "bg-brand-600/20 text-text-primary" : "text-text-secondary hover:bg-surface-800"
               }`}
             >
               <span className="truncate">{p.name}</span>
