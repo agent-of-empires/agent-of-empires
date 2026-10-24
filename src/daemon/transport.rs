@@ -53,6 +53,24 @@ pub(crate) fn prepare_runtime_directory(parent: &Path) -> anyhow::Result<()> {
     let private_gid = user_private_gid(owner);
     for ancestor in parent.ancestors() {
         let meta = std::fs::symlink_metadata(ancestor)?;
+        if meta.is_dir()
+            && meta.uid() == owner
+            && meta.mode() & 0o022 != 0
+            && !trusted_ancestor(meta.uid(), meta.gid(), meta.mode(), owner, private_gid)
+        {
+            if ancestor == parent {
+                return Err(directory_permission_error(
+                    ancestor,
+                    "0700",
+                    "Set this directory to mode 0700",
+                ));
+            }
+            return Err(directory_permission_error(
+                ancestor,
+                "go-w",
+                "Remove group/other write permission from this directory",
+            ));
+        }
         anyhow::ensure!(
             meta.is_dir()
                 && !meta.file_type().is_symlink()
@@ -63,10 +81,34 @@ pub(crate) fn prepare_runtime_directory(parent: &Path) -> anyhow::Result<()> {
     }
     let directory = std::fs::symlink_metadata(parent)?;
     anyhow::ensure!(
-        directory.uid() == owner && directory.mode() & 0o777 == 0o700,
-        "Daemon socket directory must be owned by this user with mode0700"
+        directory.uid() == owner,
+        "Daemon socket directory must be owned by this user: {}",
+        parent.display()
     );
+    if directory.mode() & 0o777 != 0o700 {
+        return Err(directory_permission_error(
+            parent,
+            "0700",
+            "Set this directory to mode 0700",
+        ));
+    }
     Ok(())
+}
+
+fn directory_permission_error(path: &Path, mode: &str, requirement: &str) -> anyhow::Error {
+    if let Some(text) = path
+        .to_str()
+        .filter(|text| !text.contains(['\r', '\n', '`']))
+    {
+        anyhow::anyhow!(
+            "Unsafe daemon socket directory: {text}. {requirement} with `chmod -- {mode} {}`, then retry.",
+            crate::session::environment::shell_escape(text)
+        )
+    } else {
+        anyhow::anyhow!(
+            "Unsafe daemon socket directory: {path:?}. {requirement} manually, then retry. No copyable shell command is available for this path."
+        )
+    }
 }
 
 /// The app dir belongs to aoe, but a umask of 002 creates it group-writable.
@@ -405,6 +447,142 @@ mod tests {
         prepare_runtime_directory(&app.join("daemon")).unwrap();
 
         assert_eq!(std::fs::metadata(&app).unwrap().mode() & 0o777, 0o755);
+    }
+
+    fn run_directory_recovery(error: &anyhow::Error) {
+        let diagnostic = error.to_string();
+        let command = diagnostic
+            .split('`')
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing recovery command: {diagnostic}"));
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .status()
+            .unwrap();
+        assert!(status.success(), "recovery command failed: {diagnostic}");
+    }
+
+    #[test]
+    fn socket_directory_recovery_command_repairs_every_nonprivate_mode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        for mode in [0o755, 0o775, 0o777] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let app = root
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join("owner's app directory");
+            std::fs::create_dir(&app).unwrap();
+            std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let parent = app.join("owner's daemon directory");
+            std::fs::create_dir(&parent).unwrap();
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(mode)).unwrap();
+
+            let error = prepare_runtime_directory(&parent).unwrap_err();
+            assert!(
+                error.to_string().contains(parent.to_str().unwrap()),
+                "{error}"
+            );
+            assert_eq!(std::fs::metadata(&parent).unwrap().mode() & 0o777, mode);
+            run_directory_recovery(&error);
+            assert_eq!(std::fs::metadata(&parent).unwrap().mode() & 0o777, 0o700);
+            prepare_runtime_directory(&parent).unwrap();
+        }
+    }
+
+    #[test]
+    fn higher_ancestor_recovery_command_removes_group_and_other_write() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let ancestor = root
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("owner's unsafe ancestor");
+        let app = ancestor.join("app");
+        let parent = app.join("daemon");
+        std::fs::create_dir(&ancestor).unwrap();
+        std::fs::create_dir(&app).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+        for directory in [&app, &parent] {
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let error = prepare_runtime_directory(&parent).unwrap_err();
+        assert!(
+            error.to_string().contains(ancestor.to_str().unwrap()),
+            "{error}"
+        );
+        assert_eq!(std::fs::metadata(&ancestor).unwrap().mode() & 0o777, 0o777);
+        // Removing only group write still leaves an unsafe world-writable ancestor.
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o757)).unwrap();
+        let error = prepare_runtime_directory(&parent).unwrap_err();
+        assert_eq!(std::fs::metadata(&ancestor).unwrap().mode() & 0o777, 0o757);
+        run_directory_recovery(&error);
+        assert_eq!(std::fs::metadata(&ancestor).unwrap().mode() & 0o777, 0o755);
+        prepare_runtime_directory(&parent).unwrap();
+    }
+
+    #[test]
+    fn recovery_command_omits_unrepresentable_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::{
+            ffi::OsStringExt,
+            fs::{MetadataExt, PermissionsExt},
+        };
+
+        // Filesystems need not accept non-UTF-8 names.
+        let invalid = std::path::PathBuf::from(OsString::from_vec(b"invalid-\xff".to_vec()));
+        for mode in ["0700", "go-w"] {
+            let diagnostic =
+                directory_permission_error(&invalid, mode, "Repair directory permissions")
+                    .to_string();
+            assert!(!diagnostic.contains("`chmod"), "{diagnostic}");
+            assert!(diagnostic.contains(&format!("{invalid:?}")), "{diagnostic}");
+            assert!(diagnostic.contains("manually, then retry"), "{diagnostic}");
+        }
+
+        for name in [
+            OsString::from("carriage\rreturn"),
+            OsString::from("line\nfeed"),
+            OsString::from("back`tick"),
+        ] {
+            for (socket, mode) in [(true, 0o755), (true, 0o777), (false, 0o777)] {
+                let root = tempfile::tempdir().unwrap();
+                let base = root.path().canonicalize().unwrap();
+                std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+                let refused = if socket {
+                    base.join("app").join(&name)
+                } else {
+                    base.join(&name)
+                };
+                let parent = if socket {
+                    refused.clone()
+                } else {
+                    refused.join("app/daemon")
+                };
+                std::fs::create_dir_all(&parent).unwrap();
+                for directory in parent.ancestors().take_while(|path| *path != base) {
+                    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                }
+                std::fs::set_permissions(&refused, std::fs::Permissions::from_mode(mode)).unwrap();
+                let diagnostic = prepare_runtime_directory(&parent).unwrap_err().to_string();
+                assert!(!diagnostic.contains("`chmod"), "{diagnostic}");
+                assert!(diagnostic.contains(&format!("{refused:?}")), "{diagnostic}");
+                assert_eq!(std::fs::metadata(&refused).unwrap().mode() & 0o777, mode);
+                let repaired = if socket { 0o700 } else { mode & !0o022 };
+                std::fs::set_permissions(&refused, std::fs::Permissions::from_mode(repaired))
+                    .unwrap();
+                prepare_runtime_directory(&parent).unwrap();
+            }
+        }
     }
 
     async fn serve_deadline_body<S>(
