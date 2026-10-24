@@ -2376,11 +2376,13 @@ mod tests {
         let _path = crate::session::test_support::EnvGuard::unset(&["DBUS_SESSION_BUS_ADDRESS"])
             .and_set("PATH", path.as_str())
             .and_set("XDG_RUNTIME_DIR", alternate.path());
-        for (legacy_unknown, manager, known_unscoped) in [
-            (false, true, false),
-            (true, true, false),
-            (true, false, false),
-            (false, true, true),
+        for (legacy_unknown, manager, known_unscoped, kernel_state) in [
+            (false, true, false, "unused"),
+            (true, true, false, "unused"),
+            (true, false, false, "empty"),
+            (false, true, true, "unused"),
+            (true, false, false, "populated"),
+            (true, false, false, "missing-events"),
         ] {
             #[cfg(target_os = "linux")]
             let canonical = tempfile::tempdir().unwrap();
@@ -2399,11 +2401,29 @@ mod tests {
                         .unwrap(),
                 )
             } else {
+                let runtime = canonical
+                    .path()
+                    .join("user")
+                    .join(nix::unistd::geteuid().as_raw().to_string());
+                std::fs::create_dir_all(runtime).unwrap();
+                std::fs::create_dir(canonical.path().join("cgroups")).unwrap();
+                std::fs::write(canonical.path().join("cgroups/cgroup.controllers"), "").unwrap();
                 None
             };
             let profile = "terminal-scope-refusal";
             let storage = Storage::new_unwatched(profile).unwrap();
             let mut row = Instance::new("owned terminal", home.path().to_str().unwrap());
+            #[cfg(target_os = "linux")]
+            if matches!(kernel_state, "populated" | "missing-events") {
+                let scope = canonical.path().join("cgroups/other.service").join(format!(
+                    "aoe-session-{}-1700000000000.scope",
+                    row.id.replace('-', "_2d")
+                ));
+                std::fs::create_dir_all(&scope).unwrap();
+                if kernel_state == "populated" {
+                    std::fs::write(scope.join("cgroup.events"), "populated 1\n").unwrap();
+                }
+            }
             row.source_profile = profile.into();
             row.scratch = true;
             let scratch = crate::session::scratch::provision_scratch_dir(&row.id).unwrap();
@@ -2435,7 +2455,10 @@ mod tests {
                 panic!("the selected row must reserve before runtime scope proof");
             };
             let result = transaction.run_hooks().unwrap().complete();
-            if known_unscoped || (legacy_unknown && (!manager || !cfg!(target_os = "linux"))) {
+            if known_unscoped
+                || (legacy_unknown
+                    && (!cfg!(target_os = "linux") || (!manager && kernel_state == "empty")))
+            {
                 assert!(result.success, "{:?}", result.errors);
                 assert!(!scratch.exists());
                 assert!(storage

@@ -152,7 +152,7 @@ impl LegacyUserManager {
         Ok(root.to_owned())
     }
 
-    fn capture() -> anyhow::Result<Option<Self>> {
+    fn capture(prefix: &str) -> anyhow::Result<Option<Self>> {
         use std::os::fd::AsRawFd as _;
         let uid = nix::unistd::geteuid().as_raw();
         let runtime = std::path::PathBuf::from(format!("/run/user/{uid}"));
@@ -162,12 +162,23 @@ impl LegacyUserManager {
             .map(|root| (root.join("user").join(uid.to_string()), uid))
             .unwrap_or((runtime, anchor_uid));
         let runtime_directories = LegacyRuntimeDirectories::open(&runtime, uid, anchor_uid)?;
-        runtime_directories.check_current(&runtime, uid, anchor_uid)?;
         let Some(directory) = &runtime_directories.runtime else {
+            runtime_directories.check_current(&runtime, uid, anchor_uid)?;
             return Ok(None);
         };
-        let systemd_directory = LegacyRuntimeDirectories::child(directory, "systemd", uid)?
-            .context("User manager private socket directory is unavailable")?;
+        let Some(systemd_directory) = LegacyRuntimeDirectories::child(directory, "systemd", uid)?
+        else {
+            anyhow::ensure!(
+                kernel_scope_inventory_clear(prefix)?,
+                "Legacy scope cgroup is still populated; original custody retained"
+            );
+            runtime_directories.check_current(&runtime, uid, anchor_uid)?;
+            anyhow::ensure!(
+                LegacyRuntimeDirectories::child(directory, "systemd", uid)?.is_none(),
+                "User manager appeared during scope absence proof"
+            );
+            return Ok(None);
+        };
         let private = runtime_io::stat_entry(systemd_directory.as_raw_fd(), "private")?;
         anyhow::ensure!(
             private.st_mode & runtime_io::KIND_MASK == runtime_io::SOCKET && private.st_uid == uid,
@@ -205,19 +216,8 @@ impl LegacyUserManager {
         };
         manager.root = manager.manager_root()?;
         validate_legacy_manager_membership(&manager.process_cgroup, &manager.root)?;
-        let directory = fs::File::open(manager.inventory_root())?;
-        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
-        // SAFETY: directory is live and stat points to writable storage.
-        anyhow::ensure!(
-            unsafe { libc::fstatfs(directory.as_raw_fd(), stat.as_mut_ptr()) } == 0,
-            "Cannot inspect the user manager cgroup filesystem: {}",
-            std::io::Error::last_os_error()
-        );
-        // SAFETY: fstatfs succeeded and initialized stat.
-        anyhow::ensure!(
-            unsafe { stat.assume_init() }.f_type == libc::CGROUP2_SUPER_MAGIC,
-            "User manager inventory is not a cgroup2 filesystem"
-        );
+        let directory = open_cgroup_directory(&manager.inventory_root())?;
+        require_cgroup2(&directory)?;
         manager.check_current()?;
         Ok(Some(manager))
     }
@@ -386,6 +386,91 @@ mod legacy_inventory_boundary_tests {
     use super::*;
 
     #[test]
+    fn existing_managerless_runtime_requires_complete_empty_kernel_inventory() {
+        use std::os::unix::fs::symlink;
+        let prefix = "aoe-session-managerless-fixture-";
+        for case in [
+            "empty",
+            "empty-scope",
+            "populated",
+            "nested",
+            "known-populated",
+            "missing-events",
+            "malformed-events",
+            "linked-events",
+            "linked-directory",
+            "partial-events",
+            "partial-type",
+            "missing-controllers",
+            "linked-controllers",
+        ] {
+            let fixture = tempfile::tempdir().unwrap();
+            let runtime = fixture
+                .path()
+                .join("user")
+                .join(nix::unistd::geteuid().as_raw().to_string());
+            fs::create_dir_all(&runtime).unwrap();
+            let root = fixture.path().join("cgroups");
+            fs::create_dir(&root).unwrap();
+            fs::write(root.join("cgroup.controllers"), "").unwrap();
+            let unit = format!("{prefix}1700000000000.scope");
+            if matches!(case, "partial-events" | "partial-type") {
+                fs::write(
+                    root.join(if case == "partial-events" {
+                        "cgroup.events"
+                    } else {
+                        "cgroup.type"
+                    }),
+                    "",
+                )
+                .unwrap();
+            } else if case == "missing-controllers" {
+                fs::remove_file(root.join("cgroup.controllers")).unwrap();
+            } else if case == "linked-controllers" {
+                fs::remove_file(root.join("cgroup.controllers")).unwrap();
+                symlink("missing", root.join("cgroup.controllers")).unwrap();
+            } else if case == "linked-directory" {
+                symlink(&runtime, root.join("hidden")).unwrap();
+            } else if case != "empty" {
+                let parent = if case == "nested" {
+                    root.join("other.service")
+                } else {
+                    root.clone()
+                };
+                let scope = parent.join(&unit);
+                fs::create_dir_all(&scope).unwrap();
+                match case {
+                    "missing-events" => {}
+                    "linked-events" => {
+                        fs::write(runtime.join("events"), "populated 0\n").unwrap();
+                        symlink(runtime.join("events"), scope.join("cgroup.events")).unwrap();
+                    }
+                    _ => fs::write(
+                        scope.join("cgroup.events"),
+                        match case {
+                            "empty-scope" => "populated 0\n",
+                            "malformed-events" => "populated 0\npopulated 1\n",
+                            _ => "populated 1\n",
+                        },
+                    )
+                    .unwrap(),
+                }
+            }
+            let _guard = super::super::systemd::legacy_runtime_fixture::install(fixture.path());
+            let names = legacy_scope_unit_names(prefix);
+            let known = [crate::process::worker_registry::ScopeOwnership::Owned { unit }];
+            let clear = legacy_scope_inventory_clear(prefix, &known);
+            if matches!(case, "empty" | "empty-scope") {
+                assert!(names.unwrap().is_empty(), "{case}");
+                assert!(clear.unwrap(), "{case}");
+            } else {
+                assert!(names.is_err(), "{case}: cannot discard original debt");
+                assert!(clear.is_err(), "{case}: cannot discard captured units");
+            }
+        }
+    }
+
+    #[test]
     fn canonical_runtime_absence_requires_safe_complete_directory_evidence() {
         use std::os::unix::fs::{symlink, PermissionsExt};
         let uid = nix::unistd::geteuid().as_raw();
@@ -450,7 +535,7 @@ mod legacy_inventory_boundary_tests {
             let result = if case == "wrong-owner" {
                 LegacyRuntimeDirectories::open(&runtime, uid, uid.wrapping_add(1)).map(|_| false)
             } else {
-                LegacyUserManager::capture().map(|manager| manager.is_none())
+                LegacyUserManager::capture("aoe-session-fixture-").map(|manager| manager.is_none())
             };
             if matches!(case, "missing-user" | "missing-runtime") {
                 assert!(result.unwrap(), "{case}");
@@ -554,7 +639,7 @@ mod legacy_inventory_boundary_tests {
 
 /// Loaded user-manager scope names starting with `prefix`.
 pub(super) fn legacy_scope_unit_names(prefix: &str) -> anyhow::Result<Vec<String>> {
-    let Some(manager) = LegacyUserManager::capture()? else {
+    let Some(manager) = LegacyUserManager::capture(prefix)? else {
         return Ok(Vec::new());
     };
     let units = manager.list_scope_units(prefix)?;
@@ -569,7 +654,7 @@ pub(super) fn legacy_scope_inventory_clear(
     use crate::process::worker_registry::ScopeOwnership;
     use std::collections::HashSet;
     use std::time::Duration;
-    let Some(manager) = LegacyUserManager::capture()? else {
+    let Some(manager) = LegacyUserManager::capture(prefix)? else {
         return Ok(true);
     };
     let retained: HashSet<&str> = known
@@ -621,44 +706,163 @@ pub(super) fn legacy_scope_inventory_clear(
             }
         }
     }
-    let mut pending = vec![manager.inventory_root()];
-    while let Some(path) = pending.pop() {
-        for entry in fs::read_dir(&path)? {
-            let entry = entry?;
-            let kind = entry.file_type()?;
-            anyhow::ensure!(!kind.is_symlink(), "Cgroup inventory contains a link");
-            if !kind.is_dir() {
-                continue;
-            }
-            let child = entry.path();
-            let name = entry.file_name();
-            let name = name.to_str().context("Non-UTF8 cgroup name")?;
-            if name.starts_with(prefix) && name.ends_with(".scope") && !retained.contains(name) {
-                let events = fs::read_to_string(child.join("cgroup.events"))?;
-                let mut populated = None;
-                for line in events.lines() {
-                    let mut fields = line.split_whitespace();
-                    if fields.next() == Some("populated") {
-                        let value = fields.next().context("Missing cgroup population")?;
-                        anyhow::ensure!(
-                            populated.is_none()
-                                && fields.next().is_none()
-                                && matches!(value, "0" | "1"),
-                            "Invalid cgroup population"
-                        );
-                        populated = Some(value == "1");
-                    }
-                }
-                match populated {
-                    Some(false) => {}
-                    Some(true) => return Ok(false),
-                    None => anyhow::bail!("Cgroup population unavailable"),
-                }
-            }
-            pending.push(child);
-        }
+    if !legacy_scope_cgroups_clear(
+        open_cgroup_directory(&manager.inventory_root())?,
+        prefix,
+        &retained,
+    )? {
+        return Ok(false);
     }
     manager.check_current()?;
+    Ok(true)
+}
+
+fn open_cgroup_directory(root: &Path) -> anyhow::Result<fs::File> {
+    Ok(nix::fcntl::open(
+        root,
+        LegacyRuntimeDirectories::flags(),
+        nix::sys::stat::Mode::empty(),
+    )?
+    .into())
+}
+
+fn require_cgroup2(directory: &fs::File) -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: directory is live and stat points to writable storage.
+    anyhow::ensure!(
+        unsafe { libc::fstatfs(directory.as_raw_fd(), stat.as_mut_ptr()) } == 0,
+        "Cannot inspect the cgroup filesystem: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: fstatfs succeeded and initialized stat.
+    anyhow::ensure!(
+        unsafe { stat.assume_init() }.f_type == libc::CGROUP2_SUPER_MAGIC,
+        "Scope inventory is not a cgroup2 filesystem"
+    );
+    Ok(())
+}
+
+fn read_cgroup_file(directory: &fs::File, name: &std::ffi::CStr) -> anyhow::Result<String> {
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
+    let mut file = runtime_io::open_readonly_at(directory.as_raw_fd(), name)?;
+    anyhow::ensure!(
+        file.metadata()?.is_file(),
+        "Cgroup interface is not a regular file"
+    );
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+    Ok(contents)
+}
+
+fn validate_physical_cgroup_root(directory: &fs::File) -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    for name in ["cgroup.events", "cgroup.type"] {
+        match runtime_io::stat_entry(directory.as_raw_fd(), name) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+            Ok(_) => anyhow::bail!("A cgroup subtree hides part of the physical hierarchy"),
+        }
+    }
+    read_cgroup_file(directory, c"cgroup.controllers")?;
+    Ok(())
+}
+
+fn kernel_scope_inventory_clear(prefix: &str) -> anyhow::Result<bool> {
+    #[cfg(test)]
+    if let Some(root) = super::systemd::legacy_runtime_fixture::root() {
+        return kernel_scope_inventory_clear_at(&root.join("cgroups"), prefix, false);
+    }
+    kernel_scope_inventory_clear_at(Path::new("/sys/fs/cgroup"), prefix, true)
+}
+
+fn kernel_scope_inventory_clear_at(
+    root: &Path,
+    prefix: &str,
+    kernel: bool,
+) -> anyhow::Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+    let namespace = fs::read_link("/proc/self/ns/cgroup")?;
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+    let directory = open_cgroup_directory(root)?;
+    if kernel {
+        validate_legacy_cgroup_mount(&mountinfo)?;
+        require_cgroup2(&directory)?;
+    }
+    // Non-root kernel cgroups expose both interfaces, even in a cgroup namespace.
+    validate_physical_cgroup_root(&directory)?;
+    let clear = legacy_scope_cgroups_clear(
+        directory.try_clone()?,
+        prefix,
+        &std::collections::HashSet::new(),
+    )?;
+    let before = directory.metadata()?;
+    let after = open_cgroup_directory(root)?.metadata()?;
+    validate_physical_cgroup_root(&directory)?;
+    anyhow::ensure!(
+        before.dev() == after.dev()
+            && before.ino() == after.ino()
+            && fs::read_link("/proc/self/ns/cgroup")? == namespace
+            && fs::read_to_string("/proc/self/mountinfo")? == mountinfo,
+        "Kernel scope inventory boundary changed during absence proof"
+    );
+    Ok(clear)
+}
+
+fn legacy_scope_cgroups_clear(
+    root: fs::File,
+    prefix: &str,
+    retained: &std::collections::HashSet<&str>,
+) -> anyhow::Result<bool> {
+    use std::os::fd::AsRawFd as _;
+    let entries = runtime_io::read_directory(root.as_raw_fd())?;
+    let mut pending = vec![(root, entries)];
+    while let Some((directory, entries)) = pending.last_mut() {
+        let Some(entry) = entries.next() else {
+            pending.pop();
+            continue;
+        };
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        anyhow::ensure!(!kind.is_symlink(), "Cgroup inventory contains a link");
+        if !kind.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let child: fs::File = nix::fcntl::openat(
+            &*directory,
+            name.as_os_str(),
+            LegacyRuntimeDirectories::flags(),
+            nix::sys::stat::Mode::empty(),
+        )?
+        .into();
+        let name = name.to_str().context("Non-UTF8 cgroup name")?;
+        if name.starts_with(prefix) && name.ends_with(".scope") && !retained.contains(name) {
+            let events = read_cgroup_file(&child, c"cgroup.events")?;
+            let mut populated = None;
+            for line in events.lines() {
+                let mut fields = line.split_whitespace();
+                if fields.next() == Some("populated") {
+                    let value = fields.next().context("Missing cgroup population")?;
+                    anyhow::ensure!(
+                        populated.is_none()
+                            && fields.next().is_none()
+                            && matches!(value, "0" | "1"),
+                        "Invalid cgroup population"
+                    );
+                    populated = Some(value == "1");
+                }
+            }
+            match populated {
+                Some(false) => {}
+                Some(true) => return Ok(false),
+                None => anyhow::bail!("Cgroup population unavailable"),
+            }
+        }
+        let entries = runtime_io::read_directory(child.as_raw_fd())?;
+        pending.push((child, entries));
+    }
     Ok(true)
 }
 pub(super) fn open_read_nonblocking(path: &std::path::Path) -> std::io::Result<std::fs::File> {
