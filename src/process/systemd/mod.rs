@@ -588,9 +588,6 @@ pub(crate) fn legacy_unknown_scope_absent(
     );
     #[cfg(target_os = "linux")]
     {
-        if !user_manager_runtime_present() {
-            return Ok(true);
-        }
         super::linux::legacy_scope_inventory_clear(&format!("{}-", escaped_id(session_id)), known)
     }
     #[cfg(target_os = "macos")]
@@ -604,23 +601,10 @@ pub(crate) fn legacy_unknown_scope_absent(
     }
 }
 
-/// Without a user manager's runtime sockets, `systemd-run --user` never
-/// created a scope, so earlier releases left none to retire.
-#[cfg(target_os = "linux")]
-fn user_manager_runtime_present() -> bool {
-    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", nix::unistd::geteuid().as_raw())));
-    user_manager_reachable(Some(&runtime_dir), None)
-}
-
 /// Units named as releases before scope custody named this session's scopes.
 fn legacy_scope_units(session_id: &str) -> anyhow::Result<Vec<String>> {
     #[cfg(target_os = "linux")]
     {
-        if !user_manager_runtime_present() {
-            return Ok(Vec::new());
-        }
         let prefix = format!("{}-", escaped_id(session_id));
         Ok(super::linux::legacy_scope_unit_names(&prefix)?
             .into_iter()
@@ -712,6 +696,32 @@ pub(crate) fn retire_scope(
     );
     anyhow::ensure!(proven_empty, "captured scope is not empty after stop");
     Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod legacy_runtime_fixture {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static ROOT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) struct Installed(Option<PathBuf>);
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            ROOT.with(|root| *root.borrow_mut() = self.0.take());
+        }
+    }
+
+    pub(crate) fn install(root: &Path) -> Installed {
+        Installed(ROOT.with(|slot| slot.replace(Some(root.to_owned()))))
+    }
+
+    pub(crate) fn root() -> Option<PathBuf> {
+        ROOT.with(|root| root.borrow().clone())
+    }
 }
 
 /// Observes this thread's `release` calls, so tests can check when one runs.

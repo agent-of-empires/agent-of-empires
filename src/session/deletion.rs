@@ -2372,24 +2372,58 @@ mod tests {
             bin.display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let runtime = tempfile::tempdir().unwrap();
-        std::fs::create_dir(runtime.path().join("systemd")).unwrap();
-        std::fs::write(runtime.path().join("systemd/private"), "").unwrap();
+        let alternate = tempfile::tempdir().unwrap();
         let _path = crate::session::test_support::EnvGuard::unset(&["DBUS_SESSION_BUS_ADDRESS"])
-            .and_set("PATH", path.as_str());
-        // A legacy row is resolvable only without a user manager that could own its scopes.
-        for (legacy_unknown, manager) in [(false, true), (true, true), (true, false)] {
-            let _manager = crate::session::test_support::EnvGuard::set(&[(
-                "XDG_RUNTIME_DIR",
-                if manager {
-                    runtime.path().to_str().unwrap()
-                } else {
-                    home.path().to_str().unwrap()
-                },
-            )]);
+            .and_set("PATH", path.as_str())
+            .and_set("XDG_RUNTIME_DIR", alternate.path());
+        for (legacy_unknown, manager, known_unscoped, kernel_state) in [
+            (false, true, false, "unused"),
+            (true, true, false, "unused"),
+            (true, false, false, "empty"),
+            (false, true, true, "unused"),
+            (true, false, false, "populated"),
+            (true, false, false, "missing-events"),
+        ] {
+            #[cfg(target_os = "linux")]
+            let canonical = tempfile::tempdir().unwrap();
+            #[cfg(target_os = "linux")]
+            let _canonical =
+                crate::process::systemd::legacy_runtime_fixture::install(canonical.path());
+            #[cfg(target_os = "linux")]
+            let _listener = if manager {
+                let runtime = canonical
+                    .path()
+                    .join("user")
+                    .join(nix::unistd::geteuid().as_raw().to_string());
+                std::fs::create_dir_all(runtime.join("systemd")).unwrap();
+                Some(
+                    std::os::unix::net::UnixListener::bind(runtime.join("systemd/private"))
+                        .unwrap(),
+                )
+            } else {
+                let runtime = canonical
+                    .path()
+                    .join("user")
+                    .join(nix::unistd::geteuid().as_raw().to_string());
+                std::fs::create_dir_all(runtime).unwrap();
+                std::fs::create_dir(canonical.path().join("cgroups")).unwrap();
+                std::fs::write(canonical.path().join("cgroups/cgroup.controllers"), "").unwrap();
+                None
+            };
             let profile = "terminal-scope-refusal";
             let storage = Storage::new_unwatched(profile).unwrap();
             let mut row = Instance::new("owned terminal", home.path().to_str().unwrap());
+            #[cfg(target_os = "linux")]
+            if matches!(kernel_state, "populated" | "missing-events") {
+                let scope = canonical.path().join("cgroups/other.service").join(format!(
+                    "aoe-session-{}-1700000000000.scope",
+                    row.id.replace('-', "_2d")
+                ));
+                std::fs::create_dir_all(&scope).unwrap();
+                if kernel_state == "populated" {
+                    std::fs::write(scope.join("cgroup.events"), "populated 1\n").unwrap();
+                }
+            }
             row.source_profile = profile.into();
             row.scratch = true;
             let scratch = crate::session::scratch::provision_scratch_dir(&row.id).unwrap();
@@ -2397,6 +2431,8 @@ mod tests {
             std::fs::write(scratch.join("payload"), b"owned checkout contents").unwrap();
             row.terminal_scopes = if legacy_unknown {
                 None
+            } else if known_unscoped {
+                Some(vec![])
             } else {
                 Some(vec![
                     crate::process::worker_registry::ScopeOwnership::Owned {
@@ -2419,8 +2455,10 @@ mod tests {
                 panic!("the selected row must reserve before runtime scope proof");
             };
             let result = transaction.run_hooks().unwrap().complete();
-            // Without a Linux scope backend a legacy row has nothing left to prove.
-            if legacy_unknown && (!manager || !cfg!(target_os = "linux")) {
+            if known_unscoped
+                || (legacy_unknown
+                    && (!cfg!(target_os = "linux") || (!manager && kernel_state == "empty")))
+            {
                 assert!(result.success, "{:?}", result.errors);
                 assert!(!scratch.exists());
                 assert!(storage
