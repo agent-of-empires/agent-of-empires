@@ -233,7 +233,7 @@ pub fn read_request_source(cli: &Cli) -> ReadRequestSource {
 
 /// Read an already published endpoint without acquiring or starting a Daemon.
 pub async fn attempt(command: ScopedCommand<'_>, source: &ReadRequestSource) -> ReadOutcome {
-    finish(execute_inner(command, source).await).await
+    finish(execute_inner(command, source).await, source).await
 }
 
 /// Acquire a local Daemon only after definitive absence, then read it once.
@@ -249,7 +249,7 @@ pub async fn run(command: ScopedCommand<'_>, source: &ReadRequestSource) -> Read
         }
         result => result,
     };
-    finish(result).await
+    finish(result, source).await
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -287,7 +287,10 @@ async fn acquire_local_read(
     ))
 }
 
-async fn finish(result: Result<render::Projection, ReadFailure>) -> ReadOutcome {
+async fn finish(
+    result: Result<render::Projection, ReadFailure>,
+    source: &ReadRequestSource,
+) -> ReadOutcome {
     match result {
         Ok(projection) => {
             let notice = if projection.session_table {
@@ -309,7 +312,26 @@ async fn finish(result: Result<render::Projection, ReadFailure>) -> ReadOutcome 
                 exit: projection.exit,
             }
         }
-        Err(error) => error.into(),
+        Err(mut error) => {
+            if error.exact.is_none()
+                && source.explicit_url.is_none()
+                && !source.env_url_is_set()
+                && matches!(
+                    error.code,
+                    "publisher_absent" | "establishment_timeout" | "marker_missing" | "unavailable"
+                )
+            {
+                error.exact = Some(format!(
+                    "daemon read: {}\nThe local Daemon's runtime read is unavailable. \
+                     Check its mode, CLI/Daemon versions and publication diagnostics. \
+                     CityHall mode disables runtime reads. When appropriate, restart the local \
+                     Daemon through its service manager or `aoe serve --restart`, then retry. \
+                     Local storage is never used as a fallback.\n",
+                    error.code
+                ));
+            }
+            error.into()
+        }
     }
 }
 

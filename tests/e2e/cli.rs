@@ -1513,7 +1513,6 @@ fn cli_send_waits_for_slow_boot_before_typing() {
     });
 }
 
-/// Lifecycle projections converge after local writes reach the Daemon.
 #[test]
 #[parallel]
 fn cli_list_and_show_expose_lifecycle_state() {
@@ -1521,6 +1520,7 @@ fn cli_list_and_show_expose_lifecycle_state() {
     let project = h.project_path();
     h.run_cli_ok(&["add", project.to_str().unwrap(), "-t", "State Probe"]);
     let show = |h: &TuiTestHarness| json_out(h, &["session", "show", "State Probe", "--json"]);
+    // #4467: local writes return before Daemon adoption.
     let adopted = |args: &[&str], ready: fn(&Value) -> bool| {
         wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
             let value = json_out(&h, args);

@@ -668,7 +668,7 @@ fn runtime_entry_present(dir: RawFd) -> bool {
 /// Unknown schemas cannot establish publication absence.
 fn validate_prebind(marker: &PrebindMarker, namespace: &str) -> Result<(), ReadFailure> {
     if marker.schema != SCHEMA {
-        return Err(ReadFailure::pre("marker_invalid"));
+        return Err(unsupported_marker_schema(marker.schema));
     }
     if !valid_uuid(&marker.prebind_instance_id) || !valid_namespace(&marker.namespace) {
         return Err(ReadFailure::pre("marker_invalid"));
@@ -683,7 +683,7 @@ fn validate_prebind(marker: &PrebindMarker, namespace: &str) -> Result<(), ReadF
 
 fn validate_postbind(marker: &PostbindMarker, namespace: &str) -> Result<(), ReadFailure> {
     if marker.schema != SCHEMA {
-        return Err(ReadFailure::pre("marker_invalid"));
+        return Err(unsupported_marker_schema(marker.schema));
     }
     if !valid_uuid(&marker.prebind_instance_id)
         || !valid_uuid(&marker.runtime_instance_id)
@@ -700,6 +700,16 @@ fn validate_postbind(marker: &PostbindMarker, namespace: &str) -> Result<(), Rea
         return Err(ReadFailure::pre("marker_identity"));
     }
     Ok(())
+}
+
+fn unsupported_marker_schema(schema: u8) -> ReadFailure {
+    ReadFailure::pre_exact(
+        "marker_invalid",
+        format!(
+            "daemon read: marker_invalid\nThis client does not support runtime publication marker \
+             schema {schema} (expected {SCHEMA}). Check CLI/Daemon version compatibility before retrying.\n"
+        ),
+    )
 }
 
 fn read_marker<T: for<'de> Deserialize<'de>>(dir: RawFd, name: &str) -> Result<T, ReadFailure> {
