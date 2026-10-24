@@ -124,5 +124,5 @@ describe("isolateEnv", () => {
     execFileSync(process.execPath, [fileURLToPath(new URL("../../scripts/check-env-isolation.mjs", import.meta.url))], {
       timeout: 30_000,
     });
-  });
+  }, 30_000);
 });

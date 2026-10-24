@@ -19,9 +19,9 @@ without `--features web` needs no JavaScript tooling. Use `npm run format` to fi
 Prettier is not used.
 
 The lint command checks Rust environment reads against the live fixture's
-isolation contract using `scripts/check-env-isolation.mjs`. The named source
-inventory test in `isolatedEnv.test.ts` invokes that same guard; the remaining
-Vitest cases exercise actual hostile-value isolation.
+isolation contract using `scripts/check-env-isolation.mjs`. The source-inventory
+test in `isolatedEnv.test.ts` invokes the same guard with a 30-second budget;
+the remaining Vitest cases exercise actual hostile-value isolation.
 
 ## Tests
 
