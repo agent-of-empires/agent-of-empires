@@ -5,7 +5,7 @@ use clap::Args;
 
 use crate::acp::client::http::PromptDispositionWire;
 use crate::acp::client::{require_daemon, HttpClient, HttpError};
-use crate::session::View;
+use crate::session::{StartBlocked, View};
 
 #[derive(Args)]
 pub struct SendArgs {
@@ -55,19 +55,17 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
     Ok(())
 }
 
-/// Daemon refusals carry the wording the local path used to print.
+/// The client carries only a validated refusal code, so the wording lives here.
 fn refusal(error: HttpError, identifier: &str) -> anyhow::Error {
-    let HttpError::Server { status, body } = &error else {
+    let HttpError::Server { body, .. } = &error else {
         return error.into();
     };
-    let json: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
-    if json["error"] == "session_not_running" {
-        return anyhow::anyhow!(
+    match body.as_str() {
+        "session_not_running" => anyhow::anyhow!(
             "Session is not running. Start it first with: aoe session start {identifier}"
-        );
-    }
-    match json["message"].as_str() {
-        Some(message) if status.as_u16() == 409 => anyhow::anyhow!("{message}"),
+        ),
+        "session_archived" => anyhow::anyhow!(StartBlocked::Archived),
+        "session_trashed" => anyhow::anyhow!(StartBlocked::Trashed),
         _ => error.into(),
     }
 }
@@ -75,36 +73,51 @@ fn refusal(error: HttpError, identifier: &str) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reqwest::StatusCode;
+    use crate::acp::client::DaemonEndpoint;
+    use crate::daemon::ApiErrorCode;
+    use crate::server::api::{api_error_with_code_header, start_blocked_response};
+    use axum::{extract::Path, routing::post, Router};
 
-    fn conflict(body: &str) -> HttpError {
-        HttpError::Server {
-            status: StatusCode::CONFLICT,
-            body: body.to_string(),
-        }
-    }
+    /// Drives the real client against the refusals the daemon actually emits.
+    #[tokio::test]
+    async fn refusals_survive_the_real_client() {
+        let app = Router::new().route(
+            "/api/sessions/{id}/send",
+            post(|Path(id): Path<String>| async move {
+                match id.as_str() {
+                    "archived" => start_blocked_response(StartBlocked::Archived),
+                    "trashed" => start_blocked_response(StartBlocked::Trashed),
+                    "dead" => api_error_with_code_header(
+                        ApiErrorCode::SessionNotRunning,
+                        "Terminal session is not running",
+                    ),
+                    _ => api_error_with_code_header(ApiErrorCode::StartFailed, "boom"),
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = HttpClient::new(DaemonEndpoint::new(
+            format!("http://{address}"),
+            Some("secret".to_string()),
+            crate::acp::client::discovery::Source::Env,
+        ))
+        .unwrap();
 
-    #[test]
-    fn refusal_keeps_the_local_path_wording() {
-        let cases = [
+        for (id, expected) in [
             (
-                conflict(r#"{"error":"session_not_running"}"#),
-                "Session is not running. Start it first with: aoe session start s1",
+                "dead",
+                "Session is not running. Start it first with: aoe session start dead",
             ),
-            (
-                conflict(
-                    r#"{"error":"session_archived","message":"session is archived; unarchive it first"}"#,
-                ),
-                "session is archived; unarchive it first",
-            ),
-        ];
-        for (error, expected) in cases {
-            assert_eq!(refusal(error, "s1").to_string(), expected);
+            ("archived", "session is archived; unarchive it first"),
+            ("trashed", "session is in trash; restore it first"),
+        ] {
+            let error = client.send_message(id, "hi", true).await.unwrap_err();
+            assert_eq!(refusal(error, id).to_string(), expected);
         }
-        let other = HttpError::Server {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            body: r#"{"error":"tmux_error"}"#.to_string(),
-        };
-        assert!(refusal(other, "s1").to_string().contains("tmux_error"));
+        let error = client.send_message("other", "hi", true).await.unwrap_err();
+        assert!(refusal(error, "other").to_string().contains("start_failed"));
+        server.abort();
     }
 }

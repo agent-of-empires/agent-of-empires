@@ -161,11 +161,12 @@ pub(super) fn bare_not_found() -> axum::response::Response {
 pub(crate) fn start_blocked_response(
     blocked: crate::session::StartBlocked,
 ) -> axum::response::Response {
-    api_error(
-        axum::http::StatusCode::CONFLICT,
-        blocked.code(),
-        blocked.to_string(),
-    )
+    use crate::daemon::ApiErrorCode;
+    let code = match blocked {
+        crate::session::StartBlocked::Archived => ApiErrorCode::SessionArchived,
+        crate::session::StartBlocked::Trashed => ApiErrorCode::SessionTrashed,
+    };
+    api_error_with_code_header(code, blocked.to_string())
 }
 
 pub(crate) fn api_error(
