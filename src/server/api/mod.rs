@@ -394,6 +394,979 @@ pub(super) fn validate_profile_name(name: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    // Write handlers and their existing rejection/extractor boundaries.
+    const MUTATING_HANDLERS: &[(&str, &str, &[&str])] = &[
+        (
+            "sessions/create.rs",
+            include_str!("sessions/create.rs"),
+            &["cancel_creation", "create_session", "review_creation_trust"],
+        ),
+        (
+            "sessions/delete.rs",
+            include_str!("sessions/delete.rs"),
+            &["abandon_purge", "delete_session", "delete_workspace"],
+        ),
+        (
+            "sessions/rename.rs",
+            include_str!("sessions/rename.rs"),
+            &[
+                "attach_session_project",
+                "rename_session",
+                "set_worktree_name",
+            ],
+        ),
+        (
+            "sessions/send.rs",
+            include_str!("sessions/send.rs"),
+            &["paste_image", "send_message"],
+        ),
+        (
+            "sessions/ensure.rs",
+            include_str!("sessions/ensure.rs"),
+            &[
+                "ensure_container_terminal",
+                "ensure_session",
+                "ensure_terminal",
+                "ensure_tool",
+                "kill_terminal",
+                "stop_auxiliary",
+            ],
+        ),
+        (
+            "sessions/update.rs",
+            include_str!("sessions/update.rs"),
+            &[
+                "update_session_diff_base",
+                "update_session_group",
+                "update_session_notifications",
+            ],
+        ),
+        (
+            "sessions/lifecycle.rs",
+            include_str!("sessions/lifecycle.rs"),
+            &[
+                "force_smart_rename",
+                "restart_session",
+                "restore_session",
+                "start_session",
+                "stop_session",
+                "summarize_session",
+                "touch_session_access",
+                "trash_session",
+                "update_session_archive",
+                "update_session_color",
+                "update_session_favorite",
+                "update_session_pin",
+                "update_session_snooze",
+                "update_session_unread",
+            ],
+        ),
+        (
+            "sessions/list.rs",
+            include_str!("sessions/list.rs"),
+            &["update_workspace_ordering"],
+        ),
+        ("git.rs", include_str!("git.rs"), &["clone_repo"]),
+        (
+            "mcp.rs",
+            include_str!("mcp.rs"),
+            &[
+                "create_mcp_server",
+                "delete_mcp_server",
+                "drop_mcp_server",
+                "edit_mcp_server",
+                "keep_mcp_server",
+                "resolve_mcp_conflict",
+            ],
+        ),
+        (
+            "log_level.rs",
+            include_str!("log_level.rs"),
+            &["patch_log_level"],
+        ),
+        (
+            "projects.rs",
+            include_str!("projects.rs"),
+            &["create_project", "delete_project", "update_project"],
+        ),
+        (
+            "system.rs",
+            include_str!("system.rs"),
+            &[
+                "create_profile",
+                "default_profile",
+                "delete_profile",
+                "dismiss_update",
+                "mark_tip_seen",
+                "mark_volume_ignores_globs_acknowledged",
+                "mark_web_tour_seen",
+                "patch_web_ui_state",
+                "rename_profile",
+                "set_show_tips",
+                "update_profile_settings",
+                "update_settings",
+                "update_theme",
+            ],
+        ),
+        (
+            "acp/worker.rs",
+            include_str!("acp/worker.rs"),
+            &[
+                "shutdown_acp",
+                "spawn_acp",
+                "switch_acp_agent",
+                "switch_acp_provider",
+            ],
+        ),
+        (
+            "acp/prompt.rs",
+            include_str!("acp/prompt.rs"),
+            &[
+                "acp_cancel",
+                "acp_force_end_turn",
+                "acp_prompt",
+                "acp_prompt_diff_comments",
+                "resolve_approval",
+                "resolve_elicitation",
+            ],
+        ),
+        (
+            "acp/view.rs",
+            include_str!("acp/view.rs"),
+            &["acp_disable", "acp_enable"],
+        ),
+        (
+            "acp/config.rs",
+            include_str!("acp/config.rs"),
+            &["acp_set_config_option", "acp_set_mode"],
+        ),
+        (
+            "push.rs",
+            include_str!("../push.rs"),
+            &["push::subscribe", "push::test", "push::unsubscribe"],
+        ),
+        (
+            "telemetry.rs",
+            include_str!("telemetry.rs"),
+            &[
+                "post_telemetry_seen",
+                "post_telemetry_structured_interaction",
+                "set_telemetry_consent",
+            ],
+        ),
+        (
+            "plugins.rs",
+            include_str!("plugins.rs"),
+            &[
+                "apply_plugin_update",
+                "dismiss_plugin_update",
+                "invoke_plugin_action",
+                "invoke_plugin_command",
+                "preview_plugin_install",
+                "restart_plugin_worker",
+                "set_plugin_enabled",
+                "start_plugin_install",
+                "start_plugin_uninstall",
+            ],
+        ),
+        (
+            "skills.rs",
+            include_str!("skills.rs"),
+            &[
+                "adopt_skill",
+                "create_skill",
+                "delete_skill",
+                "edit_skill",
+                "sync_skills",
+            ],
+        ),
+        (
+            "groups.rs",
+            include_str!("groups.rs"),
+            &[
+                "collapse_group",
+                "create_group",
+                "delete_group",
+                "move_group",
+                "reorder",
+            ],
+        ),
+        (
+            "queue.rs",
+            include_str!("queue.rs"),
+            &["queue_clear", "queue_edit", "queue_enqueue", "queue_remove"],
+        ),
+        (
+            "acp/install.rs",
+            include_str!("acp/install.rs"),
+            &["install_agent"],
+        ),
+    ];
+
+    const MUTATION_AUDIT_HELPERS: &[(&str, &str, &[&str])] = &[
+        (
+            "sessions/lifecycle.rs",
+            include_str!("sessions/lifecycle.rs"),
+            &["prepare_agent_session", "prepare_agent_session_inner"],
+        ),
+        (
+            "acp/install.rs",
+            include_str!("acp/install.rs"),
+            &["install_gate"],
+        ),
+    ];
+
+    // Exact exceptions to the read-only handler audit. Authentication and
+    // transport-only requests retain their own policy instead of a write guard.
+    const MUTATION_AUDIT_EXEMPTIONS: &[(&str, &str, &str, &str)] = &[
+        (
+            "POST",
+            "/api/presence",
+            "api::post_dashboard_presence",
+            "Ephemeral browser foreground heartbeat.",
+        ),
+        (
+            "POST",
+            "/api/plugins/{id}/pages/{page_id}/ticket",
+            "api::mint_plugin_page_ticket",
+            "Scoped authentication ticket for displaying a plugin page.",
+        ),
+        (
+            "POST",
+            "/api/client-log",
+            "api::post_client_log",
+            "Bounded browser diagnostic relay.",
+        ),
+        (
+            "POST",
+            "/api/plugins/{id}/settings/options/resolve",
+            "api::resolve_options",
+            "UI option discovery may run capability probes and populate the shared catalog.",
+        ),
+        (
+            "POST",
+            "/api/login",
+            "login::login_handler",
+            "Authentication remains available in read-only mode.",
+        ),
+        (
+            "POST",
+            "/api/login/elevate",
+            "login::elevate_handler",
+            "Authentication elevation retains its existing policy.",
+        ),
+        (
+            "POST",
+            "/api/logout",
+            "login::logout_handler",
+            "Signing out remains available in read-only mode.",
+        ),
+        (
+            "POST",
+            "/api/login/logout-all",
+            "login::logout_all_handler",
+            "Device sign-out retains its elevation policy.",
+        ),
+        (
+            "DELETE",
+            "/api/login/sessions/{id}",
+            "login::revoke_session_handler",
+            "Device revocation retains its elevation policy.",
+        ),
+        (
+            "POST",
+            "/api/login/passkey/start",
+            "passkeys::login_start_handler",
+            "Passkey authentication remains available in read-only mode.",
+        ),
+        (
+            "POST",
+            "/api/login/passkey/finish",
+            "passkeys::login_finish_handler",
+            "Passkey authentication remains available in read-only mode.",
+        ),
+        (
+            "POST",
+            "/api/passkeys/register/start",
+            "passkeys::register_start_handler",
+            "Passkey registration retains its elevation policy.",
+        ),
+        (
+            "POST",
+            "/api/passkeys/register/finish",
+            "passkeys::register_finish_handler",
+            "Passkey registration retains its elevation policy.",
+        ),
+        (
+            "DELETE",
+            "/api/passkeys/{id}",
+            "passkeys::delete_handler",
+            "Passkey removal retains its elevation policy.",
+        ),
+        (
+            "POST",
+            "/mcp",
+            "super::mcp::service(state.clone())",
+            "Read-only tools pinned by server::mcp::tests::tools_list_advertises_both_tools; revisit this exemption when adding a tool.",
+        ),
+        (
+            "PUT",
+            "/mcp",
+            "super::mcp::service(state.clone())",
+            "Read-only tools pinned by server::mcp::tests::tools_list_advertises_both_tools; revisit this exemption when adding a tool.",
+        ),
+        (
+            "PATCH",
+            "/mcp",
+            "super::mcp::service(state.clone())",
+            "Read-only tools pinned by server::mcp::tests::tools_list_advertises_both_tools; revisit this exemption when adding a tool.",
+        ),
+        (
+            "DELETE",
+            "/mcp",
+            "super::mcp::service(state.clone())",
+            "Read-only tools pinned by server::mcp::tests::tools_list_advertises_both_tools; revisit this exemption when adding a tool.",
+        ),
+    ];
+
+    fn audited_handler(identity: &str, audited: &[&str]) -> bool {
+        audited.iter().any(|name| {
+            if name.contains("::") {
+                identity == *name
+            } else {
+                identity.strip_prefix("api::") == Some(*name)
+            }
+        })
+    }
+
+    fn unrouted_mutating_handlers<'a>(
+        routes: &[crate::server::access::MutatingRoute<'_>],
+        audited: &[&'a str],
+    ) -> Vec<&'a str> {
+        audited
+            .iter()
+            .copied()
+            .filter(|name| {
+                !routes
+                    .iter()
+                    .any(|route| audited_handler(route.handler, &[*name]))
+            })
+            .collect()
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum MutationAuditFailureKind {
+        UnknownHandler,
+        AuditedAndExempt,
+        MissingReason,
+        StaleExemption,
+        DuplicateExemption,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct MutationAuditFailure<'a> {
+        kind: MutationAuditFailureKind,
+        identity: (&'a str, &'a str, &'a str),
+    }
+
+    fn mutation_audit_failures<'a>(
+        routes: &[crate::server::access::MutatingRoute<'a>],
+        audited: &[&str],
+        exemptions: &[(&'a str, &'a str, &'a str, &str)],
+    ) -> Vec<MutationAuditFailure<'a>> {
+        let mut failures = Vec::new();
+        for route in routes {
+            let exempt = exemptions.iter().any(|(method, path, handler, _)| {
+                (route.method, route.path, route.handler) == (*method, *path, *handler)
+            });
+            let kind = match (audited_handler(route.handler, audited), exempt) {
+                (false, false) => Some(MutationAuditFailureKind::UnknownHandler),
+                (true, true) => Some(MutationAuditFailureKind::AuditedAndExempt),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                failures.push(MutationAuditFailure {
+                    kind,
+                    identity: (route.method, route.path, route.handler),
+                });
+            }
+        }
+        for (index, (method, path, handler, reason)) in exemptions.iter().enumerate() {
+            let identity = (*method, *path, *handler);
+            if reason.trim().is_empty() {
+                failures.push(MutationAuditFailure {
+                    kind: MutationAuditFailureKind::MissingReason,
+                    identity,
+                });
+            }
+            if !routes.iter().any(|route| {
+                (route.method, route.path, route.handler) == (*method, *path, *handler)
+            }) {
+                failures.push(MutationAuditFailure {
+                    kind: MutationAuditFailureKind::StaleExemption,
+                    identity,
+                });
+            }
+            if exemptions[..index]
+                .iter()
+                .any(|(m, p, h, _)| (*m, *p, *h) == (*method, *path, *handler))
+            {
+                failures.push(MutationAuditFailure {
+                    kind: MutationAuditFailureKind::DuplicateExemption,
+                    identity,
+                });
+            }
+        }
+        failures
+    }
+
+    #[test]
+    fn mutation_audit_rejects_unknown_handlers_without_prefix_exceptions() {
+        use crate::server::access::MutatingRoute;
+
+        for handler in [
+            "api::new_handler",
+            "other::new_handler",
+            "login::new_handler",
+            "push::new_handler",
+        ] {
+            let routes = [MutatingRoute {
+                method: "POST",
+                path: "/unrelated/new-route",
+                handler,
+                read_only_layer: true,
+            }];
+            assert_eq!(
+                mutation_audit_failures(&routes, &[], &[]),
+                vec![MutationAuditFailure {
+                    kind: MutationAuditFailureKind::UnknownHandler,
+                    identity: ("POST", "/unrelated/new-route", handler),
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn mutation_audit_exemptions_require_exact_identity_and_reason() {
+        use crate::server::access::MutatingRoute;
+        use MutationAuditFailureKind::*;
+
+        let routes = [MutatingRoute {
+            method: "POST",
+            path: "/discovery",
+            handler: "api::discover",
+            read_only_layer: false,
+        }];
+        let exemption = ("POST", "/discovery", "api::discover", "Discovery policy.");
+        assert!(mutation_audit_failures(&routes, &[], &[exemption]).is_empty());
+        for changed in [
+            ("PUT", exemption.1, exemption.2, exemption.3),
+            (exemption.0, "/other", exemption.2, exemption.3),
+            (exemption.0, exemption.1, "other::discover", exemption.3),
+        ] {
+            assert_eq!(
+                mutation_audit_failures(&routes, &[], &[changed]),
+                vec![
+                    MutationAuditFailure {
+                        kind: UnknownHandler,
+                        identity: (exemption.0, exemption.1, exemption.2),
+                    },
+                    MutationAuditFailure {
+                        kind: StaleExemption,
+                        identity: (changed.0, changed.1, changed.2),
+                    },
+                ]
+            );
+        }
+        for (routes, audited, exemptions, kind) in [
+            (&[][..], &[][..], vec![exemption], StaleExemption),
+            (
+                &routes[..],
+                &[][..],
+                vec![exemption, exemption],
+                DuplicateExemption,
+            ),
+            (
+                &routes[..],
+                &["discover"][..],
+                vec![exemption],
+                AuditedAndExempt,
+            ),
+            (
+                &routes[..],
+                &[][..],
+                vec![(exemption.0, exemption.1, exemption.2, " ")],
+                MissingReason,
+            ),
+        ] {
+            assert_eq!(
+                mutation_audit_failures(routes, audited, &exemptions),
+                vec![MutationAuditFailure {
+                    kind,
+                    identity: (exemption.0, exemption.1, exemption.2),
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn mutation_audit_matches_qualified_handlers_without_conflating_modules() {
+        use crate::server::access::MutatingRoute;
+
+        let routes = [MutatingRoute {
+            method: "POST",
+            path: "/push",
+            handler: "push::subscribe",
+            read_only_layer: false,
+        }];
+        assert!(mutation_audit_failures(&routes, &["push::subscribe"], &[]).is_empty());
+        for audited in ["subscribe", "api::subscribe"] {
+            assert_eq!(
+                mutation_audit_failures(&routes, &[audited], &[]),
+                vec![MutationAuditFailure {
+                    kind: MutationAuditFailureKind::UnknownHandler,
+                    identity: ("POST", "/push", "push::subscribe"),
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn mutation_audit_rejects_unrouted_handlers_without_conflating_modules() {
+        use crate::server::access::MutatingRoute;
+
+        let routes = [
+            MutatingRoute {
+                method: "POST",
+                path: "/kept",
+                handler: "api::kept",
+                read_only_layer: false,
+            },
+            MutatingRoute {
+                method: "POST",
+                path: "/push",
+                handler: "push::subscribe",
+                read_only_layer: false,
+            },
+        ];
+        assert_eq!(
+            unrouted_mutating_handlers(
+                &routes,
+                &["kept", "removed", "push::subscribe", "subscribe"]
+            ),
+            vec!["removed", "subscribe"]
+        );
+    }
+
+    fn handler_source<'a>(source: &'a str, name: &str) -> Option<(&'a str, &'a str)> {
+        use syn::spanned::Spanned;
+
+        let file = syn::parse_file(source)
+            .unwrap_or_else(|error| panic!("invalid Rust source while auditing `{name}`: {error}"));
+        file.items.into_iter().find_map(|item| {
+            let syn::Item::Fn(function) = item else {
+                return None;
+            };
+            if function.sig.ident != name {
+                return None;
+            }
+            let signature = function.sig.span().byte_range();
+            let opening = function.block.brace_token.span.open().byte_range();
+            let closing = function.block.brace_token.span.close().byte_range();
+            Some((
+                source.get(signature)?,
+                source.get(opening.start..closing.end)?,
+            ))
+        })
+    }
+
+    fn eager_json_type(ty: &syn::Type) -> bool {
+        let syn::Type::Path(path) = ty else {
+            return false;
+        };
+        let Some(segment) = path.path.segments.last() else {
+            return false;
+        };
+        if segment.ident == "Json" {
+            return true;
+        }
+        if segment.ident != "Option" {
+            return false;
+        }
+        let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+            return false;
+        };
+        arguments.args.iter().any(
+            |argument| matches!(argument, syn::GenericArgument::Type(ty) if eager_json_type(ty)),
+        )
+    }
+
+    fn eager_json_consumer(signature: &str) -> Option<usize> {
+        use syn::spanned::Spanned;
+
+        syn::parse_str::<syn::Signature>(signature)
+            .expect("audited function signature")
+            .inputs
+            .iter()
+            .find_map(|argument| match argument {
+                syn::FnArg::Typed(argument) if eager_json_type(&argument.ty) => {
+                    Some(argument.ty.span().byte_range().start)
+                }
+                _ => None,
+            })
+    }
+
+    fn deferred_json_is_guarded(signature: &str, body: &str, delegate: Option<&str>) -> bool {
+        use syn::{spanned::Spanned, visit::Visit};
+
+        struct FirstUse<'a> {
+            binding: &'a syn::Ident,
+            position: Option<usize>,
+        }
+        impl FirstUse<'_> {
+            fn tokens(&mut self, tokens: proc_macro2::TokenStream) {
+                for token in tokens {
+                    match token {
+                        proc_macro2::TokenTree::Ident(ident) if ident == *self.binding => {
+                            self.record(ident.span().byte_range().start);
+                        }
+                        proc_macro2::TokenTree::Group(group) => self.tokens(group.stream()),
+                        _ => {}
+                    }
+                }
+            }
+
+            fn record(&mut self, position: usize) {
+                self.position = Some(self.position.map_or(position, |old| old.min(position)));
+            }
+        }
+        impl<'ast> Visit<'ast> for FirstUse<'_> {
+            fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+                if path.path.get_ident() == Some(self.binding) {
+                    self.record(path.span().byte_range().start);
+                }
+                syn::visit::visit_expr_path(self, path);
+            }
+
+            fn visit_macro(&mut self, expression: &'ast syn::Macro) {
+                self.tokens(expression.tokens.clone());
+            }
+        }
+
+        fn exits(block: &syn::Block) -> bool {
+            matches!(
+                block.stmts.last(),
+                Some(syn::Stmt::Expr(syn::Expr::Return(_), _))
+            )
+        }
+
+        fn app_state_type(ty: &syn::Type) -> bool {
+            match ty {
+                syn::Type::Reference(reference) => app_state_type(&reference.elem),
+                syn::Type::Path(path) => path.path.segments.iter().any(|segment| {
+                    segment.ident == "AppState"
+                        || matches!(&segment.arguments, syn::PathArguments::AngleBracketed(arguments)
+                            if arguments.args.iter().any(|argument|
+                                matches!(argument, syn::GenericArgument::Type(ty) if app_state_type(ty))))
+                }),
+                _ => false,
+            }
+        }
+
+        fn read_only_condition(condition: &syn::Expr, state: Option<&syn::Ident>) -> bool {
+            match condition {
+                syn::Expr::Field(field) => {
+                    matches!(&field.member, syn::Member::Named(member) if member == "read_only")
+                        && matches!(&*field.base, syn::Expr::Path(path)
+                            if state.is_some() && path.path.get_ident() == state)
+                }
+                syn::Expr::Let(binding)
+                    if matches!(&*binding.pat, syn::Pat::TupleStruct(pattern)
+                        if pattern.path.is_ident("Some") && pattern.elems.len() == 1) =>
+                {
+                    matches!(&*binding.expr, syn::Expr::Call(call)
+                        if matches!(&*call.func, syn::Expr::Path(path)
+                            if path.path.segments.last().is_some_and(|name| name.ident == "read_only_block"))
+                        && call.args.len() == 1
+                        && matches!(&call.args[0], syn::Expr::Reference(reference)
+                            if matches!(&*reference.expr, syn::Expr::Path(path)
+                                if state.is_some() && path.path.get_ident() == state)))
+                }
+                _ => false,
+            }
+        }
+
+        let signature = syn::parse_str::<syn::Signature>(signature).expect("audited signature");
+        let state = signature.inputs.iter().find_map(|argument| {
+            let syn::FnArg::Typed(argument) = argument else {
+                return None;
+            };
+            if !app_state_type(&argument.ty) {
+                return None;
+            }
+            match &*argument.pat {
+                syn::Pat::Ident(binding) => Some(&binding.ident),
+                syn::Pat::TupleStruct(pattern) if pattern.elems.len() == 1 => {
+                    match pattern.elems.first()? {
+                        syn::Pat::Ident(binding) => Some(&binding.ident),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        });
+        let body = syn::parse_str::<syn::Block>(body).expect("audited body");
+        signature.inputs.iter().all(|argument| {
+            let syn::FnArg::Typed(argument) = argument else {
+                return true;
+            };
+            let syn::Type::Path(path) = &*argument.ty else {
+                return true;
+            };
+            let Some(segment) = path.path.segments.last() else {
+                return true;
+            };
+            let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+                return true;
+            };
+            if segment.ident != "Result"
+                || !matches!(arguments.args.first(), Some(syn::GenericArgument::Type(ty)) if eager_json_type(ty))
+            {
+                return true;
+            }
+            let syn::Pat::Ident(binding) = &*argument.pat else {
+                return false;
+            };
+            let mut first = FirstUse {
+                binding: &binding.ident,
+                position: None,
+            };
+            first.visit_block(&body);
+            let Some(first) = first.position else {
+                return true;
+            };
+            if body.stmts.iter().any(|statement| {
+                matches!(statement, syn::Stmt::Expr(syn::Expr::If(guard), _)
+                    if read_only_condition(&guard.cond, state) && exits(&guard.then_branch)
+                    && guard.span().byte_range().end <= first)
+            }) {
+                return true;
+            }
+            let [syn::Stmt::Expr(syn::Expr::Await(tail), None)] = body.stmts.as_slice() else {
+                return false;
+            };
+            let syn::Expr::Call(call) = &*tail.base else {
+                return false;
+            };
+            delegate.is_some_and(|target| {
+                matches!(&*call.func, syn::Expr::Path(path)
+                    if path.path.segments.last().is_some_and(|name| name.ident == target))
+                    && call.args.iter().any(|argument| {
+                        matches!(argument, syn::Expr::Path(path)
+                            if path.path.get_ident() == Some(&binding.ident)
+                            && path.span().byte_range().start == first)
+                    })
+            })
+        })
+    }
+
+    #[test]
+    fn handler_source_stays_inside_the_selected_top_level_function() {
+        let source = r###"
+            pub async fn selected(body: Option<Json<Body>>) {
+                let text = "}";
+                let raw = r#"{ fn fake() {} }"#;
+                let character = '}';
+                /* outer { /* nested } */ } */
+                if true { consume(text, raw, character); }
+            }
+            pub(crate) fn neighbor() { if state.read_only {} }
+            #[cfg(test)]
+            mod tests {
+                fn selected() { if state.read_only {} }
+                fn only_in_tests() {}
+            }
+        "###;
+        let (signature, body) = handler_source(source, "selected").unwrap();
+        assert!(signature.contains("Option<Json<Body>>"));
+        assert!(body.contains("consume(text, raw, character)"));
+        assert!(!body.contains("state.read_only"));
+        assert!(!body.contains("neighbor"));
+        assert!(handler_source(source, "only_in_tests").is_none());
+        let (_, install) = handler_source(include_str!("acp/install.rs"), "install_agent").unwrap();
+        assert!(!install.contains("state.read_only"));
+        assert!(install.contains("install_gate(&state)"));
+    }
+
+    #[test]
+    fn eager_json_detection_distinguishes_deferred_rejection() {
+        for (signature, expected) in [
+            ("fn write(body: Json<Body>)", true),
+            ("fn write(body: Option<Json<Body>>)", true),
+            ("fn write(body: Option<axum::Json<Body>>)", true),
+            ("fn write(body: Result<Json<Body>, JsonRejection>)", false),
+            (
+                "fn write(body: Result<Option<Json<Body>>, JsonRejection>)",
+                false,
+            ),
+            ("fn write(body: Bytes)", false),
+        ] {
+            assert_eq!(
+                eager_json_consumer(signature).is_some(),
+                expected,
+                "{signature}"
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_json_requires_a_completed_guard_before_first_use() {
+        for parameter in ["body", "payload"] {
+            for ty in ["Json<Body>", "Option<axum::Json<Body>>"] {
+                let signature = format!(
+                    "fn write(State(app): State<Arc<AppState>>, {parameter}: std::result::Result<{ty}, JsonRejection>)"
+                );
+                for consumer in [
+                    format!("let value = match {parameter} {{ Ok(value) => value, Err(error) => return error }};"),
+                    format!("let Ok(value) = {parameter} else {{ return bad_body() }};"),
+                    format!("let value = {parameter}.map_err(rejection)?;"),
+                    format!("consume!({parameter});"),
+                ] {
+                    for guard in [
+                        "if app.read_only { return forbidden() }",
+                        "if let Some(response) = read_only_block(&app) { return response }",
+                    ] {
+                        assert!(deferred_json_is_guarded(
+                            &signature, &format!("{{ {guard} {consumer} }}"), None
+                        ));
+                        assert!(!deferred_json_is_guarded(
+                            &signature, &format!("{{ {consumer} {guard} }}"), None
+                        ));
+                    }
+                    for not_a_guard in [
+                        r#"let text = "if app.read_only { return forbidden() }";"#,
+                        "/* if app.read_only { return forbidden() } */",
+                        "if app.read_only { record() }",
+                        "if app.read_only && condition { return forbidden() }",
+                        "if condition { if app.read_only { return forbidden() } }",
+                    ] {
+                        assert!(!deferred_json_is_guarded(
+                            &signature, &format!("{{ {not_a_guard} {consumer} }}"), None
+                        ));
+                    }
+                }
+                assert!(deferred_json_is_guarded(
+                    &signature,
+                    &format!("{{ prepare(app, id, {parameter}).await }}"),
+                    Some("prepare")
+                ));
+                for body in [
+                    format!("{{ prepare(app, id, {parameter}.map(transform)).await }}"),
+                    format!("{{ inspect(&{parameter}); prepare(app, id, {parameter}).await }}"),
+                    format!("{{ unknown(app, id, {parameter}).await }}"),
+                ] {
+                    assert!(!deferred_json_is_guarded(
+                        &signature,
+                        &body,
+                        Some("prepare")
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mutating_handlers_guard_read_only_before_body_extraction() {
+        let routes = crate::server::access::router_mutating_handlers();
+        let audited: Vec<_> = MUTATING_HANDLERS
+            .iter()
+            .flat_map(|(_, _, names)| names.iter().copied())
+            .collect();
+        let classification_failures =
+            mutation_audit_failures(&routes, &audited, MUTATION_AUDIT_EXEMPTIONS);
+        let mut failures = Vec::new();
+        failures.extend(
+            unrouted_mutating_handlers(&routes, &audited)
+                .into_iter()
+                .map(|name| format!("audited handler `{name}` has no mutating route")),
+        );
+        for (file, source, handlers) in MUTATING_HANDLERS.iter().chain(MUTATION_AUDIT_HELPERS) {
+            for name in *handlers {
+                let source_name = name.rsplit("::").next().expect("handler name");
+                let Some((signature, body)) = handler_source(source, source_name) else {
+                    failures.push(format!("{file}: handler `{name}` not found"));
+                    continue;
+                };
+                let delegate = match *name {
+                    "ensure_session" | "start_session" => Some("prepare_agent_session"),
+                    "prepare_agent_session" => Some("prepare_agent_session_inner"),
+                    _ => None,
+                };
+                let deferred_guarded = deferred_json_is_guarded(signature, body, delegate);
+                let body = body
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with("//"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let mut handler_routes = routes
+                    .iter()
+                    .filter(|route| audited_handler(route.handler, &[*name]))
+                    .peekable();
+                let route_layer = handler_routes.peek().is_some()
+                    && handler_routes.all(|route| route.read_only_layer);
+                let parts_guard = signature.find("ElevatedMutationGuard");
+                let consumer = eager_json_consumer(signature);
+                let local_guard = ["state.read_only", "self.read_only", "read_only_block("]
+                    .iter()
+                    .any(|marker| body.contains(marker));
+                let delegated = match *name {
+                    "ensure_session" | "start_session" => body.contains("prepare_agent_session("),
+                    "prepare_agent_session" => body.contains("prepare_agent_session_inner("),
+                    "install_agent" => body.contains("install_gate(&state)"),
+                    _ => false,
+                };
+                if !route_layer && parts_guard.is_none() && !local_guard && !delegated {
+                    failures.push(format!("{file}: `{name}` lacks a read-only guard"));
+                }
+                if consumer.is_some()
+                    && !route_layer
+                    && !parts_guard
+                        .zip(consumer)
+                        .is_some_and(|(guard, body)| guard < body)
+                {
+                    failures.push(format!(
+                        "{file}: `{name}` rejects JSON before its read-only guard"
+                    ));
+                }
+                if !route_layer && parts_guard.is_none() && !deferred_guarded {
+                    failures.push(format!(
+                        "{file}: `{name}` can reject deferred JSON before its read-only guard"
+                    ));
+                }
+            }
+        }
+        assert!(
+            classification_failures.is_empty() && failures.is_empty(),
+            "{classification_failures:#?}\n{}",
+            failures.join("\n")
+        );
+        let (_, preparation) = handler_source(
+            include_str!("sessions/lifecycle.rs"),
+            "prepare_agent_session_inner",
+        )
+        .expect("shared preparation guard");
+        assert!(preparation.contains("state.read_only"));
+        let (_, body) = handler_source(include_str!("plugins.rs"), "invoke_plugin_action")
+            .expect("invoke_plugin_action");
+        // Keep the no-elevation policy documented on `invoke_plugin_action`.
+        for marker in ["mutation_gate", "is_elevated", "elevation_required"] {
+            assert!(
+                !body.contains(marker),
+                "invoke_plugin_action: found `{marker}`"
+            );
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn native_mutations_reject_read_only_before_body_extraction() {
@@ -419,12 +1392,22 @@ mod tests {
             (Method::POST, "/api/sessions/missing/restart"),
             (Method::POST, "/api/sessions/missing/tools/ensure"),
             (Method::POST, "/api/sessions/missing/auxiliary/stop"),
+            (Method::POST, "/api/sessions/missing/acp/switch-agent"),
+            (Method::DELETE, "/api/sessions/missing"),
+            (Method::POST, "/api/sessions/missing/trash"),
+            (Method::POST, "/api/plugins/commands/missing/invoke"),
             (Method::POST, "/api/groups"),
             (Method::PATCH, "/api/groups"),
             (Method::DELETE, "/api/groups"),
             (Method::PATCH, "/api/groups/collapse"),
             (Method::POST, "/api/reorder"),
             (Method::DELETE, "/api/workspaces"),
+            (Method::POST, "/api/plugins/missing/enabled"),
+            (Method::POST, "/api/plugins/install/preview"),
+            (Method::POST, "/api/plugins/install"),
+            (Method::POST, "/api/plugins/missing/update/apply"),
+            (Method::POST, "/api/plugins/missing/update/dismiss"),
+            (Method::PATCH, "/api/theme"),
         ] {
             let mut request = Request::builder()
                 .method(method.clone())

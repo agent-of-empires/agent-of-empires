@@ -85,7 +85,9 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/sessions/{id}",
-            patch(api::rename_session).delete(api::delete_session),
+            patch(api::rename_session)
+                .delete(api::delete_session)
+                .layer(read_only.clone()),
         )
         .route("/api/sessions/{id}/group", patch(api::update_session_group))
         .route(
@@ -147,7 +149,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/snooze",
             patch(api::update_session_snooze),
         )
-        .route("/api/sessions/{id}/trash", post(api::trash_session))
+        .route(
+            "/api/sessions/{id}/trash",
+            post(api::trash_session).layer(read_only.clone()),
+        )
         .route("/api/sessions/{id}/restore", post(api::restore_session))
         .route(
             "/api/sessions/{id}/purge/abandon",
@@ -254,16 +259,19 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/plugins/commands", get(api::plugin_commands))
         .route(
             "/api/plugins/commands/{fqid}/invoke",
-            post(api::invoke_plugin_command),
+            post(api::invoke_plugin_command).layer(read_only.clone()),
         )
         .route("/api/plugins/ui-state", get(api::plugin_ui_state))
         .route("/api/plugins/updates", get(api::plugin_updates))
         .route("/api/plugins/discover", get(api::plugin_discover))
         .route("/api/plugins/details", get(api::plugin_details))
-        .route("/api/plugins/{id}/enabled", post(api::set_plugin_enabled))
+        .route(
+            "/api/plugins/{id}/enabled",
+            post(api::set_plugin_enabled).layer(read_only.clone()),
+        )
         .route(
             "/api/plugins/{id}/worker/restart",
-            post(api::restart_plugin_worker),
+            post(api::restart_plugin_worker).layer(read_only.clone()),
         )
         .route("/api/plugins/{id}/action", post(api::invoke_plugin_action))
         .route("/api/plugins/{id}/sessions", get(api::plugin_sessions))
@@ -273,12 +281,15 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/plugins/install/preview",
-            post(api::preview_plugin_install),
+            post(api::preview_plugin_install).layer(read_only.clone()),
         )
-        .route("/api/plugins/install", post(api::start_plugin_install))
+        .route(
+            "/api/plugins/install",
+            post(api::start_plugin_install).layer(read_only.clone()),
+        )
         .route(
             "/api/plugins/{id}/uninstall",
-            post(api::start_plugin_uninstall),
+            post(api::start_plugin_uninstall).layer(read_only.clone()),
         )
         .route("/api/plugins/jobs/{job_id}", get(api::plugin_job_status))
         .route(
@@ -287,11 +298,11 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/plugins/{id}/update/apply",
-            post(api::apply_plugin_update),
+            post(api::apply_plugin_update).layer(read_only.clone()),
         )
         .route(
             "/api/plugins/{id}/update/dismiss",
-            post(api::dismiss_plugin_update),
+            post(api::dismiss_plugin_update).layer(read_only.clone()),
         )
         .route(
             "/api/app-state/web-tour-seen",
@@ -403,7 +414,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/acp", delete(api::shutdown_acp))
         .route(
             "/api/sessions/{id}/acp/switch-agent",
-            post(api::switch_acp_agent),
+            post(api::switch_acp_agent).layer(read_only.clone()),
         )
         .route(
             "/api/sessions/{id}/acp/switch-provider",
