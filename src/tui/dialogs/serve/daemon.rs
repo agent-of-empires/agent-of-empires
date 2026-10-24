@@ -1,6 +1,6 @@
 //! Daemon process control and the `$APP_DIR/serve.*` files the view reads and writes.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
@@ -189,7 +189,37 @@ pub(super) fn remember_last_mode(mode: ServeMode) {
     }
 }
 
-/// Reusing the last port keeps a bookmarked URL valid; a random high port avoids a user's own 8080.
+/// The port the next spawn reuses, if any; `None` means it picks a random one. Mirrors the reuse
+/// rule in `autostart::load_or_generate_port` without writing the file.
+pub(super) fn saved_port() -> Option<u16> {
+    saved_port_in(&crate::session::get_app_dir().ok()?)
+}
+
+fn saved_port_in(dir: &Path) -> Option<u16> {
+    std::fs::read_to_string(dir.join("serve.last_port"))
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u16>().ok())
+        .filter(|port| *port >= 49152)
+}
+
+/// Whether the next start mints a new access token, which the Devices' `aoe_token` cookies
+/// don't match. `load_or_generate_token` reuses `serve.token` only while it is under 24 hours
+/// old, and only remote serving refreshes it while running. The hour's margin covers a help
+/// overlay left open.
+pub(super) fn token_renews() -> bool {
+    crate::session::get_app_dir()
+        .ok()
+        .is_none_or(|dir| token_renews_in(&dir))
+}
+
+fn token_renews_in(dir: &Path) -> bool {
+    const REUSED_UNDER: std::time::Duration = std::time::Duration::from_secs(23 * 60 * 60);
+    std::fs::metadata(dir.join("serve.token"))
+        .and_then(|meta| meta.modified())
+        .ok()
+        .is_none_or(|modified| modified.elapsed().unwrap_or_default() >= REUSED_UNDER)
+}
+
 fn log_file_size_opt() -> Option<u64> {
     let path = crate::cli::serve::stdio_redirect_path().ok()?;
     std::fs::metadata(path).ok().map(|m| m.len())
@@ -328,5 +358,48 @@ mod tests {
         );
         set_cached_passphrase(None);
         assert_eq!(cached_passphrase(), None);
+    }
+
+    #[test]
+    fn token_renews_once_the_reuse_window_has_passed() {
+        let hours = |h: u64| std::time::Duration::from_secs(h * 60 * 60);
+        for (age, renews) in [
+            (None, true),
+            (Some(hours(1)), false),
+            (Some(hours(23)), true),
+            (Some(hours(25)), true),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            if let Some(age) = age {
+                let path = tmp.path().join("serve.token");
+                std::fs::write(&path, "t").unwrap();
+                std::fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_modified(std::time::SystemTime::now() - age)
+                    .unwrap();
+            }
+            assert_eq!(token_renews_in(tmp.path()), renews, "{age:?}");
+        }
+    }
+
+    #[test]
+    fn the_port_probe_only_reports_a_reusable_saved_port() {
+        for (saved, reused) in [
+            (None, None),
+            (Some("55555"), Some(55555)),
+            (Some("8080"), None),
+            (Some("not-a-number\n"), None),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("serve.last_port");
+            if let Some(saved) = saved {
+                std::fs::write(&path, saved).unwrap();
+            }
+            assert_eq!(saved_port_in(tmp.path()), reused, "{saved:?}");
+            // Read-only: a probe must not create the file the next spawn writes.
+            assert_eq!(path.exists(), saved.is_some(), "{saved:?}");
+        }
     }
 }

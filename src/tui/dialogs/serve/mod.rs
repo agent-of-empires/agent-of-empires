@@ -272,6 +272,182 @@ impl ServeMouse {
     }
 }
 
+/// What a restart does to the link a Device opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkChange {
+    Same,
+    /// The link changes, but the Device's cookies still let it in: another port (cookies are
+    /// host-only, not per port), or a new token behind a passphrase sign-in.
+    Moved,
+    /// The Device's cookies no longer let it in: another host, which they are not sent to, or
+    /// a new token that the `aoe_token` cookie of a token-only Device doesn't match.
+    Replaced,
+}
+
+/// What a restart does to passphrase sign-ins on an unchanged host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Logins {
+    /// No passphrase wall, or the sign-ins persist across the restart.
+    Kept,
+    /// The next start doesn't persist them, or the running daemon only held them in memory.
+    Lost,
+    /// A reattached daemon's login persistence is unknown.
+    Unknown,
+}
+
+/// What a restart does to Devices. Agents keep running either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RestartEffect {
+    link: LinkChange,
+    logins: Logins,
+    /// The next daemon puts Devices behind the passphrase login wall.
+    passphrase: bool,
+}
+
+/// What the next start will do, read when R, G or help states it: the restarted daemon reads
+/// all of it afresh.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RestartProbe {
+    /// The restart takes the server's Funnel path (Tunnel only).
+    on_funnel: bool,
+    /// `auth.persist_sessions` as the next start reads it.
+    persists: bool,
+    /// The port a Local restart reuses; `None` means a fresh random one.
+    port: Option<u16>,
+    /// The hosts a Local restart publishes: this machine's addresses plus `localhost`.
+    local_hosts: Vec<String>,
+    /// A Local restart inherits `AOE_SERVE_PASSPHRASE` from this process.
+    local_passphrase: bool,
+    /// A Local restart mints a new access token (`token_renews`).
+    local_token_renews: bool,
+}
+
+impl RestartProbe {
+    fn now(mode: ServeMode, transport: Option<TunnelTransport>) -> Self {
+        match mode {
+            ServeMode::Local => RestartProbe {
+                on_funnel: false,
+                persists: persist_sessions(),
+                port: saved_port(),
+                local_hosts: crate::server::discover_tagged_ips()
+                    .into_iter()
+                    .map(|(_, ip)| ip.to_string())
+                    .chain(["localhost".to_string()])
+                    .collect(),
+                local_passphrase: std::env::var("AOE_SERVE_PASSPHRASE")
+                    .is_ok_and(|pp| !pp.is_empty()),
+                local_token_renews: token_renews(),
+            },
+            ServeMode::Tunnel => RestartProbe {
+                on_funnel: restart_on_funnel(transport),
+                persists: persist_sessions(),
+                ..RestartProbe::default()
+            },
+        }
+    }
+}
+
+impl RestartEffect {
+    /// A Tunnel keeps its host only when it is on Funnel and the restart takes the Funnel path
+    /// again: `spawn_daemon` never re-creates a named Cloudflare tunnel, and without Funnel the
+    /// server opens a fresh quick tunnel. A Local daemon republishes this machine's addresses on
+    /// the reused or a random port, with a new token once the old one has aged out. Behind the
+    /// passphrase wall, sign-ins then survive only if the running daemon wrote them to disk and
+    /// the next start reads them back.
+    fn of(
+        mode: ServeMode,
+        urls: &[ServeUrl],
+        probe: &RestartProbe,
+        running_persists: Option<bool>,
+    ) -> Self {
+        let (link, passphrase) = match mode {
+            ServeMode::Local => {
+                let hosts_stay = urls.iter().all(|u| {
+                    link_host(&u.url)
+                        .is_some_and(|host| probe.local_hosts.iter().any(|h| h == host))
+                });
+                let port_stays = probe
+                    .port
+                    .is_some_and(|port| urls.iter().all(|u| link_port(&u.url) == Some(port)));
+                let renews = probe.local_token_renews;
+                let link = if !hosts_stay || (renews && !probe.local_passphrase) {
+                    LinkChange::Replaced
+                } else if !port_stays || renews {
+                    LinkChange::Moved
+                } else {
+                    LinkChange::Same
+                };
+                (link, probe.local_passphrase)
+            }
+            ServeMode::Tunnel => {
+                let stays = probe.on_funnel && urls.iter().any(|u| is_funnel_link(&u.url));
+                (
+                    if stays {
+                        LinkChange::Same
+                    } else {
+                        LinkChange::Replaced
+                    },
+                    true,
+                )
+            }
+        };
+        let logins = if !passphrase {
+            Logins::Kept
+        } else if !probe.persists {
+            Logins::Lost
+        } else {
+            match running_persists {
+                Some(true) => Logins::Kept,
+                Some(false) => Logins::Lost,
+                None => Logins::Unknown,
+            }
+        };
+        RestartEffect {
+            link,
+            logins,
+            passphrase,
+        }
+    }
+}
+
+fn persist_sessions() -> bool {
+    crate::session::config::load_config()
+        .ok()
+        .flatten()
+        .is_none_or(|config| config.auth.persist_sessions)
+}
+
+/// Mirrors the server's choice: `--no-tailscale` for an explicit Cloudflare pick, otherwise
+/// Funnel whenever `tailscale` is installed and logged in.
+fn restart_on_funnel(transport: Option<TunnelTransport>) -> bool {
+    transport != Some(TunnelTransport::Cloudflare)
+        && crate::server::tunnel::tailscale_available_sync()
+}
+
+fn link_authority(url: &str) -> Option<&str> {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    rest.split(['/', '?', '#']).next()
+}
+
+fn link_host(url: &str) -> Option<&str> {
+    let authority = link_authority(url)?;
+    Some(
+        authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, _)| host),
+    )
+}
+
+/// The explicit port in a Local link such as `http://192.168.1.42:51234/?token=…`.
+fn link_port(url: &str) -> Option<u16> {
+    link_authority(url)?.rsplit_once(':')?.1.parse().ok()
+}
+
+/// Funnel serves the machine's stable `https://<host>.<tailnet>.ts.net` origin.
+fn is_funnel_link(url: &str) -> bool {
+    link_host(url).is_some_and(|host| host.ends_with(".ts.net"))
+}
+
 fn stop_failed(e: &str) -> String {
     format!("Stop failed: {e}. Daemon may still be running; retry or use `aoe serve --stop` from a shell.")
 }
@@ -306,6 +482,12 @@ pub struct ServeView {
     mouse: RefCell<ServeMouse>,
     /// The label of the value a click last copied, shown for `FLASH_TTL`.
     copied: Option<(&'static str, Instant)>,
+    /// The setting the running daemon started with, when this view started it; `None` for a
+    /// reattached daemon.
+    running_persists: Option<bool>,
+    /// What a restart would do now. Refreshed when R, G or help is pressed rather than per
+    /// frame: the probe shells out to `tailscale`.
+    restart_probe: RestartProbe,
     pending_launch: Option<ServeLaunchRequest>,
     launch_in_flight: bool,
     stop_requested: bool,
@@ -338,6 +520,8 @@ impl ServeView {
             show_help: false,
             mouse: RefCell::default(),
             copied: None,
+            running_persists: None,
+            restart_probe: RestartProbe::default(),
             pending_launch: None,
             launch_in_flight: false,
             stop_requested: false,
@@ -548,6 +732,8 @@ impl ServeView {
 
     fn spawn(&mut self, mode: ServeMode, transport: Option<TunnelTransport>) {
         let passphrase = (mode == ServeMode::Tunnel).then(|| self.pending_passphrase.clone());
+        // Read just before the launch, which the daemon reads at startup.
+        self.running_persists = Some(persist_sessions());
         self.pending_launch = Some(ServeLaunchRequest {
             restart: false,
             mode,
@@ -648,10 +834,11 @@ impl ServeView {
                     self.pending_passphrase = new_pp.clone();
                     self.restart(mode, transport, Some(new_pp));
                 } else {
+                    self.restart_probe = RestartProbe::now(mode, transport);
                     self.pending_confirm = Some((PendingConfirm::NewPassphrase, Instant::now()));
                 }
             }
-            // Tunnel restarts clear all login sessions; Local rebinds the port.
+            // Reusing the passphrase keeps persisted logins; see `RestartEffect`.
             KeyCode::Char('r' | 'R') => {
                 if confirmed == Some(PendingConfirm::Restart) {
                     let pp = (mode == ServeMode::Tunnel).then(|| {
@@ -661,11 +848,15 @@ impl ServeView {
                     });
                     self.restart(mode, transport, pp);
                 } else {
+                    self.restart_probe = RestartProbe::now(mode, transport);
                     self.pending_confirm = Some((PendingConfirm::Restart, Instant::now()));
                 }
             }
             KeyCode::Tab if urls.len() > 1 => *url_index = (*url_index + 1) % urls.len(),
-            KeyCode::Char('?') => self.show_help = true,
+            KeyCode::Char('?') => {
+                self.restart_probe = RestartProbe::now(mode, transport);
+                self.show_help = true;
+            }
             KeyCode::Esc | KeyCode::Char('q') => return ServeAction::Close,
             _ => {}
         }
@@ -729,6 +920,7 @@ impl ServeView {
         transport: Option<TunnelTransport>,
         passphrase: Option<String>,
     ) {
+        self.running_persists = Some(persist_sessions());
         self.pending_launch = Some(ServeLaunchRequest {
             restart: true,
             mode,
@@ -864,6 +1056,55 @@ mod tests {
         assert_eq!(ServeMode::from_file_token(""), None);
     }
 
+    /// The restarted daemon reads `auth.persist_sessions` afresh, so a change made while the
+    /// view is open must reach the confirm and help.
+    #[test]
+    #[serial_test::serial]
+    fn r_g_and_help_reread_persist_sessions() {
+        let _tmp = crate::session::test_support::isolate_app_dir();
+        for key in ['R', 'G', '?'] {
+            let mut view = ServeView {
+                state: ServeViewState::Active {
+                    mode: ServeMode::Tunnel,
+                    // Cloudflare skips the `tailscale` probe.
+                    transport: Some(TunnelTransport::Cloudflare),
+                    urls: vec![ServeUrl {
+                        label: None,
+                        url: "https://host.tailnet.ts.net/".to_string(),
+                    }],
+                    url_index: 0,
+                    passphrase: Some("correct-horse".to_string()),
+                    opened_at: Instant::now(),
+                    log_offset: 0,
+                },
+                pending_passphrase: String::new(),
+                pending_confirm: None,
+                show_help: false,
+                mouse: RefCell::default(),
+                copied: None,
+                running_persists: Some(true),
+                restart_probe: RestartProbe {
+                    persists: true,
+                    ..RestartProbe::default()
+                },
+                pending_launch: None,
+                launch_in_flight: false,
+                stop_requested: false,
+            };
+            crate::session::config::update_config(|c| c.auth.persist_sessions = false).unwrap();
+            view.handle_key(KeyEvent::from(KeyCode::Char(key)));
+            assert!(
+                !view.restart_probe.persists,
+                "{key} kept the value read when the view opened"
+            );
+            crate::session::config::update_config(|c| c.auth.persist_sessions = true).unwrap();
+            view.pending_confirm = None;
+            view.show_help = false;
+            view.handle_key(KeyEvent::from(KeyCode::Char(key)));
+            assert!(view.restart_probe.persists, "{key}");
+        }
+    }
+
     #[test]
     fn a_tunnel_retry_preselects_the_provider_that_did_not_fail() {
         use TransportStatus::{FunnelNotEnabled, NotInstalled, Ready};
@@ -911,6 +1152,8 @@ mod tests {
             show_help: false,
             mouse: RefCell::default(),
             copied: None,
+            running_persists: None,
+            restart_probe: RestartProbe::default(),
             pending_launch: None,
             launch_in_flight: false,
             stop_requested: false,

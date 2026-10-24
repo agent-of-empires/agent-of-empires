@@ -140,8 +140,10 @@ test("skills panel adopts, edits, creates, and deletes skills", async ({ page, s
   await page.getByRole("button", { name: "+ New skill" }).click();
   await page.getByLabel("New skill directory").fill("new-skill");
   await page.getByLabel("New skill description").fill("Use for new work");
+  // The notice can be replaced before it is observed; assert the response and durable state instead.
+  const created = page.waitForResponse((r) => r.url().endsWith("/api/skills") && r.request().method() === "POST");
   await page.getByRole("button", { name: "Create" }).click();
-  await expect(notice("created")).toBeVisible();
+  expect((await created).ok()).toBe(true);
   await expect(content).toHaveValue(/name: new-skill/);
 
   page.once("dialog", (dialog) => void dialog.accept());

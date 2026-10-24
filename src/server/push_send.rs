@@ -130,7 +130,7 @@ pub fn encrypt_aes128gcm(subscription: &Subscription, plaintext: &[u8]) -> Resul
     use aes_gcm::{Aes128Gcm, KeyInit};
     use hkdf::Hkdf;
     use p256::ecdh::diffie_hellman;
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::sec1::ToSec1Point;
     use p256::{PublicKey, SecretKey};
 
     // Subscription-side key material.
@@ -151,7 +151,7 @@ pub fn encrypt_aes128gcm(subscription: &Subscription, plaintext: &[u8]) -> Resul
     getrandom::fill(&mut eph_seed).map_err(|e| anyhow!("getrandom for ephemeral key: {}", e))?;
     let d_as = SecretKey::from_slice(&eph_seed).context("derive ephemeral P-256 key from seed")?;
     let p_as = d_as.public_key();
-    let p_as_encoded = p_as.to_encoded_point(false);
+    let p_as_encoded = p_as.to_sec1_point(false);
     let p_as_bytes = p_as_encoded.as_bytes();
     if p_as_bytes.len() != 65 {
         return Err(anyhow!(
@@ -334,8 +334,8 @@ mod tests {
             // Generate a valid P-256 public key.
             let seed = [7u8; 32];
             let sk = p256::SecretKey::from_slice(&seed).unwrap();
-            use p256::elliptic_curve::sec1::ToEncodedPoint;
-            let pt = sk.public_key().to_encoded_point(false);
+            use p256::elliptic_curve::sec1::ToSec1Point;
+            let pt = sk.public_key().to_sec1_point(false);
             pt.as_bytes().to_vec()
         };
         let subscription = super::super::push::Subscription {
