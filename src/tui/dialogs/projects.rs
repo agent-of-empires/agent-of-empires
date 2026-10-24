@@ -228,11 +228,11 @@ impl ProjectsDialog {
                 DialogResult::Continue
             }
             KeyCode::Tab => {
-                self.add_focused = (self.add_focused + 1) % 7;
+                self.add_focused = super::cycle_focus(self.add_focused, 7, false);
                 DialogResult::Continue
             }
             KeyCode::BackTab => {
-                self.add_focused = (self.add_focused + 6) % 7;
+                self.add_focused = super::cycle_focus(self.add_focused, 7, true);
                 DialogResult::Continue
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if self.add_focused == 2 => {
