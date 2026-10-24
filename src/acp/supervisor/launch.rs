@@ -2598,7 +2598,7 @@ mod tests {
             )));
             assert!(events.iter().any(|(_, event)| matches!(
                 event,
-                Event::AgentMessageChunk { text } if text == "original producer completed"
+                Event::AgentMessageChunk { text, .. } if text == "original producer completed"
             )));
             let stops: Vec<_> = events
                 .iter()
