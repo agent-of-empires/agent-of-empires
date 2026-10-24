@@ -682,6 +682,11 @@ impl HttpClient {
                 {
                     HttpError::Unauthorized
                 }
+                crate::daemon::DaemonClientError::Status {
+                    status,
+                    code: Some(code),
+                    ..
+                } => classify_code(status, Some(code), None, false),
                 error => HttpError::Daemon(error),
             })
     }
@@ -978,8 +983,22 @@ pub(super) fn classify_status(
     session_id: Option<&str>,
     resolving: bool,
 ) -> HttpError {
+    classify_code(
+        status,
+        crate::daemon::ApiErrorCode::from_headers(status, headers, resolving),
+        session_id,
+        resolving,
+    )
+}
+
+/// [`classify_status`] for a code the shared client already validated.
+fn classify_code(
+    status: StatusCode,
+    code: Option<crate::daemon::ApiErrorCode>,
+    session_id: Option<&str>,
+    resolving: bool,
+) -> HttpError {
     use crate::daemon::ApiErrorCode;
-    let code = ApiErrorCode::from_headers(status, headers, resolving);
     match (status, code) {
         (StatusCode::UNAUTHORIZED, _) => HttpError::Unauthorized,
         (_, Some(ApiErrorCode::ReadOnly)) => HttpError::ReadOnly,
@@ -1718,6 +1737,57 @@ mod tests {
         assert!(matches!(error, HttpError::Unauthorized), "{error}");
         assert_eq!(wrong.logins(), 1);
         assert!(!error.to_string().contains(PASSPHRASE));
+    }
+
+    /// A refusal's validated code survives the listing path, while a missing,
+    /// unknown or status-inconsistent header stays generic. The body never ends, so
+    /// reading it would hang.
+    #[tokio::test]
+    async fn session_list_classifies_refusal_codes_without_reading_the_body() {
+        use axum::{body::Body, http::Response, routing::get, Router};
+        let cases: [(u16, Option<&str>, Option<&str>); 4] = [
+            (
+                403,
+                Some("access_policy_denied"),
+                Some("access_policy_denied"),
+            ),
+            (403, None, None),
+            (403, Some("not_a_code"), None),
+            (409, Some("read_only"), None),
+        ];
+        for (status, header, expected) in cases {
+            let app = Router::new().route(
+                "/api/sessions",
+                get(move || async move {
+                    let mut response = Response::builder().status(status);
+                    if let Some(header) = header {
+                        response = response.header(crate::daemon::ERROR_CODE_HEADER, header);
+                    }
+                    response
+                        .body(Body::from_stream(futures_util::stream::pending::<
+                            Result<axum::body::Bytes, std::io::Error>,
+                        >()))
+                        .unwrap()
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let client = HttpClient::new(endpoint(&base, Some("tok"))).unwrap();
+            let error = tokio::time::timeout(Duration::from_secs(5), client.list_sessions(None))
+                .await
+                .expect("the body must not be read")
+                .unwrap_err();
+            server.abort();
+            match (&error, expected) {
+                (HttpError::Server { status: got, body }, Some(want)) => {
+                    assert_eq!(got.as_u16(), status);
+                    assert_eq!(body, want, "{header:?}");
+                }
+                (HttpError::Daemon(_), None) => {}
+                _ => panic!("{header:?}: {error:?}"),
+            }
+        }
     }
 
     #[tokio::test]
