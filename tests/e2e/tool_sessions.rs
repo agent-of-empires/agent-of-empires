@@ -896,6 +896,7 @@ async fn native_auxiliary_ensure_uses_fresh_context_and_refuses_purge() {
         provider: None,
         container_workdir: None,
         before_start_env: Vec::new(),
+        before_start_hook_env: Vec::new(),
     });
     persist(container_row);
     let container_name = container_row
