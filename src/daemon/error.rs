@@ -25,6 +25,9 @@ pub enum ApiErrorCode {
     SmartRenameSkipped,
     SmartRenameFailed,
     SmartRenameTimeout,
+    SessionNotRunning,
+    SessionArchived,
+    SessionTrashed,
 }
 
 impl ApiErrorCode {
@@ -49,6 +52,9 @@ impl ApiErrorCode {
             Self::SmartRenameSkipped => "smart_rename_skipped",
             Self::SmartRenameFailed => "smart_rename_failed",
             Self::SmartRenameTimeout => "smart_rename_timeout",
+            Self::SessionNotRunning => "session_not_running",
+            Self::SessionArchived => "session_archived",
+            Self::SessionTrashed => "session_trashed",
         }
     }
 
@@ -65,7 +71,10 @@ impl ApiErrorCode {
             | Self::NoRevive
             | Self::CreationTrustChanged
             | Self::CreationCancelled
-            | Self::CreationNotPending => StatusCode::CONFLICT,
+            | Self::CreationNotPending
+            | Self::SessionNotRunning
+            | Self::SessionArchived
+            | Self::SessionTrashed => StatusCode::CONFLICT,
             Self::PendingTargetGone => StatusCode::NOT_FOUND,
             Self::TlsRequired => StatusCode::UPGRADE_REQUIRED,
             Self::CreateHookFailed => StatusCode::BAD_REQUEST,
@@ -111,6 +120,9 @@ impl ApiErrorCode {
             b"smart_rename_skipped" => Self::SmartRenameSkipped,
             b"smart_rename_failed" => Self::SmartRenameFailed,
             b"smart_rename_timeout" => Self::SmartRenameTimeout,
+            b"session_not_running" => Self::SessionNotRunning,
+            b"session_archived" => Self::SessionArchived,
+            b"session_trashed" => Self::SessionTrashed,
             _ => return None,
         };
         (status == code.status()).then_some(code)
@@ -172,6 +184,25 @@ mod tests {
                 Some(ApiErrorCode::NoRevive),
             ),
             (StatusCode::FORBIDDEN, "no_revive", false, None),
+            (
+                StatusCode::CONFLICT,
+                "session_not_running",
+                false,
+                Some(ApiErrorCode::SessionNotRunning),
+            ),
+            (
+                StatusCode::CONFLICT,
+                "session_archived",
+                false,
+                Some(ApiErrorCode::SessionArchived),
+            ),
+            (
+                StatusCode::CONFLICT,
+                "session_trashed",
+                false,
+                Some(ApiErrorCode::SessionTrashed),
+            ),
+            (StatusCode::FORBIDDEN, "session_archived", false, None),
             (
                 StatusCode::BAD_REQUEST,
                 "create_hook_failed",

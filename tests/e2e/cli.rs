@@ -1464,7 +1464,7 @@ fn cli_ps_empty_json() {
 #[parallel]
 fn cli_send_waits_for_slow_boot_before_typing() {
     require_tmux!();
-    let mut h = TuiTestHarness::new("cli_send_settle_wait");
+    let mut h = TuiTestHarness::new_in_tmp("cli_send_settle_wait");
     h.install_path_command("opencode");
 
     let dir = h.home_path().join("fake-bin");
@@ -1506,6 +1506,13 @@ fn cli_send_waits_for_slow_boot_before_typing() {
             .expect("capture-pane");
         let content = String::from_utf8_lossy(&out.stdout).to_string();
         if content.contains("GOT:[hello there]") {
+            // The tty echoes typed input at once, so early typing shows up above the marker.
+            let marker = content.find("Ask anything...").expect("marker printed");
+            let typed = content.find("hello there").expect("message echoed");
+            assert!(
+                typed > marker,
+                "message typed before the agent was ready:\n{content}"
+            );
             Ok(())
         } else {
             Err(format!("agent has not echoed the message:\n{content}"))
