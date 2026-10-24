@@ -127,7 +127,13 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
     for (resp, inst) in sessions.iter_mut().zip(scoped_instances.iter().copied()) {
         if !resp.acp_capable {
             let cfg = session_cfg_cache.resolve(&inst.source_profile, &inst.project_path);
-            resp.acp_capable = custom_agent_acp_capable(cfg, &inst.tool);
+            // The key the constructor resolved built-ins with: `agent_name`, else `tool`.
+            let agent_key = inst
+                .agent_name
+                .as_deref()
+                .filter(|name| !name.is_empty())
+                .unwrap_or(&inst.tool);
+            resp.acp_capable = custom_agent_acp_capable(cfg, agent_key);
         }
         // Only a terminal session that could switch needs the setting resolved.
         if resp.acp_capable && !inst.is_structured() {

@@ -3483,6 +3483,49 @@ async fn list_sessions_flags_only_terminal_sessions_when_structured_view_is_off(
 
 #[tokio::test]
 #[serial_test::serial]
+async fn list_sessions_judges_custom_agent_capability_by_the_agent_name() {
+    let tmp_home = tempfile::tempdir().expect("tempdir HOME");
+    let _home = crate::session::test_support::isolate_app_dir_at(tmp_home.path());
+    crate::session::config::update_config(|c| {
+        c.session
+            .agent_acp_cmd
+            .insert("acp-helper".into(), "acp-helper --acp".into());
+    })
+    .unwrap();
+
+    let mk = |id: &str, agent_name: Option<&str>| {
+        let mut inst = Instance::new("test-session", &format!("/tmp/{id}"));
+        inst.id = id.to_string();
+        inst.tool = "plain-tool".to_string();
+        inst.agent_name = agent_name.map(str::to_string);
+        inst.source_profile = "default".to_string();
+        inst
+    };
+    let state = crate::server::test_support::build_test_app_state(vec![
+        mk("named-agent", Some("acp-helper")),
+        mk("tool-only", None),
+    ]);
+
+    let response = list_sessions(
+        axum::extract::State(state),
+        axum::extract::Query(ListSessionsQuery { state: None }),
+    )
+    .await
+    .into_response();
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let envelope: crate::daemon::SessionsEnvelope = serde_json::from_slice(&body).unwrap();
+    let capable: Vec<_> = envelope
+        .sessions
+        .iter()
+        .map(|s| (s.id.as_str(), s.acp_capable))
+        .collect();
+    assert_eq!(capable, [("named-agent", true), ("tool-only", false)]);
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn list_sessions_state_filter() {
     let _guard = crate::session::test_support::isolate_app_dir();
     let mut live = Instance::new("live", "/tmp/scope-live");
