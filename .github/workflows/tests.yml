@@ -51,6 +51,18 @@ jobs:
           tool: cargo-nextest
       - name: Install tmux
         run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: Install confined Local test prerequisites
+        if: matrix.leg == 'web-e2e'
+        run: |
+          sudo apt-get install -y bubblewrap iproute2 apparmor
+          # The packaged profile denies capabilities to bwrap children, including ip.
+          # Replace it only in memory on this disposable runner; keep network isolation.
+          sudo apparmor_parser -r -K <<'PROFILE'
+          abi <abi/4.0>,
+          profile bwrap /usr/bin/bwrap flags=(unconfined) {
+            userns,
+          }
+          PROFILE
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
@@ -84,6 +96,8 @@ jobs:
       # the tests that wait on an ACP handshake.
       - name: Cargo test (web, e2e only)
         if: matrix.leg == 'web-e2e'
+        env:
+          AOE_REQUIRE_LOCAL_NETWORK_TESTS: '1'
         run: cargo test --features web,e2e-tests --test e2e -- --test-threads=3
       # The `web`-gated test code runs nowhere else: core-rest builds at
       # default features and the step above names only the e2e target. Both

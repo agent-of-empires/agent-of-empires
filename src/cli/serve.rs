@@ -514,8 +514,10 @@ pub async fn lock_for_startup(profile: &str, args: &mut ServeArgs) -> Result<Opt
     } else {
         crate::daemon::lifecycle::Transaction::acquire().await?
     };
-    if !args.core_only && args.passphrase.is_none() {
-        args.passphrase = std::env::var("AOE_SERVE_PASSPHRASE").ok();
+    if !args.core_only {
+        args.passphrase = resolve_launch_passphrase(args.passphrase.take(), None, || {
+            std::env::var("AOE_SERVE_PASSPHRASE").ok()
+        });
     }
     args.cityhall = args.cityhall || std::env::var_os("AOE_CITYHALL_MODE").is_some();
     match daemon_status() {
@@ -607,7 +609,8 @@ impl ServeLaunch {
     /// Rebuild the `ServeArgs` needed to relaunch this daemon. The
     /// effective auth mode is replayed via `--auth`; clap's `--no-auth`
     /// alias is not needed since `--auth=none` covers it. The passphrase
-    /// is injected by the caller after recall.
+    /// is resolved and injected by the caller (see
+    /// [`resolve_launch_passphrase`]).
     fn to_serve_args(&self, passphrase: Option<String>) -> ServeArgs {
         ServeArgs {
             core_only: self.core_only,
@@ -865,6 +868,22 @@ fn recall_serve_passphrase(launch: &ServeLaunch) -> Result<Option<String>> {
             "Cannot restart: the recorded passphrase is unavailable; leaving the daemon untouched",
         )?;
     Ok(Some(passphrase))
+}
+
+/// Resolve the passphrase for a launch that did not request one explicitly.
+/// `recorded` is `None` when there is no predecessor policy to replay,
+/// `Some(None)` when the predecessor ran without a passphrase, and
+/// `Some(Some(_))` for its credential. An explicit request (Tunnel rotation)
+/// wins, then the recorded policy, then the startup environment.
+fn resolve_launch_passphrase(
+    requested: Option<String>,
+    recorded: Option<Option<&str>>,
+    environment: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    requested.or_else(|| match recorded {
+        Some(passphrase) => passphrase.map(str::to_owned),
+        None => environment(),
+    })
 }
 
 /// One URL we can show in the Active state. Tunnel mode has a public primary
@@ -1838,8 +1857,12 @@ pub(crate) async fn restart_daemon_with_receipt(
 
     let launch = managed_launch(pid)?;
     let predecessor_passphrase = recall_serve_passphrase(&launch)?;
-    let args =
-        override_args.unwrap_or_else(|| launch.to_serve_args(predecessor_passphrase.clone()));
+    let mut args = override_args.unwrap_or_else(|| launch.to_serve_args(None));
+    args.passphrase = resolve_launch_passphrase(
+        args.passphrase.take(),
+        Some(predecessor_passphrase.as_deref()),
+        || None,
+    );
     validate_launch_args(&launch.profile, &args).await?;
     retain_rollback_launch(&transaction, &launch, predecessor_passphrase.as_deref())?;
 
@@ -2343,6 +2366,36 @@ mod tests {
             assert_eq!(json, format!("\"{}\"", variant.as_cli_str()));
             let back: AuthMode = serde_json::from_str(&json).expect("deserialize AuthMode");
             assert_eq!(back, *variant);
+        }
+    }
+
+    #[test]
+    fn launch_passphrase_precedence_is_explicit() {
+        let cases = [
+            (
+                Some("rotated"),
+                Some(Some("recorded")),
+                Some("env"),
+                Some("rotated"),
+            ),
+            (None, Some(Some("recorded")), Some("env"), Some("recorded")),
+            // A predecessor that ran without a gate must not inherit one from
+            // the restarting process.
+            (None, Some(None), Some("env"), None),
+            // Fresh starts and core promotion still honor the environment.
+            (None, None, Some("env"), Some("env")),
+            (None, None, None, None),
+        ];
+        for (requested, recorded, environment, expected) in cases {
+            let resolved =
+                resolve_launch_passphrase(requested.map(str::to_string), recorded, || {
+                    environment.map(str::to_string)
+                });
+            assert_eq!(
+                resolved.as_deref(),
+                expected,
+                "requested={requested:?} recorded={recorded:?} environment={environment:?}"
+            );
         }
     }
 
