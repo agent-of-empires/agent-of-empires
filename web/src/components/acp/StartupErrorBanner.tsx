@@ -1,6 +1,9 @@
 import { useState } from "react";
 
 import { useRespawnSession } from "../../hooks/useRespawnSession";
+import { CopyRow } from "./CopyRow";
+
+const MANUAL_INSTALL_COMMAND = "npm install -g @agentclientprotocol/claude-agent-acp@latest";
 
 function Code({ children }: { children: React.ReactNode }) {
   return <code className="rounded bg-rose-900/60 px-1">{children}</code>;
@@ -83,9 +86,9 @@ function Remediation({ message }: { message: string }) {
   return (
     <>
       Run <Code>aoe acp doctor --fix</Code> from a terminal, or install the adapter manually:
-      <pre className="mt-1 whitespace-pre-wrap rounded bg-rose-900/40 p-2 text-xs">
-        npm install -g @agentclientprotocol/claude-agent-acp@latest
-      </pre>
+      <CopyRow source={MANUAL_INSTALL_COMMAND} label="Copy command">
+        <pre className="mt-1 whitespace-pre-wrap rounded bg-rose-900/40 p-2 text-xs">{MANUAL_INSTALL_COMMAND}</pre>
+      </CopyRow>
     </>
   );
 }

@@ -402,17 +402,19 @@ html[data-ios-standalone]:not([data-editing]) {
   margin: 0.75rem 0;
 }
 .acp-markdown .acp-table-block {
-  position: relative;
   margin: 0.75rem 0;
 }
-/* Hidden until hover or focus; touch has no hover, so it stays visible there. */
+/* Copy rows of a message, its text parts and its tables: hidden until hover or keyboard focus (touch has no hover,
+   so they stay visible there). Only keyboard focus counts: a clicked button keeps focus, which must not pin the row
+   open. Direct children only, so a hovered message does not reveal its parts' rows. */
 @media (hover: hover) and (pointer: fine) {
-  .acp-markdown .acp-table-copy {
+  .acp-copy-host > .acp-copy-reveal {
     opacity: 0;
   }
-  .acp-markdown .acp-table-block:hover .acp-table-copy,
-  .acp-markdown .acp-table-copy:focus-visible,
-  .acp-markdown .acp-table-copy[data-copied="true"] {
+  .acp-copy-host:hover > .acp-copy-reveal,
+  .acp-copy-host > .acp-copy-reveal:has(:focus-visible),
+  .acp-copy-host > .acp-copy-reveal[data-open="true"],
+  .acp-copy-host > .acp-copy-reveal[data-copied="true"] {
     opacity: 1;
   }
 }

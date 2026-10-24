@@ -2272,6 +2272,55 @@
       "notes": "A prompt a plugin sent through sessions.message.send carries a \"Sent by plugin\" label instead of passing for the user's own; the server stamps the sender on the row, and Send now on a queued row names it so the daemon keeps that sender."
     },
     {
+      "id": "acp.copy-message-markdown",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": [
+        "src/components/acp/ThreadMessages.test.tsx",
+        "src/components/acp/messageMarkdown.test.ts",
+        "src/components/acp/Markdown.test.tsx",
+        "tests/acp-message-copy.spec.ts"
+      ],
+      "components": [
+        "web/src/components/acp/ThreadMessages.tsx",
+        "web/src/components/acp/MessageCopyMenu.tsx",
+        "web/src/components/acp/CopyMarkdownButton.tsx",
+        "web/src/components/acp/Markdown.tsx"
+      ],
+      "notes": "Text parts of a multi-part message and the whole message copy as raw markdown; the message menu can add tool calls. The mocked browser spec pins hover reveal, touch visibility and that the buttons do not overlap."
+    },
+    {
+      "id": "acp.copy-blocks",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": [
+        "src/components/acp/__tests__/copyActions.test.tsx",
+        "src/components/acp/__tests__/StartupErrorScreen.test.tsx",
+        "src/components/acp/__tests__/StartupErrorBanner.test.tsx",
+        "src/components/acp/__tests__/BackgroundAgentsPanel.test.tsx",
+        "src/components/acp/ToolCards.render.test.tsx",
+        "src/components/diff/comments/__tests__/DiffCommentsUserCard.test.tsx",
+        "src/lib/unifiedDiff.test.ts",
+        "src/lib/checklistMarkdown.test.ts",
+        "tests/acp-copy-blocks.spec.ts"
+      ],
+      "components": [
+        "web/src/components/acp/CopyRow.tsx",
+        "web/src/components/acp/ToolOutputMedia.tsx",
+        "web/src/components/acp/ToolCardChrome.tsx",
+        "web/src/components/acp/ToolErrorBody.tsx",
+        "web/src/components/acp/TodoCards.tsx",
+        "web/src/components/acp/PlanStrip.tsx",
+        "web/src/components/acp/ElicitationAnswerCard.tsx",
+        "web/src/components/acp/StartupErrorScreen.tsx",
+        "web/src/components/acp/StartupErrorBanner.tsx",
+        "web/src/components/acp/BackgroundAgentsPanel.tsx",
+        "web/src/components/diff/StringDiff.tsx",
+        "web/src/components/diff/comments/DiffCommentsUserCard.tsx"
+      ],
+      "notes": "Tool input and output, tool errors, edit diffs, todo lists, the plan, answers, review prompts, sub-agent prompt and result, and install commands each copy their own content. Prompt, diff and error copies are pinned in a mocked browser; the rest are unit tests."
+    },
+    {
       "id": "acp.tool-group-chunking",
       "kind": "vitest",
       "risk": "medium",
