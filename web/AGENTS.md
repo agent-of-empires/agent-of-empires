@@ -18,9 +18,10 @@ npm run typecheck:tests
 without `--features web` needs no JavaScript tooling. Use `npm run format` to fix oxfmt output;
 Prettier is not used.
 
-The lint command also checks production Rust environment reads against the live
-fixture's isolation contract. Source inventory belongs to that static guard;
-Vitest exercises actual hostile-value isolation, not source-text consistency.
+The lint command checks Rust environment reads against the live fixture's
+isolation contract using `scripts/check-env-isolation.mjs`. The source-inventory
+test in `isolatedEnv.test.ts` invokes the same guard with a 30-second budget;
+the remaining Vitest cases exercise actual hostile-value isolation.
 
 ## Tests
 
