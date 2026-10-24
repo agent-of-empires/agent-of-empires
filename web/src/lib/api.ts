@@ -1488,6 +1488,9 @@ export function isDebugBuild(about: ServerAbout | null | undefined): boolean {
 }
 export type UpdateCheckMode = "auto" | "notify" | "off";
 
+/** How the Daemon's own binary was installed. */
+export type InstallMethod = "homebrew" | "release" | "cargo" | "nix" | "unknown";
+
 export interface UpdateStatus {
   update_check_mode: UpdateCheckMode;
   current_version: string;
@@ -1498,6 +1501,10 @@ export interface UpdateStatus {
   /** Version the user already dismissed the banner for, persisted server-side
    *  in app_state so the acknowledgement is once-per-account, not per device. */
   dismissed_version: string | null;
+  /** Absent from an older Daemon; treated as "unknown". */
+  install_method?: InstallMethod;
+  /** What to run on the Daemon's machine to update; absent alongside `install_method`. */
+  update_command?: string;
 }
 
 export function fetchUpdateStatus(): Promise<UpdateStatus | null> {
