@@ -1480,15 +1480,19 @@ pub struct SessionConfig {
     )]
     pub prevent_sleep_idle_grace_minutes: u32,
 
-    /// Text sent to the agent after a successful `aoe session restart` /
-    /// `e`-keybind restart, once the post-restart readiness probe says the
-    /// pane is alive. Restart re-execs the agent at a blank prompt; this
-    /// nudge tells the agent to pick up where it left off. Set to an
-    /// empty string to disable the wake-up message entirely (the restart
-    /// itself still runs).
+    /// Text sent after a successful explicit restart, or automatic startup
+    /// recovery when `startup_recovery_wake` is enabled, once the pane is ready.
+    /// An empty string disables the message without disabling the restart.
     #[serde(default = "default_restart_wake_message")]
     #[setting(label = "Restart Wake Message", widget = "text")]
     pub restart_wake_message: String,
+
+    /// Send `restart_wake_message` after automatic Daemon startup recovery.
+    /// Disabled by default; recovery still restores missing panes and resumes
+    /// conversations. Explicit restarts are unaffected. An empty message stays off.
+    #[serde(default)]
+    #[setting(label = "Startup Recovery Wake", widget = "toggle")]
+    pub startup_recovery_wake: bool,
 
     /// What to show next to each session title: Branch (default), Auto
     /// (profile in all-profiles view), None, Profile (always), or Sandbox
@@ -2025,6 +2029,7 @@ impl Default for SessionConfig {
             prevent_sleep_when_active: false,
             prevent_sleep_idle_grace_minutes: default_prevent_sleep_idle_grace_minutes(),
             restart_wake_message: default_restart_wake_message(),
+            startup_recovery_wake: false,
             row_tag: RowTagMode::default(),
             show_activity_age: true,
             live_send_exit_chord: default_live_send_exit_chord(),

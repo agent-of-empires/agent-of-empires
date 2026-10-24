@@ -2768,11 +2768,15 @@ async fn prepare_agent_session_inner(
             )
         ) {
             let wake_message = requested_wake_message.unwrap_or_else(|| {
-                crate::session::resolve_config(&profile)
-                    .map(|config| config.session.restart_wake_message)
-                    .unwrap_or_else(|_| {
-                        crate::session::config::SessionConfig::default().restart_wake_message
-                    })
+                let session = crate::session::resolve_config(&profile)
+                    .map(|config| config.session)
+                    .unwrap_or_default();
+                // Only startup recovery supplies an expected generation.
+                if expected_generation.is_some() && !session.startup_recovery_wake {
+                    String::new()
+                } else {
+                    session.restart_wake_message
+                }
             });
             if !wake_message.is_empty() {
                 crate::session::restart::spawn_wake_worker(
