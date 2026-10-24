@@ -1409,6 +1409,21 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn a_held_probe_leaves_a_clickable_close_control() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let (mut view, gate) = gated_view();
+        gate.wait_entered();
+        let buffer = crate::tui::dialogs::test_render::draw(110, 40, |frame, theme| {
+            view.render(frame, frame.area(), theme)
+        });
+        let (col, row) = crate::tui::dialogs::test_render::find(&buffer, "[Esc] cancel");
+        let key = view.handle_click(col, row).expect("close hint is a target");
+        assert!(matches!(view.handle_key(key), ServeAction::Close));
+        gate.release.send(true).unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn a_starting_dialog_keeps_one_probe_in_flight_and_ignores_a_stale_result() {
         let _home = crate::session::test_support::isolate_app_dir();
         let (mut view, gate) = gated_view();

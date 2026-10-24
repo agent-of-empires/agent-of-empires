@@ -70,6 +70,7 @@ pub(super) fn render(view: &ServeView, frame: &mut Frame, area: Rect, theme: &Th
             frame,
             area,
             theme,
+            &mut mouse,
             " Checking... ",
             "Looking for a running daemon",
         ),
@@ -444,13 +445,31 @@ fn render_confirm(
     record_hints(frame, mouse, keys);
 }
 
-fn render_pending(frame: &mut Frame, area: Rect, theme: &Theme, title: &str, line: &str) {
+fn render_pending(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    mouse: &mut ServeMouse,
+    title: &str,
+    line: &str,
+) {
     let inner = render_page(frame, area, title, theme.border, theme.title);
+    let banner = vec![
+        Line::styled(line, Style::default().fg(theme.text)),
+        Line::from(""),
+        Line::styled("[Esc] cancel", Style::default().fg(theme.dimmed)),
+    ];
+    let banner_area = centered_rect(inner, inner.width, 3);
     frame.render_widget(
-        Paragraph::new(Line::styled(line, Style::default().fg(theme.text)))
-            .alignment(Alignment::Center),
-        centered_rect(inner, inner.width, 1),
+        Paragraph::new(banner).alignment(Alignment::Center),
+        banner_area,
     );
+    let keys_row = Rect {
+        y: banner_area.bottom().saturating_sub(1),
+        height: 1,
+        ..banner_area
+    };
+    record_hints(frame, mouse, keys_row);
 }
 
 fn render_starting(
