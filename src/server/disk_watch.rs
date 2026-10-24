@@ -4,6 +4,7 @@
 use crate::file_watch::{FileMatcher, WatchSpec};
 use std::sync::Arc;
 
+use super::lifecycle_feed::ReadRetry;
 #[cfg(test)]
 use super::reload::load_all_profiles;
 use super::reload::reload_state_instances_from_disk;
@@ -261,11 +262,15 @@ pub(super) async fn init_disk_watch_subscriptions_inner<F>(
 /// pattern but does NOT touch tmux or `state.status_tx`. Polling stays
 /// canonical; this task is pure latency reduction.
 pub(super) async fn disk_watcher_consumer(state: Arc<AppState>) {
+    let mut retry = ReadRetry::default();
+    let mut retry_in = None;
     loop {
-        tokio::select! {
+        let fresh_wake = tokio::select! {
             _ = state.shutdown.cancelled() => break,
-            _ = state.disk_changed.notified() => {}
-        }
+            _ = state.disk_changed.notified() => true,
+            _ = tokio::time::sleep(retry_in.unwrap_or_default()), if retry_in.is_some() => false,
+        };
+        retry_in = None;
         let started = std::time::Instant::now();
         let namespace = state.profile_namespace.read().await;
         let reload_lane = state.reload_lane.lock().await;
@@ -301,17 +306,11 @@ pub(super) async fn disk_watcher_consumer(state: Arc<AppState>) {
         };
         let ((fresh, metadata), live_worker_records) = loaded;
         // Diff before the reload consumes the rows. A session missing once is only a suspect,
-        // and a snapshot a commit overtook is dropped, so look again shortly rather than
-        // waiting for the next file event.
-        let observe_again = state.lifecycle.observe_disk(lifecycle_since, &fresh);
+        // a snapshot a commit overtook is dropped, and a failed read says nothing, so look
+        // again shortly rather than waiting for the next file event.
+        let observed = state.lifecycle.observe_disk(lifecycle_since, &fresh);
         drop(lifecycle_turn);
-        if observe_again {
-            let again = state.disk_changed.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                again.notify_one();
-            });
-        }
+        retry_in = retry.next(observed, fresh_wake);
         let count = fresh.instances.len();
         reload_state_instances_from_disk(
             &state,

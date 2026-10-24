@@ -5,6 +5,7 @@
 //! also covers writers in other processes and profile moves, but is debounced.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::broadcast;
 
@@ -18,6 +19,57 @@ const LIFECYCLE_CHANNEL_CAPACITY: usize = 256;
 
 /// Reads of the baseline before giving up on a quiet moment between commits.
 const BASELINE_ATTEMPTS: usize = 5;
+
+/// Wait before looking again at a missing session or an overtaken snapshot.
+const AGAIN_DELAY: Duration = Duration::from_millis(250);
+
+/// Observations repeated after a failed read before waiting for the next filesystem event.
+const READ_RETRY_ATTEMPTS: u32 = 5;
+
+/// Wait before the first read retry; each further one doubles it.
+const READ_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
+
+/// What an observation asks of the consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Observed {
+    Settled,
+    /// A missing session awaits a second look, or a commit overtook the snapshot and nothing
+    /// was applied.
+    Again,
+    /// The profile listing or a profile's storage could not be read.
+    ReadFailed,
+}
+
+/// Paces repeated observations. Read failures draw on a bounded budget that a healthy read or
+/// fresh filesystem activity refills, so a profile that stays unreadable is not reloaded
+/// forever.
+#[derive(Default)]
+pub(super) struct ReadRetry {
+    failures: u32,
+}
+
+impl ReadRetry {
+    /// How long to wait before observing again; `None` waits for the next filesystem event.
+    /// `fresh` is whether this observation was woken by filesystem activity, not by a retry.
+    pub(super) fn next(&mut self, observed: Observed, fresh: bool) -> Option<Duration> {
+        if fresh {
+            self.failures = 0;
+        }
+        match observed {
+            Observed::Settled => {
+                self.failures = 0;
+                None
+            }
+            Observed::Again => Some(AGAIN_DELAY),
+            Observed::ReadFailed if self.failures < READ_RETRY_ATTEMPTS => {
+                let delay = READ_RETRY_BASE_DELAY * 2u32.pow(self.failures);
+                self.failures += 1;
+                Some(delay)
+            }
+            Observed::ReadFailed => None,
+        }
+    }
+}
 
 /// Runs before each publication, so a test can hold one producer there.
 #[cfg(test)]
@@ -57,9 +109,8 @@ impl LifecycleFeed {
     }
 
     /// Diff the freshly loaded sessions of every profile, read after `since` was taken from
-    /// [`Self::commit_generation`]. Returns whether to observe again shortly: a missing
-    /// session awaits a second look, or a commit overtook the snapshot and nothing was applied.
-    pub(super) fn observe_disk(&self, since: u64, loaded: &LoadedInstances) -> bool {
+    /// [`Self::commit_generation`].
+    pub(super) fn observe_disk(&self, since: u64, loaded: &LoadedInstances) -> Observed {
         let health = &loaded.cache.health;
         if health.enumeration_failed {
             // An empty listing says nothing about which sessions exist.
@@ -67,7 +118,7 @@ impl LifecycleFeed {
                 tracker.baseline_unavailable();
                 (Vec::new(), ())
             });
-            return false;
+            return Observed::ReadFailed;
         }
         let rows: Vec<LifecycleRow> = loaded
             .instances
@@ -77,10 +128,17 @@ impl LifecycleFeed {
         let unread: Vec<String> = health.unreadable_profiles.iter().cloned().collect();
         self.apply(|tracker| {
             if tracker.commits() != since {
-                return (Vec::new(), true);
+                return (Vec::new(), Observed::Again);
             }
             let changes = tracker.observe(&rows, &unread);
-            (changes, tracker.has_suspects(&unread))
+            let observed = if tracker.has_suspects(&unread) {
+                Observed::Again
+            } else if unread.is_empty() {
+                Observed::Settled
+            } else {
+                Observed::ReadFailed
+            };
+            (changes, observed)
         })
     }
 
@@ -131,7 +189,7 @@ impl LifecycleFeed {
             if loaded.cache.health.enumeration_failed {
                 continue;
             }
-            if !self.observe_disk(since, &loaded) {
+            if self.observe_disk(since, &loaded) != Observed::Again {
                 return true;
             }
         }
@@ -205,7 +263,7 @@ mod tests {
 
     /// A complete disk read taken just now.
     fn observe(feed: &LifecycleFeed, instances: Vec<Instance>) -> bool {
-        feed.observe_disk(feed.commit_generation(), &complete(instances))
+        feed.observe_disk(feed.commit_generation(), &complete(instances)) == Observed::Again
     }
 
     #[test]
@@ -301,8 +359,9 @@ mod tests {
         );
 
         // ... and only then is the old snapshot observed.
-        assert!(
+        assert_eq!(
             feed.observe_disk(since, &stale),
+            Observed::Again,
             "dropped, so observe again"
         );
         assert!(rx.try_recv().is_err(), "no reverse rename");
@@ -487,10 +546,10 @@ mod tests {
     }
 
     /// A missing session of a profile that then turns unreadable cannot be confirmed or
-    /// cleared, so it must not keep asking for another read: that would reload every store
-    /// four times a second for as long as the profile stays unreadable.
+    /// cleared, so it must not keep asking for another quick read: that would reload every
+    /// store four times a second for as long as the profile stays unreadable.
     #[test]
-    fn a_suspect_in_a_profile_that_turns_unreadable_does_not_ask_for_a_retry() {
+    fn a_suspect_in_a_profile_that_turns_unreadable_does_not_ask_for_a_quick_retry() {
         let feed = LifecycleFeed::new();
         let kept = instance("kept", "p1");
         let gone = instance("gone", "p2");
@@ -503,8 +562,12 @@ mod tests {
                 &partial(vec![kept.clone()], &["p2"]),
             )
         };
-        assert!(!unreadable(&feed), "p2 cannot be looked at again yet");
-        assert!(!unreadable(&feed));
+        assert_eq!(
+            unreadable(&feed),
+            Observed::ReadFailed,
+            "p2 cannot be looked at again yet"
+        );
+        assert_eq!(unreadable(&feed), Observed::ReadFailed);
 
         // It reads again and gone is still missing: now it is confirmed.
         let mut rx = feed.subscribe();
@@ -528,8 +591,8 @@ mod tests {
             )
         };
         // Two failed reads, as when the scheduled retry also fails.
-        assert!(!failed_read(&feed), "nothing to confirm or retry");
-        assert!(!failed_read(&feed));
+        assert_eq!(failed_read(&feed), Observed::ReadFailed);
+        assert_eq!(failed_read(&feed), Observed::ReadFailed);
         assert!(rx.try_recv().is_err(), "held was not deleted");
 
         // The profile recovers with its session intact: nothing is created.
@@ -537,8 +600,74 @@ mod tests {
         assert!(rx.try_recv().is_err(), "held was not created again");
 
         // Failing to list profiles at all is no evidence either.
-        assert!(!feed.observe_disk(feed.commit_generation(), &listing_failed()));
-        assert!(!feed.observe_disk(feed.commit_generation(), &listing_failed()));
+        for _ in 0..2 {
+            assert_eq!(
+                feed.observe_disk(feed.commit_generation(), &listing_failed()),
+                Observed::ReadFailed
+            );
+        }
         assert!(rx.try_recv().is_err(), "an empty listing deleted nothing");
+    }
+
+    /// A wake consumed by a transient read failure must still publish the change once the
+    /// read recovers, with no further event; a persistent failure stops asking after its
+    /// budget, and fresh activity or a healthy read refills it.
+    #[test]
+    fn read_failures_are_retried_within_a_bounded_budget() {
+        let mut retry = ReadRetry::default();
+        let failed = |retry: &mut ReadRetry, fresh| retry.next(Observed::ReadFailed, fresh);
+
+        let delays: Vec<_> = std::iter::once(failed(&mut retry, true))
+            .chain((1..READ_RETRY_ATTEMPTS).map(|_| failed(&mut retry, false)))
+            .collect();
+        let want: Vec<_> = (0..READ_RETRY_ATTEMPTS)
+            .map(|n| Some(READ_RETRY_BASE_DELAY * 2u32.pow(n)))
+            .collect();
+        assert_eq!(delays, want, "each retry waits twice as long");
+        assert_eq!(failed(&mut retry, false), None, "the budget is spent");
+        assert_eq!(failed(&mut retry, false), None);
+
+        assert!(failed(&mut retry, true).is_some(), "fresh activity refills");
+        assert_eq!(retry.next(Observed::Settled, false), None);
+        assert_eq!(
+            failed(&mut retry, false),
+            Some(READ_RETRY_BASE_DELAY),
+            "a healthy read refills"
+        );
+
+        let mut retry = ReadRetry::default();
+        for _ in 0..=READ_RETRY_ATTEMPTS {
+            assert_eq!(retry.next(Observed::Again, false), Some(AGAIN_DELAY));
+        }
+        assert!(
+            failed(&mut retry, false).is_some(),
+            "a second look does not draw on the read budget"
+        );
+    }
+
+    #[test]
+    fn a_rename_consumed_by_a_failed_read_is_published_when_the_retry_reads() {
+        let feed = LifecycleFeed::new();
+        let mut rx = feed.subscribe();
+        let a = instance("a", "p1");
+        let b = instance("b", "p2");
+        observe(&feed, vec![a.clone(), b.clone()]);
+        let mut renamed = b.clone();
+        renamed.title = "renamed".to_string();
+
+        let mut retry = ReadRetry::default();
+        let read = |feed: &LifecycleFeed, loaded: LoadedInstances| {
+            feed.observe_disk(feed.commit_generation(), &loaded)
+        };
+        // The wake finds p2 unreadable ...
+        let observed = read(&feed, partial(vec![a.clone()], &["p2"]));
+        assert_eq!(observed, Observed::ReadFailed);
+        assert!(retry.next(observed, true).is_some(), "a retry is scheduled");
+        assert!(rx.try_recv().is_err());
+        // ... and with no new event the retry reads it back.
+        let observed = read(&feed, complete(vec![a, renamed]));
+        assert_eq!(observed, Observed::Settled);
+        assert_eq!(rx.try_recv().unwrap().kind, LifecycleKind::Renamed);
+        assert_eq!(retry.next(observed, false), None);
     }
 }
