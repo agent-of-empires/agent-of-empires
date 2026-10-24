@@ -151,6 +151,7 @@ export interface ElicitationOption {
   value: string;
   label: string;
   description?: string | null;
+  preview?: string | null;
 }
 
 /** Mirror of the untagged Rust `AnswerValue`. */
