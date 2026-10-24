@@ -21,6 +21,9 @@ const suggestion = {
   start_blocked_reason: null,
 };
 
+// main requires a runtime cursor on session responses; without it the client marks the daemon offline.
+const CURSOR = { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" };
+
 const snapshot = {
   items: [suggestion],
   providers: [
@@ -31,7 +34,9 @@ const snapshot = {
 
 test("suggestions remain available without sessions and support mobile keyboard review", async ({ page }) => {
   await mockTerminalApis(page);
-  await page.route("**/api/sessions", (route) => route.fulfill({ json: { sessions: [], workspace_ordering: [] } }));
+  await page.route("**/api/sessions", (route) =>
+    route.fulfill({ headers: CURSOR, json: { sessions: [], workspace_ordering: [] } }),
+  );
   await page.route("**/api/suggestions**", (route) => route.fulfill({ json: snapshot }));
   await page.route("**/api/suggestions/prepare**", (route) =>
     route.fulfill({
@@ -105,7 +110,9 @@ test("suggestions remain available without sessions and support mobile keyboard 
 
 test("suggestions can be dismissed, restored, and started through the browser flow", async ({ page }) => {
   await mockTerminalApis(page);
-  await page.route("**/api/sessions", (route) => route.fulfill({ json: { sessions: [], workspace_ordering: [] } }));
+  await page.route("**/api/sessions", (route) =>
+    route.fulfill({ headers: CURSOR, json: { sessions: [], workspace_ordering: [] } }),
+  );
   const liveSnapshot = structuredClone(snapshot);
   await page.route("**/api/suggestions**", async (route) => {
     if (route.request().method() === "GET") {
@@ -139,7 +146,9 @@ test("suggestions can be dismissed, restored, and started through the browser fl
 
 test("provider errors stay visible alongside the last successful suggestions", async ({ page }) => {
   await mockTerminalApis(page);
-  await page.route("**/api/sessions", (route) => route.fulfill({ json: { sessions: [], workspace_ordering: [] } }));
+  await page.route("**/api/sessions", (route) =>
+    route.fulfill({ headers: CURSOR, json: { sessions: [], workspace_ordering: [] } }),
+  );
   const failedSnapshot = structuredClone(snapshot);
   failedSnapshot.providers[0] = {
     ...failedSnapshot.providers[0],
@@ -159,7 +168,9 @@ test("provider errors stay visible alongside the last successful suggestions", a
 
 test("opens suggestions from the mobile sidebar without losing the active profile", async ({ page }) => {
   await mockTerminalApis(page);
-  await page.route("**/api/sessions", (route) => route.fulfill({ json: { sessions: [], workspace_ordering: [] } }));
+  await page.route("**/api/sessions", (route) =>
+    route.fulfill({ headers: CURSOR, json: { sessions: [], workspace_ordering: [] } }),
+  );
   await page.route("**/api/suggestions**", (route) => route.fulfill({ json: snapshot }));
   await page.setViewportSize({ width: 375, height: 812 });
   await page.goto("/?profile=work");
@@ -173,7 +184,9 @@ test("opens suggestions from the mobile sidebar without losing the active profil
 
 test("opens suggestions from the desktop sidebar without hiding the sidebar", async ({ page }) => {
   await mockTerminalApis(page);
-  await page.route("**/api/sessions", (route) => route.fulfill({ json: { sessions: [], workspace_ordering: [] } }));
+  await page.route("**/api/sessions", (route) =>
+    route.fulfill({ headers: CURSOR, json: { sessions: [], workspace_ordering: [] } }),
+  );
   await page.route("**/api/suggestions**", (route) => route.fulfill({ json: snapshot }));
   await page.setViewportSize({ width: 1280, height: 900 });
   await page.goto("/?profile=work");
