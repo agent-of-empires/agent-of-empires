@@ -58,15 +58,16 @@ pub async fn run(_profile: &str, args: MoveArgs) -> Result<()> {
             if moved.is_empty() {
                 return Err(error);
             }
-            let remaining: Vec<&str> = batch
+            let untried: Vec<&str> = batch
                 .iter()
                 .map(|r| r.id.as_str())
-                .filter(|id| !moved.contains(id))
+                .filter(|id| *id != row.id && !moved.contains(id))
                 .collect();
             bail!(
-                "{error:#}\nAlready moved to '{target}': {}\nNot moved: {}",
+                "{error:#}\nAlready moved to '{target}': {}\nNot confirmed (check with `aoe session list`): {}\nNot attempted: {}",
                 moved.join(", "),
-                remaining.join(", ")
+                row.id,
+                untried.join(", ")
             );
         }
         moved.push(&row.id);
