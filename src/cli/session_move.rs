@@ -62,9 +62,6 @@ pub async fn run(profile: &str, args: MoveArgs) -> Result<()> {
         };
         if let Err(error) = client.rename_session(&row.id, &body, &info.epoch).await {
             let error = anyhow::Error::from(error).context(format!("Failed to move {}", row.id));
-            if moved.is_empty() {
-                return Err(error);
-            }
             let ids: Vec<&str> = batch.iter().map(|r| r.id.as_str()).collect();
             bail!(partial_report(
                 &format!("{error:#}"),
@@ -91,11 +88,20 @@ fn partial_report(error: &str, target: &str, ids: &[&str], moved: &[&str], faile
         .copied()
         .filter(|id| *id != failed && !moved.contains(id))
         .collect();
-    format!(
-        "{error}\nAlready moved to '{target}': {}\nNot confirmed (check with `aoe session list`): {failed}\nNot attempted: {}",
-        moved.join(", "),
-        untried.join(", ")
-    )
+    let mut report = error.to_string();
+    if !moved.is_empty() {
+        report.push_str(&format!(
+            "\nAlready moved to '{target}': {}",
+            moved.join(", ")
+        ));
+    }
+    report.push_str(&format!(
+        "\nNot confirmed (check with `aoe session list`): {failed}"
+    ));
+    if !untried.is_empty() {
+        report.push_str(&format!("\nNot attempted: {}", untried.join(", ")));
+    }
+    report
 }
 
 /// Id, then unique id prefix, then unique title.
@@ -236,7 +242,14 @@ mod tests {
         assert!(report.ends_with("Not attempted: c"));
 
         let first = partial_report("boom", "work", &ids, &[], "a");
+        assert!(!first.contains("Already moved"));
         assert!(first.contains("Not confirmed (check with `aoe session list`): a\n"));
         assert!(first.ends_with("Not attempted: b, c"));
+
+        let only = partial_report("boom", "work", &["a"], &[], "a");
+        assert_eq!(
+            only,
+            "boom\nNot confirmed (check with `aoe session list`): a"
+        );
     }
 }
