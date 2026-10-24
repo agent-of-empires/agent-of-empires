@@ -745,9 +745,15 @@ pub(crate) async fn spawn_structured_session(
                 let claude_store_pin = response_instance.selected_claude_store_pin();
                 service.work.spawn("acp.create_spawn", async move {
                     let namespace = spawn_state.profile_namespace.read().await;
-                    let submission = service_for_check.prompt_submission(&id).await;
-                    let inst_lock = service_for_check.instance_lock(&id).await;
-                    let guard = inst_lock.lock().await;
+                    let Some((submission, guard)) = acquire_spawn_guards(
+                        &service_for_check,
+                        &id,
+                        reservation.lease().cancellation(),
+                    )
+                    .await
+                    else {
+                        return;
+                    };
                     let check_id = id.clone();
                     let checked = tokio::task::spawn_blocking(move || {
                         use crate::session::SessionStore;
@@ -869,6 +875,28 @@ pub(crate) async fn spawn_structured_session(
     }
 }
 
+/// Takes the submission and instance guards, or `None` once a stop cancels the
+/// lease. A purge holds both guards while it waits for this reservation to
+/// drop, so waiting through a cancel deadlocks until its timeout.
+async fn acquire_spawn_guards(
+    service: &SessionService,
+    id: &str,
+    cancelled: &tokio_util::sync::CancellationToken,
+) -> Option<(
+    tokio::sync::OwnedMutexGuard<()>,
+    tokio::sync::OwnedMutexGuard<()>,
+)> {
+    let acquire = async {
+        let submission = service.prompt_submission(id).await;
+        let instance = service.instance_lock(id).await.lock_owned().await;
+        (submission, instance)
+    };
+    tokio::select! {
+        guards = acquire => Some(guards),
+        () = cancelled.cancelled() => None,
+    }
+}
+
 pub(crate) async fn finish_structured_launch(
     state: &Arc<super::AppState>,
     native: Arc<super::session_store::NativeSessionStore>,
@@ -918,6 +946,27 @@ pub(crate) async fn finish_structured_launch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn spawn_guard_wait_yields_to_lease_cancellation() {
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let service = &state.session_service;
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        assert!(acquire_spawn_guards(service, "s1", &cancelled)
+            .await
+            .is_some());
+
+        let held = service.instance_lock("s1").await.lock_owned().await;
+        cancelled.cancel();
+        let waited = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            acquire_spawn_guards(service, "s1", &cancelled),
+        )
+        .await
+        .expect("a cancelled lease must not wait on the held guards");
+        assert!(waited.is_none());
+        drop(held);
+    }
 
     #[tokio::test]
     #[serial_test::serial]
