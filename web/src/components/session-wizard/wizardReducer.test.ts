@@ -114,8 +114,46 @@ describe("APPLY_PROFILE_DEFAULTS", () => {
       true,
     ],
     ["import", { importAcpSessionId: "abc" }, [], defaults({ useStructuredView: false }), true],
+    [
+      "off outranks a hand-set view",
+      {},
+      [set("useStructuredView", true)],
+      defaults({ useStructuredView: false, structuredViewOffered: false }),
+      false,
+    ],
   ] as const)("seeds the configured view: %s", (_, data, edits, seed, view) => {
     expect(run(makeState(data), ...edits, seed).data.useStructuredView).toBe(view);
+  });
+});
+
+describe("structuredViewOffered", () => {
+  it("follows the latest profile defaults, and an omitted flag keeps the last one", () => {
+    const off = reducer(makeState(), defaults({ structuredViewOffered: false }));
+    expect(off.data.structuredViewOffered).toBe(false);
+    expect(reducer(off, defaults()).data.structuredViewOffered).toBe(false);
+    expect(reducer(off, defaults({ structuredViewOffered: true })).data.structuredViewOffered).toBe(true);
+  });
+});
+
+describe("leaving an import under structured_view off", () => {
+  // An import deliberately holds structured while the toggle is hidden; ending it must not leak that.
+  it.each([
+    ["another project", set("path", "/other")],
+    ["Scratch", set("scratch", true)],
+  ])("clears the structured choice when moving to %s", (_, edit) => {
+    const importing = makeState({
+      importAcpSessionId: "abc",
+      useStructuredView: true,
+      structuredViewOffered: false,
+    });
+    const next = reducer(importing, edit);
+    expect(next.data.importAcpSessionId).toBe("");
+    expect(next.data.useStructuredView).toBe(false);
+  });
+
+  it("keeps the choice when structured is offered", () => {
+    const importing = makeState({ importAcpSessionId: "abc", useStructuredView: true });
+    expect(reducer(importing, set("path", "/other")).data.useStructuredView).toBe(true);
   });
 });
 

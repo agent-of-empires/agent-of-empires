@@ -116,11 +116,22 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
     // constructor. Distinct `(profile, project_path)` pairs resolve once via
     // the shared cache.
     for (resp, inst) in sessions.iter_mut().zip(scoped_instances.iter().copied()) {
-        if resp.acp_capable {
-            continue;
+        if !resp.acp_capable {
+            let cfg = session_cfg_cache.resolve(&inst.source_profile, &inst.project_path);
+            // The key the constructor resolved built-ins with: `agent_name`, else `tool`.
+            let agent_key = inst
+                .agent_name
+                .as_deref()
+                .filter(|name| !name.is_empty())
+                .unwrap_or(&inst.tool);
+            resp.acp_capable = custom_agent_acp_capable(cfg, agent_key);
         }
-        let cfg = session_cfg_cache.resolve(&inst.source_profile, &inst.project_path);
-        resp.acp_capable = custom_agent_acp_capable(cfg, &inst.tool);
+        // Only a terminal session that could switch needs the setting resolved.
+        if resp.acp_capable && !inst.is_structured() {
+            resp.structured_view_off = !session_cfg_cache
+                .structured_view(&inst.source_profile, &inst.project_path)
+                .is_offered();
+        }
     }
 
     // Resolve per-profile cleanup defaults with a TTL cache on AppState
@@ -719,6 +730,7 @@ mod workspace_ordering_tests {
             acp_session_id: None,
             acp_agent: None,
             acp_can_fork: false,
+            structured_view_off: false,
             keeps_context: false,
             clear_aliases: Vec::new(),
             claude_fullscreen: false,

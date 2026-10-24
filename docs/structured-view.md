@@ -136,8 +136,8 @@ It exits 1 if Node is missing, 2 if some agents are unreachable, else 0. Pass `-
 
 ## Choosing the view per session
 
-- **Web wizard:** defaults to the structured view (set [`acp.default_new_session_view`](guides/configuration.md) to change it); turn off **Use structured view** to get the terminal view.
-- **CLI / TUI:** default to the terminal view. From the CLI, opt in with `--structured-view` or `--agent`; in the TUI new-session dialog, toggle the **Structured** field (shown for ACP-capable tools).
+- **Web wizard and TUI dialog:** default to the structured view; set [`acp.structured_view`](guides/configuration.md) to `terminal` to preselect the terminal, or `off` to hide the option. Turn off **Use structured view** (the **Structured** field in the TUI, shown for ACP-capable tools) to get the terminal view.
+- **CLI:** defaults to the terminal view; opt in with `--structured-view` or `--agent`.
 - Either way, an existing active session can switch views: the web sidebar's right-click menu (**Switch to terminal** / **Switch to structured view**) or the TUI's right-click context menu (requires a healthy runtime; archived, trashed, and still-creating rows are excluded until they leave that state). Both surfaces confirm first. The worktree, open files, and commits are always preserved. For a **claude** session, the conversation is kept in both directions only when AoE can resolve a shared native store. A terminal switch whose store cannot be resolved, or which the structured worker does not share, is refused with HTTP 409 and `set-session-id --store` recovery guidance. Every other agent starts fresh on the target surface.
 
 If the agent cannot resume a prior conversation, the transcript reports a context reset before assigning a fresh conversation. Recorded terminal context and an explicitly selected conversation count as prior context. Reattaching to the same live conversation does not add a reset.

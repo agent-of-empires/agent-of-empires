@@ -1,6 +1,7 @@
 //! The `SessionResponse` wire model and per-request config resolution.
 
 use super::*;
+use crate::session::config::StructuredView;
 use crate::session::projection::SessionProjection;
 use chrono::{DateTime, Utc};
 
@@ -166,6 +167,7 @@ impl SessionResponse {
                 &inst.tool,
                 inst.agent_name.as_deref(),
             ),
+            structured_view_off: false,
             // Same agent resolution as `acp_agent` above; computed once here so
             // the web dashboard and native TUI stop mirroring the gate.
             keeps_context: crate::agents::acp_transcript_cli_resumable(
@@ -363,7 +365,7 @@ pub(super) fn custom_agent_acp_capable(
 /// across the `list_sessions` overlays so a repo-local override is read from
 /// disk once per unique pair rather than once per row. See #2603.
 pub(super) struct SessionCfgCache<'a> {
-    entries: HashMap<(String, String), SessionConfig>,
+    entries: HashMap<(String, String), (SessionConfig, StructuredView)>,
     /// Where this cache reports its disk reads. The counter belongs to the
     /// request, not to the cache, so every cache the request opens adds to
     /// one total: splitting the shared cache per overlay then shows up as
@@ -380,18 +382,26 @@ impl<'a> SessionCfgCache<'a> {
         }
     }
     /// Resolve `(profile, project_path)`, reading from disk on first miss only.
-    pub(super) fn resolve(&mut self, profile: &str, project_path: &str) -> &SessionConfig {
+    fn entry(&mut self, profile: &str, project_path: &str) -> &(SessionConfig, StructuredView) {
         let misses = self.misses;
         self.entries
             .entry((profile.to_string(), project_path.to_string()))
             .or_insert_with(|| {
                 misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+                let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                     profile,
                     std::path::Path::new(project_path),
-                )
-                .session
+                );
+                (config.session, config.acp.structured_view)
             })
+    }
+
+    pub(super) fn resolve(&mut self, profile: &str, project_path: &str) -> &SessionConfig {
+        &self.entry(profile, project_path).0
+    }
+
+    pub(super) fn structured_view(&mut self, profile: &str, project_path: &str) -> StructuredView {
+        self.entry(profile, project_path).1
     }
 }
 

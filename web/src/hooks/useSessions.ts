@@ -18,6 +18,8 @@ function mergeSession(session: SessionResponse, previous: SessionResponse): Sess
     ...session,
     rate_limit: session.rate_limit === undefined ? previous.rate_limit : session.rate_limit,
     rate_limit_auto_resume: session.rate_limit_auto_resume ?? previous.rate_limit_auto_resume,
+    // Omitted when false, and mutation responses never resolve it: keep the polled value.
+    structured_view_off: session.structured_view_off ?? previous.structured_view_off,
   };
 }
 

@@ -1083,6 +1083,10 @@ pub struct SessionResponse {
     /// non-forkable agents.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub acp_can_fork: bool,
+    /// `acp.structured_view = off` for this session's profile and project: a
+    /// terminal session may not switch into the structured view.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub structured_view_off: bool,
     /// Whether switching this session between terminal and structured view
     /// preserves the conversation (only claude pairings share one
     /// CLI-resumable transcript). Server-owned via

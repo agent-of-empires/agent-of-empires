@@ -724,6 +724,8 @@ fn the_profile_row_cycles_and_rides_along_on_submit() {
 
     let mut dialog = with_profiles(&["default", "work"]);
     dialog.handle_key(key(KeyCode::Right));
+    // Structured is preselected by default, and its adapter check is not under test.
+    dialog.structured_enabled = false;
     assert_eq!(
         submitted(dialog.handle_key(key(KeyCode::Enter))).profile,
         "work"
@@ -843,6 +845,24 @@ fn editing_the_env_list_does_submit_a_session_override() {
         submitted(dialog.build_submit_result()).extra_env,
         vec!["THING=$NEW_THING".to_string(), "EXTRA=1".to_string()]
     );
+}
+
+#[test]
+fn structured_view_setting_gates_the_offer_and_sets_the_default() {
+    use crate::session::config::StructuredView;
+    for (view, offered, starts_structured) in [
+        (StructuredView::Off, false, false),
+        (StructuredView::Terminal, true, false),
+        (StructuredView::Structured, true, true),
+    ] {
+        let mut config = Config::default();
+        config.acp.structured_view = view;
+        assert_eq!(compute_structured_capable("claude", &config), offered);
+        assert_eq!(
+            config.acp.structured_view.starts_structured(),
+            starts_structured
+        );
+    }
 }
 
 #[test]
@@ -1567,6 +1587,8 @@ fn test_unreadable_registry_keeps_a_held_resolution_for_the_same_path() {
     assert!(dialog.sandbox_enabled, "the project's override resolved");
 
     fs::write(&registry, "{ not json").expect("break registry");
+    // Structured is preselected by default, and its adapter check is not under test.
+    dialog.structured_enabled = false;
     let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
     assert!(
         data.sandbox,
@@ -1604,6 +1626,8 @@ fn test_scratch_round_trip_does_not_count_an_unreadable_registry_as_resolved() {
     );
 
     fs::write(&registry, valid).expect("repair registry");
+    // Structured is preselected by default, and its adapter check is not under test.
+    dialog.structured_enabled = false;
     let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
     assert!(
         data.sandbox,
@@ -1635,6 +1659,8 @@ fn test_unreadable_registry_blocks_submission_until_the_path_resolves() {
 
     // A missing registry file is genuinely empty, and a repaired one resolves the override.
     fs::write(&registry, valid).expect("repair registry");
+    // Structured is preselected by default, and its adapter check is not under test.
+    dialog.structured_enabled = false;
     let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
     assert!(
         data.sandbox,
@@ -1794,7 +1820,7 @@ fn a_selected_session_carries_its_view() {
     fs::create_dir_all(app_dir.join("profiles").join("default")).expect("default profile");
     fs::write(
         app_dir.join("config.toml"),
-        "[acp]\noffer_structured_in_new_session = true\n",
+        "[acp]\nstructured_view = \"structured\"\n",
     )
     .expect("global config");
 
@@ -1830,7 +1856,7 @@ fn a_carried_agent_is_judged_by_the_repo_config() {
     fs::create_dir_all(app_dir.join("profiles").join("default")).expect("default profile");
     fs::write(
         app_dir.join("config.toml"),
-        "[acp]\noffer_structured_in_new_session = true\n",
+        "[acp]\nstructured_view = \"structured\"\n",
     )
     .expect("global config");
     let repo = tempfile::tempdir().expect("repo");
