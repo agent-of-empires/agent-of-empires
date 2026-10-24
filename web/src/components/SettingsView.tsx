@@ -167,6 +167,9 @@ interface Props {
   /** Notifies the host when the profile changes via the header dropdown,
    *  so it can keep `?profile=` in sync for shareable/refreshable URLs. */
   onSelectProfile?: (profile: string) => void;
+  /** `<section>.<key>` from the `?field=` query: scroll to and highlight that
+   *  row once the schema loads, as a settings-search jump does. */
+  field?: string | null;
   /** Read-only server: the Profiles tab hides its create/edit controls. */
   readOnly?: boolean;
   /** CityHall client mode: curate Settings to the end-user-safe tabs (Theme,
@@ -248,6 +251,7 @@ export function SettingsView({
   onServerAboutRefresh,
   profile,
   onSelectProfile,
+  field,
   readOnly,
   cityhall = false,
 }: Props) {
@@ -333,6 +337,19 @@ export function SettingsView({
     },
     [onSelectTab],
   );
+
+  // Deep link: once the schema loads, focus the `?field=` row if it is on the open tab.
+  const [deepLinked, setDeepLinked] = useState<string | null>(null);
+  if (field && field !== deepLinked && !schemaLoading) {
+    setDeepLinked(field);
+    const d = searchSchema.find(
+      (x) =>
+        `${x.section}.${x.field}` === field &&
+        x.web_write.policy !== "local_only" &&
+        SECTION_TO_TAB[x.section] === activeTab,
+    );
+    if (d) setFocusRequest((prev) => ({ section: d.section, field: d.field, nonce: (prev?.nonce ?? 0) + 1 }));
+  }
 
   useEffect(() => {
     fetchProfiles().then((p) => {

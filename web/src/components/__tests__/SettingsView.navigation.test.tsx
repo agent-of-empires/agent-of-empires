@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, describe, expect, it, vi, beforeEach } from "vitest";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { SettingsView } from "../SettingsView";
 
 const SCHEMA = [
@@ -34,7 +34,7 @@ afterEach(() => {
   localStorage.clear();
 });
 
-function renderView(tab: string | null) {
+function renderView(tab: string | null, field?: string) {
   const onSelectTab = vi.fn();
   const onShowList = vi.fn();
   render(
@@ -44,6 +44,7 @@ function renderView(tab: string | null) {
       onSelectTab={onSelectTab}
       onShowList={onShowList}
       onServerAboutRefresh={() => {}}
+      field={field}
     />,
   );
   return { onSelectTab, onShowList };
@@ -81,5 +82,23 @@ describe("SettingsView navigation", () => {
     // The field renders from the same schema, so the picker has had its chance.
     await screen.findByText(field);
     expect(!!screen.queryByTestId("settings-profile-picker")).toBe(shown);
+  });
+
+  describe("?field= deep link", () => {
+    const highlighted = () => document.querySelector(".animate-settings-highlight");
+
+    it("highlights and scrolls to the row on the open tab", async () => {
+      const scrollIntoView = vi.fn();
+      Element.prototype.scrollIntoView = scrollIntoView;
+      renderView("sandbox", "sandbox.enabled_by_default");
+      await waitFor(() => expect(scrollIntoView).toHaveBeenCalled());
+      expect(highlighted()?.getAttribute("data-settings-field")).toBe("sandbox.enabled_by_default");
+    });
+
+    it.each([["sandbox.nope"], ["updates.check_mode"]])("opens the tab without error for %s", async (field) => {
+      renderView("sandbox", field);
+      await screen.findByText("enabled_by_default");
+      expect(highlighted()).toBeNull();
+    });
   });
 });

@@ -2155,6 +2155,7 @@ function AppContent({
             await refreshProjects();
           }}
           profile={searchParams.get("profile")}
+          field={searchParams.get("field")}
           onSelectProfile={(p) => {
             const next = new URLSearchParams(searchParams);
             next.set("profile", p);
