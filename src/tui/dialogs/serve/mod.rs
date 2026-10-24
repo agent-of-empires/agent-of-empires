@@ -566,6 +566,22 @@ impl ServeView {
         Self::with_probe_handler(run_probe)
     }
 
+    /// A view past its construction probe, for tests that need the settled screen.
+    #[cfg(test)]
+    pub(crate) fn settled() -> Self {
+        let mut view = Self::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while matches!(view.state, ServeViewState::Checking { .. }) {
+            view.tick();
+            assert!(
+                Instant::now() < deadline,
+                "construction probe never settled"
+            );
+            std::thread::yield_now();
+        }
+        view
+    }
+
     fn with_probe_handler(handler: impl FnMut(Probe) -> bool + Send + 'static) -> Self {
         let mut probes = Probes::new(handler);
         let attempt = probes.request(Probe::WebDaemon);
