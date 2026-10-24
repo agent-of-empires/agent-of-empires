@@ -87,7 +87,7 @@ pub(crate) async fn login(
     let res = client.post(url).json(&body).send().await?;
     let status = res.status();
     if !status.is_success() {
-        return Err(map_auth_error(status));
+        return Err(map_auth_error(status, res.headers()));
     }
     let cookie = extract_session_cookie(res.headers()).ok_or(HttpError::Unauthorized)?;
     let session = PassphraseSession {
@@ -99,15 +99,10 @@ pub(crate) async fn login(
     Ok(session)
 }
 
-/// Authentication response bodies can reflect credentials, including transformed values.
-fn map_auth_error(status: StatusCode) -> HttpError {
-    match status {
-        StatusCode::UNAUTHORIZED => HttpError::Unauthorized,
-        _ => HttpError::Server {
-            status,
-            body: String::new(),
-        },
-    }
+/// Authentication response bodies can reflect credentials, so only the status and the
+/// validated error-code header are read.
+fn map_auth_error(status: StatusCode, headers: &HeaderMap) -> HttpError {
+    super::http::classify_status(status, headers, None, false)
 }
 
 /// Confirm the passphrase again against `POST /api/login/elevate`, extending
@@ -136,7 +131,7 @@ pub(super) async fn elevate(
     if status.is_success() {
         return Ok(());
     }
-    Err(map_auth_error(status))
+    Err(map_auth_error(status, res.headers()))
 }
 
 fn login_client(url: impl reqwest::IntoUrl) -> Result<(reqwest::Client, reqwest::Url), HttpError> {
@@ -471,16 +466,41 @@ mod tests {
         assert!(cache_dir.join(DEVICE_BINDING_FILENAME).exists());
     }
 
+    /// 401 maps from the status alone; a coded 403 keeps its code only when exactly one
+    /// known value agrees with the status. The body is never an input.
     #[test]
-    fn map_auth_error_distinguishes_unauthorized_from_generic() {
-        assert!(matches!(
-            map_auth_error(StatusCode::UNAUTHORIZED),
-            HttpError::Unauthorized
-        ));
-        assert!(matches!(
-            map_auth_error(StatusCode::TOO_MANY_REQUESTS),
-            HttpError::Server { status, .. } if status == StatusCode::TOO_MANY_REQUESTS
-        ));
+    fn map_auth_error_classifies_from_the_status_and_one_valid_code() {
+        let headers = |values: &[&str]| {
+            let mut map = HeaderMap::new();
+            for value in values {
+                map.append("aoe-error-code", value.parse().unwrap());
+            }
+            map
+        };
+        let forbidden = StatusCode::FORBIDDEN;
+        for (status, values, want) in [
+            (StatusCode::UNAUTHORIZED, &["read_only"][..], "unauthorized"),
+            (forbidden, &["read_only"], "read_only"),
+            (
+                forbidden,
+                &["access_policy_denied"],
+                "code:access_policy_denied",
+            ),
+            (forbidden, &[], "status"),
+            (forbidden, &["not_a_code"], "status"),
+            (forbidden, &["access_policy_denied", "read_only"], "status"),
+            (StatusCode::CONFLICT, &["access_policy_denied"], "status"),
+            (StatusCode::TOO_MANY_REQUESTS, &[], "status"),
+        ] {
+            let got = match map_auth_error(status, &headers(values)) {
+                HttpError::Unauthorized => "unauthorized".to_string(),
+                HttpError::ReadOnly => "read_only".to_string(),
+                HttpError::Server { body, .. } if !body.is_empty() => format!("code:{body}"),
+                HttpError::Server { .. } => "status".to_string(),
+                other => panic!("{status} {values:?}: {other:?}"),
+            };
+            assert_eq!(got, want, "{status} {values:?}");
+        }
     }
 
     #[tokio::test]

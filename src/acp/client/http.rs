@@ -937,9 +937,18 @@ fn check_resolve_status(res: reqwest::Response, session_id: &str) -> Result<(), 
 }
 
 fn status_error(res: &reqwest::Response, session_id: Option<&str>, resolving: bool) -> HttpError {
+    classify_status(res.status(), res.headers(), session_id, resolving)
+}
+
+/// Classify from the status and the one validated `AoE-Error-Code` header, never a body.
+pub(super) fn classify_status(
+    status: StatusCode,
+    headers: &header::HeaderMap,
+    session_id: Option<&str>,
+    resolving: bool,
+) -> HttpError {
     use crate::daemon::ApiErrorCode;
-    let status = res.status();
-    let code = ApiErrorCode::from_headers(status, res.headers(), resolving);
+    let code = ApiErrorCode::from_headers(status, headers, resolving);
     match (status, code) {
         (StatusCode::UNAUTHORIZED, _) => HttpError::Unauthorized,
         (_, Some(ApiErrorCode::ReadOnly)) => HttpError::ReadOnly,
