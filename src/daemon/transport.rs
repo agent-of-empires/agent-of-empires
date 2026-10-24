@@ -537,8 +537,18 @@ mod tests {
             fs::{MetadataExt, PermissionsExt},
         };
 
+        // Filesystems need not accept non-UTF-8 names.
+        let invalid = std::path::PathBuf::from(OsString::from_vec(b"invalid-\xff".to_vec()));
+        for mode in ["0700", "go-w"] {
+            let diagnostic =
+                directory_permission_error(&invalid, mode, "Repair directory permissions")
+                    .to_string();
+            assert!(!diagnostic.contains("`chmod"), "{diagnostic}");
+            assert!(diagnostic.contains(&format!("{invalid:?}")), "{diagnostic}");
+            assert!(diagnostic.contains("manually, then retry"), "{diagnostic}");
+        }
+
         for name in [
-            OsString::from_vec(b"invalid-\xff".to_vec()),
             OsString::from("carriage\rreturn"),
             OsString::from("line\nfeed"),
             OsString::from("back`tick"),
