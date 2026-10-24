@@ -254,7 +254,7 @@ Git worktrees need the bare repo pattern so the container can reach the repo's g
 
 ### Container killed (OOM)
 
-Without `--rm`, an OOM-killed container stops but remains available to inspect. Before deleting the session, run `docker inspect <container>` and check `State.OOMKilled`. `sandbox.extra_run_args` can add `--rm`, which removes the container on exit. Docker Desktop runs containers in a Linux VM with a configurable memory ceiling. The VM's kernel can kill containers when memory runs out.
+For Docker, without `--rm`, an OOM-killed container stops but remains available to inspect. Before deleting the session, run `docker inspect <container>` and check `State.OOMKilled`. `sandbox.extra_run_args` can add `--rm`, which removes the container on exit. Docker Desktop runs containers in a Linux VM with a configurable memory ceiling. The VM's kernel can kill containers when memory runs out.
 
 Check Docker Desktop's configured VM memory under **Settings > Resources > Advanced** before choosing `[sandbox] memory_limit`. Raise the VM allocation if needed, and give each container an explicit limit no larger than the VM's available memory. `docker stats --no-stream` shows the limit a running container got. With Docker Engine running directly on Linux, there is no Desktop VM ceiling; a container limit can stop one container from taking all the host's RAM.
 
