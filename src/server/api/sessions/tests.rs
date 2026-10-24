@@ -7653,6 +7653,33 @@ async fn restart_for_update_refuses_a_session_that_is_not_out_of_date() {
 }
 
 #[tokio::test]
+async fn an_update_restart_refuses_a_session_that_became_busy_before_admission() {
+    let mut inst = Instance::new("busy-agent", "/tmp/busy-agent");
+    inst.id = "busy-agent".to_string();
+    inst.status = Status::Running;
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+    let body = crate::daemon::RestartSessionBody {
+        only_if_idle: true,
+        ..Default::default()
+    };
+    let response = lifecycle::prepare_agent_session(
+        state.clone(),
+        "busy-agent".to_string(),
+        Ok(None),
+        lifecycle::AgentPreparation::Restart,
+        Some(Arc::new(body)),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let instances = state.instances.read().await;
+    assert_eq!(
+        instances[0].status,
+        Status::Running,
+        "nothing was torn down or relaunched"
+    );
+}
+
+#[tokio::test]
 async fn update_restart_of_a_structured_session_defers_to_the_reconciler() {
     let mut inst = Instance::new("structured-agent", "/tmp/structured-agent");
     inst.id = "structured-agent".to_string();

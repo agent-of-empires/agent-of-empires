@@ -346,6 +346,9 @@ pub struct RestartSessionBody {
     #[serde(default)]
     pub discard_sandbox_container: bool,
     pub wake_message: Option<String>,
+    /// Refuse, under the lifecycle locks, a session that is no longer Idle.
+    #[serde(default)]
+    pub only_if_idle: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -280,7 +280,7 @@ impl HomeView {
             new_tool,
             new_extra_args,
             new_command_override,
-            None,
+            false,
         )
     }
 
@@ -323,17 +323,18 @@ impl HomeView {
         if !auto_resume {
             anyhow::bail!("auto_resume_on_restart is off, so a restart would start a new conversation. Restart with 'e' if that is intended");
         }
-        self.restart_selected_session_with_wake(None, None, None, None, Some(String::new()))
+        self.restart_selected_session_with_wake(None, None, None, None, true)
     }
 
-    /// `wake_message` replaces `session.restart_wake_message` when set.
+    /// `for_update` sends no wake-up message and has the daemon refuse a session that is no longer
+    /// idle.
     fn restart_selected_session_with_wake(
         &mut self,
         new_profile: Option<&str>,
         new_tool: Option<&str>,
         new_extra_args: Option<&str>,
         new_command_override: Option<&str>,
-        wake_message: Option<String>,
+        for_update: bool,
     ) -> anyhow::Result<()> {
         let id = match &self.selected_session {
             Some(id) => id.clone(),
@@ -390,7 +391,8 @@ impl HomeView {
             extra_args: new_extra_args.map(str::to_owned),
             command_override: new_command_override.map(str::to_owned),
             unsnooze: wake_snooze,
-            wake_message,
+            wake_message: for_update.then(String::new),
+            only_if_idle: for_update,
             ..Default::default()
         };
         if let Err(error) = self

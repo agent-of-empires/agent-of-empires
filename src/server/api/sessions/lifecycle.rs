@@ -1852,6 +1852,7 @@ pub(super) async fn apply_update_restart(
     }
     let body = crate::daemon::RestartSessionBody {
         wake_message: Some(String::new()),
+        only_if_idle: true,
         ..Default::default()
     };
     prepare_agent_session(
@@ -2297,6 +2298,15 @@ async fn prepare_agent_session_inner(
     }
     if state.cityhall_mode && !instance.is_structured() {
         return crate::server::api::cityhall_response();
+    }
+    // The eligibility check that asked for this ran before these locks, and a prompt can land
+    // while it waited, so the idle promise is enforced on the row this request reloaded.
+    if restart.as_ref().is_some_and(|body| body.only_if_idle) && instance.status != Status::Idle {
+        return api_error(
+            StatusCode::CONFLICT,
+            "not_eligible",
+            "Session is busy or its agent is not out of date".to_string(),
+        );
     }
     // #4116: a shelved row refuses every start path with its own code, decided on
     // the row this request reloaded. It answers before the lifecycle reservation,
