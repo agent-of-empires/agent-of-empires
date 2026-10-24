@@ -1,0 +1,99 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>PROTOTYPE (throwaway): remote row sizing in merged home list</title>
+<style>
+body{font:15px/1.5 system-ui;max-width:900px;margin:2rem auto;padding:0 1rem;color:#222}
+h1{font-size:1.3rem}.q{background:#fff7e0;border-left:4px solid #d08a00;padding:.6rem 1rem}
+button{font:inherit;padding:.3rem .7rem;margin:.15rem;border:1px solid #888;border-radius:6px;background:#fff;cursor:pointer}
+button.on{background:#d08a00;color:#fff;border-color:#d08a00}
+pre{background:#111;color:#ddd;padding:.7rem;overflow:auto;min-height:7rem}
+table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:.25rem .6rem;text-align:left}
+.bad{color:#b00020;font-weight:600}.ok{color:#0a7d2c;font-weight:600}
+</style>
+<h1>PROTOTYPE (throwaway): preview of a session this client does not own</h1>
+<p class="q"><b>Question:</b> in a merged home list, a remote session is owned (size lock) by someone else at a big grid
+(say a 200x50 browser). Our row preview is a small rectangle. What should the preview do: crop, claim and resize, or avoid the live grid in the list?
+Facts from real tmux 3.7c: a non-owner frame carries no column count (<code>pane0</code> is null for a single pane), only ANSI lines at the owner's width;
+<code>resize-window</code> to the preview rect re-wraps history for every viewer.</p>
+
+<h3>Setup</h3>
+Owner grid cols <input id=oc type=number value=200 style="width:4rem"> rows <input id=or type=number value=50 style="width:4rem">
+&nbsp; Preview rect cols <input id=pc type=number value=60 style="width:4rem"> rows <input id=pr type=number value=15 style="width:4rem">
+&nbsp; Other viewers on the session <input id=ov type=number value=1 style="width:3rem">
+<div id=policies></div>
+<h3>Actions</h3>
+<button id=nav>Move cursor onto this remote row</button>
+<button id=nav5>Scroll past 5 remote rows</button>
+<button id=att>Press Enter (attach)</button>
+<h3>State</h3>
+<pre id=out></pre>
+<h3>Walkthroughs</h3>
+<div id=tabs></div><p id=desc></p><div id=steps></div>
+<script>
+// ---- pure module (liftable): (state, action) -> state ----
+const POLICIES = {
+  crop:   {name:'A. Crop owner grid to rect (never resize)'},
+  claim:  {name:'B. Claim lock and resize remote to rect'},
+  hybrid: {name:'C. List shows crop (read-only); Enter claims (explicit takeover)'},
+};
+function visibleFraction(s){ return Math.min(1,s.pc/s.oc)*Math.min(1,s.pr/s.or); }
+function reduce(s, a){
+  s = {...s, log:[...s.log], last:''};
+  const say = m => s.log.push(m);
+  if(a.t==='policy'){ return {...s, policy:a.v, log:[], last:'policy changed'}; }
+  if(a.t==='cfg'){ return {...s, ...a.v}; }
+  if(a.t==='nav'){
+    if(s.policy==='claim' && !s.weOwn){
+      s.weOwn = true; s.resizes++; s.displacedViewers += s.ov;
+      s.grid=[s.pc,s.pr];
+      say(`Took size lock, remote window ${s.oc}x${s.or} -> ${s.pc}x${s.pr}. ${s.ov} other viewer(s) now see a re-wrapped, cramped window; full-screen agents redraw and lose scrollback layout.`);
+    } else if(s.policy==='claim'){ say('Already owner at rect size.'); }
+    else {
+      s.weOwn = false;
+      const f = Math.round(visibleFraction(s)*100);
+      say(`Read-only. Frame is ${s.oc}x${s.or}, rect is ${s.pc}x${s.pr}: ${f}% of the screen visible, lines wider than ${s.pc} cut (no wrap possible without a width hint).`);
+      s.crops++;
+    }
+  }
+  if(a.t==='leave'){
+    if(s.policy==='claim' && s.weOwn){ s.weOwn=false; s.resizes++; s.grid=[s.oc,s.or]; say(`Released lock, grid restored to ${s.oc}x${s.or} (second resize; viewers redraw again).`); }
+    else say('Left row. Nothing to undo.');
+  }
+  if(a.t==='nav5'){ for(let i=0;i<5;i++){ s=reduce(reduce(s,{t:'nav'}),{t:'leave'}); } s.log.push('(5 rows passed: cursor jitter = resize churn under B)'); }
+  if(a.t==='att'){
+    s.weOwn = true; s.attached = true; s.resizes++; s.displacedViewers += s.ov; s.grid=[s.pc, s.pr];
+    say(`Explicit attach: stole lock, grid ${s.pc}x${s.pr} (full screen in real use). Same as today's picker Enter. Owner viewers get is_owner=false.`);
+  }
+  return s;
+}
+const init = () => ({policy:'hybrid',oc:200,or:50,pc:60,pr:15,ov:1,weOwn:false,attached:false,grid:[200,50],resizes:0,displacedViewers:0,crops:0,log:[],last:''});
+// ---- thin shell ----
+let S = init();
+const $ = id => document.getElementById(id);
+function dispatch(a){ S = reduce(S,a); render(); }
+function render(){
+  $('policies').innerHTML = Object.entries(POLICIES).map(([k,p])=>`<button class="${S.policy===k?'on':''}" onclick="dispatch({t:'policy',v:'${k}'})">${p.name}</button>`).join('');
+  const churn = S.resizes>0 ? '<span class=bad>'+S.resizes+'</span>' : '<span class=ok>0</span>';
+  $('out').innerHTML = `policy:            ${POLICIES[S.policy].name}
+remote window:     ${S.grid[0]}x${S.grid[1]}   (we hold size lock: ${S.weOwn})
+preview rect:      ${S.pc}x${S.pr}   visible if cropped: ${Math.round(visibleFraction(S)*100)}%
+resizes caused:    ${S.resizes}
+viewers displaced: ${S.displacedViewers}
+crop renders:      ${S.crops}
+
+` + S.log.slice(-6).join('\n');
+}
+['oc','or','pc','pr','ov'].forEach(id=>$(id).onchange=()=>dispatch({t:'cfg',v:{[id]:+$(id).value}}));
+$('nav').onclick=()=>dispatch({t:'nav'});
+$('nav5').onclick=()=>dispatch({t:'nav5'});
+$('att').onclick=()=>dispatch({t:'att'});
+const WALK = {
+ 'Browse the list': {d:'Policy A. Move over a remote row. Nothing on the remote changes, but you see only a corner of a 200x50 screen.', set:{policy:'crop'}, steps:[['Move cursor onto row',{t:'nav'}],['Leave row',{t:'leave'}]]},
+ 'Claim churn': {d:'Policy B. Scroll past 5 remote rows. Watch the resize counter and displaced viewers: browsing alone disturbs the owner.', set:{policy:'claim'}, steps:[['Scroll past 5 rows',{t:'nav5'}]]},
+ 'Hybrid': {d:'Policy C. Browse is read-only; only Enter takes over. Zero resizes from browsing, one resize on attach: identical to today\'s picker.', set:{policy:'hybrid'}, steps:[['Move onto row',{t:'nav'}],['Press Enter',{t:'att'}]]},
+};
+$('tabs').innerHTML = Object.keys(WALK).map(k=>`<button onclick="tab('${k}')">${k}</button>`).join('');
+window.tab = k => { S = init(); S.policy = WALK[k].set.policy; $('desc').textContent = WALK[k].d;
+  $('steps').innerHTML = WALK[k].steps.map(([l,a],i)=>`<button onclick='dispatch(${JSON.stringify(a)})'>${i+1}. ${l}</button>`).join(''); render(); };
+window.dispatch = dispatch; render();
+</script>
