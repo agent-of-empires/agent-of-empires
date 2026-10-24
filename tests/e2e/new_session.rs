@@ -91,6 +91,9 @@ on_create = ["{hook_cmd}"]
 [updates]
 update_check_mode = "off"
 
+[acp]
+structured_view = "off"
+
 [app_state]
 has_seen_welcome = true
 has_responded_to_telemetry = true
