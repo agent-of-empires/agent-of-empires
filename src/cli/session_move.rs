@@ -4,7 +4,9 @@ use anyhow::{bail, Result};
 use clap::Args;
 
 use crate::acp::client::require_daemon;
-use crate::daemon::{RenameSessionBody, RuntimeHealth, SessionResponse, RUNTIME_PROTOCOL_VERSION};
+use crate::daemon::{
+    AcpWorkerState, RenameSessionBody, RuntimeHealth, SessionResponse, RUNTIME_PROTOCOL_VERSION,
+};
 use crate::session::{PanePresence, Status};
 
 #[derive(Args)]
@@ -18,7 +20,7 @@ pub struct MoveArgs {
     to_profile: String,
 }
 
-pub async fn run(_profile: &str, args: MoveArgs) -> Result<()> {
+pub async fn run(profile: &str, args: MoveArgs) -> Result<()> {
     let client = require_daemon().await?.daemon_client()?;
     let info = client.runtime_info().await?;
     anyhow::ensure!(
@@ -30,7 +32,12 @@ pub async fn run(_profile: &str, args: MoveArgs) -> Result<()> {
         bail!("Profile '{target}' does not exist");
     }
 
-    let rows = client.list_sessions(None).await?.sessions;
+    let source = if profile.is_empty() {
+        crate::session::config::resolve_default_profile()
+    } else {
+        profile.to_string()
+    };
+    let rows = in_profile(client.list_sessions(None).await?.sessions, &source);
     let mut batch: Vec<&SessionResponse> = Vec::with_capacity(args.identifiers.len());
     for identifier in &args.identifiers {
         let row = resolve(identifier, &rows)?;
@@ -58,22 +65,37 @@ pub async fn run(_profile: &str, args: MoveArgs) -> Result<()> {
             if moved.is_empty() {
                 return Err(error);
             }
-            let untried: Vec<&str> = batch
-                .iter()
-                .map(|r| r.id.as_str())
-                .filter(|id| *id != row.id && !moved.contains(id))
-                .collect();
-            bail!(
-                "{error:#}\nAlready moved to '{target}': {}\nNot confirmed (check with `aoe session list`): {}\nNot attempted: {}",
-                moved.join(", "),
-                row.id,
-                untried.join(", ")
-            );
+            let ids: Vec<&str> = batch.iter().map(|r| r.id.as_str()).collect();
+            bail!(partial_report(
+                &format!("{error:#}"),
+                target,
+                &ids,
+                &moved,
+                &row.id
+            ));
         }
         moved.push(&row.id);
         println!("✓ Moved {} ({}) to profile '{target}'", row.title, row.id);
     }
     Ok(())
+}
+
+fn in_profile(rows: Vec<SessionResponse>, source: &str) -> Vec<SessionResponse> {
+    rows.into_iter().filter(|r| r.profile == source).collect()
+}
+
+/// The failed id may have committed before its response was lost, so it is not "not moved".
+fn partial_report(error: &str, target: &str, ids: &[&str], moved: &[&str], failed: &str) -> String {
+    let untried: Vec<&str> = ids
+        .iter()
+        .copied()
+        .filter(|id| *id != failed && !moved.contains(id))
+        .collect();
+    format!(
+        "{error}\nAlready moved to '{target}': {}\nNot confirmed (check with `aoe session list`): {failed}\nNot attempted: {}",
+        moved.join(", "),
+        untried.join(", ")
+    )
 }
 
 /// Id, then unique id prefix, then unique title.
@@ -109,13 +131,14 @@ fn resolve<'a>(identifier: &str, rows: &'a [SessionResponse]) -> Result<&'a Sess
 }
 
 /// The Daemon does not refuse active sessions on a profile move, so refuse them here.
-/// An unreadable status counts as active.
+/// An unreadable status or a live structured worker counts as active.
 fn refuse_if_active(row: &SessionResponse) -> Result<()> {
     let active = row.lifecycle_reservation.is_some()
         || matches!(
             row.agent_pane.state,
             PanePresence::Alive | PanePresence::Unknown
         )
+        || row.acp_worker_state != AcpWorkerState::Absent
         || Status::from_api_str(&row.status).is_none_or(Status::blocks_worktree_edit);
     if active {
         bail!(
@@ -174,17 +197,46 @@ mod tests {
         dead.agent_pane.state = PanePresence::Dead;
         assert!(refuse_if_active(&dead).is_ok());
 
-        let busy: [fn(&mut SessionResponse); 5] = [
+        let busy: [fn(&mut SessionResponse); 8] = [
             |r| r.status = "Running".into(),
             |r| r.status = "Deleting".into(),
             |r| r.status = "from a newer daemon".into(),
             |r| r.agent_pane.state = PanePresence::Alive,
             |r| r.agent_pane.state = PanePresence::Unknown,
+            |r| r.acp_worker_state = AcpWorkerState::Running,
+            |r| r.acp_worker_state = AcpWorkerState::Resuming,
+            |r| r.acp_worker_state = AcpWorkerState::Stopping,
         ];
         for mutate in busy {
             let mut active = row("a", "t", "p");
             mutate(&mut active);
             assert!(refuse_if_active(&active).is_err());
         }
+    }
+
+    #[test]
+    fn resolves_only_within_the_source_profile() {
+        let rows = in_profile(
+            vec![
+                row("abc123", "alpha", "default"),
+                row("zzz999", "alpha", "work"),
+            ],
+            "work",
+        );
+        assert_eq!(resolve("alpha", &rows).unwrap().id, "zzz999");
+        assert!(resolve("abc123", &rows).is_err());
+    }
+
+    #[test]
+    fn partial_report_separates_unconfirmed_from_unattempted() {
+        let ids = ["a", "b", "c"];
+        let report = partial_report("boom", "work", &ids, &["a"], "b");
+        assert!(report.contains("Already moved to 'work': a\n"));
+        assert!(report.contains("Not confirmed (check with `aoe session list`): b\n"));
+        assert!(report.ends_with("Not attempted: c"));
+
+        let first = partial_report("boom", "work", &ids, &[], "a");
+        assert!(first.contains("Not confirmed (check with `aoe session list`): a\n"));
+        assert!(first.ends_with("Not attempted: b, c"));
     }
 }
