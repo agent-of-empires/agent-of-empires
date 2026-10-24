@@ -49,14 +49,12 @@ async function waitForReadOnlyDashboard(page: Page, serve: ServeHandle) {
 }
 
 test.describe("wizard", () => {
-  test("wizard with Use structured view on creates a structured_view session", async ({ page, spawnServe }) => {
+  test("wizard with Structured view selected creates a structured_view session", async ({ page, spawnServe }) => {
     // #1841: the structured view toggle defaults on for an ACP-capable agent.
     const serve = await spawnServe({ acp: true });
     const wizard = await openWizard(page, serve);
     await pickScratch(wizard);
-    const acpToggle = wizard.getByRole("switch", {
-      name: "Use structured view",
-    });
+    const acpToggle = wizard.getByRole("radio", { name: "Structured view" });
     await expect(acpToggle).toBeVisible({ timeout: 10_000 });
     await expect(acpToggle).toBeChecked();
     await wizard.getByRole("button", { name: /Launch session/ }).click();

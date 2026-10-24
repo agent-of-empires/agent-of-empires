@@ -28,7 +28,7 @@ test.describe("essentials", () => {
     await expect(w.getByTestId("wizard-project-row")).toContainText("/tmp/example");
     await expect(w.getByPlaceholder("Auto-generated if empty")).toHaveValue("");
     await expect(w.getByTestId("wizard-agent-row")).toContainText("claude");
-    await expect(switchNamed(page, "Use structured view")).toHaveAttribute("aria-checked", "true");
+    await expect(wizard(page).getByRole("radio", { name: "Structured view" })).toHaveAttribute("aria-checked", "true");
     await expect(switchNamed(page, "Auto-approve actions")).toHaveAttribute("aria-checked", "false");
     await expect(switchNamed(page, "Create a worktree")).toHaveAttribute("aria-checked", "true");
     await expect(w.getByTestId("wizard-worktree-row")).toContainText("auto, new branch");
@@ -49,14 +49,9 @@ test.describe("essentials", () => {
     await expect(group).toHaveValue("backend");
   });
 
-  test("default_new_session_view = terminal opens the switch unticked and creates a terminal (#3517)", async ({
-    page,
-  }) => {
+  test("default_new_session_view = terminal selects Terminal view and creates a terminal (#3517)", async ({ page }) => {
     const created = await startWizard(page, { settings: { acp: { default_new_session_view: "terminal" } } });
-    await expect(wizard(page).getByRole("switch", { name: "Use structured view" })).toHaveAttribute(
-      "aria-checked",
-      "false",
-    );
+    await expect(wizard(page).getByRole("radio", { name: "Structured view" })).toHaveAttribute("aria-checked", "false");
     await launch(page);
     await expect.poll(() => created[0]?.view).toBe("terminal");
   });
@@ -346,7 +341,7 @@ test.describe("agents and presets", () => {
     await selectAgent(page, /remote-helper/);
     await expectHidden(hidden);
     // Without agent_acp_cmd a custom agent is terminal-only; the override preview may show its binary by design.
-    await expect(switchNamed(page, "Use structured view")).toBeDisabled();
+    await expect(w.getByRole("radio", { name: "Structured view" })).toBeDisabled();
     await expect(w.getByText(/needs agent_acp_cmd/)).toBeVisible();
     await openPanel(page, "Agent");
     await expectHidden(hidden.slice(1));
@@ -408,6 +403,60 @@ test.describe("confirmations before create", () => {
       await page.getByTestId("volume-ignores-glob-proceed").click();
       await expect.poll(() => created.length).toBe(1);
       await expect.poll(() => acknowledged.length).toBe(1);
+    });
+  });
+});
+
+test.describe("View row", () => {
+  test("arrow keys move between Structured view and Terminal view", async ({ page }) => {
+    const created = await startWizard(page);
+    const w = wizard(page);
+    const group = w.getByRole("radiogroup", { name: "View" });
+    const structured = group.getByRole("radio", { name: "Structured view" });
+    const terminal = group.getByRole("radio", { name: "Terminal view" });
+    await expect(structured).toHaveAttribute("aria-checked", "true");
+    // At md and up, label, summary and segments share one line.
+    const row = w.getByTestId("wizard-view-row");
+    const middle = async (el: import("@playwright/test").Locator) => {
+      const box = (await el.boundingBox())!;
+      return box.y + box.height / 2;
+    };
+    const line = await middle(group);
+    expect(Math.abs((await middle(row.getByText("View", { exact: true }))) - line)).toBeLessThan(4);
+    expect(Math.abs((await middle(row.getByText("plan, tool calls and diffs as cards"))) - line)).toBeLessThan(4);
+    expect(
+      await row.getByText("plan, tool calls and diffs as cards").evaluate((el) => el.scrollWidth <= el.clientWidth),
+    ).toBe(true);
+    await structured.focus();
+    await page.keyboard.press("ArrowRight");
+    await expect(terminal).toHaveAttribute("aria-checked", "true");
+    await expect(terminal).toBeFocused();
+    await expect(w.getByTestId("wizard-view-row")).toContainText("the Agent's own terminal UI");
+    await launch(page);
+    await expect.poll(() => created[0]?.view).toBe("terminal");
+  });
+
+  test.describe("at 375px", () => {
+    test.use({ viewport: { width: 375, height: 812 } });
+
+    test("the summary wraps under the label and segments, with nothing cut off", async ({ page }) => {
+      await startWizard(page);
+      await page.setViewportSize({ width: 375, height: 812 });
+      const row = wizard(page).getByTestId("wizard-view-row");
+      const label = (await row.getByText("View", { exact: true }).boundingBox())!;
+      const segments = (await row.getByRole("radiogroup").boundingBox())!;
+      const summary = row.getByText("plan, tool calls and diffs as cards");
+      const summaryBox = (await summary.boundingBox())!;
+      // Label and segments share the first line; the summary starts below them.
+      expect(Math.abs(label.y + label.height / 2 - (segments.y + segments.height / 2))).toBeLessThan(6);
+      expect(summaryBox.y).toBeGreaterThanOrEqual(segments.y + segments.height - 1);
+      expect((await row.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+      // Nothing is truncated or pushed sideways.
+      expect(await summary.evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
+      const overflow = await page.evaluate(
+        () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+      );
+      expect(overflow).toBeLessThanOrEqual(0);
     });
   });
 });

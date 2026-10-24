@@ -1142,7 +1142,8 @@
         "web/src/components/session-wizard/WizardRows.tsx",
         "web/src/components/session-wizard/steps/SandboxPanel.tsx",
         "web/src/components/session-wizard/steps/LaunchFields.tsx"
-      ]
+      ],
+      "notes": "The View row is a Structured view | Terminal view radio group: arrow keys move the selection, Structured view is disabled with the reason for an agent that can't run it, and at 375px the summary wraps under the label and segments."
     },
     {
       "id": "wizard.create-progress",
