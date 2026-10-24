@@ -69,7 +69,9 @@ The session's branch name is a suggestion: if the added repo lacks that branch, 
 
 Unless the session is already a workspace, its directory moves, so it is stopped for the move and restarted. A known conversation bound to the old directory blocks the move; other sessions may attempt to resume their stored ID, but continuity is not guaranteed. Attaching is refused mid-turn. Everything that can refuse the attach is checked before stopping; if conversion later fails, AoE attempts to restore the worker.
 
-A sandboxed session has its container recreated, since bind mounts are fixed at creation and the container mounts the common ancestor of the workspace and every repo. Build caches go with the container under the default [volume ignores strategy](sandbox.md#volume-ignores); under `"named"` they are keyed on their container path and survive an attach that leaves that path alone. Attaching a repo from outside the current common ancestor moves every mount, so those caches start cold and the volumes they leave behind need removing by hand.
+Scratch sessions cannot accept attached repositories; they have no repository of their own.
+
+A sandboxed session has its container recreated, since bind mounts are fixed at creation and the container mounts the common ancestor of the workspace and every repo. Build caches go with the container under the default [volume ignores strategy](sandbox.md#volume-ignores-strategy); under `"named"` they are keyed on their container path and survive an attach that leaves that path alone. Attaching a repo from outside the current common ancestor moves every mount, so those caches start cold and the volumes they leave behind need removing by hand.
 
 ## The project registry
 

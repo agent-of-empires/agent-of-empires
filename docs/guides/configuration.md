@@ -261,7 +261,7 @@ status = "running"
 regex = "esc to interrupt|thinking"
 ```
 
-Each rule sets `status` (`running`, `waiting`, `idle`, `error`) and exactly one of `contains` (case-insensitive substring) or `regex` (Rust regex; use `(?i)` for case-insensitive). Rules are matched in order against the ANSI-stripped pane; first match wins and no match reports `idle`, so put the specific states before broad ones. Rules outrank `agent_detect_as`, a built-in detector of the same name, and a status hook the agent writes. Invalid rules are skipped with a warning and take effect on the next config resolve.
+Put specific states such as `waiting` and `error` before broad `running` matches. See [`agents.<name>.status_rules`](#session) for the rule format and precedence.
 
 #### OMP terminal status
 
@@ -539,22 +539,6 @@ hotkey = "Alt+g"
 ```
 
 See [Tool Sessions](tool-sessions.md) for the full reference.
-
-## Worktree and sandbox
-
-```toml
-[worktree]
-enabled = false                                       # auto-enable for new sessions
-path_template = "../{repo-name}-worktrees/{branch}"   # {repo-name}, {branch}, {session-id}
-auto_cleanup = true
-
-[sandbox]
-enabled_by_default = false
-default_image = "ghcr.io/agent-of-empires/aoe-sandbox:latest"
-environment = ["GH_TOKEN=$AOE_GH_TOKEN"]
-```
-
-[Git Worktrees](worktrees.md) and [Container Sandbox](sandbox.md) document the remaining keys in each section.
 
 ## Profiles
 
