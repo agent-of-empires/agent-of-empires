@@ -84,7 +84,12 @@ pub(crate) async fn login(
         "passphrase": passphrase,
         "device_binding_secret": binding_secret,
     });
-    let res = client.post(url).json(&body).send().await?;
+    // A token-plus-passphrase daemon gates the login route on the bearer too.
+    let mut request = client.post(url).json(&body);
+    if let Some(token) = endpoint.bearer_token() {
+        request = request.bearer_auth(token);
+    }
+    let res = request.send().await?;
     let status = res.status();
     if !status.is_success() {
         return Err(map_auth_error(status, res.headers()));

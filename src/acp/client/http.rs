@@ -757,9 +757,10 @@ impl HttpClient {
 
     /// Build, authenticate and send one request, retrying once after a fresh
     /// passphrase login when a *cached* login session comes back 401 (rotated
-    /// passphrase, expired or evicted session). A first-ever login failure,
-    /// or a 401 carrying a bearer token, is not retried: the credential
-    /// itself is wrong, not merely stale.
+    /// passphrase, expired or evicted session), or when a bearer token alone is
+    /// refused and a passphrase resolves (a daemon that also requires the second
+    /// factor). A first-ever login failure is not retried: the credential itself
+    /// is wrong, not merely stale.
     async fn execute(
         &self,
         builder: reqwest::RequestBuilder,
@@ -770,15 +771,17 @@ impl HttpClient {
         // today) simply keeps the first response.
         let retry = request.try_clone();
         let had_cached_session = self.passphrase_session.get(&self.endpoint).is_some();
-        let response = self.send_authenticated(request).await?;
-        if !had_cached_session || response.status() != StatusCode::UNAUTHORIZED {
+        let response = self.send_authenticated(request, false).await?;
+        let bearer_only =
+            !had_cached_session && self.endpoint.bearer_token().is_some() && self.can_login();
+        if response.status() != StatusCode::UNAUTHORIZED || !(had_cached_session || bearer_only) {
             return Ok(response);
         }
         self.passphrase_session.invalidate(&self.endpoint);
         let Some(retry) = retry else {
             return Ok(response);
         };
-        self.send_authenticated(retry).await
+        self.send_authenticated(retry, true).await
     }
 
     async fn execute_elevated(
@@ -787,7 +790,7 @@ impl HttpClient {
     ) -> Result<reqwest::Response, HttpError> {
         let response = self.execute(build()).await?;
         if self.endpoint.unix_path().is_some()
-            || self.endpoint.bearer_token().is_some()
+            || self.passphrase_session.get(&self.endpoint).is_none()
             || crate::daemon::ApiErrorCode::from_headers(
                 response.status(),
                 response.headers(),
@@ -804,33 +807,45 @@ impl HttpClient {
     async fn send_authenticated(
         &self,
         mut request: reqwest::Request,
+        force_session: bool,
     ) -> Result<reqwest::Response, HttpError> {
-        self.attach_credential(&mut request).await?;
+        self.attach_credential(&mut request, force_session).await?;
         Ok(
             crate::daemon::transport::execute(&self.http, self.endpoint.unix_path(), request)
                 .await?,
         )
     }
 
-    /// Attach whichever credential is available: a bearer token when one
-    /// resolves (`--auth=token`), otherwise the passphrase-login session
-    /// (`--auth=passphrase`), logging in on first use. Neither resolving
+    /// A passphrase can be used here: never over a Unix socket, whose peer owner
+    /// already authorizes the request, and `resolved_passphrase` refuses a plaintext
+    /// `http://` non-loopback URL.
+    fn can_login(&self) -> bool {
+        self.endpoint.unix_path().is_none() && self.endpoint.resolved_passphrase().is_some()
+    }
+
+    /// Attach whichever credential is available. A cached passphrase-login session
+    /// wins, then a bearer token (`--auth=token`), then a fresh login
+    /// (`--auth=passphrase`). `force_session` skips the bearer. Nothing resolving
     /// (`--auth=none`) leaves the request untouched.
-    ///
-    /// The passphrase only ever travels to an endpoint that can keep it
-    /// confidential: `resolved_passphrase` refuses a plaintext `http://`
-    /// non-loopback URL, and a local Unix-socket daemon is skipped outright
-    /// because its peer owner already authorizes the request.
-    async fn attach_credential(&self, request: &mut reqwest::Request) -> Result<(), HttpError> {
-        let token = self.endpoint.bearer_token();
-        if let Some(authorization) = crate::daemon::authorization_header(token)? {
-            request
-                .headers_mut()
-                .insert(header::AUTHORIZATION, authorization);
-            return Ok(());
-        }
-        if self.endpoint.unix_path().is_some() || self.endpoint.resolved_passphrase().is_none() {
-            return Ok(());
+    async fn attach_credential(
+        &self,
+        request: &mut reqwest::Request,
+        force_session: bool,
+    ) -> Result<(), HttpError> {
+        let can_login = self.can_login();
+        let cached = can_login && self.passphrase_session.get(&self.endpoint).is_some();
+        if !(force_session && can_login || cached) {
+            if let Some(authorization) =
+                crate::daemon::authorization_header(self.endpoint.bearer_token())?
+            {
+                request
+                    .headers_mut()
+                    .insert(header::AUTHORIZATION, authorization);
+                return Ok(());
+            }
+            if !can_login {
+                return Ok(());
+            }
         }
         let session = self.ensure_passphrase_session().await?;
         request.headers_mut().insert(
@@ -1432,7 +1447,7 @@ mod tests {
     /// The request `attach_credential` would put on the wire, headers and all.
     async fn credentialed(client: &HttpClient, url: &str) -> reqwest::Request {
         let mut request = client.http.get(url).build().unwrap();
-        client.attach_credential(&mut request).await.unwrap();
+        client.attach_credential(&mut request, false).await.unwrap();
         request
     }
 
@@ -1559,7 +1574,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn log_level_reads_and_patches_without_surfacing_an_error_body() {
+        let _env = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_PASSPHRASE"]);
         use axum::{response::IntoResponse, routing::get, Json, Router};
         let app = Router::new().route(
             "/api/log-level",
@@ -1597,6 +1614,54 @@ mod tests {
         assert_eq!(read.reloadable, Some(true));
         assert_eq!(patched.previous.as_deref(), Some("info"));
         assert!(!rejected.to_string().contains("secret-token"));
+    }
+
+    /// Against the real router, a bearer alone is refused on a token-plus-passphrase
+    /// daemon, and the fallback login must itself carry the bearer.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_bearer_falls_back_to_a_passphrase_login_on_a_real_router() {
+        use crate::server::test_support;
+        let mut _env = test_support::RuntimeEnvGuard::read_lock();
+        let dir = tempfile::tempdir().unwrap();
+        _env.bind(dir.path());
+        let phrase = "http client second factor";
+        let token = "b".repeat(64);
+        let _phrase =
+            crate::session::test_support::EnvGuard::set(&[("AOE_DAEMON_PASSPHRASE", phrase)]);
+        let state = test_support::build_test_app_state_with_policy_configured(
+            Vec::new(),
+            vec!["127.0.0.1".into()],
+            Vec::new(),
+            Some(token.clone()),
+            |state| {
+                state.login_manager =
+                    std::sync::Arc::new(crate::server::login::LoginManager::new(Some(phrase)));
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = test_support::build_router_for_test(state.clone());
+        let shutdown = state.shutdown.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown.cancelled_owned())
+            .await
+            .unwrap();
+        });
+        let client = HttpClient::new(endpoint(&base, Some(&token))).unwrap();
+        client.health_check().await.unwrap();
+        client.health_check().await.unwrap();
+        assert_eq!(
+            state.login_manager.device_snapshot(None).await.len(),
+            1,
+            "one login, then the cached session"
+        );
+        state.shutdown.cancel();
+        server.await.unwrap();
     }
 
     #[tokio::test]
