@@ -576,6 +576,7 @@ impl<S: BroadcastSink> Drain<S> {
             );
             let client = Arc::new(client);
             respawn_lease.retirement().record_client(&client, false);
+            self.refuse_if_dismissed(&config).await;
             self.fail_launch(
                 &respawn_lease,
                 previous,
@@ -588,6 +589,7 @@ impl<S: BroadcastSink> Drain<S> {
         let client = Arc::new(client);
         respawn_lease.retirement().record_client(&client, false);
         if !respawn_lease.attest_runner().await {
+            self.refuse_if_dismissed(&config).await;
             self.fail_launch(
                 &respawn_lease,
                 previous,
