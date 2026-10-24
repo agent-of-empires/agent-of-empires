@@ -31,10 +31,9 @@ export function useSessions() {
   // GET admission is global; only installed rows attest individual mutation receipts.
   const floorGet = useRef<RuntimeCursor | null>(null);
   const abandonedEpochs = useRef(new Set<string>());
-  // Reads begun so far, and the pushed statuses by id with the reads begun at push time; a read at or below
-  // that count predates the push.
-  const startedReadsRef = useRef(0);
-  const pushedRef = useRef(new Map<string, { status: SessionResponse["status"]; read: number }>());
+  // Pushed statuses by id. The snapshot behind GET /api/sessions is published after the push is broadcast, so a
+  // poll can legitimately still show the old status; a pushed status is held until a poll shows it.
+  const pushedRef = useRef(new Map<string, SessionResponse["status"]>());
 
   const injectSession = useCallback((session: SessionResponse) => {
     setState((prev) =>
@@ -46,7 +45,7 @@ export function useSessions() {
     lastLocalOrderingAtRef.current = Date.now();
   }, []);
 
-  const applyResult = useCallback((data: SessionsEnvelope | null, read: number) => {
+  const applyResult = useCallback((data: SessionsEnvelope | null) => {
     setLoaded(true);
     if (data !== null) {
       setError(false);
@@ -58,14 +57,16 @@ export function useSessions() {
       if (floor && floor.epoch !== cursor.epoch) abandonedEpochs.current.add(floor.epoch);
       floorGet.current = cursor;
       const pushed = pushedRef.current;
+      const present = new Set(data.sessions.map((s) => s.id));
+      for (const id of pushed.keys()) if (!present.has(id)) pushed.delete(id);
       const sessions = data.sessions.map((s) => {
-        const p = pushed.get(s.id);
-        if (!p) return s;
-        if (read > p.read) {
+        const status = pushed.get(s.id);
+        if (status === undefined) return s;
+        if (s.status === status) {
           pushed.delete(s.id);
           return s;
         }
-        return { ...s, status: p.status };
+        return { ...s, status };
       });
       setState({
         sessions,
@@ -94,14 +95,13 @@ export function useSessions() {
     };
     const tick = async () => {
       const mine = ++generation;
-      const read = ++startedReadsRef.current;
       const request = new AbortController();
       controller = request;
       const requestDeadline = setTimeout(() => {
         if (cancelled || mine !== generation) return;
         generation++;
         request.abort();
-        applyResult(null, read);
+        applyResult(null);
         scheduleNext();
       }, POLL_DEADLINE_MS);
       deadline = requestDeadline;
@@ -109,7 +109,7 @@ export function useSessions() {
       clearTimeout(requestDeadline);
       if (cancelled || mine !== generation) return;
       controller = undefined;
-      applyResult(data, read);
+      applyResult(data);
       scheduleNext();
     };
     void tick();
@@ -123,12 +123,11 @@ export function useSessions() {
   }, [applyResult]);
 
   const refresh = useCallback(() => {
-    const read = ++startedReadsRef.current;
-    void fetchSessions().then((data) => applyResult(data, read));
+    void fetchSessions().then(applyResult);
   }, [applyResult]);
 
   const applyPushedStatus = useCallback((id: string, status: SessionResponse["status"]) => {
-    pushedRef.current.set(id, { status, read: startedReadsRef.current });
+    pushedRef.current.set(id, status);
     setState((prev) => ({ ...prev, sessions: prev.sessions.map((s) => (s.id === id ? { ...s, status } : s)) }));
   }, []);
 

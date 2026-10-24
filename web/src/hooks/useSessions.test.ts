@@ -53,22 +53,24 @@ describe("useSessions / pushed status", () => {
     return { resolvers, envelope, ...renderHook(() => useSessions()) };
   }
 
-  it("holds a pushed status against a poll that was in flight when it landed", async () => {
+  it("holds a pushed status against a poll the publication has not caught up with", async () => {
     const { result, resolvers, envelope } = mountWithReads();
     await act(async () => resolvers[0]!(envelope("Running", 1n)));
-    act(() => result.current.refresh()); // in flight when the push lands
     act(() => result.current.applyPushedStatus("a", "Waiting"));
-    expect(result.current.sessions[0]!.status).toBe("Waiting");
-    await act(async () => resolvers[1]!(envelope("Running", 2n)));
+    act(() => result.current.refresh()); // begins after the push, but the cached snapshot predates it
+    await act(async () => resolvers[1]!(envelope("Running", 1n)));
     expect(result.current.sessions[0]!.status).toBe("Waiting");
   });
 
-  it("yields to a poll that began after the push", async () => {
+  it("releases a pushed status once a snapshot shows it, so a later differing poll applies", async () => {
     const { result, resolvers, envelope } = mountWithReads();
     await act(async () => resolvers[0]!(envelope("Running", 1n)));
     act(() => result.current.applyPushedStatus("a", "Waiting"));
     act(() => result.current.refresh());
-    await act(async () => resolvers[1]!(envelope("Running", 2n)));
+    await act(async () => resolvers[1]!(envelope("Waiting", 2n)));
+    expect(result.current.sessions[0]!.status).toBe("Waiting");
+    act(() => result.current.refresh());
+    await act(async () => resolvers[2]!(envelope("Running", 3n)));
     expect(result.current.sessions[0]!.status).toBe("Running");
   });
 });
