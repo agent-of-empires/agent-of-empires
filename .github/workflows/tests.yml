@@ -293,6 +293,8 @@ jobs:
           node-version: '22'
       - name: Cargo test (macOS, lib + bins)
         run: cargo nextest run --features e2e-tests --lib --bins --no-fail-fast
+      - name: Cargo test (macOS, daemon-only CLI reads)
+        run: cargo nextest run --features e2e-tests --test integration -E 'test(cli_read_daemon::)' --no-fail-fast
       - name: Cargo test (macOS, acp live-daemon e2e)
         run: cargo test --features e2e-tests --test e2e -- acp_ --test-threads=1 --nocapture
 

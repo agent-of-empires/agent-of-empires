@@ -167,13 +167,13 @@ pub struct ServeArgs {
     #[arg(long)]
     pub open: bool,
 
-    /// Internal marker: this invocation is the detached child spawned by
-    /// `--daemon`. Set automatically by `start_daemon()`; never pass by hand.
-    /// Tells `main.rs` to classify the process as `ServeDaemonChild` so the
-    /// sink resolver routes tracing to the configured log file (its
-    /// stdout/stderr are detached). Hidden from `--help`.
+    /// Internal marker for a detached child; selects daemon logging.
     #[arg(long, hide = true)]
     pub daemon_child: bool,
+
+    /// Preserve missing defaults only during automatic read acquisition.
+    #[arg(long, hide = true, requires_all = ["daemon_child", "core_only"])]
+    pub read_acquisition: bool,
 
     /// Restart the running managed daemon with its recorded policy.
     /// Missing credentials are rejected before stopping it.
@@ -626,6 +626,7 @@ impl ServeLaunch {
             passphrase,
             open: false,
             daemon_child: false,
+            read_acquisition: false,
             restart: false,
             rollback: false,
             allowed_host: self.allowed_host.clone(),
@@ -1317,6 +1318,7 @@ pub async fn run(profile: &str, mut args: ServeArgs, startup: Option<ServeStartu
         crate::server::ServerConfig {
             profile,
             core_only: args.core_only,
+            read_acquisition: args.read_acquisition,
             host: &host,
             port: args.resolved_port(),
             auth_mode,
@@ -1458,8 +1460,9 @@ async fn fetch_cityhall_bundle(url: &str, token: &str) -> Result<String> {
     Ok(daemon::decode_text(response).await?)
 }
 
+/// `None` selects read acquisition; `Some` preserves native profile admission.
 pub(crate) async fn ensure_local_daemon(
-    profile: &str,
+    native_profile: Option<&str>,
     allow_start: bool,
 ) -> Result<(crate::acp::client::DaemonEndpoint, Option<u32>)> {
     use clap::Parser;
@@ -1483,13 +1486,24 @@ pub(crate) async fn ensure_local_daemon(
             allow_start,
             "Local daemon autostart is disabled; start one with `aoe serve --core-only --daemon`"
         );
-        let resolved_profile = crate::session::config::effective_profile(profile);
+        let resolved_profile = if let Some(profile) = native_profile {
+            crate::session::config::effective_profile(profile)
+        } else {
+            let default = crate::session::config::resolve_default_profile();
+            let profiles = crate::session::list_profiles()?;
+            if profiles.iter().any(|profile| profile == &default) {
+                default
+            } else {
+                profiles.into_iter().next().unwrap_or(default)
+            }
+        };
         let profile = resolved_profile.as_str();
         crate::session::require_known_profile(profile)?;
         let cli = crate::cli::Cli::try_parse_from(["aoe", "serve", "--core-only", "--daemon"])?;
-        let Some(crate::cli::Commands::Serve(args)) = cli.command else {
+        let Some(crate::cli::Commands::Serve(mut args)) = cli.command else {
             unreachable!()
         };
+        args.read_acquisition = native_profile.is_none();
         start_daemon(profile, &args, &transaction, false).await?;
         daemon_pid()
     } else {
@@ -1498,10 +1512,20 @@ pub(crate) async fn ensure_local_daemon(
     let endpoint = crate::acp::client::DaemonEndpoint::local_unix(
         crate::daemon::transport::local_socket_path()?,
     );
-    endpoint
-        .daemon_client()?
-        .local_runtime_ready((!profile.is_empty()).then_some(profile))
-        .await?;
+    let client = endpoint.daemon_client()?;
+    if let Some(profile) = native_profile {
+        client
+            .local_runtime_ready((!profile.is_empty()).then_some(profile))
+            .await?;
+    } else {
+        let pid = existing
+            .or(started)
+            .context("Local daemon has no verified owner after startup")?;
+        anyhow::ensure!(
+            client.local_daemon_ready(pid).await?,
+            "Local daemon runtime identity or protocol is incompatible"
+        );
+    }
     Ok((endpoint, started))
 }
 pub(crate) async fn start_dashboard_for_tui(
@@ -1578,6 +1602,9 @@ async fn start_daemon(
     cmd.env_remove("AOE_CITYHALL_MODE")
         .env_remove("AOE_SERVE_PASSPHRASE");
     cmd.args(["serve", "--daemon-child"]);
+    if args.read_acquisition {
+        cmd.arg("--read-acquisition");
+    }
     if args.core_only {
         cmd.arg("--core-only");
     } else {

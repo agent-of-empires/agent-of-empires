@@ -1,6 +1,4 @@
-//! Compare exit code and both streams from the same store over UDS and local reads.
-//! These fixtures require the Linux UDS publisher. Other platforms fall back
-//! to the local store unless an HTTP endpoint is selected.
+//! Preserve CLI projections over live local UDS and loopback HTTP transports.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -48,17 +46,6 @@ const REFUSALS: [&[&str]; 4] = [
     &["list", "-p", "ghost-profile"],
     &["session", "show", "k-amb"],
     // Whitespace names a profile; only an empty flag is unset.
-    &["list", "-p", "   ", "--json"],
-];
-
-/// Registry and missing-selector answers are independent of session rows.
-/// Emptying sessions witnesses other answers, including ambiguous selectors.
-const NOT_WITNESSED_BY_EMPTYING: &[&[&str]] = &[
-    &["profile"],
-    &["project", "list"],
-    &["project", "list", "--json"],
-    &["session", "show", "no-such-session"],
-    &["list", "-p", "ghost-profile"],
     &["list", "-p", "   ", "--json"],
 ];
 
@@ -168,7 +155,7 @@ impl Fixture {
         }
         std::fs::write(
             app_dir.join("config.toml"),
-            format!("default_profile = \"{PROFILE}\"\n\n[updates]\nupdate_check_mode = \"off\"\n"),
+            format!("default_profile = \"{PROFILE}\"\n\n[updates]\nupdate_check_mode = \"off\"\n[systemd]\nenabled = false\n"),
         )
         .expect("config");
         let base = home.clone();
@@ -557,10 +544,9 @@ fn assert_same(args: &[String], served: &Run, local: &Run) {
     }
 }
 
-/// Retract publication before comparing the same store through local reads.
 #[tokio::test]
 #[serial_test::serial]
-async fn the_served_bytes_are_the_bytes_the_local_command_prints() {
+async fn local_and_http_daemons_preserve_the_cli_projection() {
     let fixture = Fixture::new();
     let mut rows = fixture_sessions(fixture.path());
     rows.push(row(
@@ -622,10 +608,6 @@ async fn profile_scoped_ids_preserve_each_store_on_both_transports() {
             &["session", "show", "i-child", "-p", "zeta"],
         ],
         usize::MAX,
-        &[
-            &["list", "--json", "-p", "zeta"],
-            &["session", "show", "i-child", "-p", "zeta"],
-        ],
     )
     .await;
     let all: Vec<serde_json::Value> = serde_json::from_str(&answers[2].stdout).unwrap();
@@ -672,12 +654,6 @@ async fn one_directory_under_two_spellings_is_one_project_on_both_transports() {
             &["project", "list", "--scope", "profile", "--json"],
         ],
         usize::MAX,
-        // Registered projects do not depend on the session rows the probe empties.
-        &[
-            &["project", "list", "--json"],
-            &["project", "list"],
-            &["project", "list", "--scope", "profile", "--json"],
-        ],
     )
     .await;
 }
@@ -700,7 +676,6 @@ async fn unreadable_profiles_preserve_inventory_and_healthy_aggregate_rows() {
                 &["list", "--json", "--all"],
             ],
             usize::MAX,
-            &[&["profile"]],
             |args, served, local| {
                 if args.first().is_none_or(|arg| arg != "list") {
                     assert_same(args, served, local);
@@ -750,7 +725,6 @@ async fn a_broken_global_registry_does_not_refuse_the_reads_that_ignore_it() {
             &["session", "list-trash"],
         ],
         usize::MAX,
-        &[],
     )
     .await;
     for run in &served {
@@ -774,7 +748,6 @@ async fn a_stored_trailing_separator_still_names_its_session() {
             &["list", "--json"],
         ],
         usize::MAX,
-        &[],
     )
     .await;
     assert!(
@@ -799,15 +772,7 @@ async fn a_stored_trailing_separator_still_names_its_session() {
 #[serial_test::serial]
 async fn a_whitespace_profile_is_a_profile_name_on_both_transports() {
     let fixture = Fixture::new();
-    let served = compare_transports(
-        &fixture,
-        &[&["list", "-p", "   ", "--json"]],
-        0,
-        // The refusal is the profile that does not exist, which emptying the
-        // sessions does not change.
-        &[&["list", "-p", "   ", "--json"]],
-    )
-    .await;
+    let served = compare_transports(&fixture, &[&["list", "-p", "   ", "--json"]], 0).await;
     assert_eq!(
         served[0].exit, 1,
         "a profile that does not exist is the operator's own state: {:?}",
@@ -828,32 +793,22 @@ async fn a_whitespace_profile_is_a_profile_name_on_both_transports() {
 async fn compare_both_transports(fixture: &Fixture) {
     let mut commands: Vec<&[&str]> = COMMANDS.to_vec();
     commands.extend_from_slice(&REFUSALS);
-    let _served = compare_transports(
-        fixture,
-        &commands,
-        COMMANDS.len(),
-        // Emptying session rows cannot distinguish profile-directory inventory.
-        NOT_WITNESSED_BY_EMPTYING,
-    )
-    .await;
+    let _served = compare_transports(fixture, &commands, COMMANDS.len()).await;
 }
 
 /// `refusals_from` bounds the successful prefix; usize::MAX means no refusals.
-/// `not_witnessed` names fixture answers unchanged by removing local sessions.
 async fn compare_transports(
     fixture: &Fixture,
     commands: &[&[&str]],
     refusals_from: usize,
-    not_witnessed: &[&[&str]],
 ) -> Vec<Run> {
-    compare_transports_with(fixture, commands, refusals_from, not_witnessed, assert_same).await
+    compare_transports_with(fixture, commands, refusals_from, assert_same).await
 }
 
 async fn compare_transports_with(
     fixture: &Fixture,
     commands: &[&[&str]],
     refusals_from: usize,
-    not_witnessed: &[&[&str]],
     compare: impl Fn(&[String], &Run, &Run),
 ) -> Vec<Run> {
     // Normalize caller-prepared data before caching or comparing either transport.
@@ -874,7 +829,7 @@ async fn compare_transports_with(
 
     let mut served: Vec<(Vec<String>, Run)> = Vec::new();
     {
-        let daemon = RuntimeUdsTestServer::start_in(&xdg_base, state)
+        let daemon = RuntimeUdsTestServer::start_in(&xdg_base, state.clone())
             .unwrap_or_else(|reason| panic!("the fixture home is a trusted namespace: {reason}"));
         for (index, args) in commands.iter().enumerate() {
             let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
@@ -901,39 +856,37 @@ async fn compare_transports_with(
         }
         fixture.restore_sessions(saved);
 
-        // Retraction makes the next pass use the local store.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let router = agent_of_empires::server::test_support::build_router_for_test(state.clone());
+        let stopped = shutdown.clone();
+        let http = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(stopped.cancelled_owned())
+            .await
+            .unwrap();
+        });
+        for (args, expected) in &served {
+            let mut remote_args = args.clone();
+            remote_args.extend(["--daemon-url".into(), url.clone()]);
+            let remote = run(home.clone(), remote_args).await;
+            compare(args, expected, &remote);
+        }
         shutdown.cancel();
         let _fixture = daemon.join().await;
+        http.await.unwrap();
     }
-
-    for (args, expected) in &served {
-        let local = run(home.clone(), args.clone()).await;
-        compare(args, expected, &local);
+    for (args, _) in &served {
+        let mut disabled = args.clone();
+        disabled.push("--no-autostart".into());
+        let absent = run(home.clone(), disabled).await;
+        assert_ne!(absent.exit, 0, "{}", args.join(" "));
+        assert!(absent.stdout.is_empty(), "{absent:?}");
+        assert!(!absent.stderr.contains("Started aoe daemon"), "{absent:?}");
     }
-
-    // Verify which answers are unchanged by emptying the local session registry.
-    let saved = fixture.take_sessions();
-    let mut unwitnessed: Vec<String> = Vec::new();
-    for (args, expected) in &served {
-        let local = run(home.clone(), args.clone()).await;
-        if &local == expected {
-            unwitnessed.push(args.join(" "));
-        }
-    }
-    fixture.restore_sessions(saved);
-    let mut declared: Vec<String> = not_witnessed
-        .iter()
-        .map(|command| command.join(" "))
-        .filter(|command| served.iter().any(|(args, _)| args.join(" ") == *command))
-        .collect();
-    // Compare the declared and observed exceptions as sets.
-    unwitnessed.sort();
-    declared.sort();
-    assert_eq!(
-        unwitnessed, declared,
-        "the rows the emptied-store probe cannot witness have changed: say why \
-         here, or take them out of the set"
-    );
     served.into_iter().map(|(_, run)| run).collect()
 }
 

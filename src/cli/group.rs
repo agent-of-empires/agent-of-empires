@@ -2,7 +2,6 @@
 
 use anyhow::{bail, Result};
 use clap::{Args, Subcommand};
-use serde::Serialize;
 
 use crate::session::{GroupTree, Storage};
 
@@ -64,66 +63,14 @@ pub struct GroupMoveArgs {
     group: String,
 }
 
-#[derive(Serialize)]
-struct GroupInfo {
-    name: String,
-    path: String,
-    session_count: usize,
-    children: Vec<String>,
-}
-
 #[tracing::instrument(target = "cli.session", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, command: GroupCommands) -> Result<()> {
     match command {
-        GroupCommands::List(args) => list_groups(profile, args).await,
+        GroupCommands::List(_) => unreachable!("runtime reads are handled before local dispatch"),
         GroupCommands::Create(args) => create_group(profile, args).await,
         GroupCommands::Delete(args) => delete_group(profile, args).await,
         GroupCommands::Move(args) => move_session(profile, args).await,
     }
-}
-
-async fn list_groups(profile: &str, args: GroupListArgs) -> Result<()> {
-    let storage = Storage::open_reference(profile)?;
-    let (instances, groups) = storage.load_with_groups()?;
-
-    let group_tree = GroupTree::new_with_groups(&instances, &groups);
-    let session_count = |path: &str| instances.iter().filter(|i| i.group_path == path).count();
-
-    if args.json {
-        let group_list: Vec<GroupInfo> = group_tree
-            .get_all_groups()
-            .iter()
-            .map(|g| GroupInfo {
-                name: g.name.clone(),
-                path: g.path.clone(),
-                session_count: session_count(&g.path),
-                children: g.children.iter().map(|c| c.name.clone()).collect(),
-            })
-            .collect();
-        super::output::print_json(&group_list)?;
-    } else {
-        let all_groups = group_tree.get_all_groups();
-        if all_groups.is_empty() {
-            println!("No groups found.");
-            println!("Create one with: aoe group create <name>");
-            return Ok(());
-        }
-
-        println!("Groups:\n");
-        for group in &all_groups {
-            let session_count = session_count(&group.path);
-            let indent = group.path.matches('/').count();
-            println!(
-                "{}• {} ({} sessions)",
-                "  ".repeat(indent),
-                group.name,
-                session_count
-            );
-        }
-        println!("\nTotal: {} groups", all_groups.len());
-    }
-
-    Ok(())
 }
 
 async fn create_group(profile: &str, args: GroupCreateArgs) -> Result<()> {

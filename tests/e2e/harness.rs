@@ -376,9 +376,7 @@ pub struct TuiTestHarness {
     extra_env_remove: Vec<String>,
     /// Prepended to PATH ahead of the `claude` stub.
     extra_path_dirs: Vec<PathBuf>,
-    /// When set, `Drop` stops the structured view workers and the serve daemon
-    /// before killing the tmux session, so a panicking assertion can't
-    /// leak a daemon between serial tests.
+    /// Stop structured view workers and attempt daemon shutdown during teardown.
     stop_daemon_on_drop: bool,
     /// When true, `install_acp_shim` bakes `FAKE_ACP_FORK_FAIL=1` into the shim
     /// so the fake agent rejects `session/fork`. Baked into the shim (not the
@@ -1532,10 +1530,14 @@ last_seen_version = "{}"
 
 impl Drop for TuiTestHarness {
     fn drop(&mut self) {
-        // A spawned TUI may have started its isolated daemon.
         if self.stop_daemon_on_drop || self.spawned {
-            let _ = self.run_cli(&["acp", "stop", "--all"]);
-            let _ = self.run_cli(&["serve", "--stop"]);
+            let _ = self.cli_command(&["acp", "stop", "--all"]).output();
+        }
+        if self.stop_daemon_on_drop
+            || self.spawned
+            || app_dir_in(self.home_dir.path()).join("serve.pid").exists()
+        {
+            let _ = self.cli_command(&["serve", "--stop"]).output();
         }
         // Reap all sessions on this private socket, including CLI-created panes.
         self.kill_server();
