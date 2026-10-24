@@ -617,46 +617,62 @@ impl HttpClient {
         check_resolve_status(res, session_id)
     }
 
-    /// Read sessions with the endpoint's bearer token or passphrase session.
+    /// Read sessions with the endpoint's bearer token or passphrase session,
+    /// recovering once from a stale session or a bearer a second factor refused.
     pub async fn list_sessions(
         &self,
         state: Option<crate::session::SessionScope>,
     ) -> Result<crate::daemon::SessionsEnvelope, HttpError> {
-        let had_cached_session = self.endpoint.bearer_token().is_none()
-            && self.passphrase_session.get(&self.endpoint).is_some();
-        match self.list_sessions_once(state).await {
-            Err(HttpError::Unauthorized) if had_cached_session => {
+        let had_cached_session =
+            self.can_login() && self.passphrase_session.get(&self.endpoint).is_some();
+        let bearer_only =
+            !had_cached_session && self.endpoint.bearer_token().is_some() && self.can_login();
+        match self.list_sessions_once(state, false).await {
+            Err(HttpError::Unauthorized) if had_cached_session || bearer_only => {
                 self.passphrase_session.invalidate(&self.endpoint);
-                self.list_sessions_once(state).await
+                self.list_sessions_once(state, true).await
             }
             result => result,
         }
     }
 
     pub(crate) async fn daemon_client(&self) -> Result<crate::daemon::DaemonClient, HttpError> {
+        self.daemon_client_with(false).await
+    }
+
+    /// Same credential order as [`Self::attach_credential`].
+    async fn daemon_client_with(
+        &self,
+        force_session: bool,
+    ) -> Result<crate::daemon::DaemonClient, HttpError> {
         let base_url = &self.endpoint.base_url;
-        let client = if let Some(path) = self.endpoint.unix_path() {
-            crate::daemon::DaemonClient::new_unix(path)
-        } else if let Some(token) = self.endpoint.bearer_token() {
-            crate::daemon::DaemonClient::new(base_url, Some(token))
-        } else if self.endpoint.resolved_passphrase().is_some() {
-            let session = self.ensure_passphrase_session().await?;
-            crate::daemon::DaemonClient::with_session(
-                base_url,
-                &session.cookie,
-                &session.binding_secret,
-            )
-        } else {
-            crate::daemon::DaemonClient::new(base_url, None)
-        }?;
-        Ok(client)
+        if let Some(path) = self.endpoint.unix_path() {
+            return Ok(crate::daemon::DaemonClient::new_unix(path)?);
+        }
+        let can_login = self.can_login();
+        let cached = can_login && self.passphrase_session.get(&self.endpoint).is_some();
+        if !(force_session && can_login || cached) {
+            if let Some(token) = self.endpoint.bearer_token() {
+                return Ok(crate::daemon::DaemonClient::new(base_url, Some(token))?);
+            }
+            if !can_login {
+                return Ok(crate::daemon::DaemonClient::new(base_url, None)?);
+            }
+        }
+        let session = self.ensure_passphrase_session().await?;
+        Ok(crate::daemon::DaemonClient::with_session(
+            base_url,
+            &session.cookie,
+            &session.binding_secret,
+        )?)
     }
 
     async fn list_sessions_once(
         &self,
         state: Option<crate::session::SessionScope>,
+        force_session: bool,
     ) -> Result<crate::daemon::SessionsEnvelope, HttpError> {
-        let client = self.daemon_client().await?;
+        let client = self.daemon_client_with(force_session).await?;
         client
             .list_sessions(state)
             .await
@@ -1653,7 +1669,9 @@ mod tests {
             .unwrap();
         });
         let client = HttpClient::new(endpoint(&base, Some(&token))).unwrap();
-        client.health_check().await.unwrap();
+        // Listing recovers from the refused bearer, then reuses the cached login.
+        client.list_sessions(None).await.unwrap();
+        client.list_sessions(None).await.unwrap();
         client.health_check().await.unwrap();
         assert_eq!(
             state.login_manager.device_snapshot(None).await.len(),
