@@ -2015,6 +2015,78 @@ async fn purge_receipt_publishes_removal_and_committed_peer_rows() -> anyhow::Re
 
 #[tokio::test]
 #[serial_test::serial]
+async fn purge_of_a_busy_session_names_the_holder_and_retries_after_release() -> anyhow::Result<()>
+{
+    use axum::body::to_bytes;
+    let _guard = crate::session::test_support::isolate_app_dir();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir()?)?;
+    let mut row = Instance::new("busy purge", "/tmp/busy-purge");
+    row.source_profile = "busy".into();
+    row.status = Status::Stopped;
+    row.trash();
+    let id = row.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+    let storage = Storage::new("busy", state.file_watch.clone())?;
+    storage.update(|rows, _| {
+        rows.push(row);
+        Ok(())
+    })?;
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+    state.runtime.publish(&state).await?;
+    let generation = storage.update(|rows, _| {
+        Ok(rows[0]
+            .try_acquire_lifecycle_reservation(
+                crate::session::LifecycleOperation::Restore,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                chrono::Utc::now(),
+            )
+            .unwrap())
+    })?;
+
+    let single = delete_session(State(state.clone()), Path(id.clone()), None)
+        .await
+        .into_response();
+    assert_eq!(single.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(single.into_body(), usize::MAX).await?)?;
+    assert_eq!(body["error"], "lifecycle_busy");
+    assert_eq!(body["operation"], "restore");
+
+    let batch = delete_workspace(
+        State(state.clone()),
+        Some(Json(DeleteWorkspaceBody {
+            session_ids: vec![id.clone()],
+            ..Default::default()
+        })),
+    )
+    .await
+    .into_response();
+    assert_eq!(batch.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(batch.into_body(), usize::MAX).await?)?;
+    assert_eq!(body["error"], "lifecycle_busy");
+    assert_eq!(body["busy"][0]["id"], id.as_str());
+    assert_eq!(storage.load()?.len(), 1);
+
+    storage.update(|rows, _| {
+        rows[0].release_lifecycle_reservation_if_owned(
+            crate::session::LifecycleOperation::Restore,
+            generation,
+        );
+        Ok(())
+    })?;
+    let retried = delete_session(State(state.clone()), Path(id), None)
+        .await
+        .into_response();
+    assert_eq!(retried.status(), StatusCode::OK);
+    assert!(storage.load()?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn workspace_purge_retains_shared_files_when_structured_shutdown_is_unproven(
 ) -> anyhow::Result<()> {
     let _home = crate::session::test_support::isolate_app_dir();

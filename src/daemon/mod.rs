@@ -1497,6 +1497,10 @@ mod tests {
             ),
             "409 lifecycle_locked must map from status plus header with no body read, got: {error:?}"
         );
+        assert!(
+            error.to_string().contains("busy with another operation"),
+            "TUI-facing text must say the session is busy, got: {error}"
+        );
         let captured = next_request(rx).await;
         assert_eq!(captured.path, "/api/sessions/sess-1/stop");
     }

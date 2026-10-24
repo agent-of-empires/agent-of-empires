@@ -4111,3 +4111,63 @@ mod wait_decision_tests {
         assert!(adopt_stored(&live, converted).is_err());
     }
 }
+
+#[cfg(test)]
+mod empty_trash_busy_tests {
+    use super::empty_trash;
+    use crate::session::{Instance, LifecycleOperation, Storage};
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn empty_trash_purges_the_rest_then_fails_for_a_busy_session() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let root = crate::session::get_app_dir().unwrap();
+        crate::session::purge_owners::initialize(&root).unwrap();
+        crate::tmux::tool_retirement::initialize(&root).unwrap();
+        let profile = "empty-trash-busy";
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let mut busy = Instance::new("busy", "/tmp/empty-trash-busy-a");
+        let mut free = Instance::new("free", "/tmp/empty-trash-busy-b");
+        for row in [&mut busy, &mut free] {
+            row.source_profile = profile.into();
+            row.trash();
+        }
+        let busy_id = busy.id.clone();
+        storage
+            .update(|rows, _| {
+                rows.extend([busy, free]);
+                Ok(())
+            })
+            .unwrap();
+        let generation = storage
+            .update(|rows, _| {
+                let row = rows.iter_mut().find(|row| row.id == busy_id).unwrap();
+                Ok(row
+                    .try_acquire_lifecycle_reservation(
+                        LifecycleOperation::Restore,
+                        Instance::LIFECYCLE_RESERVATION_TTL,
+                        chrono::Utc::now(),
+                    )
+                    .unwrap())
+            })
+            .unwrap();
+
+        let error = empty_trash(profile).await.unwrap_err().to_string();
+        assert!(error.contains("1 session(s) were skipped"), "{error}");
+        let left = storage.load().unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, busy_id);
+
+        storage
+            .update(|rows, _| {
+                rows[0].release_lifecycle_reservation_if_owned(
+                    LifecycleOperation::Restore,
+                    generation,
+                );
+                Ok(())
+            })
+            .unwrap();
+        empty_trash(profile).await.unwrap();
+        assert!(storage.load().unwrap().is_empty());
+    }
+}

@@ -2993,7 +2993,7 @@ mod tests {
                 change, "unchanged",
                 "valid selected generation was rejected after claiming"
             );
-            assert_eq!(result.disposition, DeletionDisposition::Busy);
+            assert_eq!(result.disposition, DeletionDisposition::Superseded);
             assert_eq!(result.teardown_started, change == "group after teardown");
             let retained = storage.load().unwrap();
             assert_eq!(retained.len(), 1);
@@ -3053,13 +3053,95 @@ mod tests {
             Err(result) => result,
             Ok(_) => panic!("purge removed a row whose execution mode changed during hooks"),
         };
-        assert_eq!(result.disposition, DeletionDisposition::Busy);
+        assert_eq!(result.disposition, DeletionDisposition::Superseded);
         assert!(!result.teardown_started);
         let retained = storage.load().unwrap();
         assert_eq!(retained.len(), 1);
         assert!(retained[0].is_structured());
         assert_eq!(retained[0].status, crate::session::Status::Idle);
         assert!(!retained[0].has_fresh_lifecycle_reservation(Utc::now()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn purge_reports_the_holding_operation_as_busy_until_it_is_released() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let root = crate::session::get_app_dir().unwrap();
+        super::super::purge_owners::initialize(&root).unwrap();
+        crate::tmux::tool_retirement::initialize(&root).unwrap();
+        let profile = "purge-busy-holder";
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let mut instance = create_test_instance();
+        instance.source_profile = profile.into();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let generation = storage
+            .update(|rows, _| {
+                Ok(rows[0]
+                    .try_acquire_lifecycle_reservation(
+                        LifecycleOperation::Restore,
+                        Instance::LIFECYCLE_RESERVATION_TTL,
+                        Utc::now(),
+                    )
+                    .unwrap())
+            })
+            .unwrap();
+        let request = || DeletionRequest {
+            session_id: instance.id.clone(),
+            instance: instance.clone(),
+            delete_worktree: false,
+            delete_branch: false,
+            delete_sandbox: false,
+            force_delete: false,
+            detach_hooks: true,
+            keep_scratch: false,
+        };
+
+        let busy = match PurgeTransaction::reserve(
+            Storage::open_unwatched(profile).unwrap(),
+            request(),
+            None,
+        )
+        .unwrap()
+        {
+            Err(result) => result,
+            Ok(_) => panic!("purge reserved a session another operation holds"),
+        };
+        assert_eq!(busy.disposition, DeletionDisposition::Busy);
+        assert_eq!(
+            busy.conflict(),
+            Some(LifecycleReservationError::Busy(LifecycleOperation::Restore))
+        );
+        assert!(!busy.teardown_started);
+        assert_eq!(storage.load().unwrap().len(), 1);
+
+        storage
+            .update(|rows, _| {
+                rows[0].release_lifecycle_reservation_if_owned(
+                    LifecycleOperation::Restore,
+                    generation,
+                );
+                Ok(())
+            })
+            .unwrap();
+        let transaction = match PurgeTransaction::reserve(
+            Storage::open_unwatched(profile).unwrap(),
+            request(),
+            None,
+        )
+        .unwrap()
+        {
+            Ok(transaction) => transaction,
+            Err(_) => panic!("purge stayed refused after the holder released"),
+        };
+        assert_eq!(
+            transaction.complete().disposition,
+            DeletionDisposition::Removed
+        );
     }
 
     #[test]
@@ -3764,7 +3846,7 @@ mod tests {
         .unwrap();
         match rejected {
             Err(result) => {
-                assert_eq!(result.disposition, DeletionDisposition::Busy)
+                assert_eq!(result.disposition, DeletionDisposition::Superseded)
             }
             Ok(_) => panic!("foreign creation acquired rollback ownership"),
         }
@@ -3912,7 +3994,7 @@ mod tests {
         .unwrap();
         match rejected {
             Err(result) => {
-                assert_eq!(result.disposition, DeletionDisposition::Busy)
+                assert_eq!(result.disposition, DeletionDisposition::Superseded)
             }
             Ok(_) => {
                 panic!("a superseded creation took rollback ownership from generation {foreign}")
@@ -4028,7 +4110,7 @@ mod tests {
             Ok(_) => panic!("superseded purge crossed the irreversible boundary"),
             Err(result) => *result,
         };
-        assert_eq!(result.disposition, DeletionDisposition::Busy);
+        assert_eq!(result.disposition, DeletionDisposition::Superseded);
         assert!(!result.teardown_started);
         let retained = storage.load().unwrap();
         assert_eq!(retained.len(), 1);
@@ -4109,7 +4191,7 @@ mod tests {
             Ok(_) => panic!("a superseded trash lifecycle crossed the irreversible boundary"),
             Err(result) => result,
         };
-        assert_eq!(result.disposition, DeletionDisposition::Busy);
+        assert_eq!(result.disposition, DeletionDisposition::Superseded);
         assert!(!result.teardown_started);
         let retained = storage.load().unwrap().remove(0);
         assert!(!retained.same_trash_lifecycle(&selected));
