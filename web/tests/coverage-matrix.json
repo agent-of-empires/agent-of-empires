@@ -1833,6 +1833,18 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/SessionRow.tsx"]
     },
     {
+      "id": "session.degraded-move-warning-shown",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/__tests__/trashActions.test.ts", "src/lib/api.test.ts"],
+      "components": [
+        "web/src/lib/api.ts",
+        "web/src/lib/trashActions.ts",
+        "web/src/components/sidebar/SessionActions.tsx"
+      ],
+      "notes": "A trash, restore or workdir rename whose worktree move landed with git degraded keeps the new path and toasts the server's warnings instead of reporting plain success."
+    },
+    {
       "id": "session.delete-shared-worktree-kept",
       "kind": "mocked-playwright",
       "risk": "high",

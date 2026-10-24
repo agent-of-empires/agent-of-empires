@@ -491,8 +491,14 @@ pub struct TrashOutcome {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum TrashRelocationOutcome {
     Skipped,
-    Relocated,
-    Failed { reason: String },
+    /// `warning` is set when git is left degraded at the new path.
+    Relocated {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
+    },
+    Failed {
+        reason: String,
+    },
 }
 
 fn default_kill_pane() -> bool {
@@ -805,7 +811,11 @@ pub struct PendingApproval {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum RestoreOutcome {
-    Restored,
+    /// `warning` is set when git is left degraded at the original path.
+    Restored {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
+    },
     AlreadyRestored,
 }
 
