@@ -104,6 +104,7 @@ describe("StartupErrorScreen", () => {
 
   it.each([
     ["installable and sandboxed", incompatible(true), true, true],
+    ["non-auto-installable and sandboxed", incompatible(false), true, false],
     ["installable with one-click install off", incompatible(true), false, false],
     [
       "not installable",
