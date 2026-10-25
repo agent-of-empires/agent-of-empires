@@ -3770,7 +3770,7 @@ impl HomeView {
                     let msg = match &method {
                         InstallMethod::Nix => {
                             format!(
-                                "Nix install: run `{}` to update",
+                                "Nix install: run `{}` to update, or for a flake input run `nix flake update <input>` and rebuild",
                                 crate::update::install::InstallKind::Nix.update_command()
                             )
                         }
