@@ -34,8 +34,10 @@ const READ_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 pub(super) enum Observed {
     Settled,
     /// A missing session awaits a second look, or a commit overtook the snapshot and nothing
-    /// was applied.
-    Again,
+    /// was applied. `read_healthy` is whether every profile was listed and read.
+    Again {
+        read_healthy: bool,
+    },
     /// The profile listing or a profile's storage could not be read.
     ReadFailed,
 }
@@ -60,7 +62,12 @@ impl ReadRetry {
                 self.failures = 0;
                 None
             }
-            Observed::Again => Some(AGAIN_DELAY),
+            Observed::Again { read_healthy } => {
+                if read_healthy {
+                    self.failures = 0;
+                }
+                Some(AGAIN_DELAY)
+            }
             Observed::ReadFailed if self.failures < READ_RETRY_ATTEMPTS => {
                 let delay = READ_RETRY_BASE_DELAY * 2u32.pow(self.failures);
                 self.failures += 1;
@@ -126,14 +133,15 @@ impl LifecycleFeed {
             .map(|inst| LifecycleRow::of(inst, &inst.effective_profile()))
             .collect();
         let unread: Vec<String> = health.unreadable_profiles.iter().cloned().collect();
+        let read_healthy = unread.is_empty();
         self.apply(|tracker| {
             if tracker.commits() != since {
-                return (Vec::new(), Observed::Again);
+                return (Vec::new(), Observed::Again { read_healthy });
             }
             let changes = tracker.observe(&rows, &unread);
             let observed = if tracker.has_suspects(&unread) {
-                Observed::Again
-            } else if unread.is_empty() {
+                Observed::Again { read_healthy }
+            } else if read_healthy {
                 Observed::Settled
             } else {
                 Observed::ReadFailed
@@ -189,7 +197,7 @@ impl LifecycleFeed {
             if loaded.cache.health.enumeration_failed {
                 continue;
             }
-            if self.observe_disk(since, &loaded) != Observed::Again {
+            if !matches!(self.observe_disk(since, &loaded), Observed::Again { .. }) {
                 return true;
             }
         }
@@ -263,7 +271,10 @@ mod tests {
 
     /// A complete disk read taken just now.
     fn observe(feed: &LifecycleFeed, instances: Vec<Instance>) -> bool {
-        feed.observe_disk(feed.commit_generation(), &complete(instances)) == Observed::Again
+        matches!(
+            feed.observe_disk(feed.commit_generation(), &complete(instances)),
+            Observed::Again { .. }
+        )
     }
 
     #[test]
@@ -361,7 +372,7 @@ mod tests {
         // ... and only then is the old snapshot observed.
         assert_eq!(
             feed.observe_disk(since, &stale),
-            Observed::Again,
+            Observed::Again { read_healthy: true },
             "dropped, so observe again"
         );
         assert!(rx.try_recv().is_err(), "no reverse rename");
@@ -636,12 +647,65 @@ mod tests {
         );
 
         let mut retry = ReadRetry::default();
+        let again = |read_healthy| Observed::Again { read_healthy };
         for _ in 0..=READ_RETRY_ATTEMPTS {
-            assert_eq!(retry.next(Observed::Again, false), Some(AGAIN_DELAY));
+            assert_eq!(retry.next(again(true), false), Some(AGAIN_DELAY));
         }
         assert!(
             failed(&mut retry, false).is_some(),
             "a second look does not draw on the read budget"
+        );
+
+        // Spent budget, then a fully readable second look, then a transient failure.
+        let mut retry = ReadRetry::default();
+        for _ in 0..READ_RETRY_ATTEMPTS {
+            failed(&mut retry, false);
+        }
+        assert_eq!(failed(&mut retry, false), None);
+        assert_eq!(retry.next(again(true), false), Some(AGAIN_DELAY));
+        assert_eq!(
+            failed(&mut retry, false),
+            Some(READ_RETRY_BASE_DELAY),
+            "a healthy second look refills the budget"
+        );
+
+        // A second look that still has an unread profile does not.
+        let mut retry = ReadRetry::default();
+        for _ in 0..READ_RETRY_ATTEMPTS {
+            failed(&mut retry, false);
+        }
+        for _ in 0..=READ_RETRY_ATTEMPTS {
+            assert_eq!(retry.next(again(false), false), Some(AGAIN_DELAY));
+            assert_eq!(failed(&mut retry, false), None, "still bounded");
+        }
+    }
+
+    /// A suspect in a readable profile asks for a second look even while another profile is
+    /// unread, but that look is not a healthy read; once the suspect clears only the failure
+    /// remains.
+    #[test]
+    fn a_second_look_beside_an_unread_profile_is_not_a_healthy_read() {
+        let feed = LifecycleFeed::new();
+        let (kept, gone) = (instance("kept", "p1"), instance("gone", "p1"));
+        let held = instance("held", "p2");
+        observe(&feed, vec![kept.clone(), gone, held.clone()]);
+
+        let read = |feed: &LifecycleFeed| {
+            feed.observe_disk(
+                feed.commit_generation(),
+                &partial(vec![kept.clone()], &["p2"]),
+            )
+        };
+        assert_eq!(
+            read(&feed),
+            Observed::Again {
+                read_healthy: false
+            }
+        );
+        assert_eq!(
+            read(&feed),
+            Observed::ReadFailed,
+            "the suspect is confirmed"
         );
     }
 
