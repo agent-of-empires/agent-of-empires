@@ -4,6 +4,7 @@ import type { Dialog, Page } from "@playwright/test";
 import { test, expect, type ServeHandle } from "../helpers/liveTest";
 import { enableStructuredViewAndWait, composer } from "../helpers/acp";
 import { listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
+import { openDeleteDialogFromRow } from "../helpers/trashMocks";
 
 async function openFile(page: Page, serve: ServeHandle, title?: string) {
   const sessions = await listSessions(serve.baseUrl);
@@ -172,6 +173,44 @@ test("read-only mode refuses editing even with the browser preference enabled", 
   });
   expect(result.status()).toBe(403);
 });
+
+for (const permanent of [false, true]) {
+  test(`declining file discard prevents ${permanent ? "permanent deletion" : "Trash"} of the active session`, async ({
+    page,
+    spawnServe,
+  }) => {
+    const serve = await spawnServe({
+      seedFn: seedSessionViaAoeAdd({ title: "file-remove", git: false, files: { "notes.txt": "original" } }),
+    });
+    await page.addInitScript(() => localStorage.setItem("aoe-web-settings", JSON.stringify({ fileEditing: true })));
+    const session = await openFile(page, serve);
+    await page.getByRole("button", { name: "Edit", exact: true }).click();
+    const editor = page.getByRole("textbox", { name: "Edit notes.txt" });
+    await editor.fill("keep these edits");
+    const row = page.getByTestId("sidebar-session-row").filter({ hasText: "file-remove" });
+    const dialog = await openDeleteDialogFromRow(page, row);
+    if (permanent) await dialog.getByTestId("delete-session-permanent").click();
+    const mutations: string[] = [];
+    page.on("request", (request) => {
+      if (request.method() === "DELETE" || request.url().endsWith(`/api/sessions/${session.id}/trash`)) {
+        mutations.push(request.method());
+      }
+    });
+    const declined = page.waitForEvent("dialog");
+    const attempt = dialog.getByRole("button", { name: /^Delete$/ }).click();
+    const discard = await declined;
+    expect(discard.message()).toBe("Discard unsaved file changes?");
+    await discard.dismiss();
+    await attempt;
+    await expect(dialog).toBeHidden();
+    await expect(editor).toHaveValue("keep these edits");
+    await expect(page).toHaveURL(`${serve.baseUrl}/session/${session.id}`);
+    const remaining = (await listSessions(serve.baseUrl)).find((item) => item.id === session.id);
+    expect(remaining).toBeDefined();
+    expect(remaining?.trashed_at ?? null).toBeNull();
+    expect(mutations).toEqual([]);
+  });
+}
 
 test("mobile editing keeps controls usable and confirms leaving the Files pane", async ({
   page,

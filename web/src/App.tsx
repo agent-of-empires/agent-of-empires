@@ -12,6 +12,7 @@ import {
 import { Puzzle } from "lucide-react";
 import {
   confirmFileEditNavigation,
+  confirmFileEditRemoval,
   hasUnsavedFileEdits,
   isFileEditorOpen,
   rememberFileEditLocation,
@@ -1270,9 +1271,15 @@ function AppContent({
     [sessions],
   );
 
+  const confirmRemovingSessions = useCallback(
+    (candidates: readonly SessionResponse[]) => confirmFileEditRemoval(candidates.map((session) => session.id)),
+    [],
+  );
+
   const handleConfirmDelete = async (options: DeleteSessionOptions) => {
     if (deletingSessions.length === 0) return;
     setDeletingSessions([]);
+    if (!confirmRemovingSessions(deletingSessions)) return;
     await deleteWorkspaceSessions(deletingSessions, options, activeSessionId, {
       setStatus: setSessionStatus,
       clearDeleting: clearDeletingStatus,
@@ -1292,6 +1299,7 @@ function AppContent({
   const handleEmptyTrash = useCallback(
     async (confirmed: Workspace[]) => {
       if (confirmed.length === 0 || emptyingTrashRef.current) return;
+      if (!confirmRemovingSessions(confirmed.flatMap((workspace) => workspace.sessions))) return;
       emptyingTrashRef.current = true;
       let anyFailed = false;
       let anyBusy = false;
@@ -1338,7 +1346,7 @@ function AppContent({
               : "Emptied trash",
       );
     },
-    [activeSessionId, setSessionStatus, clearDeletingStatus, leaveActiveSession],
+    [activeSessionId, setSessionStatus, clearDeletingStatus, leaveActiveSession, confirmRemovingSessions],
   );
 
   // Move-to-trash path (#2489): the safe default. Unlike permanent delete it
@@ -1351,6 +1359,7 @@ function AppContent({
     const wasActive = activeSessionId != null && ids.includes(activeSessionId);
 
     setDeletingSessions([]);
+    if (!confirmRemovingSessions(deletingSessions)) return;
     for (const id of ids) setSessionStatus(id, "Stopped");
     if (wasActive) {
       leaveActiveSession();

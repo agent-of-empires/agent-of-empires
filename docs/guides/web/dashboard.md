@@ -21,9 +21,12 @@ Editing is off by default. Enable **Settings > Panels > Edit project text files*
 
 - Save or Cancel in the viewer. Ctrl/Cmd+S and Esc apply only while the text area has focus. Confirm before leaving unsaved changes. Unsaved text survives resizing or rotating across the phone layout. Resizing does not duplicate or cancel a pending save.
 - Existing UTF-8 text files up to 5 MB only. Read-only dashboards, out-of-project transcript files, and Sandbox folders backed by separate volumes and individual file bind mounts stay read-only with a reason. Files are unavailable in CityHall mode.
-- Saves preserve line endings, the trailing newline and ordinary file permissions. Special permission bits are cleared. A changed disk version refuses the save; copy your edits or reload. The editor checks for external changes while open.
+- Saves retain consistent LF, CRLF or CR endings and the edited text's trailing newline. Mixed endings follow line position and can shift after lines are inserted or removed.
+- Saves retain ordinary file permissions and clear special permission bits.
+- Saves use an [optimistic version check](../../api.md#get-and-put-apisessionsidfile). A detected disk change refuses the save; copy your edits or reload. The editor polls for external changes while open.
 - Temporary Sandbox verification failures pause saving and show a reason. Saving resumes when verification succeeds, keeping the draft.
 - Turning editing off hides the editor and parks unsaved text. Turn it back on to resume the same draft and opened version.
+- Trash and permanent deletion ask before discarding unsaved drafts, including parked drafts.
 - After saving, optionally draft a note in Structured view without submitting it. Terminal view shows a reminder to tell the agent.
 
 ## Creating a session
