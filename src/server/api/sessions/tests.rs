@@ -6787,6 +6787,48 @@ async fn rename_session_quiesces_structured_worker_only_on_profile_move() -> any
     Ok(())
 }
 
+/// #4919: a worker whose retirement is not proven blocks the profile move.
+#[tokio::test]
+#[serial_test::serial]
+async fn rename_session_refuses_profile_move_while_worker_retirement_is_unproven(
+) -> anyhow::Result<()> {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut inst = Instance::new("Before", "/tmp/stopping");
+    inst.id = "stopping".into();
+    inst.source_profile = "rename-source".into();
+    inst.status = Status::Idle;
+    inst.view = crate::session::View::Structured;
+    let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+    let source = Storage::new("rename-source", state.file_watch.clone())?;
+    source.update(|rows, _| {
+        *rows = vec![inst];
+        Ok(())
+    })?;
+    let target = Storage::new("rename-target", state.file_watch.clone())?;
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+    state.acp_supervisor.test_hold_stopping("stopping");
+
+    let response = rename_session(
+        State(state.clone()),
+        Path("stopping".to_string()),
+        Ok(Json(RenameSessionBody {
+            title: None,
+            group: None,
+            profile: Some("rename-target".into()),
+            rename_branch: false,
+        })),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await?)?;
+    assert_eq!(body["error"], "worker_shutdown_failed");
+    assert!(source.load()?.iter().any(|row| row.id == "stopping"));
+    assert!(target.load()?.is_empty());
+    Ok(())
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn composed_rename_receipt_contains_complete_source_and_target_profiles() -> anyhow::Result<()>

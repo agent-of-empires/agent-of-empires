@@ -585,10 +585,12 @@ struct EditDuplicate(String);
 /// it running under the old profile (#4919). `blocks_worktree_edit` misses both
 /// because a "stopped" structured session sits at Idle yet still owns a worker.
 ///
-/// `shutdown` is reversible: it keeps the transcript and `acp_session_id`, so the
+/// The stop is reversible: it keeps the transcript and `acp_session_id`, so the
 /// reconciler fresh-spawns under the new path and profile and resumes via
 /// session/load. Callers hold `instance_lock` across shutdown, move and persist.
-/// Refuses the move (409) if a live worker cannot be stopped.
+/// Waits for retirement to settle, since `shutdown` also succeeds for a worker
+/// that is already stopping. Refuses the move (409) if a live worker is not
+/// proven stopped within the deadline.
 async fn quiesce_structured_worker(
     state: &Arc<AppState>,
     id: &str,
@@ -597,7 +599,11 @@ async fn quiesce_structured_worker(
     if !is_structured {
         return Ok(());
     }
-    match state.acp_supervisor.shutdown(id).await {
+    match state
+        .acp_supervisor
+        .shutdown_and_wait(id, std::time::Duration::from_secs(5))
+        .await
+    {
         Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => Ok(()),
         Err(e) => {
             tracing::warn!(
