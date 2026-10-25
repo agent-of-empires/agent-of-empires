@@ -2070,6 +2070,15 @@ async fn purge_of_a_busy_session_names_the_holder_and_retries_after_release() ->
     assert_eq!(body["busy"][0]["id"], id.as_str());
     assert_eq!(storage.load()?.len(), 1);
 
+    let restore = restore_session(State(state.clone()), Path(id.clone()))
+        .await
+        .into_response();
+    assert_eq!(restore.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(restore.into_body(), usize::MAX).await?)?;
+    assert_eq!(body["error"], "lifecycle_busy");
+    assert_eq!(body["operation"], "restore");
+
     storage.update(|rows, _| {
         rows[0].release_lifecycle_reservation_if_owned(
             crate::session::LifecycleOperation::Restore,
@@ -2471,9 +2480,13 @@ async fn abandon_purge_requires_current_ownership_without_waiting_for_teardown(
             ))
             .unwrap()
     };
-    for (operation, expected) in [
-        (LifecycleOperation::Purge, generation + 1),
-        (LifecycleOperation::Stop, generation),
+    for (operation, expected, code) in [
+        (
+            LifecycleOperation::Purge,
+            generation + 1,
+            "lifecycle_superseded",
+        ),
+        (LifecycleOperation::Stop, generation, "lifecycle_locked"),
     ] {
         storage.update(|rows, _| {
             rows[0].lifecycle_reservation.as_mut().unwrap().op = operation;
@@ -2485,6 +2498,7 @@ async fn abandon_purge_requires_current_ownership_without_waiting_for_teardown(
         )
         .await??;
         assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(response.headers()[crate::daemon::ERROR_CODE_HEADER], code);
         assert!(!response
             .headers()
             .contains_key(crate::daemon::RUNTIME_REVISION_HEADER));

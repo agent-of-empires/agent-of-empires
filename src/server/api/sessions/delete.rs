@@ -890,13 +890,25 @@ pub async fn abandon_purge(
                 !cityhall || row.is_structured(),
                 LifecycleTargetError::CityHall
             );
-            anyhow::ensure!(
-                row.lifecycle_reservation_is_owned(
-                    LifecycleOperation::Purge,
-                    body.expected_generation.get()
-                ),
-                LifecycleTargetError::Busy
-            );
+            if !row.lifecycle_reservation_is_owned(
+                LifecycleOperation::Purge,
+                body.expected_generation.get(),
+            ) {
+                let holder = row
+                    .lifecycle_reservation
+                    .as_ref()
+                    .filter(|reservation| {
+                        reservation.op != LifecycleOperation::Purge
+                            && row.has_fresh_lifecycle_reservation(chrono::Utc::now())
+                    })
+                    .map(|reservation| reservation.op);
+                return Err(holder
+                    .map_or(
+                        crate::session::LifecycleReservationError::Superseded,
+                        crate::session::LifecycleReservationError::Busy,
+                    )
+                    .into());
+            }
             removed = Some(rows.remove(index));
             Ok(())
         })?;

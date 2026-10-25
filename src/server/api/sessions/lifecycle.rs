@@ -748,7 +748,13 @@ pub async fn restore_session(
                 let now = chrono::Utc::now();
                 if !row.is_trashed() {
                     if row.has_fresh_lifecycle_reservation(now) {
-                        return Err(LifecycleTargetError::Busy.into());
+                        return Err(row.lifecycle_reservation.as_ref().map_or(
+                            LifecycleTargetError::Busy.into(),
+                            |reservation| {
+                                crate::session::LifecycleReservationError::Busy(reservation.op)
+                                    .into()
+                            },
+                        ));
                     }
                     return Ok(None);
                 }
@@ -763,8 +769,8 @@ pub async fn restore_session(
                     crate::session::claim::RestoreClaimDecision::AlreadyGone => {
                         Err(LifecycleTargetError::Missing.into())
                     }
-                    crate::session::claim::RestoreClaimDecision::Busy(_) => {
-                        Err(LifecycleTargetError::Busy.into())
+                    crate::session::claim::RestoreClaimDecision::Busy(holder) => {
+                        Err(crate::session::LifecycleReservationError::Busy(holder).into())
                     }
                 }
             })?;
