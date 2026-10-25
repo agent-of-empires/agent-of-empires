@@ -68,9 +68,13 @@ export function useDiffFiles(sessionId: string | null, enabled: boolean): UseDif
     }
   }
 
+  // Layout phase: drop in-flight responses before they can land on the new session.
   useLayoutEffect(() => {
     requestIdRef.current += 1;
     lastFingerprintRef.current = "";
+  }, [sessionId]);
+
+  useEffect(() => {
     if (!sessionId) return;
     const timer = setTimeout(() => {
       void fetchFiles();
