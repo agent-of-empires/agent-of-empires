@@ -1278,7 +1278,9 @@ function AppContent({
       }
       toastBus.handler?.[anyFailed || anyBusy ? "error" : "info"](
         anyFailed
-          ? "Some trashed sessions could not be deleted"
+          ? anyBusy
+            ? "Some trashed sessions could not be deleted, and some are busy with another operation; retry the busy ones when it finishes"
+            : "Some trashed sessions could not be deleted"
           : anyBusy
             ? "Some trashed sessions are busy with another operation; retry when it finishes"
             : anyKept

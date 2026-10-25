@@ -159,6 +159,21 @@ describe("deleteWorkspaceSessions (#2536)", () => {
     expect(result.kept).toEqual([]);
   });
 
+  it("keeps the Busy hint when other deletions also fail", async () => {
+    deleteMock.mockResolvedValue({
+      ok: true,
+      deleted: [],
+      failed: [{ id: "a", error: "boom" }],
+      busy: [{ id: "b", error: "busy with restore" }],
+    });
+    const d = deps();
+
+    await deleteWorkspaceSessions(sessions("a", "b"), {}, null, d);
+
+    expect(d.notify.error).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("busy with another operation"));
+    expect(d.notify.error).toHaveBeenCalledWith(expect.stringContaining("could not be deleted"));
+  });
+
   it("does not mark rows Error when the whole batch is Busy", async () => {
     deleteMock.mockResolvedValue({ ok: false, error: "busy", busy: [{ id: "a", error: "busy" }] });
     const d = deps();

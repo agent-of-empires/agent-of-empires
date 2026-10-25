@@ -139,7 +139,11 @@ export async function deleteWorkspaceSessions(
   if (activeInWorkspace && deleted.has(activeSessionId!)) deps.navigateHome();
 
   if (result.failed && result.failed.length > 0) {
-    deps.notify?.error?.("Some sessions could not be deleted");
+    deps.notify?.error?.(
+      busy.size > 0
+        ? "Some sessions could not be deleted, and some are busy with another operation; retry the busy ones when it finishes"
+        : "Some sessions could not be deleted",
+    );
     return { ...result, kept };
   }
   if (busy.size > 0) {
