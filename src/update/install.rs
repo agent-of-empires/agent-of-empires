@@ -540,7 +540,7 @@ fn update_via_brew(target_version: &str) -> Result<()> {
 
 fn nix_refusal_message() -> String {
     format!(
-        "aoe was installed via Nix. Update by running:\n\n    {NIX_UPDATE_COMMAND}\n\n(check the entry name with `nix profile list`), or, if aoe comes from a flake input (NixOS or home-manager), run `nix flake update agent-of-empires` and rebuild (`nixos-rebuild switch`, `home-manager switch`, ...)."
+        "aoe was installed via Nix. Update by running:\n\n    {NIX_UPDATE_COMMAND}\n\n(check the entry name with `nix profile list`), or, if aoe comes from a flake input (NixOS or home-manager), run `nix flake update <input>` (your flake's name for aoe) and rebuild (`nixos-rebuild switch`, `home-manager switch`, ...)."
     )
 }
 
