@@ -99,9 +99,25 @@ describe("FileContentViewer", () => {
     expect(save).toHaveBeenCalledWith("s1", "/repo/a.ts", "v1", "parked draft");
   });
 
+  it("uses a late parked draft's opened version instead of the viewer's newer snapshot", async () => {
+    const original = { content: "original", version: "v1", is_binary: false, truncated: false };
+    vi.spyOn(api, "getSessionFile").mockResolvedValue({ ...original, content: "new disk content", version: "v2" });
+    const save = vi.spyOn(api, "saveSessionFile").mockResolvedValue({ ok: true, status: 204, error: undefined });
+    const settings = renderHook(() => useWebSettings());
+    act(() => settings.result.current.update({ fileEditing: true }));
+    render(<FileContentViewer sessionId="s1" filePath="/repo/a.ts" />);
+    const edit = await screen.findByRole("button", { name: "Edit", exact: true });
+    setFileDraft(fileDraftKey("s1", "/repo/a.ts"), { original, text: "parked edit", pendingSave: null });
+    fireEvent.click(edit);
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("parked edit");
+    fireEvent.click(screen.getByRole("button", { name: "Save", exact: true }));
+    await screen.findByText("File saved.");
+    expect(save).toHaveBeenCalledWith("s1", "/repo/a.ts", "v1", "parked edit");
+  });
+
   it("shows a parked draft only after editing is enabled", async () => {
     const original = { content: "original", version: "v1", is_binary: false, truncated: false };
-    setFileDraft(fileDraftKey("s1", "/repo/a.ts"), { original, text: "restored draft", saving: false });
+    setFileDraft(fileDraftKey("s1", "/repo/a.ts"), { original, text: "restored draft", pendingSave: null });
     vi.spyOn(api, "getSessionFile").mockResolvedValue(original);
     const settings = renderHook(() => useWebSettings());
     render(<FileContentViewer sessionId="s1" filePath="/repo/a.ts" />);

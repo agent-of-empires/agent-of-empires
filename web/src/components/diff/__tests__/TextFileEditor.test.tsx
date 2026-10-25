@@ -11,6 +11,7 @@ import {
   installFileEditGuards,
   isFileEditorOpen,
   preserveLineEndings,
+  registerFileEditor,
   setFileDraft,
 } from "../../../lib/fileEditGuard";
 
@@ -119,6 +120,85 @@ describe("TextFileEditor", () => {
     await act(async () => complete({ ok: true, status: 204, error: undefined }));
     expect(onSaved).toHaveBeenCalledOnce();
   });
+  it("keeps one pending save across remounts and delivers success to the current editor", async () => {
+    let complete!: (value: { ok: boolean; status: number; error: undefined }) => void;
+    const save = vi.spyOn(api, "saveSessionFile").mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          complete = resolve;
+        }),
+    );
+    const first = setup();
+    fireEvent.change(first.editor, { target: { value: "pending draft" } });
+    fireEvent.keyDown(first.editor, { key: "s", ctrlKey: true });
+    cleanup();
+    const current = setup();
+    expect((current.editor as HTMLTextAreaElement).value).toBe("pending draft");
+    expect((current.editor as HTMLTextAreaElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Saving..." }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.keyDown(current.editor, { key: "s", ctrlKey: true });
+    expect(save).toHaveBeenCalledOnce();
+    expect(confirmFileEditNavigation()).toBe(false);
+    await act(async () => {
+      complete({ ok: true, status: 204, error: undefined });
+    });
+    expect(first.onSaved).not.toHaveBeenCalled();
+    expect(current.onSaved).toHaveBeenCalledOnce();
+    expect(hasUnsavedFileEdits()).toBe(false);
+  });
+
+  it.each(["conflict", "offline"])("restores a save's %s result after it settles while unmounted", async (failure) => {
+    let complete!: (value: { ok: boolean; status: number; error: string }) => void;
+    let reject!: (reason: Error) => void;
+    const save = vi.spyOn(api, "saveSessionFile").mockImplementation(
+      () =>
+        new Promise((resolve, fail) => {
+          complete = resolve;
+          reject = fail;
+        }),
+    );
+    const first = setup();
+    fireEvent.change(first.editor, { target: { value: "keep pending draft" } });
+    fireEvent.keyDown(first.editor, { key: "s", ctrlKey: true });
+    cleanup();
+    await act(async () => {
+      if (failure === "conflict") complete({ ok: false, status: 409, error: "File changed" });
+      else reject(new Error("offline"));
+    });
+    const current = setup();
+    await screen.findByText(failure === "conflict" ? "File changed" : /Save could not be confirmed/);
+    expect((current.editor as HTMLTextAreaElement).value).toBe("keep pending draft");
+    expect((current.editor as HTMLTextAreaElement).disabled).toBe(false);
+    expect((screen.getByRole("button", { name: "Save", exact: true }) as HTMLButtonElement).disabled).toBe(
+      failure === "conflict",
+    );
+    expect(save).toHaveBeenCalledOnce();
+    expect(first.onSaved).not.toHaveBeenCalled();
+    expect(current.onSaved).not.toHaveBeenCalled();
+    vi.spyOn(window, "confirm").mockReturnValue(false);
+    expect(confirmFileEditNavigation()).toBe(false);
+  });
+
+  it("transfers draft ownership between panes without unregistering the new owner", () => {
+    const key = fileDraftKey("s1", "notes.txt");
+    const first = vi.fn();
+    const current = vi.fn();
+    const releaseFirst = registerFileEditor(key, first);
+    const releaseCurrent = registerFileEditor(key, current);
+    try {
+      expect(first).toHaveBeenCalledOnce();
+      releaseFirst();
+      setFileDraft(key, { original, text: "shared draft", pendingSave: null });
+      vi.spyOn(window, "confirm").mockReturnValue(true);
+      expect(confirmFileEditNavigation()).toBe(true);
+      expect(current).toHaveBeenCalledOnce();
+      expect(first).toHaveBeenCalledOnce();
+    } finally {
+      releaseFirst();
+      releaseCurrent();
+    }
+  });
+
   it("owns Escape only while mounted, so the app shortcut does not also close the file", () => {
     setup();
     expect(isFileEditorOpen()).toBe(true);

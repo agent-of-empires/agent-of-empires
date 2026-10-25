@@ -1,17 +1,17 @@
-import type { SessionFileResponse } from "./api";
+import type { SessionFileResponse, saveSessionFile } from "./api";
 import { toastBus } from "./toastBus";
 
 interface FileDraft {
   /** The snapshot the edit started from; its version guards the save. */
   original: SessionFileResponse;
   text: string;
-  saving: boolean;
+  pendingSave: ReturnType<typeof saveSessionFile> | null;
 }
 
 // Unsaved drafts outlive their editor, so a layout switch or reopening the file restores them.
 // Leaving an open editor asks first; a page unload loses every draft.
 const drafts = new Map<string, FileDraft>();
-// Mounted editors by draft key; discarding a draft closes its editor.
+// One editor owns each draft, even when multiple panes show the same file.
 const editors = new Map<string, () => void>();
 
 export function fileDraftKey(sessionId: string, filePath: string): string {
@@ -29,6 +29,7 @@ export function setFileDraft(key: string, draft: FileDraft | null): void {
 }
 
 export function registerFileEditor(key: string, discard: () => void): () => void {
+  editors.get(key)?.();
   editors.set(key, discard);
   return () => {
     if (editors.get(key) === discard) editors.delete(key);
@@ -50,7 +51,7 @@ export function hasUnsavedFileEdits(): boolean {
 
 export function confirmFileEditNavigation(): boolean {
   const open = openDrafts();
-  if (open.some(([, draft]) => draft.saving)) {
+  if (open.some(([, draft]) => draft.pendingSave)) {
     toastBus.handler?.error("Wait for the file save to finish.");
     return false;
   }

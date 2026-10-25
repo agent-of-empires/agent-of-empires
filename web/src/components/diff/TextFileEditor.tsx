@@ -29,7 +29,8 @@ export function TextFileEditor({ sessionId, filePath, original, onBack, onCancel
   const normalized = original.content.replace(/\r\n|\r/g, "\n");
   const key = fileDraftKey(sessionId, filePath);
   const [draft, setDraft] = useState(() => getFileDraft(key)?.text ?? normalized);
-  const [saving, setSaving] = useState(false);
+  const [pendingSave, setPendingSave] = useState(() => getFileDraft(key)?.pendingSave ?? null);
+  const saving = pendingSave !== null;
   const [changed, setChanged] = useState(false);
   const [checkFailed, setCheckFailed] = useState(false);
   const [editDisabledReason, setEditDisabledReason] = useState(original.edit_disabled_reason ?? null);
@@ -37,8 +38,7 @@ export function TextFileEditor({ sessionId, filePath, original, onBack, onCancel
   const [copied, setCopied] = useState(false);
   const textarea = useRef<HTMLTextAreaElement>(null);
   const dirty = draft !== normalized;
-  const latest = useLatestRef({ onCancel });
-  const savingRef = useRef(false);
+  const latest = useLatestRef({ onCancel, onSaved });
 
   useEffect(() => {
     textarea.current?.focus();
@@ -55,7 +55,7 @@ export function TextFileEditor({ sessionId, filePath, original, onBack, onCancel
       clearTimeout(timer);
       try {
         const current = await getSessionFile(sessionId, filePath, { versionOnly: true });
-        if (cancelled || savingRef.current) return;
+        if (cancelled || getFileDraft(key)?.pendingSave) return;
         setCheckFailed(current === null);
         setEditDisabledReason(current?.edit_disabled_reason ?? null);
         if (current && current.version !== original.version) setChanged(true);
@@ -75,43 +75,51 @@ export function TextFileEditor({ sessionId, filePath, original, onBack, onCancel
       clearTimeout(timer);
       window.removeEventListener("focus", onFocus);
     };
-  }, [sessionId, filePath, original.version]);
+  }, [sessionId, filePath, original.version, key]);
+
+  useEffect(() => {
+    if (!pendingSave) return;
+    let cancelled = false;
+    void pendingSave.then((result) => {
+      if (cancelled) return;
+      if (result.ok) {
+        setFileDraft(key, null);
+        latest.current.onSaved();
+      } else {
+        setFileDraft(key, { original, text: draft, pendingSave: null });
+        if (result.status === 409 || result.status === 404) setChanged(true);
+        setError(result.error ?? "Could not save file. Your edits are kept.");
+      }
+      setPendingSave(null);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [pendingSave, key, original, draft, latest]);
 
   const discard = () => {
     setFileDraft(key, null);
     onCancel();
   };
   const cancel = () => {
-    if (savingRef.current) return;
+    if (getFileDraft(key)?.pendingSave) return;
     if (!dirty || window.confirm("Discard unsaved file changes?")) discard();
   };
-  const save = async () => {
-    if (savingRef.current || !dirty || changed || editDisabledReason || !original.version) return;
-    savingRef.current = true;
-    setFileDraft(key, { original, text: draft, saving: true });
-    setSaving(true);
+  const save = () => {
+    if (getFileDraft(key)?.pendingSave || !dirty || changed || editDisabledReason || !original.version) return;
+    const pending = saveSessionFile(
+      sessionId,
+      filePath,
+      original.version,
+      preserveLineEndings(draft, original.content),
+    ).catch(() => ({
+      ok: false,
+      status: 0,
+      error: "Save could not be confirmed. Your edits are kept; check the file before retrying.",
+    }));
+    setFileDraft(key, { original, text: draft, pendingSave: pending });
+    setPendingSave(pending);
     setError(null);
-    try {
-      const result = await saveSessionFile(
-        sessionId,
-        filePath,
-        original.version,
-        preserveLineEndings(draft, original.content),
-      );
-      if (result.ok) {
-        setFileDraft(key, null);
-        onSaved();
-      } else {
-        if (result.status === 409 || result.status === 404) setChanged(true);
-        setError(result.error ?? "Could not save file. Your edits are kept.");
-      }
-    } catch {
-      setError("Save could not be confirmed. Your edits are kept; check the file before retrying.");
-    } finally {
-      savingRef.current = false;
-      if (getFileDraft(key)) setFileDraft(key, { original, text: draft, saving: false });
-      setSaving(false);
-    }
   };
 
   return (
@@ -201,7 +209,7 @@ export function TextFileEditor({ sessionId, filePath, original, onBack, onCancel
         onChange={(event) => {
           const text = event.target.value;
           setDraft(text);
-          setFileDraft(key, text === normalized ? null : { original, text, saving: false });
+          setFileDraft(key, text === normalized ? null : { original, text, pendingSave: null });
           setCopied(false);
         }}
         onKeyDown={(event) => {
