@@ -95,6 +95,25 @@ describe("SettingsView navigation", () => {
       expect(highlighted()?.getAttribute("data-settings-field")).toBe("sandbox.enabled_by_default");
     });
 
+    it("refocuses when the same field returns after it was dropped (browser Back)", async () => {
+      const scrollIntoView = vi.fn();
+      Element.prototype.scrollIntoView = scrollIntoView;
+      const view = (field?: string) => (
+        <SettingsView
+          onClose={() => {}}
+          tab="sandbox"
+          onSelectTab={() => {}}
+          onServerAboutRefresh={() => {}}
+          field={field}
+        />
+      );
+      const { rerender } = render(view("sandbox.enabled_by_default"));
+      await waitFor(() => expect(scrollIntoView).toHaveBeenCalledTimes(1));
+      rerender(view(undefined));
+      rerender(view("sandbox.enabled_by_default"));
+      await waitFor(() => expect(scrollIntoView).toHaveBeenCalledTimes(2));
+    });
+
     it.each([["sandbox.nope"], ["updates.check_mode"]])("opens the tab without error for %s", async (field) => {
       renderView("sandbox", field);
       await screen.findByText("enabled_by_default");
