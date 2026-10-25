@@ -1,11 +1,16 @@
 import type { SessionFileResponse, saveSessionFile } from "./api";
 import { toastBus } from "./toastBus";
 
+interface FileSave {
+  promise: ReturnType<typeof saveSessionFile>;
+  result?: Awaited<ReturnType<typeof saveSessionFile>>;
+}
+
 interface FileDraft {
   /** The snapshot the edit started from; its version guards the save. */
   original: SessionFileResponse;
   text: string;
-  pendingSave: ReturnType<typeof saveSessionFile> | null;
+  pendingSave: FileSave | null;
 }
 
 // Unsaved drafts outlive their editor, so a layout switch or reopening the file restores them.
@@ -28,6 +33,29 @@ export function setFileDraft(key: string, draft: FileDraft | null): void {
   else drafts.delete(key);
 }
 
+/** The request settles independently of whichever layout currently owns the editor. */
+export function startFileSave(
+  key: string,
+  draft: Omit<FileDraft, "pendingSave">,
+  promise: ReturnType<typeof saveSessionFile>,
+): FileSave {
+  const save: FileSave = { promise };
+  setFileDraft(key, { ...draft, pendingSave: save });
+  void promise.then((result) => {
+    save.result = result;
+  });
+  return save;
+}
+
+export function isFileSaving(key: string): boolean {
+  const save = drafts.get(key)?.pendingSave;
+  return save != null && save.result === undefined;
+}
+
+function isUnsaved(draft: FileDraft): boolean {
+  return !draft.pendingSave?.result?.ok;
+}
+
 export function registerFileEditor(key: string, discard: () => void): () => void {
   editors.get(key)?.();
   editors.set(key, discard);
@@ -41,23 +69,35 @@ export function isFileEditorOpen(): boolean {
   return editors.size > 0;
 }
 
-function openDrafts(): [string, FileDraft][] {
-  return [...drafts].filter(([key]) => editors.has(key));
+function blockingDrafts(): [string, FileDraft][] {
+  return [...drafts].filter(([key, draft]) => isUnsaved(draft) && (editors.has(key) || isFileSaving(key)));
 }
 
 export function hasUnsavedFileEdits(): boolean {
-  return openDrafts().length > 0;
+  return blockingDrafts().length > 0;
 }
 
 export function confirmFileEditNavigation(): boolean {
-  const open = openDrafts();
-  if (open.some(([, draft]) => draft.pendingSave)) {
+  return confirmDrafts(blockingDrafts());
+}
+
+/** Removing a Session also discards drafts parked outside the current layout. */
+export function confirmFileEditRemoval(sessionIds: readonly string[]): boolean {
+  return confirmDrafts(
+    [...drafts].filter(
+      ([key, draft]) => isUnsaved(draft) && sessionIds.some((id) => key.startsWith(fileDraftKey(id, ""))),
+    ),
+  );
+}
+
+function confirmDrafts(affected: [string, FileDraft][]): boolean {
+  if ([...drafts.keys()].some(isFileSaving)) {
     toastBus.handler?.error("Wait for the file save to finish.");
     return false;
   }
-  if (open.length === 0) return true;
+  if (affected.length === 0) return true;
   if (!window.confirm("Discard unsaved file changes?")) return false;
-  open.forEach(([key]) => {
+  affected.forEach(([key]) => {
     drafts.delete(key);
     editors.get(key)?.();
   });
@@ -82,7 +122,7 @@ export function installFileEditGuards(): void {
   if (installed) return;
   installed = true;
   window.addEventListener("beforeunload", (event) => {
-    if (drafts.size === 0) return;
+    if (![...drafts.values()].some(isUnsaved)) return;
     event.preventDefault();
     event.returnValue = "";
   });
