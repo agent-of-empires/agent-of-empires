@@ -162,4 +162,26 @@ describe("useDiffFiles", () => {
     await waitFor(() => expect(result.current.files[0]?.path).toBe("b.ts"));
     expect(result.current.perRepoBases).toEqual([{ base_branch: "dev", repo_path: "/repo" }]);
   });
+
+  it("ignores a refresh bound to the previous session after a switch (#4847)", async () => {
+    mockGetFiles.mockResolvedValueOnce(resp({ files: [file("a.ts")] }));
+    const { result, rerender } = renderHook(({ id }: { id: string }) => useDiffFiles(id, true), {
+      initialProps: { id: "a" },
+    });
+    await waitFor(() => expect(result.current.files[0]?.path).toBe("a.ts"));
+    const staleRefresh = result.current.refresh;
+
+    let release: (r: RichDiffFilesResponse) => void = () => {};
+    mockGetFiles.mockReturnValueOnce(new Promise((r) => (release = r)));
+    rerender({ id: "b" });
+    await waitFor(() => expect(mockGetFiles).toHaveBeenCalledTimes(2));
+
+    await act(() => staleRefresh());
+    expect(mockGetFiles).toHaveBeenCalledTimes(2);
+    expect(result.current).toMatchObject({ files: [], loading: true });
+
+    release(resp({ files: [file("b.ts")] }));
+    await waitFor(() => expect(result.current.files[0]?.path).toBe("b.ts"));
+    expect(result.current.loading).toBe(false);
+  });
 });

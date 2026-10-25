@@ -23,15 +23,17 @@ export function useDiffFiles(sessionId: string | null, enabled: boolean): UseDif
   const [revision, setRevision] = useState(0);
   const lastFingerprintRef = useRef("");
   const requestIdRef = useRef(0);
+  const currentSessionIdRef = useRef(sessionId);
   const diffPanelSeenForRef = useRef<string | null>(null);
   const enabledRef = useLatestRef(enabled);
 
   const fetchFiles = useCallback(async () => {
     if (!sessionId) return;
-    const reqId = ++requestIdRef.current;
     const capturedSessionId = sessionId;
+    if (capturedSessionId !== currentSessionIdRef.current) return;
+    const reqId = ++requestIdRef.current;
     const resp = await getSessionDiffFiles(capturedSessionId);
-    if (reqId !== requestIdRef.current || capturedSessionId !== sessionId) return;
+    if (reqId !== requestIdRef.current || capturedSessionId !== currentSessionIdRef.current) return;
     if (resp) {
       // Include bases and warning: a base change can leave the file list identical (#3329).
       const fingerprint = JSON.stringify({
@@ -70,6 +72,7 @@ export function useDiffFiles(sessionId: string | null, enabled: boolean): UseDif
 
   // Layout phase: drop in-flight responses before they can land on the new session.
   useLayoutEffect(() => {
+    currentSessionIdRef.current = sessionId;
     requestIdRef.current += 1;
     lastFingerprintRef.current = "";
   }, [sessionId]);
