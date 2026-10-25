@@ -3490,7 +3490,7 @@
       "id": "acp.startup-error-screen",
       "kind": "vitest",
       "risk": "high",
-      "notes": "Every line on the screen stays on a validated text colour (text-text-subtle), asserted across installable, install-off and sandboxed states.",
+      "notes": "Changed descriptive text uses text-text-subtle, with no text-text-secondary or text-text-dim classes, asserted across installable, install-off and sandboxed states.",
       "specs": ["src/components/acp/__tests__/StartupErrorScreen.test.tsx"],
       "components": ["web/src/components/acp/StartupErrorScreen.tsx", "web/src/components/acp/RecoveryActionRow.tsx"]
     },
