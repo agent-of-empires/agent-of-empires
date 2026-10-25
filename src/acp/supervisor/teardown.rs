@@ -3795,11 +3795,15 @@ mod tests {
 
         gate.open.notify_one();
         let stale_launch = spawner.await.unwrap();
+        let stale_launch_was_rejected = match &stale_launch {
+            Err(SupervisorError::SpawnCancelled(_) | SupervisorError::TeardownPending(_)) => true,
+            Err(SupervisorError::Acp(AcpError::Spawn(message))) => {
+                message == "constructor cancelled before registry publication"
+            }
+            _ => false,
+        };
         assert!(
-            matches!(
-                stale_launch,
-                Err(SupervisorError::SpawnCancelled(_)) | Err(SupervisorError::TeardownPending(_))
-            ),
+            stale_launch_was_rejected,
             "a stale launch must not install a worker: {stale_launch:?}"
         );
         assert!(control.signals().contains(&(4242, "TERM")));
