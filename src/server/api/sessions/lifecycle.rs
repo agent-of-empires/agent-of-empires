@@ -810,7 +810,7 @@ pub async fn restore_session(
                         Err(LifecycleTargetError::Missing.into())
                     }
                     crate::session::claim::RestoreCommit::Superseded => {
-                        Err(LifecycleTargetError::Busy.into())
+                        Err(crate::session::LifecycleReservationError::Superseded.into())
                     }
                 }
             })?;
