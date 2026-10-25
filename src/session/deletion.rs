@@ -57,6 +57,8 @@ pub struct DeletionResult {
     pub teardown_started: bool,
     /// Latest durable row when the transaction deliberately kept it.
     pub retained_instance: Option<Instance>,
+    /// Operation that blocked a `Busy` result, as decided by the claim.
+    busy_holder: Option<LifecycleOperation>,
 }
 
 impl DeletionResult {
@@ -74,6 +76,7 @@ impl DeletionResult {
             disposition,
             retained_instance,
             teardown_started: false,
+            busy_holder: None,
         }
     }
 
@@ -81,11 +84,9 @@ impl DeletionResult {
     pub fn conflict(&self) -> Option<LifecycleReservationError> {
         match self.disposition {
             DeletionDisposition::Busy => Some(
-                self.retained_instance
-                    .as_ref()
-                    .and_then(|row| row.lifecycle_reservation.as_ref())
-                    .map_or(LifecycleReservationError::Superseded, |reservation| {
-                        LifecycleReservationError::Busy(reservation.op)
+                self.busy_holder
+                    .map_or(LifecycleReservationError::Superseded, |holder| {
+                        LifecycleReservationError::Busy(holder)
                     }),
             ),
             DeletionDisposition::Superseded => Some(LifecycleReservationError::Superseded),
@@ -299,6 +300,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
         let now = Utc::now();
         let mut reserved = None;
         let mut rejected = None;
+        let mut busy_holder = None;
         store.update(|instances, _groups| {
             if let Some(stored) = instances.iter().find(|instance| instance.id == id) {
                 if let Some(consent) = &consent {
@@ -385,6 +387,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
                     return Ok(());
                 }
                 crate::session::claim::PurgeClaimDecision::Busy(holder) => {
+                    busy_holder = Some(holder);
                     let retained = instances.iter().find(|instance| instance.id == id).cloned();
                     rejected = Some((
                         DeletionDisposition::Busy,
@@ -416,12 +419,9 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
         })?;
 
         if let Some((disposition, message, retained_instance)) = rejected {
-            return Ok(Err(Box::new(DeletionResult::rejected(
-                id,
-                disposition,
-                message,
-                retained_instance,
-            ))));
+            let mut result = DeletionResult::rejected(id, disposition, message, retained_instance);
+            result.busy_holder = busy_holder;
+            return Ok(Err(Box::new(result)));
         }
         let (generation, snapshot) =
             reserved.ok_or_else(|| anyhow::anyhow!("purge reservation produced no outcome"))?;
@@ -1452,6 +1452,7 @@ fn perform_deletion_core(
             disposition: DeletionDisposition::Failed,
             teardown_started: true,
             retained_instance: None,
+            busy_holder: None,
         };
     }
 
@@ -1508,6 +1509,7 @@ fn perform_deletion_core(
             errors,
             disposition: DeletionDisposition::Failed,
             retained_instance: None,
+            busy_holder: None,
         };
     }
 
@@ -1525,6 +1527,7 @@ fn perform_deletion_core(
         errors,
         disposition: DeletionDisposition::Failed,
         retained_instance: None,
+        busy_holder: None,
     }
 }
 
@@ -3142,6 +3145,56 @@ mod tests {
             transaction.complete().disposition,
             DeletionDisposition::Removed
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn purge_keeps_the_typed_holder_of_a_retained_handoff_without_a_reservation() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let root = crate::session::get_app_dir().unwrap();
+        super::super::purge_owners::initialize(&root).unwrap();
+        crate::tmux::tool_retirement::initialize(&root).unwrap();
+        let profile = "purge-busy-handoff";
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let mut instance = create_test_instance();
+        instance.source_profile = profile.into();
+        instance.terminal_handoff = Some(Box::new(
+            crate::session::test_support::launch_owed_handoff(&instance),
+        ));
+        assert!(instance.lifecycle_reservation.is_none());
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        let busy = match PurgeTransaction::reserve(
+            Storage::open_unwatched(profile).unwrap(),
+            DeletionRequest {
+                session_id: instance.id.clone(),
+                instance,
+                delete_worktree: false,
+                delete_branch: false,
+                delete_sandbox: false,
+                force_delete: false,
+                detach_hooks: true,
+                keep_scratch: false,
+            },
+            None,
+        )
+        .unwrap()
+        {
+            Err(result) => result,
+            Ok(_) => panic!("purge reserved a session with a retained terminal handoff"),
+        };
+        assert_eq!(busy.disposition, DeletionDisposition::Busy);
+        assert_eq!(
+            busy.conflict(),
+            Some(LifecycleReservationError::Busy(LifecycleOperation::Launch))
+        );
+        assert!(!busy.teardown_started);
+        assert_eq!(storage.load().unwrap().len(), 1);
     }
 
     #[test]

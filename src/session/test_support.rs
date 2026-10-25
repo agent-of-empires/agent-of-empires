@@ -587,3 +587,30 @@ mod tests {
         );
     }
 }
+
+/// A launch-owed terminal handoff: it blocks lifecycle claims without any reservation.
+pub(crate) fn launch_owed_handoff(
+    row: &crate::session::Instance,
+) -> crate::session::TerminalHandoffIntent {
+    crate::session::TerminalHandoffIntent {
+        id: uuid::Uuid::new_v4(),
+        profile: "default".into(),
+        profile_identity: (0, 0),
+        generation: row.lifecycle_generation,
+        target_generation: row.lifecycle_generation,
+        stage: crate::session::TerminalHandoffStage::TerminalLaunchOwed,
+        context: crate::session::TerminalHandoffContext::Discard,
+        source_acp_session_id: None,
+        source_event_seq: 0,
+        final_event_seq: None,
+        source_conversation: row.conversation_state(),
+        runner: crate::session::purge_owners::RunnerCapture::Unresolved {
+            error: "retained original authority".into(),
+        },
+        unborn_fence: None,
+        terminal: None,
+        launch_required: true,
+        launch_started: false,
+        launch: None,
+    }
+}
