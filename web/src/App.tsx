@@ -1244,6 +1244,7 @@ function AppContent({
       if (confirmed.length === 0 || emptyingTrashRef.current) return;
       emptyingTrashRef.current = true;
       let anyFailed = false;
+      let anyBusy = false;
       let anyKept = false;
       try {
         for (const ws of confirmed) {
@@ -1267,18 +1268,22 @@ function AppContent({
               notify: null,
             },
           );
-          anyFailed ||= !result.ok || (result.failed?.length ?? 0) > 0;
+          const busy = (result.busy?.length ?? 0) > 0;
+          anyBusy ||= busy;
+          anyFailed ||= (!result.ok && !busy) || (result.failed?.length ?? 0) > 0;
           anyKept ||= (result.kept?.length ?? 0) > 0;
         }
       } finally {
         emptyingTrashRef.current = false;
       }
-      toastBus.handler?.[anyFailed ? "error" : "info"](
+      toastBus.handler?.[anyFailed || anyBusy ? "error" : "info"](
         anyFailed
           ? "Some trashed sessions could not be deleted"
-          : anyKept
-            ? "Some selected sessions changed and were not deleted"
-            : "Emptied trash",
+          : anyBusy
+            ? "Some trashed sessions are busy with another operation; retry when it finishes"
+            : anyKept
+              ? "Some selected sessions changed and were not deleted"
+              : "Emptied trash",
       );
     },
     [activeSessionId, setSessionStatus, clearDeletingStatus, leaveActiveSession],
