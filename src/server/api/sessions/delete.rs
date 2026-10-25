@@ -1312,7 +1312,7 @@ pub async fn delete_workspace(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
-                    "error": "deletion_failed", "message": message, "failed": failed,
+                    "error": "deletion_failed", "message": message, "failed": failed, "busy": busy,
                 })),
             )
                 .into_response();
