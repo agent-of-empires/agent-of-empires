@@ -233,7 +233,8 @@ pub async fn spawn_acp(
         )
         .await
     {
-        Ok(reservation) => reservation,
+        Ok(reservation) => Some(reservation),
+        Err(SupervisorError::AlreadyRunning(_)) if rate_limit_resume_resets_at.is_some() => None,
         Err(e) => return supervisor_error_response("spawn failed", &e),
     };
     if spawn_request.cancellation().is_cancelled() {
@@ -244,17 +245,31 @@ pub async fn spawn_acp(
         );
     }
     drop(exclusion);
-    match state.acp_supervisor.spawn_inner(request, reservation).await {
-        Ok(()) => {}
-        Err(SupervisorError::AlreadyRunning(_)) if rate_limit_resume_resets_at.is_some() => {}
-        Err(e) => return supervisor_error_response("spawn failed", &e),
+    if let Some(reservation) = reservation {
+        if let Err(e) = state.acp_supervisor.spawn_inner(request, reservation).await {
+            return supervisor_error_response("spawn failed", &e);
+        }
     }
     if rate_limit_resume_resets_at.is_some() {
         // Reacquire only for installing the continuation. The guard is not
         // held while the adapter launch and its hooks run.
-        if let Ok(mut exclusion) =
-            crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &id, true).await
-        {
+        let exclusion = tokio::select! {
+            biased;
+            _ = spawn_request.cancellation().cancelled() => {
+                return supervisor_error_response(
+                    "spawn cancelled",
+                    &SupervisorError::SpawnCancelled(id.clone()),
+                );
+            }
+            exclusion = crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &id, true) => exclusion,
+        };
+        if let Ok(mut exclusion) = exclusion {
+            if spawn_request.cancellation().is_cancelled() {
+                return supervisor_error_response(
+                    "spawn cancelled",
+                    &SupervisorError::SpawnCancelled(id.clone()),
+                );
+            }
             if let Some(submission) = exclusion.take_submission() {
                 let _ = install_rate_limit_continuation(&state, &id, submission).await;
             }
@@ -2899,5 +2914,162 @@ mod tests {
         let _instance_lock = instance_lock
             .try_lock()
             .expect("submission must precede the instance lock");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rate_limit_manual_resume_tolerates_an_already_running_worker() {
+        use crate::session::{Instance, Status, Storage, View};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let mut row = Instance::new("manual rate-limit resume", project.path().to_str().unwrap());
+        row.id = "sess-3514-manual-resume-already-running".into();
+        row.source_profile = "default".into();
+        row.status = Status::Running;
+        row.view = View::Structured;
+        row.tool = "claude".into();
+        row.agent_name = Some("claude".into());
+        let id = row.id.clone();
+        let mut ordinary_row =
+            Instance::new("ordinary running worker", project.path().to_str().unwrap());
+        ordinary_row.id = "sess-ordinary-manual-resume-already-running".into();
+        ordinary_row.source_profile = "default".into();
+        ordinary_row.status = Status::Running;
+        ordinary_row.view = View::Structured;
+        ordinary_row.tool = "claude".into();
+        ordinary_row.agent_name = Some("claude".into());
+        let ordinary_id = ordinary_row.id.clone();
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            "default",
+            vec![row.clone(), ordinary_row.clone()],
+        );
+
+        let launches = Arc::new(AtomicUsize::new(0));
+        let launcher: crate::acp::supervisor::Launcher = {
+            let launches = Arc::clone(&launches);
+            Arc::new(move |_, _| {
+                launches.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    Err(crate::acp::acp_client::AcpError::Spawn(
+                        "an already-running worker must not be started again".into(),
+                    ))
+                })
+            })
+        };
+        let state = crate::server::test_support::build_test_app_state_with_launcher(
+            vec![row, ordinary_row],
+            launcher,
+        );
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        state
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(&id)
+            .await;
+        state
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(&ordinary_id)
+            .await;
+
+        let resets_at = Utc::now() - chrono::Duration::minutes(30);
+        let prompt = || crate::acp::Event::UserPromptSent {
+            text: "continue the interrupted work".into(),
+            attachments: Vec::new(),
+            prompt_id: None,
+            synthesized: false,
+            origin_plugin: None,
+        };
+        let rate_limit = || crate::acp::Event::RateLimit {
+            info: RateLimitInfo {
+                status: "limited".into(),
+                resets_at: Some(resets_at),
+                kind: "usage".into(),
+            },
+        };
+        let stopped = || crate::acp::Event::Stopped {
+            reason: "rate_limited".into(),
+        };
+        let events = [
+            prompt(),
+            rate_limit(),
+            stopped(),
+            crate::acp::Event::RateLimitAutoResumed {
+                resets_at,
+                manual: false,
+            },
+            prompt(),
+            rate_limit(),
+            stopped(),
+        ];
+        let recorded_at_ms =
+            Utc::now().timestamp_millis() - chrono::Duration::hours(1).num_milliseconds();
+        for (index, event) in events.iter().enumerate() {
+            state
+                .acp_event_store
+                .record_at(
+                    &id,
+                    u64::try_from(index).unwrap() + 1,
+                    event,
+                    recorded_at_ms,
+                )
+                .unwrap();
+        }
+        state
+            .acp_supervisor
+            .hydrate_seqs([(id.clone(), state.acp_event_store.highest_seq(&id))]);
+        assert_eq!(state.acp_event_store.rate_limit_redelivery_streak(&id), 1);
+
+        let request =
+            || -> Result<Json<SpawnAcpRequest>, axum::extract::rejection::JsonRejection> {
+                Ok(Json(SpawnAcpRequest {
+                    agent: None,
+                    model: None,
+                    additional_dirs: Vec::new(),
+                    provider_env: Vec::new(),
+                }))
+            };
+        let response = spawn_acp(State(state.clone()), Path(id.clone()), request())
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state.acp_supervisor.is_running(&id).await);
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+        let stored = Storage::open_unwatched("default")
+            .unwrap()
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|instance| instance.id == id)
+            .expect("session remains stored");
+        assert_eq!(
+            stored
+                .pending_initial_turn
+                .as_ref()
+                .map(|turn| turn.text.as_str()),
+            Some("continue the interrupted work")
+        );
+        assert_eq!(state.acp_event_store.rate_limit_redelivery_streak(&id), 1);
+        assert!(matches!(
+            state
+                .acp_event_store
+                .replay_from(&id, 1)
+                .last()
+                .map(|(_, event)| event),
+            Some(crate::acp::Event::RateLimitAutoResumed { manual: true, .. })
+        ));
+
+        let ordinary_response =
+            spawn_acp(State(state.clone()), Path(ordinary_id.clone()), request())
+                .await
+                .into_response();
+        assert_eq!(ordinary_response.status(), StatusCode::CONFLICT);
+        assert!(state.acp_supervisor.is_running(&ordinary_id).await);
+        assert!(state
+            .acp_event_store
+            .replay_from(&ordinary_id, 1)
+            .is_empty());
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
     }
 }

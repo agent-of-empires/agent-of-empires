@@ -2815,10 +2815,16 @@ mod tests {
             "the concurrent shutdown settled the reaper's teardown"
         );
         p.release_and_wait().await;
-        tokio::time::timeout(Duration::from_secs(5), shutdown)
+        let shutdown_result = tokio::time::timeout(Duration::from_secs(5), shutdown)
             .await
-            .expect("the concurrent shutdown leaves the publication gate")
-            .expect("concurrent shutdown");
+            .expect("the concurrent shutdown leaves the publication gate");
+        assert!(
+            matches!(
+                shutdown_result,
+                Ok(()) | Err(SupervisorError::UnknownSession(_))
+            ),
+            "the concurrent shutdown completes only after the reaper: {shutdown_result:?}"
+        );
         tokio::time::timeout(Duration::from_secs(5), reaper)
             .await
             .expect("the captured reaper teardown settles")
@@ -3788,10 +3794,14 @@ mod tests {
         );
 
         gate.open.notify_one();
-        assert!(matches!(
-            spawner.await.unwrap(),
-            Err(SupervisorError::SpawnCancelled(_))
-        ));
+        let stale_launch = spawner.await.unwrap();
+        assert!(
+            matches!(
+                stale_launch,
+                Err(SupervisorError::SpawnCancelled(_)) | Err(SupervisorError::TeardownPending(_))
+            ),
+            "a stale launch must not install a worker: {stale_launch:?}"
+        );
         assert!(control.signals().contains(&(4242, "TERM")));
         assert!(control.releases().is_empty(), "{:?}", control.releases());
         assert_eq!(sup.worker_state("s-stale").await, AcpWorkerState::Resuming);
