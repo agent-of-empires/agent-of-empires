@@ -271,6 +271,9 @@ pub(super) async fn disk_watcher_consumer(state: Arc<AppState>) {
             _ = tokio::time::sleep(retry_in.unwrap_or_default()), if retry_in.is_some() => false,
         };
         retry_in = None;
+        if state.shutdown.is_cancelled() {
+            break;
+        }
         let started = std::time::Instant::now();
         let namespace = state.profile_namespace.read().await;
         let reload_lane = state.reload_lane.lock().await;
