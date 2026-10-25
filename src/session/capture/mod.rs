@@ -41,8 +41,8 @@ pub(crate) use pi::{
 };
 pub(crate) use prime::{
     hand_off_root_transcript as hand_off_prime_root_transcript, prime_agent_poll_fn_sandboxed,
-    root_session_header, PrimeRootPublication, PRIME_AGENT_HEADER_SCAN_BYTES,
-    PRIME_AGENT_MAX_SESSION_FILES,
+    root_session_header, validate_root_transcript as validate_prime_root_transcript,
+    PrimeRootPublication, PRIME_AGENT_HEADER_SCAN_BYTES, PRIME_AGENT_MAX_SESSION_FILES,
 };
 
 pub(crate) fn canonicalize_allowing_missing_leaf(path: &Path) -> Option<PathBuf> {

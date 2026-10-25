@@ -1,15 +1,11 @@
-//! Restart and resume: deciding whether to reuse a session id, probing
-//! whether the resumed pane survived, and falling back to a fresh launch.
+//! Restart and resume: attest conversation targets before teardown and
+//! preserve their identities when native resume fails.
 
 use super::*;
 
-/// Governs whether `start_with_resume_fallback` may pass `--resume <sid>` at
-/// all, independent of the per-sid loop-breaker (`resume_probe_failed_sid`),
-/// which always applies regardless of policy. `HonorAutoResumeSetting` is
-/// used by explicit user restart/reattach (`e`, `Enter`); `Allow` is used by
-/// Send Message and Live Send, which must keep trying to preserve agent
-/// context even when the user has disabled auto-resume for manual restarts.
-/// See #2609.
+/// `HonorAutoResumeSetting` permits configured fresh launches on manual restart.
+/// `Allow` preserves context for Send Message and Live Send. A failed ID requires
+/// explicit recovery whenever the selected policy would otherwise resume it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResumeAttemptPolicy {
     HonorAutoResumeSetting,
@@ -356,6 +352,35 @@ impl Instance {
         Ok(generation)
     }
 
+    pub(super) fn preflight_resume_launch_in(
+        &mut self,
+        stores: CaptureStorage<'_>,
+        resume_policy: ResumeAttemptPolicy,
+    ) -> Result<()> {
+        if matches!(self.resume_intent, ResumeIntent::Default) {
+            if let Some(observation) = self.capture_freshest_conversation_in(stores) {
+                self.apply_conversation_observation(&observation);
+            }
+        }
+        self.apply_resume_policy(resume_policy)?;
+        if !self.force_fresh_next_launch && self.conversation_target().is_some() {
+            if let Some(execution) = self.resolve_launch_execution()? {
+                let validate_target = !matches!(self.resume_intent, ResumeIntent::Default)
+                    || self
+                        .conversation_target()
+                        .and_then(|(_, binding, _)| binding)
+                        .is_some_and(ConversationBinding::is_known);
+                if validate_target && !self.validate_prime_fork_handoff(&execution)? {
+                    self.validate_conversation_target(
+                        &execution.binding,
+                        execution.target_session_id.as_deref(),
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn finish_reserved_launch(
         &mut self,
         storage: &dyn crate::session::SessionStore,
@@ -371,44 +396,21 @@ impl Instance {
             restart,
             conversation_carry,
         } = options;
+        // Capture may refresh memory, but publication must compare against durable prior state.
         let prior = self.conversation_state();
-        let preflight = (|| -> Result<()> {
-            if matches!(self.resume_intent, ResumeIntent::Default) {
-                if let Some(observation) =
-                    self.capture_freshest_conversation_in(CaptureStorage::Scoped(storage))
-                {
-                    self.apply_conversation_observation(&observation);
-                }
-            }
-            self.apply_resume_policy(resume_policy)?;
-            if !self.force_fresh_next_launch && self.conversation_target().is_some() {
-                // Revalidate after teardown as well: final publication and a carry
-                // may change the target, but neither may precede this refusal gate.
-                if let Some(execution) = self.resolve_launch_execution()? {
-                    if !matches!(self.resume_intent, ResumeIntent::Default)
-                        || self
-                            .conversation_target()
-                            .and_then(|(_, binding, _)| binding)
-                            .is_some_and(ConversationBinding::is_known)
-                    {
-                        self.validate_conversation_target(
-                            &execution.binding,
-                            execution.target_session_id.as_deref(),
-                        )?;
-                    }
-                }
-            }
-            Ok(())
-        })();
-        if let Err(error) = preflight {
+        if let Err(error) =
+            self.preflight_resume_launch_in(CaptureStorage::Scoped(storage), resume_policy)
+        {
             self.adopt_conversation_state(prior);
             self.fail_reserved_launch(storage, generation, &error, false);
             return Err(error);
         }
-        let expected = self.apply_fresh_launch_intent_in(storage);
+        if std::mem::take(&mut self.force_fresh_next_launch) {
+            self.resume_intent = ResumeIntent::Cleared;
+        }
         let result = (|| {
             let prepared =
-                self.stop_carry_and_prepare_in(storage, restart, conversation_carry, expected)?;
+                self.stop_carry_and_prepare_in(storage, restart, conversation_carry, prior)?;
             let launch_outcome = self.spawn_prepared_launch(size, storage, prepared)?;
             let outcome = self.finish_resume_launch(launch_outcome, storage)?;
             self.commit_lifecycle_launch(storage, generation, restart)?;
@@ -545,11 +547,13 @@ impl Instance {
                 .auto_resume_on_restart
             }
         };
-        if !is_valid_session_id(sid) || !self.supports_native_resume() {
+        if !resume_allowed_by_policy {
+            if self.status_agent().is_some() || self.default_selector_agent().is_some() {
+                self.force_fresh_next_launch = true;
+            }
             return Ok(());
         }
-        if !resume_allowed_by_policy {
-            self.force_fresh_next_launch = true;
+        if !is_valid_session_id(sid) || !self.supports_native_resume() {
             return Ok(());
         }
         anyhow::ensure!(
@@ -687,6 +691,188 @@ mod tests {
     use crate::session::instance::test_helpers::{install_aliases, seed_claude_transcript};
     use serial_test::serial;
     use tempfile::tempdir;
+    #[test]
+    #[serial]
+    #[serial(hook_base)]
+    fn fresh_publication_keeps_the_durable_cas_baseline() {
+        use crate::session::instance::test_helpers::write_sidecar;
+        if !crate::tmux::test_helpers::tmux_available() {
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _env = isolate_resume_environment(temp.path());
+        let (_hooks, _base, _hook_temp) = crate::hooks::test_support::BaseGuard::ready();
+        let _agent = install_fake_claude(temp.path(), "#!/bin/sh\nexec sleep 60\n");
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let (old, fresh) = (
+            "11111111-2222-4333-8444-555555555555",
+            "66666666-7777-4888-8999-aaaaaaaaaaaa",
+        );
+        let mut inst = Instance::new("fresh-publication", project.to_str().unwrap());
+        inst.tool = "claude".into();
+        inst.command = "claude".into();
+        inst.source_profile = "fresh-publication".into();
+        seed_claude_transcript(&mut inst, old);
+        seed_claude_transcript(&mut inst.clone(), fresh);
+        let binding = inst.resolve_native_execution(None).unwrap().binding;
+        let launch_id = uuid::Uuid::new_v4().to_string();
+        let directory = write_sidecar(&inst.id, old);
+        let leaf = crate::hooks::session_id_leaf(Some(&launch_id)).unwrap();
+        inst.active_execution = Some(ActiveExecution {
+            launch_id: launch_id.clone(),
+            binding,
+            capture: Some(CaptureContext::Hooks(directory.join(leaf.as_ref()))),
+            container: None,
+        });
+        let storage = crate::session::Storage::new_unwatched(&inst.source_profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
+        let generation = inst
+            .acquire_lifecycle_reservation(
+                &storage,
+                LifecycleOperation::Launch,
+                Some(Status::Starting),
+            )
+            .unwrap();
+        crate::hooks::write_session_id_via_guard(&inst.id, fresh, Some(&launch_id)).unwrap();
+        assert_eq!(
+            storage.load().unwrap()[0].agent_session_id.as_deref(),
+            Some(old)
+        );
+        assert_eq!(inst.capture_freshest_conversation().unwrap().sid, fresh);
+        let name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(name);
+        let outcome = inst
+            .finish_reserved_launch(
+                &storage,
+                None,
+                ResumeLaunchOptions {
+                    resume_policy: ResumeAttemptPolicy::Allow,
+                    restart: true,
+                    conversation_carry: None,
+                },
+                generation,
+                Ok(()),
+            )
+            .unwrap();
+        assert_eq!(outcome, StartOutcome::Resumed);
+        let stored = storage.load().unwrap().remove(0);
+        assert_eq!(stored.agent_session_id.as_deref(), Some(fresh));
+        assert_eq!(
+            stored.agent_session_binding.as_ref().unwrap().session_id,
+            fresh
+        );
+        assert_ne!(
+            stored.active_execution.as_ref().unwrap().launch_id,
+            launch_id
+        );
+        assert_eq!(stored.active_execution, inst.active_execution);
+        assert_eq!(
+            inst.restart_with_resume_policy(None, true, ResumeAttemptPolicy::Allow)
+                .unwrap(),
+            StartOutcome::Resumed
+        );
+        assert_eq!(
+            storage.load().unwrap()[0].agent_session_id.as_deref(),
+            Some(fresh)
+        );
+        inst.kill_clean_in(&storage).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn explicit_fresh_configuration_clears_opaque_wrapper_identity() {
+        use crate::tmux::test_helpers::{
+            only_pane_id, pane_field, wait_for_pane_command, TmuxTestSession,
+        };
+        if !crate::tmux::test_helpers::tmux_available() {
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _env = isolate_resume_environment(temp.path());
+        let ready = temp.path().join("agent-ready");
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\nprintf '%s\\n' \"$$\" > {}\nexec /bin/sleep 60\n",
+            shell_escape(ready.to_str().unwrap())
+        );
+        let _agent = install_fake_claude(temp.path(), &script);
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let profile = "opaque-fresh-policy";
+        let config =
+            crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(config, "[session]\nauto_resume_on_restart=false\n").unwrap();
+        let mut inst = Instance::new("opaque-fresh-policy", project.to_str().unwrap());
+        inst.tool = "claude".into();
+        inst.command = "claude".into();
+        inst.source_profile = profile.into();
+        let sid = "11111111-2222-4333-8444-555555555555";
+        seed_claude_transcript(&mut inst, sid);
+        inst.command = format!(
+            "/bin/sh -c 'exec {}'",
+            temp.path().join("bin/claude").display()
+        );
+        assert!(!inst.supports_native_resume());
+        let before = inst.conversation_state();
+        let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
+        let name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+        let _pane = TmuxTestSession::from_name(&name);
+        assert!(crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", &name, "exec sleep 60"])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        let pane = only_pane_id(&name);
+        wait_for_pane_command(&pane, "sleep");
+        let process = pane_field(&pane, "#{pane_pid}");
+        assert!(inst
+            .restart_with_resume_policy(None, true, ResumeAttemptPolicy::Allow)
+            .is_err());
+        assert_eq!(only_pane_id(&name), pane);
+        assert_eq!(pane_field(&pane, "#{pane_pid}"), process);
+        assert_eq!(storage.load().unwrap()[0].conversation_state(), before);
+        let outcome = inst
+            .restart_with_resume_policy(None, true, ResumeAttemptPolicy::HonorAutoResumeSetting)
+            .unwrap();
+        assert_eq!(outcome, StartOutcome::Fresh);
+        let stored = storage.load().unwrap().remove(0);
+        assert_eq!(stored.agent_session_id, None);
+        assert_eq!(stored.agent_session_binding, None);
+        assert_eq!(stored.resume_intent, ResumeIntent::Default);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let pid = loop {
+            if let Some(pid) = std::fs::read_to_string(&ready)
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+            {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "opaque wrapper did not run its agent"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(crate::process::worker::is_pid_alive(pid));
+        assert_ne!(pane_field(&only_pane_id(&name), "#{pane_pid}"), process);
+        inst.kill_clean_in(&storage).unwrap();
+    }
+
     #[test]
     #[serial]
     fn managed_resume_refusal_preserves_the_live_pane_and_capture_generation() {

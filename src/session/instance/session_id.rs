@@ -806,6 +806,10 @@ impl Instance {
             return Ok(false);
         }
         if execution.is_none() && !self.supports_native_resume() {
+            if matches!(self.resume_intent, ResumeIntent::Cleared) {
+                self.set_agent_conversation(None, None, None);
+                self.resume_probe_failed_sid = None;
+            }
             anyhow::ensure!(
                 !matches!(
                     self.resume_intent,
