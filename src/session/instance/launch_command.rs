@@ -819,15 +819,6 @@ impl Instance {
         let target = self.conversation_target();
         match (self.resolve_native_execution(target), target) {
             (Ok(execution), _) => Ok(Some(execution)),
-            (Err(error), _)
-                if self.default_selector_agent().is_some_and(|agent| {
-                    agent.name == "prime-agent"
-                        && self.launch_invokes_resolved_agent_directly(agent)
-                        && (target.is_some() || self.prime_agent_launch_options().is_some())
-                }) =>
-            {
-                Err(error)
-            }
             (Err(error), Some((sid, binding, explicit)))
                 if explicit
                     || self.status_agent().is_some()
@@ -843,6 +834,15 @@ impl Instance {
                         self.id
                     ))
                     .context(ManagedResumeRefused))
+            }
+            (Err(error), _)
+                if self.default_selector_agent().is_some_and(|agent| {
+                    agent.name == "prime-agent"
+                        && self.launch_invokes_resolved_agent_directly(agent)
+                        && (target.is_some() || self.prime_agent_launch_options().is_some())
+                }) =>
+            {
+                Err(error)
             }
             // A user command with no native agent does not consume a stored ID.
             (Err(error), _) => {

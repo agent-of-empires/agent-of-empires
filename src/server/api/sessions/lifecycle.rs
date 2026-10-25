@@ -2839,11 +2839,19 @@ mod durable_stop_tests {
             "AOE_PROFILE",
             "AOE_DAEMON_URL",
             "AOE_DAEMON_TOKEN",
+            "PRIME_AGENT_SESSION_DIR",
+            "PRIME_AGENT_CODING_AGENT_SESSION_DIR",
+            "PRIME_AGENT_CODING_AGENT_DIR",
         ])
         .and_set("AOE_TMUX_SOCKET", root.path().join("tmux.sock"));
         let _omp = crate::session::test_support::install_login_shell_path_command(
             root.path(),
             "omp",
+            "#!/bin/sh\nexit 97\n",
+        );
+        let _prime = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "prime-agent",
             "#!/bin/sh\nexit 97\n",
         );
         crate::session::config::update_app_state(|state| {
@@ -2858,13 +2866,19 @@ mod durable_stop_tests {
         .unwrap();
         let project = root.path().join("private-project");
         std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir_all(project.join(".prime/agent")).unwrap();
+        std::fs::write(
+            project.join(".prime/agent/settings.json"),
+            r#"{"sessionDir":7}"#,
+        )
+        .unwrap();
         let transcript = root.path().join("private-transcript.jsonl");
         std::fs::write(&transcript, "private-conversation-body\n").unwrap();
         let sid = "11111111-2222-4333-8444-555555555555";
-        for failed_probe in [false, true] {
+        for (tool, failed_probe) in [("omp", false), ("omp", true), ("prime-agent", false)] {
             let mut row = Instance::new("managed refusal", project.to_str().unwrap());
-            row.tool = "omp".into();
-            row.command = "omp".into();
+            row.tool = tool.into();
+            row.command = tool.into();
             row.source_profile = "default".into();
             row.status = Status::Stopped;
             row.agent_session_id = Some(sid.into());
@@ -2873,7 +2887,19 @@ mod durable_stop_tests {
             row.agent_session_binding = Some(binding);
             row.resume_probe_failed_sid = failed_probe.then(|| sid.into());
             row.omp_capture_generation = Some("original-generation".into());
-            assert!(row.supports_native_resume());
+            if tool == "omp" {
+                assert!(row.supports_native_resume());
+            } else {
+                let agent = crate::agents::get_agent("prime-agent").unwrap();
+                assert!(row.launch_invokes_resolved_agent_directly(agent));
+                assert_eq!(row.command, "prime-agent");
+                assert_eq!(row.agent_session_id.as_deref(), Some(sid));
+                assert!(row.resume_probe_failed_sid.is_none());
+                assert_eq!(
+                    std::fs::read_to_string(project.join(".prime/agent/settings.json")).unwrap(),
+                    r#"{"sessionDir":7}"#
+                );
+            }
             assert_eq!(row.resume_intent, crate::session::ResumeIntent::Default);
             if failed_probe {
                 assert_eq!(row.resume_probe_failed_sid, row.agent_session_id);
@@ -2930,6 +2956,10 @@ mod durable_stop_tests {
             assert_eq!(stored.conversation_state(), conversation);
             assert_eq!(stored.omp_capture_generation, row.omp_capture_generation);
             assert_eq!(stored.resume_probe_failed_sid, row.resume_probe_failed_sid);
+            assert_eq!(stored.id, row.id);
+            assert_eq!(stored.tool, row.tool);
+            assert_eq!(stored.command, row.command);
+            assert_eq!(stored.project_path, row.project_path);
             assert!(stored.lifecycle_reservation.is_none());
             assert_eq!(
                 std::fs::read_to_string(&transcript).unwrap(),

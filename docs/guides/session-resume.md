@@ -72,6 +72,8 @@ Disabling `agent_status_hooks` removes status writers only; identity hooks decla
 
 Automatic resume also refuses when native execution cannot be resolved in these contexts. The table describes explicit pin and fork operations, not interface status labels. `set-session-id` uses the recorded active execution when available; otherwise it resolves the current launch configuration. For agents identified by their store alone, restoring the original configuration can resolve the refusal. Pi and OMP also require their exact transcript; recover it with `--store` as described below rather than selecting a recent conversation.
 
+When native execution resolution fails for a recorded managed conversation under `Default`, including Prime Agent, the API returns HTTP `409` with `aoe-error-code: managed_resume_refused` and recovery guidance.
+
 | Context | `set-session-id` | Fork | Remedy |
 |---------|------------------|------|--------|
 | Unsandboxed Codex on a macOS host | Refused | Refused | None yet; run Codex in a managed container |

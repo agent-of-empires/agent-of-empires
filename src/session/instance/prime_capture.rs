@@ -1303,18 +1303,59 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn native_prime_resolution_failure_never_downgrades_to_an_unowned_launch() {
+        use crate::session::{ManagedResumeRefused, ResumeIntent};
+
         let _app = crate::session::test_support::isolate_app_dir();
-        for sid in [None, Some("018f47a6-7b80-7cc3-98a2-37b5f486b2a1")] {
+        let sid = "018f47a6-7b80-7cc3-98a2-37b5f486b2a1";
+        for (intent, recorded_sid, extra_args, refused) in [
+            (ResumeIntent::Default, Some(sid), "", true),
+            (ResumeIntent::Default, None, "", false),
+            (ResumeIntent::Cleared, Some(sid), "", false),
+            (ResumeIntent::Use(sid.into()), Some(sid), "", false),
+            (
+                ResumeIntent::Fork { from: sid.into() },
+                Some(sid),
+                "",
+                false,
+            ),
+            (ResumeIntent::Default, Some(sid), "--no-session", true),
+        ] {
             let mut instance = tool_instance("prime-agent", "/tmp");
-            instance.agent_session_id = sid.map(str::to_owned);
-            super::super::execution::FAIL_NEXT_NATIVE_RESOLUTION.with(|fail| fail.set(true));
-            let expected = instance.conversation_state();
-            let result = instance.prepare_launch_command(expected);
-            assert!(
-                result.is_err(),
-                "Prime resolution failure must not produce an unowned native command"
+            instance.command = "prime-agent".into();
+            instance.agent_session_id = recorded_sid.map(str::to_owned);
+            instance.resume_intent = intent;
+            instance.extra_args = extra_args.into();
+            let agent = instance.default_selector_agent().unwrap();
+            assert_eq!(agent.name, "prime-agent");
+            assert!(instance.launch_invokes_resolved_agent_directly(agent));
+            assert_eq!(
+                instance.prime_agent_launch_options().is_some(),
+                extra_args.is_empty()
             );
+            assert_eq!(
+                instance.conversation_target().is_some(),
+                !matches!(instance.resume_intent, ResumeIntent::Cleared) && recorded_sid.is_some()
+            );
+            let expected = instance.conversation_state();
+            let before = serde_json::to_value(&instance).unwrap();
+            super::super::execution::FAIL_NEXT_NATIVE_RESOLUTION.with(|fail| fail.set(true));
+            let result = instance.prepare_launch_command(expected.clone());
             super::super::execution::FAIL_NEXT_NATIVE_RESOLUTION.with(|fail| fail.set(false));
+            let error = result
+                .err()
+                .expect("Prime resolution failure must not produce an unowned native command");
+            assert_eq!(instance.conversation_state(), expected);
+            assert_eq!(serde_json::to_value(&instance).unwrap(), before);
+            assert_eq!(
+                error.root_cause().to_string(),
+                "injected transient native resolution failure"
+            );
+            assert_eq!(
+                error.is::<ManagedResumeRefused>(),
+                refused,
+                "intent={:?}, recorded_sid={recorded_sid:?}, args={extra_args:?}: {error:#}",
+                instance.resume_intent
+            );
         }
     }
 }
