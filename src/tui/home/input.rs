@@ -3769,10 +3769,7 @@ impl HomeView {
                 ) {
                     let msg = match &method {
                         InstallMethod::Nix => {
-                            format!(
-                                "Nix install: run `{}` to update, or for a flake input run `nix flake update <input>` and rebuild",
-                                crate::update::install::InstallKind::Nix.update_command()
-                            )
+                            "Nix install: run `aoe update` in a terminal for instructions".to_string()
                         }
                         InstallMethod::Cargo => {
                             "Cargo install: run `cargo install --git https://github.com/agent-of-empires/agent-of-empires aoe`".to_string()
