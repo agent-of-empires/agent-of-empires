@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { getSessionDiffFiles, reportTelemetrySeen } from "../lib/api";
 import type { RepoBase, RichDiffFile } from "../lib/types";
 import { useLatestRef } from "./useLatestRef";
@@ -68,7 +68,7 @@ export function useDiffFiles(sessionId: string | null, enabled: boolean): UseDif
     }
   }
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     requestIdRef.current += 1;
     lastFingerprintRef.current = "";
     if (!sessionId) return;
