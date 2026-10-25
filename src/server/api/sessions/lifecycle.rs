@@ -2853,6 +2853,7 @@ mod durable_stop_tests {
         crate::session::config::update_config(|config| {
             config.systemd.enabled = false;
             config.session.smart_rename = false;
+            config.session.auto_resume_on_restart = true;
         })
         .unwrap();
         let project = root.path().join("private-project");
@@ -2863,7 +2864,7 @@ mod durable_stop_tests {
         for failed_probe in [false, true] {
             let mut row = Instance::new("managed refusal", project.to_str().unwrap());
             row.tool = "omp".into();
-            row.command = root.path().join("bin/omp").to_str().unwrap().into();
+            row.command = "omp".into();
             row.source_profile = "default".into();
             row.status = Status::Stopped;
             row.agent_session_id = Some(sid.into());
@@ -2872,6 +2873,11 @@ mod durable_stop_tests {
             row.agent_session_binding = Some(binding);
             row.resume_probe_failed_sid = failed_probe.then(|| sid.into());
             row.omp_capture_generation = Some("original-generation".into());
+            assert!(row.supports_native_resume());
+            assert_eq!(row.resume_intent, crate::session::ResumeIntent::Default);
+            if failed_probe {
+                assert_eq!(row.resume_probe_failed_sid, row.agent_session_id);
+            }
             let conversation = row.conversation_state();
             let name = crate::tmux::Session::generate_name(&row.id, &row.title);
             let _pane = TmuxTestSession::from_name(&name);
