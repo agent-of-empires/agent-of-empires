@@ -2178,6 +2178,7 @@
         "web/src/App.tsx",
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/EmptyTrashConfirm.tsx",
+        "web/src/lib/api.ts",
         "web/src/lib/trashActions.ts"
       ]
     },
