@@ -1,4 +1,4 @@
-import { useRef, type ReactNode } from "react";
+import { useId, useRef, type ReactNode } from "react";
 import { Toggle } from "./steps/Toggle";
 
 const ROW = "flex items-center gap-3 min-h-[44px] md:min-h-[36px] px-3 border-b border-surface-700/30 last:border-b-0";
@@ -132,6 +132,7 @@ export function SegmentedRow<T extends string>({
   testId?: string;
 }) {
   const refs = useRef<(HTMLButtonElement | null)[]>([]);
+  const summaryId = useId();
   const enabled = options.filter((o) => !o.disabled);
   const move = (step: 1 | -1) => {
     const at = enabled.findIndex((o) => o.value === value);
@@ -147,6 +148,7 @@ export function SegmentedRow<T extends string>({
     >
       <Label>{label}</Label>
       <span
+        id={summaryId}
         title={typeof summary === "string" ? summary : undefined}
         className="order-last basis-full text-xs text-text-dim md:order-none md:basis-auto md:flex-1 md:min-w-0 md:truncate"
       >
@@ -155,6 +157,7 @@ export function SegmentedRow<T extends string>({
       <div
         role="radiogroup"
         aria-label={label}
+        aria-describedby={summaryId}
         className="ml-auto flex shrink-0 rounded-md border border-surface-700 bg-surface-950 p-0.5"
         onKeyDown={(e) => {
           if (e.key === "ArrowRight" || e.key === "ArrowDown") {

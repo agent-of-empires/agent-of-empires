@@ -404,6 +404,9 @@ describe("SessionWizard rows", () => {
     expect(screen.getByTestId("wizard-view-row").textContent).toMatch(summary);
     // A reason cut off at md stays readable on hover.
     expect(screen.getByTestId("wizard-view-row").querySelector("[title]")?.getAttribute("title")).toMatch(summary);
+    // Screen readers hear the reason with the group.
+    const describedBy = screen.getByRole("radiogroup", { name: "View" }).getAttribute("aria-describedby");
+    expect(document.getElementById(describedBy ?? "")?.textContent).toMatch(summary);
     // Terminal view is what an agent without Structured view gets.
     const terminal = screen.getByRole("radio", { name: "Terminal view" });
     expect(terminal.getAttribute("aria-checked")).toBe(String(disabled));
