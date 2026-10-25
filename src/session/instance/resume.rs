@@ -3,6 +3,15 @@
 
 use super::*;
 
+pub(crate) const MANAGED_RESUME_RECOVERY_MESSAGE: &str =
+    "Managed resume refused; the conversation is preserved. Check and restore the original agent \
+     configuration and store, then explicitly retry with aoe session set-session-id <session> \
+     <native-id>; use --store with the exact store or transcript where required.";
+
+#[derive(Debug, thiserror::Error)]
+#[error("{}", MANAGED_RESUME_RECOVERY_MESSAGE)]
+pub(crate) struct ManagedResumeRefused;
+
 /// `HonorAutoResumeSetting` permits configured fresh launches on manual restart.
 /// `Allow` preserves context for Send Message and Live Send. A failed ID requires
 /// explicit recovery whenever the selected policy would otherwise resume it.
@@ -556,11 +565,13 @@ impl Instance {
         if !is_valid_session_id(sid) || !self.supports_native_resume() {
             return Ok(());
         }
-        anyhow::ensure!(
-            self.resume_probe_failed_sid.as_deref() != Some(sid),
-            "resume previously failed for conversation {sid}; identity preserved; restore its original context and explicitly retry with aoe session set-session-id {} {sid}, using --store with the exact store or transcript where required",
-            self.id
-        );
+        if self.resume_probe_failed_sid.as_deref() == Some(sid) {
+            return Err(anyhow::anyhow!(
+                "resume previously failed for conversation {sid}; identity preserved; restore its original context and explicitly retry with aoe session set-session-id {} {sid}, using --store with the exact store or transcript where required",
+                self.id
+            )
+            .context(ManagedResumeRefused));
+        }
         Ok(())
     }
 

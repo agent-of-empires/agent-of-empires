@@ -837,10 +837,12 @@ impl Instance {
                 if !matches!(self.resume_intent, ResumeIntent::Default) {
                     return Err(error);
                 }
-                Err(error.context(format!(
-                    "cannot attest execution context for managed conversation {sid}; launch refused without replacing it; restore the original agent configuration and store, or rebind with aoe session set-session-id {} {sid} (use --store with the exact store or transcript where required)",
-                    self.id
-                )))
+                Err(error
+                    .context(format!(
+                        "cannot attest execution context for managed conversation {sid}; launch refused without replacing it; restore the original agent configuration and store, or rebind with aoe session set-session-id {} {sid} (use --store with the exact store or transcript where required)",
+                        self.id
+                    ))
+                    .context(ManagedResumeRefused))
             }
             // A user command with no native agent does not consume a stored ID.
             (Err(error), _) => {

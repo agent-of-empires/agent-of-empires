@@ -346,13 +346,13 @@ impl HomeView {
         if let Some((id, message)) = self.pending_indeterminate_queue.first().cloned() {
             self.open_indeterminate_dialog(&id, &message);
             if errors.len() > 1 {
-                self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                self.info_dialog = Some(crate::tui::dialogs::InfoDialog::sized_to_fit(
                     "Runtime change",
                     &diagnostics,
                 ));
             }
         } else {
-            self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+            self.info_dialog = Some(crate::tui::dialogs::InfoDialog::sized_to_fit(
                 "Runtime change",
                 &diagnostics,
             ));

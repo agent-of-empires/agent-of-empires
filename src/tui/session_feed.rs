@@ -533,7 +533,13 @@ async fn run_command_writer(
                                 {
                                     cursor.revision = cursor.revision.max(committed.revision);
                                 }
-                                let mut failure = CommandFailure::submitted(error);
+                                let mut failure = match error {
+                                    error @ crate::daemon::DaemonClientError::Committed {
+                                        code: crate::daemon::ApiErrorCode::ManagedResumeRefused,
+                                        ..
+                                    } => CommandFailure::Rejected(error.to_string()),
+                                    error => CommandFailure::submitted(error),
+                                };
                                 match &mut failure {
                                     CommandFailure::Rejected(message)
                                     | CommandFailure::Unknown(message) => {
@@ -560,7 +566,11 @@ async fn run_command_writer(
                     let crate::daemon::DaemonClientError::Committed { cursor, code } = error else {
                         unreachable!();
                     };
-                    let failure = if code == crate::daemon::ApiErrorCode::PurgeFailed {
+                    let failure = if matches!(
+                        code,
+                        crate::daemon::ApiErrorCode::PurgeFailed
+                            | crate::daemon::ApiErrorCode::ManagedResumeRefused
+                    ) {
                         CommandFailure::Rejected(message)
                     } else {
                         CommandFailure::Unknown(message)
@@ -2260,35 +2270,67 @@ mod tests {
 
     #[tokio::test]
     async fn committed_failure_fences_until_publication_and_only_unknown_outcomes_quarantine() {
-        for (request, known) in [
+        use axum::response::IntoResponse;
+        for (request, code, known) in [
             (
                 SessionRequest::Mutation(SessionMutation::Start(StartSessionBody::default())),
+                "start_failed",
                 false,
             ),
             (
                 SessionRequest::Purge(crate::daemon::DeleteSessionBody::default()),
+                "purge_failed",
+                true,
+            ),
+            (
+                SessionRequest::Mutation(SessionMutation::Start(StartSessionBody::default())),
+                "managed_resume_refused",
                 true,
             ),
         ] {
-            let (mut feed, mut requests) = feed_with_native_lane();
-            feed.submit_request("partial".into(), request).unwrap();
-            let failure = if known {
-                CommandFailure::Rejected("Purge failed after commit".into())
-            } else {
-                CommandFailure::Unknown("Start committed but preparation failed".into())
-            };
-            requests
-                .try_recv()
-                .unwrap()
-                .result
-                .send(Ok(CommandReply::CommittedFailure {
-                    cursor: RuntimeCursor {
-                        epoch: "test".into(),
-                        revision: 2,
+            let app = axum::Router::new().fallback(move || async move {
+                (
+                    if code == "start_failed" {
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                    } else {
+                        axum::http::StatusCode::CONFLICT
                     },
-                    failure,
-                }))
-                .unwrap();
+                    [
+                        (crate::daemon::ERROR_CODE_HEADER, code),
+                        (crate::daemon::RUNTIME_EPOCH_HEADER, "test"),
+                        (crate::daemon::RUNTIME_REVISION_HEADER, "2"),
+                    ],
+                    "private refusal detail",
+                )
+                    .into_response()
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = crate::daemon::DaemonClient::new(
+                &format!("http://{}", listener.local_addr().unwrap()),
+                Some("private-token"),
+            )
+            .unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let (mut feed, requests) = feed_with_native_lane();
+            let writer = tokio::spawn(run_command_writer(
+                client,
+                "test".into(),
+                feed.grant.clone(),
+                requests,
+                None,
+            ));
+            feed.submit_request("partial".into(), request).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    assert!(feed.drain_command_errors().is_empty());
+                    if feed.pending["partial"].reply.is_some() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("writer receives committed refusal");
             assert!(feed.drain_command_errors().is_empty());
             assert!(!feed.can_submit("partial"));
             let next = snapshot("test", 2);
@@ -2302,6 +2344,10 @@ mod tests {
                 feed.resolve_indeterminate("partial").unwrap();
                 assert!(feed.can_submit("partial"));
             }
+            drop(feed.commands.take());
+            writer.await.unwrap();
+            server.abort();
+            let _ = server.await;
         }
     }
 
@@ -3553,12 +3599,14 @@ mod tests {
     #[tokio::test]
     async fn committed_start_remains_fenced_when_pane_preparation_fails() {
         use axum::response::IntoResponse;
-        for (start_refused, ensure_status) in [
-            (false, axum::http::StatusCode::FORBIDDEN),
-            (false, axum::http::StatusCode::CONFLICT),
-            (false, axum::http::StatusCode::INTERNAL_SERVER_ERROR),
-            (false, axum::http::StatusCode::OK),
-            (true, axum::http::StatusCode::FORBIDDEN),
+        for (start_refused, ensure_status, committed_revision) in [
+            (false, axum::http::StatusCode::FORBIDDEN, None),
+            (false, axum::http::StatusCode::CONFLICT, None),
+            (false, axum::http::StatusCode::INTERNAL_SERVER_ERROR, None),
+            (false, axum::http::StatusCode::OK, None),
+            (true, axum::http::StatusCode::FORBIDDEN, None),
+            (false, axum::http::StatusCode::CONFLICT, Some("1")),
+            (false, axum::http::StatusCode::CONFLICT, Some("3")),
         ] {
             let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
             let app = axum::Router::new()
@@ -3592,6 +3640,21 @@ mod tests {
                         move || {
                             seen.lock().unwrap().push("ensure");
                             async move {
+                                if let Some(revision) = committed_revision {
+                                    return (
+                                        ensure_status,
+                                        [
+                                            (
+                                                crate::daemon::ERROR_CODE_HEADER,
+                                                "managed_resume_refused",
+                                            ),
+                                            (crate::daemon::RUNTIME_EPOCH_HEADER, "test"),
+                                            (crate::daemon::RUNTIME_REVISION_HEADER, revision),
+                                        ],
+                                        "private pane refusal detail",
+                                    )
+                                        .into_response();
+                                }
                                 (
                                     ensure_status,
                                     [(crate::daemon::ERROR_CODE_HEADER, "resume_failed")],
@@ -3627,6 +3690,11 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
+            if let Some(revision) = committed_revision {
+                assert!(matches!(&reply,
+                    Ok(CommandReply::CommittedFailure { cursor, failure: CommandFailure::Rejected(_) })
+                    if cursor.revision == revision.parse::<u64>().unwrap().max(2)));
+            }
             original.send(reply).unwrap();
             assert!(feed.drain_command_errors().is_empty());
             if start_refused {
@@ -3639,7 +3707,15 @@ mod tests {
                     Err(tokio::sync::oneshot::error::TryRecvError::Empty)
                 ));
                 assert!(!feed.can_submit("id"));
-                feed.mark_snapshot_applied(snapshot("test", 2));
+                if committed_revision == Some("3") {
+                    feed.mark_snapshot_applied(snapshot("test", 2));
+                    assert!(feed.drain_command_errors().is_empty());
+                    assert!(!feed.can_submit("id"));
+                }
+                let revision = committed_revision
+                    .map(|value| value.parse::<u64>().unwrap().max(2))
+                    .unwrap_or(2);
+                feed.mark_snapshot_applied(snapshot("test", revision));
                 let errors = feed.drain_command_errors();
                 assert!(preparation.result.try_recv().unwrap().is_err());
                 let unknown = ensure_status.is_server_error() || ensure_status.is_success();

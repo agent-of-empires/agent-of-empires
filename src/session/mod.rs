@@ -100,8 +100,8 @@ pub use instance::{
     TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR,
 };
 pub(crate) use instance::{
-    ConversationState, LaunchReservation, ResumeAttemptPolicy, ResumeLaunchOptions,
-    TerminalContextResume,
+    ConversationState, LaunchReservation, ManagedResumeRefused, ResumeAttemptPolicy,
+    ResumeLaunchOptions, TerminalContextResume, MANAGED_RESUME_RECOVERY_MESSAGE,
 };
 pub(crate) use instance::{
     TerminalHandoffContext, TerminalHandoffIntent, TerminalHandoffKey, TerminalHandoffStage,
