@@ -18,6 +18,10 @@ const SESSIONS = [
 const selectedComposer = (page: Page) => page.locator('[aria-hidden="false"]').getByPlaceholder(/Send a message/);
 const retainedComposer = (page: Page) => page.locator('[aria-hidden="true"]').getByPlaceholder(/Send a message/);
 
+// Controlled time flushes the 250/700 ms mount-focus reclaim timers (Composer useInitialFocus)
+// so they cannot mask a missing activation effect on the return trip.
+const settleInitialFocus = (page: Page) => page.clock.runFor(1_000);
+
 async function selectViaSidebar(page: Page, title: string, id: string) {
   await clickSidebarSession(page, title);
   await expect(page).toHaveURL(new RegExp(`/session/${id}$`));
@@ -28,6 +32,7 @@ test("sidebar A to B to A focuses retained A's composer and typing reaches only 
   await page.addInitScript(() => {
     window.localStorage.setItem("aoe-web-settings", JSON.stringify({ persistentStructuredViews: true }));
   });
+  await page.clock.install();
   await mockStructuredSessionApis(page, { id: SESSIONS[0]!.id, title: SESSIONS[0]!.title });
   await mockSessionsList(page, () =>
     SESSIONS.map((s) => ({
@@ -45,9 +50,11 @@ test("sidebar A to B to A focuses retained A's composer and typing reaches only 
   await selectViaSidebar(page, "focus-a", "sess-focus-a");
   // Retention keeps this DOM node alive across the A to B to A round trip.
   await selectedComposer(page).evaluate((el) => el.setAttribute("data-test-owner", "A"));
+  await settleInitialFocus(page);
 
   await selectViaSidebar(page, "focus-b", "sess-focus-b");
   await expect(retainedComposer(page)).toHaveAttribute("data-test-owner", "A");
+  await settleInitialFocus(page);
 
   await selectViaSidebar(page, "focus-a", "sess-focus-a");
   const composerA = selectedComposer(page);
