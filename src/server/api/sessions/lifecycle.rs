@@ -2761,11 +2761,7 @@ async fn prepare_agent_session_inner(
         };
         if matches!(
             outcome,
-            Some(
-                crate::session::StartOutcome::Fresh
-                    | crate::session::StartOutcome::Resumed
-                    | crate::session::StartOutcome::FreshAfterFailedResume { .. }
-            )
+            Some(crate::session::StartOutcome::Fresh | crate::session::StartOutcome::Resumed)
         ) {
             let wake_message = requested_wake_message.unwrap_or_else(|| {
                 crate::session::resolve_config(&profile)

@@ -269,9 +269,7 @@ impl Instance {
         }
         self.adopt_tool(new_tool);
         self.prior_tool_session_ids.remove(new_tool);
-        // The transcript the carry copies is what the previous failure was
-        // missing, so the loop-breaker must not outlive the account it fired
-        // on; the resume-probe cascade still catches a second failure.
+        // A carried transcript permits a new probe under the selected account.
         self.resume_probe_failed_sid = None;
         self.acp_load_session_capable = None;
     }

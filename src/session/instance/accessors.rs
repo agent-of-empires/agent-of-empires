@@ -460,7 +460,7 @@ impl Instance {
             .map(|(capture, _)| capture.backend)
     }
 
-    /// Bare wrappers can receive automatic selectors, without proving execution identity.
+    /// Bare wrappers can receive fresh-session selectors without attesting execution.
     pub(super) fn legacy_default_selector_agent(&self) -> Option<&'static crate::agents::AgentDef> {
         if matches!(
             self.resume_intent,

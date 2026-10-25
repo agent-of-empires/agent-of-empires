@@ -146,9 +146,7 @@ impl Instance {
                 StartOutcome::ResumeFailed { sid } => {
                     return Ok(EnsureReadyOutcome::ResumeFailed { sid });
                 }
-                StartOutcome::Resumed
-                | StartOutcome::Fresh
-                | StartOutcome::FreshAfterFailedResume { .. } => {}
+                StartOutcome::Resumed | StartOutcome::Fresh => {}
             }
             self.wait_for_pane_ready(&session);
             return Ok(EnsureReadyOutcome::Started);
@@ -160,9 +158,7 @@ impl Instance {
                 StartOutcome::ResumeFailed { sid } => {
                     return Ok(EnsureReadyOutcome::ResumeFailed { sid });
                 }
-                StartOutcome::Resumed
-                | StartOutcome::Fresh
-                | StartOutcome::FreshAfterFailedResume { .. } => {}
+                StartOutcome::Resumed | StartOutcome::Fresh => {}
             }
             self.wait_for_pane_ready(&session);
             return Ok(EnsureReadyOutcome::Respawned);

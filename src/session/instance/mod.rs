@@ -675,10 +675,8 @@ pub struct Instance {
     /// agent's ids and consumes the incoming agent's entry, so the map holds at
     /// most one entry per tool the row has ever run under.
     ///
-    /// `resume_probe_failed_sid` is deliberately not parked with them: a
-    /// restored sid is worth one fresh probe (the conversation may well still
-    /// be there), and if it is gone the resume-fallback cascade already starts
-    /// a new session instead. Additive: absent in older rows, no migration.
+    /// `resume_probe_failed_sid` is not parked: restoring a conversation after
+    /// an engine swap permits one new resume probe.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub(crate) prior_tool_session_ids: HashMap<String, PriorToolSession>,
 

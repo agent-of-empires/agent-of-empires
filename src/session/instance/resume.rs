@@ -185,13 +185,9 @@ impl Instance {
     ///      rather than arming the resume loop-breaker: nothing was resumed,
     ///      so there is no resume to break. See `probe_pinned_fresh_launch`.
     ///
-    /// `resume_policy` gates step 1: `HonorAutoResumeSetting` additionally
-    /// requires `SessionConfig::auto_resume_on_restart`; `Allow` always
-    /// permits an attempt when the resolved agent supports native resume. Independent
-    /// of policy, a sid that already equals `resume_probe_failed_sid` from a
-    /// prior call never re-attempts resume: it returns
-    /// `StartOutcome::FreshAfterFailedResume` instead of repeating the same
-    /// doomed probe. See #2609.
+    /// `HonorAutoResumeSetting` respects an explicit fresh-launch configuration.
+    /// A previous failed probe refuses another automatic attempt, preserving the
+    /// conversation until the user rebinds it or explicitly requests a fresh start.
     ///
     /// Latency: only fires the probe when a freshly-created tmux session is
     /// being handed an id AoE already had stored (step 1 or step 3). Healthy
@@ -375,14 +371,46 @@ impl Instance {
             restart,
             conversation_carry,
         } = options;
-        let skipped_failed_resume_sid = self.apply_resume_policy(resume_policy);
+        let prior = self.conversation_state();
+        let preflight = (|| -> Result<()> {
+            if matches!(self.resume_intent, ResumeIntent::Default) {
+                if let Some(observation) =
+                    self.capture_freshest_conversation_in(CaptureStorage::Scoped(storage))
+                {
+                    self.apply_conversation_observation(&observation);
+                }
+            }
+            self.apply_resume_policy(resume_policy)?;
+            if !self.force_fresh_next_launch && self.conversation_target().is_some() {
+                // Revalidate after teardown as well: final publication and a carry
+                // may change the target, but neither may precede this refusal gate.
+                if let Some(execution) = self.resolve_launch_execution()? {
+                    if !matches!(self.resume_intent, ResumeIntent::Default)
+                        || self
+                            .conversation_target()
+                            .and_then(|(_, binding, _)| binding)
+                            .is_some_and(ConversationBinding::is_known)
+                    {
+                        self.validate_conversation_target(
+                            &execution.binding,
+                            execution.target_session_id.as_deref(),
+                        )?;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = preflight {
+            self.adopt_conversation_state(prior);
+            self.fail_reserved_launch(storage, generation, &error, false);
+            return Err(error);
+        }
         let expected = self.apply_fresh_launch_intent_in(storage);
         let result = (|| {
             let prepared =
                 self.stop_carry_and_prepare_in(storage, restart, conversation_carry, expected)?;
             let launch_outcome = self.spawn_prepared_launch(size, storage, prepared)?;
-            let outcome =
-                self.finish_resume_launch(launch_outcome, skipped_failed_resume_sid, storage)?;
+            let outcome = self.finish_resume_launch(launch_outcome, storage)?;
             self.commit_lifecycle_launch(storage, generation, restart)?;
             Ok(outcome)
         })();
@@ -500,11 +528,13 @@ impl Instance {
         }
     }
 
-    fn apply_resume_policy(&mut self, resume_policy: ResumeAttemptPolicy) -> Option<String> {
-        if self.resume_intent != ResumeIntent::Default {
-            return None;
+    fn apply_resume_policy(&mut self, resume_policy: ResumeAttemptPolicy) -> Result<()> {
+        if self.resume_intent != ResumeIntent::Default || self.force_fresh_next_launch {
+            return Ok(());
         }
-        let sid = self.agent_session_id.clone()?;
+        let Some(sid) = self.agent_session_id.as_deref() else {
+            return Ok(());
+        };
         let resume_allowed_by_policy = match resume_policy {
             ResumeAttemptPolicy::Allow => true,
             ResumeAttemptPolicy::HonorAutoResumeSetting => {
@@ -515,17 +545,19 @@ impl Instance {
                 .auto_resume_on_restart
             }
         };
-        if !is_valid_session_id(&sid) || !self.supports_native_resume() {
-            return None;
-        }
-        if self.resume_probe_failed_sid.as_deref() == Some(&sid) {
-            self.force_fresh_next_launch = true;
-            return Some(sid);
+        if !is_valid_session_id(sid) || !self.supports_native_resume() {
+            return Ok(());
         }
         if !resume_allowed_by_policy {
             self.force_fresh_next_launch = true;
+            return Ok(());
         }
-        None
+        anyhow::ensure!(
+            self.resume_probe_failed_sid.as_deref() != Some(sid),
+            "resume previously failed for conversation {sid}; identity preserved; restore its original context and explicitly retry with aoe session set-session-id {} {sid}, using --store with the exact store or transcript where required",
+            self.id
+        );
+        Ok(())
     }
 
     /// Fail the launch when a fresh-but-pinned start (`--session-id <sid>` on
@@ -587,7 +619,6 @@ impl Instance {
     fn finish_resume_launch(
         &mut self,
         launch_outcome: LaunchSidOutcome,
-        skipped_failed_resume_sid: Option<String>,
         storage: &dyn crate::session::SessionStore,
     ) -> Result<StartOutcome> {
         let (attempted_sid, pinned_prior_sid) = match launch_outcome {
@@ -607,10 +638,7 @@ impl Instance {
             if let Some(sid) = pinned_prior_sid {
                 self.probe_pinned_fresh_launch(&sid)?;
             }
-            return Ok(match skipped_failed_resume_sid {
-                Some(sid) => StartOutcome::FreshAfterFailedResume { sid },
-                None => StartOutcome::Fresh,
-            });
+            return Ok(StartOutcome::Fresh);
         };
 
         let probe = match self.probe_settle(RESUME_PROBE_MAX, RESUME_PROBE_POLL) {
@@ -661,6 +689,79 @@ mod tests {
     use tempfile::tempdir;
     #[test]
     #[serial]
+    fn managed_resume_refusal_preserves_the_live_pane_and_capture_generation() {
+        use crate::tmux::test_helpers::{
+            only_pane_id, pane_field, tmux_available, wait_for_pane_command, TmuxTestSession,
+        };
+        if !tmux_available() {
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _env = isolate_resume_environment(temp.path());
+        let _omp = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "omp",
+            "#!/bin/sh\nexec sleep 60\n",
+        );
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let sid = "11111111-2222-4333-8444-555555555555";
+        let mut inst = Instance::new("managed-resume-refusal", project.to_str().unwrap());
+        inst.tool = "omp".into();
+        inst.command = "omp".into();
+        inst.source_profile = "managed-resume-refusal".into();
+        inst.agent_session_id = Some(sid.into());
+        inst.omp_capture_generation = Some("original-generation".into());
+        let before = inst.conversation_state();
+        let storage =
+            crate::session::storage::Storage::new_unwatched(&inst.source_profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
+        let name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+        let _pane = TmuxTestSession::from_name(&name);
+        assert!(crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", &name, "exec sleep 60"])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        let pane = only_pane_id(&name);
+        wait_for_pane_command(&pane, "sleep");
+        let process = pane_field(&pane, "#{pane_pid}");
+        for failed_probe in [false, true] {
+            storage
+                .update(|rows, _| {
+                    rows[0].resume_probe_failed_sid = failed_probe.then(|| sid.into());
+                    Ok(())
+                })
+                .unwrap();
+            let result = inst.restart_with_resume_policy(None, true, ResumeAttemptPolicy::Allow);
+            assert!(result.is_err(), "an unbound managed resume must refuse");
+            assert_eq!(only_pane_id(&name), pane);
+            assert_eq!(pane_field(&pane, "#{pane_pid}"), process);
+            assert_eq!(pane_field(&pane, "#{pane_dead}"), "0");
+            assert_eq!(inst.conversation_state(), before);
+            let stored = storage.load().unwrap().remove(0);
+            assert_eq!(stored.conversation_state(), before);
+            assert_eq!(
+                stored.omp_capture_generation.as_deref(),
+                Some("original-generation")
+            );
+            assert_eq!(
+                stored.resume_probe_failed_sid.as_deref(),
+                failed_probe.then_some(sid)
+            );
+            assert!(stored.lifecycle_reservation.is_none());
+        }
+    }
+
+    #[test]
+    #[serial]
     fn cleared_bare_wrapper_launch_replaces_persisted_identity() {
         let temp = tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
@@ -693,10 +794,8 @@ mod tests {
                 })
                 .unwrap();
 
-            assert_eq!(
-                inst.apply_resume_policy(ResumeAttemptPolicy::HonorAutoResumeSetting),
-                failed_probe.then(|| old.into())
-            );
+            inst.apply_resume_policy(ResumeAttemptPolicy::HonorAutoResumeSetting)
+                .unwrap();
             let expected = inst.apply_fresh_launch_intent();
             let prepared = inst.prepare_launch_command(expected.clone()).unwrap();
             let fresh = inst
@@ -1059,7 +1158,6 @@ mod tests {
                         LaunchSidOutcome::Fresh {
                             pinned_prior_sid: Some(sid.to_string()),
                         },
-                        None,
                         &crate::session::storage::Storage::new_unwatched("resume-contract")
                             .unwrap(),
                     )
@@ -1204,7 +1302,6 @@ mod tests {
             LaunchSidOutcome::Existing {
                 sid: launched_sid.to_string(),
             },
-            None,
             &storage,
         );
         assert!(
@@ -1494,35 +1591,21 @@ mod tests {
             Some(stale_sid.as_str())
         );
 
-        // Second attempt, same sid, same doomed command: on the pre-fix
-        // tree this reproduces the reported bug (identical `ResumeFailed`
-        // forever). The fix must instead skip the resume attempt and
-        // start fresh.
-        inst.kill_clean_in(&storage).unwrap();
-        let second = inst
-            .start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow)
-            .unwrap();
-
-        let _ = crate::tmux::tmux_command()
-            .args(["kill-session", "-t", &tmux_name])
-            .output();
-
+        let before = inst.conversation_state();
+        let second = inst.start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow);
+        assert!(
+            second.is_err(),
+            "a failed resume must require an explicit retry"
+        );
+        assert_eq!(inst.conversation_state(), before);
         assert_eq!(
-            second,
-            StartOutcome::FreshAfterFailedResume {
-                sid: stale_sid.clone(),
-            },
-            "a sid that already failed a resume probe must not be retried automatically"
+            inst.resume_probe_failed_sid.as_deref(),
+            Some(stale_sid.as_str())
         );
-        assert_ne!(
-            inst.agent_session_id.as_deref(),
-            Some(stale_sid.as_str()),
-            "loop-breaker must generate a fresh sid instead of repeating the doomed one"
-        );
-        assert_eq!(
-            inst.resume_probe_failed_sid, None,
-            "loop-breaker's fresh launch clears the stale marker, matching ResumeIntent::Cleared semantics"
-        );
+        let stored = storage.load().unwrap().remove(0);
+        assert_eq!(stored.conversation_state(), before);
+        assert_eq!(stored.resume_probe_failed_sid, inst.resume_probe_failed_sid);
+        assert!(!inst.tmux_session().unwrap().exists_live());
     }
 
     #[test]
