@@ -6,6 +6,7 @@ import * as api from "../../../lib/api";
 import * as clipboard from "../../../lib/clipboard";
 import {
   confirmFileEditNavigation,
+  confirmFileEditRemoval,
   fileDraftKey,
   hasUnsavedFileEdits,
   installFileEditGuards,
@@ -132,6 +133,8 @@ describe("TextFileEditor", () => {
     fireEvent.change(first.editor, { target: { value: "pending draft" } });
     fireEvent.keyDown(first.editor, { key: "s", ctrlKey: true });
     cleanup();
+    expect(hasUnsavedFileEdits()).toBe(true);
+    expect(confirmFileEditNavigation()).toBe(false);
     const current = setup();
     expect((current.editor as HTMLTextAreaElement).value).toBe("pending draft");
     expect((current.editor as HTMLTextAreaElement).disabled).toBe(true);
@@ -145,6 +148,35 @@ describe("TextFileEditor", () => {
     expect(first.onSaved).not.toHaveBeenCalled();
     expect(current.onSaved).toHaveBeenCalledOnce();
     expect(hasUnsavedFileEdits()).toBe(false);
+  });
+
+  it("unblocks navigation and unload when a save completes while no editor is mounted", async () => {
+    let complete!: (value: { ok: boolean; status: number; error: undefined }) => void;
+    vi.spyOn(api, "saveSessionFile").mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          complete = resolve;
+        }),
+    );
+    const first = setup();
+    fireEvent.change(first.editor, { target: { value: "saved offscreen" } });
+    fireEvent.keyDown(first.editor, { key: "s", ctrlKey: true });
+    cleanup();
+    expect(hasUnsavedFileEdits()).toBe(true);
+    expect(confirmFileEditNavigation()).toBe(false);
+    await act(async () => {
+      complete({ ok: true, status: 204, error: undefined });
+    });
+    const confirm = vi.spyOn(window, "confirm");
+    expect(confirmFileEditNavigation()).toBe(true);
+    expect(hasUnsavedFileEdits()).toBe(false);
+    expect(confirm).not.toHaveBeenCalled();
+    const unload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(unload);
+    expect(unload.defaultPrevented).toBe(false);
+    const current = setup();
+    await waitFor(() => expect(current.onSaved).toHaveBeenCalledOnce());
+    expect(first.onSaved).not.toHaveBeenCalled();
   });
 
   it.each(["conflict", "offline"])("restores a save's %s result after it settles while unmounted", async (failure) => {
@@ -218,6 +250,22 @@ describe("TextFileEditor", () => {
     expect((setup().editor as HTMLTextAreaElement).value).toBe("survives");
     expect(hasUnsavedFileEdits()).toBe(true);
   });
+  it("confirms removal of a Session with a parked draft without blocking removal of another Session", () => {
+    const { editor } = setup();
+    fireEvent.change(editor, { target: { value: "parked draft" } });
+    cleanup();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    expect(confirmFileEditRemoval(["s2"])).toBe(true);
+    expect(confirm).not.toHaveBeenCalled();
+    expect(confirmFileEditRemoval(["s1"])).toBe(false);
+    expect(confirm).toHaveBeenCalledOnce();
+    confirm.mockReturnValue(true);
+    expect(confirmFileEditRemoval(["s1"])).toBe(true);
+    const unload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(unload);
+    expect(unload.defaultPrevented).toBe(false);
+  });
+
   it("leaves no draft behind once the edit is clean again", () => {
     const { editor } = setup();
     fireEvent.change(editor, { target: { value: "changed" } });

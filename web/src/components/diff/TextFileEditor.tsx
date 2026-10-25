@@ -7,9 +7,11 @@ import {
   confirmFileEditNavigation,
   fileDraftKey,
   getFileDraft,
+  isFileSaving,
   preserveLineEndings,
   registerFileEditor,
   setFileDraft,
+  startFileSave,
 } from "../../lib/fileEditGuard";
 import { useLatestRef } from "../../hooks/useLatestRef";
 
@@ -55,7 +57,7 @@ export function TextFileEditor({ sessionId, filePath, original, onBack, onCancel
       clearTimeout(timer);
       try {
         const current = await getSessionFile(sessionId, filePath, { versionOnly: true });
-        if (cancelled || getFileDraft(key)?.pendingSave) return;
+        if (cancelled || isFileSaving(key)) return;
         setCheckFailed(current === null);
         setEditDisabledReason(current?.edit_disabled_reason ?? null);
         if (current && current.version !== original.version) setChanged(true);
@@ -80,7 +82,7 @@ export function TextFileEditor({ sessionId, filePath, original, onBack, onCancel
   useEffect(() => {
     if (!pendingSave) return;
     let cancelled = false;
-    void pendingSave.then((result) => {
+    void pendingSave.promise.then((result) => {
       if (cancelled) return;
       if (result.ok) {
         setFileDraft(key, null);
@@ -102,11 +104,11 @@ export function TextFileEditor({ sessionId, filePath, original, onBack, onCancel
     onCancel();
   };
   const cancel = () => {
-    if (getFileDraft(key)?.pendingSave) return;
+    if (pendingSave || isFileSaving(key)) return;
     if (!dirty || window.confirm("Discard unsaved file changes?")) discard();
   };
   const save = () => {
-    if (getFileDraft(key)?.pendingSave || !dirty || changed || editDisabledReason || !original.version) return;
+    if (pendingSave || isFileSaving(key) || !dirty || changed || editDisabledReason || !original.version) return;
     const pending = saveSessionFile(
       sessionId,
       filePath,
@@ -117,8 +119,7 @@ export function TextFileEditor({ sessionId, filePath, original, onBack, onCancel
       status: 0,
       error: "Save could not be confirmed. Your edits are kept; check the file before retrying.",
     }));
-    setFileDraft(key, { original, text: draft, pendingSave: pending });
-    setPendingSave(pending);
+    setPendingSave(startFileSave(key, { original, text: draft }, pending));
     setError(null);
   };
 
