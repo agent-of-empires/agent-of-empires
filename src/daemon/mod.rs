@@ -169,6 +169,9 @@ fn daemon_status_message(status: StatusCode, code: Option<ApiErrorCode>, body: &
         Some(ApiErrorCode::LifecycleLocked) => {
             "Session is busy with another operation; nothing changed, retry when it finishes".into()
         }
+        Some(ApiErrorCode::LifecycleSuperseded) => {
+            "Session changed after it was selected; it may be partly processed, refresh and check before retrying".into()
+        }
         _ => format!("daemon returned HTTP {status}: {body}"),
     }
 }
@@ -866,7 +869,11 @@ impl DaemonClient {
             // D1: 409 lifecycle_locked maps from status plus the single finite
             // server-owned header without reading the body. 401 maps from status
             // alone; neither retains a body or token in the error.
-            if code == Some(ApiErrorCode::LifecycleLocked) || status == StatusCode::UNAUTHORIZED {
+            if matches!(
+                code,
+                Some(ApiErrorCode::LifecycleLocked | ApiErrorCode::LifecycleSuperseded)
+            ) || status == StatusCode::UNAUTHORIZED
+            {
                 return Err(DaemonClientError::Status {
                     status,
                     code,
@@ -1503,6 +1510,35 @@ mod tests {
         );
         let captured = next_request(rx).await;
         assert_eq!(captured.path, "/api/sessions/sess-1/stop");
+    }
+
+    #[tokio::test]
+    async fn conflict_lifecycle_superseded_stays_distinct_from_busy() {
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let base = serve_mutation_once(
+            "/api/sessions/{id}/stop",
+            409,
+            vec![(ERROR_CODE_HEADER, "lifecycle_superseded")],
+            r#"{"error":"lifecycle_superseded","message":"changed"}"#,
+            tx,
+        )
+        .await;
+        let client = DaemonClient::new(&base, None).expect("test client");
+        let error = client
+            .mutate_session("sess-1", &SessionMutation::Stop, "epoch-1")
+            .await
+            .expect_err("conflict must fail");
+        assert!(matches!(
+            error,
+            DaemonClientError::Status {
+                code: Some(ApiErrorCode::LifecycleSuperseded),
+                ref body,
+                ..
+            } if body.is_empty()
+        ));
+        let text = error.to_string();
+        assert!(text.contains("changed after it was selected"), "{text}");
+        assert!(!text.contains("nothing changed"), "{text}");
     }
 
     #[tokio::test]

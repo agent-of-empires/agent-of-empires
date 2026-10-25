@@ -649,8 +649,8 @@ operation holds the session, nothing changed, and the caller may retry once it
 finishes. It is not `KeptRestored` (restored mid-purge), already gone, or a
 cleanup failure. Over HTTP it is `409` with the `lifecycle_locked` code header
 and `{"error":"lifecycle_busy","operation":"<holder>"}`; a selection that
-changed after it was made is `lifecycle_superseded` and must be refreshed, not
-retried. A batch delete that skips Busy sessions lists them under `busy` and
+changed after it was made is `409` with its own `lifecycle_superseded` code
+header; it may already be partly processed, so refresh and check before retrying. A batch delete that skips Busy sessions lists them under `busy` and
 reports `partial`; when nothing else completed it answers `409 lifecycle_busy`.
 `aoe rm --purge` and `aoe session restore` exit non-zero for Busy. `aoe session
 empty-trash` purges the rest, lists each skipped session on stderr, then exits

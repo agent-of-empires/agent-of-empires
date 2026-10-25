@@ -1140,40 +1140,46 @@ pub(crate) fn lifecycle_rejection(
     if error.is::<crate::session::SessionGone>() {
         return Some(crate::server::api::session_not_found());
     }
-    let (code, operation, message) =
-        match error.downcast_ref::<crate::session::LifecycleReservationError>() {
-            Some(crate::session::LifecycleReservationError::Busy(operation)) => (
+    let (code, operation, message) = match error
+        .downcast_ref::<crate::session::LifecycleReservationError>()
+    {
+        Some(crate::session::LifecycleReservationError::Busy(operation)) => (
+            "lifecycle_busy",
+            Some(*operation),
+            format!(
+                "Session is busy with {}; nothing changed, retry when it finishes",
+                serde_json::json!(operation)
+                    .as_str()
+                    .unwrap_or("another operation")
+            ),
+        ),
+        Some(crate::session::LifecycleReservationError::Superseded) => (
+            "lifecycle_superseded",
+            None,
+            "Session changed after it was selected; refresh and check before retrying".to_owned(),
+        ),
+        _ if matches!(
+            error.downcast_ref::<LifecycleTargetError>(),
+            Some(LifecycleTargetError::Busy)
+        ) =>
+        {
+            (
                 "lifecycle_busy",
-                Some(*operation),
-                format!(
-                    "Session is busy with {}; nothing changed, retry when it finishes",
-                    serde_json::json!(operation)
-                        .as_str()
-                        .unwrap_or("another operation")
-                ),
-            ),
-            Some(crate::session::LifecycleReservationError::Superseded) => (
-                "lifecycle_superseded",
                 None,
-                "Session changed after it was selected; refresh and retry".to_owned(),
-            ),
-            _ if matches!(
-                error.downcast_ref::<LifecycleTargetError>(),
-                Some(LifecycleTargetError::Busy)
-            ) =>
-            {
-                (
-                    "lifecycle_busy",
-                    None,
-                    "Session lifecycle is busy".to_owned(),
-                )
-            }
-            _ => return None,
-        };
+                "Session lifecycle is busy".to_owned(),
+            )
+        }
+        _ => return None,
+    };
+    let header = if code == "lifecycle_superseded" {
+        crate::daemon::ApiErrorCode::LifecycleSuperseded.header()
+    } else {
+        crate::daemon::ApiErrorCode::LifecycleLocked.header()
+    };
     Some(
         (
             StatusCode::CONFLICT,
-            crate::daemon::ApiErrorCode::LifecycleLocked.header(),
+            header,
             Json(serde_json::json!({"error": code, "operation": operation, "message": message})),
         )
             .into_response(),

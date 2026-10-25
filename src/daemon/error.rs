@@ -11,6 +11,7 @@ pub enum ApiErrorCode {
     AccessPolicyDenied,
     CityhallMode,
     LifecycleLocked,
+    LifecycleSuperseded,
     PendingTargetGone,
     TlsRequired,
     RuntimeEpochMismatch,
@@ -35,6 +36,7 @@ impl ApiErrorCode {
             Self::AccessPolicyDenied => "access_policy_denied",
             Self::CityhallMode => "cityhall_mode",
             Self::LifecycleLocked => "lifecycle_locked",
+            Self::LifecycleSuperseded => "lifecycle_superseded",
             Self::PendingTargetGone => "pending_target_gone",
             Self::StartFailed => "start_failed",
             Self::PurgeFailed => "purge_failed",
@@ -59,6 +61,7 @@ impl ApiErrorCode {
             | Self::AccessPolicyDenied
             | Self::CityhallMode => StatusCode::FORBIDDEN,
             Self::LifecycleLocked
+            | Self::LifecycleSuperseded
             | Self::RuntimeEpochMismatch
             | Self::ResumeFailed
             | Self::PurgeFailed
@@ -97,6 +100,7 @@ impl ApiErrorCode {
             b"access_policy_denied" => Self::AccessPolicyDenied,
             b"cityhall_mode" => Self::CityhallMode,
             b"lifecycle_locked" => Self::LifecycleLocked,
+            b"lifecycle_superseded" => Self::LifecycleSuperseded,
             b"pending_target_gone" if resolving_pending_target => Self::PendingTargetGone,
             b"tls_required" => Self::TlsRequired,
             b"runtime_epoch_mismatch" => Self::RuntimeEpochMismatch,
@@ -172,6 +176,12 @@ mod tests {
                 Some(ApiErrorCode::NoRevive),
             ),
             (StatusCode::FORBIDDEN, "no_revive", false, None),
+            (
+                StatusCode::CONFLICT,
+                "lifecycle_superseded",
+                false,
+                Some(ApiErrorCode::LifecycleSuperseded),
+            ),
             (
                 StatusCode::BAD_REQUEST,
                 "create_hook_failed",
