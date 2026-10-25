@@ -228,7 +228,7 @@ fn save_file(
             return Err((StatusCode::FORBIDDEN, reason));
         }
         Ok(std::fs::Permissions::from_mode(
-            current.read.metadata.mode() & 0o7777,
+            current.read.metadata.mode() & 0o777,
         ))
     };
     let permissions = check()?;
@@ -291,14 +291,17 @@ pub async fn save_session_file(
         Ok(scope) => scope,
         Err(response) => return response,
     };
-    // Sandbox start and replacement hold this lock, so the mount check and the
-    // publication see one container. Read the instance after taking it.
-    let inst_lock = state.instance_lock(&id).await;
-    let _guard = inst_lock.lock().await;
+    // Keep one Sandbox through publication, even if the request is cancelled.
+    let guard = state.instance_lock(&id).await.lock_owned().await;
     let Some(instance) = find_instance(&state, &id).await else {
         return crate::server::api::session_not_found();
     };
-    match tokio::task::spawn_blocking(move || save_file(&scope.roots, &instance, request)).await {
+    match tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        save_file(&scope.roots, &instance, request)
+    })
+    .await
+    {
         Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
         Ok(Err((status, message))) => api_error(status, "file_save", message),
         Err(error) => {
@@ -344,7 +347,7 @@ mod tests {
         fs::create_dir(roots[0].join("sub")).unwrap();
         let target = roots[0].join("sub/script.sh");
         fs::write(&target, "#!/bin/sh\r\necho old\r\n").unwrap();
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o751)).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o6751)).unwrap();
         let original = snapshot(&roots, &instance, "sub/script.sh");
         let before = snapshot(&roots, &instance, "sub/script.sh");
         assert_eq!(
@@ -364,7 +367,7 @@ mod tests {
         .unwrap();
         assert_eq!(fs::read(&target).unwrap(), content.as_bytes());
         assert_eq!(
-            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
             0o751
         );
         assert_ne!(
@@ -591,6 +594,62 @@ mod tests {
             sandbox_mount_reason(&container, &path),
             Some("This file is mounted separately in the Sandbox")
         );
+    }
+
+    #[test]
+    fn cancelled_handler_keeps_instance_locked_until_the_save_finishes() {
+        use std::future::{poll_fn, Future};
+        use std::task::Poll;
+        use std::time::Duration;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (_dir, roots, instance) = fixture();
+            let target = roots[0].join("a.txt");
+            fs::write(&target, "original").unwrap();
+            let opened = snapshot(&roots, &instance, "a.txt");
+            let state = crate::server::test_support::build_test_app_state(vec![instance.clone()]);
+            let lock = state.instance_lock(&instance.id).await;
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            // Queue the save so cancellation cannot race its completion.
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+            });
+            started_rx.await.unwrap();
+            let mut handler = Box::pin(save_session_file(
+                State(state),
+                Path(instance.id),
+                Ok(Json(request(
+                    "a.txt",
+                    opened.version.as_deref().unwrap(),
+                    "updated",
+                ))),
+            ));
+            poll_fn(|cx| {
+                assert!(handler.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            assert!(lock.try_lock().is_err());
+            drop(handler);
+            assert!(
+                lock.try_lock().is_err(),
+                "cancelled request released the save lock"
+            );
+            assert_eq!(fs::read_to_string(&target).unwrap(), "original");
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            let _guard = tokio::time::timeout(Duration::from_secs(10), lock.lock())
+                .await
+                .unwrap();
+            assert_eq!(fs::read_to_string(&target).unwrap(), "updated");
+        });
     }
 
     #[tokio::test]

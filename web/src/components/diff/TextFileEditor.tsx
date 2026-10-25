@@ -32,6 +32,7 @@ export function TextFileEditor({ sessionId, filePath, original, onBack, onCancel
   const [saving, setSaving] = useState(false);
   const [changed, setChanged] = useState(false);
   const [checkFailed, setCheckFailed] = useState(false);
+  const [editDisabledReason, setEditDisabledReason] = useState(original.edit_disabled_reason ?? null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const textarea = useRef<HTMLTextAreaElement>(null);
@@ -56,7 +57,8 @@ export function TextFileEditor({ sessionId, filePath, original, onBack, onCancel
         const current = await getSessionFile(sessionId, filePath, { versionOnly: true });
         if (cancelled || savingRef.current) return;
         setCheckFailed(current === null);
-        if (current && (current.version !== original.version || current.edit_disabled_reason)) setChanged(true);
+        setEditDisabledReason(current?.edit_disabled_reason ?? null);
+        if (current && current.version !== original.version) setChanged(true);
       } finally {
         checking = false;
         if (!cancelled) timer = setTimeout(() => void check(), 2000);
@@ -84,7 +86,7 @@ export function TextFileEditor({ sessionId, filePath, original, onBack, onCancel
     if (!dirty || window.confirm("Discard unsaved file changes?")) discard();
   };
   const save = async () => {
-    if (savingRef.current || !dirty || changed || !original.version) return;
+    if (savingRef.current || !dirty || changed || editDisabledReason || !original.version) return;
     savingRef.current = true;
     setFileDraft(key, { original, text: draft, saving: true });
     setSaving(true);
@@ -132,7 +134,7 @@ export function TextFileEditor({ sessionId, filePath, original, onBack, onCancel
         </button>
         <button
           className={`${button} bg-brand-600 text-text-on-brand hover:bg-brand-500 disabled:hover:bg-brand-600`}
-          disabled={!dirty || saving || changed}
+          disabled={!dirty || saving || changed || !!editDisabledReason}
           onClick={() => void save()}
           title="Save (Ctrl/Cmd+S)"
         >
@@ -170,6 +172,11 @@ export function TextFileEditor({ sessionId, filePath, original, onBack, onCancel
               Reload from disk
             </button>
           </div>
+        </div>
+      )}
+      {editDisabledReason && (
+        <div role="status" className="px-3 py-2 text-xs text-text-dim">
+          {editDisabledReason}
         </div>
       )}
       {checkFailed && (

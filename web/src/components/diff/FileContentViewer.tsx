@@ -31,6 +31,7 @@ function SessionFileViewer({ sessionId, filePath, onBack, structured }: Props) {
   const [editing, setEditing] = useState<SessionFileResponse | null>(
     () => getFileDraft(fileDraftKey(sessionId, filePath))?.original ?? null,
   );
+  const activeEditing = settings.fileEditing ? editing : null;
   const [revision, setRevision] = useState(0);
   const [saved, setSaved] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -76,7 +77,7 @@ function SessionFileViewer({ sessionId, filePath, onBack, structured }: Props) {
       tabIndex={-1}
       className="flex-1 flex flex-col bg-surface-900 overflow-hidden focus:outline-none"
     >
-      {!editing && (
+      {!activeEditing && (
         <div className="px-3 py-2 border-b border-surface-700/20 flex items-center gap-2 shrink-0">
           {onBack && <BackButton label="Files" onClick={onBack} />}
           <span className="font-mono text-[12px] text-text-primary truncate flex-1">{filePath}</span>
@@ -99,7 +100,7 @@ function SessionFileViewer({ sessionId, filePath, onBack, structured }: Props) {
         </div>
       )}
 
-      {!editing && settings.fileEditing && data?.edit_disabled_reason && (
+      {!activeEditing && settings.fileEditing && data?.edit_disabled_reason && (
         <div className="px-3 py-2 text-xs text-text-dim">{data.edit_disabled_reason}</div>
       )}
       {saved && (
@@ -124,11 +125,11 @@ function SessionFileViewer({ sessionId, filePath, onBack, structured }: Props) {
           )}
         </div>
       )}
-      {editing ? (
+      {activeEditing ? (
         <TextFileEditor
           sessionId={sessionId}
           filePath={filePath}
-          original={editing}
+          original={activeEditing}
           onBack={onBack}
           onCancel={() => {
             setEditing(null);
