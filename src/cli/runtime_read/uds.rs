@@ -1339,7 +1339,6 @@ mod tests {
         let mut stat = os::Stat {
             st_mode: os::DIRECTORY | 0o777,
             st_uid: 0,
-            st_gid: 0,
             st_dev: 0,
             st_ino: 0,
             st_nlink: 1,
@@ -1360,7 +1359,6 @@ mod tests {
         stat.st_mode = crate::process::runtime_io::DIRECTORY | 0o757;
         assert!(!group_other_writes_allowed(&stat, false, 1));
         stat.st_uid = 1;
-        stat.st_gid = 1;
         stat.st_mode = os::DIRECTORY | 0o775;
         assert!(!group_other_writes_allowed(&stat, false, 1));
         assert!(!group_other_writes_allowed(&stat, true, 1));
