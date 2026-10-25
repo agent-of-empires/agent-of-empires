@@ -4,7 +4,7 @@ import { deleteWorkspace, restoreSession, trashSession } from "./api";
 import type { DeleteSessionOptions, DeleteWorkspaceResult, TrashPurgeConsent } from "./api";
 import type { SessionResponse, SessionStatus, Workspace } from "./types";
 
-const BUSY_MESSAGE = "Some sessions are busy with another operation; nothing changed, retry when it finishes";
+const BUSY_MESSAGE = "Some sessions are busy with another operation and were not changed; retry them when it finishes";
 
 /** A workspace is only trashed as a whole, so restore every session of the workspace containing `sessionId`. */
 export function trashedWorkspaceRestoreIds(workspaces: Workspace[], sessionId: string): string[] {
