@@ -39,8 +39,10 @@ vi.mock("../../lib/api", () => ({
   deleteProfile: vi.fn(() => Promise.resolve(true)),
 }));
 
-function renderView(tab: string) {
-  return render(<SettingsView onClose={() => {}} tab={tab} onSelectTab={vi.fn()} onServerAboutRefresh={() => {}} />);
+function renderView(tab: string, field?: string) {
+  return render(
+    <SettingsView onClose={() => {}} tab={tab} onSelectTab={vi.fn()} onServerAboutRefresh={() => {}} field={field} />,
+  );
 }
 
 import { resetSettingsStore } from "../../lib/settingsStore";
@@ -49,7 +51,8 @@ beforeEach(resetSettingsStore);
 
 describe("SettingsView schema load", () => {
   it("shows an error + retry when the schema fails, then recovers", async () => {
-    renderView("worktree");
+    Element.prototype.scrollIntoView = vi.fn();
+    renderView("worktree", "worktree.path_template");
 
     // First fetch returned null -> error surfaced, not a blank tab.
     await waitFor(() => expect(screen.getByText("Failed to load settings schema.")).toBeTruthy());
@@ -60,6 +63,10 @@ describe("SettingsView schema load", () => {
     await waitFor(() => expect(screen.getByText("Path Template")).toBeTruthy());
     expect(screen.queryByText("Failed to load settings schema.")).toBeNull();
     expect(vi.mocked(api.getSettingsSchema)).toHaveBeenCalledTimes(2);
+    // A ?field= deep link waits for the successful load, so Retry completes it.
+    expect(document.querySelector(".animate-settings-highlight")?.getAttribute("data-settings-field")).toBe(
+      "worktree.path_template",
+    );
   });
 
   it("keeps a mixed tab's non-schema rows visible when the schema fails", async () => {

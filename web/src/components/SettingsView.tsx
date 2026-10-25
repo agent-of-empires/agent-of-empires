@@ -340,7 +340,7 @@ export function SettingsView({
 
   // Deep link: once the schema loads, focus the `?field=` row if it is on the open tab.
   const [deepLinked, setDeepLinked] = useState<string | null>(null);
-  if (field && field !== deepLinked && !schemaLoading) {
+  if (field && field !== deepLinked && !schemaLoading && !schemaError) {
     setDeepLinked(field);
     const d = searchSchema.find(
       (x) =>
