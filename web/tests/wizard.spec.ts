@@ -44,7 +44,7 @@ test.describe("essentials", () => {
     await closePanel(page);
     await expect(w.getByTestId("wizard-worktree-row")).toContainText("feat/rows, new branch");
 
-    const group = w.getByLabel(GROUP_LABEL);
+    const group = w.getByLabel(GROUP_LABEL, { exact: true });
     await group.fill("backend");
     await expect(group).toHaveValue("backend");
   });
@@ -182,7 +182,7 @@ test.describe("mobile", () => {
     await expect(launchBtn).toBeInViewport();
     await expect(launchBtn).not.toContainText("Enter");
     // No dead band between the last row and Launch.
-    const group = (await w.getByLabel("Group").boundingBox())!;
+    const group = (await w.getByLabel("Group", { exact: true }).boundingBox())!;
     const launch = (await launchBtn.boundingBox())!;
     expect(launch.y - (group.y + group.height)).toBeLessThan(80);
   });
@@ -216,7 +216,7 @@ test.describe("worktree and branch", () => {
     await expect(w.getByLabel("Base branch")).toHaveCount(0);
     await closePanel(page);
     // Fields from the form and the agent panel ride along in the same payload.
-    await w.getByLabel(GROUP_LABEL).fill("backend");
+    await w.getByLabel(GROUP_LABEL, { exact: true }).fill("backend");
     await openPanel(page, "Agent");
     await w.getByPlaceholder("e.g. --port 8080").fill("--verbose");
     await closePanel(page);
@@ -408,6 +408,145 @@ test.describe("confirmations before create", () => {
       await page.getByTestId("volume-ignores-glob-proceed").click();
       await expect.poll(() => created.length).toBe(1);
       await expect.poll(() => acknowledged.length).toBe(1);
+    });
+  });
+});
+
+test.describe("Group field", () => {
+  const GROUPS = [
+    { path: "client", session_count: 0 },
+    { path: "client/api", session_count: 2 },
+    { path: "client/web", session_count: 1 },
+    { path: "studio", session_count: 2 },
+  ];
+
+  test("arrows and Enter pick a group; Esc closes and keeps the text", async ({ page }) => {
+    await startWizard(page, { groups: GROUPS });
+    const w = wizard(page);
+    const field = w.getByRole("combobox", { name: "Group" });
+    await field.click();
+    await field.fill("client/");
+    const list = w.getByRole("listbox", { name: "Groups" });
+    await expect(list.getByRole("option")).toHaveCount(3);
+    await expect(w.getByRole("option", { name: 'Create group "client/"' })).toHaveAttribute("aria-selected", "true");
+    await page.keyboard.press("ArrowUp");
+    await page.keyboard.press("ArrowUp");
+    await expect(w.getByRole("option", { name: "client/api · 2 sessions" })).toHaveAttribute("aria-selected", "true");
+    await page.keyboard.press("Enter");
+    await expect(field).toHaveValue("client/api");
+    await expect(list).toBeHidden();
+
+    await field.fill("brand-new");
+    await expect(list).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(list).toBeHidden();
+    await expect(field).toHaveValue("brand-new");
+    await expect(w).toBeVisible();
+  });
+
+  test("in a list taller than the popup, the highlighted row stays in view", async ({ page }) => {
+    const many = Array.from({ length: 20 }, (_, i) => ({
+      path: `team/g${String(i + 1).padStart(2, "0")}`,
+      session_count: 1,
+    }));
+    await startWizard(page, { groups: many });
+    const w = wizard(page);
+    const field = w.getByRole("combobox", { name: "Group" });
+    await field.click();
+    await field.fill("team/");
+    const list = w.getByRole("listbox", { name: "Groups" });
+    const inView = async (name: string) => {
+      const row = (await w.getByRole("option", { name }).boundingBox())!;
+      const box = (await list.boundingBox())!;
+      return row.y >= box.y - 1 && row.y + row.height <= box.y + box.height + 1;
+    };
+    // The default create row is last, past the popup's height.
+    await expect(w.getByRole("option", { name: 'Create group "team/"' })).toHaveAttribute("aria-selected", "true");
+    await expect.poll(() => inView('Create group "team/"')).toBe(true);
+    for (let i = 0; i < 20; i++) await page.keyboard.press("ArrowUp");
+    await expect(w.getByRole("option", { name: "team/g01 · 1 session" })).toHaveAttribute("aria-selected", "true");
+    await expect.poll(() => inView("team/g01 · 1 session")).toBe(true);
+  });
+
+  test("Groups that load after typing keep the highlighted create row in view", async ({ page }) => {
+    const many = Array.from({ length: 20 }, (_, i) => ({
+      path: `team/g${String(i + 1).padStart(2, "0")}`,
+      session_count: 1,
+    }));
+    await mockWizardApis(page);
+    // Registered last, so it answers `/api/groups` instead of the helper, once released.
+    let release: () => void = () => {};
+    const held = new Promise<void>((resolve) => (release = resolve));
+    await page.route("**/api/groups**", async (r) => {
+      await held;
+      await r.fulfill({ json: many });
+    });
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.goto("/");
+    await openWizard(page);
+    await selectProject(page, "/tmp/example");
+    const w = wizard(page);
+    const field = w.getByRole("combobox", { name: "Group" });
+    await field.click();
+    await field.fill("team/");
+    const create = w.getByRole("option", { name: 'Create group "team/"' });
+    await expect(create).toHaveAttribute("aria-selected", "true");
+    release();
+    const list = w.getByRole("listbox", { name: "Groups" });
+    await expect(list.getByRole("option")).toHaveCount(21);
+    await expect(create).toHaveAttribute("aria-selected", "true");
+    await expect
+      .poll(async () => {
+        const row = (await create.boundingBox())!;
+        const box = (await list.boundingBox())!;
+        return row.y >= box.y - 1 && row.y + row.height <= box.y + box.height + 1;
+      })
+      .toBe(true);
+  });
+
+  test.describe("at 375px", () => {
+    test.use({ viewport: { width: 375, height: 812 } });
+
+    test("with the keyboard up, the list fits the room left", async ({ page }) => {
+      await startWizard(page, { groups: GROUPS });
+      const w = wizard(page);
+      const field = w.getByRole("combobox", { name: "Group" });
+      // A short viewport stands in for the on-screen keyboard, leaving under 96px on either side.
+      await page.setViewportSize({ width: 375, height: 260 });
+      await field.evaluate((el) => el.scrollIntoView({ block: "start" }));
+      await field.click();
+      const popup = w.getByTestId("group-combobox-popup");
+      await expect(popup).toBeVisible();
+      const popupBox = (await popup.boundingBox())!;
+      const areaBox = (await w.locator("[data-wizard-scroll]").boundingBox())!;
+      expect(popupBox.y).toBeGreaterThanOrEqual(areaBox.y - 1);
+      expect(popupBox.y + popupBox.height).toBeLessThanOrEqual(Math.min(areaBox.y + areaBox.height, 260) + 1);
+      // The capped popup still shows a whole option, and it can be picked.
+      const option = w.getByRole("option").first();
+      const optionBox = (await option.boundingBox())!;
+      const listBox = (await w.getByRole("listbox", { name: "Groups" }).boundingBox())!;
+      expect(optionBox.height).toBeGreaterThanOrEqual(43);
+      expect(optionBox.y).toBeGreaterThanOrEqual(listBox.y - 1);
+      expect(optionBox.y + optionBox.height).toBeLessThanOrEqual(listBox.y + listBox.height + 1);
+      await option.click();
+      await expect(field).toHaveValue("client");
+    });
+
+    test("the list opens upward inside the sheet, with 44px rows", async ({ page }) => {
+      await startWizard(page, { groups: GROUPS });
+      await page.setViewportSize({ width: 375, height: 812 });
+      const w = wizard(page);
+      const field = w.getByRole("combobox", { name: "Group" });
+      await field.click();
+      const popup = w.getByTestId("group-combobox-popup");
+      await expect(popup).toBeVisible();
+      const fieldBox = (await field.boundingBox())!;
+      const popupBox = (await popup.boundingBox())!;
+      const areaBox = (await w.locator("[data-wizard-scroll]").boundingBox())!;
+      expect(popupBox.y + popupBox.height).toBeLessThanOrEqual(fieldBox.y + 1);
+      expect(popupBox.y).toBeGreaterThanOrEqual(areaBox.y - 1);
+      const row = (await w.getByRole("option").first().boundingBox())!;
+      expect(row.height).toBeGreaterThanOrEqual(44);
     });
   });
 });

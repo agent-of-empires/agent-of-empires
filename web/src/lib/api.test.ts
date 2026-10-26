@@ -113,7 +113,7 @@ const requestCases: RequestCase[] = [
     () => api.updateMachineSettings({ a: 1 }),
     { body: { a: 1 }, result: "committed" },
   ],
-  ["PATCH /api/theme", () => api.updateTheme({ name: "dracula" }), { body: { name: "dracula" }, result: true }],
+  ["PATCH /api/theme", () => api.updateTheme({ name: "dracula" }), { body: { name: "dracula" }, result: "committed" }],
   ["GET /api/app-state/web-ui-state", () => api.getWebUiState(), { respond: json({ k: "v" }), result: { k: "v" } }],
   [
     "PATCH /api/app-state/web-ui-state",
@@ -1291,6 +1291,16 @@ describe("login", () => {
 });
 
 describe("session mutation messages", () => {
+  it.each([
+    ["trashSession", () => api.trashSession("s1"), { relocation: { status: "relocated", warning: "w" } }],
+    ["restoreSession", () => api.restoreSession("s1"), { status: "restored", warning: "w" }],
+  ])("%s folds a degraded move warning into warnings", async (_name, call, outcome) => {
+    fetchSpy.mockResolvedValueOnce(json({ ...session, outcome }));
+    expect((await call())?.warnings).toEqual(["w"]);
+    fetchSpy.mockResolvedValueOnce(json({ ...session, outcome: { status: "restored" } }));
+    expect((await call())?.warnings).toBeUndefined();
+  });
+
   it("renameSession keeps only string warnings", async () => {
     fetchSpy.mockResolvedValueOnce(runtimeJson({ ...session, outcome: { warnings: ["kept", 3, null] } }));
     expect(await api.renameSession("s1", "T")).toEqual({ ok: true, session, cursor, warnings: ["kept"] });
@@ -1313,6 +1323,14 @@ describe("deleteWorkspace errors", () => {
       ok: false,
       error: "Server did not confirm which sessions were deleted",
     });
+  });
+
+  it("carries the busy list on a partial 200 and on the all-busy 409", async () => {
+    const busy = [{ id: "b", error: "busy with restore" }];
+    fetchSpy.mockResolvedValueOnce(json({ status: "partial", deleted: ["a"], kept: [], failed: [], busy }));
+    expect(await api.deleteWorkspace(["a", "b"])).toEqual({ ok: true, deleted: ["a"], kept: [], failed: [], busy });
+    fetchSpy.mockResolvedValueOnce(json({ error: "lifecycle_busy", message: "busy", busy }, 409));
+    expect(await api.deleteWorkspace(["b"])).toEqual({ ok: false, error: "busy", busy });
   });
 
   it("maps server and network errors", async () => {
@@ -1614,5 +1632,19 @@ describe("header-complete operations", () => {
       clearTimeout(timer);
       controller.close();
     }
+  });
+});
+
+describe("restartSessionForUpdate", () => {
+  it("POSTs and reports success, the server message on a 409, and nothing when offline", async () => {
+    fetchSpy.mockResolvedValueOnce(empty());
+    expect(await api.restartSessionForUpdate("s1")).toEqual({ ok: true });
+    expect(lastCall()).toMatchObject({ url: "/api/sessions/s1/restart-for-update", init: { method: "POST" } });
+
+    fetchSpy.mockResolvedValueOnce(json({ error: "not_eligible", message: "Session is busy" }, 409));
+    expect(await api.restartSessionForUpdate("s1")).toEqual({ ok: false, message: "Session is busy" });
+
+    offline();
+    expect(await api.restartSessionForUpdate("s1")).toEqual({ ok: false });
   });
 });

@@ -628,6 +628,9 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         crate::session::View::Terminal
     };
 
+    // Set when the adapter isn't found but an on_create hook may install it, which holds only if
+    // the hook still runs once trust is decided.
+    let mut adapter_awaits_hooks: Option<String> = None;
     if instance.is_structured() {
         let (mut spec, spec_from_registry) = match registry.get(&agent_name) {
             Some(spec) => (spec.clone(), true),
@@ -672,7 +675,26 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 &mut spec,
             )?;
         }
-        if !crate::cli::acp::command_present(&spec.command) {
+        if structured_adapter_missing(
+            &args,
+            &config,
+            &spec.command,
+            std::path::Path::new(&instance.project_path),
+            || containers::get_container_runtime().is_available(),
+            // Trust is asked later, so without --trust-hooks the repository's hooks may still run.
+            || {
+                let apply = crate::session::builder::structured::preparation_hooks_apply(
+                    &crate::session::config::profile_config::resolve_config_or_warn(profile).hooks,
+                    &original_project_path,
+                    args.scratch,
+                    args.trust_hooks.then_some(true),
+                );
+                if apply {
+                    adapter_awaits_hooks = Some(spec.command.clone());
+                }
+                apply
+            },
+        ) {
             let hint = crate::acp::install_hints::install_hint_for(&spec.command)
                 .unwrap_or("install via your package manager and re-run");
             if user_picked_agent {
@@ -875,6 +897,8 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 }
             }
         };
+
+        refuse_adapter_without_hooks(adapter_awaits_hooks.as_deref(), resolved_hooks.as_ref())?;
 
         if let Some(resolved) = resolved_hooks {
             let commands = &resolved.hooks().on_create;
@@ -1312,6 +1336,55 @@ fn cleanup_partial_session(
             let _ = std::fs::remove_dir_all(scratch);
         }
     }
+}
+
+/// Once trust is decided, refuse the adapter the first check let through for a preparation
+/// hook if declining trust left no such hook to run.
+fn refuse_adapter_without_hooks(
+    adapter_awaits_hooks: Option<&str>,
+    resolved: Option<&repo_config::ResolvedHooks>,
+) -> Result<()> {
+    let Some(command) = adapter_awaits_hooks else {
+        return Ok(());
+    };
+    if resolved.is_some_and(|resolved| {
+        let hooks = resolved.hooks();
+        !hooks.on_create.is_empty() || !hooks.on_launch.is_empty()
+    }) {
+        return Ok(());
+    }
+    let hint = crate::acp::install_hints::install_hint_for(command)
+        .unwrap_or("install via your package manager and re-run");
+    bail!(
+        "ACP adapter `{command}` is not installed or not on $PATH, and no on_create or \
+         on_launch hook will run to install it (the repository's hooks weren't trusted).\n\
+         Install: {hint}\n\
+         Or re-run with --trust-hooks, or use the terminal view: drop --agent / --structured-view."
+    )
+}
+
+/// Whether a structured `aoe add` must refuse, or fall back, for its adapter. A sandboxed
+/// adapter runs inside the container, which bundles it, so a sandbox the runtime can start
+/// skips the host check. `preparation_hooks` is asked only when the adapter isn't found:
+/// an `on_create` or `on_launch` hook that runs first may install it.
+fn structured_adapter_missing(
+    args: &AddArgs,
+    config: &crate::session::Config,
+    command: &str,
+    project_path: &std::path::Path,
+    runtime_available: impl FnOnce() -> bool,
+    preparation_hooks: impl FnOnce() -> bool,
+) -> bool {
+    let sandboxed =
+        (args.sandbox || args.sandbox_image.is_some() || config.sandbox.enabled_by_default)
+            && runtime_available();
+    !sandboxed
+        && !crate::session::builder::structured::adapter_reachable(
+            command,
+            Some(project_path),
+            config,
+        )
+        && !preparation_hooks()
 }
 
 fn resolve_tool_for_add(args: &AddArgs, config: &crate::session::Config) -> Result<String> {
@@ -1889,6 +1962,185 @@ mod tests {
             match cli.command {
                 Some(Commands::Add(args)) => (profile, *args),
                 _ => panic!("expected an add invocation"),
+            }
+        }
+
+        /// After trust is decided, an adapter the first check let through for an on_create
+        /// hook is refused when no such hook will run.
+        #[test]
+        #[serial]
+        fn declined_trust_refuses_an_adapter_waiting_on_hooks() {
+            use crate::session::config::repo_config::ResolvedHooks;
+            let _home = crate::session::test_support::isolate_app_dir();
+            let repo = tempfile::tempdir().unwrap();
+            let installing = ResolvedHooks::with_repo(
+                "default",
+                repo.path(),
+                crate::session::HooksConfig {
+                    on_create: vec!["npm install".into()],
+                    ..Default::default()
+                },
+            );
+            let launching = ResolvedHooks::with_repo(
+                "default",
+                repo.path(),
+                crate::session::HooksConfig {
+                    on_launch: vec!["npm install".into()],
+                    ..Default::default()
+                },
+            );
+            assert!(installing.is_some() && launching.is_some());
+            let refuse = super::super::refuse_adapter_without_hooks;
+            assert!(refuse(None, None).is_ok(), "nothing waited on hooks");
+            for (hook, resolved) in [("on_create", &installing), ("on_launch", &launching)] {
+                assert!(
+                    refuse(Some("my-acp"), resolved.as_ref()).is_ok(),
+                    "an {hook} hook will run"
+                );
+            }
+            let refused = refuse(Some("my-acp"), None).unwrap_err().to_string();
+            assert!(
+                refused.contains("`my-acp`") && refused.contains("--trust-hooks"),
+                "{refused}"
+            );
+        }
+
+        /// `aoe add` skips the host adapter check only for a sandbox the runtime can start,
+        /// whichever way it was asked for, and otherwise judges the adapter as the create
+        /// check does.
+        #[test]
+        #[serial]
+        fn structured_adapter_check_follows_the_sandbox_and_the_agent_path() {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let project = tempfile::tempdir().unwrap();
+            let bin = tempfile::tempdir().unwrap();
+            let adapter = format!("aoe-test-add-adapter-{}", std::process::id());
+            crate::session::test_support::write_stub_adapter(bin.path(), &adapter);
+            let config = |tweak: &dyn Fn(&mut crate::session::Config)| {
+                let mut config = crate::session::Config::default();
+                tweak(&mut config);
+                config
+            };
+            let plain = config(&|_| {});
+            let on_path =
+                config(&|c| c.environment = vec![format!("PATH={}", bin.path().display())]);
+            let hooked = config(&|c| c.host_hooks.before_session = vec!["true".into()]);
+            let sandbox_default = config(&|c| c.sandbox.enabled_by_default = true);
+            let dir = project.path().to_str().unwrap();
+            struct Case<'a> {
+                label: &'static str,
+                extra: &'a [&'a str],
+                config: &'a crate::session::Config,
+                runtime: bool,
+                refused: bool,
+            }
+            let cases = [
+                Case {
+                    label: "found nowhere",
+                    extra: &[],
+                    config: &plain,
+                    runtime: true,
+                    refused: true,
+                },
+                Case {
+                    label: "on the configured PATH",
+                    extra: &[],
+                    config: &on_path,
+                    runtime: true,
+                    refused: false,
+                },
+                Case {
+                    label: "a before_session hook may set PATH",
+                    extra: &[],
+                    config: &hooked,
+                    runtime: true,
+                    refused: false,
+                },
+                Case {
+                    label: "--sandbox",
+                    extra: &["--sandbox"],
+                    config: &plain,
+                    runtime: true,
+                    refused: false,
+                },
+                Case {
+                    label: "--sandbox-image",
+                    extra: &["--sandbox-image", "img:1"],
+                    config: &plain,
+                    runtime: true,
+                    refused: false,
+                },
+                Case {
+                    label: "sandbox on by default",
+                    extra: &[],
+                    config: &sandbox_default,
+                    runtime: true,
+                    refused: false,
+                },
+                Case {
+                    label: "--sandbox without a runtime",
+                    extra: &["--sandbox"],
+                    config: &plain,
+                    runtime: false,
+                    refused: true,
+                },
+                Case {
+                    label: "sandbox default without a runtime",
+                    extra: &[],
+                    config: &sandbox_default,
+                    runtime: false,
+                    refused: true,
+                },
+            ];
+            for case in cases {
+                let argv: Vec<&str> = ["aoe", "add", dir]
+                    .iter()
+                    .chain(case.extra)
+                    .copied()
+                    .collect();
+                let (_, args) = dispatch_argv(&argv);
+                let checked_runtime = std::cell::Cell::new(false);
+                let got = super::super::structured_adapter_missing(
+                    &args,
+                    case.config,
+                    &adapter,
+                    project.path(),
+                    || {
+                        checked_runtime.set(true);
+                        case.runtime
+                    },
+                    || false,
+                );
+                assert_eq!(got, case.refused, "{}", case.label);
+                let asked_for_sandbox =
+                    !case.extra.is_empty() || case.config.sandbox.enabled_by_default;
+                assert_eq!(
+                    checked_runtime.get(),
+                    asked_for_sandbox,
+                    "{}: runtime probe",
+                    case.label
+                );
+            }
+            // Check preparation hooks only when the adapter is missing.
+            let (_, args) = dispatch_argv(&["aoe", "add", dir]);
+            for (label, config, missing) in [
+                ("found nowhere", &plain, true),
+                ("on PATH", &on_path, false),
+            ] {
+                let asked = std::cell::Cell::new(false);
+                let got = super::super::structured_adapter_missing(
+                    &args,
+                    config,
+                    &adapter,
+                    project.path(),
+                    || false,
+                    || {
+                        asked.set(true);
+                        true
+                    },
+                );
+                assert!(!got, "{label}: an on_create hook may install it");
+                assert_eq!(asked.get(), missing, "{label}: asked about hooks");
             }
         }
 

@@ -214,7 +214,7 @@ pub fn wait_for_port(port: u16, timeout: Duration) -> bool {
     false
 }
 
-/// Poll `probe` until it returns `Ok`; panic with its last error at the deadline.
+/// Retry `Err` until `Ok` or timeout. Probe panics abort polling.
 pub fn wait_until<T>(
     timeout: Duration,
     interval: Duration,
@@ -1138,6 +1138,33 @@ last_seen_version = "{}"
         self.synchronize_input();
     }
 
+    /// Drag the left button between 1-indexed terminal cells (SGR 1006).
+    pub fn send_mouse_drag(&self, start: (u16, u16), end: (u16, u16)) {
+        let seq = format!(
+            "\x1b[<0;{};{}M\x1b[<32;{};{}M\x1b[<0;{};{}m",
+            start.0, start.1, end.0, end.1, end.0, end.1,
+        );
+        self.tmux_ok(
+            &["send-keys", "-t", &self.session_name, "-l", &seq],
+            "send_mouse_drag",
+        );
+        self.synchronize_input();
+    }
+
+    pub fn resize_window(&self, width: u16, height: u16) {
+        self.tmux_ok(
+            &[
+                "resize-window",
+                "-t",
+                &self.session_name,
+                "-x",
+                &width.to_string(),
+                "-y",
+                &height.to_string(),
+            ],
+            "resize-window",
+        );
+    }
     fn synchronize_input(&self) {
         if !self.input_barrier || !self.session_alive() {
             return;

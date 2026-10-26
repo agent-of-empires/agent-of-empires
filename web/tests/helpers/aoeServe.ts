@@ -471,6 +471,13 @@ function writeFakeClaudeShim(binDir: string): void {
     writeFileSync(path, script);
     chmodSync(path, 0o755);
   }
+  // A structured create refuses an adapter it can't find. These exit at once, so the
+  // create passes and its spawn fails fast with nothing left running.
+  for (const name of ["claude-agent-acp", "codex-acp"]) {
+    const path = join(binDir, name);
+    writeFileSync(path, "#!/bin/sh\nexit 1\n");
+    chmodSync(path, 0o755);
+  }
 }
 
 function writeFakeAcpShim(

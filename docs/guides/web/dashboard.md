@@ -21,6 +21,7 @@ The **New session** wizard is one screen of one-line rows, like the TUI dialog; 
 
 - **Project**: pick the working directory from the Recent tab, browse for one, clone a URL, or start a scratch session with no path. The Recent tab lists your saved projects under a "Saved projects" section above the directories of your recent sessions. The recent list keeps a project around after its last session is deleted, so you can quickly start there again; entries whose directory no longer exists are dropped.
 - **Title**: auto-slugifies into a worktree branch name unless you edit the branch.
+- **Group**: search existing groups, including empty groups, or select the create row for a new name; surrounding spaces are trimmed on selection and `/` nests groups. Counts show sessions directly in the group, excluding archived and trashed sessions. Escape closes the suggestions without closing the wizard.
 - **Agent**: the tool, plus instructions, command override, and extra args.
 - **Structured**, **Auto-approve**, **Worktree**, and **Sandbox** switches; the Worktree and Sandbox rows open their branch, base, image, and env options.
 

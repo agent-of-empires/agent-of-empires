@@ -66,6 +66,7 @@ mod serve_lock;
 mod session_wait;
 mod settings;
 mod skills_tui;
+mod stacked_list_resize;
 mod stop_confirm;
 #[cfg(target_os = "linux")]
 mod systemd_scope;

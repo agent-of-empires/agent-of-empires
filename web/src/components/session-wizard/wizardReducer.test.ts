@@ -9,6 +9,7 @@ function makeState(data: Partial<WizardData> = {}): WizardState {
     error: null,
     agents: [],
     groups: [],
+    groupsFor: null,
     profiles: [],
     dockerAvailable: false,
     dockerChecked: false,

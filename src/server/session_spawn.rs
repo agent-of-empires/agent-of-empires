@@ -1148,6 +1148,7 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
         crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         crate::session::config::update_app_state(|state| {

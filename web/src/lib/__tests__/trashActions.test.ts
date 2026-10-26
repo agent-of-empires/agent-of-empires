@@ -60,6 +60,16 @@ describe("trash and restore loops (#2489)", () => {
     expect(notify.error).toHaveBeenCalledWith("Failed to restore session");
   });
 
+  it("surfaces the warnings of a landed trash or restore", async () => {
+    const warned = { ...snap("a"), warnings: ["submodule x is not repointed"] } as SessionResponse;
+    trashMock.mockResolvedValue(warned);
+    restoreMock.mockResolvedValue(warned);
+    const notify = notifier();
+    await trashSessions(["a"], { applySession: vi.fn(), onError: vi.fn(), notify });
+    await restoreSessions(["a"], { applySession: vi.fn(), notify });
+    expect(notify.info.mock.calls.filter(([m]) => m === "submodule x is not repointed")).toHaveLength(2);
+  });
+
   it("tolerates a null notifier", async () => {
     trashMock.mockResolvedValue(snap("a"));
     restoreMock.mockResolvedValue(snap("a"));
@@ -137,6 +147,52 @@ describe("deleteWorkspaceSessions (#2536)", () => {
       await deleteWorkspaceSessions(sessions("a", "b"), {}, "b", d);
       expect(d.navigateHome).toHaveBeenCalledTimes(navigations);
     }
+  });
+
+  it("reports a Busy sibling distinctly after another session was deleted", async () => {
+    deleteMock.mockResolvedValue({
+      ok: true,
+      deleted: ["a"],
+      failed: [],
+      busy: [{ id: "b", error: "busy with restore" }],
+    });
+    const d = deps();
+
+    const result = await deleteWorkspaceSessions(sessions("a", "b"), {}, null, d);
+
+    expect(d.purgeLocal).toHaveBeenCalledExactlyOnceWith("a");
+    expect(d.setStatus).not.toHaveBeenCalledWith("b", "Error");
+    expect(d.clearDeleting).toHaveBeenCalledWith([expect.objectContaining({ id: "b" })]);
+    expect(d.notify.error).toHaveBeenCalledWith(expect.stringContaining("busy with another operation"));
+    expect(d.notify.info).not.toHaveBeenCalled();
+    expect(result.busy).toEqual([{ id: "b", error: "busy with restore" }]);
+    expect(result.kept).toEqual([]);
+  });
+
+  it("keeps the Busy hint when other deletions also fail", async () => {
+    deleteMock.mockResolvedValue({
+      ok: true,
+      deleted: [],
+      failed: [{ id: "a", error: "boom" }],
+      busy: [{ id: "b", error: "busy with restore" }],
+    });
+    const d = deps();
+
+    await deleteWorkspaceSessions(sessions("a", "b"), {}, null, d);
+
+    expect(d.notify.error).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("busy with another operation"));
+    expect(d.notify.error).toHaveBeenCalledWith(expect.stringContaining("could not be deleted"));
+  });
+
+  it("does not mark rows Error when the whole batch is Busy", async () => {
+    deleteMock.mockResolvedValue({ ok: false, error: "busy", busy: [{ id: "a", error: "busy" }] });
+    const d = deps();
+
+    await deleteWorkspaceSessions(sessions("a"), {}, null, d);
+
+    expect(d.setStatus).not.toHaveBeenCalledWith("a", "Error");
+    expect(d.clearDeleting).toHaveBeenCalledTimes(1);
+    expect(d.notify.error).toHaveBeenCalledWith(expect.stringContaining("busy with another operation"));
   });
 
   it("reports a partial failure: purges the deleted id, flags the failed one Error", async () => {

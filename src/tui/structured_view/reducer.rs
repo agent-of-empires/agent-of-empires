@@ -867,6 +867,7 @@ mod tests {
         t.apply_reduced_state(4, s, &[]);
         t.merge_server_rows(server_rows(&[Event::AgentMessageChunk {
             text: "hi".into(),
+            message_id: None,
         }]));
         assert!(!t.server_rows.is_empty());
 
@@ -938,7 +939,10 @@ mod tests {
                 synthesized: false,
                 origin_plugin: None,
             },
-            Event::AgentMessageChunk { text: "one".into() },
+            Event::AgentMessageChunk {
+                text: "one".into(),
+                message_id: None,
+            },
         ]);
         // Append each row via a delta.
         for row in rows.clone() {

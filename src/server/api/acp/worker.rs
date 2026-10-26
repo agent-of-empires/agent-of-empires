@@ -527,6 +527,9 @@ pub async fn switch_acp_agent(
             .await
         {
             Ok(exclusion) => exclusion,
+            Err(error) if is_store_write_failure(&error) => {
+                return persist_failure_response(&state, &id, "agent switch", &error).await;
+            }
             Err(error) => return launch_error_response("agent switch completion", &error),
         };
     state
@@ -732,7 +735,12 @@ pub async fn switch_acp_provider(
     let exclusion =
         match persist_provider_switch(native.clone(), &instance, &provider, exclusion).await {
             Ok(exclusion) => exclusion,
-            Err(error) => return launch_error_response("persisting the provider switch", &error),
+            Err(error) => {
+                if is_store_write_failure(&error) {
+                    state.acp_supervisor.request_respawn(&id);
+                }
+                return launch_error_response("persisting the provider switch", &error);
+            }
         };
     drop(native);
 
@@ -1623,6 +1631,107 @@ mod tests {
                 (Some(expected.0), Some(expected.1))
             );
         }
+    }
+
+    /// The target spawns, then the stored write fails on a valid row: the
+    /// caller gets the 500, the new worker is stopped, nothing announces a
+    /// switch, and neither store moves. Once storage recovers the retry lands.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_failed_agent_switch_write_stops_the_target_and_a_retry_recovers() {
+        use crate::server::test_support as support;
+        let profile = "default";
+        let _tmp = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let mut inst = crate::session::Instance::new("claude", project.path().to_str().unwrap());
+        inst.view = crate::session::View::Structured;
+        inst.status = crate::session::Status::Idle;
+        inst.source_profile = profile.to_string();
+        inst.agent_name = Some("claude".to_string());
+        inst.acp_effort = Some("high".to_string());
+        let id = inst.id.clone();
+        support::seed_instances_on_disk_for_test(profile, vec![inst.clone()]);
+        let state =
+            support::build_test_app_state_with_launcher(vec![inst], support::succeeding_launcher());
+        support::refresh_canonical_metadata_for_test(&state).await;
+        state.acp_supervisor.test_insert_worker(&id).await;
+        let switch = || async {
+            switch_acp_agent(
+                State(state.clone()),
+                Path(id.clone()),
+                Json(crate::acp::protocol::SwitchAgentRequest {
+                    target: "codex".to_string(),
+                    model: None,
+                    reason: None,
+                }),
+            )
+            .await
+            .into_response()
+        };
+        let switched = || {
+            state
+                .acp_event_store
+                .replay_from(&id, 0)
+                .iter()
+                .filter(|(_, event)| {
+                    matches!(event, crate::acp::state::Event::AgentSwitched { .. })
+                })
+                .count()
+        };
+
+        let failure = support::fail_session_writes_for_test(profile);
+        let resp = switch().await;
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(
+            body.contains("persist_failed") && body.contains("agent switch"),
+            "{body}"
+        );
+        assert_eq!(
+            state.acp_supervisor.worker_state(&id).await,
+            crate::daemon::AcpWorkerState::Absent,
+            "the target worker is stopped"
+        );
+        assert_eq!(switched(), 0);
+        assert_eq!(
+            state
+                .telemetry_structured
+                .agent_switches
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        let memory = state.instances.read().await;
+        assert_eq!(memory[0].agent_name.as_deref(), Some("claude"));
+        assert_eq!(memory[0].acp_effort.as_deref(), Some("high"));
+        drop(memory);
+        let stored = support::load_instances_from_disk_for_test(profile);
+        assert_eq!(stored[0].agent_name.as_deref(), Some("claude"));
+        assert_eq!(stored[0].acp_effort.as_deref(), Some("high"));
+
+        drop(failure);
+        // The failed commit left the store degraded until the next reload.
+        support::accept_runtime_read_cache_for_test(&state).await;
+        let resp = switch().await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(switched(), 1);
+        assert_eq!(
+            state
+                .telemetry_structured
+                .agent_switches
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        let stored = support::load_instances_from_disk_for_test(profile);
+        assert_eq!(stored[0].agent_name.as_deref(), Some("codex"));
+        assert_eq!(stored[0].acp_effort, None);
+        assert_eq!(
+            state.instances.read().await[0].agent_name.as_deref(),
+            Some("codex")
+        );
     }
 
     /// The pick reaches both stores, and the model resets to the provider's

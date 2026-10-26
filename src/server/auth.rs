@@ -23,38 +23,6 @@ pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
         == 0
 }
 
-/// Resolve the real client IP, trusting X-Forwarded-For only from loopback
-/// (i.e., only when the request came through the cloudflared proxy).
-pub(crate) fn resolve_client_ip(
-    socket_addr: SocketAddr,
-    headers: &axum::http::HeaderMap,
-    behind_ingress: bool,
-) -> IpAddr {
-    let socket_ip = socket_addr.ip();
-    // A forwarded header is only as trustworthy as the proxy that sets it, and
-    // a loopback peer is indistinguishable from that proxy: any local process
-    // could otherwise rotate the header and void the per-IP auth rate limiter.
-    if behind_ingress && socket_ip.is_loopback() {
-        if let Some(cf_ip) = headers.get("cf-connecting-ip") {
-            if let Ok(ip_str) = cf_ip.to_str() {
-                if let Ok(ip) = ip_str.trim().parse::<IpAddr>() {
-                    return ip;
-                }
-            }
-        }
-        if let Some(xff) = headers.get("x-forwarded-for") {
-            if let Ok(xff_str) = xff.to_str() {
-                if let Some(last) = xff_str.rsplit(',').next() {
-                    if let Ok(ip) = last.trim().parse::<IpAddr>() {
-                        return ip;
-                    }
-                }
-            }
-        }
-    }
-    socket_ip
-}
-
 /// Build a Set-Cookie header value with optional Secure flag for HTTPS tunnels.
 fn build_cookie(token: &str, secure: bool, max_age_secs: u64) -> String {
     let mut cookie = format!(
@@ -494,7 +462,7 @@ pub async fn auth_middleware(
                 .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0))),
         ),
     };
-    let client_ip = resolve_client_ip(addr, request.headers(), state.behind_tunnel);
+    let client_ip = state.ingress(addr, request.headers()).client_ip;
 
     if let Some(uid) = peer_uid {
         // The socket's owner is identified by the kernel, not by anything the
@@ -805,10 +773,6 @@ mod tests {
         builder.body(axum::body::Body::empty()).unwrap()
     }
 
-    fn ip(s: &str) -> IpAddr {
-        s.parse().unwrap()
-    }
-
     #[test]
     fn constant_time_eq_compares_whole_strings() {
         for (a, b) in [("abc123", "abc123"), ("", "")] {
@@ -824,44 +788,6 @@ mod tests {
         ] {
             assert!(!constant_time_eq(a, b), "{a:?} != {b:?}");
         }
-    }
-
-    /// X-Forwarded-For is only trusted from loopback, i.e. only behind the proxy.
-    #[test]
-    fn resolve_client_ip_trusts_forwarding_headers_only_from_loopback() {
-        let from = |socket: &str, headers: &[(&str, &str)]| {
-            let mut map = axum::http::HeaderMap::new();
-            for (k, v) in headers {
-                let name = axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap();
-                map.insert(name, v.parse().unwrap());
-            }
-            resolve_client_ip(socket.parse().unwrap(), &map, true)
-        };
-        let cf = ("cf-connecting-ip", "203.0.113.50");
-        let xff = |v: &'static str| ("x-forwarded-for", v);
-
-        let loopback = "127.0.0.1:12345";
-        assert_eq!(
-            from(loopback, &[cf, xff("10.0.0.1")]),
-            ip("203.0.113.50"),
-            "cf-connecting-ip wins over xff"
-        );
-        assert_eq!(
-            from(loopback, &[xff("spoofed.by.client, 203.0.113.50")]),
-            ip("203.0.113.50"),
-            "xff uses the last hop, not the client-spoofable head"
-        );
-        assert_eq!(from(loopback, &[]), ip("127.0.0.1"));
-        assert_eq!(
-            from(loopback, &[xff("not-an-ip")]),
-            ip("127.0.0.1"),
-            "malformed xff falls back to the socket"
-        );
-        assert_eq!(
-            from("192.168.1.100:12345", &[xff("10.0.0.1")]),
-            ip("192.168.1.100"),
-            "a remote peer cannot forge its own origin"
-        );
     }
 
     #[test]

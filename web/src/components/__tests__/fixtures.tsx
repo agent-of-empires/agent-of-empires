@@ -1,5 +1,5 @@
 /* eslint-disable react-refresh/only-export-components */
-import { useMemo, useRef, useState, type ReactNode } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { vi } from "vitest";
 import { useSidebarTriage } from "../../hooks/useSidebarTriage";
@@ -9,7 +9,6 @@ import { SidebarCompactContext } from "../../lib/sidebarCompact";
 import { SessionColorsContext } from "../../lib/sessionColors";
 import { SessionRowTagContext, type SessionRowTagMode } from "../../lib/sessionRowTag";
 import { UnreadIndicatorContext } from "../../lib/unreadIndicator";
-import { DragSuppressContext } from "../sidebar/dnd";
 import { SessionRow } from "../sidebar/SessionRow";
 import type { RowBulkApi } from "../sidebar/types";
 import { SessionActionProvider } from "../sidebar/SessionActionProvider";
@@ -101,6 +100,7 @@ interface RowOptions {
   unread?: boolean;
   onStop?: (sessionId: string) => void;
   onStart?: (sessionId: string) => void;
+  onRestartForUpdate?: (sessionId: string) => void;
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
 }
 
@@ -112,6 +112,7 @@ function Row({
   onCreateSession,
   onStop,
   onStart,
+  onRestartForUpdate,
   onSwitchView,
 }: RowOptions & { ws: Workspace }) {
   const triage = useSidebarTriage(useMemo(() => [ws], [ws]));
@@ -149,6 +150,7 @@ function Row({
         onCreateSession={onCreateSession}
         onStop={onStop}
         onStart={onStart}
+        onRestartForUpdate={onRestartForUpdate}
         onSwitchView={onSwitchView}
         readOnly={readOnly}
         optimistic={triage.optimisticFor(ws.id)}
@@ -169,7 +171,6 @@ function Providers({
   compact = false,
   unread,
 }: RowOptions & { children: ReactNode }) {
-  const ref = useRef(0);
   const inner = (
     <SidebarCompactContext.Provider value={compact}>
       <SessionRowTagContext.Provider value={rowTagMode}>
@@ -177,14 +178,10 @@ function Providers({
       </SessionRowTagContext.Provider>
     </SidebarCompactContext.Provider>
   );
-  return (
-    <DragSuppressContext.Provider value={ref}>
-      {unread === undefined ? (
-        inner
-      ) : (
-        <UnreadIndicatorContext.Provider value={unread}>{inner}</UnreadIndicatorContext.Provider>
-      )}
-    </DragSuppressContext.Provider>
+  return unread === undefined ? (
+    inner
+  ) : (
+    <UnreadIndicatorContext.Provider value={unread}>{inner}</UnreadIndicatorContext.Provider>
   );
 }
 
