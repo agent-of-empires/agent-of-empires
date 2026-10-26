@@ -74,6 +74,26 @@ describe("FileContentViewer", () => {
     expect(screen.queryByTestId("full-file")).toBeNull();
   });
 
+  it("shows the filesystem restriction and disables editing when atomic replacement is unavailable", async () => {
+    const reason = "This filesystem does not support atomic file replacement";
+    vi.spyOn(api, "getSessionFile").mockResolvedValue({
+      content: "original",
+      version: "v1",
+      is_binary: false,
+      truncated: false,
+      edit_disabled_reason: reason,
+    });
+    const settings = renderHook(() => useWebSettings());
+    act(() => settings.result.current.update({ fileEditing: true }));
+    render(<FileContentViewer sessionId="s1" filePath="/repo/a.ts" />);
+    await screen.findByText("original");
+    const edit = screen.getByRole("button", { name: "Edit", exact: true }) as HTMLButtonElement;
+    expect(edit.disabled).toBe(true);
+    expect(edit.title).toBe(reason);
+    fireEvent.click(edit);
+    expect(screen.queryByRole("textbox")).toBeNull();
+  });
+
   it("parks a draft while editing is disabled and restores its opened version on re-enable", async () => {
     const original = { content: "original", version: "v1", is_binary: false, truncated: false };
     const get = vi.spyOn(api, "getSessionFile").mockResolvedValue(original);

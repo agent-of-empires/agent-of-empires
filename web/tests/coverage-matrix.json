@@ -11,7 +11,7 @@
         "src/components/diff/__tests__/FileContentViewer.test.tsx"
       ],
       "components": ["web/src/components/diff/TextFileEditor.tsx", "web/src/components/diff/FileContentViewer.tsx"],
-      "notes": "Transient Sandbox restrictions disable button and keyboard saves without latching a conflict; recovery preserves the draft. Disabling editing hides the editor and restores the same draft and opened version when re-enabled. Pending saves and their results survive remounts without duplicate requests. Session-removal checks include parked drafts."
+      "notes": "Sandbox and unsupported-filesystem restrictions disable button and keyboard saves without latching a conflict; eligibility recovery preserves the draft. The viewer explains why atomic replacement is unavailable. Disabling editing hides the editor and restores the same draft and opened version when re-enabled. Pending saves and their results survive remounts without duplicate requests. Session-removal checks include parked drafts."
     },
     {
       "id": "files.edit-existing-text",

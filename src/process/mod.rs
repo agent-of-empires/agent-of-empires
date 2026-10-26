@@ -343,6 +343,45 @@ pub(crate) fn rename_exclusive(
     }
 }
 
+/// Atomically exchange two existing entries, keeping the displaced inode reachable.
+#[cfg(unix)]
+pub(crate) fn rename_exchange(
+    source_dir: &std::os::fd::OwnedFd,
+    source: &std::ffi::OsStr,
+    destination_dir: &std::os::fd::OwnedFd,
+    destination: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(errno) = EXCHANGE_ERROR.get() {
+        return Err(std::io::Error::from_raw_os_error(errno));
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        platform::rename_exchange(source_dir, source, destination_dir, destination)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (source_dir, source, destination_dir, destination);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic file exchange is unsupported on this platform",
+        ))
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn exchange_unsupported(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::Unsupported
+        || error.raw_os_error().is_some_and(|code| {
+            [libc::EINVAL, libc::ENOSYS, libc::ENOTSUP, libc::EOPNOTSUPP].contains(&code)
+        })
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static EXCHANGE_ERROR: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
 /// Wait for `child` to exit, killing and reaping it if it outlives `timeout`.
 /// Returns `Ok(None)` when the timeout fired and the child was killed.
 ///

@@ -983,6 +983,37 @@ pub(super) fn rename_exclusive(
     destination_dir: &std::os::fd::OwnedFd,
     destination: &std::ffi::OsStr,
 ) -> std::io::Result<()> {
+    rename_with_flags(
+        source_dir,
+        source,
+        destination_dir,
+        destination,
+        libc::RENAME_NOREPLACE,
+    )
+}
+
+pub(super) fn rename_exchange(
+    source_dir: &std::os::fd::OwnedFd,
+    source: &std::ffi::OsStr,
+    destination_dir: &std::os::fd::OwnedFd,
+    destination: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    rename_with_flags(
+        source_dir,
+        source,
+        destination_dir,
+        destination,
+        libc::RENAME_EXCHANGE,
+    )
+}
+
+fn rename_with_flags(
+    source_dir: &std::os::fd::OwnedFd,
+    source: &std::ffi::OsStr,
+    destination_dir: &std::os::fd::OwnedFd,
+    destination: &std::ffi::OsStr,
+    flags: libc::c_uint,
+) -> std::io::Result<()> {
     use nix::NixPath;
     use std::os::fd::AsRawFd;
 
@@ -997,7 +1028,7 @@ pub(super) fn rename_exclusive(
                     source.as_ptr(),
                     destination_dir.as_raw_fd(),
                     destination.as_ptr(),
-                    libc::RENAME_NOREPLACE,
+                    flags,
                 )
             })
             .map(|_| ())

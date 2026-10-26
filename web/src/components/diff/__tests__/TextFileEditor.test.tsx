@@ -313,36 +313,38 @@ describe("TextFileEditor", () => {
     expect(screen.queryByText("Cannot check disk changes. Your edits are kept.")).toBeNull();
     expect((editor as HTMLTextAreaElement).value).toBe("keep draft");
   });
-  it("recovers from transient edit restrictions without discarding or saving the draft", async () => {
-    vi.useFakeTimers();
-    const reason = "Cannot verify this Sandbox's shared files";
-    vi.spyOn(api, "getSessionFile")
-      .mockResolvedValueOnce({ ...original, edit_disabled_reason: reason })
-      .mockResolvedValue(original);
-    const save = vi.spyOn(api, "saveSessionFile").mockResolvedValue({ ok: true, status: 204, error: undefined });
-    const { editor, onCancel, onSaved } = setup();
-    fireEvent.change(editor, { target: { value: "keep draft" } });
-    await act(async () => {
-      vi.advanceTimersByTime(2000);
-    });
-    expect(screen.getByText(reason)).toBeTruthy();
-    expect(screen.queryByText(/File changed on disk/)).toBeNull();
-    expect((screen.getByRole("button", { name: "Save", exact: true }) as HTMLButtonElement).disabled).toBe(true);
-    fireEvent.keyDown(editor, { key: "s", ctrlKey: true });
-    expect(save).not.toHaveBeenCalled();
-    await act(async () => {
-      vi.advanceTimersByTime(2000);
-    });
-    expect(screen.queryByText(reason)).toBeNull();
-    expect((editor as HTMLTextAreaElement).value).toBe("keep draft");
-    expect((screen.getByRole("button", { name: "Save", exact: true }) as HTMLButtonElement).disabled).toBe(false);
-    expect(onCancel).not.toHaveBeenCalled();
-    await act(async () => {
-      fireEvent.keyDown(editor, { key: "s", metaKey: true });
-    });
-    expect(onSaved).toHaveBeenCalledOnce();
-    expect(save).toHaveBeenCalledWith("s1", "notes.txt", "v1", "keep draft");
-  });
+  it.each(["Cannot verify this Sandbox's shared files", "This filesystem does not support atomic file replacement"])(
+    "keeps the draft and disables saving until edit eligibility recovers: %s",
+    async (reason) => {
+      vi.useFakeTimers();
+      vi.spyOn(api, "getSessionFile")
+        .mockResolvedValueOnce({ ...original, edit_disabled_reason: reason })
+        .mockResolvedValue(original);
+      const save = vi.spyOn(api, "saveSessionFile").mockResolvedValue({ ok: true, status: 204, error: undefined });
+      const { editor, onCancel, onSaved } = setup();
+      fireEvent.change(editor, { target: { value: "keep draft" } });
+      await act(async () => {
+        vi.advanceTimersByTime(2000);
+      });
+      expect(screen.getByText(reason)).toBeTruthy();
+      expect(screen.queryByText(/File changed on disk/)).toBeNull();
+      expect((screen.getByRole("button", { name: "Save", exact: true }) as HTMLButtonElement).disabled).toBe(true);
+      fireEvent.keyDown(editor, { key: "s", ctrlKey: true });
+      expect(save).not.toHaveBeenCalled();
+      await act(async () => {
+        vi.advanceTimersByTime(2000);
+      });
+      expect(screen.queryByText(reason)).toBeNull();
+      expect((editor as HTMLTextAreaElement).value).toBe("keep draft");
+      expect((screen.getByRole("button", { name: "Save", exact: true }) as HTMLButtonElement).disabled).toBe(false);
+      expect(onCancel).not.toHaveBeenCalled();
+      await act(async () => {
+        fireEvent.keyDown(editor, { key: "s", metaKey: true });
+      });
+      expect(onSaved).toHaveBeenCalledOnce();
+      expect(save).toHaveBeenCalledWith("s1", "notes.txt", "v1", "keep draft");
+    },
+  );
 
   it("keeps real version conflicts latched after edit eligibility recovers", async () => {
     vi.useFakeTimers();
