@@ -151,6 +151,7 @@ export interface ElicitationOption {
   value: string;
   label: string;
   description?: string | null;
+  preview?: string | null;
 }
 
 /** Mirror of the untagged Rust `AnswerValue`. */
@@ -398,7 +399,7 @@ export type AcpEvent =
         ended_at: string;
       };
     }
-  | { AgentMessageChunk: { text: string } }
+  | { AgentMessageChunk: { text: string; message_id?: string } }
   | { CancelRequested: { escalates_at: string } }
   | { Stopped: { reason: string } }
   | { AgentStartupError: { message: string } }
@@ -710,6 +711,8 @@ export interface ActivityRow {
   output?: ToolOutputBlock[];
   elicitationAnswers?: ElicitationAnswer[];
   asyncSubagent?: boolean;
+  /** A `message` row that opens a new agent message, so its text starts a new paragraph. */
+  messageStart?: boolean;
   at: string; // ISO-8601
 }
 
@@ -733,6 +736,7 @@ export interface TranscriptRow {
   };
   elicitation_answers?: ElicitationAnswer[];
   async_subagent?: boolean;
+  message_start?: boolean;
 }
 
 export type TranscriptDelta =
@@ -789,6 +793,7 @@ export function transcriptRowToActivity(row: TranscriptRow, sessionId: string): 
       ? { elicitationAnswers: row.elicitation_answers }
       : {}),
     ...(row.async_subagent ? { asyncSubagent: true } : {}),
+    ...(row.message_start ? { messageStart: true } : {}),
   };
 }
 

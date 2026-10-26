@@ -136,6 +136,28 @@ pub fn build_test_app_state_configured(
     )
 }
 
+/// A state for ingress tests: optional bearer token and passphrase login, with the
+/// plaintext-remote gate and proxy mode set explicitly.
+pub fn build_test_app_state_ingress(
+    token: Option<String>,
+    passphrase: Option<&str>,
+    proxy_mode: bool,
+    allow_plaintext_remote: bool,
+) -> Arc<AppState> {
+    build_test_app_state_with_policy_configured(
+        Vec::new(),
+        vec!["localhost".to_string()],
+        vec!["http://localhost:8080".to_string()],
+        token,
+        |state| {
+            state.login_manager = Arc::new(login::LoginManager::new(passphrase));
+            state.behind_tunnel = proxy_mode;
+            state.trust_cf_header = proxy_mode;
+            state.allow_plaintext_remote = allow_plaintext_remote;
+        },
+    )
+}
+
 /// Like [`build_test_app_state`] but every worker start goes through
 /// `launcher`, so a test decides how a start ends.
 #[cfg(test)]
@@ -260,6 +282,9 @@ pub(crate) fn build_test_app_state_impl_with_event_store(
         passkey_manager: Arc::new(super::passkeys::PasskeyManager::in_memory()),
         rate_limiter: Arc::new(RateLimiter::new()),
         behind_tunnel: false,
+        trust_cf_header: false,
+        // Handler tests drive requests from arbitrary peers; the 426 gate has its own tests.
+        allow_plaintext_remote: true,
         auth_mode: "none",
         serve_mode: "local",
         allowed_hosts,
@@ -371,6 +396,15 @@ pub fn seed_instances_on_disk_for_test(profile: &str, insts: Vec<Instance>) {
             Ok(())
         })
         .expect("seed sessions.json");
+}
+
+/// Make storage for `profile` fail on every write: a plain file where its directory belongs.
+pub fn block_profile_storage_for_test(profile: &str) {
+    let dir = crate::session::get_app_dir()
+        .expect("app dir")
+        .join("profiles");
+    std::fs::create_dir_all(&dir).expect("profiles dir");
+    std::fs::write(dir.join(profile), b"").expect("block profile");
 }
 
 pub fn load_instances_from_disk_for_test(profile: &str) -> Vec<Instance> {
@@ -649,6 +683,32 @@ pub(crate) fn counting_failing_launcher() -> (
         })
     });
     (launcher, launches)
+}
+
+/// A launcher that hands back a fake worker that accepts commands, keeping the
+/// event senders alive so the drains never see a close.
+#[cfg(test)]
+pub(crate) fn succeeding_launcher() -> crate::acp::supervisor::Launcher {
+    let senders: Arc<std::sync::Mutex<Vec<tokio::sync::mpsc::Sender<crate::acp::state::Event>>>> =
+        Default::default();
+    Arc::new(move |_config, id| {
+        let senders = Arc::clone(&senders);
+        Box::pin(async move {
+            let (client, tx, _cmds) =
+                crate::acp::acp_client::AcpClient::fake_for_test_cmd_recording(id);
+            senders.lock().unwrap().push(tx);
+            Ok(client)
+        })
+    })
+}
+
+/// Fails every `sessions.json` write while the guard lives, leaving rows loadable.
+/// The failpoint is process-wide, so the test must be serial.
+#[cfg(test)]
+pub(crate) fn fail_session_writes_for_test(profile: &str) -> impl Drop {
+    Storage::new_unwatched(profile)
+        .expect("storage")
+        .fail_writes_for_test()
 }
 
 /// Once the blocking hook signals `ready`, archive the stored rows matching `is_target` under

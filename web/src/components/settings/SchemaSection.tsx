@@ -1,6 +1,5 @@
 import { useEffect, useRef } from "react";
 import type { SettingsFieldDescriptor, SettingsValidation } from "../../lib/types";
-import { type TourAnchorId, tourAnchor } from "../../lib/tourSteps";
 import {
   CollapsibleSection,
   ListField,
@@ -24,8 +23,6 @@ interface Props {
   onAfterSave?: (descriptor: SettingsFieldDescriptor, value: unknown) => Promise<void> | void;
   /** A settings-search jump: scroll to and highlight the field, opening Advanced if needed. */
   focusRequest?: { section: string; field: string; nonce: number } | null;
-  /** Tour anchor for one field's wrapper. */
-  fieldAnchor?: { field: string; anchor: TourAnchorId };
   /** CityHall curation: an allowlist and a denylist of field names. */
   onlyFields?: string[];
   hideFields?: string[];
@@ -179,7 +176,6 @@ export function SchemaSection({
   advancedSubtitle,
   onAfterSave,
   focusRequest,
-  fieldAnchor,
   onlyFields,
   hideFields,
 }: Props) {
@@ -211,14 +207,12 @@ export function SchemaSection({
 
   const wrap = (d: SettingsFieldDescriptor, node: React.ReactNode) => {
     const isTarget = d.field === targetField;
-    const anchorProps = fieldAnchor && d.field === fieldAnchor.field ? tourAnchor(fieldAnchor.anchor) : {};
     return (
       <div
         key={d.field}
         ref={isTarget ? targetRef : undefined}
         data-settings-field={`${d.section}.${d.field}`}
         className={isTarget ? "animate-settings-highlight" : undefined}
-        {...anchorProps}
       >
         {node}
       </div>

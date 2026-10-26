@@ -2353,6 +2353,32 @@ mod tests {
         assert!(dump.contains("src/main.rs") && !dump.contains("zzz/other.md"));
     }
 
+    /// Two agent messages render as two bubbles; one streamed message
+    /// stays whole.
+    #[test]
+    fn agent_messages_with_different_ids_render_apart() {
+        let chunk = |text: &str, id: &str| Event::AgentMessageChunk {
+            text: text.into(),
+            message_id: Some(id.into()),
+        };
+        let mut t = AcpTranscript::new("s-1");
+        t.server_rows = server_rows(&[
+            chunk("for #4656.", "m-a"),
+            chunk("", "m-b"),
+            chunk("The waiter has the lock.", "m-b"),
+            Event::ThinkingStarted,
+            chunk("Build", "m-c"),
+            chunk("ing now", "m-c"),
+        ]);
+        let out = joined(&transcript_lines(&t, &Theme::default(), None));
+        assert!(!out.contains("#4656.The waiter"), "{out:?}");
+        assert!(
+            out.contains("for #4656.") && out.contains("The waiter has the lock."),
+            "{out:?}"
+        );
+        assert!(out.contains("Building now"), "{out:?}");
+    }
+
     #[test]
     fn transcript_projection() {
         use crate::acp::approvals::Nonce;
@@ -2376,6 +2402,7 @@ mod tests {
         t.server_rows = server_rows(&[
             Event::AgentMessageChunk {
                 text: "working on it".into(),
+                message_id: None,
             },
             Event::ElicitationResolved {
                 nonce: Nonce("e-1".into()),
@@ -2731,6 +2758,7 @@ mod tests {
             },
             Event::AgentMessageChunk {
                 text: "What should we build?".into(),
+                message_id: None,
             },
         ]);
 

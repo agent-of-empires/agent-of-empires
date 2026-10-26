@@ -138,6 +138,34 @@ test("Escape closes the palette before the underlying uninstall confirmation", a
   await expect(page).toHaveURL(/\/$/);
 });
 
+test("About above uninstall keeps Tab focus inside and first Escape closes only About", async ({ page }) => {
+  await page.getByTestId("plugin-uninstall-example.plugin").click();
+  const uninstall = page.getByRole("dialog", { name: "Uninstall Example", exact: true });
+  await expect(uninstall).toBeVisible();
+  await page.keyboard.press("ControlOrMeta+k");
+  const palette = page.getByRole("dialog", { name: "Command palette", exact: true });
+  await expect(palette.getByRole("combobox")).toBeFocused();
+  await palette.getByRole("combobox").fill("About");
+  await page.keyboard.press("Enter");
+  const about = page.getByRole("dialog", { name: "Agent of Empires", exact: true });
+  await expect(about).toBeVisible();
+  const close = about.getByRole("button", { name: "Close", exact: true });
+  const feedback = about.getByRole("link", { name: "Send feedback", exact: true });
+  await expect(close).toBeFocused();
+
+  await page.keyboard.press("Shift+Tab");
+  await expect(feedback).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(close).toBeFocused();
+
+  await page.keyboard.press("Shift+Tab");
+  await page.keyboard.press("Escape");
+  await expect(about).toBeHidden();
+  await expect(uninstall).toBeVisible();
+  await expect(page).toHaveURL(/\/settings\/plugins$/);
+  expect(await publishedRequests(page, "/api/plugins/example.plugin/uninstall", "POST")).toEqual([]);
+});
+
 for (const terminal of ["succeeded", "failed", "gone"] as const) {
   test(`Escape keeps a running plugin job open and dismisses it when ${terminal}`, async ({ page }) => {
     let state: "running" | typeof terminal = "running";

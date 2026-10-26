@@ -316,6 +316,7 @@ pub(super) fn map_update_to_events(
             ContentBlock::Text(text) => {
                 let mut events = vec![Event::AgentMessageChunk {
                     text: text.text.clone(),
+                    message_id: chunk.message_id.map(|id| id.0.to_string()),
                 }];
                 if is_compact_start(&text.text) {
                     events.push(Event::ConversationCompactionStarted);
@@ -671,6 +672,30 @@ mod tests {
 
     fn claude(update: SessionUpdate) -> Vec<Event> {
         map_update_to_events(update, &agent_profiles::CLAUDE)
+    }
+
+    /// The ACP message id survives into the stored event, and history
+    /// stored before the field existed still loads.
+    #[test]
+    fn agent_message_chunk_keeps_its_message_id() {
+        use super::super::test_helpers::text_chunk;
+        for id in [Some("m-1"), None] {
+            let events = claude(text_chunk("hi", id));
+            assert!(
+                matches!(events.as_slice(), [Event::AgentMessageChunk { text, message_id }] if text == "hi" && message_id.as_deref() == id),
+                "{id:?}: {events:?}"
+            );
+            let stored = serde_json::to_string(&events[0]).unwrap();
+            assert_eq!(stored.contains("message_id"), id.is_some(), "{stored}");
+        }
+        let old: Event = serde_json::from_str(r#"{"AgentMessageChunk":{"text":"hi"}}"#).unwrap();
+        assert!(matches!(
+            old,
+            Event::AgentMessageChunk {
+                message_id: None,
+                ..
+            }
+        ));
     }
 
     fn tool_update(id: &'static str, fields: ToolCallUpdateFields) -> SessionUpdate {
@@ -1159,6 +1184,7 @@ mod tests {
             (
                 Event::AgentMessageChunk {
                     text: "Compacting...".into(),
+                    message_id: None,
                 },
                 true,
             ),

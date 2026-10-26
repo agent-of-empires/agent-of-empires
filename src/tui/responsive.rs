@@ -32,8 +32,7 @@ pub const STACKED_LIST_HEIGHT_FRACTION: u16 = 3;
 /// show selection + 1 neighbor + spinner row.
 pub const STACKED_LIST_HEIGHT_MIN: u16 = 5;
 
-/// Upper bound on stacked-mode list height; keeps the preview from
-/// being squeezed on tall viewports.
+/// Upper bound on automatic stacked-mode list height.
 pub const STACKED_LIST_HEIGHT_MAX: u16 = 12;
 
 /// Lower bound on stacked-mode preview height. Below this the
@@ -64,9 +63,13 @@ pub fn dialog_width(viewport_width: u16) -> u16 {
     }
 }
 
-pub fn stacked_list_height(main_height: u16) -> u16 {
-    (main_height / STACKED_LIST_HEIGHT_FRACTION)
-        .clamp(STACKED_LIST_HEIGHT_MIN, STACKED_LIST_HEIGHT_MAX)
+pub fn stacked_list_height(main_height: u16, requested: Option<u16>) -> u16 {
+    let automatic = (main_height / STACKED_LIST_HEIGHT_FRACTION)
+        .clamp(STACKED_LIST_HEIGHT_MIN, STACKED_LIST_HEIGHT_MAX);
+    let maximum = main_height.saturating_sub(STACKED_PREVIEW_MIN);
+    requested
+        .unwrap_or(automatic)
+        .clamp(STACKED_LIST_HEIGHT_MIN.min(maximum), maximum)
 }
 
 #[cfg(test)]
@@ -88,13 +91,23 @@ mod tests {
         for w in DIALOG_MIN_WIDTH..=DIALOG_MAX_WIDTH * 2 {
             assert!(dialog_width(w) <= w, "dialog_width({w}) > {w}");
         }
-        for (height, want) in [
-            (10, STACKED_LIST_HEIGHT_MIN),
-            (15, 5),
-            (30, 10),
-            (60, STACKED_LIST_HEIGHT_MAX),
+        for (height, want) in [(10, 2), (15, 5), (30, 10), (60, STACKED_LIST_HEIGHT_MAX)] {
+            assert_eq!(stacked_list_height(height, None), want, "{height}");
+        }
+    }
+
+    #[test]
+    fn requested_stacked_height_reserves_preview_space() {
+        for (available, requested, expected) in [
+            (45, 20, 20),
+            (45, 0, 5),
+            (45, u16::MAX, 37),
+            (15, 20, 7),
+            (10, 20, 2),
+            (8, 20, 0),
+            (0, 20, 0),
         ] {
-            assert_eq!(stacked_list_height(height), want, "{height}");
+            assert_eq!(stacked_list_height(available, Some(requested)), expected);
         }
     }
 }

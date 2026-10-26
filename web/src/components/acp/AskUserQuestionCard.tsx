@@ -369,29 +369,38 @@ function QuestionField({
             const checked = isMulti ? multi.has(opt.value) : single === opt.value;
             const { label, description } = optionParts(opt);
             return (
-              <label
-                key={opt.value}
-                className={[
-                  "flex cursor-pointer items-start gap-2 rounded-md border px-2 py-1.5 text-xs",
-                  checked
-                    ? "border-brand-600 bg-brand-700/15 text-text-primary"
-                    : "border-surface-700 bg-surface-900 text-text-secondary hover:bg-surface-800",
-                  disabled ? "cursor-not-allowed opacity-60" : "",
-                ].join(" ")}
-              >
-                <input
-                  type={isMulti ? "checkbox" : "radio"}
-                  name={isMulti ? undefined : groupName}
-                  className="mt-0.5 accent-brand-600"
-                  checked={checked}
-                  disabled={disabled}
-                  onChange={() => (isMulti ? onToggleMulti(opt.value) : onSetSingle(opt.value))}
-                />
-                <span className="min-w-0 break-words">
-                  <span className={description ? "font-medium" : undefined}>{label}</span>
-                  {description && <span className="block text-[11px] text-text-dim">{description}</span>}
-                </span>
-              </label>
+              <div key={opt.value}>
+                <label
+                  className={[
+                    "flex cursor-pointer items-start gap-2 rounded-md border px-2 py-1.5 text-xs",
+                    checked
+                      ? "border-brand-600 bg-brand-700/15 text-text-primary"
+                      : "border-surface-700 bg-surface-900 text-text-secondary hover:bg-surface-800",
+                    disabled ? "cursor-not-allowed opacity-60" : "",
+                  ].join(" ")}
+                >
+                  <input
+                    type={isMulti ? "checkbox" : "radio"}
+                    name={isMulti ? undefined : groupName}
+                    className="mt-0.5 accent-brand-600"
+                    checked={checked}
+                    disabled={disabled}
+                    onChange={() => (isMulti ? onToggleMulti(opt.value) : onSetSingle(opt.value))}
+                  />
+                  <span className="min-w-0 break-words">
+                    <span className={description ? "font-medium" : undefined}>{label}</span>
+                    {description && <span className="block text-[11px] text-text-dim">{description}</span>}
+                  </span>
+                </label>
+                {opt.preview && (
+                  <details className="mt-1 ml-6 text-[11px] text-text-subtle">
+                    <summary className="cursor-pointer">Preview</summary>
+                    <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md border border-surface-700 bg-surface-900 p-2 font-mono">
+                      {opt.preview}
+                    </pre>
+                  </details>
+                )}
+              </div>
             );
           })}
         </div>

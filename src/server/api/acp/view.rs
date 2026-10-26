@@ -2413,6 +2413,7 @@ mod tests {
         producer_events
             .send(Event::AgentMessageChunk {
                 text: "original producer finished materializing its native context".into(),
+                message_id: None,
             })
             .await?;
         let tail_frame = tokio::time::timeout(Duration::from_secs(5), frames.recv()).await??;

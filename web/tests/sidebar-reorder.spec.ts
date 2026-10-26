@@ -21,6 +21,54 @@ async function openDesktop(page: Page, sessions: MockSessionInput[] = threeSessi
   return handle;
 }
 
+type DragProbeWindow = Window & {
+  __aoeDragClickProbe?: { released: () => boolean; restore: () => void };
+};
+
+/** Observe the sensor's capturing click listener, not a presumed teardown delay. */
+async function observeSensorRelease(page: Page) {
+  await page.evaluate(() => {
+    const add = document.addEventListener;
+    const remove = document.removeEventListener;
+    const pending = new Set<EventListenerOrEventListenerObject>();
+    let seen = false;
+    document.addEventListener = ((...args: Parameters<Document["addEventListener"]>) => {
+      const [type, listener, options] = args;
+      if (type === "click" && typeof options === "object" && options?.capture) {
+        seen = true;
+        pending.add(listener);
+      }
+      add.apply(document, args);
+    }) as Document["addEventListener"];
+    document.removeEventListener = ((...args: Parameters<Document["removeEventListener"]>) => {
+      const [type, listener, options] = args;
+      if (type === "click" && (options === true || (typeof options === "object" && options?.capture))) {
+        pending.delete(listener);
+      }
+      remove.apply(document, args);
+    }) as Document["removeEventListener"];
+    (window as DragProbeWindow).__aoeDragClickProbe = {
+      released: () => seen && pending.size === 0,
+      restore: () => {
+        document.addEventListener = add;
+        document.removeEventListener = remove;
+      },
+    };
+  });
+}
+
+async function clickAfterSensorRelease(page: Page, x: number, y: number) {
+  await page.waitForFunction(() => (window as DragProbeWindow).__aoeDragClickProbe?.released(), null, {
+    timeout: 5_000,
+  });
+  await page.evaluate(() => {
+    const browser = window as DragProbeWindow;
+    browser.__aoeDragClickProbe?.restore();
+    delete browser.__aoeDragClickProbe;
+  });
+  await page.mouse.click(x, y);
+}
+
 async function expectNoOrderingPut(page: Page, handle: SidebarMockHandle, ms: number) {
   await observeFor(page, ms, async () => {
     expect(await publishedRequests(page, "/api/workspace-ordering", "PUT")).toEqual([]);
@@ -91,6 +139,36 @@ test.describe("desktop rows", () => {
     // The reloaded order comes from the served ordering, not a client sort.
     await page.reload();
     await expect.poll(() => readVisibleSessionTitles(page), { timeout: 8_000 }).toEqual(["gamma", "alpha", "beta"]);
+  });
+
+  test("a click right after a drop goes through: the row that didn't move navigates", async ({ page }) => {
+    await openDesktop(page);
+    const wrappers = page.locator(WRAPPERS);
+    await expect(wrappers).toHaveCount(3);
+    // alpha keeps its place when gamma drops onto beta, so its box is valid straight after the drop.
+    const alpha = (await wrappers.nth(0).boundingBox())!;
+    await observeSensorRelease(page);
+    await dragRow(page, wrappers.nth(2), wrappers.nth(1));
+    await clickAfterSensorRelease(page, alpha.x + alpha.width - 4, alpha.y + alpha.height / 2);
+    await expect(page).toHaveURL(/\/session\/s-a$/, { timeout: 5_000 });
+  });
+
+  test("Escape cancels a drag without reordering, and the next click goes through", async ({ page }) => {
+    const handle = await openDesktop(page);
+    const wrappers = page.locator(WRAPPERS);
+    await expect(wrappers).toHaveCount(3);
+    const alpha = (await wrappers.nth(0).boundingBox())!;
+    await observeSensorRelease(page);
+    await dragRow(page, wrappers.nth(2), wrappers.nth(1), { release: false });
+    // The drag must really be live, or the "nothing happened" checks below prove nothing.
+    await expect(wrappers.nth(2)).toHaveClass(/ring-2/);
+    // dnd-kit's pointer sensor cancels on Escape, which must release the click guard too.
+    await page.keyboard.press("Escape");
+    await page.mouse.up();
+    await expectNoOrderingPut(page, handle, 200);
+    expect(await readVisibleSessionTitles(page)).toEqual(["alpha", "beta", "gamma"]);
+    await clickAfterSensorRelease(page, alpha.x + alpha.width - 4, alpha.y + alpha.height / 2);
+    await expect(page).toHaveURL(/\/session\/s-a$/, { timeout: 5_000 });
   });
 
   test("a 4px movement does not start a drag; a stationary click navigates without reordering", async ({ page }) => {
@@ -221,6 +299,28 @@ test.describe("group headers", () => {
         .filter(Boolean),
     );
   const draggable = (page: Page) => page.locator("[data-testid='sidebar-group-header'][data-draggable='true']");
+
+  test("a click right after a header drop toggles the header just dropped", async ({ page }) => {
+    await openDesktop(page, twoRepos);
+    await expect(draggable(page)).toHaveCount(2);
+    const before = await groupNames(page);
+    const source = (await draggable(page).nth(1).boundingBox())!;
+    const target = (await page.locator("[data-testid='sidebar-group-header']").nth(0).boundingBox())!;
+    await observeSensorRelease(page);
+    await page.mouse.move(source.x + 40, source.y + source.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(target.x + 40, target.y + target.height / 3, { steps: 12 });
+    await page.mouse.up();
+    // The dropped header now sits where the target was.
+    const dropped = page
+      .locator("[data-testid='sidebar-group-header']")
+      .filter({ hasText: before[1]! })
+      .locator("button[aria-expanded]");
+    await expect(dropped).toHaveAttribute("aria-expanded", "true");
+    const box = (await dropped.boundingBox())!;
+    await clickAfterSensorRelease(page, box.x + box.width / 2, box.y + box.height / 2);
+    await expect(dropped).toHaveAttribute("aria-expanded", "false");
+  });
 
   test("drag a group header to reorder, order persists across reload", async ({ page }) => {
     await openDesktop(page, twoRepos);

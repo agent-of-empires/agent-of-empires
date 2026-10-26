@@ -188,12 +188,19 @@ pub async fn reconcile_acp_workers(
 
     // `aoe acp stop|kill|restart` runs out of process; the reaper surfaces it
     // and returns restart ids, which, like respawn requests (#2109), get a clean slate.
-    for id in supervisor
-        .reap_user_stopped()
-        .await
-        .into_iter()
-        .chain(supervisor.take_respawn_requests())
-    {
+    for id in supervisor.reap_user_stopped().await {
+        forget_session_budget(&id, attempted, parked, respawn_history, capacity_deferred);
+    }
+    for id in supervisor.take_respawn_requests() {
+        // A teardown in flight settles later; the request waits for it, or the
+        // loop below would pin the session as attempted.
+        if matches!(
+            supervisor.worker_state(&id).await,
+            AcpWorkerState::Resuming | AcpWorkerState::Stopping
+        ) {
+            supervisor.request_respawn(&id);
+            continue;
+        }
         forget_session_budget(&id, attempted, parked, respawn_history, capacity_deferred);
     }
     // Pre-session startup failures re-arm under the ordinary budget.
@@ -549,7 +556,7 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::test_fixtures::{capacity_startup_errors, test_state, Tick};
+    use super::test_fixtures::{capacity_startup_errors, startup_errors, test_state, Tick};
     use super::*;
 
     #[test]
@@ -813,6 +820,33 @@ mod tests {
             );
             assert_eq!(capacity_startup_errors(&state, id), 1);
         }
+    }
+
+    /// A respawn request made while the worker is still mid-teardown is kept
+    /// until it settles; spent early, the tick would pin the session as attempted
+    /// and nothing would bring the worker back.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_respawn_request_waits_out_a_teardown_in_flight() {
+        let id = "s-req";
+        let (_home, state, _project) = test_state(id);
+        let mut tick = Tick::default();
+        tick.run(&state).await;
+        let attempts = startup_errors(&state, id);
+        assert!(tick.attempted.contains(id), "precondition");
+
+        let lease = state.acp_supervisor.test_hold_stopping(id).unwrap();
+        state.acp_supervisor.request_respawn(id);
+        tick.run(&state).await;
+        assert_eq!(startup_errors(&state, id), attempts, "nothing spawns yet");
+
+        state.acp_supervisor.test_settle_stopping(&lease);
+        tick.run(&state).await;
+        assert_eq!(
+            startup_errors(&state, id),
+            attempts + 1,
+            "the kept request respawns the session once the teardown ends"
+        );
     }
 
     /// Wake-on-drain: a dormant session with a queue must be woken, or its

@@ -66,6 +66,14 @@ pub(super) fn render(view: &ServeView, frame: &mut Frame, area: Rect, theme: &Th
             (*tailscale, *cloudflare),
             flash_text(flash),
         ),
+        ServeViewState::Checking { .. } => render_pending(
+            frame,
+            area,
+            theme,
+            &mut mouse,
+            " Checking... ",
+            "Looking for a running daemon",
+        ),
         ServeViewState::Starting {
             mode, started_at, ..
         } => render_starting(
@@ -435,6 +443,33 @@ fn render_confirm(
         Style::default().fg(theme.dimmed),
     );
     record_hints(frame, mouse, keys);
+}
+
+fn render_pending(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    mouse: &mut ServeMouse,
+    title: &str,
+    line: &str,
+) {
+    let inner = render_page(frame, area, title, theme.border, theme.title);
+    let banner = vec![
+        Line::styled(line, Style::default().fg(theme.text)),
+        Line::from(""),
+        Line::styled("[Esc] cancel", Style::default().fg(theme.dimmed)),
+    ];
+    let banner_area = centered_rect(inner, inner.width, 3);
+    frame.render_widget(
+        Paragraph::new(banner).alignment(Alignment::Center),
+        banner_area,
+    );
+    let keys_row = Rect {
+        y: banner_area.bottom().saturating_sub(1),
+        height: 1,
+        ..banner_area
+    };
+    record_hints(frame, mouse, keys_row);
 }
 
 fn render_starting(
@@ -1006,6 +1041,7 @@ mod tests {
             pending_launch: None,
             launch_in_flight: false,
             stop_requested: false,
+            probes: super::super::Probes::new(|_| false),
         };
         let mut term = Terminal::new(TestBackend::new(72, 26)).unwrap();
         term.draw(|f| render(&view, f, f.area(), &Theme::default()))
@@ -1058,6 +1094,7 @@ mod tests {
             pending_launch: None,
             launch_in_flight: false,
             stop_requested: false,
+            probes: super::super::Probes::new(|_| false),
         }
     }
 
