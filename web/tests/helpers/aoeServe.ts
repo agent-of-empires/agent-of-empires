@@ -722,7 +722,11 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
   try {
     if (opts.seedFn) await opts.seedFn({ home, shimBin, xdg, tmp, tmuxTmp, env: seedEnv });
     // Seeding through migrated CLI commands auto-starts a Daemon; the server under test must own its own.
-    spawnSync(aoeBinary, ["serve", "--stop"], { env: seedEnv });
+    const stop = spawnSync(aoeBinary, ["serve", "--stop"], { env: seedEnv, encoding: "utf8" });
+    if (stop.error) throw stop.error;
+    if (stop.status !== 0 && !stop.stderr.includes("No running daemon found")) {
+      throw new Error(`aoe serve --stop failed: ${stop.stderr}`);
+    }
     for (let attempt = 0; attempt < 5; attempt++) {
       port = portFor(opts.workerIndex, opts.parallelIndex, attempt);
       baseUrl = `http://127.0.0.1:${port}`;
