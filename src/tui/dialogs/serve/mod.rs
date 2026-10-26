@@ -925,6 +925,79 @@ mod tests {
         }
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn restart_requires_an_uninterrupted_confirmation() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        for (cancelled, expired) in [(false, false), (true, false), (false, true)] {
+            let mut view = ServeView {
+                state: ServeViewState::Active {
+                    mode: ServeMode::Local,
+                    transport: None,
+                    urls: vec![ServeUrl {
+                        label: None,
+                        url: "http://127.0.0.1:8081/".to_string(),
+                    }],
+                    url_index: 0,
+                    passphrase: None,
+                    opened_at: Instant::now(),
+                    log_offset: 0,
+                },
+                pending_passphrase: String::new(),
+                pending_confirm: None,
+                show_help: false,
+                mouse: RefCell::default(),
+                copied: None,
+                pending_launch: None,
+                launch_in_flight: false,
+                stop_requested: false,
+            };
+            let restart_key = KeyEvent::from(KeyCode::Char('R'));
+            assert!(matches!(
+                view.handle_key(restart_key),
+                ServeAction::Continue
+            ));
+            assert!(matches!(&view.state, ServeViewState::Active { .. }));
+            assert!(!view.launch_in_flight);
+            assert!(view.pending_launch.is_none());
+            assert!(matches!(
+                view.pending_confirm,
+                Some((PendingConfirm::Restart, _))
+            ));
+
+            if cancelled {
+                assert!(matches!(
+                    view.handle_key(KeyEvent::from(KeyCode::Char('x'))),
+                    ServeAction::Continue
+                ));
+                assert!(view.pending_confirm.is_none());
+            }
+            let stale = Instant::now() - CONFIRM_TTL - Duration::from_secs(1);
+            if expired {
+                view.pending_confirm = Some((PendingConfirm::Restart, stale));
+            }
+            let action = view.handle_key(restart_key);
+            if cancelled || expired {
+                assert!(matches!(action, ServeAction::Continue));
+                assert!(matches!(&view.state, ServeViewState::Active { .. }));
+                assert!(!view.launch_in_flight);
+                assert!(view.pending_launch.is_none());
+                assert!(view.pending_confirm.is_some_and(|(action, when)| {
+                    action == PendingConfirm::Restart && when > stale
+                }));
+            } else {
+                let ServeAction::Launch(request) = action else {
+                    panic!("second restart key must launch");
+                };
+                assert!(request.restart);
+                assert_eq!(request.mode, ServeMode::Local);
+                assert!(matches!(&view.state, ServeViewState::Starting { .. }));
+                assert!(view.launch_in_flight);
+                assert!(view.pending_confirm.is_none());
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial]
     async fn stop_key_returns_owned_action_while_launch_transaction_is_held() {
