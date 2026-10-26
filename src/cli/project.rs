@@ -242,7 +242,7 @@ async fn remove(profile: &str, profile_explicit: bool, args: ProjectRemoveArgs) 
     };
     // The Daemon resolves a path in its own cwd, so a path-like argument is
     // anchored here; a bare name still looks up by name.
-    let name_or_path = if args.name_or_path.contains(std::path::MAIN_SEPARATOR)
+    let name_or_path = if args.name_or_path.contains(std::path::is_separator)
         || matches!(args.name_or_path.as_str(), "." | "..")
     {
         std::path::absolute(&args.name_or_path)?
