@@ -446,6 +446,7 @@ mod tests {
             include_str!("sessions/lifecycle.rs"),
             &[
                 "force_smart_rename",
+                "restart_for_update",
                 "restart_session",
                 "restore_session",
                 "start_session",
@@ -1443,6 +1444,7 @@ mod tests {
             (Method::PATCH, "/api/sessions/missing/access"),
             (Method::POST, "/api/sessions/missing/purge/abandon"),
             (Method::POST, "/api/sessions/missing/restart"),
+            (Method::POST, "/api/sessions/missing/restart-for-update"),
             (Method::POST, "/api/sessions/missing/tools/ensure"),
             (Method::POST, "/api/sessions/missing/auxiliary/stop"),
             (Method::POST, "/api/sessions/missing/acp/switch-agent"),
