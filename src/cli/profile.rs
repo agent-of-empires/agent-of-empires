@@ -2,7 +2,10 @@
 
 use anyhow::{bail, Result};
 use clap::Subcommand;
+use reqwest::Method;
 use std::io::{self, Write};
+
+use crate::daemon::transport::path_segment;
 
 use crate::session;
 
@@ -103,22 +106,16 @@ async fn list_profiles() -> Result<()> {
 }
 
 async fn create_profile(name: &str) -> Result<()> {
-    super::mutate_profile(crate::daemon::ProfileMutation::Create(
-        crate::daemon::CreateProfileBody { name: name.into() },
-    ))
-    .await?;
+    let body = serde_json::json!({ "name": name });
+    super::runtime_write(Method::POST, "/api/profiles", Some(body)).await?;
     println!("✓ Created profile: {}", name);
     println!("  Use with: aoe -p {}", name);
     Ok(())
 }
 async fn rename_profile(old_name: &str, new_name: &str) -> Result<()> {
-    super::mutate_profile(crate::daemon::ProfileMutation::Rename {
-        name: old_name.into(),
-        body: crate::daemon::RenameProfileBody {
-            new_name: new_name.into(),
-        },
-    })
-    .await?;
+    let path = format!("/api/profiles/{}/rename", path_segment(old_name)?);
+    let body = serde_json::json!({ "new_name": new_name });
+    super::runtime_write(Method::PATCH, &path, Some(body)).await?;
     println!("✓ Renamed profile: {} -> {}", old_name, new_name);
     Ok(())
 }
@@ -138,11 +135,8 @@ async fn delete_profile(name: &str) -> Result<()> {
         return Ok(());
     }
 
-    super::mutate_profile(crate::daemon::ProfileMutation::Delete {
-        name: name.into(),
-        query: crate::daemon::DeleteProfileQuery::default(),
-    })
-    .await?;
+    let path = format!("/api/profiles/{}", path_segment(name)?);
+    super::runtime_write(Method::DELETE, &path, None).await?;
     println!("✓ Deleted profile: {}", name);
     Ok(())
 }
@@ -156,13 +150,8 @@ async fn show_default_profile() -> Result<()> {
 }
 
 async fn set_default_profile(name: &str) -> Result<()> {
-    if !session::list_profiles()?.iter().any(|p| p == name) {
-        bail!("Profile '{name}' does not exist");
-    }
-    super::mutate_profile(crate::daemon::ProfileMutation::SetDefault(
-        crate::daemon::DefaultProfileBody { name: name.into() },
-    ))
-    .await?;
+    let body = serde_json::json!({ "name": name });
+    super::runtime_write(Method::PATCH, "/api/default-profile", Some(body)).await?;
     println!("✓ Default profile set to: {}", name);
     Ok(())
 }

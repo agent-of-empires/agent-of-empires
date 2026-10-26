@@ -47,7 +47,7 @@ fn test_project_registry_add_list_override_and_remove() {
             vec!["project", "add", missing.to_str().unwrap()],
             "does not exist or is not a directory",
         ),
-        (vec!["project", "add", repo], "409"),
+        (vec!["project", "add", repo], "already registered"),
         (vec!["project", "add", repo, "--scope", "profile"], "409"),
     ] {
         let stderr = h.run_cli_err(&args);
@@ -168,4 +168,65 @@ fn project_remove_prefers_the_name_over_a_colliding_client_path() {
     let listed = h.run_cli_ok(&["project", "list"]);
     assert!(!listed.contains("named"), "{listed}");
     assert!(listed.contains("at-path"), "{listed}");
+}
+
+#[test]
+#[parallel]
+fn project_remove_anchors_a_bare_name_that_matches_no_entry() {
+    let mut h = TuiTestHarness::new_in_tmp("project_rm_bare");
+    h.stop_daemon_on_drop();
+    let (a, b) = (h.home_path().join("a"), h.home_path().join("b"));
+    init_git_repo(&a.join("repo"));
+    init_git_repo(&b.join("repo"));
+    let run_in = |dir: &std::path::Path, args: &[&str]| {
+        let out = h
+            .cli_command(args)
+            .current_dir(dir)
+            .output()
+            .expect("run aoe");
+        assert!(out.status.success(), "{args:?}: {out:?}");
+    };
+    // The Daemon starts in `a`; neither entry is named `repo`.
+    run_in(&a, &["project", "add", "./repo", "--name", "in-a"]);
+    run_in(&b, &["project", "add", "./repo", "--name", "in-b"]);
+
+    run_in(&b, &["project", "remove", "repo"]);
+    let listed = h.run_cli_ok(&["project", "list"]);
+    assert!(
+        listed.contains("in-a") && !listed.contains("in-b"),
+        "{listed}"
+    );
+}
+
+/// The Daemon, not the CLI's own store, decides which profiles exist.
+#[test]
+#[parallel]
+fn profile_and_project_writes_use_the_selected_daemons_store() {
+    let mut server = TuiTestHarness::new_in_tmp("remote_store_server");
+    server.stop_daemon_on_drop();
+    let port = server.start_daemon();
+    server.run_cli_ok(&["profile", "create", "remote-only"]);
+    let repo = server.home_path().join("remote-repo");
+    init_git_repo(&repo);
+
+    let client = TuiTestHarness::new_in_tmp("remote_store_client");
+    let url = format!("http://127.0.0.1:{port}");
+    let run = |args: &[&str]| {
+        let out = client
+            .cli_command(args)
+            .env("AOE_DAEMON_URL", &url)
+            .output()
+            .expect("run aoe");
+        assert!(out.status.success(), "{args:?}: {out:?}");
+    };
+    run(&["profile", "default", "remote-only"]);
+    run(&[
+        "-p",
+        "remote-only",
+        "project",
+        "add",
+        repo.to_str().unwrap(),
+    ]);
+    let listed = server.run_cli_ok(&["-p", "remote-only", "project", "list", "--scope", "profile"]);
+    assert!(listed.contains("remote-repo"), "{listed}");
 }

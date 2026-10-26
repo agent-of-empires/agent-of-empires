@@ -64,30 +64,31 @@ pub(crate) async fn daemon_client() -> Result<crate::acp::client::HttpClient> {
     Ok(crate::acp::client::HttpClient::new(endpoint)?)
 }
 
-/// A ready Daemon runtime and its epoch, auto-started when none runs.
-async fn runtime_client() -> Result<(crate::daemon::DaemonClient, String)> {
-    let client = crate::acp::client::require_daemon()
-        .await?
-        .daemon_client()?;
-    let info = client.runtime_info().await?;
+/// A profile or project write on the epoch-checked Daemon routes. The Daemon,
+/// auto-started when none runs, validates profiles, paths and names against its
+/// own store and answers with its own message.
+pub(crate) async fn runtime_write(
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> Result<serde_json::Value> {
+    let endpoint = crate::acp::client::require_daemon().await?;
+    let info = endpoint.daemon_client()?.runtime_info().await?;
     anyhow::ensure!(
         info.protocol_version == crate::daemon::RUNTIME_PROTOCOL_VERSION
             && info.health == crate::daemon::RuntimeHealth::Healthy,
         "Daemon runtime is not ready"
     );
-    Ok((client, info.epoch))
-}
-
-pub(crate) async fn mutate_profile(mutation: crate::daemon::ProfileMutation) -> Result<()> {
-    let (client, epoch) = runtime_client().await?;
-    client.mutate_profile(&mutation, &epoch).await?;
-    Ok(())
-}
-
-pub(crate) async fn mutate_project(mutation: crate::daemon::ProjectMutation) -> Result<()> {
-    let (client, epoch) = runtime_client().await?;
-    client.mutate_project(&mutation, &epoch).await?;
-    Ok(())
+    let client = crate::acp::client::HttpClient::new(endpoint)?;
+    Ok(client
+        .mutate_with(method, path, |request| {
+            let request = request.header(crate::daemon::RUNTIME_EPOCH_HEADER, &info.epoch);
+            match &body {
+                Some(body) => request.json(body),
+                None => request,
+            }
+        })
+        .await?)
 }
 
 pub fn resolve_session<'a>(identifier: &str, instances: &'a [Instance]) -> Result<&'a Instance> {
