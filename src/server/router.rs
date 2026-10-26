@@ -175,6 +175,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             post(api::restart_session).layer(read_only.clone()),
         )
         .route(
+            "/api/sessions/{id}/restart-for-update",
+            post(api::restart_for_update).layer(read_only.clone()),
+        )
+        .route(
             "/api/sessions/{id}/terminal",
             post(api::ensure_terminal).delete(api::kill_terminal),
         )
@@ -514,6 +518,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
     .layer(axum::middleware::from_fn_with_state(
         state.clone(),
         access_policy,
+    ))
+    .layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        super::ingress::plaintext_gate,
     ))
     .layer(axum::middleware::from_fn(security_headers))
     .layer(axum::middleware::from_fn(http_request_span))

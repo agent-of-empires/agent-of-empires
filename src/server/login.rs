@@ -15,7 +15,6 @@ use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-use super::auth::resolve_client_ip;
 use super::secure_store::{check_path_security, write_private};
 use super::AppState;
 use crate::util::{now_ms, system_time_to_ms};
@@ -828,7 +827,7 @@ pub async fn login_handler(
         )
             .into_response();
     };
-    let client_ip = resolve_client_ip(addr, &headers, state.behind_tunnel);
+    let client_ip = state.ingress(addr, &headers).client_ip;
 
     if !state.login_manager.is_enabled() {
         return (
@@ -943,7 +942,7 @@ pub async fn elevate_handler(
         )
             .into_response();
     };
-    let client_ip = resolve_client_ip(addr, request.headers(), state.behind_tunnel);
+    let client_ip = state.ingress(addr, request.headers()).client_ip;
 
     if !state.login_manager.is_enabled() {
         return (

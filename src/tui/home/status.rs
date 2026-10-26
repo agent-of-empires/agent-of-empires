@@ -1049,13 +1049,16 @@ impl HomeView {
         let mut changed = !row_outcomes.is_empty() || namespace.is_some();
         for (id, outcome) in row_outcomes {
             match outcome {
-                SessionCommandOutcome::Trashed(receipt) => {
-                    if let crate::daemon::TrashRelocationOutcome::Failed { reason } =
-                        receipt.outcome.relocation
-                    {
+                SessionCommandOutcome::Trashed(receipt) => match receipt.outcome.relocation {
+                    crate::daemon::TrashRelocationOutcome::Failed { reason } => {
                         self.record_runtime_message(format!("{id}: Session is in Trash, but its worktree relocation is incomplete: {reason}"));
                     }
-                }
+                    crate::daemon::TrashRelocationOutcome::Relocated {
+                        warning: Some(warning),
+                    } => self.record_runtime_message(format!("{id}: {warning}")),
+                    crate::daemon::TrashRelocationOutcome::Relocated { warning: None }
+                    | crate::daemon::TrashRelocationOutcome::Skipped => {}
+                },
                 SessionCommandOutcome::Purged(receipt) => {
                     self.record_purge_outcome(&id, receipt.outcome)
                 }
@@ -1103,7 +1106,10 @@ impl HomeView {
                     });
                 }
                 SessionCommandOutcome::Restored(receipt) => match receipt.outcome {
-                    crate::daemon::RestoreOutcome::Restored => {
+                    crate::daemon::RestoreOutcome::Restored { warning } => {
+                        if let Some(warning) = warning {
+                            self.record_runtime_message(format!("{id}: {warning}"));
+                        }
                         if self.selected_session.as_deref() == Some(id.as_str()) {
                             self.select_session_by_id(&id);
                         }
