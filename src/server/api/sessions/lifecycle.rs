@@ -2131,6 +2131,29 @@ pub(super) enum AgentPreparation {
     Ensure,
 }
 
+#[derive(Clone, Copy)]
+enum RestartOrigin {
+    Explicit,
+    StartupRecovery,
+}
+
+fn select_restart_wake_message(
+    origin: RestartOrigin,
+    requested: Option<String>,
+    profile: &str,
+) -> String {
+    requested.unwrap_or_else(|| {
+        let session = crate::session::resolve_config(profile)
+            .map(|config| config.session)
+            .unwrap_or_default();
+        if matches!(origin, RestartOrigin::StartupRecovery) && !session.startup_recovery_wake {
+            String::new()
+        } else {
+            session.restart_wake_message
+        }
+    })
+}
+
 pub(super) async fn prepare_agent_session(
     state: Arc<AppState>,
     id: String,
@@ -2141,7 +2164,16 @@ pub(super) async fn prepare_agent_session(
     preparation: AgentPreparation,
     restart: Option<Arc<crate::daemon::RestartSessionBody>>,
 ) -> axum::response::Response {
-    prepare_agent_session_inner(state, id, body, preparation, restart, None).await
+    prepare_agent_session_inner(
+        state,
+        id,
+        body,
+        preparation,
+        restart,
+        None,
+        RestartOrigin::Explicit,
+    )
+    .await
 }
 
 pub(crate) async fn recovery_restart(
@@ -2159,6 +2191,7 @@ pub(crate) async fn recovery_restart(
             ..Default::default()
         })),
         Some(expected_generation),
+        RestartOrigin::StartupRecovery,
     )
     .await
 }
@@ -2173,6 +2206,7 @@ async fn prepare_agent_session_inner(
     preparation: AgentPreparation,
     restart: Option<Arc<crate::daemon::RestartSessionBody>>,
     expected_generation: Option<u64>,
+    restart_origin: RestartOrigin,
 ) -> axum::response::Response {
     if preparation == AgentPreparation::Ensure && state.cityhall_mode {
         return crate::server::api::cityhall_response();
@@ -2767,17 +2801,8 @@ async fn prepare_agent_session_inner(
                     | crate::session::StartOutcome::FreshAfterFailedResume { .. }
             )
         ) {
-            let wake_message = requested_wake_message.unwrap_or_else(|| {
-                let session = crate::session::resolve_config(&profile)
-                    .map(|config| config.session)
-                    .unwrap_or_default();
-                // Only startup recovery supplies an expected generation.
-                if expected_generation.is_some() && !session.startup_recovery_wake {
-                    String::new()
-                } else {
-                    session.restart_wake_message
-                }
-            });
+            let wake_message =
+                select_restart_wake_message(restart_origin, requested_wake_message, &profile);
             if !wake_message.is_empty() {
                 crate::session::restart::spawn_wake_worker(
                     id.clone(),
@@ -3276,4 +3301,72 @@ pub async fn update_session_unread(
     drop(_guard);
     drop(namespace);
     crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
+}
+
+#[cfg(test)]
+mod restart_wake_tests {
+    use super::{select_restart_wake_message, RestartOrigin};
+
+    #[test]
+    #[serial_test::serial]
+    fn restart_wake_selection_respects_origin_and_profile_policy() -> anyhow::Result<()> {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let config_path = crate::session::get_app_dir()?.join("config.toml");
+        let profile = "wake-policy";
+        let default_message = "wake up: pick up what you were doing";
+        for (global, overrides, recovered, explicit) in [
+            ("", "", "", default_message),
+            (
+                "startup_recovery_wake = false\nrestart_wake_message = '  custom text  '",
+                "",
+                "",
+                "  custom text  ",
+            ),
+            (
+                "startup_recovery_wake = true",
+                "",
+                default_message,
+                default_message,
+            ),
+            (
+                "startup_recovery_wake = true\nrestart_wake_message = '  custom text  '",
+                "",
+                "  custom text  ",
+                "  custom text  ",
+            ),
+            (
+                "startup_recovery_wake = true\nrestart_wake_message = ''",
+                "",
+                "",
+                "",
+            ),
+            (
+                "startup_recovery_wake = false",
+                "startup_recovery_wake = true\nrestart_wake_message = 'profile text'",
+                "profile text",
+                "profile text",
+            ),
+            (
+                "startup_recovery_wake = true",
+                "startup_recovery_wake = false",
+                "",
+                default_message,
+            ),
+        ] {
+            std::fs::write(&config_path, format!("[session]\n{global}\n"))?;
+            let profile_config = toml::from_str(&format!("[session]\n{overrides}\n"))?;
+            crate::session::config::profile_config::save_profile_config(profile, &profile_config)?;
+            for (origin, expected) in [
+                (RestartOrigin::StartupRecovery, recovered),
+                (RestartOrigin::Explicit, explicit),
+            ] {
+                assert_eq!(
+                    select_restart_wake_message(origin, None, profile),
+                    expected,
+                    "global={global:?}, profile={overrides:?}"
+                );
+            }
+        }
+        Ok(())
+    }
 }
