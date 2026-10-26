@@ -447,6 +447,13 @@ pub struct ImageDismissBody {
 
 /// `POST /api/sandbox/image-dismiss`: snoozes the banner for this remote digest. The TUI reads
 /// and writes the same `app_state.dismissed_image_digest`.
+/// The only form a registry digest, and so `is_dismissed`, can match.
+fn is_sha256_digest(digest: &str) -> bool {
+    digest.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
 pub async fn sandbox_image_dismiss(
     State(state): State<Arc<AppState>>,
     body: Result<Json<ImageDismissBody>, JsonRejection>,
@@ -455,9 +462,7 @@ pub async fn sandbox_image_dismiss(
         return resp;
     }
     let digest = match body {
-        Ok(Json(body)) if body.digest.starts_with("sha256:") && body.digest.len() <= 80 => {
-            body.digest
-        }
+        Ok(Json(body)) if is_sha256_digest(&body.digest) => body.digest,
         _ => {
             return api_error(
                 StatusCode::BAD_REQUEST,
@@ -529,6 +534,10 @@ mod tests {
             (
                 Ok(ImageCheck::Unknown(UnknownReason::NoLocalDigest)),
                 serde_json::json!({"state": "unknown", "reason": "no_local_digest"}),
+            ),
+            (
+                Ok(ImageCheck::Unknown(UnknownReason::RuntimeUnavailable)),
+                serde_json::json!({"state": "unknown", "reason": "runtime_unavailable"}),
             ),
             // A registry or network error is never reported as current.
             (
@@ -899,11 +908,20 @@ mod tests {
                 })),
             )
         };
-        let (code, _) = json(dismiss(read_only, "sha256:abc").await).await;
+        let digest = format!("sha256:{}", "0a".repeat(32));
+        let (code, _) = json(dismiss(read_only, &digest).await).await;
         assert_eq!(code, StatusCode::FORBIDDEN);
-        let (code, _) = json(dismiss(state.clone(), "not-a-digest").await).await;
-        assert_eq!(code, StatusCode::BAD_REQUEST);
-        let (code, _) = json(dismiss(state.clone(), "sha256:abc").await).await;
+        for bad in [
+            "not-a-digest".to_string(),
+            "sha256:abc".to_string(),
+            format!("sha256:{}", "0A".repeat(32)),
+            format!("sha256:{}", "0g".repeat(32)),
+            format!("{digest}0"),
+        ] {
+            let (code, _) = json(dismiss(state.clone(), &bad).await).await;
+            assert_eq!(code, StatusCode::BAD_REQUEST, "{bad}");
+        }
+        let (code, _) = json(dismiss(state.clone(), &digest).await).await;
         assert_eq!(code, StatusCode::OK);
         // The TUI reads the same field.
         assert_eq!(
@@ -911,7 +929,7 @@ mod tests {
                 .app_state
                 .dismissed_image_digest
                 .as_deref(),
-            Some("sha256:abc")
+            Some(digest.as_str())
         );
     }
 }

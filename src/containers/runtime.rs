@@ -89,14 +89,23 @@ impl ContainerRuntime {
                         super::image_update::pick_repo_digest(image, &stdout)
                             .map_or(LocalDigest::NoDigest, LocalDigest::Digest)
                     }
-                    _ => LocalDigest::Missing,
+                    _ => self.missing_or_unavailable(),
                 }
             }
             // Apple's `image inspect` exposes no repo digest.
             RuntimeKind::AppleContainer if self.image_exists_locally(image) => {
                 LocalDigest::NoDigest
             }
-            RuntimeKind::AppleContainer => LocalDigest::Missing,
+            RuntimeKind::AppleContainer => self.missing_or_unavailable(),
+        }
+    }
+
+    /// A failed inspect means "not pulled" only when the runtime itself answers.
+    fn missing_or_unavailable(&self) -> LocalDigest {
+        if self.is_available() && self.is_daemon_running() {
+            LocalDigest::Missing
+        } else {
+            LocalDigest::Unavailable
         }
     }
 
@@ -105,9 +114,20 @@ impl ContainerRuntime {
     }
 
     /// The command [`Self::pull_image`] runs, for a user to copy when the dashboard can't pull.
+    /// The image comes from config, so anything outside an image reference's characters is
+    /// quoted rather than pasted into a shell as is.
     pub fn pull_command(&self, image: &str) -> String {
-        let mut parts = vec![self.base.binary];
-        parts.extend(self.base.pull_prefix);
+        let plain = !image.is_empty()
+            && image
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "._-/:@".contains(c));
+        let image = if plain {
+            image.to_string()
+        } else {
+            crate::session::environment::shell_escape(image)
+        };
+        let mut parts = vec![self.base.binary.to_string()];
+        parts.extend(self.base.pull_prefix.iter().map(|p| p.to_string()));
         parts.push(image);
         parts.join(" ")
     }
@@ -874,6 +894,86 @@ fn parse_batch_states(stdout: &str, prefix: &str) -> HashMap<String, ContainerSt
 mod tests {
     use super::*;
     use crate::session::test_support::EnvGuard;
+
+    #[test]
+    fn pull_command_quotes_an_image_only_when_a_shell_would_read_it() {
+        let cases = [
+            (
+                ContainerRuntime::docker(),
+                "ghcr.io/agent-of-empires/aoe-sandbox:latest",
+                "docker pull ghcr.io/agent-of-empires/aoe-sandbox:latest",
+            ),
+            (
+                ContainerRuntime::podman(),
+                "repo/img@sha256:0123",
+                "podman pull repo/img@sha256:0123",
+            ),
+            (
+                ContainerRuntime::apple_container(),
+                "img:1",
+                "container image pull img:1",
+            ),
+            // A configured value with shell syntax is shown inert.
+            (
+                ContainerRuntime::docker(),
+                "img; rm -rf ~",
+                "docker pull 'img; rm -rf ~'",
+            ),
+            (
+                ContainerRuntime::docker(),
+                "it's$(x)",
+                r"docker pull 'it'\''s$(x)'",
+            ),
+        ];
+        for (runtime, image, expected) in cases {
+            assert_eq!(runtime.pull_command(image), expected, "{image:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_inspect_is_not_pulled_only_when_the_runtime_answers() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = |script: Option<&str>| {
+            let binary = match script {
+                Some(body) => {
+                    let path = dir.path().join(format!("rt{}", body.len()));
+                    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                        .unwrap();
+                    path.to_string_lossy().into_owned()
+                }
+                None => dir.path().join("absent").to_string_lossy().into_owned(),
+            };
+            ContainerRuntime {
+                base: RuntimeBase {
+                    binary: Box::leak(binary.into_boxed_str()),
+                    ..RuntimeBase::DOCKER
+                },
+                kind: RuntimeKind::Docker,
+            }
+        };
+        let cases = [
+            (None, LocalDigest::Unavailable), // not installed
+            // Docker Desktop not started: `info` fails along with the inspect.
+            (
+                Some(r#"[ "$1" = --version ] && exit 0; exit 1"#),
+                LocalDigest::Unavailable,
+            ),
+            (
+                Some(r#"[ "$1" = image ] && exit 1; exit 0"#),
+                LocalDigest::Missing,
+            ),
+        ];
+        for (script, expected) in cases {
+            assert_eq!(
+                runtime(script).local_image_digest("ghcr.io/x/y:latest"),
+                expected,
+                "{script:?}"
+            );
+        }
+    }
 
     #[test]
     fn batch_listing_states_keep_inspect_liveness() {

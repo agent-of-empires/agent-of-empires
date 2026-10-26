@@ -17,6 +17,9 @@ pub enum LocalDigest {
     /// whose `image inspect` exposes none.
     NoDigest,
     Missing,
+    /// The runtime didn't answer (not installed, or its daemon isn't running), so whether the
+    /// image is pulled is unknown too.
+    Unavailable,
 }
 
 /// Why a newer image can't be detected. Never "current": the dashboard must not say an
@@ -28,6 +31,7 @@ pub enum UnknownReason {
     Pinned,
     NotPulled,
     NoLocalDigest,
+    RuntimeUnavailable,
 }
 
 impl UnknownReason {
@@ -37,6 +41,7 @@ impl UnknownReason {
             UnknownReason::Pinned => "pinned",
             UnknownReason::NotPulled => "not_pulled",
             UnknownReason::NoLocalDigest => "no_local_digest",
+            UnknownReason::RuntimeUnavailable => "runtime_unavailable",
         }
     }
 }
@@ -275,6 +280,7 @@ fn pre_check(
         LocalDigest::Digest(digest) => Ok((reference, digest)),
         LocalDigest::NoDigest => Err(UnknownReason::NoLocalDigest),
         LocalDigest::Missing => Err(UnknownReason::NotPulled),
+        LocalDigest::Unavailable => Err(UnknownReason::RuntimeUnavailable),
     }
 }
 
@@ -328,13 +334,19 @@ mod tests {
     fn each_local_outcome_maps_to_its_own_state_never_current() {
         const IMAGE: &str = "ghcr.io/agent-of-empires/aoe-sandbox:latest";
         let digest = || LocalDigest::Digest("sha256:aaa".into());
-        let cases: [(&str, fn() -> LocalDigest, Option<UnknownReason>); 5] = [
+        let cases: [(&str, fn() -> LocalDigest, Option<UnknownReason>); 6] = [
             ("", digest, Some(UnknownReason::Unparseable)),
             ("ubuntu@sha256:0123", digest, Some(UnknownReason::Pinned)),
             (
                 IMAGE,
                 || LocalDigest::Missing,
                 Some(UnknownReason::NotPulled),
+            ),
+            // Docker Desktop not started: not "not pulled", which a pull would contradict.
+            (
+                IMAGE,
+                || LocalDigest::Unavailable,
+                Some(UnknownReason::RuntimeUnavailable),
             ),
             // Apple Container, or an image built locally.
             (
