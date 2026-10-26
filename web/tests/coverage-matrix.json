@@ -3548,7 +3548,8 @@
         "web/src/components/acp/StructuredView.tsx",
         "web/src/components/acp/StartupErrorBanner.tsx",
         "web/src/components/acp/RecoveryActionRow.tsx"
-      ]
+      ],
+      "notes": "Auth-required startup errors name the agent's own login step: Claude keeps claude /login and ANTHROPIC_API_KEY, Codex gets codex login and OPENAI_API_KEY, other agents get generic sign-in copy with no Claude or Codex commands."
     },
     {
       "id": "acp.startup-error-banner-actions",
