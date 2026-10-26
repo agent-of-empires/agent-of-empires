@@ -1001,19 +1001,34 @@ mod tests {
         )
     }
 
-    fn eager_json_consumer(signature: &str) -> Option<usize> {
+    fn signature_extractors(signature: &str) -> (Option<usize>, Option<usize>) {
         use syn::spanned::Spanned;
 
-        syn::parse_str::<syn::Signature>(signature)
-            .expect("audited function signature")
-            .inputs
-            .iter()
-            .find_map(|argument| match argument {
-                syn::FnArg::Typed(argument) if eager_json_type(&argument.ty) => {
-                    Some(argument.ty.span().byte_range().start)
-                }
-                _ => None,
-            })
+        let signature =
+            syn::parse_str::<syn::Signature>(signature).expect("audited function signature");
+        let mut parts_guard = None;
+        let mut consumer = None;
+        for argument in &signature.inputs {
+            let syn::FnArg::Typed(argument) = argument else {
+                continue;
+            };
+            // Optional or nested guards do not establish unconditional admission.
+            if parts_guard.is_none()
+                && matches!(&*argument.ty, syn::Type::Path(path)
+                    if path.path.segments.last().is_some_and(|segment|
+                        segment.ident == "ElevatedMutationGuard"
+                            && matches!(segment.arguments, syn::PathArguments::None)))
+            {
+                parts_guard = Some(argument.ty.span().byte_range().start);
+            }
+            if consumer.is_none() && eager_json_type(&argument.ty) {
+                consumer = Some(argument.ty.span().byte_range().start);
+            }
+            if parts_guard.is_some() && consumer.is_some() {
+                break;
+            }
+        }
+        (parts_guard, consumer)
     }
 
     fn deferred_json_is_guarded(signature: &str, body: &str, delegate: Option<&str>) -> bool {
@@ -1212,8 +1227,47 @@ mod tests {
             ("fn write(body: Bytes)", false),
         ] {
             assert_eq!(
-                eager_json_consumer(signature).is_some(),
+                signature_extractors(signature).1.is_some(),
                 expected,
+                "{signature}"
+            );
+        }
+    }
+
+    #[test]
+    fn parts_guard_detection_rejects_decoy_extractors() {
+        for (signature, guarded) in [
+            (
+                "fn write(guard: ElevatedMutationGuard, body: Json<Body>)",
+                true,
+            ),
+            (
+                "fn write(guard: api::ElevatedMutationGuard, body: Json<Body>)",
+                true,
+            ),
+            (
+                "fn write(guard: NotElevatedMutationGuard, body: Json<Body>)",
+                false,
+            ),
+            (
+                "fn write(guard: ElevatedMutationGuardExtra, body: Json<Body>)",
+                false,
+            ),
+            (
+                "fn write(ElevatedMutationGuard: Other, body: Json<Body>)",
+                false,
+            ),
+            (
+                "fn write(guard: Option<ElevatedMutationGuard>, body: Json<Body>)",
+                false,
+            ),
+        ] {
+            let (parts_guard, consumer) = signature_extractors(signature);
+            assert_eq!(
+                parts_guard
+                    .zip(consumer)
+                    .is_some_and(|(guard, body)| guard < body),
+                guarded,
                 "{signature}"
             );
         }
@@ -1314,8 +1368,7 @@ mod tests {
                     .peekable();
                 let route_layer = handler_routes.peek().is_some()
                     && handler_routes.all(|route| route.read_only_layer);
-                let parts_guard = signature.find("ElevatedMutationGuard");
-                let consumer = eager_json_consumer(signature);
+                let (parts_guard, consumer) = signature_extractors(signature);
                 let local_guard = ["state.read_only", "self.read_only", "read_only_block("]
                     .iter()
                     .any(|marker| body.contains(marker));
