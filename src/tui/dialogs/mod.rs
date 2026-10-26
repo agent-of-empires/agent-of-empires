@@ -182,6 +182,18 @@ pub fn navigate_list(selected: &mut usize, len: usize, code: KeyCode) -> bool {
     true
 }
 
+/// Next (or previous, if `backwards`) focus index among `len` elements, wrapping at both ends.
+pub fn cycle_focus(current: usize, len: usize, backwards: bool) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    if backwards {
+        (current + len - 1) % len
+    } else {
+        (current + 1) % len
+    }
+}
+
 /// Move `selected` to the hovered row; returns whether it changed.
 pub fn hover_select(selected: &mut usize, hovered: Option<usize>) -> bool {
     match hovered {
@@ -190,6 +202,32 @@ pub fn hover_select(selected: &mut usize, hovered: Option<usize>) -> bool {
             true
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cycle_focus;
+
+    #[test]
+    fn cycle_focus_wraps_both_ways() {
+        // (current, len, backwards, expected)
+        for (current, len, backwards, expected) in [
+            (0, 3, false, 1),
+            (2, 3, false, 0),
+            (0, 3, true, 2),
+            (2, 3, true, 1),
+            (0, 1, false, 0),
+            (0, 1, true, 0),
+            (0, 0, false, 0),
+            (0, 0, true, 0),
+        ] {
+            assert_eq!(
+                cycle_focus(current, len, backwards),
+                expected,
+                "current={current} len={len} backwards={backwards}"
+            );
+        }
     }
 }
 

@@ -105,7 +105,7 @@ async fn listed_session_imports_in_its_listed_cwd_and_replays_history() {
             .await
             .expect("history replay before deadline")
             .expect("event stream open");
-        if matches!(&event, Event::AgentMessageChunk { text } if text == "from history") {
+        if matches!(&event, Event::AgentMessageChunk { text, .. } if text == "from history") {
             break;
         }
     }

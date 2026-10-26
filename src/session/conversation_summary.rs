@@ -127,7 +127,7 @@ pub fn extract_transcript_delta(events: &[(u64, Event)], since_seq: u64) -> (Str
             Event::UserPromptSent {
                 synthesized: true, ..
             } => {}
-            Event::AgentMessageChunk { text } => {
+            Event::AgentMessageChunk { text, .. } => {
                 // Coalesce a run of chunks under one [Assistant] header.
                 if !agent_open {
                     out.push_str("\n[Assistant]\n");
@@ -396,7 +396,10 @@ mod tests {
         }
     }
     fn agent(text: &str) -> Event {
-        Event::AgentMessageChunk { text: text.into() }
+        Event::AgentMessageChunk {
+            text: text.into(),
+            message_id: None,
+        }
     }
     fn tool(name: &str, args: &str) -> Event {
         Event::ToolCallStarted {

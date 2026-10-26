@@ -163,7 +163,7 @@ webauthn-rs = "0.5"
 base64 = "0.23"
 
 # Web Push (VAPID + payload encryption).
-p256 = { version = "0.13", features = ["pem", "pkcs8", "ecdsa", "ecdh"] }
+p256 = { version = "0.14", features = ["pem", "pkcs8", "ecdsa", "ecdh"] }
 hkdf = "0.13"
 aes-gcm = "0.11"
 jsonwebtoken = { version = "11.0", features = ["aws_lc_rs"] }

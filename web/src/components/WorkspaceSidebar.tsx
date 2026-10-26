@@ -22,7 +22,7 @@ import { useSidebarTriage } from "../hooks/useSidebarTriage";
 import { ProjectsSection } from "./ProjectsSection";
 import { FoldChevron, PlusIcon, StrokeIcon } from "./icons";
 import { usePersistedFlag } from "./usePersistedFlag";
-import { useSuppressClickAfterDrag } from "./sidebar/dnd";
+import { newDragClickGuard, useSuppressClickAfterDrag, type DragClickGuard } from "./sidebar/dnd";
 import {
   filterFlat,
   filterNested,
@@ -115,8 +115,8 @@ export function WorkspaceSidebar(props: Props) {
     pluginSortActive ||
     facets.activeFacets.length > 0 ||
     groups.some((g) => !g.capabilities.reorder);
-  const dragSuppressRef = useRef<number>(0);
-  useSuppressClickAfterDrag(dragSuppressRef);
+  const dragClickGuard = useRef<DragClickGuard>(newDragClickGuard());
+  useSuppressClickAfterDrag(dragClickGuard);
 
   const [filterOpen, setFilterOpen] = useState(false);
   const [filterQuery, setFilterQuery] = useState("");
@@ -314,7 +314,7 @@ export function WorkspaceSidebar(props: Props) {
               onToggleGroup={props.onToggleGroup}
               onReorderGroups={props.onReorderGroups}
               onReorderWorkspaces={props.onReorderWorkspaces}
-              dragSuppressRef={dragSuppressRef}
+              dragClickGuard={dragClickGuard}
             />
           )}
 

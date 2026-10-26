@@ -36,7 +36,9 @@ pub(crate) use hermes::hermes_poll_fn_sandboxed_store;
 pub(crate) use kimi::{kimi_poll_fn_sandboxed_store, selected_index_record, KIMI_INDEX_MAX_BYTES};
 pub(crate) use omp::*;
 pub(crate) use opencode::{fork_opencode_session_id, preassign_opencode_session_id};
-pub(crate) use pi::{extract_pi_header_fields, pi_sidecar_poll_fn, read_pi_session_observation};
+pub(crate) use pi::{
+    extract_pi_header_fields, find_pi_transcript, pi_sidecar_poll_fn, read_pi_session_observation,
+};
 pub(crate) use prime::{
     hand_off_root_transcript as hand_off_prime_root_transcript, prime_agent_poll_fn_sandboxed,
     root_session_header, PrimeRootPublication, PRIME_AGENT_HEADER_SCAN_BYTES,

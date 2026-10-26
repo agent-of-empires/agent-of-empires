@@ -24,6 +24,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe session show`↴](#aoe-session-show)
 * [`aoe session wait`↴](#aoe-session-wait)
 * [`aoe session rename`↴](#aoe-session-rename)
+* [`aoe session move`↴](#aoe-session-move)
 * [`aoe session set-worktree-name`↴](#aoe-session-set-worktree-name)
 * [`aoe session capture`↴](#aoe-session-capture)
 * [`aoe session current`↴](#aoe-session-current)
@@ -112,6 +113,11 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe hooks status`↴](#aoe-hooks-status)
 * [`aoe hooks approve`↴](#aoe-hooks-approve)
 * [`aoe serve`↴](#aoe-serve)
+* [`aoe daemon`↴](#aoe-daemon)
+* [`aoe daemon start`↴](#aoe-daemon-start)
+* [`aoe daemon stop`↴](#aoe-daemon-stop)
+* [`aoe daemon status`↴](#aoe-daemon-status)
+* [`aoe daemon restart`↴](#aoe-daemon-restart)
 * [`aoe url`↴](#aoe-url)
 * [`aoe acp`↴](#aoe-acp)
 * [`aoe acp doctor`↴](#aoe-acp-doctor)
@@ -174,6 +180,7 @@ Run without arguments to launch the TUI dashboard.
 * `skill` — Query and manage agent skills
 * `hooks` — Let AoE write agent hooks into each agent's own config, for every agent and every profile
 * `serve` — Start the aoe daemon: REST/WebSocket API, plus the web dashboard in builds that embed it
+* `daemon` — Control the background aoe daemon; each verb is the matching `aoe serve` flag (`--daemon`, `--stop`, `--status`, `--restart`)
 * `url` — Print the URL of a running `aoe serve` daemon
 * `acp` — Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 * `uninstall` — Uninstall Agent of Empires
@@ -423,6 +430,7 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `show` — Show session details
 * `wait` — Block until a session's agent activity status matches one of the `--until` values. Exits 0 on a match, 124 on timeout (like `timeout(1)`), and 1 if the session stops. Tmux sessions only
 * `rename` — Rename a session
+* `move` — Move sessions to another profile. Sessions that look active when the command starts are refused; one that starts mid-batch can still move. Each keeps its title, group and worktree; the target profile's config applies from the next start
 * `set-worktree-name` — Edit a managed worktree session's workdir directory name (and, optionally, its git branch). Moves the worktree directory in place; the session must not be running. See #1723
 * `capture` — Capture tmux pane output
 * `current` — Auto-detect current session
@@ -552,6 +560,22 @@ Rename a session
 * `-g`, `--group <GROUP>` — New group for the session (empty string to ungroup)
 * `--rename-branch` — When the session is tied (session.tie_workdir_to_name) and an aoe-managed worktree, also rename the underlying git branch to match. Off by default; ignored for untied / non-worktree sessions
 * `--branch <BRANCH>` — Rename the Git branch without moving the worktree directory
+
+
+
+## `aoe session move`
+
+Move sessions to another profile. Sessions that look active when the command starts are refused; one that starts mid-batch can still move. Each keeps its title, group and worktree; the target profile's config applies from the next start
+
+**Usage:** `aoe session move --to-profile <TO_PROFILE> <IDENTIFIERS>...`
+
+###### **Arguments:**
+
+* `<IDENTIFIERS>` — Session IDs or titles to move
+
+###### **Options:**
+
+* `--to-profile <TO_PROFILE>` — Destination profile; it must already exist
 
 
 
@@ -1751,13 +1775,60 @@ Start the aoe daemon: REST/WebSocket API, plus the web dashboard in builds that 
 * `--tunnel-url <TUNNEL_URL>` — Hostname for a named tunnel (e.g., aoe.example.com)
 * `--daemon` — Run as a background daemon (detach from terminal)
 * `--stop` — Stop a running daemon
-* `--status` — Print the running daemon's PID, mode, URLs, and log path. Exits non-zero when no daemon is running. Useful for shell scripts that want to know whether a daemon is up without parsing `ps`.
+* `--status` — Print the local daemon's PID, mode, URLs, and log path. With `AOE_DAEMON_URL` set, report the remote daemon's reachability and token state instead. Exits non-zero when no daemon is running. Useful for shell scripts that want to know whether a daemon is up without parsing `ps`.
 
    `--status` is read-only and incompatible with every flag that would change daemon state (`--stop`, `--daemon`, `--remote`) or the bind config of a fresh daemon (`--no-auth`, `--auth`, `--behind-proxy`, `--read-only`, `--passphrase`, `--port`, `--tunnel-name`, `--no-tailscale`, `--tunnel-url`, `--open`, `--allowed-host`, `--allowed-origin`). Clap reports the misuse instead of silently ignoring the extras.
 * `--passphrase <PASSPHRASE>` — Require a passphrase for login (second-factor auth). Can also be set via AOE_SERVE_PASSPHRASE environment variable
 * `--open` — Open the dashboard URL in the default browser once the server is ready. Ignored in a build with no dashboard bundle, under --daemon or --remote, and whenever no browser the user could see is reachable (see `tui::open_url`): over SSH without a forwarded display, or on Linux/BSD with no display server. `BROWSER` overrides the check on platforms whose launcher reads it, which excludes macOS
 * `--restart` — Restart the running managed daemon with its recorded policy. Missing credentials are rejected before stopping it
 * `--rollback` — Restore the retained managed launch, including a core replaced by the dashboard
+
+
+
+## `aoe daemon`
+
+Control the background aoe daemon; each verb is the matching `aoe serve` flag (`--daemon`, `--stop`, `--status`, `--restart`)
+
+**Usage:** `aoe daemon <COMMAND>`
+
+###### **Subcommands:**
+
+* `start` — Start the daemon in the background (`aoe serve --daemon`)
+* `stop` — Stop the running daemon (`aoe serve --stop`)
+* `status` — Print the daemon's PID, mode, URLs and log path, or remote reachability with `AOE_DAEMON_URL` (`aoe serve --status`)
+* `restart` — Restart the daemon with its persisted launch config (`aoe serve --restart`)
+
+
+
+## `aoe daemon start`
+
+Start the daemon in the background (`aoe serve --daemon`)
+
+**Usage:** `aoe daemon start`
+
+
+
+## `aoe daemon stop`
+
+Stop the running daemon (`aoe serve --stop`)
+
+**Usage:** `aoe daemon stop`
+
+
+
+## `aoe daemon status`
+
+Print the daemon's PID, mode, URLs and log path, or remote reachability with `AOE_DAEMON_URL` (`aoe serve --status`)
+
+**Usage:** `aoe daemon status`
+
+
+
+## `aoe daemon restart`
+
+Restart the daemon with its persisted launch config (`aoe serve --restart`)
+
+**Usage:** `aoe daemon restart`
 
 
 

@@ -13,7 +13,7 @@ import {
   type SidebarWorkspaceView,
 } from "../../lib/sidebarGroups";
 import { workspaceIsPinned, workspaceIsSunk } from "../../lib/sidebarSort";
-import { DragSuppressContext, typedClosestCenter } from "./dnd";
+import { dragEnded, dragStarted, typedClosestCenter, useReleaseDragOnUnmount, type DragClickGuard } from "./dnd";
 import { SessionRow } from "./SessionRow";
 import { SidebarGroupHeader } from "./SidebarGroupHeader";
 import { SortableRepoGroup, SortableSessionRow } from "./Sortable";
@@ -89,7 +89,7 @@ export function FlatGroupList({
   onToggleGroup,
   onReorderGroups,
   onReorderWorkspaces,
-  dragSuppressRef,
+  dragClickGuard,
 }: {
   ctx: ListContext;
   groups: SidebarGroup[];
@@ -99,8 +99,9 @@ export function FlatGroupList({
   onToggleGroup: (groupId: string) => void;
   onReorderGroups: (orderedGroupIds: string[]) => void;
   onReorderWorkspaces: (newOrder: string[]) => void;
-  dragSuppressRef: React.MutableRefObject<number>;
+  dragClickGuard: React.MutableRefObject<DragClickGuard>;
 }) {
+  useReleaseDragOnUnmount(dragClickGuard);
   // Desktop activates on distance so a still click navigates; touch needs a hold so flicks scroll.
   const sensors = useSensors(
     useSensor(MouseSensor, { activationConstraint: { distance: 8 } }),
@@ -164,21 +165,24 @@ export function FlatGroupList({
   };
 
   return (
-    <DragSuppressContext.Provider value={dragSuppressRef}>
-      <DndContext
-        sensors={sensors}
-        collisionDetection={typedClosestCenter}
-        onDragEnd={reorderDisabled ? undefined : handleDragEnd}
-      >
-        <SortableContext items={liveGroups.map((g) => g.id)} strategy={verticalListSortingStrategy}>
-          {liveGroups.map((group) => (
-            <SortableRepoGroup key={group.id} groupId={group.id} disabled={groupDragDisabled}>
-              {(handle) => body(group, groupDragDisabled ? undefined : handle)}
-            </SortableRepoGroup>
-          ))}
-        </SortableContext>
-      </DndContext>
-    </DragSuppressContext.Provider>
+    <DndContext
+      sensors={sensors}
+      collisionDetection={typedClosestCenter}
+      onDragStart={() => dragStarted(dragClickGuard.current)}
+      onDragEnd={(event) => {
+        dragEnded(dragClickGuard.current);
+        if (!reorderDisabled) handleDragEnd(event);
+      }}
+      onDragCancel={() => dragEnded(dragClickGuard.current)}
+    >
+      <SortableContext items={liveGroups.map((g) => g.id)} strategy={verticalListSortingStrategy}>
+        {liveGroups.map((group) => (
+          <SortableRepoGroup key={group.id} groupId={group.id} disabled={groupDragDisabled}>
+            {(handle) => body(group, groupDragDisabled ? undefined : handle)}
+          </SortableRepoGroup>
+        ))}
+      </SortableContext>
+    </DndContext>
   );
 }
 

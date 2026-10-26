@@ -25,6 +25,8 @@ interface Props {
   pluginPanes: PluginPane[];
   onBackToAgent: () => void;
   onOpenAgentsPane: () => void;
+  /** Opens the switch-view confirmation for that Session; omitted where it can't switch. */
+  onSwitchToTerminal?: (sessionId: string) => void;
   pairedMounted: boolean;
   activeSession: SessionResponse | null;
   activeSessionId: string | null;
@@ -69,6 +71,7 @@ export function MobileMainPane({
   pluginPanes,
   onBackToAgent,
   onOpenAgentsPane,
+  onSwitchToTerminal,
   pairedMounted,
   activeSession,
   activeSessionId,
@@ -150,6 +153,7 @@ export function MobileMainPane({
                     fileRefSession={session}
                     onOpenAgentsPane={onOpenAgentsPane}
                     isSandboxed={session.is_sandboxed}
+                    onSwitchToTerminal={onSwitchToTerminal ? () => onSwitchToTerminal(session.id) : undefined}
                   />
                 </Suspense>
               )}

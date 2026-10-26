@@ -2045,30 +2045,35 @@ impl Instance {
                 })?;
                 let mut store = root.clone();
                 if let Some((sid, binding, explicit)) = target {
-                    if let Some(binding) = binding.filter(|binding| binding.session_id == sid) {
-                        if let Some(file) = &binding.transcript_path {
-                            anyhow::ensure!(binding.execution.as_ref().is_some_and(|source| source.filesystem == "host"), "Pi transcript filesystem is unsupported");
-                            let native = inputs.native_transcript_path(file, &root)?;
-                            let parent = native.parent().context("Pi transcript has no parent directory")?;
-                            anyhow::ensure!(native.starts_with(&root) && (!custom || parent == root), "Pi transcript does not belong to the configured session directory");
-                            let directory = crate::session::AnchoredDir::open(file.parent().context("Pi transcript has no parent")?)?;
-                            match directory.regular_lookup(std::path::Path::new(file.file_name().context("Pi transcript has no filename")?))? {
-                                Some(true) => {
-                                    let (header_sid, _) = crate::session::capture::extract_pi_header_fields(file).context("Pi transcript has no readable session header")?;
-                                    anyhow::ensure!(header_sid.as_deref() == Some(sid), "Pi transcript names a different conversation");
-                                    pi_transcript_path = Some(native.to_str().context("Pi transcript path is not UTF-8")?.to_owned());
-                                }
-                                None => anyhow::ensure!(!explicit && file.file_name().and_then(|name| name.to_str()).and_then(|name| name.rsplit_once('_')).and_then(|(_, tail)| tail.strip_suffix(".jsonl")) == Some(sid), "explicit Pi resume requires a materialized transcript"),
-                                Some(false) => anyhow::bail!("Pi transcript is not a regular file"),
+                    let binding = binding.filter(|binding| binding.session_id == sid);
+                    let bound = binding.and_then(|binding| binding.transcript_path.clone());
+                    let file = bound.clone().or_else(|| {
+                        (!explicit && inputs.container.is_none())
+                            .then(|| crate::session::capture::find_pi_transcript(&root, sid, !custom))
+                            .flatten()
+                    });
+                    if let Some(file) = &file {
+                        anyhow::ensure!(bound.is_none() || binding.is_some_and(|binding| binding.execution.as_ref().is_some_and(|source| source.filesystem == "host")), "Pi transcript filesystem is unsupported");
+                        let native = inputs.native_transcript_path(file, &root)?;
+                        let parent = native.parent().context("Pi transcript has no parent directory")?;
+                        anyhow::ensure!(native.starts_with(&root) && (!custom || parent == root), "Pi transcript does not belong to the configured session directory");
+                        let directory = crate::session::AnchoredDir::open(file.parent().context("Pi transcript has no parent")?)?;
+                        match directory.regular_lookup(std::path::Path::new(file.file_name().context("Pi transcript has no filename")?))? {
+                            Some(true) => {
+                                let (header_sid, _) = crate::session::capture::extract_pi_header_fields(file).context("Pi transcript has no readable session header")?;
+                                anyhow::ensure!(header_sid.as_deref() == Some(sid), "Pi transcript names a different conversation");
+                                pi_transcript_path = Some(native.to_str().context("Pi transcript path is not UTF-8")?.to_owned());
                             }
-                            store = parent.to_path_buf();
-                            if session_dir.is_none() {
-                                namespace_arguments.extend(["--session-dir".into(), store.to_str().context("Pi store path is not UTF-8")?.into()]);
-                            }
-                        } else {
-                            anyhow::ensure!(!explicit && binding.provenance == ConversationProvenance::Preallocated,
-                                "Pi resume requires its exact transcript path; rebind with aoe session set-session-id and --store pointing to the transcript");
+                            None => anyhow::ensure!(!explicit && file.file_name().and_then(|name| name.to_str()).and_then(|name| name.rsplit_once('_')).and_then(|(_, tail)| tail.strip_suffix(".jsonl")) == Some(sid), "explicit Pi resume requires a materialized transcript"),
+                            Some(false) => anyhow::bail!("Pi transcript is not a regular file"),
                         }
+                        store = parent.to_path_buf();
+                        if session_dir.is_none() {
+                            namespace_arguments.extend(["--session-dir".into(), store.to_str().context("Pi store path is not UTF-8")?.into()]);
+                        }
+                    } else if let Some(binding) = binding {
+                        anyhow::ensure!(!explicit && binding.provenance == ConversationProvenance::Preallocated,
+                            "Pi resume requires its exact transcript path; rebind with aoe session set-session-id and --store pointing to the transcript");
                     }
                 }
                 pi_root = Some(if namespace_arguments.is_empty() { root } else { store.clone() });
@@ -4193,5 +4198,73 @@ mod tests {
             .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
             .map(|(_, value)| value.as_deref());
         assert_eq!(routed, Some(resolved.to_str()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pi_row_without_a_recorded_path_resumes_from_the_transcript_found_by_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _pi = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "pi",
+            "#!/bin/sh\nexit 0\n",
+        );
+        std::fs::create_dir_all(temp.path().join("pi-agent")).unwrap();
+        let agent_dir = temp.path().join("pi-agent").canonicalize().unwrap();
+        let sid = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+        let store = agent_dir.join("sessions/--moved-project--");
+        std::fs::create_dir_all(&store).unwrap();
+        let transcript = store.join(format!("2026-01-01T00-00-00-000Z_{sid}.jsonl"));
+        std::fs::write(
+            &transcript,
+            format!("{}\n", serde_json::json!({"type": "session", "id": sid})),
+        )
+        .unwrap();
+        let profile = "pi-transcript-by-id";
+        let path =
+            crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "[session.agent_config_dir]\npi = {:?}\n",
+                agent_dir.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(profile);
+        let mut inst = Instance::new("pi-by-id", temp.path().to_str().unwrap());
+        inst.source_profile = profile.into();
+        inst.tool = "pi".into();
+
+        let native = inst
+            .resolve_native_execution(Some((sid, None, false)))
+            .unwrap();
+        assert_eq!(
+            native.pi_transcript_path.as_deref(),
+            transcript.to_str(),
+            "the row owns an id and no path: the transcript is found by id"
+        );
+        assert!(native
+            .namespace_arguments
+            .windows(2)
+            .any(|pair| pair[0] == "--session-dir" && pair[1] == store.to_str().unwrap()));
+
+        let migrated = ConversationBinding::unknown(sid);
+        let native = inst
+            .resolve_native_execution(Some((sid, Some(&migrated), false)))
+            .unwrap();
+        assert_eq!(
+            native.pi_transcript_path.as_deref(),
+            transcript.to_str(),
+            "a migrated id-only binding has no execution; the discovered host transcript still resumes"
+        );
+
+        let unknown = "bbbbbbbb-1111-4111-8111-bbbbbbbbbbbb";
+        let fresh = inst
+            .resolve_native_execution(Some((unknown, None, false)))
+            .unwrap();
+        assert_eq!(fresh.pi_transcript_path, None, "no transcript, no selector");
     }
 }

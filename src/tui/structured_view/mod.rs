@@ -2120,6 +2120,7 @@ mod tests {
                     value: o.to_string(),
                     label: o.to_string(),
                     description: None,
+                    preview: None,
                 })
                 .collect(),
             min_items: None,

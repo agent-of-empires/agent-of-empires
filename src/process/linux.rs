@@ -1576,7 +1576,6 @@ pub(crate) mod runtime_io {
     pub(crate) struct Stat {
         pub st_mode: u32,
         pub st_uid: u32,
-        pub st_gid: u32,
         pub st_dev: u64,
         pub st_ino: u64,
         pub st_nlink: libc::nlink_t,
@@ -1585,7 +1584,6 @@ pub(crate) mod runtime_io {
         Stat {
             st_mode: stat.st_mode,
             st_uid: stat.st_uid,
-            st_gid: stat.st_gid,
             st_dev: stat.st_dev,
             st_ino: stat.st_ino,
             st_nlink: stat.st_nlink,

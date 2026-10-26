@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 import { RateLimitRecoverySection, SystemNotices } from "./SystemNotices";
+import { emptyAcpState } from "../../lib/acpTypes";
+import { isNewSessionStarting } from "./startupWait";
 
 vi.mock("../../lib/api", () => ({
   fetchAcpAgents: vi.fn(),
@@ -40,6 +42,50 @@ function noticeProps(overrides?: Partial<NoticeProps>): NoticeProps {
 const mount = (overrides?: Partial<NoticeProps>) => render(<SystemNotices {...noticeProps(overrides)} />);
 
 describe("SystemNotices", () => {
+  // The startup wait line covers a new Session's first connection; reconnect lines stay.
+  it.each<[string, Partial<NoticeProps>, RegExp | null]>([
+    ["first connect while starting", { status: "connecting", hasEverOpened: false, newSessionStarting: true }, null],
+    ["first connect error while starting", { status: "error", hasEverOpened: false, newSessionStarting: true }, null],
+    [
+      "a first-connection retry while starting",
+      { status: "error", reconnecting: true, retryCount: 1, hasEverOpened: false, newSessionStarting: true },
+      null,
+    ],
+    ["a closed socket while starting", { status: "closed", hasEverOpened: false, newSessionStarting: true }, null],
+    [
+      "a retry once the Session has connected",
+      { status: "error", reconnecting: true, retryCount: 1, hasEverOpened: true, newSessionStarting: true },
+      /Structured view disconnected\. Reconnecting \(1\/7\)/,
+    ],
+    [
+      "a reconnect",
+      { status: "connecting", hasEverOpened: true, newSessionStarting: true },
+      /Reconnecting to structured view/,
+    ],
+    [
+      "a disconnect",
+      { status: "error", hasEverOpened: true, newSessionStarting: false },
+      /Structured view reconnecting/,
+    ],
+  ])("%s", (_label, overrides, expected) => {
+    const { container } = mount(overrides);
+    if (expected) expect(container.textContent).toMatch(expected);
+    else expect(container.textContent).toBe("");
+  });
+
+  it.each([false, true])("offers recovery after retry exhaustion (previously connected: %s)", (hasEverOpened) => {
+    const props = noticeProps({ status: "closed", hasEverOpened, retryCount: 7 });
+    const starting = isNewSessionStarting(emptyAcpState(), props, "resuming");
+    const { getByRole, queryByText } = render(<SystemNotices {...props} newSessionStarting={starting} />);
+    expect(starting).toBe(false);
+    expect(
+      queryByText(hasEverOpened ? "Connection lost. Auto-retry stopped." : "Could not connect. Auto-retry stopped."),
+    ).not.toBeNull();
+    expect(queryByText(/Starting|Retrying|Reconnecting/)).toBeNull();
+    fireEvent.click(getByRole("button", { name: "Reconnect" }));
+    expect(props.manualReconnect).toHaveBeenCalledOnce();
+  });
+
   it.each([
     [true, /Auto-resume is armed/],
     [false, /Auto-resume is off for this profile/],

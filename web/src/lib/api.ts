@@ -1806,26 +1806,45 @@ export interface InstallAgentResponse {
   recovered_sessions: number;
 }
 
-/** Run `npm install -g` for the session's agent on the host. Opt-in and
- *  hardened server-side (see `install_agent` in src/server/api/acp.rs).
- *  Resolves with the parsed body on 2xx; throws with the server's error
- *  message on failure (disabled, sandboxed, not npm-installable, npm
- *  missing) so the caller can surface why. The caller respawns the worker
- *  separately via `useRespawnSession` on `success`. */
+/** A refused install; `code` is the server's error code, such as `npm_missing`. */
+export class InstallAgentError extends Error {
+  readonly code: string | undefined;
+  constructor(message: string, code: string | undefined) {
+    super(message);
+    this.code = code;
+  }
+}
+
+/** Run `npm install -g` for the session's agent where it runs; throws `InstallAgentError` when refused. */
 export async function installAcpAgent(sessionId: string): Promise<InstallAgentResponse> {
   const { ok, status, payload } = await send(`/api/sessions/${encodeURIComponent(sessionId)}/acp/install-agent`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
   });
-  if (!ok) throw new Error(rawMessage(payload) || (payload?.error as string) || `Server returned ${status}`);
+  if (!ok) {
+    const code = stringField(payload, "error");
+    throw new InstallAgentError(rawMessage(payload) || code || `Server returned ${status}`, code);
+  }
   if (!payload) throw new Error("Server returned an invalid or empty response");
   return payload as unknown as InstallAgentResponse;
 }
 
-/** Fetch a markdown primer built from events `seq < beforeSeq`. Used
- *  after a `session/load` failure: the agent's model context is empty
- *  but the transcript is intact in SQLite, so the user can opt in to
- *  pre-filling the composer with a compact recap. See #1004. */
+/** How to install a session's ACP adapter, from `GET /acp/install-info`. */
+export interface AgentInstallInfo {
+  agent: string;
+  display_name: string;
+  install_command: string | null;
+  npm_installable: boolean;
+  /** Whether `install-agent` would accept a request now. */
+  install_allowed: boolean;
+  sandboxed: boolean;
+}
+
+export function fetchAgentInstallInfo(sessionId: string): Promise<AgentInstallInfo | null> {
+  return fetchJson<AgentInstallInfo>(`/api/sessions/${encodeURIComponent(sessionId)}/acp/install-info`);
+}
+
+/** Markdown recap of events `seq < beforeSeq`, offered after a `session/load` failure. */
 export function fetchContextPrimer(
   sessionId: string,
   beforeSeq: number,
@@ -1908,8 +1927,10 @@ export async function browseFilesystem(
   return { ...data, ok: true };
 }
 
-export async function fetchGroups(): Promise<GroupInfo[]> {
-  return (await fetchJson<GroupInfo[]>("/api/groups")) ?? [];
+/** The profile's groups, sorted by path; the served profile when omitted. */
+export async function fetchGroups(profile?: string): Promise<GroupInfo[]> {
+  const query = profile ? `?profile=${encodeURIComponent(profile)}` : "";
+  return (await fetchJson<GroupInfo[]>(`/api/groups${query}`)) ?? [];
 }
 
 /** Resolve a plugin `dynamic_select` widget's options from the host (#2897).

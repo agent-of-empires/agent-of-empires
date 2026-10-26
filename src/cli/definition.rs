@@ -241,6 +241,13 @@ pub enum Commands {
     /// builds that embed it
     Serve(ServeArgs),
 
+    /// Control the background aoe daemon; each verb is the matching `aoe serve`
+    /// flag (`--daemon`, `--stop`, `--status`, `--restart`)
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommands,
+    },
+
     /// Print the URL of a running `aoe serve` daemon
     Url(UrlArgs),
 
@@ -285,6 +292,42 @@ pub enum Commands {
     },
 }
 
+#[derive(Subcommand, Clone, Copy)]
+pub enum DaemonCommands {
+    /// Start the daemon in the background (`aoe serve --daemon`)
+    Start,
+    /// Stop the running daemon (`aoe serve --stop`)
+    Stop,
+    /// Print the daemon's PID, mode, URLs and log path, or remote reachability with `AOE_DAEMON_URL` (`aoe serve --status`)
+    Status,
+    /// Restart the daemon with its persisted launch config (`aoe serve --restart`)
+    Restart,
+}
+
+impl Commands {
+    /// Rewrites `aoe daemon <verb>` into the equivalent `aoe serve` command so
+    /// both spellings share every startup and gating path.
+    pub fn resolve_daemon_alias(self) -> Self {
+        let Commands::Daemon { command } = self else {
+            return self;
+        };
+        let flag = match command {
+            DaemonCommands::Start => "--daemon",
+            DaemonCommands::Stop => "--stop",
+            DaemonCommands::Status => "--status",
+            DaemonCommands::Restart => "--restart",
+        };
+        let args = ServeCli::parse_from(["serve", flag]).args;
+        Commands::Serve(args)
+    }
+}
+
+#[derive(Parser)]
+struct ServeCli {
+    #[command(flatten)]
+    args: ServeArgs,
+}
+
 pub const CLI_COMMAND_NAMES: &[&str] = &[
     "add",
     "agents",
@@ -297,6 +340,7 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
     "send",
     "status",
     "killall",
+    "daemon",
     "session",
     "group",
     "plugin",
@@ -335,6 +379,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::Send(_) => "send",
         Commands::Status(_) => "status",
         Commands::Killall(_) => "killall",
+        Commands::Daemon { .. } => "daemon",
         Commands::Stop { .. } => return None,
         Commands::Session { .. } => "session",
         Commands::Group { .. } => "group",
@@ -368,6 +413,35 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn daemon_verbs_resolve_to_the_serve_lifecycle_flags() {
+        for (verb, expect) in [
+            ("start", "--daemon"),
+            ("stop", "--stop"),
+            ("status", "--status"),
+            ("restart", "--restart"),
+        ] {
+            let alias = Cli::try_parse_from(["aoe", "daemon", verb]).expect("parse");
+            let Some(Commands::Serve(got)) = alias.command.map(Commands::resolve_daemon_alias)
+            else {
+                panic!("daemon {verb} did not resolve to serve");
+            };
+            let Some(Commands::Serve(want)) = Cli::try_parse_from(["aoe", "serve", expect])
+                .expect("parse")
+                .command
+            else {
+                unreachable!()
+            };
+            assert_eq!(
+                (got.daemon, got.stop, got.status, got.restart),
+                (want.daemon, want.stop, want.status, want.restart),
+                "daemon {verb}"
+            );
+            assert_eq!(got.resolved_port(), want.resolved_port());
+            assert_eq!(got.host, want.host);
+        }
+    }
 
     #[test]
     fn command_name_is_allowlisted_and_identifier_safe() {

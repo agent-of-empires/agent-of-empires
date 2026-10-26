@@ -931,6 +931,7 @@ done
                 });
                 events.push(Event::AgentMessageChunk {
                     text: "prior assistant turn".into(),
+                    message_id: None,
                 });
             }
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);

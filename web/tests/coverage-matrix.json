@@ -147,7 +147,7 @@
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/components/__tests__/DashboardUpdateBanner.test.tsx", "src/lib/webBuildId.test.ts"],
-      "components": ["web/src/components/DashboardUpdateBanner.tsx"]
+      "components": ["web/src/components/DashboardUpdateBanner.tsx", "web/src/hooks/useDashboardUpdate.ts"]
     },
     {
       "id": "app-shell.loading-skeleton",
@@ -1864,8 +1864,14 @@
       "id": "sidebar.reorder-click-after-drag-suppressed",
       "kind": "mocked-playwright",
       "risk": "high",
-      "specs": ["tests/sidebar-reorder.spec.ts"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+      "specs": ["tests/sidebar-reorder.spec.ts", "src/components/sidebar/dnd.test.ts"],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/SidebarGroupHeader.tsx",
+        "web/src/components/sidebar/dnd.ts",
+        "web/src/components/sidebar/Sortable.tsx"
+      ],
+      "notes": "End, cancel and mid-drag unmount suppress only the release click; a fresh press disarms the guard. Browser regressions observe installation and removal of the sensor click listener before one deliberate click, without a fixed delay or click retries."
     },
     {
       "id": "sidebar.reorder-cross-group-noop",
@@ -2272,6 +2278,14 @@
       "notes": "A prompt a plugin sent through sessions.message.send carries a \"Sent by plugin\" label instead of passing for the user's own; the server stamps the sender on the row, and Send now on a queued row names it so the daemon keeps that sender."
     },
     {
+      "id": "acp.agent-message-boundaries",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/acp/activityMessages.test.ts", "tests/live/acp-transcript.spec.ts"],
+      "components": ["web/src/components/acp/activityMessages.ts", "web/src/lib/acpTypes.ts"],
+      "notes": "Back-to-back agent messages render as separate paragraphs: the server marks the row that opens a new ACP message (message_start), and only that mark breaks the text, so one streamed message never splits mid-word."
+    },
+    {
       "id": "acp.tool-group-chunking",
       "kind": "vitest",
       "risk": "medium",
@@ -2663,7 +2677,9 @@
         "web/src/components/DisconnectBanner.tsx",
         "web/src/components/UpdateBanner.tsx",
         "web/src/components/DashboardUpdateBanner.tsx",
-        "web/src/components/PushHealthBanner.tsx"
+        "web/src/components/PushHealthBanner.tsx",
+        "web/src/hooks/useConnectionBanner.ts",
+        "web/src/hooks/useUpdateBanner.ts"
       ]
     },
     {
@@ -3485,18 +3501,56 @@
       "components": ["web/src/components/acp/ToolErrorBody.tsx"]
     },
     {
+      "id": "acp.startup-wait-line",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/acp/__tests__/SessionBanners.test.tsx",
+        "src/components/acp/startupWait.test.ts",
+        "src/lib/agentDisplayName.test.ts",
+        "src/components/acp/SystemNotices.test.tsx",
+        "src/components/acp/QueuedPromptsStrip.test.tsx",
+        "src/components/acp/SendButton.test.tsx",
+        "tests/acp-startup-wait.spec.ts"
+      ],
+      "components": [
+        "web/src/components/acp/startupWait.ts",
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/SessionBanners.tsx",
+        "web/src/components/acp/SystemNotices.tsx",
+        "web/src/components/acp/PromptStrips.tsx",
+        "web/src/components/acp/ComposerControls.tsx"
+      ],
+      "notes": "A new Session shows one startup line naming the Agent with an elapsed count, switching to a neutral line at 15s with no duration or delivery promise; the queued strip and Send button say what they wait for. Reduced motion holds one breathe frame. First-dial backoff keeps the startup line; exhausted retries stop it and expose Reconnect even before the first successful connection. The disconnected new-Session Send and Queue follow-up labels and titles use Pending until the Agent is ready; connected Send and resumed-Session copy remain unchanged."
+    },
+    {
       "id": "acp.startup-error-screen",
       "kind": "vitest",
       "risk": "high",
       "specs": ["src/components/acp/__tests__/StartupErrorScreen.test.tsx"],
-      "components": ["web/src/components/acp/StartupErrorScreen.tsx"]
+      "components": ["web/src/components/acp/StartupErrorScreen.tsx", "web/src/components/acp/RecoveryActionRow.tsx"]
     },
     {
       "id": "acp.startup-error-banner",
       "kind": "vitest",
       "risk": "high",
       "specs": ["src/components/acp/__tests__/StartupErrorBanner.test.tsx"],
-      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/StartupErrorBanner.tsx"]
+      "components": [
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/StartupErrorBanner.tsx",
+        "web/src/components/acp/RecoveryActionRow.tsx"
+      ]
+    },
+    {
+      "id": "acp.startup-error-banner-actions",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/acp-startup-error-banner.spec.ts"],
+      "components": [
+        "web/src/components/acp/StartupErrorBanner.tsx",
+        "web/src/components/acp/RecoveryActionRow.tsx",
+        "web/src/App.tsx"
+      ]
     },
     {
       "id": "acp.startup-error-banner-live",
@@ -4349,9 +4403,10 @@
     {
       "id": "story.wizard-group-field",
       "kind": "mocked-playwright",
-      "risk": "low",
-      "specs": ["tests/wizard.spec.ts"],
-      "components": ["web/src/components/session-wizard/steps/WorktreePanel.tsx"]
+      "risk": "medium",
+      "specs": ["tests/wizard.spec.ts", "src/components/session-wizard/__tests__/GroupCombobox.test.tsx"],
+      "components": ["web/src/components/session-wizard/steps/GroupCombobox.tsx"],
+      "notes": "The Group field reads the selected canonical daemon profile and counts only non-archived, non-trashed sessions. Selecting a create row commits its displayed trimmed path; Esc and blur keep typed text. The popup opens upward inside the sheet when needed."
     },
     {
       "id": "story.wizard-extra-repos",
