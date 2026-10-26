@@ -261,8 +261,10 @@ describe("StartupErrorBanner auth remediation", () => {
     const message = `Failed to start structured view agent "${agent}": authentication required`;
     const { findByTestId } = renderBanner({ message });
     const banner = await findByTestId("startup-error-banner");
-    await waitFor(() => expect(banner.textContent).not.toContain("usually missing"));
-    for (const text of present) expect(banner.textContent).toContain(text);
+    await waitFor(() => {
+      for (const text of present) expect(banner.textContent).toContain(text);
+    });
+    expect(banner.textContent).not.toContain("usually missing");
     for (const text of absent) expect(banner.textContent).not.toContain(text);
   });
 });
