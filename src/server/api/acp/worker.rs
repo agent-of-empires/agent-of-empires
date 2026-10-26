@@ -353,8 +353,11 @@ pub async fn restart_acp(
         return response;
     }
 
-    let was_resuming =
-        state.acp_supervisor.worker_state(&id).await == crate::daemon::AcpWorkerState::Resuming;
+    let stop_request = state
+        .acp_supervisor
+        .begin_stop_request(&id, "user_stopped", None, false)
+        .await;
+    let was_resuming = stop_request.cancelled_launch();
     // A running worker must finish its current submission before restart
     // tears it down. Hold only this barrier here; the full launch exclusion
     // also owns the instance lock and would block an external stop.
@@ -370,13 +373,9 @@ pub async fn restart_acp(
         };
         Some(submission)
     };
-    // An in-flight resume cannot hold the submission barrier while waiting for
-    // shutdown, so cancel its launch before waiting for the exclusion guards.
-    let stop_request = if was_resuming {
-        let stop_request = state
-            .acp_supervisor
-            .begin_stop_request(&id, "user_stopped", None, false)
-            .await;
+    // The stop request shares the installation gate, so a launch either gets
+    // cancelled here or is observed as running and stopped after the barrier.
+    if was_resuming {
         if let Err(e) = state
             .acp_supervisor
             .shutdown_and_wait_for_restart(&id, std::time::Duration::from_secs(5), &restart)
@@ -384,10 +383,7 @@ pub async fn restart_acp(
         {
             return supervisor_error_response("restart shutdown failed", &e);
         }
-        Some(stop_request)
-    } else {
-        None
-    };
+    }
 
     if restart.is_cancelled() {
         return supervisor_error_response(
@@ -440,23 +436,15 @@ pub async fn restart_acp(
         );
     }
     // Running workers are stopped only after the submission barrier is held.
-    let stop_request = match stop_request {
-        Some(stop_request) => stop_request,
-        None => {
-            let stop_request = state
-                .acp_supervisor
-                .begin_stop_request(&id, "user_stopped", None, false)
-                .await;
-            if let Err(e) = state
-                .acp_supervisor
-                .shutdown_and_wait_for_restart(&id, std::time::Duration::from_secs(5), &restart)
-                .await
-            {
-                return supervisor_error_response("restart shutdown failed", &e);
-            }
-            stop_request
+    if !was_resuming {
+        if let Err(e) = state
+            .acp_supervisor
+            .shutdown_and_wait_for_restart(&id, std::time::Duration::from_secs(5), &restart)
+            .await
+        {
+            return supervisor_error_response("restart shutdown failed", &e);
         }
-    };
+    }
     if restart.is_cancelled() {
         return supervisor_error_response(
             "restart cancelled by a stop request",

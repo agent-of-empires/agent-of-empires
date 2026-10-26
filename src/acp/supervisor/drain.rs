@@ -576,15 +576,9 @@ impl<S: BroadcastSink> Drain<S> {
         if let Some((wrapper, base)) = &config.wrapper_substitution {
             log_wrapper_substitution(session_id, &config.tool, wrapper, base);
         }
-        let launched = tokio::select! {
-            launched = (self.launcher)(config.clone(), AcpSessionId(session_id.clone())) => launched,
-            _ = reservation.cancellation().cancelled() => {
-                if lock_recover(&self.lifecycle).convert_to_stopping(&respawn_lease) {
-                    self.finish_cancelled(&respawn_lease, previous).await;
-                }
-                return None;
-            }
-        };
+        // Like spawn_inner, keep the cooperative handshake result so a
+        // concurrent permanent stop can retire its adapter-side session.
+        let launched = (self.launcher)(config.clone(), AcpSessionId(session_id.clone())).await;
         let mut client = match launched {
             Ok(client) => client,
             Err(e) => {
@@ -1515,6 +1509,108 @@ mod tests {
         assert!(
             sup.take_respawned_in_place().is_empty(),
             "a retired replacement never reached the agent"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn permanent_delete_during_respawn_uses_the_replacement_client() {
+        let _home = isolate_home();
+        let control =
+            Arc::new(crate::acp::runner_lifecycle::test_support::FakeProcessControl::default());
+        control.alive(4242).alive(4343);
+        let gate = Gate::default();
+        let (launcher, deleted) = recording_gated_launcher(
+            &gate,
+            4343,
+            "s-resp-delete",
+            "native-replacement",
+            Some(attested_test_birth(4343, 1)),
+        );
+        let sup = Arc::new(
+            Supervisor::new(VecSink::new())
+                .with_process_control(control)
+                .with_launcher(launcher),
+        );
+        save_attested_test_record("s-resp-delete", 4242, 0);
+        let socket = worker_registry::socket_path_for("s-resp-delete").unwrap();
+        let lease = sup
+            .test_install_runner(
+                "s-resp-delete",
+                runner_config(socket),
+                Some(attested_test_identity(4242, 0)),
+            )
+            .await;
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
+        let drain = sup.start_drain_task("s-resp-delete".into(), lease, inbound_rx, None);
+        drop(inbound_tx);
+
+        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+            .await
+            .expect("replacement publishes its adapter session before the gate");
+        assert_eq!(
+            sup.worker_state("s-resp-delete").await,
+            AcpWorkerState::Resuming
+        );
+        let record = worker_registry::load_strict("s-resp-delete")
+            .unwrap()
+            .expect("replacement registry record is published");
+        assert_eq!(
+            record.stored_acp_session_id.as_deref(),
+            Some("native-replacement")
+        );
+        let respawning_lease = sup
+            .capture_retirement("s-resp-delete")
+            .unwrap()
+            .lease
+            .expect("respawn owns a cancellation lease");
+        let cancellation = respawning_lease.cancellation().clone();
+        let cancelled = tokio::spawn(async move { cancellation.cancelled().await });
+        let deletion = {
+            let sup = Arc::clone(&sup);
+            tokio::spawn(async move {
+                sup.shutdown_and_delete_and_wait("s-resp-delete", Duration::from_secs(5))
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), cancelled)
+            .await
+            .expect("permanent delete cancels the respawn")
+            .expect("cancellation observer does not panic");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !lock_recover(&sup.lifecycle).adapter_delete_pending(&respawning_lease) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "permanent delete did not register adapter deletion debt"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !deleted.load(std::sync::atomic::Ordering::SeqCst),
+            "replacement has not returned its client before the gate opens"
+        );
+        gate.open.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), deletion)
+            .await
+            .expect("permanent delete waits for respawn retirement")
+            .expect("delete task does not panic")
+            .expect("delete settles");
+        tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .expect("drain task settles after deletion")
+            .unwrap();
+        assert!(
+            deleted.load(std::sync::atomic::Ordering::SeqCst),
+            "session/delete was sent through the replacement client"
+        );
+        assert!(worker_registry::load_strict("s-resp-delete")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            sup.worker_state("s-resp-delete").await,
+            AcpWorkerState::Absent
         );
     }
 

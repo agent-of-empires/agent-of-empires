@@ -289,6 +289,10 @@ impl StopRequestGuard {
     pub(crate) fn cancelled_target(&self) -> bool {
         self.cancelled_pending > 0 || self.cancelled_launch
     }
+
+    pub(crate) fn cancelled_launch(&self) -> bool {
+        self.cancelled_launch
+    }
 }
 
 impl Drop for RestartRequestGuard {
