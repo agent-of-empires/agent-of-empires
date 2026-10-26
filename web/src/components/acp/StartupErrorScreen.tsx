@@ -21,8 +21,9 @@ function Code({ children }: { children: React.ReactNode }) {
 
 /** install-info, re-read when the page regains focus so a setting turned on in
  *  the TUI unlocks the install without a reload. */
-function useInstallInfo(sessionId: string): AgentInstallInfo | null {
+function useInstallInfo(sessionId: string, detail: IncompatibleAgentDetail): AgentInstallInfo | null {
   const [info, setInfo] = useState<AgentInstallInfo | null>(null);
+  // A new detail means the adapter ran again, for example once its container started.
   useEffect(() => {
     let alive = true;
     // Focus and visibilitychange often fire together; only the latest read may land.
@@ -44,14 +45,14 @@ function useInstallInfo(sessionId: string): AgentInstallInfo | null {
       window.removeEventListener("focus", load);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [sessionId]);
+  }, [sessionId, detail]);
   return info;
 }
 
 /** Replaces the chat when the adapter compatibility check refuses the Session:
  *  the steps that fix it from here, or the command to run by hand. */
 export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: Props) {
-  const info = useInstallInfo(sessionId);
+  const info = useInstallInfo(sessionId, detail);
   const sandboxed = info?.sandboxed ?? isSandboxed;
   const name = info?.display_name ?? null;
   const stepOneId = useId();
@@ -65,7 +66,7 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
     return respawn();
   });
   const failsAgain = installedFor !== null && installedFor !== detail;
-  // Cleared by the next detail, which arrives once the started container runs the adapter again.
+  // A refused Update, cleared by the next detail, which arrives once the started container runs the adapter again.
   const [containerDownFor, setContainerDownFor] = useState<IncompatibleAgentDetail | null>(null);
 
   const hostCommand = "install_command" in detail ? detail.install_command : null;
@@ -76,7 +77,9 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
   const observer = info?.install_blocked === "read_only" || info?.install_blocked === "cityhall";
   const webInstall = !observer && "auto_install" in detail && detail.auto_install;
   const allowed = info?.install_allowed === true;
-  const containerDown = containerDownFor === detail && install.errorCode === "container_not_running";
+  const containerDown =
+    info?.install_blocked === "container_not_running" ||
+    (containerDownFor === detail && install.errorCode === "container_not_running");
   const busy = respawnState === "retrying" || install.state === "installing";
 
   const updateLabel = sandboxed ? "Update in Sandbox & restart" : "Update & restart";
@@ -129,8 +132,8 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
         )}
         {containerDown && (
           <p data-testid="startup-error-container-down" className="mt-3 text-sm text-status-error">
-            This Session's container isn't running, so the update had nowhere to run. Start the container, then update
-            again.
+            This Session's container isn't running, so the update has nowhere to run. Start the container, then update
+            the adapter.
           </p>
         )}
 

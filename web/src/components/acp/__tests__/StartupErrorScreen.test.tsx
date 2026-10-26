@@ -423,6 +423,24 @@ describe("StartupErrorScreen", () => {
     expect(queryByTestId("adapter-install-error")).toBeNull();
   });
 
+  it("a stopped container reported by install-info gets its steps before any click", async () => {
+    const stopped = info({ ...sandbox, install_allowed: false, install_blocked: "container_not_running" });
+    const view = await renderScreen(incompatible(), stopped);
+    const { getByTestId, queryByTestId } = view;
+    const screen = getByTestId("startup-error-screen");
+    expect(getByTestId("startup-error-container-down").textContent).toContain("This Session's container isn't running");
+    expect(buttons(screen)).toEqual(["Start the container"]);
+    expect(stepTitles(getByTestId)).toEqual(["Click Start the container", "Then update the adapter"]);
+
+    fireEvent.click(getByTestId("startup-error-start-container"));
+    spawnCall();
+    fetchAgentInstallInfo.mockResolvedValue(info({ ...sandbox, ...allowed }));
+    view.rerender(<StartupErrorScreen detail={incompatible()} sessionId="s1" />);
+    await waitFor(() => expect(buttons(screen)).toEqual(["Update in Sandbox & restart", "Check again"]));
+    expect(queryByTestId("startup-error-container-down")).toBeNull();
+    expect(getByTestId("startup-error-step-1").getAttribute("data-done")).toBe("true");
+  });
+
   it("fails again: a version failure after the install says it changed nothing", async () => {
     installAcpAgent.mockResolvedValue(installOk());
     const view = await renderScreen(incompatible(), info({ ...sandbox, ...allowed }));
