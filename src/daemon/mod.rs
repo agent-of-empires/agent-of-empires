@@ -649,6 +649,7 @@ impl DaemonClient {
             ProjectMutation::Remove {
                 target,
                 name_or_path,
+                anchored_path,
             } => {
                 let url = self
                     .sessions_url
@@ -657,7 +658,11 @@ impl DaemonClient {
                         transport::path_segment(name_or_path)?
                     ))
                     .map_err(|_| DaemonClientError::Transport)?;
-                self.http.delete(url).query(target)
+                let request = self.http.delete(url).query(target);
+                match anchored_path {
+                    Some(path) => request.query(&[("path", path)]),
+                    None => request,
+                }
             }
         };
         self.request_mutation(request, epoch).await

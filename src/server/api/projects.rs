@@ -39,6 +39,9 @@ pub struct ProjectQuery {
     /// Profile whose registry entries to resolve; defaults to the served profile.
     #[serde(default)]
     pub profile: Option<String>,
+    /// Client-anchored path for a remove, matched alongside the name.
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 fn project_error(status: StatusCode, code: &str, message: &str) -> Response {
@@ -431,19 +434,27 @@ pub async fn delete_project(
         Err(response) => return response,
     };
     let elevated = handler_elevated(&state, session.as_deref(), loopback.is_some()).await;
+    let anchored_path = query.path;
     commit_project(
         state,
         scope,
         query.profile,
         StatusCode::OK,
         move |profile, scope| {
-            projects::remove_guarded(profile, scope, &name, |entry, effect| {
-                if elevated || (entry.overrides.plugin_settings.is_empty() && effect.is_noop()) {
-                    Ok(())
-                } else {
-                    Err(RegistryError::Forbidden(PLUGIN_SETTINGS_ELEVATION.into()))
-                }
-            })
+            projects::remove_guarded(
+                profile,
+                scope,
+                &name,
+                anchored_path.as_deref(),
+                |entry, effect| {
+                    if elevated || (entry.overrides.plugin_settings.is_empty() && effect.is_noop())
+                    {
+                        Ok(())
+                    } else {
+                        Err(RegistryError::Forbidden(PLUGIN_SETTINGS_ELEVATION.into()))
+                    }
+                },
+            )
             .map(|commit| commit.map_result(|removed| ProjectChange::Removed(removed.into())))
         },
     )
@@ -702,6 +713,7 @@ mod tests {
                     Query(ProjectQuery {
                         scope: Some("global".into()),
                         profile: Some("test".into()),
+                        path: None,
                     }),
                     Some(axum::Extension(AuthenticatedSession(session))),
                     None,
@@ -781,6 +793,7 @@ mod tests {
                 Query(ProjectQuery {
                     scope: Some("global".into()),
                     profile: Some("test".into()),
+                    path: None,
                 }),
                 ext(),
                 None,
@@ -870,6 +883,7 @@ mod tests {
                 Query(ProjectQuery {
                     scope: Some("profile".into()),
                     profile: Some("test".into()),
+                    path: None,
                 }),
                 Some(axum::Extension(AuthenticatedSession(session.clone()))),
                 None,
@@ -981,6 +995,7 @@ mod tests {
             Query(ProjectQuery {
                 scope: Some("profile".into()),
                 profile: Some("test".into()),
+                path: None,
             }),
             None,
             None,

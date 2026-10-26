@@ -135,3 +135,37 @@ fn project_remove_resolves_a_relative_path_in_the_cli_cwd() {
         "{listed}"
     );
 }
+
+#[test]
+#[parallel]
+fn project_remove_prefers_the_name_over_a_colliding_client_path() {
+    let mut h = TuiTestHarness::new_in_tmp("project_rm_name");
+    h.stop_daemon_on_drop();
+    let cwd = h.home_path().join("cwd");
+    let named = h.home_path().join("named");
+    init_git_repo(&named);
+    init_git_repo(&cwd.join("org/repo"));
+    let run = |args: &[&str]| {
+        let out = h
+            .cli_command(args)
+            .current_dir(&cwd)
+            .output()
+            .expect("run aoe");
+        assert!(out.status.success(), "{args:?}: {out:?}");
+    };
+    // A display name that looks like a relative path, and another project at
+    // the path the same text resolves to in the CLI's directory.
+    run(&[
+        "project",
+        "add",
+        named.to_str().unwrap(),
+        "--name",
+        "org/repo",
+    ]);
+    run(&["project", "add", "org/repo", "--name", "at-path"]);
+
+    run(&["project", "remove", "org/repo"]);
+    let listed = h.run_cli_ok(&["project", "list"]);
+    assert!(!listed.contains("named"), "{listed}");
+    assert!(listed.contains("at-path"), "{listed}");
+}
