@@ -163,7 +163,7 @@ function AcpChrome({
 }: ChromeProps) {
   const { sessionId, acpWorkerState, acpAgent } = view;
   const { state, status } = ctx;
-  const startingAgent = isNewSessionStarting(state, status, ctx.hasEverOpened, acpWorkerState)
+  const startingAgent = isNewSessionStarting(state, ctx, acpWorkerState)
     ? agentDisplayName(state.agent ?? acpAgent)
     : null;
   // Neither can start until restored or unarchived, so nothing here may send (#4116).

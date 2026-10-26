@@ -4,6 +4,7 @@ import type { RespawnState } from "../../hooks/useRespawnSession";
 import type { AcpState } from "../../lib/acpTypes";
 import type { AcpContext } from "./AcpRuntime";
 import { SwitchAgentModal } from "./SwitchAgentModal";
+import { connectionRetriesExhausted } from "./startupWait";
 
 /** Owns the rate-limit recovery modal toggle and hands its opener to `children`. */
 export function RateLimitRecoverySection({
@@ -85,29 +86,29 @@ export function SystemNotices({
 }) {
   const messages: { kind: "warn" | "info" | "muted"; text: string }[] = [];
   const warn = (text: string) => messages.push({ kind: "warn", text });
-  const reconnectRetriesExhausted = status !== "open" && hasEverOpened && !reconnecting && retryCount >= maxRetries;
-  if (newSessionStarting && !hasEverOpened) {
-    // Shown once, by the startup wait line, including first-connection retries.
-  } else if (reconnecting && status !== "open") {
-    const countdownPart = retryCountdown > 0 ? ` in ${retryCountdown}s` : "";
-    warn(`Structured view disconnected. Reconnecting (${retryCount}/${maxRetries})${countdownPart}…`);
-  } else if (status === "connecting") {
-    messages.push({
-      kind: "info",
-      text: hasEverOpened ? "Reconnecting to structured view…" : "Starting structured view…",
-    });
-  } else if (status === "error") {
-    warn(
-      hasEverOpened
-        ? "Structured view reconnecting… showing cached transcript; new messages disabled."
-        : "Starting structured view worker… this can take a few seconds for new sessions.",
-    );
-  } else if (status === "closed" && !reconnectRetriesExhausted) {
-    warn(
-      hasEverOpened
-        ? "Structured view disconnected. Showing cached transcript; new messages disabled."
-        : "Structured view not ready yet. Retrying…",
-    );
+  const reconnectRetriesExhausted = connectionRetriesExhausted({ status, reconnecting, retryCount, maxRetries });
+  if (!reconnectRetriesExhausted && !(newSessionStarting && !hasEverOpened)) {
+    if (reconnecting && status !== "open") {
+      const countdownPart = retryCountdown > 0 ? ` in ${retryCountdown}s` : "";
+      warn(`Structured view disconnected. Reconnecting (${retryCount}/${maxRetries})${countdownPart}…`);
+    } else if (status === "connecting") {
+      messages.push({
+        kind: "info",
+        text: hasEverOpened ? "Reconnecting to structured view…" : "Starting structured view…",
+      });
+    } else if (status === "error") {
+      warn(
+        hasEverOpened
+          ? "Structured view reconnecting… showing cached transcript; new messages disabled."
+          : "Starting structured view worker… this can take a few seconds for new sessions.",
+      );
+    } else if (status === "closed") {
+      warn(
+        hasEverOpened
+          ? "Structured view disconnected. Showing cached transcript; new messages disabled."
+          : "Structured view not ready yet. Retrying…",
+      );
+    }
   }
   if (lagged) warn("Some events were missed during reconnect.");
   if (rateLimit) {
@@ -172,7 +173,9 @@ export function SystemNotices({
       )}
       {reconnectRetriesExhausted && (
         <div className="flex items-center justify-between gap-3 text-xs text-brand-400">
-          <span>Connection lost. Auto-retry stopped.</span>
+          <span>
+            {hasEverOpened ? "Connection lost. Auto-retry stopped." : "Could not connect. Auto-retry stopped."}
+          </span>
           <button type="button" onClick={manualReconnect} className={ACTION_BUTTON}>
             Reconnect
           </button>

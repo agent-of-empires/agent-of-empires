@@ -3420,12 +3420,14 @@
         "tests/acp-startup-wait.spec.ts"
       ],
       "components": [
+        "web/src/components/acp/startupWait.ts",
+        "web/src/components/acp/StructuredView.tsx",
         "web/src/components/acp/SessionBanners.tsx",
         "web/src/components/acp/SystemNotices.tsx",
         "web/src/components/acp/PromptStrips.tsx",
         "web/src/components/acp/ComposerControls.tsx"
       ],
-      "notes": "A new Session shows one startup line naming the Agent with an elapsed count, switching to a neutral line at 15s with no duration or delivery promise; the queued strip and Send button say what they wait for. Reduced motion holds one breathe frame."
+      "notes": "A new Session shows one startup line naming the Agent with an elapsed count, switching to a neutral line at 15s with no duration or delivery promise; the queued strip and Send button say what they wait for. Reduced motion holds one breathe frame. First-dial backoff keeps the startup line; exhausted retries stop it and expose Reconnect even before the first successful connection."
     },
     {
       "id": "acp.startup-error-screen",

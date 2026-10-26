@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 import { RateLimitRecoverySection, SystemNotices } from "./SystemNotices";
+import { emptyAcpState } from "../../lib/acpTypes";
+import { isNewSessionStarting } from "./startupWait";
 
 vi.mock("../../lib/api", () => ({
   fetchAcpAgents: vi.fn(),
@@ -69,6 +71,19 @@ describe("SystemNotices", () => {
     const { container } = mount(overrides);
     if (expected) expect(container.textContent).toMatch(expected);
     else expect(container.textContent).toBe("");
+  });
+
+  it.each([false, true])("offers recovery after retry exhaustion (previously connected: %s)", (hasEverOpened) => {
+    const props = noticeProps({ status: "closed", hasEverOpened, retryCount: 7 });
+    const starting = isNewSessionStarting(emptyAcpState(), props, "resuming");
+    const { getByRole, queryByText } = render(<SystemNotices {...props} newSessionStarting={starting} />);
+    expect(starting).toBe(false);
+    expect(
+      queryByText(hasEverOpened ? "Connection lost. Auto-retry stopped." : "Could not connect. Auto-retry stopped."),
+    ).not.toBeNull();
+    expect(queryByText(/Starting|Retrying|Reconnecting/)).toBeNull();
+    fireEvent.click(getByRole("button", { name: "Reconnect" }));
+    expect(props.manualReconnect).toHaveBeenCalledOnce();
   });
 
   it.each([
