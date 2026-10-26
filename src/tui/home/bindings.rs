@@ -236,6 +236,9 @@ pub enum Context {
     /// Only while live-send relays keys to the agent; inert in the session list, where the
     /// same keys mean something else.
     LiveSend,
+    /// `App` dispatches the chord before the home view, so it never resolves here and the
+    /// key still falls through to plugin bindings when `App` declines it.
+    AppOnly,
 }
 
 /// Help-overlay section. Ordering mirrors `components/help.rs`.
@@ -305,6 +308,7 @@ fn context_holds(context: Context, ctx: &Ctx) -> bool {
         Context::UnreadEnabled => crate::session::unread_enabled(),
         Context::CustomSortable => true,
         Context::LiveSend => ctx.live_send,
+        Context::AppOnly => false,
     }
 }
 
@@ -673,7 +677,7 @@ pub static BINDINGS: &[Binding] = &[
         id: ActionId::DismissUpdateBanner,
         non_strict: &[ctrl('x')],
         strict: &[ctrl('x')],
-        context: Context::Always,
+        context: Context::AppOnly,
         help: Some(HelpMeta {
             section: HelpSection::Other,
             desc: "Dismiss update bar (this session)",
@@ -1705,6 +1709,10 @@ mod tests {
                 assert_eq!(resolve(key, strict, &ctx()), *in_list, "{key:?} list");
                 assert_eq!(resolve(key, strict, &live), *in_live, "{key:?} live");
             }
+        }
+        // App-owned: never resolves in Home (so plugins keep Ctrl+X), yet App still matches it.
+        for c in [ctx(), live] {
+            assert_eq!(resolve_action(&ctrl_key('x'), false, &c), None);
         }
         assert!(is_bound(
             ActionId::DismissUpdateBanner,
