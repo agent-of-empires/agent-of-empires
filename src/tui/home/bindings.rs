@@ -404,48 +404,23 @@ fn plugin_bindings() -> Vec<(Chord, PluginAction)> {
     out
 }
 
-/// Parse a key-chord string like `Ctrl+K`, `Shift+D`, `F5`, or `q` into a
-/// [`Chord`]. Supports `Ctrl`/`Shift` modifiers, single characters, and
-/// function keys. Returns `None` for anything else.
+/// Parse a chord in the tmux-style grammar shared with `live_send_leader` (`C-k`, `Ctrl+K`,
+/// `M-Up`, `S-PageUp`, `F5`, `q`) into a [`Chord`]. Bare letters are lowercase and
+/// `Shift`+letter is the uppercase char, as in the table; Shift on a named key sets `shift`.
+/// Returns `None` for anything the live-send grammar rejects.
 pub fn parse_chord(s: &str) -> Option<Chord> {
-    let mut ctrl = false;
-    let mut shift = false;
-    let mut key: Option<&str> = None;
-    for tok in s.split('+').map(str::trim).filter(|t| !t.is_empty()) {
-        match tok.to_ascii_lowercase().as_str() {
-            "ctrl" | "control" => ctrl = true,
-            "shift" => shift = true,
-            // Unsupported modifiers and a second key token are rejected rather than
-            // silently remapped: `Alt+K` must not collapse to a bare `k` that hijacks core
-            // navigation.
-            "alt" | "option" | "meta" | "super" | "cmd" => return None,
-            _ if key.is_none() => key = Some(tok),
-            _ => return None,
-        }
-    }
-    let key = key?;
-    let code = if key.len() == 1 {
-        // Match the table's convention: bare letters are lowercase chars and Shift is the
-        // uppercase char, since terminals deliver Ctrl+k as a lowercase Char with the
-        // CONTROL modifier and Shift+d as Char('D').
-        let c = key.chars().next().unwrap();
-        let c = if shift {
-            c.to_ascii_uppercase()
-        } else {
-            c.to_ascii_lowercase()
-        };
-        KeyCode::Char(c)
-    } else {
-        let n = key
-            .strip_prefix(['F', 'f'])
-            .and_then(|n| n.parse::<u8>().ok())?;
-        KeyCode::F(n)
+    let (code, mods) = super::live_send::parse_chord(s)?;
+    let shift = mods.contains(KeyModifiers::SHIFT);
+    let code = match code {
+        KeyCode::Char(c) if shift => KeyCode::Char(c.to_ascii_uppercase()),
+        KeyCode::Char(c) => KeyCode::Char(c.to_ascii_lowercase()),
+        other => other,
     };
     Some(Chord {
         code,
-        ctrl,
-        alt: false,
-        shift: false,
+        ctrl: mods.contains(KeyModifiers::CONTROL),
+        alt: mods.contains(KeyModifiers::ALT),
+        shift: shift && !matches!(code, KeyCode::Char(_)),
     })
 }
 
@@ -453,10 +428,12 @@ pub fn parse_chord(s: &str) -> Option<Chord> {
 /// `aoe plugin info` to flag a plugin keybind that core shadows.
 pub fn core_shadows(chord: &Chord) -> bool {
     BINDINGS.iter().any(|b| {
-        b.non_strict
-            .iter()
-            .chain(b.strict)
-            .any(|c| c.code == chord.code && c.ctrl == chord.ctrl)
+        b.non_strict.iter().chain(b.strict).any(|c| {
+            c.code == chord.code
+                && c.ctrl == chord.ctrl
+                && c.alt == chord.alt
+                && c.shift == chord.shift
+        })
     })
 }
 
@@ -1386,32 +1363,56 @@ mod tests {
     }
 
     #[test]
-    fn parse_chord_accepts_ctrl_or_bare_keys_only() {
-        let chord = |code, ctrl| {
+    fn parse_chord_reads_the_shared_tmux_grammar() {
+        let chord = |code, ctrl, alt, shift| {
             Some(Chord {
                 code,
                 ctrl,
-                alt: false,
-                shift: false,
+                alt,
+                shift,
             })
         };
+        let k = KeyCode::Char;
         let cases = [
-            ("Ctrl+K", chord(KeyCode::Char('k'), true)),
-            ("Shift+D", chord(KeyCode::Char('D'), false)),
-            ("q", chord(KeyCode::Char('q'), false)),
-            ("F5", chord(KeyCode::F(5), false)),
+            ("Ctrl+K", chord(k('k'), true, false, false)),
+            ("C-k", chord(k('k'), true, false, false)),
+            ("Shift+D", chord(k('D'), false, false, false)),
+            ("Ctrl+Shift+G", chord(k('G'), true, false, false)),
+            ("q", chord(k('q'), false, false, false)),
+            ("Q", chord(k('q'), false, false, false)),
+            ("F5", chord(KeyCode::F(5), false, false, false)),
+            ("M-Up", alt_code(KeyCode::Up).into()),
+            ("Alt+Down", alt_code(KeyCode::Down).into()),
+            ("S-PageUp", shift_code(KeyCode::PageUp).into()),
+            ("Shift+PgDn", shift_code(KeyCode::PageDown).into()),
+            ("C-Up", ctrl_code(KeyCode::Up).into()),
+            ("Ctrl+Alt+K", chord(k('k'), true, true, false)),
             ("", None),
             ("Ctrl+", None),
-            // Unknown modifiers must not collapse to a bare key that hijacks core
-            // navigation, and a chord may carry at most one key token.
-            ("Alt+K", None),
-            ("Ctrl+Alt+K", None),
             ("Ctrl+K+J", None),
-            ("Meta+K", None),
+            ("Super+K", None),
         ];
         for (input, want) in cases {
             assert_eq!(parse_chord(input), want, "{input:?}");
         }
+        // Declared chords round-trip through the grammar.
+        for b in BINDINGS {
+            for c in b.non_strict.iter().chain(b.strict) {
+                if matches!(c.code, KeyCode::Up | KeyCode::PageUp | KeyCode::PageDown) {
+                    let spec = format!(
+                        "{}{}{}{:?}",
+                        if c.ctrl { "C-" } else { "" },
+                        if c.alt { "M-" } else { "" },
+                        if c.shift { "S-" } else { "" },
+                        c.code
+                    );
+                    assert_eq!(parse_chord(&spec).as_ref(), Some(c), "{spec}");
+                }
+            }
+        }
+        // A modified chord is not claimed by the bare-letter binding it resembles.
+        assert!(!core_shadows(&parse_chord("M-n").unwrap()));
+        assert!(core_shadows(&parse_chord("M-Up").unwrap()));
     }
 
     #[test]
