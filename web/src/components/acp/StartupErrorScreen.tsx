@@ -3,7 +3,7 @@ import { useEffect, useId, useState } from "react";
 import type { IncompatibleAgentDetail } from "../../lib/acpTypes";
 import { fetchAgentInstallInfo, type AgentInstallInfo } from "../../lib/api";
 import { useRespawnSession } from "../../hooks/useRespawnSession";
-import { useAdapterInstall } from "./adapterRecovery";
+import { splitInstallHint, useAdapterInstall } from "./adapterRecovery";
 import { CommandBlock, RecoveryActionRow, type RecoveryAction } from "./RecoveryActionRow";
 
 interface Props {
@@ -161,7 +161,7 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
                 {manualCommand && (
                   <div className="mt-2" data-testid="startup-error-fallback">
                     <p className="text-xs text-text-dim">Or run this where the Daemon runs, then Check again:</p>
-                    <CommandBlock command={manualCommand} testId="startup-error-install-command" scroll />
+                    <CommandBlock {...splitInstallHint(manualCommand)} testId="startup-error-install-command" scroll />
                   </div>
                 )}
               </Step>
@@ -174,7 +174,7 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
               >
                 {manualCommand || containerHint ? (
                   <CommandBlock
-                    command={(manualCommand ?? containerHint)!}
+                    {...splitInstallHint((manualCommand ?? containerHint)!)}
                     testId="startup-error-install-command"
                     scroll
                   />

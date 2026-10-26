@@ -10,6 +10,10 @@ import { StartupErrorScreen } from "../StartupErrorScreen";
 
 const fetchAgentInstallInfo = vi.fn();
 const installAcpAgent = vi.fn();
+const writeClipboard = vi.fn().mockResolvedValue(true);
+vi.mock("../../../lib/clipboard", () => ({
+  writeClipboard: (text: string) => writeClipboard(text),
+}));
 vi.mock("../../../lib/api", async (importOriginal) => ({
   InstallAgentError: (await importOriginal<typeof import("../../../lib/api")>()).InstallAgentError,
   fetchAgentInstallInfo: (...args: unknown[]) => fetchAgentInstallInfo(...args),
@@ -18,7 +22,9 @@ vi.mock("../../../lib/api", async (importOriginal) => ({
 
 const CLAUDE_NPM = "npm install -g @agentclientprotocol/claude-agent-acp@latest";
 const IN_CONTAINER = "podman exec aoe-sandbox-s1 npm install -g @agentclientprotocol/claude-agent-acp@latest";
-const OPENCODE = "curl -fsSL https://opencode.ai/install | bash";
+// The catalogue hint, with the note that isn't part of the command.
+const OPENCODE = "curl -fsSL https://opencode.ai/install | bash  (then `opencode acp`)";
+const OPENCODE_COMMAND = "curl -fsSL https://opencode.ai/install | bash";
 
 const incompatible = (auto_install = true, install_command = CLAUDE_NPM): IncompatibleAgentDetail => ({
   kind: "incompatible_agent_version",
@@ -166,6 +172,14 @@ describe("StartupErrorScreen", () => {
     expect(getByTestId("startup-error-screen").getAttribute("role")).toBe("alert");
   });
 
+  it("copies only the command from a catalogue hint and shows its note beside it", async () => {
+    const { getByTestId, getByRole } = await renderScreen(incompatible(false, OPENCODE), opencode);
+    const block = getByTestId("startup-error-install-command").parentElement!.parentElement!;
+    expect(block.textContent).toContain("then `opencode acp`");
+    fireEvent.click(getByRole("button", { name: "Copy" }));
+    await waitFor(() => expect(writeClipboard).toHaveBeenCalledWith(OPENCODE_COMMAND));
+  });
+
   it("names no Agent until install-info answers", () => {
     fetchAgentInstallInfo.mockReturnValue(new Promise(() => {}));
     const { getByRole } = render(<StartupErrorScreen detail={incompatible()} sessionId="s1" />);
@@ -234,7 +248,7 @@ describe("StartupErrorScreen", () => {
       eyebrow: "Adapter out of date",
       steps: ["Run this where the Daemon runs", "Click Check again"],
       buttons: ["Check again"],
-      command: OPENCODE,
+      command: OPENCODE_COMMAND,
     },
     {
       label: "Sandbox, adapter npm can't install",
@@ -243,7 +257,7 @@ describe("StartupErrorScreen", () => {
       eyebrow: "Adapter out of date",
       steps: ["Run this inside this Session's container", "Click Check again"],
       buttons: ["Check again"],
-      command: OPENCODE,
+      command: OPENCODE_COMMAND,
     },
     {
       label: "read-only",
