@@ -149,6 +149,19 @@ fn refuse_unresolved_adapter(
     ))
 }
 
+/// `current_exe()` keeps returning the original path after the binary is
+/// unlinked, so the spawn would otherwise fail with a bare ENOENT.
+fn ensure_runner_exe(exe: &std::path::Path) -> Result<(), AcpError> {
+    if exe.exists() {
+        return Ok(());
+    }
+    Err(AcpError::Spawn(format!(
+        "aoe binary `{}` no longer exists; the running `aoe serve` was started from a \
+         build that was removed. Rebuild or reinstall aoe and restart `aoe serve`",
+        exe.display()
+    )))
+}
+
 /// The runner owns the agent subprocess and outlives the daemon, so no `Child`
 /// handle is kept: the daemon reaches it over the unix socket, and the OS keeps
 /// it alive across `aoe serve` restarts.
@@ -160,6 +173,7 @@ pub(super) async fn spawn_runner_detached(
 ) -> Result<(u32, Option<crate::session::ExecutionBinding>), AcpError> {
     let current_exe =
         std::env::current_exe().map_err(|e| AcpError::Spawn(format!("current_exe: {e}")))?;
+    ensure_runner_exe(&current_exe)?;
     let log_path = crate::process::worker_registry::log_path_for(&session_id)
         .map_err(|e| AcpError::Spawn(format!("log path: {e}")))?;
     if let Some(parent) = log_path.parent() {
@@ -525,6 +539,19 @@ mod tests {
     const XDG: &str = "XDG_RUNTIME_DIR";
     const BUS: &str = "DBUS_SESSION_BUS_ADDRESS";
     const ENV: &str = "/usr/bin/env";
+
+    #[test]
+    fn missing_runner_exe_names_path_and_remedy() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("aoe");
+        let Err(AcpError::Spawn(message)) = ensure_runner_exe(&gone) else {
+            panic!("missing exe must fail with AcpError::Spawn");
+        };
+        assert!(message.contains(&gone.display().to_string()), "{message}");
+        assert!(message.contains("restart `aoe serve`"), "{message}");
+
+        assert!(ensure_runner_exe(&std::env::current_exe().unwrap()).is_ok());
+    }
 
     fn prefix() -> ScopePrefix {
         ScopePrefix {
