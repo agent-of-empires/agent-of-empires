@@ -1305,11 +1305,7 @@ mod tests {
             explicit_profile: Some("main".into()),
             env_profile: None,
         };
-        let ScopedRead::Answered(outcome) =
-            attempt(classify(cli.command.as_ref()).unwrap(), &source).await
-        else {
-            panic!("a bearer plus passphrase must not fall back to disk");
-        };
+        let outcome = attempt(classify(cli.command.as_ref()).unwrap(), &source).await;
         assert_eq!(outcome.exit, 0, "{:?}", outcome.stderr);
         let value: serde_json::Value = serde_json::from_str(&outcome.stdout.unwrap()).unwrap();
         assert_eq!(value["id"], "second-factor-read");
