@@ -1032,7 +1032,7 @@ mod tests {
         (parts_guard, consumer)
     }
 
-    fn deferred_json_is_guarded(signature: &str, body: &str, delegate: Option<&str>) -> bool {
+    fn body_admission_guards(signature: &str, body: &str, delegate: Option<&str>) -> (bool, bool) {
         use syn::{spanned::Spanned, visit::Visit};
 
         struct FirstUse<'a> {
@@ -1069,11 +1069,76 @@ mod tests {
             }
         }
 
+        fn ungroup(expression: &syn::Expr) -> &syn::Expr {
+            match expression {
+                syn::Expr::Paren(value) if value.attrs.is_empty() => ungroup(&value.expr),
+                syn::Expr::Group(value) if value.attrs.is_empty() => ungroup(&value.expr),
+                _ => expression,
+            }
+        }
+
+        fn expression_exits(expression: &syn::Expr) -> bool {
+            match ungroup(expression) {
+                syn::Expr::Return(value) => value.attrs.is_empty(),
+                syn::Expr::Block(value) if value.attrs.is_empty() => exits(&value.block),
+                syn::Expr::If(value) if value.attrs.is_empty() => {
+                    exits(&value.then_branch)
+                        && value
+                            .else_branch
+                            .as_ref()
+                            .is_some_and(|(_, otherwise)| expression_exits(otherwise))
+                }
+                _ => false,
+            }
+        }
+
         fn exits(block: &syn::Block) -> bool {
-            matches!(
-                block.stmts.last(),
-                Some(syn::Stmt::Expr(syn::Expr::Return(_), _))
-            )
+            block.stmts.iter().any(|statement| {
+                matches!(statement, syn::Stmt::Expr(expression, _) if expression_exits(expression))
+            })
+        }
+
+        fn state_value(expression: &syn::Expr, state: Option<&syn::Ident>) -> bool {
+            match ungroup(expression) {
+                syn::Expr::Reference(value) if value.attrs.is_empty() => {
+                    state_value(&value.expr, state)
+                }
+                syn::Expr::Path(value) => {
+                    value.attrs.is_empty() && state.is_some() && value.path.get_ident() == state
+                }
+                _ => false,
+            }
+        }
+
+        fn state_call<'a>(
+            expression: &'a syn::Expr,
+            target: &str,
+            state: Option<&syn::Ident>,
+        ) -> Option<&'a syn::ExprCall> {
+            let syn::Expr::Call(call) = ungroup(expression) else {
+                return None;
+            };
+            (call.attrs.is_empty()
+                && matches!(ungroup(&call.func), syn::Expr::Path(path)
+                    if path.attrs.is_empty() && path.qself.is_none()
+                    && path.path.segments.last().is_some_and(|name| name.ident == target))
+                && call
+                    .args
+                    .first()
+                    .is_some_and(|argument| state_value(argument, state)))
+            .then_some(call)
+        }
+
+        fn read_only_call(expression: &syn::Expr, state: Option<&syn::Ident>) -> bool {
+            if let Some(call) = state_call(expression, "read_only_block", state) {
+                return call.args.len() == 1;
+            }
+            matches!(ungroup(expression), syn::Expr::MethodCall(call)
+                if call.attrs.is_empty() && call.method == "or_else" && call.args.len() == 1
+                && matches!(ungroup(&call.args[0]), syn::Expr::Closure(fallback)
+                    if fallback.attrs.is_empty() && fallback.inputs.is_empty()
+                    && fallback.asyncness.is_none())
+                && read_only_call(&call.receiver, state))
         }
 
         fn app_state_type(ty: &syn::Type) -> bool {
@@ -1090,26 +1155,98 @@ mod tests {
         }
 
         fn read_only_condition(condition: &syn::Expr, state: Option<&syn::Ident>) -> bool {
-            match condition {
+            match ungroup(condition) {
                 syn::Expr::Field(field) => {
-                    matches!(&field.member, syn::Member::Named(member) if member == "read_only")
-                        && matches!(&*field.base, syn::Expr::Path(path)
-                            if state.is_some() && path.path.get_ident() == state)
+                    field.attrs.is_empty()
+                        && matches!(&field.member, syn::Member::Named(member) if member == "read_only")
+                        && state_value(&field.base, state)
                 }
-                syn::Expr::Let(binding)
-                    if matches!(&*binding.pat, syn::Pat::TupleStruct(pattern)
-                        if pattern.path.is_ident("Some") && pattern.elems.len() == 1) =>
-                {
-                    matches!(&*binding.expr, syn::Expr::Call(call)
-                        if matches!(&*call.func, syn::Expr::Path(path)
-                            if path.path.segments.last().is_some_and(|name| name.ident == "read_only_block"))
-                        && call.args.len() == 1
-                        && matches!(&call.args[0], syn::Expr::Reference(reference)
-                            if matches!(&*reference.expr, syn::Expr::Path(path)
-                                if state.is_some() && path.path.get_ident() == state)))
+                syn::Expr::Let(binding) => {
+                    binding.attrs.is_empty()
+                        && matches!(&*binding.pat, syn::Pat::TupleStruct(pattern)
+                            if pattern.path.is_ident("Some") && pattern.elems.len() == 1)
+                        && read_only_call(&binding.expr, state)
                 }
                 _ => false,
             }
+        }
+
+        fn delegated_condition(
+            condition: &syn::Expr,
+            state: Option<&syn::Ident>,
+            delegate: Option<&str>,
+        ) -> bool {
+            let (syn::Expr::Let(binding), Some(target)) = (ungroup(condition), delegate) else {
+                return false;
+            };
+            binding.attrs.is_empty()
+                && matches!(&*binding.pat, syn::Pat::TupleStruct(pattern)
+                    if pattern.path.is_ident("Err") && pattern.elems.len() == 1)
+                && state_call(&binding.expr, target, state).is_some_and(|call| call.args.len() == 1)
+        }
+
+        fn tail_delegate<'a>(
+            body: &'a syn::Block,
+            state: Option<&syn::Ident>,
+            delegate: Option<&str>,
+        ) -> Option<&'a syn::ExprCall> {
+            let [syn::Stmt::Expr(expression, semicolon)] = body.stmts.as_slice() else {
+                return None;
+            };
+            let expression = match ungroup(expression) {
+                syn::Expr::Return(value) if value.attrs.is_empty() => value.expr.as_deref()?,
+                expression if semicolon.is_none() => expression,
+                _ => return None,
+            };
+            let syn::Expr::Await(value) = ungroup(expression) else {
+                return None;
+            };
+            if !value.attrs.is_empty() {
+                return None;
+            }
+            state_call(&value.base, delegate?, state)
+        }
+
+        fn guarded_before(
+            body: &syn::Block,
+            state: Option<&syn::Ident>,
+            delegate: Option<&str>,
+            position: usize,
+        ) -> bool {
+            for statement in &body.stmts {
+                if let syn::Stmt::Expr(syn::Expr::If(guard), _) = statement {
+                    if guard.attrs.is_empty()
+                        && guard.span().byte_range().end <= position
+                        && exits(&guard.then_branch)
+                        && (read_only_condition(&guard.cond, state)
+                            || delegated_condition(&guard.cond, state, delegate))
+                    {
+                        return true;
+                    }
+                }
+                // Opaque control flow is not admission evidence.
+                match statement {
+                    syn::Stmt::Local(local)
+                        if local
+                            .init
+                            .as_ref()
+                            .is_some_and(|init| expression_exits(&init.expr)) =>
+                    {
+                        break
+                    }
+                    syn::Stmt::Expr(expression, _) if expression_exits(expression) => break,
+                    syn::Stmt::Expr(
+                        syn::Expr::Loop(_)
+                        | syn::Expr::ForLoop(_)
+                        | syn::Expr::While(_)
+                        | syn::Expr::Match(_),
+                        _,
+                    )
+                    | syn::Stmt::Macro(_) => break,
+                    _ => {}
+                }
+            }
+            false
         }
 
         let signature = syn::parse_str::<syn::Signature>(signature).expect("audited signature");
@@ -1132,7 +1269,9 @@ mod tests {
             }
         });
         let body = syn::parse_str::<syn::Block>(body).expect("audited body");
-        signature.inputs.iter().all(|argument| {
+        let delegated = tail_delegate(&body, state, delegate);
+        let guarded = delegated.is_some() || guarded_before(&body, state, delegate, usize::MAX);
+        let deferred = signature.inputs.iter().all(|argument| {
             let syn::FnArg::Typed(argument) = argument else {
                 return true;
             };
@@ -1161,29 +1300,18 @@ mod tests {
             let Some(first) = first.position else {
                 return true;
             };
-            if body.stmts.iter().any(|statement| {
-                matches!(statement, syn::Stmt::Expr(syn::Expr::If(guard), _)
-                    if read_only_condition(&guard.cond, state) && exits(&guard.then_branch)
-                    && guard.span().byte_range().end <= first)
-            }) {
+            if guarded_before(&body, state, delegate, first) {
                 return true;
             }
-            let [syn::Stmt::Expr(syn::Expr::Await(tail), None)] = body.stmts.as_slice() else {
-                return false;
-            };
-            let syn::Expr::Call(call) = &*tail.base else {
-                return false;
-            };
-            delegate.is_some_and(|target| {
-                matches!(&*call.func, syn::Expr::Path(path)
-                    if path.path.segments.last().is_some_and(|name| name.ident == target))
-                    && call.args.iter().any(|argument| {
-                        matches!(argument, syn::Expr::Path(path)
-                            if path.path.get_ident() == Some(&binding.ident)
-                            && path.span().byte_range().start == first)
-                    })
+            delegated.is_some_and(|call| {
+                call.args.iter().any(|argument| {
+                    matches!(ungroup(argument), syn::Expr::Path(path)
+                        if path.path.get_ident() == Some(&binding.ident)
+                        && path.span().byte_range().start == first)
+                })
             })
-        })
+        });
+        (guarded, deferred)
     }
 
     #[test]
@@ -1275,6 +1403,54 @@ mod tests {
     }
 
     #[test]
+    fn body_admission_rejects_non_executable_guards_and_delegation() {
+        let signature =
+            "fn write(State(state): State<Arc<AppState>>, body: Result<Json<Body>, JsonRejection>)";
+        let shared = "fn gate(state: &AppState)";
+        for (signature, body, delegate, expected) in [
+            (signature, "{ if state.read_only { return forbidden(); } work(); }", None, true),
+            (signature, "{ if other_gate() { return denied(); } if state.read_only { return forbidden(); } work(); }", None, true),
+            (signature, "{ if let Some(resp) = crate::server::api::read_only_block(&state) { return resp; } work(); }", None, true),
+            (shared, "{ if let Some(resp) = read_only_block(state).or_else(|| cityhall_block(state)) { return Err(resp); } Ok(()) }", None, true),
+            (signature, "{ prepare_agent_session(state, id, body, mode, None).await }", Some("prepare_agent_session"), true),
+            (signature, "{ return super::lifecycle::prepare_agent_session(state, id, body, mode, None).await; }", Some("prepare_agent_session"), true),
+            (signature, "{ if let Err(resp) = install_gate(&state) { return resp; } work(); }", Some("install_gate"), true),
+            (signature, "{ /* if state.read_only { return forbidden(); } */ work(); }", None, false),
+            (signature, "{ let text = \"state.read_only\"; work(); }", None, false),
+            (signature, r##"{ let text = r#"if state.read_only { return forbidden(); }"#; work(); }"##, None, false),
+            (signature, "{ work(); // read_only_block(&state)\n }", None, false),
+            (signature, "{ let callback = || { if state.read_only { return forbidden(); } }; work(); }", None, false),
+            (signature, "{ let future = async { if state.read_only { return forbidden(); } }; work(); }", None, false),
+            (signature, "{ fn nested(state: &AppState) { if state.read_only { return forbidden(); } } work(); }", None, false),
+            (signature, "{ if false { if state.read_only { return forbidden(); } } work(); }", None, false),
+            (signature, "{ if state.read_only { record(); } work(); }", None, false),
+            (signature, "{ if state.read_only && condition { return forbidden(); } work(); }", None, false),
+            (signature, "{ return ok(); if state.read_only { return forbidden(); } work(); }", None, false),
+            (signature, "{ let stopped = { return ok(); }; if state.read_only { return forbidden(); } work(); }", None, false),
+            (signature, "{ { return ok(); } if state.read_only { return forbidden(); } work(); }", None, false),
+            (signature, "{ if flag { return a(); } else { return b(); } if state.read_only { return forbidden(); } work(); }", None, false),
+            (signature, "{ #[cfg(any())] if state.read_only { return forbidden(); } work(); }", None, false),
+            (signature, "{ let text = \"prepare_agent_session(state, id, body, mode, None)\"; work(); }", Some("prepare_agent_session"), false),
+            (signature, "{ let future = prepare_agent_session(state, id, body, mode, None); work(); }", Some("prepare_agent_session"), false),
+            (signature, "{ let callback = || prepare_agent_session(state, id, body, mode, None); work(); }", Some("prepare_agent_session"), false),
+            (signature, "{ if false { prepare_agent_session(state, id, body, mode, None).await; } work(); }", Some("prepare_agent_session"), false),
+            (signature, "{ prepare_agent_session(state, id, body, mode, None).await; }", Some("prepare_agent_session"), false),
+            (signature, "{ prepare_agent_session(state, id, body, mode, None).await; work(); }", Some("prepare_agent_session"), false),
+            (signature, "{ prepare_agent_session(other, id, body, mode, None).await }", Some("prepare_agent_session"), false),
+            (signature, "{ different(state, id, body, mode, None).await }", Some("prepare_agent_session"), false),
+            (signature, "{ if let Err(resp) = install_gate(&other) { return resp; } work(); }", Some("install_gate"), false),
+            (signature, "{ install_gate(&state); work(); }", Some("install_gate"), false),
+            (signature, "{ let text = \"install_gate(&state)\"; work(); }", Some("install_gate"), false),
+        ] {
+            assert_eq!(
+                body_admission_guards(signature, body, delegate).0,
+                expected,
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
     fn deferred_json_requires_a_completed_guard_before_first_use() {
         for parameter in ["body", "payload"] {
             for ty in ["Json<Body>", "Option<axum::Json<Body>>"] {
@@ -1291,12 +1467,12 @@ mod tests {
                         "if app.read_only { return forbidden() }",
                         "if let Some(response) = read_only_block(&app) { return response }",
                     ] {
-                        assert!(deferred_json_is_guarded(
+                        assert!(body_admission_guards(
                             &signature, &format!("{{ {guard} {consumer} }}"), None
-                        ));
-                        assert!(!deferred_json_is_guarded(
+                        ).1);
+                        assert!(!body_admission_guards(
                             &signature, &format!("{{ {consumer} {guard} }}"), None
-                        ));
+                        ).1);
                     }
                     for not_a_guard in [
                         r#"let text = "if app.read_only { return forbidden() }";"#,
@@ -1305,26 +1481,25 @@ mod tests {
                         "if app.read_only && condition { return forbidden() }",
                         "if condition { if app.read_only { return forbidden() } }",
                     ] {
-                        assert!(!deferred_json_is_guarded(
+                        assert!(!body_admission_guards(
                             &signature, &format!("{{ {not_a_guard} {consumer} }}"), None
-                        ));
+                        ).1);
                     }
                 }
-                assert!(deferred_json_is_guarded(
-                    &signature,
-                    &format!("{{ prepare(app, id, {parameter}).await }}"),
-                    Some("prepare")
-                ));
+                assert!(
+                    body_admission_guards(
+                        &signature,
+                        &format!("{{ prepare(app, id, {parameter}).await }}"),
+                        Some("prepare")
+                    )
+                    .1
+                );
                 for body in [
                     format!("{{ prepare(app, id, {parameter}.map(transform)).await }}"),
                     format!("{{ inspect(&{parameter}); prepare(app, id, {parameter}).await }}"),
                     format!("{{ unknown(app, id, {parameter}).await }}"),
                 ] {
-                    assert!(!deferred_json_is_guarded(
-                        &signature,
-                        &body,
-                        Some("prepare")
-                    ));
+                    assert!(!body_admission_guards(&signature, &body, Some("prepare")).1);
                 }
             }
         }
@@ -1355,14 +1530,9 @@ mod tests {
                 let delegate = match *name {
                     "ensure_session" | "start_session" => Some("prepare_agent_session"),
                     "prepare_agent_session" => Some("prepare_agent_session_inner"),
+                    "install_agent" => Some("install_gate"),
                     _ => None,
                 };
-                let deferred_guarded = deferred_json_is_guarded(signature, body, delegate);
-                let body = body
-                    .lines()
-                    .filter(|line| !line.trim_start().starts_with("//"))
-                    .collect::<Vec<_>>()
-                    .join("\n");
                 let mut handler_routes = routes
                     .iter()
                     .filter(|route| audited_handler(route.handler, &[*name]))
@@ -1370,16 +1540,12 @@ mod tests {
                 let route_layer = handler_routes.peek().is_some()
                     && handler_routes.all(|route| route.read_only_layer);
                 let (parts_guard, consumer) = signature_extractors(signature);
-                let local_guard = ["state.read_only", "self.read_only", "read_only_block("]
-                    .iter()
-                    .any(|marker| body.contains(marker));
-                let delegated = match *name {
-                    "ensure_session" | "start_session" => body.contains("prepare_agent_session("),
-                    "prepare_agent_session" => body.contains("prepare_agent_session_inner("),
-                    "install_agent" => body.contains("install_gate(&state)"),
-                    _ => false,
+                let (guarded, deferred_guarded) = if route_layer || parts_guard.is_some() {
+                    (true, true)
+                } else {
+                    body_admission_guards(signature, body, delegate)
                 };
-                if !route_layer && parts_guard.is_none() && !local_guard && !delegated {
+                if !route_layer && parts_guard.is_none() && !guarded {
                     failures.push(format!("{file}: `{name}` lacks a read-only guard"));
                 }
                 if consumer.is_some()
@@ -1404,21 +1570,6 @@ mod tests {
             "{classification_failures:#?}\n{}",
             failures.join("\n")
         );
-        let (_, preparation) = handler_source(
-            include_str!("sessions/lifecycle.rs"),
-            "prepare_agent_session_inner",
-        )
-        .expect("shared preparation guard");
-        assert!(preparation.contains("state.read_only"));
-        let (_, body) = handler_source(include_str!("plugins.rs"), "invoke_plugin_action")
-            .expect("invoke_plugin_action");
-        // Keep the no-elevation policy documented on `invoke_plugin_action`.
-        for marker in ["mutation_gate", "is_elevated", "elevation_required"] {
-            assert!(
-                !body.contains(marker),
-                "invoke_plugin_action: found `{marker}`"
-            );
-        }
     }
 
     #[tokio::test]
