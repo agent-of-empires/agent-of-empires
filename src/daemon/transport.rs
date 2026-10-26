@@ -98,7 +98,7 @@ pub(crate) fn prepare_runtime_directory(parent: &Path) -> anyhow::Result<()> {
 fn directory_permission_error(path: &Path, mode: &str, requirement: &str) -> anyhow::Error {
     if let Some(text) = path
         .to_str()
-        .filter(|text| !text.contains(['\r', '\n', '`']))
+        .filter(|text| !text.contains(|c: char| c.is_control() || c == '`'))
     {
         anyhow::anyhow!(
             "Unsafe daemon socket directory: {text}. {requirement} with `chmod -- {mode} {}`, then retry.",
@@ -552,6 +552,11 @@ mod tests {
             OsString::from("carriage\rreturn"),
             OsString::from("line\nfeed"),
             OsString::from("back`tick"),
+            OsString::from("escape\x1b[31m"),
+            OsString::from("bell\x07"),
+            OsString::from("tab\tname"),
+            OsString::from("delete\x7f"),
+            OsString::from("c1\u{9b}"),
         ] {
             for (socket, mode) in [(true, 0o755), (true, 0o777), (false, 0o777)] {
                 let root = tempfile::tempdir().unwrap();
