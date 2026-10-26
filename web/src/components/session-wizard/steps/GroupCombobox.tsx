@@ -71,7 +71,7 @@ export function GroupCombobox({
     setHighlight(i >= 0 ? keyOf(nextOptions[i]!) : null);
   };
   const pick = (option: GroupOption) => {
-    if (option.kind === "group") onChange(option.group.path);
+    onChange(option.kind === "group" ? option.group.path : option.path);
     setOpen(false);
   };
   const kept = highlight === null ? -1 : options.findIndex((o) => keyOf(o) === highlight);

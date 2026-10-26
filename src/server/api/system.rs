@@ -1689,41 +1689,34 @@ pub async fn list_groups(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<GroupsQuery>,
 ) -> impl IntoResponse {
-    // Held across the name check and the read, so a profile rename or delete can't slip between.
     let _namespace = state.profile_namespace.read().await;
-    let served = state.served_profile().to_string();
-    let requested = query.profile.filter(|p| !p.is_empty());
-    let profile = tokio::task::spawn_blocking(move || match requested {
-        // Never create a profile by naming it here.
-        Some(name) => crate::session::list_profiles()
-            .unwrap_or_default()
-            .contains(&name)
-            .then_some(name),
-        None if served.is_empty() => Some(crate::session::config::resolve_default_profile()),
-        None => Some(served),
-    })
-    .await
-    .ok()
-    .flatten();
-    let Some(profile) = profile else {
-        return Json(Vec::<GroupInfo>::new());
+    let (profile, stored) = {
+        let metadata = state.canonical_metadata.read().await;
+        let served = state.served_profile().to_string();
+        let name = query.profile.filter(|p| !p.is_empty()).unwrap_or_else(|| {
+            if served.is_empty() {
+                metadata.default_profile.clone()
+            } else {
+                served
+            }
+        });
+        let Some(profile) = metadata.profiles.iter().find(|p| p.name == name) else {
+            return Json(Vec::<GroupInfo>::new());
+        };
+        (profile.name.clone(), profile.groups.clone())
     };
     let session_groups: Vec<String> = state
         .instances
         .read()
         .await
         .iter()
-        .filter(|inst| inst.source_profile == profile && inst.trashed_at.is_none())
+        .filter(|inst| {
+            inst.source_profile == profile
+                && inst.trashed_at.is_none()
+                && inst.archived_at.is_none()
+        })
         .map(|inst| inst.group_path.clone())
         .collect();
-    let stored = tokio::task::spawn_blocking(move || {
-        crate::session::Storage::open(&profile, crate::file_watch::FileWatchService::noop())
-            .and_then(|s| s.load_groups_readonly())
-    })
-    .await
-    .ok()
-    .and_then(Result::ok)
-    .unwrap_or_default();
     Json(group_infos(&session_groups, &stored))
 }
 
@@ -1735,12 +1728,16 @@ fn group_infos(session_groups: &[String], stored: &[crate::session::Group]) -> V
         session_groups.iter().map(String::as_str),
         stored,
     );
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for path in session_groups {
+        *counts.entry(path.as_str()).or_default() += 1;
+    }
     let mut groups: Vec<GroupInfo> = tree
         .get_all_groups()
         .into_iter()
         .filter(|g| !g.path.is_empty() && !crate::session::is_synthetic_project_header(&g.path))
         .map(|g| GroupInfo {
-            session_count: session_groups.iter().filter(|p| **p == g.path).count(),
+            session_count: counts.get(g.path.as_str()).copied().unwrap_or_default(),
             archived: g.is_archived(),
             path: g.path,
         })
@@ -2655,6 +2652,74 @@ mod tests {
             .join("profiles")
             .join("ghost");
         assert!(!ghost.exists(), "{}", ghost.display());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn list_groups_uses_canonical_profiles_and_counts_only_live_sessions(
+    ) -> anyhow::Result<()> {
+        use crate::daemon::ProfileSnapshot;
+        use crate::session::{Group, Instance};
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut live = Instance::new("live", "/tmp");
+        live.source_profile = "memory".into();
+        live.group_path = "client/api".into();
+        let mut archived = live.clone();
+        archived.id = "archived".into();
+        archived.archived_at = Some(chrono::Utc::now());
+        let mut trashed = live.clone();
+        trashed.id = "trashed".into();
+        trashed.trashed_at = Some(chrono::Utc::now());
+        let mut other = live.clone();
+        other.id = "other".into();
+        other.source_profile = "other".into();
+        let state =
+            crate::server::test_support::build_test_app_state(vec![live, archived, trashed, other]);
+        let served = state.served_profile().to_string();
+        state.rename_served_profile(&served, "memory");
+        {
+            let mut metadata = state.canonical_metadata.write().await;
+            metadata.default_profile = "memory".into();
+            metadata.profiles = vec![ProfileSnapshot {
+                name: "memory".into(),
+                description: None,
+                groups: vec![Group::new("empty", "empty")],
+                projects: Vec::new(),
+            }];
+        }
+        let read = |profile: Option<&str>| {
+            let state = state.clone();
+            let query = GroupsQuery {
+                profile: profile.map(str::to_owned),
+            };
+            async move {
+                let response = list_groups(State(state), axum::extract::Query(query))
+                    .await
+                    .into_response();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+            }
+        };
+        let expected = serde_json::json!([
+            {"path": "client", "session_count": 0, "archived": false},
+            {"path": "client/api", "session_count": 1, "archived": false},
+            {"path": "empty", "session_count": 0, "archived": false},
+        ]);
+        for query in [None, Some(""), Some("memory")] {
+            assert_eq!(read(query).await, expected, "{query:?}");
+        }
+        assert_eq!(read(Some("missing")).await, serde_json::json!([]));
+        state.rename_served_profile("memory", "");
+        assert_eq!(read(None).await, expected, "canonical default profile");
+        let root = crate::session::get_app_dir()?;
+        assert!(
+            !root.join("profiles/memory").exists(),
+            "reads must not create a profile"
+        );
         Ok(())
     }
 

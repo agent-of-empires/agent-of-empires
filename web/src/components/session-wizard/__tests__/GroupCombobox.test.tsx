@@ -90,13 +90,22 @@ describe("GroupCombobox", () => {
     );
   });
 
-  it("Enter on a new name keeps the typed text, never a longer match", () => {
+  it.each(["Stu", "  Stu  "])("Enter creates the normalized new name: %s", (text) => {
     render(<Harness />);
     fireEvent.focus(input());
-    type("Stu");
+    type(text);
     expect(activeOption()).toBe('Create group "Stu"');
     key("Enter");
     expect(value()).toBe("Stu");
+    expect(input().getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("picking the create row commits its displayed trimmed path", () => {
+    render(<Harness />);
+    fireEvent.focus(input());
+    type(" client/new ");
+    fireEvent.mouseDown(screen.getByRole("option", { name: 'Create group "client/new"' }));
+    expect(value()).toBe("client/new");
     expect(input().getAttribute("aria-expanded")).toBe("false");
   });
 
