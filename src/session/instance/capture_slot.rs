@@ -73,6 +73,7 @@ impl CapturePollerSlot {
         self.handle = None;
     }
 
+    #[cfg(any(test, debug_assertions))]
     pub(crate) fn set_handle(&mut self, handle: Option<Arc<Mutex<SessionPoller>>>) {
         self.handle = handle;
     }
