@@ -100,6 +100,14 @@ pub enum ActionId {
     /// Permanently purge every trashed session after a confirm (palette only; no chord).
     EmptyTrash,
     ToggleSplitTerminal,
+    /// Open the command palette (any hotkey mode).
+    OpenCommandPalette,
+    /// Dismiss the update, status or image banner for this session. `App` owns the
+    /// banner state, so it executes this before the home view sees the key.
+    DismissUpdateBanner,
+    /// Scroll the preview back or forward a page while live-send relays keys.
+    PreviewScrollUp,
+    PreviewScrollDown,
 }
 
 impl ActionId {
@@ -139,12 +147,15 @@ impl ActionId {
 /// A single chord. `ctrl` requires the Control modifier; Shift is implicit in
 /// the uppercase letter `code` (terminals deliver `Shift+d` as `Char('D')`,
 /// and iOS Mosh delivers a bare uppercase keycode with no Shift modifier, so
-/// matching on the uppercase code rather than a Shift flag covers both).
+/// matching on the uppercase code rather than a Shift flag covers both). `shift` is the
+/// exception for non-character keys (`Shift+PageUp`), which have no uppercase form; it is
+/// ignored for `KeyCode::Char`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Chord {
     pub code: KeyCode,
     pub ctrl: bool,
     pub alt: bool,
+    pub shift: bool,
 }
 
 const fn k(c: char) -> Chord {
@@ -152,6 +163,7 @@ const fn k(c: char) -> Chord {
         code: KeyCode::Char(c),
         ctrl: false,
         alt: false,
+        shift: false,
     }
 }
 
@@ -160,6 +172,7 @@ const fn ctrl(c: char) -> Chord {
         code: KeyCode::Char(c),
         ctrl: true,
         alt: false,
+        shift: false,
     }
 }
 
@@ -168,6 +181,7 @@ const fn f(n: u8) -> Chord {
         code: KeyCode::F(n),
         ctrl: false,
         alt: false,
+        shift: false,
     }
 }
 
@@ -176,6 +190,7 @@ const fn ctrl_code(code: KeyCode) -> Chord {
         code,
         ctrl: true,
         alt: false,
+        shift: false,
     }
 }
 
@@ -184,6 +199,16 @@ const fn alt_code(code: KeyCode) -> Chord {
         code,
         ctrl: false,
         alt: true,
+        shift: false,
+    }
+}
+
+const fn shift_code(code: KeyCode) -> Chord {
+    Chord {
+        code,
+        ctrl: false,
+        alt: false,
+        shift: true,
     }
 }
 
@@ -208,6 +233,9 @@ pub enum Context {
     /// Rows can be arranged by hand. Under a computed sort the action still resolves, so
     /// the keys are not silently swallowed by cursor movement: it explains itself instead.
     CustomSortable,
+    /// Only while live-send relays keys to the agent; inert in the session list, where the
+    /// same keys mean something else.
+    LiveSend,
 }
 
 /// Help-overlay section. Ordering mirrors `components/help.rs`.
@@ -247,6 +275,8 @@ pub struct Ctx {
     /// True when the cursor sits on a real project header in project view, so
     /// the pin toggle can claim its chord ahead of the projects-dialog binding.
     pub project_group_selected: bool,
+    /// Live-send is relaying keys to the agent.
+    pub live_send: bool,
 }
 
 fn chord_matches(c: &Chord, key: &KeyEvent) -> bool {
@@ -259,6 +289,7 @@ fn chord_matches(c: &Chord, key: &KeyEvent) -> bool {
     key.code == c.code
         && key.modifiers.contains(KeyModifiers::CONTROL) == c.ctrl
         && key.modifiers.contains(KeyModifiers::ALT) == c.alt
+        && (!c.shift || key.modifiers.contains(KeyModifiers::SHIFT))
 }
 
 fn context_holds(context: Context, ctx: &Ctx) -> bool {
@@ -273,6 +304,7 @@ fn context_holds(context: Context, ctx: &Ctx) -> bool {
         Context::ProjectGroupSelected => ctx.project_group_selected,
         Context::UnreadEnabled => crate::session::unread_enabled(),
         Context::CustomSortable => true,
+        Context::LiveSend => ctx.live_send,
     }
 }
 
@@ -409,6 +441,7 @@ pub fn parse_chord(s: &str) -> Option<Chord> {
         code,
         ctrl,
         alt: false,
+        shift: false,
     })
 }
 
@@ -434,6 +467,32 @@ pub fn label(id: ActionId, strict: bool) -> String {
     chords.first().map(format_chord).unwrap_or_default()
 }
 
+/// Whether `key` is one of the action's chords in the given mode, ignoring context
+/// guards. For handlers that run outside the home dispatcher.
+pub fn is_bound(id: ActionId, strict: bool, key: &KeyEvent) -> bool {
+    BINDINGS.iter().any(|b| {
+        let chords = if strict { b.strict } else { b.non_strict };
+        b.id == id && chords.iter().any(|c| chord_matches(c, key))
+    })
+}
+
+/// The key event a click on the action's footer button synthesizes: its primary chord.
+pub fn key_event(id: ActionId, strict: bool) -> Option<KeyEvent> {
+    let b = BINDINGS.iter().find(|b| b.id == id)?;
+    let c = if strict { b.strict } else { b.non_strict }.first()?;
+    let mut modifiers = KeyModifiers::NONE;
+    if c.ctrl {
+        modifiers |= KeyModifiers::CONTROL;
+    }
+    if c.alt {
+        modifiers |= KeyModifiers::ALT;
+    }
+    if c.shift {
+        modifiers |= KeyModifiers::SHIFT;
+    }
+    Some(KeyEvent::new(c.code, modifiers))
+}
+
 fn format_chord(c: &Chord) -> String {
     let key = match c.code {
         KeyCode::Char(ch) => ch.to_ascii_uppercase().to_string(),
@@ -442,10 +501,15 @@ fn format_chord(c: &Chord) -> String {
         KeyCode::Down => "Down".to_string(),
         KeyCode::Left => "Left".to_string(),
         KeyCode::Right => "Right".to_string(),
+        KeyCode::PageUp => "PgUp".to_string(),
+        KeyCode::PageDown => "PgDn".to_string(),
         _ => return String::new(),
     };
     // A bare letter keeps its lone-character form; every modified chord is spelled out, or
     // the help overlay and the palette show the new arrow bindings with no key at all.
+    if c.shift {
+        return format!("Shift+{key}");
+    }
     match (c.ctrl, c.alt, c.code) {
         (false, false, KeyCode::Char(ch)) => ch.to_string(),
         (true, true, _) => format!("Ctrl+Alt+{key}"),
@@ -531,6 +595,24 @@ pub static BINDINGS: &[Binding] = &[
             group: PaletteGroup::Actions,
         }),
     },
+    // Live-send only: bare PageUp/PageDown belong to the agent (and to cursor paging in
+    // the list), so the scroll chords need Shift.
+    Binding {
+        id: ActionId::PreviewScrollUp,
+        non_strict: &[shift_code(KeyCode::PageUp)],
+        strict: &[shift_code(KeyCode::PageUp)],
+        context: Context::LiveSend,
+        help: None,
+        palette: None,
+    },
+    Binding {
+        id: ActionId::PreviewScrollDown,
+        non_strict: &[shift_code(KeyCode::PageDown)],
+        strict: &[shift_code(KeyCode::PageDown)],
+        context: Context::LiveSend,
+        help: None,
+        palette: None,
+    },
     // --- attention-sort triage ---
     Binding {
         id: ActionId::ToggleFavorite,
@@ -575,6 +657,29 @@ pub static BINDINGS: &[Binding] = &[
         palette: None,
     },
     // --- always-on actions ---
+    Binding {
+        id: ActionId::OpenCommandPalette,
+        // `Ctrl+Shift+K` arrives as an uppercase char on some terminals.
+        non_strict: &[ctrl('k'), ctrl('K')],
+        strict: &[ctrl('k'), ctrl('K')],
+        context: Context::Always,
+        help: Some(HelpMeta {
+            section: HelpSection::Other,
+            desc: "Command palette",
+        }),
+        palette: None,
+    },
+    Binding {
+        id: ActionId::DismissUpdateBanner,
+        non_strict: &[ctrl('x')],
+        strict: &[ctrl('x')],
+        context: Context::Always,
+        help: Some(HelpMeta {
+            section: HelpSection::Other,
+            desc: "Dismiss update bar (this session)",
+        }),
+        palette: None,
+    },
     Binding {
         id: ActionId::Quit,
         non_strict: &[k('q')],
@@ -1218,10 +1323,10 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::Restart => "restart",
         ActionId::ToggleArchive => "archive",
         ActionId::ToggleFavorite => "favorite",
-        ActionId::MoveRowUp => "move row up",
-        ActionId::MoveRowDown => "move row down",
-        ActionId::JumpPrevFinished => "previous working or just-finished session",
-        ActionId::JumpNextFinished => "next working or just-finished session",
+        ActionId::MoveRowUp => "move-row-up",
+        ActionId::MoveRowDown => "move-row-down",
+        ActionId::JumpPrevFinished => "previous-finished",
+        ActionId::JumpNextFinished => "next-finished",
         ActionId::ToggleSnooze => "snooze",
         ActionId::ToggleUnread => "toggle-unread",
         ActionId::TogglePreviewInfo => "toggle-preview-info",
@@ -1247,6 +1352,10 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::Fork => "fork",
         ActionId::AutoName => "auto-name",
         ActionId::EmptyTrash => "empty-trash",
+        ActionId::OpenCommandPalette => "command-palette",
+        ActionId::DismissUpdateBanner => "dismiss-update-banner",
+        ActionId::PreviewScrollUp => "preview-scroll-up",
+        ActionId::PreviewScrollDown => "preview-scroll-down",
     }
 }
 
@@ -1260,6 +1369,7 @@ mod tests {
             sort_order: SortOrder::Newest,
             has_search: false,
             project_group_selected: false,
+            live_send: false,
         }
     }
 
@@ -1278,6 +1388,7 @@ mod tests {
                 code,
                 ctrl,
                 alt: false,
+                shift: false,
             })
         };
         let cases = [
@@ -1307,7 +1418,8 @@ mod tests {
         assert!(!core_shadows(&Chord {
             code: KeyCode::Char('z'),
             ctrl: true,
-            alt: false
+            alt: false,
+            shift: false,
         }));
         let c = ctx();
         assert_eq!(
@@ -1545,5 +1657,75 @@ mod tests {
             }
         }
         assert_eq!(label(ActionId::ToggleFavorite, false), "f");
+    }
+
+    #[test]
+    fn app_and_live_chords_resolve_in_their_own_context() {
+        let ev = |code, modifiers| KeyEvent::new(code, modifiers);
+        let live = Ctx {
+            live_send: true,
+            ..ctx()
+        };
+        let cases = [
+            // (event, resolves in the list, resolves in live-send)
+            (
+                ev(KeyCode::Char('k'), KeyModifiers::CONTROL),
+                Some(ActionId::OpenCommandPalette),
+                Some(ActionId::OpenCommandPalette),
+            ),
+            (
+                ev(KeyCode::Char('K'), KeyModifiers::CONTROL),
+                Some(ActionId::OpenCommandPalette),
+                Some(ActionId::OpenCommandPalette),
+            ),
+            (
+                ev(KeyCode::PageUp, KeyModifiers::SHIFT),
+                None,
+                Some(ActionId::PreviewScrollUp),
+            ),
+            (
+                ev(KeyCode::PageDown, KeyModifiers::SHIFT),
+                None,
+                Some(ActionId::PreviewScrollDown),
+            ),
+            (ev(KeyCode::PageUp, KeyModifiers::NONE), None, None),
+            (
+                ev(KeyCode::PageUp, KeyModifiers::SHIFT | KeyModifiers::CONTROL),
+                None,
+                None,
+            ),
+            (
+                ev(KeyCode::Up, KeyModifiers::ALT),
+                Some(ActionId::JumpPrevFinished),
+                Some(ActionId::JumpPrevFinished),
+            ),
+        ];
+        for strict in [false, true] {
+            for (key, in_list, in_live) in &cases {
+                assert_eq!(resolve(key, strict, &ctx()), *in_list, "{key:?} list");
+                assert_eq!(resolve(key, strict, &live), *in_live, "{key:?} live");
+            }
+        }
+        assert!(is_bound(
+            ActionId::DismissUpdateBanner,
+            false,
+            &ctrl_key('x')
+        ));
+        assert!(!is_bound(ActionId::DismissUpdateBanner, false, &key('x')));
+        assert_eq!(label(ActionId::PreviewScrollUp, false), "Shift+PgUp");
+    }
+
+    #[test]
+    fn action_names_are_unique_kebab_case() {
+        let mut seen = std::collections::HashSet::new();
+        for b in BINDINGS {
+            let name = palette_id(b.id);
+            assert!(
+                name.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+                "{name:?} is not kebab-case"
+            );
+            assert!(seen.insert(name), "{name:?} is used twice");
+        }
     }
 }
