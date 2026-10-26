@@ -359,7 +359,7 @@ function sendButtonClass(disabled: boolean, extra = "") {
   ].join(" ");
 }
 
-/** Stays clickable while disconnected: `sendPrompt` queues until the session resumes. */
+/** Remains clickable while disconnected so `sendPrompt` can queue the message. */
 export function SendButton({
   connected = true,
   disabled = false,
@@ -372,18 +372,18 @@ export function SendButton({
   waitingFor?: string | null;
   onSend: () => void;
 }) {
-  const queueLabel = waitingFor ? `Queue message until ${waitingFor} is ready` : "Queue message until session resumes";
+  const disconnectedLabel = waitingFor ? `Pending until ${waitingFor} is ready` : "Queue message until session resumes";
   const title = disabled
     ? "Type a message to send"
     : connected
       ? "Send, Enter"
       : waitingFor
-        ? `Queued until ${waitingFor} is ready`
+        ? disconnectedLabel
         : "Session not active, will send on resume";
   return (
     <button
       type="button"
-      aria-label={connected ? "Send message" : queueLabel}
+      aria-label={connected ? "Send message" : disconnectedLabel}
       title={title}
       onClick={onSend}
       disabled={disabled}

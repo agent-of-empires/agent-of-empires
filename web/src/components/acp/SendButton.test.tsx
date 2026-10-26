@@ -9,12 +9,13 @@ afterEach(cleanup);
 describe("SendButton", () => {
   it.each<[string, boolean, string | null, string, string]>([
     ["connected", true, null, "Send message", "Send, Enter"],
+    ["connected while its Agent starts", true, "Claude Code", "Send message", "Send, Enter"],
     [
       "a new Session waits for its Agent",
       false,
       "Claude Code",
-      "Queue message until Claude Code is ready",
-      "Queued until Claude Code is ready",
+      "Pending until Claude Code is ready",
+      "Pending until Claude Code is ready",
     ],
     [
       "a resumed Session waits to resume",
