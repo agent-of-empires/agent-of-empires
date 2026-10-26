@@ -1416,6 +1416,15 @@ mod tests {
                 }
             }
         }
+        // Literal separator keys and spaced tokens still declare and match.
+        for (spec, event) in [
+            ("-", key('-')),
+            ("Ctrl+-", ctrl_key('-')),
+            ("Ctrl + J", ctrl_key('j')),
+        ] {
+            assert!(parse_chord(spec).is_some(), "{spec:?}");
+            assert!(keybind_matches(spec, &event), "{spec:?}");
+        }
         // A modified chord is not claimed by the bare-letter binding it resembles.
         assert!(!core_shadows(&parse_chord("M-n").unwrap()));
         assert!(core_shadows(&parse_chord("M-Up").unwrap()));
