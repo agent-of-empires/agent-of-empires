@@ -1458,7 +1458,7 @@ for line in sys.stdin:
             .unwrap()
         {
             Event::AcpSessionAssigned { acp_session_id } => assigned = Some(acp_session_id),
-            Event::AgentMessageChunk { text } => addressed = Some(text),
+            Event::AgentMessageChunk { text, .. } => addressed = Some(text),
             _ => {}
         }
     }
@@ -2295,7 +2295,7 @@ for line in sys.stdin:
     assert!(events.iter().any(|(_, event)| matches!(event,
         Event::AcpSessionAssigned { acp_session_id } if acp_session_id == "owned-native-session")));
     assert!(events.iter().any(|(_, event)| matches!(event,
-        Event::AgentMessageChunk { text } if text == "real original turn completed")));
+        Event::AgentMessageChunk { text, .. } if text == "real original turn completed")));
     let stops: Vec<_> = events
         .iter()
         .filter_map(|(_, event)| match event {

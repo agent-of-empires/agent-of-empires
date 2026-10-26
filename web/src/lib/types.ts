@@ -339,7 +339,9 @@ export interface BrowseResponse {
 
 export interface GroupInfo {
   path: string;
+  /** Sessions directly in this group, not in its children. */
   session_count: number;
+  archived?: boolean;
 }
 
 export interface ProjectOverrides {

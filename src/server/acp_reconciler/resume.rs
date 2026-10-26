@@ -1051,7 +1051,7 @@ mod tests {
         assert_eq!(reasons, ["prompt_complete"]);
         assert!(events.iter().any(|(_, event)| matches!(
             event,
-            Event::AgentMessageChunk { text } if text == "original producer completed"
+            Event::AgentMessageChunk { text, .. } if text == "original producer completed"
         )));
         state.acp_supervisor.detach_all().await;
     }

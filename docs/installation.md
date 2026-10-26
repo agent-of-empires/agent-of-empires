@@ -39,7 +39,7 @@ A source build leaves the binary at `target/release/aoe`. Verify any install wit
 aoe update
 ```
 
-`aoe update` detects how aoe was installed (Homebrew, the install script, Nix, or Cargo) and dispatches to the right mechanism. For Nix and Cargo it prints the manual command instead, since those need external tooling. In the TUI, press `u` while the update bar is visible to run the same flow, or `Ctrl+x` to dismiss the bar.
+`aoe update` detects how aoe was installed (Homebrew, the install script, Nix, or Cargo) and dispatches to the right mechanism. For Nix and Cargo it prints the manual command instead, since those need external tooling. A Nix profile install updates with `nix profile upgrade agent-of-empires` (see `nix profile list` for the entry name); if aoe comes from a flake input, run `nix flake update <input>` (your flake's name for aoe) and rebuild your system or home-manager configuration. In the TUI, press `u` while the update bar is visible to run the same flow, or `Ctrl+x` to dismiss the bar.
 
 A schema upgrade refuses to run while a daemon is still writing the old data layout. The TUI and ordinary commands stop before migration and tell you how to continue. With the new binary installed, run `aoe serve --restart` to retain the managed daemon's launch settings and authentication, stop its original process, migrate under exclusion, and start its replacement. Alternatively, run `aoe serve --stop`, then reopen the TUI. Stop a service-supervised daemon through its service manager before migrating and restart it there afterwards. Do not remove PID files or schema markers to bypass this gate.
 

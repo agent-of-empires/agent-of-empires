@@ -12,6 +12,12 @@ cargo fmt
 cargo clippy
 ```
 
+Local dashboard end-to-end tests on Linux require `bubblewrap`, `iproute2`, and
+`tmux`. Host security policy must allow `CAP_NET_ADMIN` in bubblewrap's children
+to configure their private network namespace. The
+[web-e2e CI leg](../.github/workflows/tests.yml) requires this coverage with
+`AOE_REQUIRE_LOCAL_NETWORK_TESTS=1`; unavailable confinement fails the job.
+
 The binary is `target/{profile}/aoe`. Web commands and test selection live in `web/AGENTS.md`.
 
 Debug builds carry line tables only, and dependencies carry no debug info, to keep `target/` small across worktrees. Panics still name the file and line in this crate, but a debugger has no local values; rebuild with `RUSTFLAGS="-Cdebuginfo=2"` for a full debugging session.

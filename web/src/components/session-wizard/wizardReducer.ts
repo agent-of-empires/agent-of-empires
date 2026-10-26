@@ -62,6 +62,8 @@ export interface WizardState {
   error: string | null;
   agents: AgentInfo[];
   groups: GroupInfo[];
+  /** Which profile `groups` was fetched for; any other profile sees no Groups. */
+  groupsFor: string | null;
   profiles: ProfileInfo[];
   dockerAvailable: boolean;
   /** The Docker probe has answered, even if the answer was a failure. */
@@ -75,7 +77,7 @@ export type Action =
   | { type: "SUBMIT_SUCCESS" }
   | { type: "SUBMIT_CANCEL" }
   | { type: "SET_AGENTS"; agents: AgentInfo[] }
-  | { type: "SET_GROUPS"; groups: GroupInfo[] }
+  | { type: "SET_GROUPS"; groups: GroupInfo[]; groupsFor: string }
   | { type: "SET_PROFILES"; profiles: ProfileInfo[] }
   | { type: "SET_DOCKER"; available: boolean }
   | {
@@ -244,7 +246,7 @@ export function reducer(state: WizardState, action: Action): WizardState {
     case "SET_AGENTS":
       return { ...state, agents: action.agents };
     case "SET_GROUPS":
-      return { ...state, groups: action.groups };
+      return { ...state, groups: action.groups, groupsFor: action.groupsFor };
     case "SET_PROFILES":
       return { ...state, profiles: action.profiles };
     case "SET_DOCKER":

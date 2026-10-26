@@ -242,6 +242,16 @@ impl DaemonClient {
         self.request_json(self.http.get(url)).await
     }
 
+    /// The daemon's own default profile, which can differ from this client's config.
+    pub async fn default_profile(&self) -> Result<String, DaemonClientError> {
+        let url = self
+            .sessions_url
+            .join("profiles")
+            .map_err(|_| DaemonClientError::Transport)?;
+        let rows: Vec<ProfileRow> = self.request_json(self.http.get(url)).await?;
+        default_of(rows).ok_or(DaemonClientError::Transport)
+    }
+
     pub(crate) async fn local_runtime_ready(
         &self,
         profile: Option<&str>,
@@ -1175,9 +1185,29 @@ fn truncate_utf8(value: &mut String, max_bytes: usize) {
     value.truncate(boundary);
 }
 
+#[derive(serde::Deserialize)]
+struct ProfileRow {
+    name: String,
+    is_default: bool,
+}
+
+fn default_of(rows: Vec<ProfileRow>) -> Option<String> {
+    rows.into_iter().find(|r| r.is_default).map(|r| r.name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_profile_is_the_row_the_daemon_marks() {
+        let rows: Vec<ProfileRow> = serde_json::from_str(
+            r#"[{"name":"main","is_default":false},{"name":"work","is_default":true,"description":"x"}]"#,
+        )
+        .unwrap();
+        assert_eq!(default_of(rows).as_deref(), Some("work"));
+        assert_eq!(default_of(Vec::new()), None);
+    }
 
     #[tokio::test]
     async fn native_admission_preserves_degraded_reads_without_relaxing_identity() {

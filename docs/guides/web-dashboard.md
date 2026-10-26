@@ -22,6 +22,7 @@ aoe serve                       # Localhost only (safe, default)
 aoe serve --remote              # Remote over HTTPS (Tailscale Funnel, else Cloudflare quick tunnel)
 aoe serve --host 0.0.0.0        # LAN/VPN access (HTTP, requires VPN)
 aoe serve --daemon              # Run in background
+aoe daemon start                # Same; also stop, status, restart
 aoe serve --open                # Open the URL in the default browser when ready
 aoe serve --remote --read-only  # Monitor without terminal input
 ```
@@ -49,6 +50,8 @@ aoe serve --core-only --daemon
 An explicit `aoe serve` request enables Web serving by replacing a managed private-API Daemon under its lifecycle lock. It validates the requested exposure before stopping the old process, waits for dashboard readiness, and leaves terminal sessions running. Successful promotion retains the prior private-API launch for explicit recovery.
 
 `aoe serve --restart` replays the current managed launch. A failed replacement has no automatic fallback: use `aoe serve --rollback` to restore the retained launch, including after `--stop` or when the web plugin is disabled. Missing or mismatched credentials refuse rollback rather than dropping authentication; unavailable prerequisites can still make replay fail.
+
+Local restarts from the TUI preserve the running dashboard's effective passphrase, including when a newly opened TUI has no `AOE_SERVE_PASSPHRASE` variable. Restart refuses before stopping the running Daemon if its required credential cannot be recovered. Generating a new Tunnel passphrase explicitly replaces that credential.
 
 The retained launch and credential stay private (`0600`). Restart or rollback consumes them only after readiness; failed replay retains them. Promotion to Web serving does not consume the private-API recovery pair. Stop foreground or service-supervised processes through their owning shell or manager before rollback replaces them.
 
@@ -146,7 +149,44 @@ With `--auth=passphrase --behind-proxy`, the passphrase wall applies to TCP loop
 
 `--behind-proxy` requires at least one `--allowed-host <public-hostname>`: aoe cannot infer the hostname your proxy forwards, and the [DNS-rebinding gate](#dns-rebinding) rejects any `Host` it does not recognize. If the proxy listens on a nonstandard port, also pass the exact origin, e.g. `--allowed-origin https://aoe.example.com:8443`. The daemon refuses to start (with an explicit message) if `--behind-proxy` is set without `--allowed-host`.
 
-### Running under systemd
+### Running under systemd or launchd
+
+`aoe daemon start|stop|status|restart` are the `aoe serve --daemon|--stop|--status|--restart` controls. To let the OS own the daemon instead, run foreground `aoe serve` from a service unit, with no `--daemon` and no exposure flags. Substitute the absolute path from `command -v aoe`.
+
+`~/.config/systemd/user/aoe.service`, enabled with `systemctl --user enable --now aoe.service`:
+
+```ini
+[Unit]
+Description=Agent of Empires daemon
+
+[Service]
+Type=notify
+ExecStart=/path/to/aoe serve
+Restart=on-failure
+KillMode=process
+
+[Install]
+WantedBy=default.target
+```
+
+`KillMode=process` keeps a tmux server the daemon started, and every pane, alive across `systemctl --user stop` and `restart`, at the cost of leaving the daemon's other child processes running after a stop. Alternatively drop it and select a dedicated `tmux.socket_name` whose server starts outside the daemon; see [systemd](configuration.md#systemd).
+
+`~/Library/LaunchAgents/com.agentofempires.daemon.plist`, loaded with `launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.agentofempires.daemon.plist"`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.agentofempires.daemon</string>
+  <key>ProgramArguments</key><array><string>/path/to/aoe</string><string>serve</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+</dict>
+</plist>
+```
+
+Control a manager-owned daemon with `systemctl --user` or `launchctl`, not `aoe daemon`: with `Restart=on-failure` and `SuccessfulExit=false` a stop through aoe leaves the unit inactive, and `aoe daemon start` would run a second, unmanaged daemon. The daemon inherits the service manager's `PATH`, so set it to include `tmux` and your agents. Give a debug build its own unit name or label so it does not replace the release one.
 
 `aoe serve` supports `Type=notify` when `NOTIFY_SOCKET` is set, using pathname or Linux abstract (`@name`) sockets. It sends `READY=1` after binding the required TCP and owner-verified Unix listeners, publishing the first canonical snapshot, and starting workers/tasks; it sends `STOPPING=1` when shutdown starts. A quarantined component does not stop healthy CLI reads, but native health and mutation admission remain fail-closed. Supported local runtime-read publication waits for retained readers before readiness; CityHall and unsupported namespaces keep their no-publication behavior. Writes run outside async workers and each has a one-second timeout; a receiver that remains full can still cause `READY=1` to be lost. Wrappers such as `cargo run` require `NotifyAccess=all`.
 

@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
 
 import type { IncompatibleAgentDetail } from "../../lib/acpTypes";
-import { fetchSettings, installAcpAgent } from "../../lib/api";
+import { fetchSettings } from "../../lib/api";
 import { useRespawnSession } from "../../hooks/useRespawnSession";
+import { useAdapterInstall } from "./adapterRecovery";
+import { RecoveryActionRow, type RecoveryAction } from "./RecoveryActionRow";
 
 interface Props {
   detail: IncompatibleAgentDetail;
@@ -23,10 +25,7 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
 
   const { state: respawnState, error: respawnError, respawn } = useRespawnSession(sessionId);
   const [allowInstall, setAllowInstall] = useState(false);
-  const [installState, setInstallState] = useState<"idle" | "installing" | "failed">("idle");
-  const [installError, setInstallError] = useState<string | null>(null);
-  const [installOutput, setInstallOutput] = useState<string | null>(null);
-  const [recoveredCount, setRecoveredCount] = useState(0);
+  const install = useAdapterInstall(sessionId, respawn);
 
   useEffect(() => {
     let alive = true;
@@ -40,30 +39,29 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
     };
   }, []);
 
-  const busy = respawnState === "retrying" || installState === "installing";
-
-  const handleUpdateAndRestart = async () => {
-    setInstallState("installing");
-    setInstallError(null);
-    setInstallOutput(null);
-    try {
-      const res = await installAcpAgent(sessionId);
-      const log = `${res.stdout}\n${res.stderr}`.trim();
-      setInstallOutput(log || null);
-      if (!res.success) {
-        setInstallState("failed");
-        setInstallError(`Install exited with code ${res.exit_code ?? "unknown"}.`);
-        return;
-      }
-      setRecoveredCount(res.recovered_sessions);
-      setInstallState("idle");
-      // Re-run the handshake against the freshly installed version.
-      await respawn();
-    } catch (e) {
-      setInstallState("failed");
-      setInstallError(e instanceof Error ? e.message : String(e));
-    }
+  const busy = respawnState === "retrying" || install.state === "installing";
+  const restart: RecoveryAction = {
+    label: respawnState === "retrying" ? "Restarting…" : "Restart agent",
+    onClick: () => void respawn(),
+    testId: "startup-error-restart",
+    disabled: busy,
   };
+  const update: RecoveryAction = {
+    label:
+      install.state === "installing" ? "Updating…" : isSandboxed ? "Update in sandbox & restart" : "Update & restart",
+    onClick: () => void install.install(),
+    testId: "startup-error-update-restart",
+    disabled: busy,
+  };
+  const updateDisabled: RecoveryAction = {
+    label: "Update & restart",
+    onClick: () => {},
+    testId: "startup-error-update-restart-disabled",
+    disabled: true,
+    title:
+      'Turn on "Allow agent install from web" in the aoe TUI settings (Global, Acp tab, Advanced) to install from the dashboard',
+  };
+  const canUpdate = autoInstallable && allowInstall;
 
   return (
     <div
@@ -77,11 +75,11 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
           Adapter compatibility check failed
         </div>
         <h2 className="mt-2 text-lg font-semibold text-text-primary">{heading}</h2>
-        <p className="mt-3 text-sm text-text-secondary">{summary}</p>
+        <p className="mt-3 text-sm text-text-subtle">{summary}</p>
 
         {showHostCommand && (
           <div className="mt-4">
-            <div className="text-[11px] font-medium uppercase tracking-wide text-text-dim">
+            <div className="text-[11px] font-medium uppercase tracking-wide text-text-subtle">
               Run this, then restart the agent
             </div>
             <pre
@@ -95,23 +93,23 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
 
         {isSandboxed && installCommand && (
           <div className="mt-4" data-testid="startup-error-sandbox-note">
-            <div className="text-[11px] font-medium uppercase tracking-wide text-text-dim">
+            <div className="text-[11px] font-medium uppercase tracking-wide text-text-subtle">
               This session runs in a sandbox
             </div>
             {autoInstallable ? (
-              <p className="mt-1 text-sm text-text-secondary">
+              <p className="mt-1 text-sm text-text-subtle">
                 The adapter lives inside the container, so a host{" "}
                 <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">npm install</code> would not reach
-                it. Use <span className="font-medium text-text-secondary">Update &amp; restart</span> below to install
-                the adapter <span className="font-medium text-text-secondary">inside the container</span> and reload the
+                it. Use <span className="font-medium text-text-subtle">Update &amp; restart</span> below to install the
+                adapter <span className="font-medium text-text-subtle">inside the container</span> and reload the
                 session.
               </p>
             ) : (
               <>
-                <p className="mt-1 text-sm text-text-secondary">
+                <p className="mt-1 text-sm text-text-subtle">
                   The adapter lives inside the container, so installing it on the host would not reach it.
                 </p>
-                <div className="mt-3 text-[11px] font-medium uppercase tracking-wide text-text-dim">
+                <div className="mt-3 text-[11px] font-medium uppercase tracking-wide text-text-subtle">
                   Run this inside the container, then press Restart agent
                 </div>
                 <pre
@@ -122,7 +120,7 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
                 </pre>
               </>
             )}
-            <p className="mt-2 text-xs text-text-dim">
+            <p className="mt-2 text-xs text-text-subtle">
               This updates the running container only. To keep new sessions from hitting this, refresh the sandbox
               image: the aoe TUI shows a "sandbox image update available" banner that pulls the right image with your
               configured container runtime.
@@ -132,46 +130,16 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
 
         <DetailRows detail={detail} />
 
-        <div className="mt-5 flex flex-wrap items-center gap-2">
-          <button
-            type="button"
-            data-testid="startup-error-restart"
-            onClick={respawn}
-            disabled={busy}
-            className="rounded-md border border-surface-700 bg-surface-800 px-3 py-1.5 text-xs font-medium text-text-primary hover:bg-surface-700 disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            {respawnState === "retrying" ? "Restarting…" : "Restart agent"}
-          </button>
-          {autoInstallable && allowInstall && (
-            <button
-              type="button"
-              data-testid="startup-error-update-restart"
-              onClick={handleUpdateAndRestart}
-              disabled={busy}
-              className="rounded-md border border-status-error/60 bg-status-error/20 px-3 py-1.5 text-xs font-medium text-text-primary hover:bg-status-error/30 disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              {installState === "installing"
-                ? "Updating…"
-                : isSandboxed
-                  ? "Update in sandbox & restart"
-                  : "Update & restart"}
-            </button>
-          )}
-          {autoInstallable && !allowInstall && (
-            <button
-              type="button"
-              data-testid="startup-error-update-restart-disabled"
-              disabled
-              title="Enable acp.allow_agent_install in the aoe TUI settings (Advanced) to install from the dashboard"
-              className="cursor-not-allowed rounded-md border border-surface-700 bg-surface-800 px-3 py-1.5 text-xs font-medium text-text-dim opacity-60"
-            >
-              Update & restart
-            </button>
-          )}
+        <div className="mt-2">
+          <RecoveryActionRow
+            primary={canUpdate ? update : restart}
+            secondary={canUpdate ? [restart] : autoInstallable ? [updateDisabled] : []}
+            install={install}
+          />
         </div>
 
         {autoInstallable && !allowInstall && (
-          <div className="mt-2 text-xs text-text-dim" data-testid="startup-error-enable-hint">
+          <div className="mt-2 text-xs text-text-subtle" data-testid="startup-error-enable-hint">
             One-click install is off. Enable{" "}
             <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">acp.allow_agent_install</code> in the{" "}
             <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">aoe</code> TUI settings (Advanced) to
@@ -184,25 +152,17 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
         {respawnState === "ok" && (
           <div className="mt-2 text-xs text-emerald-200/90">
             Restart requested. The agent re-runs the compatibility check on the next handshake.
-            {recoveredCount > 0 &&
-              ` Also restarting ${recoveredCount} other session${recoveredCount === 1 ? "" : "s"} blocked on the same adapter.`}
+            {install.recovered > 0 &&
+              ` Also restarting ${install.recovered} other session${install.recovered === 1 ? "" : "s"} blocked on the same adapter.`}
           </div>
         )}
         {respawnState === "failed" && respawnError && (
           <div className="mt-2 text-xs text-status-error">Restart failed: {respawnError}</div>
         )}
-        {installState === "failed" && installError && (
-          <div className="mt-2 text-xs text-status-error">{installError}</div>
-        )}
-        {installOutput && (
-          <pre className="mt-2 max-h-40 overflow-auto rounded-md border border-surface-700 bg-surface-950 p-2 font-mono text-[11px] text-text-secondary">
-            {installOutput}
-          </pre>
-        )}
 
-        <div className="mt-4 text-xs text-text-dim">
+        <div className="mt-4 text-xs text-text-subtle">
           The session is paused until the adapter satisfies the required version. After installing, use{" "}
-          <span className="font-medium text-text-secondary">Restart agent</span> above (no full restart of{" "}
+          <span className="font-medium text-text-subtle">Restart agent</span> above (no full restart of{" "}
           <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">aoe serve</code> needed) and the check
           re-runs at the next ACP <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">initialize</code>{" "}
           handshake.
@@ -280,10 +240,10 @@ function DetailRows({ detail }: { detail: IncompatibleAgentDetail }) {
       break;
   }
   return (
-    <dl className="mt-4 grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 font-mono text-[11px] text-text-secondary">
+    <dl className="mt-4 grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 font-mono text-[11px] text-text-subtle">
       {rows.map(([label, value]) => (
         <div key={label} className="contents">
-          <dt className="font-medium text-text-dim">{label}</dt>
+          <dt className="font-medium text-text-subtle">{label}</dt>
           <dd className="break-all">{value}</dd>
         </div>
       ))}

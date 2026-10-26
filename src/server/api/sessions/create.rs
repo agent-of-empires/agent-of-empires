@@ -902,6 +902,61 @@ pub async fn create_session(
         }
     }
 
+    // A structured session whose adapter resolves nowhere could only fail to
+    // start, so refuse it before anything is provisioned. An import is
+    // always structured, and its listing below would launch the adapter.
+    let importing = body
+        .import_acp_session_id
+        .as_deref()
+        .is_some_and(|id| !id.trim().is_empty());
+    if body.view == crate::session::View::Structured || importing {
+        let profile = validation_profile.to_string();
+        let project_path = std::path::PathBuf::from(&body.path);
+        // These launch in a directory provisioned later, not `body.path`.
+        let launch_dir_known = !(body.scratch
+            || create_body_uses_worktree(&body)
+            || !body.extra_repo_paths.is_empty());
+        let (tool, agent_name) = (body.tool.clone(), body.agent_name.clone());
+        let (command_override, sandboxed) = (body.command_override.clone(), body.sandbox);
+        let (scratch, trust_hooks) = (body.scratch, body.trust_hooks);
+        let missing = tokio::task::spawn_blocking(move || {
+            use crate::session::builder::structured::{
+                preparation_hooks_apply, validate_structured_choice, StructuredChoice,
+                StructuredChoiceError,
+            };
+            let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+                &profile,
+                &project_path,
+            );
+            let choice = StructuredChoice {
+                tool: &tool,
+                agent_name: agent_name.as_deref(),
+                command_override: &command_override,
+                sandboxed,
+                project_path: launch_dir_known.then_some(project_path.as_path()),
+                // The repository's hooks are merged into `config` whatever their trust.
+                preparation_hooks: &|| {
+                    preparation_hooks_apply(
+                        &crate::session::config::profile_config::resolve_config_or_warn(&profile)
+                            .hooks,
+                        &project_path,
+                        scratch,
+                        trust_hooks,
+                    )
+                },
+            };
+            match validate_structured_choice(&choice, &config) {
+                Err(StructuredChoiceError::AdapterMissing(msg)) => Some(msg),
+                _ => None,
+            }
+        })
+        .await
+        .unwrap_or(None);
+        if let Some(msg) = missing {
+            return api_error(StatusCode::BAD_REQUEST, "acp_adapter_missing", msg);
+        }
+    }
+
     // A new session has exactly one conversation source.
     if create_body_has_conflicting_sources(&body) {
         return api_error(

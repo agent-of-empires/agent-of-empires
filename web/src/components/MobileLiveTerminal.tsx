@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, RefObject } from "react";
 import type { AnsiSegment } from "../lib/ansi";
-import { LineParseCache, lineText, textWidth, wrapLine } from "../lib/liveTermLines";
+import { LineParseCache, linkifyLine, lineText, textWidth, wrapLine } from "../lib/liveTermLines";
 import { cursorLineIndex, pointerPaneCell, unwrapPointer } from "../lib/liveMouse";
 import type { LiveFrame, LiveStats } from "../hooks/useLiveTerminal";
 import { useWebSettings } from "../hooks/useWebSettings";
@@ -212,7 +212,7 @@ export function MobileLiveTerminal({
       let wrapped = wrapCache.get(line);
       if (!wrapped || wrapped.cols !== cols) {
         // Plain text, so the anchor matches a line whichever producer encoded its style.
-        wrapped = { cols, rows: wrapLine(line, cols), key: lineText(line).trimEnd() };
+        wrapped = { cols, rows: wrapLine(linkifyLine(line), cols), key: lineText(line).trimEnd() };
         wrapCache.set(line, wrapped);
       }
       lineStartRow[i] = rows.length;

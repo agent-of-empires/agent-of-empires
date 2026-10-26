@@ -197,7 +197,7 @@ impl EventStore {
                 Event::UserPromptSent { text, .. } if first_prompt.is_none() => {
                     first_prompt = Some(text);
                 }
-                Event::AgentMessageChunk { text }
+                Event::AgentMessageChunk { text, .. }
                     if first_prompt.is_some() && agent.len() < max_agent_bytes =>
                 {
                     agent.push_str(&text);
@@ -765,7 +765,7 @@ mod tests {
         );
         assert!(matches!(
             store.latest_seed_status_event("s-2"),
-            Some(Event::AgentMessageChunk { text }) if text == "build done"
+            Some(Event::AgentMessageChunk { text, .. }) if text == "build done"
         ));
         store.record("s-3", 1, &Event::ThinkingStarted).unwrap();
         assert!(matches!(
@@ -951,7 +951,10 @@ mod tests {
             tool_call_id: None,
             description: "sleep".into(),
         };
-        let chunk = || Event::AgentMessageChunk { text: "x".into() };
+        let chunk = || Event::AgentMessageChunk {
+            text: "x".into(),
+            message_id: None,
+        };
         let mut seq = 0;
         let mut record = |event: Event| {
             seq += 1;

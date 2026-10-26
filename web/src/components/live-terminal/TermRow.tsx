@@ -1,13 +1,6 @@
 import { Fragment, memo, type CSSProperties, type ReactNode } from "react";
 import type { AnsiSegment, AnsiStyle } from "../../lib/ansi";
-import {
-  clusterSpanAt,
-  findCursorCharIndex,
-  isHttpUrl,
-  splitCellRuns,
-  splitUrls,
-  textWidth,
-} from "../../lib/liveTermLines";
+import { clusterSpanAt, findCursorCharIndex, isHttpUrl, splitCellRuns, textWidth } from "../../lib/liveTermLines";
 
 function segStyle(style: AnsiStyle): CSSProperties | undefined {
   const css: CSSProperties = {};
@@ -62,26 +55,17 @@ function LinkedRow({ segs }: { segs: AnsiSegment[] }) {
   if (segs.length === 0) return <div> </div>; // keep empty rows at full height
   return (
     <div>
-      {segs.map((seg, i) =>
-        // An OSC 8 link's text need not be its URL, so it anchors whole instead of being re-scanned.
-        (seg.url && isHttpUrl(seg.url) ? [{ text: seg.text, url: seg.url }] : splitUrls(seg.text)).map((part, j) => {
-          const runs = splitCellRuns(part.text).map((run, k) =>
-            runSpan(`${i}-${j}-${k}`, run.text, run.fixed, run.cells, segStyle(seg.style)),
-          );
-          if (!part.url) return <Fragment key={`${i}-${j}`}>{runs}</Fragment>;
-          return (
-            <a
-              key={`${i}-${j}`}
-              href={part.url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="underline cursor-pointer"
-            >
-              {runs}
-            </a>
-          );
-        }),
-      )}
+      {segs.map((seg, i) => {
+        const runs = splitCellRuns(seg.text).map((run, k) =>
+          runSpan(`${i}-${k}`, run.text, run.fixed, run.cells, segStyle(seg.style)),
+        );
+        if (!seg.url || !isHttpUrl(seg.url)) return <Fragment key={i}>{runs}</Fragment>;
+        return (
+          <a key={i} href={seg.url} target="_blank" rel="noopener noreferrer" className="underline cursor-pointer">
+            {runs}
+          </a>
+        );
+      })}
     </div>
   );
 }
