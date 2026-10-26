@@ -87,6 +87,16 @@ pub(crate) enum StatusSource {
 }
 
 /// Shared application state accessible by all request handlers.
+/// A structured view restart's reply, kept so every request that joined it gets the same answer.
+#[derive(Clone)]
+pub(crate) struct RestartReply {
+    pub(crate) status: axum::http::StatusCode,
+    pub(crate) headers: axum::http::HeaderMap,
+    pub(crate) body: axum::body::Bytes,
+}
+
+pub(crate) type RestartWait = tokio::sync::watch::Receiver<Option<RestartReply>>;
+
 pub struct AppState {
     /// Selected at launch, follows its rename, and does not follow default changes.
     pub(crate) profile: std::sync::RwLock<String>,
@@ -181,6 +191,9 @@ pub struct AppState {
     /// last-summary seq). Synchronous mutex; tiny critical sections. See
     /// `session::conversation_summary` and #2808.
     pub summary_inflight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Per session, the structured view restart in progress. A restart requested meanwhile
+    /// waits for its reply instead of stopping the worker it is starting.
+    pub(crate) acp_restarts: std::sync::Mutex<std::collections::HashMap<String, RestartWait>>,
     /// Global cap on concurrent conversation-summary one-shots. Separate from
     /// `smart_rename_semaphore` (permits=2) and sized to 1: a summary runs the
     /// agent over the whole transcript, so it is slower and costlier than a

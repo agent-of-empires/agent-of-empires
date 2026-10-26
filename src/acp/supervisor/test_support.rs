@@ -28,6 +28,11 @@ impl<S: BroadcastSink> Supervisor<S> {
         self
     }
 
+    pub(crate) fn with_max_concurrent_workers(mut self, limit: u32) -> Self {
+        self.max_concurrent_workers = limit;
+        self
+    }
+
     pub(crate) fn test_cancel_requested(&self, lease: &Lease) -> bool {
         lock_recover(&self.lifecycle)
             .cancel_requested(lease)

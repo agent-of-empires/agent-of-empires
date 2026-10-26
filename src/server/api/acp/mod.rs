@@ -260,6 +260,7 @@ mod tests {
                         model: None,
                         additional_dirs: Vec::new(),
                         provider_env: Vec::new(),
+                        restart: false,
                     })),
                 )
                 .await
@@ -305,6 +306,7 @@ mod tests {
                     model: None,
                     additional_dirs: Vec::new(),
                     provider_env: Vec::new(),
+                    restart: false,
                 })),
             )
             .await
@@ -345,6 +347,7 @@ mod tests {
                 model: None,
                 additional_dirs: Vec::new(),
                 provider_env: Vec::new(),
+                restart: false,
             })),
         ));
         assert!(futures_util::poll!(launch.as_mut()).is_pending());
@@ -414,6 +417,7 @@ mod tests {
                                 model: None,
                                 additional_dirs: Vec::new(),
                                 provider_env: Vec::new(),
+                                restart: false,
                             })),
                         )
                         .await

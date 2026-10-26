@@ -821,6 +821,7 @@ pub(crate) async fn start_server(
             crate::session::smart_rename::MAX_CONCURRENT,
         ),
         summary_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+        acp_restarts: std::sync::Mutex::default(),
         summary_semaphore: tokio::sync::Semaphore::new(
             crate::session::conversation_summary::MAX_CONCURRENT,
         ),

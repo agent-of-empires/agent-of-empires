@@ -8,6 +8,7 @@ use crate::acp::protocol::{
 };
 use crate::server::acp_reconciler::install_rate_limit_continuation;
 use crate::server::api::find_instance;
+use crate::server::state::RestartReply;
 
 use super::*;
 
@@ -22,6 +23,10 @@ pub struct SpawnAcpRequest {
     /// Filtered against the agent's allowlist.
     #[serde(default)]
     pub provider_env: Vec<EnvPair>,
+    /// Stop the session's worker first, or cancel its start in progress, and spawn once it is
+    /// gone, instead of refusing while one exists.
+    #[serde(default)]
+    pub restart: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,6 +117,92 @@ pub async fn spawn_acp(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
+    if req.restart {
+        join_restart(state, id, req).await
+    } else {
+        spawn_now(state, id, req).await
+    }
+}
+
+impl RestartReply {
+    async fn capture(response: Response) -> Self {
+        let (parts, body) = response.into_parts();
+        Self {
+            status: parts.status,
+            headers: parts.headers,
+            body: axum::body::to_bytes(body, usize::MAX)
+                .await
+                .unwrap_or_default(),
+        }
+    }
+
+    fn into_response(self) -> Response {
+        (self.status, self.headers, self.body).into_response()
+    }
+}
+
+/// Clears the session's restart slot when its restart settles, including by panic.
+struct RestartSlot {
+    state: Arc<AppState>,
+    id: String,
+}
+
+impl Drop for RestartSlot {
+    fn drop(&mut self) {
+        self.state
+            .acp_restarts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
+    }
+}
+
+/// One restart per session at a time, from its stop until its spawn settles. Two clicks or two
+/// Devices get the same restart and its reply. It runs in its own task, so a client that goes
+/// away mid-restart can't strand the others.
+async fn join_restart(state: Arc<AppState>, id: String, req: SpawnAcpRequest) -> Response {
+    let mut wait = {
+        let mut restarts = state
+            .acp_restarts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match restarts.get(&id) {
+            Some(wait) => wait.clone(),
+            None => {
+                let (reply_tx, wait) = tokio::sync::watch::channel(None);
+                restarts.insert(id.clone(), wait.clone());
+                let slot = RestartSlot {
+                    state: state.clone(),
+                    id: id.clone(),
+                };
+                tokio::spawn(async move {
+                    let reply = RestartReply::capture(
+                        spawn_now(slot.state.clone(), slot.id.clone(), req).await,
+                    )
+                    .await;
+                    drop(slot);
+                    let _ = reply_tx.send(Some(reply));
+                });
+                wait
+            }
+        }
+    };
+    let reply = wait
+        .wait_for(Option::is_some)
+        .await
+        .ok()
+        .and_then(|r| r.clone());
+    match reply {
+        Some(reply) => reply.into_response(),
+        None => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "restart ended without a reply",
+        )
+            .into_response(),
+    }
+}
+
+async fn spawn_now(state: Arc<AppState>, id: String, req: SpawnAcpRequest) -> Response {
     let exclusion =
         match crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &id, true).await {
             Ok(exclusion) => exclusion,
@@ -147,6 +238,11 @@ pub async fn spawn_acp(
         Ok(store) => store,
         Err(response) => return response,
     };
+    if req.restart {
+        if let Err(response) = stop_before_respawn(&state, &id, "restart").await {
+            return response;
+        }
+    }
     let (sandbox_info, mut exclusion) = match crate::acp::sandbox::ensure_container_for_session(
         native.clone(),
         instance.clone(),
@@ -220,6 +316,38 @@ pub async fn spawn_acp(
         status: "running",
     })
     .into_response()
+}
+
+/// Stop the session's worker, or cancel its start in progress, and wait until it is proven
+/// gone, so the spawn that follows can't land on top of it. Callers hold the launch exclusion.
+async fn stop_before_respawn(state: &AppState, id: &str, action: &str) -> Result<(), Response> {
+    let not_stopped = || {
+        super::super::api_error(
+            StatusCode::CONFLICT,
+            "worker_not_stopped",
+            format!("the previous worker has not finished stopping; retry the {action} shortly"),
+        )
+    };
+    match state
+        .acp_supervisor
+        .shutdown_and_wait(id, std::time::Duration::from_secs(5))
+        .await
+    {
+        Ok(()) => {}
+        Err(SupervisorError::TeardownPending(_)) => return Err(not_stopped()),
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("shutdown failed before {action}: {e}"),
+            )
+                .into_response())
+        }
+    }
+    // `shutdown_and_wait` can return while the entry is still settling.
+    if state.acp_supervisor.worker_state(id).await != crate::daemon::AcpWorkerState::Absent {
+        return Err(not_stopped());
+    }
+    Ok(())
 }
 
 pub async fn shutdown_acp(
@@ -698,31 +826,9 @@ pub async fn switch_acp_provider(
         Err(response) => return response,
     };
 
-    if let Err(e) = state
-        .acp_supervisor
-        .shutdown_and_wait(&id, std::time::Duration::from_secs(5))
-        .await
-    {
-        if matches!(e, SupervisorError::TeardownPending(_)) {
-            return super::super::api_error(
-                StatusCode::CONFLICT,
-                "worker_not_stopped",
-                "the previous worker has not finished stopping; retry the switch shortly",
-            );
-        }
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("shutdown failed before provider switch: {e}"),
-        )
-            .into_response();
-    }
     // No provider mutation until the previous runner is proven absent.
-    if state.acp_supervisor.worker_state(&id).await != crate::daemon::AcpWorkerState::Absent {
-        return super::super::api_error(
-            StatusCode::CONFLICT,
-            "worker_not_stopped",
-            "the previous worker has not finished stopping; retry the switch shortly",
-        );
+    if let Err(response) = stop_before_respawn(&state, &id, "provider switch").await {
+        return response;
     }
 
     let model_cleared = instance
@@ -936,6 +1042,184 @@ mod tests {
             .await
             .unwrap();
             assert!(child.wait().unwrap().success());
+        }
+    }
+
+    /// A restart cancels a start stuck after its runner was born, tears that runner down and
+    /// spawns once, within a capacity of one: even when the stuck adapter answers right after the
+    /// cancel, two restarts race, or a second restart arrives while the first is spawning. A
+    /// worker still mid-teardown refuses it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn spawn_restart_replaces_a_stuck_start_once() {
+        use crate::acp::runner_lifecycle::test_support::FakeProcessControl;
+        use crate::acp::supervisor::test_support::{
+            attested_test_identity, save_attested_test_record,
+        };
+        use crate::server::test_support as support;
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        const STUCK: u32 = 4719;
+        const FRESH: u32 = 4720;
+        let request = |restart| {
+            Ok(Json(SpawnAcpRequest {
+                agent: None,
+                model: None,
+                additional_dirs: Vec::new(),
+                provider_env: Vec::new(),
+                restart,
+            }))
+        };
+        for case in [
+            "stuck",
+            "late answer",
+            "two restarts",
+            "restart while respawning",
+            "held stopping",
+        ] {
+            let _app_dir = crate::session::test_support::isolate_app_dir();
+            let project = tempfile::tempdir().unwrap();
+            let mut inst =
+                crate::session::Instance::new("restart", project.path().to_str().unwrap());
+            inst.source_profile = "default".into();
+            inst.view = crate::session::View::Structured;
+            let id = inst.id.clone();
+            support::seed_instances_on_disk_for_test("default", vec![inst.clone()]);
+            let control = Arc::new(FakeProcessControl::default());
+            control.alive(STUCK).alive(FRESH);
+            let stuck = Arc::new(tokio::sync::Notify::new());
+            let respawning = Arc::new(tokio::sync::Notify::new());
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let launches = Arc::new(AtomicUsize::new(0));
+            let senders = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let launcher: crate::acp::supervisor::Launcher = {
+                let (stuck, respawning, gate, launches, senders) = (
+                    stuck.clone(),
+                    respawning.clone(),
+                    gate.clone(),
+                    launches.clone(),
+                    senders.clone(),
+                );
+                Arc::new(move |config, session_id| {
+                    let first = launches.fetch_add(1, SeqCst) == 0;
+                    let (stuck, respawning, gate, senders) = (
+                        stuck.clone(),
+                        respawning.clone(),
+                        gate.clone(),
+                        senders.clone(),
+                    );
+                    Box::pin(async move {
+                        let lease = config
+                            .launch_lease
+                            .clone()
+                            .expect("supervisor retains its producer lease");
+                        let pid = if first { STUCK } else { FRESH };
+                        lease.record_scope(
+                            crate::process::worker_registry::ScopeOwnership::Unscoped,
+                        );
+                        assert!(lease.record_runner(attested_test_identity(pid, config.generation)));
+                        if first {
+                            // Born, then waiting on an adapter that hasn't answered.
+                            stuck.notify_one();
+                            lease.cancellation().cancelled().await;
+                            if case != "late answer" {
+                                return Err(crate::acp::acp_client::AcpError::Spawn(
+                                    "cancelled while starting".into(),
+                                ));
+                            }
+                        } else if case == "restart while respawning" {
+                            respawning.notify_one();
+                            tokio::select! {
+                                _ = lease.cancellation().cancelled() => {
+                                    return Err(crate::acp::acp_client::AcpError::Spawn(
+                                        "the restart's own start was cancelled".into(),
+                                    ));
+                                }
+                                _ = gate.notified() => {}
+                            }
+                        }
+                        save_attested_test_record(&session_id.0, pid, config.generation);
+                        let (client, tx) =
+                            crate::acp::acp_client::AcpClient::fake_for_test(session_id);
+                        senders.lock().unwrap().push(tx);
+                        Ok(client.with_runner_pid(pid))
+                    })
+                })
+            };
+            let state = support::build_test_app_state_impl(
+                vec![inst],
+                Vec::new(),
+                Vec::new(),
+                None,
+                false,
+                |_| {},
+                |supervisor| {
+                    supervisor
+                        .with_process_control(control.clone())
+                        .with_launcher(launcher)
+                        .with_max_concurrent_workers(1)
+                },
+            );
+            support::refresh_canonical_metadata_for_test(&state).await;
+
+            if case == "held stopping" {
+                state.acp_supervisor.test_hold_stopping(&id);
+                let refused = spawn_acp(State(state.clone()), Path(id.clone()), request(true))
+                    .await
+                    .into_response();
+                assert_eq!(refused.status(), StatusCode::CONFLICT);
+                let body = axum::body::to_bytes(refused.into_body(), 4096)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body["error"], "worker_not_stopped");
+                assert_eq!(launches.load(SeqCst), 0, "nothing spawns on top");
+                continue;
+            }
+
+            let first = tokio::spawn(spawn_acp(
+                State(state.clone()),
+                Path(id.clone()),
+                request(false),
+            ));
+            tokio::time::timeout(std::time::Duration::from_secs(10), stuck.notified())
+                .await
+                .expect("the first start reaches its adapter");
+            let restart = || spawn_acp(State(state.clone()), Path(id.clone()), request(true));
+            let restarted = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                if case == "two restarts" {
+                    let (a, b) = tokio::join!(restart(), restart());
+                    vec![a.into_response(), b.into_response()]
+                } else if case == "restart while respawning" {
+                    let first_restart = tokio::spawn(restart());
+                    respawning.notified().await;
+                    let mut second = Box::pin(restart());
+                    // One poll joins the restart in flight; only then may its spawn finish.
+                    assert!(futures_util::poll!(second.as_mut()).is_pending());
+                    gate.notify_one();
+                    let second = second.await.into_response();
+                    vec![first_restart.await.unwrap().into_response(), second]
+                } else {
+                    vec![restart().await.into_response()]
+                }
+            })
+            .await
+            .expect("the restart returns once the stuck start is gone");
+            for response in restarted {
+                assert_eq!(response.status(), StatusCode::OK, "{case}");
+            }
+
+            let first = first.await.unwrap().into_response();
+            assert_eq!(first.status(), StatusCode::CONFLICT, "{case}");
+            let body = axum::body::to_bytes(first.into_body(), 4096).await.unwrap();
+            let body = String::from_utf8_lossy(&body);
+            assert!(body.starts_with("spawn_cancelled"), "{case}: {body}");
+            assert!(control.signals().contains(&(STUCK, "TERM")), "{case}");
+            assert!(
+                control.signals().iter().all(|(pid, _)| *pid != FRESH),
+                "{case}"
+            );
+            assert_eq!(launches.load(SeqCst), 2, "{case}");
+            assert!(state.acp_supervisor.is_running(&id).await, "{case}");
         }
     }
 
@@ -1932,6 +2216,7 @@ mod tests {
                         model: None,
                         additional_dirs: Vec::new(),
                         provider_env: Vec::new(),
+                        restart: false,
                     })),
                 )
                 .await
