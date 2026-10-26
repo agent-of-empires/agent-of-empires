@@ -16,6 +16,7 @@ import { diffSelectionStale } from "./lib/diffSelection";
 import { useSessions } from "./hooks/useSessions";
 import { useAttentionCounts } from "./hooks/useAttentionCounts";
 import { useStatusSounds } from "./hooks/useStatusSounds";
+import { useSessionStatusStream } from "./hooks/useSessionStatusStream";
 import { useDashboardPresence } from "./hooks/useDashboardPresence";
 import { clearAcpCache } from "./hooks/useAcpSession";
 import { clearDraft, sweepOrphanDrafts } from "./lib/acpDrafts";
@@ -97,16 +98,18 @@ import {
   restoreSession,
   fetchPlugins,
 } from "./lib/api";
-import type { DeleteSessionOptions, ServerAbout, SettingsResponse } from "./lib/api";
+import type { DeleteSessionOptions, RuntimeCursor, ServerAbout, SettingsResponse } from "./lib/api";
 import { getClientCapabilities } from "./lib/clientCapabilities";
 import { normalizeProjectPathKey } from "./lib/registeredProjects";
 import { IdleDecayWindowContext, parseIdleDecayWindowMs } from "./lib/idleDecay";
 import { parseUnreadIndicatorEnabled, UnreadIndicatorContext, useUnreadIndicatorEnabled } from "./lib/unreadIndicator";
 import { parseSessionRowTagMode, SessionRowTagContext, type SessionRowTagMode } from "./lib/sessionRowTag";
 import { parseSessionColorsEnabled, SessionColorsContext } from "./lib/sessionColors";
+import { settleSettingsIntrosReadOnly } from "./lib/settingsIntros";
 import { onSettingsChanged } from "./lib/settingsEvents";
 import { parseSystemHealthEnabled, SystemHealthEnabledContext } from "./lib/systemHealth";
 import { toastBus, reportError } from "./lib/toastBus";
+import { restartForUpdate } from "./lib/restartForUpdate";
 import { startPendingCreates } from "./lib/pendingCreates";
 import { isAbsolutePath, resolveToRepoRelative, type FileRef } from "./lib/fileRef";
 import { NAVIGATE_EVENT, OPEN_SESSION_EVENT } from "./lib/sessionRoute";
@@ -398,6 +401,8 @@ function AppContent({
     applySessionMutation,
     observedById,
     runtimeEpoch,
+    refresh: refreshSessions,
+    applyPushedStatus,
   } = useSessions();
   const workspaces = useWorkspaces(sessions);
   // Creates whose outcome the wizard never learned keep reconciling here, past its unmount.
@@ -424,7 +429,15 @@ function AppContent({
   const trashedWorkspaces = useMemo(() => workspaces.filter(workspaceIsTrashed), [workspaces]);
 
   const { unreadCount, waitingCount } = useAttentionCounts(sessions, activeSessionId);
-  useStatusSounds(sessions);
+  const { onSoundDue, cancelCue } = useStatusSounds(sessions);
+  const onPushedStatus = useCallback(
+    (id: string, status: SessionResponse["status"], cursor: RuntimeCursor) => {
+      cancelCue(id);
+      applyPushedStatus(id, status, cursor);
+    },
+    [cancelCue, applyPushedStatus],
+  );
+  useSessionStatusStream({ onStatus: onPushedStatus, onSoundDue, onResync: refreshSessions });
   const attentionBadgeColors = useMemo(() => getAttentionBadgeColors(resolvedTheme), [resolvedTheme]);
 
   // Remember the active session and restore it on a PWA relaunch (#2103).
@@ -1130,6 +1143,7 @@ function AppContent({
       if (generation === serverAboutGeneration.current && about) {
         setServerAbout(about);
         setServedProfileReady(true);
+        settleSettingsIntrosReadOnly(about.read_only);
       }
     } finally {
       if (generation === serverAboutGeneration.current) setServerAboutLoaded(true);
@@ -1148,6 +1162,8 @@ function AppContent({
         if (about) {
           setServerAbout(about);
           setServedProfileReady(true);
+          // Settings intro choices made before this answer was in wait to learn where they go.
+          settleSettingsIntrosReadOnly(about.read_only);
         }
         // Read-only servers can't persist an opt-in choice, so skip the ping.
         if (about && !about.read_only) reportTelemetrySeen("web");
@@ -1244,6 +1260,7 @@ function AppContent({
       if (confirmed.length === 0 || emptyingTrashRef.current) return;
       emptyingTrashRef.current = true;
       let anyFailed = false;
+      let anyBusy = false;
       let anyKept = false;
       try {
         for (const ws of confirmed) {
@@ -1267,18 +1284,24 @@ function AppContent({
               notify: null,
             },
           );
-          anyFailed ||= !result.ok || (result.failed?.length ?? 0) > 0;
+          const busy = (result.busy?.length ?? 0) > 0;
+          anyBusy ||= busy;
+          anyFailed ||= (!result.ok && !busy) || (result.failed?.length ?? 0) > 0;
           anyKept ||= (result.kept?.length ?? 0) > 0;
         }
       } finally {
         emptyingTrashRef.current = false;
       }
-      toastBus.handler?.[anyFailed ? "error" : "info"](
+      toastBus.handler?.[anyFailed || anyBusy ? "error" : "info"](
         anyFailed
-          ? "Some trashed sessions could not be deleted"
-          : anyKept
-            ? "Some selected sessions changed and were not deleted"
-            : "Emptied trash",
+          ? anyBusy
+            ? "Some trashed sessions could not be deleted, and some are busy with another operation; retry the busy ones when it finishes"
+            : "Some trashed sessions could not be deleted"
+          : anyBusy
+            ? "Some trashed sessions are busy with another operation; retry when it finishes"
+            : anyKept
+              ? "Some selected sessions changed and were not deleted"
+              : "Emptied trash",
       );
     },
     [activeSessionId, setSessionStatus, clearDeletingStatus, leaveActiveSession],
@@ -2122,6 +2145,7 @@ function AppContent({
                 onDelete: handleDeleteSession,
                 onStop: handleStopSession,
                 onStart: handleStartSession,
+                onRestartForUpdate: restartForUpdate,
                 onSwitchView: handleSwitchView,
                 onCreateSession: handleCreateSession,
               }}
@@ -2155,6 +2179,7 @@ function AppContent({
             await refreshProjects();
           }}
           profile={searchParams.get("profile")}
+          field={searchParams.get("field")}
           onSelectProfile={(p) => {
             const next = new URLSearchParams(searchParams);
             next.set("profile", p);
@@ -2340,14 +2365,12 @@ function AppContent({
   });
   const tour = useTour({
     scope: tourScope,
-    readOnly: !!serverAbout?.read_only,
-    cityhall: caps.cityhall,
+    readOnly: serverAbout?.read_only,
     isDesktop: !isCoarse,
     autoLaunchReady: tourAutoLaunchReady && welcome.resolved,
     seen: tourSeen,
     seenKnown: tourSeenKnown,
     onSeen: handleTourSeen,
-    onNavigate: (tab) => (tab ? navigate(`/settings/${tab}`) : handleCloseSettings()),
   });
 
   // Auto-pop the tip-of-the-day once per load, after onboarding settles, like
@@ -2526,6 +2549,7 @@ function AppContent({
                 onEmptyTrash={handleEmptyTrash}
                 onStopSession={handleStopSession}
                 onStartSession={handleStartSession}
+                onRestartForUpdate={restartForUpdate}
                 onSwitchView={handleSwitchView}
                 readOnly={serverAbout?.read_only}
                 canManageProjects={caps.canManageProjects}

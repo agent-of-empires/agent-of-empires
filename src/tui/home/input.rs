@@ -4894,14 +4894,23 @@ impl HomeView {
                     super::Item::Session { id, .. } => self.session_switch_view_target(id),
                     super::Item::Group { .. } => None,
                 };
-                ContextMenuDialog::for_session(
+                let update_restart = match &self.flat_items[idx] {
+                    super::Item::Session { id, .. } => self.update_restart_offered(id),
+                    super::Item::Group { .. } => false,
+                };
+                let menu = ContextMenuDialog::for_session(
                     anchor,
                     is_archived,
                     snooze,
                     unread,
                     can_fork,
                     switch_view,
-                )
+                );
+                if update_restart {
+                    menu.with_restart_for_update()
+                } else {
+                    menu
+                }
             });
             return true;
         }
@@ -4997,6 +5006,15 @@ impl HomeView {
             ContextMenuAction::NewFromSelection => self.open_new_from_selection(),
             ContextMenuAction::Fork => self.open_fork_from_selection(),
             ContextMenuAction::SwitchView => self.prompt_switch_view_for_selected(),
+            ContextMenuAction::RestartForUpdate => {
+                if let Err(e) = self.restart_selected_for_update() {
+                    tracing::warn!("restart_selected_for_update failed: {}", e);
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Restart Failed",
+                        &format!("Could not restart session: {e}"),
+                    ));
+                }
+            }
             ContextMenuAction::OpenSortPicker => self.show_sort_picker(),
             ContextMenuAction::AddProject => self.open_add_project_for_selected(),
             ContextMenuAction::OpenGroupPicker => self.show_group_picker(),

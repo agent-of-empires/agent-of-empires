@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 
 import { afterEach, describe, expect, it, vi, beforeEach } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fetchSettings } from "../../lib/api";
 import { SettingsView } from "../SettingsView";
 
 const PROFILES = [{ name: "main", is_default: true }];
@@ -51,7 +52,9 @@ const THEME_SCHEMA = [
   },
 ];
 
-const updateTheme = vi.fn(() => Promise.resolve(true));
+const updateTheme = vi.fn((_patch: Record<string, unknown>) =>
+  Promise.resolve("committed" as "committed" | "rejected" | "uncertain"),
+);
 const updateSettings = vi.fn(() => Promise.resolve("committed" as const));
 
 vi.mock("../../lib/api", () => ({
@@ -65,7 +68,7 @@ vi.mock("../../lib/api", () => ({
   deleteProfile: vi.fn(() => Promise.resolve(true)),
   updateSettings: (updates: Record<string, unknown>, profile?: string) => updateSettings(updates, profile),
   updateTheme: (patch: Record<string, unknown>) => updateTheme(patch),
-  fetchThemes: vi.fn(() => Promise.resolve(["empire", "dracula"])),
+  fetchThemes: vi.fn(() => Promise.resolve(["empire", "dracula", "nord"])),
 }));
 
 const dispatchThemePickerChanged = vi.fn();
@@ -73,15 +76,34 @@ vi.mock("../../hooks/useResolvedTheme", () => ({
   dispatchThemePickerChanged: (name?: string) => dispatchThemePickerChanged(name),
 }));
 
+const savedSettings = (name: string) => ({ theme: { name, idle_decay_minutes: 0 } });
+
+function deferred<T>() {
+  let resolve: (value: T) => void = () => {};
+  const promise = new Promise<T>((r) => (resolve = r));
+  return { promise, resolve };
+}
+
 afterEach(() => {
   cleanup();
+  vi.mocked(fetchSettings)
+    .mockReset()
+    .mockImplementation(() => Promise.resolve(savedSettings("empire")));
   updateTheme.mockClear();
   updateSettings.mockClear();
   dispatchThemePickerChanged.mockClear();
 });
 
-function renderThemeTab() {
-  return render(<SettingsView onClose={() => {}} tab="theme" onSelectTab={vi.fn()} onServerAboutRefresh={() => {}} />);
+function renderThemeTab(profile?: string) {
+  return render(
+    <SettingsView
+      onClose={() => {}}
+      tab="theme"
+      profile={profile}
+      onSelectTab={vi.fn()}
+      onServerAboutRefresh={() => {}}
+    />,
+  );
 }
 
 /** A <select> that carries an <option> with this value. */
@@ -147,5 +169,117 @@ describe("SettingsView theme tab save routing", () => {
     fireEvent.blur(idle);
     await waitFor(() => expect(updateSettings).toHaveBeenCalledWith({ theme: { idle_decay_minutes: 5 } }, "main"));
     expect(updateTheme).not.toHaveBeenCalled();
+  });
+
+  it("keeps a theme pick that stays unconfirmed on screen after its resends, without repainting or reporting a rejection", async () => {
+    for (let i = 0; i < 3; i++) updateTheme.mockImplementationOnce(() => Promise.resolve("uncertain"));
+    renderThemeTab();
+    await waitFor(() => selectWithOption("dracula"));
+    fireEvent.change(selectWithOption("dracula"), { target: { value: "dracula" } });
+
+    await waitFor(() => expect(updateTheme).toHaveBeenCalledTimes(3));
+    expect(updateTheme).toHaveBeenLastCalledWith({ name: "dracula" });
+    expect(screen.queryByText("Failed to save, please try again")).toBeNull();
+    expect(dispatchThemePickerChanged).not.toHaveBeenCalled();
+  });
+
+  it("repaints an uncertain theme pick once a fetch shows it saved", async () => {
+    updateTheme.mockImplementationOnce(() => Promise.resolve("uncertain"));
+    renderThemeTab();
+    await waitFor(() => selectWithOption("dracula"));
+    const saved = { theme: { name: "dracula", idle_decay_minutes: 0 } };
+    vi.mocked(fetchSettings).mockResolvedValueOnce(saved).mockResolvedValueOnce(saved);
+    fireEvent.change(selectWithOption("dracula"), { target: { value: "dracula" } });
+
+    await waitFor(() => expect(dispatchThemePickerChanged).toHaveBeenCalledWith("dracula"));
+    expect(updateTheme).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports a rejected theme pick and never repaints", async () => {
+    updateTheme.mockImplementationOnce(() => Promise.resolve("rejected"));
+    renderThemeTab();
+    await waitFor(() => selectWithOption("dracula"));
+    fireEvent.change(selectWithOption("dracula"), { target: { value: "dracula" } });
+
+    await screen.findByText("Failed to save, please try again");
+    expect(dispatchThemePickerChanged).not.toHaveBeenCalled();
+  });
+
+  it("repaints once, from the retry, when an old first fetch leaves an uncertain pick unconfirmed", async () => {
+    renderThemeTab();
+    await waitFor(() => selectWithOption("dracula"));
+    updateTheme.mockImplementationOnce(() => Promise.resolve("uncertain"));
+    // The retry commits after the first confirmation GET already showed the old theme.
+    updateTheme.mockImplementationOnce(() => Promise.resolve("committed"));
+    fireEvent.change(selectWithOption("dracula"), { target: { value: "dracula" } });
+
+    await waitFor(() => expect(dispatchThemePickerChanged).toHaveBeenCalledWith("dracula"));
+    expect(updateTheme).toHaveBeenCalledTimes(2);
+    expect(dispatchThemePickerChanged).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not resend one profile's uncertain pick after a newer pick committed under another", async () => {
+    const view = renderThemeTab("main");
+    await waitFor(() => selectWithOption("dracula"));
+    const reconcile = deferred<ReturnType<typeof savedSettings>>();
+    vi.mocked(fetchSettings).mockReturnValueOnce(reconcile.promise as never);
+    updateTheme.mockImplementationOnce(() => Promise.resolve("uncertain"));
+    fireEvent.change(selectWithOption("dracula"), { target: { value: "dracula" } });
+    await waitFor(() => expect(updateTheme).toHaveBeenCalledTimes(1));
+
+    view.rerender(
+      <SettingsView
+        onClose={() => {}}
+        tab="theme"
+        profile="alt"
+        onSelectTab={vi.fn()}
+        onServerAboutRefresh={() => {}}
+      />,
+    );
+    await waitFor(() => selectWithOption("nord"));
+    fireEvent.change(selectWithOption("nord"), { target: { value: "nord" } });
+    await waitFor(() => expect(updateTheme).toHaveBeenCalledTimes(2));
+
+    await act(async () => reconcile.resolve(savedSettings("empire")));
+    await waitFor(() => expect(dispatchThemePickerChanged).toHaveBeenCalledWith("nord"));
+    expect(updateTheme).toHaveBeenCalledTimes(2);
+    expect(updateTheme).toHaveBeenLastCalledWith({ name: "nord" });
+  });
+
+  it("does not repaint an older pick whose held confirmation matches after a newer pick committed", async () => {
+    renderThemeTab("main");
+    await waitFor(() => selectWithOption("dracula"));
+    const reconcile = deferred<ReturnType<typeof savedSettings>>();
+    const confirm = deferred<ReturnType<typeof savedSettings>>();
+    vi.mocked(fetchSettings)
+      .mockReturnValueOnce(reconcile.promise as never)
+      .mockReturnValueOnce(confirm.promise as never);
+    updateTheme.mockImplementationOnce(() => Promise.resolve("uncertain"));
+    fireEvent.change(selectWithOption("dracula"), { target: { value: "dracula" } });
+    await waitFor(() => expect(updateTheme).toHaveBeenCalledTimes(1));
+
+    fireEvent.change(selectWithOption("nord"), { target: { value: "nord" } });
+    await waitFor(() => expect(dispatchThemePickerChanged).toHaveBeenCalledWith("nord"));
+    await act(async () => confirm.resolve(savedSettings("dracula")));
+    await act(async () => reconcile.resolve(savedSettings("dracula")));
+
+    expect(dispatchThemePickerChanged.mock.calls).toEqual([["nord"]]);
+  });
+
+  it("repaints once when a retry persists but loses its response and a later GET confirms it", async () => {
+    let fetches = 0;
+    vi.mocked(fetchSettings).mockImplementation(() =>
+      Promise.resolve(savedSettings(++fetches <= 2 ? "empire" : "dracula")),
+    );
+    renderThemeTab("main");
+    await waitFor(() => selectWithOption("dracula"));
+    fetches = 0;
+    updateTheme.mockImplementationOnce(() => Promise.resolve("uncertain"));
+    updateTheme.mockImplementationOnce(() => Promise.resolve("uncertain"));
+    fireEvent.change(selectWithOption("dracula"), { target: { value: "dracula" } });
+
+    await waitFor(() => expect(dispatchThemePickerChanged).toHaveBeenCalledWith("dracula"));
+    expect(updateTheme).toHaveBeenCalledTimes(2);
+    expect(dispatchThemePickerChanged).toHaveBeenCalledTimes(1);
   });
 });

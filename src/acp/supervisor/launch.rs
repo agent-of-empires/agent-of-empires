@@ -923,6 +923,15 @@ fn admission_error(error: anyhow::Error, session_id: &str) -> SupervisorError {
     }
 }
 
+/// Admit a launch with no captured admission, such as a crash respawn, against the row as stored now.
+pub(super) async fn admit_stored_row(
+    profile: Option<&str>,
+    session_id: &str,
+) -> Result<(), SupervisorError> {
+    let (admission, _) = capture_durable_launch(profile, session_id, None, false).await?;
+    admit_durable_launch(admission.as_ref(), session_id).await
+}
+
 /// Check the same authority and generation before hooks, after hooks and after handshake.
 async fn admit_durable_launch(
     admission: Option<&super::LaunchAdmission>,

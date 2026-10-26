@@ -718,6 +718,9 @@ async fn save_settings_patch(
 /// Header a client stamps on each settings PATCH: `<tab id>.<sequence>`, increasing per tab.
 const WRITE_STAMP_HEADER: &str = "x-aoe-write-stamp";
 
+/// Write-gate scope of the global theme; the `@` keeps it apart from profile names.
+const THEME_SCOPE: &str = "@theme";
+
 /// Past this many tracked leaves the table is reset rather than grown without bound.
 const MAX_TRACKED_WRITES: usize = 4096;
 
@@ -925,6 +928,7 @@ pub struct ThemePatch {
 /// for the same reason). `read_only` still blocks it.
 pub async fn update_theme(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     body: Result<Json<ThemePatch>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
@@ -953,6 +957,29 @@ pub async fn update_theme(
             );
         }
     }
+    // Same late-write guard as settings saves: drop a stamped leaf a newer write already applied.
+    let stamp = WriteStamp::from_headers(&headers);
+    let mut applied = write_gate().await;
+    let mut leaves = serde_json::Map::new();
+    if let Some(name) = &patch.name {
+        leaves.insert("name".into(), name.clone().into());
+    }
+    if patch.color_mode.is_some() {
+        leaves.insert("color_mode".into(), true.into());
+    }
+    let mut written = serde_json::json!({ "theme": leaves });
+    if drop_stale_leaves(&applied, stamp.as_ref(), THEME_SCOPE, &mut written) {
+        if is_empty_patch(&written) {
+            return stale_write_response();
+        }
+        let kept = &written["theme"];
+        if kept.get("name").is_none() {
+            patch.name = None;
+        }
+        if kept.get("color_mode").is_none() {
+            patch.color_mode = None;
+        }
+    }
     let result = tokio::task::spawn_blocking(move || {
         // `update_config` re-loads via `Config::load()`, so a corrupt
         // config.toml errors out instead of being replaced with defaults.
@@ -968,6 +995,10 @@ pub async fn update_theme(
         Ok::<_, anyhow::Error>(crate::tui::styles::resolve_theme(&theme_name))
     })
     .await;
+    if matches!(result, Ok(Ok(_))) {
+        record_applied(&mut applied, stamp.as_ref(), THEME_SCOPE, &written);
+    }
+    drop(applied);
 
     match result {
         Ok(Ok(resolved)) => match serde_json::to_value(&resolved) {
@@ -3571,5 +3602,55 @@ mod tests {
             .status(),
             StatusCode::OK
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn theme_save_drops_a_late_older_write_of_the_same_leaf() {
+        use crate::session::config::ColorMode;
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let save = |tab_seq: &'static str, name: Option<String>, mode: Option<ColorMode>| {
+            let state = state.clone();
+            async move {
+                let mut headers = HeaderMap::new();
+                headers.insert(WRITE_STAMP_HEADER, tab_seq.parse().unwrap());
+                update_theme(
+                    State(state),
+                    headers,
+                    Ok(Json(ThemePatch {
+                        name,
+                        color_mode: mode,
+                    })),
+                )
+                .await
+                .into_response()
+                .status()
+            }
+        };
+
+        assert_eq!(
+            save("tab1.2", None, Some(ColorMode::Palette)).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            save("tab1.1", None, Some(ColorMode::Truecolor)).await,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            crate::session::Config::load().unwrap().theme.color_mode,
+            ColorMode::Palette
+        );
+
+        // A fresh name still lands when its stale color mode is dropped from the same patch.
+        let name = crate::tui::styles::available_themes().remove(0);
+        assert_eq!(
+            save("tab1.1", Some(name.clone()), Some(ColorMode::Truecolor)).await,
+            StatusCode::OK
+        );
+        let theme = crate::session::Config::load().unwrap().theme;
+        assert_eq!(theme.name, name);
+        assert_eq!(theme.color_mode, ColorMode::Palette);
     }
 }

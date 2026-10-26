@@ -12,6 +12,12 @@ cargo fmt
 cargo clippy
 ```
 
+Local dashboard end-to-end tests on Linux require `bubblewrap`, `iproute2`, and
+`tmux`. Host security policy must allow `CAP_NET_ADMIN` in bubblewrap's children
+to configure their private network namespace. The
+[web-e2e CI leg](../.github/workflows/tests.yml) requires this coverage with
+`AOE_REQUIRE_LOCAL_NETWORK_TESTS=1`; unavailable confinement fails the job.
+
 The binary is `target/{profile}/aoe`. Web commands and test selection live in `web/AGENTS.md`.
 
 When adding a mutating REST route, classify it in the CityHall allow or deny table in `src/server/access.rs`. Audit its handler or declare an exact, justified exemption in `src/server/api/mod.rs`.

@@ -1127,14 +1127,11 @@ export function updateMachineSettings(updates: Record<string, unknown>): Promise
  * Sets the global theme (name and/or color mode). Dedicated endpoint, not
  * `PATCH /api/settings`: the theme is a global preference but cosmetic, so it
  * must not trip the passphrase/elevation wall the general settings surface
- * carries. Returns false on read-only servers (403) or network failure.
+ * carries. `rejected` on read-only servers (403); `uncertain` on a network
+ * failure or 5xx, where the write may still have landed.
  */
-export async function updateTheme(patch: { name?: string; color_mode?: string }): Promise<boolean> {
-  try {
-    return await fetchOk("/api/theme", jsonInit("PATCH", patch));
-  } catch {
-    return false;
-  }
+export function updateTheme(patch: { name?: string; color_mode?: string }): Promise<SaveOutcome> {
+  return announceOutcome(sendSave("/api/theme", jsonInit("PATCH", patch)));
 }
 
 /**
@@ -1488,6 +1485,9 @@ export function isDebugBuild(about: ServerAbout | null | undefined): boolean {
 }
 export type UpdateCheckMode = "auto" | "notify" | "off";
 
+/** How the Daemon's own binary was installed. */
+export type InstallMethod = "homebrew" | "release" | "cargo" | "nix" | "unknown";
+
 export interface UpdateStatus {
   update_check_mode: UpdateCheckMode;
   current_version: string;
@@ -1498,6 +1498,10 @@ export interface UpdateStatus {
   /** Version the user already dismissed the banner for, persisted server-side
    *  in app_state so the acknowledgement is once-per-account, not per device. */
   dismissed_version: string | null;
+  /** Absent from an older Daemon; treated as "unknown". */
+  install_method?: InstallMethod;
+  /** What to run on the Daemon's machine to update; absent alongside `install_method`. */
+  update_command?: string;
 }
 
 export function fetchUpdateStatus(): Promise<UpdateStatus | null> {
@@ -2527,6 +2531,15 @@ export async function summarizeSession(id: string): Promise<{ ok: boolean; messa
   }
 }
 
+/** The server re-checks eligibility; a 409 means the session got busy or is no longer out of date. */
+export async function restartSessionForUpdate(id: string): Promise<{ ok: boolean; message?: string }> {
+  try {
+    return await okWithMessage(`/api/sessions/${encodeURIComponent(id)}/restart-for-update`, { method: "POST" });
+  } catch {
+    return { ok: false };
+  }
+}
+
 /**
  * Edit a managed worktree session's workdir name: move the worktree
  * directory and, optionally, rename its git branch. The session must not be
@@ -2850,6 +2863,9 @@ export interface WorkspaceDeleteFailure {
   error: string;
 }
 
+/** Another lifecycle operation holds the session; nothing changed, retry later. */
+export type WorkspaceDeleteBusy = WorkspaceDeleteFailure;
+
 export interface DeleteWorkspaceResult {
   ok: boolean;
   error?: string;
@@ -2859,6 +2875,8 @@ export interface DeleteWorkspaceResult {
   kept?: string[];
   /** Sessions that could not be deleted, with their error. */
   failed?: WorkspaceDeleteFailure[];
+  /** Sessions skipped because another operation holds them. */
+  busy?: WorkspaceDeleteBusy[];
 }
 
 /** Delete siblings before their shared-worktree owner under the selected consent. */
@@ -2874,12 +2892,14 @@ export async function deleteWorkspace(
       deleted?: string[];
       kept?: string[];
       failed?: WorkspaceDeleteFailure[];
+      busy?: WorkspaceDeleteBusy[];
     };
     if (!res.ok) {
       return {
         ok: false,
         error: data.message || `Server error (${res.status})`,
         failed: data.failed,
+        busy: data.busy,
       };
     }
     // The endpoint always reports which sessions it removed. A 2xx without a
@@ -2889,7 +2909,14 @@ export async function deleteWorkspace(
     if (!Array.isArray(data.deleted)) {
       return { ok: false, error: "Server did not confirm which sessions were deleted" };
     }
-    return { ok: true, messages: data.messages, deleted: data.deleted, kept: data.kept, failed: data.failed };
+    return {
+      ok: true,
+      messages: data.messages,
+      deleted: data.deleted,
+      kept: data.kept,
+      failed: data.failed,
+      busy: data.busy,
+    };
   } catch (e) {
     return {
       ok: false,
