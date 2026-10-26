@@ -748,7 +748,13 @@ pub async fn restore_session(
                 let now = chrono::Utc::now();
                 if !row.is_trashed() {
                     if row.has_fresh_lifecycle_reservation(now) {
-                        return Err(LifecycleTargetError::Busy.into());
+                        return Err(row.lifecycle_reservation.as_ref().map_or(
+                            LifecycleTargetError::Busy.into(),
+                            |reservation| {
+                                crate::session::LifecycleReservationError::Busy(reservation.op)
+                                    .into()
+                            },
+                        ));
                     }
                     return Ok(None);
                 }
@@ -763,8 +769,8 @@ pub async fn restore_session(
                     crate::session::claim::RestoreClaimDecision::AlreadyGone => {
                         Err(LifecycleTargetError::Missing.into())
                     }
-                    crate::session::claim::RestoreClaimDecision::Busy(_) => {
-                        Err(LifecycleTargetError::Busy.into())
+                    crate::session::claim::RestoreClaimDecision::Busy(holder) => {
+                        Err(crate::session::LifecycleReservationError::Busy(holder).into())
                     }
                 }
             })?;
@@ -804,7 +810,7 @@ pub async fn restore_session(
                         Err(LifecycleTargetError::Missing.into())
                     }
                     crate::session::claim::RestoreCommit::Superseded => {
-                        Err(LifecycleTargetError::Busy.into())
+                        Err(crate::session::LifecycleReservationError::Superseded.into())
                     }
                 }
             })?;
@@ -1140,21 +1146,50 @@ pub(crate) fn lifecycle_rejection(
     if error.is::<crate::session::SessionGone>() {
         return Some(crate::server::api::session_not_found());
     }
-    if matches!(
-        error.downcast_ref::<LifecycleTargetError>(),
-        Some(LifecycleTargetError::Busy)
-    ) || matches!(
-        error.downcast_ref::<crate::session::LifecycleReservationError>(),
-        Some(
-            crate::session::LifecycleReservationError::Busy(_)
-                | crate::session::LifecycleReservationError::Superseded
+    let (code, operation, message) = match error
+        .downcast_ref::<crate::session::LifecycleReservationError>()
+    {
+        Some(crate::session::LifecycleReservationError::Busy(operation)) => (
+            "lifecycle_busy",
+            Some(*operation),
+            format!(
+                "Session is busy with {}; nothing changed, retry when it finishes",
+                serde_json::json!(operation)
+                    .as_str()
+                    .unwrap_or("another operation")
+            ),
+        ),
+        Some(crate::session::LifecycleReservationError::Superseded) => (
+            "lifecycle_superseded",
+            None,
+            "Session changed after it was selected; refresh and check before retrying".to_owned(),
+        ),
+        _ if matches!(
+            error.downcast_ref::<LifecycleTargetError>(),
+            Some(LifecycleTargetError::Busy)
+        ) =>
+        {
+            (
+                "lifecycle_busy",
+                None,
+                "Session lifecycle is busy".to_owned(),
+            )
+        }
+        _ => return None,
+    };
+    let header = if code == "lifecycle_superseded" {
+        crate::daemon::ApiErrorCode::LifecycleSuperseded.header()
+    } else {
+        crate::daemon::ApiErrorCode::LifecycleLocked.header()
+    };
+    Some(
+        (
+            StatusCode::CONFLICT,
+            header,
+            Json(serde_json::json!({"error": code, "operation": operation, "message": message})),
         )
-    ) {
-        return Some((StatusCode::CONFLICT,
-            crate::daemon::ApiErrorCode::LifecycleLocked.header(),
-            Json(serde_json::json!({"error": "lifecycle_busy", "message": "Session lifecycle is busy"}))).into_response());
-    }
-    None
+            .into_response(),
+    )
 }
 
 async fn adopt_lifecycle_commit<R>(

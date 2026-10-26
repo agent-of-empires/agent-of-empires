@@ -245,6 +245,9 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
                 .first()
                 .map(String::as_str)
                 .unwrap_or("Session purge was refused");
+            if result.disposition == crate::session::deletion::DeletionDisposition::Busy {
+                anyhow::bail!("{detail}: {removed_title}; nothing changed, retry once it finishes");
+            }
             anyhow::bail!("{detail}: {removed_title}");
         }
     };

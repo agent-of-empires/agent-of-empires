@@ -133,16 +133,8 @@ pub(crate) async fn purge_session_artifacts(
                     messages: result.errors,
                     teardown_started: false,
                 }),
-                DeletionDisposition::Busy => {
-                    let operation = result
-                        .retained_instance
-                        .as_ref()
-                        .and_then(|row| row.lifecycle_reservation.as_ref())
-                        .map(|reservation| reservation.op);
-                    Err(operation
-                        .map(crate::session::LifecycleReservationError::Busy)
-                        .unwrap_or(crate::session::LifecycleReservationError::Superseded)
-                        .into())
+                DeletionDisposition::Busy | DeletionDisposition::Superseded => {
+                    Err(result.conflict().expect("conflict disposition").into())
                 }
                 DeletionDisposition::Failed | DeletionDisposition::Removed => {
                     Err(anyhow::anyhow!(result.errors.join("; ")))
@@ -211,7 +203,7 @@ pub(crate) async fn purge_session_artifacts(
                 teardown_started: result.teardown_started,
             });
         }
-        DeletionDisposition::Busy => {
+        DeletionDisposition::Busy | DeletionDisposition::Superseded => {
             anyhow::bail!(crate::session::LifecycleReservationError::Superseded)
         }
         DeletionDisposition::Failed => {
@@ -898,13 +890,25 @@ pub async fn abandon_purge(
                 !cityhall || row.is_structured(),
                 LifecycleTargetError::CityHall
             );
-            anyhow::ensure!(
-                row.lifecycle_reservation_is_owned(
-                    LifecycleOperation::Purge,
-                    body.expected_generation.get()
-                ),
-                LifecycleTargetError::Busy
-            );
+            if !row.lifecycle_reservation_is_owned(
+                LifecycleOperation::Purge,
+                body.expected_generation.get(),
+            ) {
+                let holder = row
+                    .lifecycle_reservation
+                    .as_ref()
+                    .filter(|reservation| {
+                        reservation.op != LifecycleOperation::Purge
+                            && row.has_fresh_lifecycle_reservation(chrono::Utc::now())
+                    })
+                    .map(|reservation| reservation.op);
+                return Err(holder
+                    .map_or(
+                        crate::session::LifecycleReservationError::Superseded,
+                        crate::session::LifecycleReservationError::Busy,
+                    )
+                    .into());
+            }
             removed = Some(rows.remove(index));
             Ok(())
         })?;
@@ -980,6 +984,9 @@ pub struct TrashPurgeConsent {
 pub(super) struct WorkspaceDeleteFailure {
     pub(super) id: String,
     pub(super) error: String,
+    /// Another lifecycle operation holds the session; reported under `busy`.
+    #[serde(skip)]
+    pub(super) busy: bool,
 }
 
 /// Preserve first-seen order without deleting the same row twice.
@@ -1139,6 +1146,7 @@ pub(super) async fn purge_workspace_artifacts(
                     failed.push(WorkspaceDeleteFailure {
                         id: owner_id,
                         error: format!("Resource ownership unavailable: {error:#}"),
+                        busy: false,
                     });
                     return (deleted, kept, failed, messages, None);
                 }
@@ -1148,6 +1156,7 @@ pub(super) async fn purge_workspace_artifacts(
                 failed.push(WorkspaceDeleteFailure {
                     id: owner_id,
                     error: format!("Workspace: {msg}"),
+                    busy: false,
                 });
                 return (deleted, kept, failed, messages, Some(msg));
             }
@@ -1180,6 +1189,7 @@ pub(super) async fn purge_workspace_artifacts(
                     failed.push(WorkspaceDeleteFailure {
                         id: id.clone(),
                         error: cleanup_errors.join("; "),
+                        busy: false,
                     });
                     deleted.push(id);
                     break;
@@ -1197,6 +1207,10 @@ pub(super) async fn purge_workspace_artifacts(
                 failed.push(WorkspaceDeleteFailure {
                     id: id.clone(),
                     error: msg.to_string(),
+                    busy: matches!(
+                        msg.downcast_ref::<crate::session::LifecycleReservationError>(),
+                        Some(crate::session::LifecycleReservationError::Busy(_))
+                    ),
                 });
                 // The owner remains intact when a sibling cannot be safely removed.
                 break;
@@ -1288,6 +1302,7 @@ pub async fn delete_workspace(
             )
                 .into_response();
         }
+        let (busy, failed): (Vec<_>, Vec<_>) = failed.into_iter().partition(|f| f.busy);
         if deleted.is_empty() && !failed.is_empty() {
             let message = failed
                 .iter()
@@ -1297,7 +1312,19 @@ pub async fn delete_workspace(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
-                    "error": "deletion_failed", "message": message, "failed": failed,
+                    "error": "deletion_failed", "message": message, "failed": failed, "busy": busy,
+                })),
+            )
+                .into_response();
+        }
+        if deleted.is_empty() && kept.is_empty() && !busy.is_empty() {
+            return (
+                StatusCode::CONFLICT,
+                crate::daemon::ApiErrorCode::LifecycleLocked.header(),
+                Json(serde_json::json!({
+                    "error": "lifecycle_busy",
+                    "message": "Sessions are busy with another operation; nothing changed, retry when it finishes",
+                    "busy": busy,
                 })),
             )
                 .into_response();
@@ -1309,8 +1336,8 @@ pub async fn delete_workspace(
         crate::server::runtime::mutation_response(
             &snapshot.value.cursor,
             Json(serde_json::json!({
-                "status": if !failed.is_empty() || (!deleted.is_empty() && !kept.is_empty()) { "partial" } else if !kept.is_empty() { "kept" } else { "deleted" },
-                "deleted": deleted, "kept": kept, "failed": failed, "messages": messages,
+                "status": if !failed.is_empty() || !busy.is_empty() || (!deleted.is_empty() && !kept.is_empty()) { "partial" } else if !kept.is_empty() { "kept" } else { "deleted" },
+                "deleted": deleted, "kept": kept, "failed": failed, "busy": busy, "messages": messages,
             })),
         )
     });

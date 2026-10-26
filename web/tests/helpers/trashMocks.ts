@@ -47,6 +47,8 @@ export interface TrashHandle {
 
 export interface TrashMockOptions {
   failDeleteIds?: string[];
+  /** Ids another lifecycle operation holds: reported under `busy`, never deleted. */
+  busyDeleteIds?: string[];
   /** Mirror the server's owner-last teardown: reorder ids and abort on the first failure. */
   ownerLast?: boolean;
   /** Slice the sidebar by group_path instead of repo. */
@@ -106,6 +108,7 @@ export async function installTrashMocks(
     ]),
   );
   const failDelete = new Set(opts.failDeleteIds ?? []);
+  const busyDelete = new Set(opts.busyDeleteIds ?? []);
 
   if (opts.groupAxis) {
     await page.addInitScript(() => {
@@ -163,7 +166,13 @@ export async function installTrashMocks(
     const ordered = opts.ownerLast && ids.length > 0 ? [...ids.slice(1), ids[0]!] : ids;
     const deleted: string[] = [];
     const failed: Array<{ id: string; error: string }> = [];
+    const busy: Array<{ id: string; error: string }> = [];
     for (const id of ordered) {
+      if (busyDelete.has(id)) {
+        busy.push({ id, error: "busy with restore" });
+        if (opts.ownerLast) break;
+        continue;
+      }
       if (failDelete.has(id)) {
         failed.push({ id, error: "worktree locked" });
         if (opts.ownerLast) break;
@@ -180,7 +189,22 @@ export async function installTrashMocks(
         json: { error: "deletion_failed", message: failed.map((f) => f.error).join("; "), failed },
       });
     }
-    return r.fulfill({ json: { status: failed.length ? "partial" : "deleted", deleted, failed, messages: [] } });
+    // Like the server: nothing completed and only Busy blocked it is a 409.
+    if (deleted.length === 0 && failed.length === 0 && busy.length > 0) {
+      return r.fulfill({
+        status: 409,
+        json: { error: "lifecycle_busy", message: "Sessions are busy with another operation", busy },
+      });
+    }
+    return r.fulfill({
+      json: {
+        status: failed.length || busy.length ? "partial" : "deleted",
+        deleted,
+        failed,
+        busy,
+        messages: [],
+      },
+    });
   });
 
   return handle;

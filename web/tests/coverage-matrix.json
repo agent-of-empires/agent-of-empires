@@ -590,6 +590,16 @@
       ]
     },
     {
+      "id": "settings.field-deep-link",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/__tests__/SettingsView.navigation.test.tsx",
+        "src/components/__tests__/SettingsView.schema-load.test.tsx"
+      ],
+      "components": ["web/src/components/SettingsView.tsx", "web/src/App.tsx"]
+    },
+    {
       "id": "settings.tui-only-fold",
       "kind": "vitest",
       "risk": "low",
@@ -893,7 +903,12 @@
       "id": "notifications.status-sounds",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/lib/statusSounds.test.ts", "src/hooks/useStatusSounds.test.ts"],
+      "specs": [
+        "src/lib/statusSounds.test.ts",
+        "src/hooks/useStatusSounds.test.ts",
+        "src/hooks/useSessionStatusStream.test.ts",
+        "src/hooks/useSessions.test.ts"
+      ],
       "components": ["web/src/lib/statusSounds.ts", "web/src/hooks/useStatusSounds.ts", "web/src/lib/soundPlayer.ts"]
     },
     {
@@ -947,7 +962,11 @@
       "id": "sidebar.terminal-focus-handoff",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/terminal-focus-shortcut.spec.ts", "src/hooks/useKeyboardShortcuts.test.ts"],
+      "specs": [
+        "tests/terminal-focus-shortcut.spec.ts",
+        "tests/acp-retained-focus-sidebar-nav.spec.ts",
+        "src/hooks/useKeyboardShortcuts.test.ts"
+      ],
       "components": [
         "web/src/App.tsx",
         "web/src/components/WorkspaceSidebar.tsx",
@@ -2184,6 +2203,7 @@
         "web/src/App.tsx",
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/EmptyTrashConfirm.tsx",
+        "web/src/lib/api.ts",
         "web/src/lib/trashActions.ts"
       ]
     },
@@ -3535,6 +3555,7 @@
       "id": "acp.startup-error-screen",
       "kind": "vitest",
       "risk": "high",
+      "notes": "Changed descriptive text uses text-text-subtle, with no text-text-secondary or text-text-dim classes, asserted across installable, install-off and sandboxed states.",
       "specs": ["src/components/acp/__tests__/StartupErrorScreen.test.tsx"],
       "components": ["web/src/components/acp/StartupErrorScreen.tsx", "web/src/components/acp/RecoveryActionRow.tsx"]
     },
@@ -5011,6 +5032,18 @@
         "web/src/lib/api.ts"
       ],
       "notes": "Browser: isolated serve publishes advancing native epoch revision receipts for color and notifications. Uses the isolated spawnServe fixture; native HTTP receipts and canonical persistence are asserted, then a page reload verifies the sidebar without pending overlays."
+    },
+    {
+      "id": "selected-item-contrast",
+      "kind": "deferred",
+      "issue": "https://github.com/agent-of-empires/agent-of-empires/issues/4898",
+      "risk": "low",
+      "reason": "Styling-only selected-item fill; contrast is pinned across built-in themes by the Rust builtins_clear_contrast_floors test.",
+      "components": [
+        "web/src/components/acp/SessionConfigControls.tsx",
+        "web/src/components/profiles/ProfilesSection.tsx",
+        "web/src/components/sidebar/SessionRowMenu.tsx"
+      ]
     }
   ]
 }

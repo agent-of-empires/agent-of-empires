@@ -26,6 +26,12 @@ enum TunnelKind {
 }
 
 impl TunnelKind {
+    /// Cloudflare tunnels set `cf-connecting-ip`; Tailscale Funnel rewrites `x-forwarded-for`
+    /// but passes a caller's `cf-connecting-ip` through.
+    fn sets_cf_connecting_ip(&self) -> bool {
+        !matches!(self, Self::Tailscale)
+    }
+
     /// Short label for `serve.mode` and the TUI status bar.
     pub fn mode_label(&self) -> &'static str {
         match self {
@@ -36,6 +42,10 @@ impl TunnelKind {
 }
 
 impl TunnelHandle {
+    pub fn sets_cf_connecting_ip(&self) -> bool {
+        self.kind.sets_cf_connecting_ip()
+    }
+
     pub fn mode_label(&self) -> &'static str {
         self.kind.mode_label()
     }
@@ -830,6 +840,27 @@ pub fn tailscale_funnel_cap_ready_sync() -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_cloudflare_tunnels_are_trusted_for_cf_connecting_ip() {
+        for (kind, trusted) in [
+            (TunnelKind::Quick, true),
+            (
+                TunnelKind::Named {
+                    tunnel_name: "t".into(),
+                },
+                true,
+            ),
+            (TunnelKind::Tailscale, false),
+        ] {
+            assert_eq!(
+                kind.sets_cf_connecting_ip(),
+                trusted,
+                "{}",
+                kind.mode_label()
+            );
+        }
+    }
+
     use super::*;
 
     // The telemetry `serve_mode` signal reads `mode_label()`, so a named
