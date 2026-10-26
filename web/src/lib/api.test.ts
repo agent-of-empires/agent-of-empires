@@ -1624,3 +1624,17 @@ describe("header-complete operations", () => {
     }
   });
 });
+
+describe("restartSessionForUpdate", () => {
+  it("POSTs and reports success, the server message on a 409, and nothing when offline", async () => {
+    fetchSpy.mockResolvedValueOnce(empty());
+    expect(await api.restartSessionForUpdate("s1")).toEqual({ ok: true });
+    expect(lastCall()).toMatchObject({ url: "/api/sessions/s1/restart-for-update", init: { method: "POST" } });
+
+    fetchSpy.mockResolvedValueOnce(json({ error: "not_eligible", message: "Session is busy" }, 409));
+    expect(await api.restartSessionForUpdate("s1")).toEqual({ ok: false, message: "Session is busy" });
+
+    offline();
+    expect(await api.restartSessionForUpdate("s1")).toEqual({ ok: false });
+  });
+});

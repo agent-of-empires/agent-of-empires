@@ -1751,6 +1751,18 @@
       ]
     },
     {
+      "id": "sidebar.restart-for-update",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/SessionRowSiblingTargets.test.tsx", "src/lib/restartForUpdate.test.ts"],
+      "components": [
+        "web/src/components/sidebar/sessionActionTargets.ts",
+        "web/src/components/sidebar/SessionRowMenu.tsx",
+        "web/src/components/sidebar/SessionActions.tsx",
+        "web/src/lib/restartForUpdate.ts"
+      ]
+    },
+    {
       "id": "sidebar.repo-appearance",
       "kind": "mocked-playwright",
       "risk": "low",

@@ -1818,6 +1818,88 @@ pub async fn restart_session(
     .await
 }
 
+/// Restart a session whose agent binary was replaced after launch (#4214). Eligibility is
+/// re-checked here because the list that offered it may be several seconds old.
+pub async fn restart_for_update(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
+    let instance = {
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            return crate::server::api::session_not_found();
+        };
+        inst.clone()
+    };
+    let structured_ready = state
+        .acp_supervisor
+        .worker_states_snapshot()
+        .await
+        .get(&id)
+        .is_some_and(|(worker, _)| *worker == crate::daemon::AcpWorkerState::Running)
+        && state
+            .acp_event_store
+            .pending_approval_requests(&id)
+            .is_empty();
+    let resume_available = update_restart_resumable(&instance, &context_resume_for(&instance));
+    if !crate::session::update_restart::offer_pending(&instance, resume_available, structured_ready)
+    {
+        return api_error(
+            StatusCode::CONFLICT,
+            "not_eligible",
+            "Session is busy or its agent is not out of date".to_string(),
+        );
+    }
+    apply_update_restart(&state, id, instance).await
+}
+
+/// Restart an eligible session onto the updated agent.
+pub(super) async fn apply_update_restart(
+    state: &Arc<AppState>,
+    id: String,
+    instance: Instance,
+) -> axum::response::Response {
+    if instance.is_structured() {
+        // The reconciler terminates the worker once its turn drains and respawns it against the
+        // stored conversation.
+        state.acp_supervisor.mark_build_respawn_pending(&id);
+        let response = SessionResponse::from_instance(
+            &instance,
+            crate::claude_settings::read_tui_fullscreen(),
+        );
+        return (StatusCode::ACCEPTED, Json(response)).into_response();
+    }
+    // The offer promises the conversation survives, and a restart that honors
+    // `auto_resume_on_restart` would start a new one when it is off.
+    let auto_resume = crate::session::resolve_config(&instance.effective_profile())
+        .map(|config| config.session.auto_resume_on_restart)
+        .unwrap_or(true);
+    if !auto_resume {
+        return api_error(
+            StatusCode::CONFLICT,
+            "auto_resume_disabled",
+            "auto_resume_on_restart is off, so a restart would start a new conversation"
+                .to_string(),
+        );
+    }
+    let body = crate::daemon::RestartSessionBody {
+        wake_message: Some(String::new()),
+        only_if_idle: true,
+        ..Default::default()
+    };
+    prepare_agent_session(
+        state.clone(),
+        id,
+        Ok(None),
+        AgentPreparation::Restart,
+        Some(Arc::new(body)),
+    )
+    .await
+}
+
 fn admit_restart(
     row: &mut Instance,
     body: &crate::daemon::RestartSessionBody,
@@ -2251,6 +2333,15 @@ async fn prepare_agent_session_inner(
     }
     if state.cityhall_mode && !instance.is_structured() {
         return crate::server::api::cityhall_response();
+    }
+    // The eligibility check that asked for this ran before these locks, and a prompt can land
+    // while it waited, so the idle promise is enforced on the row this request reloaded.
+    if restart.as_ref().is_some_and(|body| body.only_if_idle) && instance.status != Status::Idle {
+        return api_error(
+            StatusCode::CONFLICT,
+            "not_eligible",
+            "Session is busy or its agent is not out of date".to_string(),
+        );
     }
     // #4116: a shelved row refuses every start path with its own code, decided on
     // the row this request reloaded. It answers before the lifecycle reservation,

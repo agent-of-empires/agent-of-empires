@@ -2531,6 +2531,15 @@ export async function summarizeSession(id: string): Promise<{ ok: boolean; messa
   }
 }
 
+/** The server re-checks eligibility; a 409 means the session got busy or is no longer out of date. */
+export async function restartSessionForUpdate(id: string): Promise<{ ok: boolean; message?: string }> {
+  try {
+    return await okWithMessage(`/api/sessions/${encodeURIComponent(id)}/restart-for-update`, { method: "POST" });
+  } catch {
+    return { ok: false };
+  }
+}
+
 /**
  * Edit a managed worktree session's workdir name: move the worktree
  * directory and, optionally, rename its git branch. The session must not be
