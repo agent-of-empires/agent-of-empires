@@ -421,25 +421,30 @@ export function StopButton() {
 export function QueueSendButton({
   connected,
   steering,
+  waitingFor = null,
   disabled = false,
   onSend,
 }: {
   connected: boolean;
   steering: boolean;
+  waitingFor?: string | null;
   disabled?: boolean;
   onSend: () => void;
 }) {
+  const pendingLabel = !connected && waitingFor ? `Pending until ${waitingFor} is ready` : null;
   const title = disabled
     ? "Type a message to queue"
     : !connected
-      ? "Queue follow-up, will send on resume, Enter"
+      ? (pendingLabel ?? "Queue follow-up, will send on resume, Enter")
       : steering
         ? "Send into the current turn, Enter"
         : "Queue follow-up (sent when current turn ends), Enter";
   return (
     <button
       type="button"
-      aria-label={connected && steering ? "Send message into the current turn" : "Queue follow-up message"}
+      aria-label={
+        connected && steering ? "Send message into the current turn" : (pendingLabel ?? "Queue follow-up message")
+      }
       {...tourAnchor(TOUR_ANCHORS.queueSend)}
       title={title}
       onClick={onSend}

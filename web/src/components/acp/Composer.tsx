@@ -366,6 +366,7 @@ export function Composer(props: Props) {
                     <StopButton />
                     <QueueSendButton
                       connected={connected}
+                      waitingFor={props.waitingFor}
                       steering={!!promptCapabilities?.steering}
                       disabled={!canSend}
                       onSend={submitComposer}
