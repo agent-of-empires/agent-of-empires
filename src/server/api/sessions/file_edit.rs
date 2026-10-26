@@ -14,12 +14,23 @@ use super::diff::{SessionFileResponse, SessionFileScope, MAX_CONTENTS_BYTES};
 use crate::server::api::file_provenance::{self, Confined};
 use crate::server::api::{api_error, cityhall_block, find_instance, read_only_block};
 use crate::server::AppState;
-use crate::session::anchored_fs::FilePublication;
+use crate::session::anchored_fs::{FileExchange, FileExchangeResult, FileExchangeUncertain};
 use crate::session::{AnchoredDir, Instance};
 
 // Serialize dashboard saves even when two Sessions share a Working directory.
 static SAVES: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 type FileError = (StatusCode, &'static str);
+const EXCHANGE_UNSUPPORTED: &str = "This filesystem does not support atomic file replacement";
+
+#[derive(Debug, thiserror::Error)]
+#[error("{1}")]
+struct SaveError(StatusCode, String);
+
+impl From<FileError> for SaveError {
+    fn from((status, message): FileError) -> Self {
+        Self(status, message.into())
+    }
+}
 
 #[derive(Deserialize)]
 pub struct SaveSessionFileRequest {
@@ -124,6 +135,64 @@ fn sandbox_mount_reason(
     }
 }
 
+fn exchange_reason(confined: &Confined) -> Option<&'static str> {
+    let support = || -> anyhow::Result<bool> {
+        let root = AnchoredDir::open(&confined.root)?;
+        let relative = confined.canonical.strip_prefix(&confined.root)?;
+        root.child(relative.parent().unwrap_or(FsPath::new("")))?
+            .supports_file_exchange()
+    };
+    match support() {
+        Ok(true) => None,
+        Ok(false) => Some(EXCHANGE_UNSUPPORTED),
+        Err(_) => Some("Cannot verify atomic file replacement in this folder"),
+    }
+}
+
+fn opened_file_version(file: &mut std::fs::File, path: &FsPath) -> anyhow::Result<Option<String>> {
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0))?;
+    let before = file.metadata()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_CONTENTS_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    if bytes.len() > MAX_CONTENTS_BYTES
+        || before.len() != after.len()
+        || before.modified()? != after.modified()?
+        || before.permissions() != after.permissions()
+    {
+        return Ok(None);
+    }
+    Ok(Some(version(
+        &bytes,
+        path,
+        &cap_std::fs::Metadata::from_just_metadata(after),
+    )))
+}
+
+fn publication_error(error: anyhow::Error) -> SaveError {
+    tracing::warn!(target: "http.api.sessions", %error, "file save could not be confirmed");
+    if error.downcast_ref::<FileExchangeUncertain>().is_none() {
+        if let Some(error) = error.downcast_ref::<std::io::Error>() {
+            if crate::process::exchange_unsupported(error) {
+                return (StatusCode::FORBIDDEN, EXCHANGE_UNSUPPORTED).into();
+            }
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) {
+                return io_error(std::io::Error::from(error.kind())).into();
+            }
+        }
+    }
+    match error.downcast::<SaveError>() {
+        Ok(error) => error,
+        Err(error) => SaveError(StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Could not confirm file save: {error:#}. Your edits are kept; check the file before retrying.")),
+    }
+}
+
 /// A confined file's content, edit version, and why editing is refused, if it is.
 struct Snapshot {
     read: file_provenance::FileRead,
@@ -151,7 +220,9 @@ fn snapshot(
     } else if read.metadata.permissions().readonly() {
         Some("File permissions are read-only")
     } else {
-        instance.and_then(|inst| sandbox_reason(inst, &confined.canonical))
+        instance
+            .and_then(|inst| sandbox_reason(inst, &confined.canonical))
+            .or_else(|| exchange_reason(confined))
     };
     let version = (!read.truncated && !read.is_binary && read.valid_utf8)
         .then(|| version(read.content.as_bytes(), &confined.canonical, &read.metadata));
@@ -193,7 +264,7 @@ fn save_file(
     roots: &[PathBuf],
     instance: &Instance,
     request: SaveSessionFileRequest,
-) -> Result<(), FileError> {
+) -> Result<(), SaveError> {
     use cap_std::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
     const CHANGED: FileError = (
@@ -204,17 +275,18 @@ fn save_file(
         return Err((
             StatusCode::BAD_REQUEST,
             "Only UTF-8 text files up to 5 MB can be saved",
-        ));
+        )
+            .into());
     }
     let path = FsPath::new(&request.path);
     let confined = project_file(roots, path)?;
     // Outside `SAVES`: a runtime probe can take a minute. The caller's instance
     // lock keeps the container from being replaced before publication.
     if let Some(reason) = sandbox_reason(instance, &confined.canonical) {
-        return Err((StatusCode::FORBIDDEN, reason));
+        return Err((StatusCode::FORBIDDEN, reason).into());
     }
     let _save = SAVES.lock();
-    // Runs again immediately before publication: optimistic, not a lock on external writers.
+    // Revalidate while the draft stage is private; verify the displaced inode after exchange.
     let check = || -> Result<std::fs::Permissions, FileError> {
         let current = project_file(roots, path)?;
         if current.canonical != confined.canonical {
@@ -254,25 +326,25 @@ fn save_file(
     let parent = root
         .child(relative.parent().unwrap_or(FsPath::new("")))
         .map_err(|_| (StatusCode::FORBIDDEN, "Cannot open file directory"))?;
-    let validate = || check().map(drop).map_err(|(_, msg)| anyhow::anyhow!(msg));
-    root.publish_file(
-        relative,
+    let validate = || {
+        check()
+            .map(drop)
+            .map_err(|error| SaveError::from(error).into())
+    };
+    let file_version = |file: &mut std::fs::File| opened_file_version(file, &confined.canonical);
+    match parent.exchange_file(
+        FsPath::new(relative.file_name().ok_or((StatusCode::FORBIDDEN, "Cannot replace project root"))?),
         &mut request.content.as_bytes(),
         permissions,
-        true,
-        Some(FilePublication {
-            staging: &parent,
-            validate: &validate,
-        }),
-    )
-    .map_err(|error| {
-        tracing::warn!(target: "http.api.sessions", %error, "file save failed");
-        check().err().unwrap_or((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Could not save file; check directory permissions and free disk space",
-        ))
-    })?;
-    Ok(())
+        FileExchange { validate: &validate, version: &file_version, expected: &request.version },
+    ).map_err(publication_error)? {
+        FileExchangeResult::Saved => Ok(()),
+        FileExchangeResult::Conflict { preserved: None } => Err(CHANGED.into()),
+        FileExchangeResult::Conflict { preserved: Some(path) } => Err(SaveError(
+            StatusCode::CONFLICT,
+            format!("File changed during save. A displaced version was preserved at {}. Copy your edits or reload.", path.display()),
+        )),
+    }
 }
 
 pub async fn save_session_file(
@@ -303,7 +375,7 @@ pub async fn save_session_file(
     .await
     {
         Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
-        Ok(Err((status, message))) => api_error(status, "file_save", message),
+        Ok(Err(SaveError(status, message))) => api_error(status, "file_save", message),
         Err(error) => {
             tracing::error!(target: "http.api.sessions", %error, "file save panicked");
             api_error(
@@ -501,7 +573,7 @@ mod tests {
         assert_eq!(
             results
                 .iter()
-                .filter(|result| matches!(result, Err((StatusCode::CONFLICT, _))))
+                .filter(|result| matches!(result, Err(SaveError(StatusCode::CONFLICT, _))))
                 .count(),
             1
         );
@@ -537,6 +609,348 @@ mod tests {
         assert!(failed.is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "original");
         assert_eq!(fs::read_dir(&roots[0]).unwrap().count(), 1);
+    }
+
+    struct ResetExchangeHooks;
+
+    impl Drop for ResetExchangeHooks {
+        fn drop(&mut self) {
+            crate::session::anchored_fs::FILE_EXCHANGE_HOOK.set(None);
+            crate::session::anchored_fs::FAIL_SYNC_ONCE.set(None);
+            crate::process::EXCHANGE_ERROR.set(None);
+        }
+    }
+
+    #[test]
+    fn exchange_preserves_writers_across_validation_verification_and_undo() {
+        use crate::session::anchored_fs::{FileExchangePhase as Phase, FILE_EXCHANGE_HOOK};
+        use std::os::unix::fs::FileExt;
+        for (case, expected, recovery) in [
+            ("in-place before exchange", "external", None),
+            ("rename before exchange", "external", None),
+            ("recreate before exchange", "external", None),
+            ("held writer after exchange", "external", None),
+            ("third writer after exchange", "third", Some("original")),
+            ("third writer before undo", "third", Some("external")),
+            ("third writer during undo", "external", Some("third")),
+            ("in-place writer during undo", "external", Some("third")),
+            ("in-place writer after publication", "third", None),
+        ] {
+            let _hooks = ResetExchangeHooks;
+            let (_dir, roots, instance) = fixture();
+            let target = roots[0].join("a.txt");
+            fs::write(&target, "original").unwrap();
+            let opened = snapshot(&roots, &instance, "a.txt").version.unwrap();
+            let modified = fs::metadata(&target).unwrap().modified().unwrap();
+            let held = fs::OpenOptions::new().write(true).open(&target).unwrap();
+            if case == "third writer after exchange" {
+                fs::write(roots[0].join("a.txt.aoe-conflict"), "earlier conflict").unwrap();
+            }
+            FILE_EXCHANGE_HOOK.set(Some(Box::new(move |phase, target, _stage| {
+                let replace = |text: &str| {
+                    let temporary = target.with_extension("agent-stage");
+                    fs::write(&temporary, text).unwrap();
+                    fs::rename(temporary, target).unwrap();
+                };
+                if phase == Phase::BeforeExchange {
+                    match case {
+                        "in-place before exchange" => {
+                            fs::write(target, "external").unwrap();
+                            fs::File::options()
+                                .write(true)
+                                .open(target)
+                                .unwrap()
+                                .set_times(fs::FileTimes::new().set_modified(modified))
+                                .unwrap();
+                        }
+                        "rename before exchange" => replace("external"),
+                        "recreate before exchange" => {
+                            fs::remove_file(target).unwrap();
+                            fs::write(target, "external").unwrap();
+                        }
+                        "third writer before undo"
+                        | "third writer during undo"
+                        | "in-place writer during undo" => {
+                            fs::write(target, "external").unwrap();
+                        }
+                        _ => {}
+                    }
+                }
+                if phase == Phase::AfterExchange {
+                    match case {
+                        "held writer after exchange" => {
+                            assert_eq!(held.write_at(b"external", 0).unwrap(), 8);
+                        }
+                        "third writer after exchange" => replace("third"),
+                        "in-place writer during undo" | "in-place writer after publication" => {
+                            fs::write(target, "third").unwrap();
+                        }
+                        _ => {}
+                    }
+                }
+                if phase == Phase::BeforeUndo && case == "third writer before undo" {
+                    replace("third");
+                }
+                if phase == Phase::UndoExchange && case == "third writer during undo" {
+                    replace("third");
+                }
+            })));
+            let result = save_file(&roots, &instance, request("a.txt", &opened, "browser"));
+            FILE_EXCHANGE_HOOK.set(None);
+            if case == "in-place writer after publication" {
+                result.unwrap();
+            } else {
+                assert_eq!(result.unwrap_err().0, StatusCode::CONFLICT, "{case}");
+            }
+            assert_eq!(fs::read_to_string(&target).unwrap(), expected, "{case}");
+            if let Some(recovery) = recovery {
+                let suffix = if case == "third writer after exchange" {
+                    ".1"
+                } else {
+                    ""
+                };
+                assert_eq!(
+                    fs::read_to_string(roots[0].join(format!("a.txt.aoe-conflict{suffix}")))
+                        .unwrap(),
+                    recovery,
+                    "{case}"
+                );
+                if !suffix.is_empty() {
+                    assert_eq!(
+                        fs::read_to_string(roots[0].join("a.txt.aoe-conflict")).unwrap(),
+                        "earlier conflict"
+                    );
+                }
+            } else {
+                assert_eq!(
+                    fs::read_dir(&roots[0]).unwrap().count(),
+                    1,
+                    "{case}: verified stages are removed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exchange_restores_special_entries_without_following_or_unlinking_them() {
+        use crate::session::anchored_fs::{FileExchangePhase, FILE_EXCHANGE_HOOK};
+        for kind in ["symlink", "directory", "fifo"] {
+            let _hooks = ResetExchangeHooks;
+            let (_dir, roots, instance) = fixture();
+            let outside = tempfile::tempdir().unwrap();
+            let secret = outside.path().join("secret");
+            fs::write(&secret, "outside").unwrap();
+            let target = roots[0].join("a.txt");
+            fs::write(&target, "original").unwrap();
+            let opened = snapshot(&roots, &instance, "a.txt").version.unwrap();
+            let secret_for_hook = secret.clone();
+            FILE_EXCHANGE_HOOK.set(Some(Box::new(move |phase, target, _| {
+                if phase == FileExchangePhase::BeforeExchange {
+                    fs::remove_file(target).unwrap();
+                    match kind {
+                        "symlink" => std::os::unix::fs::symlink(&secret_for_hook, target).unwrap(),
+                        "directory" => fs::create_dir(target).unwrap(),
+                        _ => nix::unistd::mkfifo(
+                            target,
+                            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+                        )
+                        .unwrap(),
+                    }
+                }
+            })));
+            assert_eq!(
+                save_file(&roots, &instance, request("a.txt", &opened, "browser"))
+                    .unwrap_err()
+                    .0,
+                StatusCode::CONFLICT,
+                "{kind}"
+            );
+            let metadata = fs::symlink_metadata(&target).unwrap();
+            use std::os::unix::fs::FileTypeExt;
+            match kind {
+                "symlink" => assert!(metadata.is_symlink()),
+                "directory" => assert!(metadata.is_dir()),
+                _ => assert!(metadata.file_type().is_fifo()),
+            }
+            assert_eq!(fs::read_to_string(&secret).unwrap(), "outside");
+            assert_eq!(fs::read_dir(&roots[0]).unwrap().count(), 1, "{kind}");
+        }
+    }
+
+    #[test]
+    fn failed_undo_preserves_the_displaced_version_and_reports_its_path() {
+        use crate::session::anchored_fs::{FileExchangePhase, FILE_EXCHANGE_HOOK};
+        let _hooks = ResetExchangeHooks;
+        let (_dir, roots, instance) = fixture();
+        fs::write(roots[0].join("a.txt"), "original").unwrap();
+        let opened = snapshot(&roots, &instance, "a.txt").version.unwrap();
+        FILE_EXCHANGE_HOOK.set(Some(Box::new(|phase, target, _| {
+            if phase == FileExchangePhase::BeforeExchange {
+                fs::write(target, "external").unwrap();
+            }
+            if phase == FileExchangePhase::BeforeUndo {
+                crate::process::EXCHANGE_ERROR.set(Some(libc::EIO));
+            }
+        })));
+        let error = save_file(&roots, &instance, request("a.txt", &opened, "browser")).unwrap_err();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        let recovery = roots[0].join("a.txt.aoe-conflict");
+        assert_eq!(fs::read_to_string(&recovery).unwrap(), "external");
+        assert!(error.1.contains(recovery.to_str().unwrap()), "{}", error.1);
+        assert_eq!(
+            fs::read_to_string(roots[0].join("a.txt")).unwrap(),
+            "browser"
+        );
+    }
+
+    #[test]
+    fn exhausted_recovery_names_never_remove_the_unverified_displaced_file() {
+        use crate::session::anchored_fs::{FileExchangePhase, FILE_EXCHANGE_HOOK};
+        let _hooks = ResetExchangeHooks;
+        let (_dir, roots, instance) = fixture();
+        fs::write(roots[0].join("a.txt"), "original").unwrap();
+        let opened = snapshot(&roots, &instance, "a.txt").version.unwrap();
+        for n in 0..100 {
+            let suffix = if n == 0 {
+                String::new()
+            } else {
+                format!(".{n}")
+            };
+            fs::write(
+                roots[0].join(format!("a.txt.aoe-conflict{suffix}")),
+                "earlier",
+            )
+            .unwrap();
+        }
+        FILE_EXCHANGE_HOOK.set(Some(Box::new(|phase, target, _| {
+            if phase == FileExchangePhase::AfterExchange {
+                let other = target.with_extension("other");
+                fs::write(&other, "third").unwrap();
+                fs::rename(other, target).unwrap();
+            }
+        })));
+        let error = save_file(&roots, &instance, request("a.txt", &opened, "browser")).unwrap_err();
+        assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+        let staged = fs::read_dir(&roots[0])
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".aoe-copy-")
+            })
+            .unwrap();
+        assert_eq!(fs::read_to_string(&staged).unwrap(), "original");
+        assert!(error.1.contains(staged.to_str().unwrap()), "{}", error.1);
+        assert_eq!(fs::read_to_string(roots[0].join("a.txt")).unwrap(), "third");
+        assert_eq!(fs::read_dir(&roots[0]).unwrap().count(), 102);
+    }
+
+    #[test]
+    fn unsupported_exchange_disables_editing_and_leaves_the_target_untouched() {
+        for errno in [libc::EINVAL, libc::EOPNOTSUPP, libc::ENOSYS] {
+            let _hooks = ResetExchangeHooks;
+            let (_dir, roots, instance) = fixture();
+            fs::write(roots[0].join("a.txt"), "original").unwrap();
+            let opened = snapshot(&roots, &instance, "a.txt").version.unwrap();
+            crate::process::EXCHANGE_ERROR.set(Some(errno));
+            let disabled = snapshot(&roots, &instance, "a.txt");
+            assert_eq!(
+                disabled.edit_disabled_reason.as_deref(),
+                Some(EXCHANGE_UNSUPPORTED)
+            );
+            assert_eq!(disabled.version.as_deref(), Some(opened.as_str()));
+            let error =
+                save_file(&roots, &instance, request("a.txt", &opened, "browser")).unwrap_err();
+            assert_eq!(error.0, StatusCode::FORBIDDEN);
+            assert_eq!(
+                fs::read_to_string(roots[0].join("a.txt")).unwrap(),
+                "original"
+            );
+            assert_eq!(fs::read_dir(&roots[0]).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn an_exchange_that_becomes_unsupported_after_the_probe_never_falls_back() {
+        use crate::session::anchored_fs::{FileExchangePhase, FILE_EXCHANGE_HOOK};
+        let _hooks = ResetExchangeHooks;
+        let (_dir, roots, instance) = fixture();
+        fs::write(roots[0].join("a.txt"), "original").unwrap();
+        let opened = snapshot(&roots, &instance, "a.txt").version.unwrap();
+        FILE_EXCHANGE_HOOK.set(Some(Box::new(|phase, _, _| {
+            if phase == FileExchangePhase::BeforeExchange {
+                crate::process::EXCHANGE_ERROR.set(Some(libc::EOPNOTSUPP));
+            }
+        })));
+        let error = save_file(&roots, &instance, request("a.txt", &opened, "browser")).unwrap_err();
+        assert_eq!(error.0, StatusCode::FORBIDDEN);
+        assert_eq!(error.1, EXCHANGE_UNSUPPORTED);
+        assert_eq!(
+            fs::read_to_string(roots[0].join("a.txt")).unwrap(),
+            "original"
+        );
+        assert_eq!(fs::read_dir(&roots[0]).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_rejected_draft_stage_never_receives_public_permissions() {
+        use crate::session::anchored_fs::{FileExchangePhase, FILE_EXCHANGE_HOOK};
+        let _hooks = ResetExchangeHooks;
+        let (_dir, roots, instance) = fixture();
+        fs::write(roots[0].join("a.txt"), "original").unwrap();
+        fs::set_permissions(roots[0].join("a.txt"), fs::Permissions::from_mode(0o644)).unwrap();
+        let opened = snapshot(&roots, &instance, "a.txt").version.unwrap();
+        FILE_EXCHANGE_HOOK.set(Some(Box::new(|phase, target, stage| {
+            if phase == FileExchangePhase::Staged {
+                assert_eq!(
+                    fs::metadata(stage).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+                fs::write(target, "external").unwrap();
+            }
+        })));
+        let error = save_file(
+            &roots,
+            &instance,
+            request("a.txt", &opened, "private draft"),
+        )
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert_eq!(
+            fs::read_to_string(roots[0].join("a.txt")).unwrap(),
+            "external"
+        );
+        assert_eq!(fs::read_dir(&roots[0]).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn sync_failure_after_publication_reports_uncertainty_without_a_false_conflict() {
+        use crate::session::anchored_fs::{FileExchangePhase, FAIL_SYNC_ONCE, FILE_EXCHANGE_HOOK};
+        let _hooks = ResetExchangeHooks;
+        let (_dir, roots, instance) = fixture();
+        fs::write(roots[0].join("a.txt"), "original").unwrap();
+        let opened = snapshot(&roots, &instance, "a.txt").version.unwrap();
+        FILE_EXCHANGE_HOOK.set(Some(Box::new(|phase, target, _| {
+            if phase == FileExchangePhase::AfterExchange {
+                FAIL_SYNC_ONCE.set(Some(target.parent().unwrap().to_path_buf()));
+            }
+        })));
+        let error = save_file(&roots, &instance, request("a.txt", &opened, "browser")).unwrap_err();
+        assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            error
+                .1
+                .contains("file was saved, but directory sync failed"),
+            "{}",
+            error.1
+        );
+        assert!(!error.1.contains("File changed on disk"));
+        assert_eq!(
+            fs::read_to_string(roots[0].join("a.txt")).unwrap(),
+            "browser"
+        );
     }
 
     #[test]
