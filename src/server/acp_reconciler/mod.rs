@@ -856,4 +856,41 @@ mod tests {
 
         assert!(!tick.attempted.contains(id));
     }
+
+    /// A durable `aoe acp stop` fence refuses automatic resume; repeated ticks
+    /// must not count that as a crash loop, and explicit resume still clears it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn durable_user_stop_does_not_crash_loop() {
+        use crate::process::worker_registry::{self, ResumeAuthority, WorkerRecord};
+
+        let id = "sess-stopped";
+        let (_home, state, project) = test_fixtures::test_state(id);
+        let record = WorkerRecord::new(
+            id.into(),
+            std::process::id(),
+            worker_registry::socket_path_for(id).unwrap(),
+            "aoe-agent".into(),
+            "aoe-agent".into(),
+            project.path().to_path_buf(),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        worker_registry::save(&record).unwrap();
+        worker_registry::request_stop(&record).unwrap();
+        worker_registry::retire_selected(&record).unwrap();
+
+        let mut tick = test_fixtures::Tick::default();
+        for _ in 0..=RECONCILER_MAX_RESPAWNS_IN_WINDOW {
+            tick.run(&state).await;
+        }
+
+        assert_eq!(test_fixtures::startup_errors(&state, id), 0);
+        assert!(tick.parked.is_empty());
+        let observed = worker_registry::stop_intent(id).unwrap();
+        worker_registry::admit_resume(id, ResumeAuthority::Explicit, &observed).unwrap();
+    }
 }

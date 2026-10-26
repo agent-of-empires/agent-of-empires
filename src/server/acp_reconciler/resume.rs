@@ -178,7 +178,11 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
         }
         Err(error) => {
             tracing::debug!(target: "acp.supervisor", session = %id, "resume not admitted: {error}");
-            return ResumeOutcome::Retry;
+            // A durable stop fence is terminal; only a pending teardown clears.
+            return match error {
+                SupervisorError::TeardownPending(_) => ResumeOutcome::Retry,
+                _ => ResumeOutcome::SpawnFinished,
+            };
         }
     };
     reservation.expected_lifecycle_generation = Some(target.lifecycle_generation);
