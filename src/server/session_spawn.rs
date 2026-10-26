@@ -744,10 +744,16 @@ pub(crate) async fn spawn_structured_session(
                 let spawn_state = state.clone();
                 let claude_store_pin = response_instance.selected_claude_store_pin();
                 service.work.spawn("acp.create_spawn", async move {
-                    let namespace = spawn_state.profile_namespace.read().await;
-                    let submission = service_for_check.prompt_submission(&id).await;
-                    let inst_lock = service_for_check.instance_lock(&id).await;
-                    let guard = inst_lock.lock().await;
+                    let Some((namespace, submission, guard)) = acquire_spawn_guards(
+                        &service_for_check,
+                        &spawn_state.profile_namespace,
+                        &id,
+                        reservation.lease().cancellation(),
+                    )
+                    .await
+                    else {
+                        return;
+                    };
                     let check_id = id.clone();
                     let checked = tokio::task::spawn_blocking(move || {
                         use crate::session::SessionStore;
@@ -869,6 +875,32 @@ pub(crate) async fn spawn_structured_session(
     }
 }
 
+/// Takes the namespace, submission and instance guards, or `None` once a stop
+/// cancels the lease. A purge holds them while it waits for this reservation
+/// to drop, and a queued namespace writer makes the read wait behind it, so
+/// waiting through a cancel deadlocks until the purge timeout.
+async fn acquire_spawn_guards(
+    service: &SessionService,
+    namespace: &Arc<tokio::sync::RwLock<()>>,
+    id: &str,
+    cancelled: &tokio_util::sync::CancellationToken,
+) -> Option<(
+    tokio::sync::OwnedRwLockReadGuard<()>,
+    tokio::sync::OwnedMutexGuard<()>,
+    tokio::sync::OwnedMutexGuard<()>,
+)> {
+    let acquire = async {
+        let namespace = namespace.clone().read_owned().await;
+        let submission = service.prompt_submission(id).await;
+        let instance = service.instance_lock(id).await.lock_owned().await;
+        (namespace, submission, instance)
+    };
+    tokio::select! {
+        guards = acquire => Some(guards),
+        () = cancelled.cancelled() => None,
+    }
+}
+
 pub(crate) async fn finish_structured_launch(
     state: &Arc<super::AppState>,
     native: Arc<super::session_store::NativeSessionStore>,
@@ -918,6 +950,39 @@ pub(crate) async fn finish_structured_launch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn spawn_guard_wait_yields_to_lease_cancellation() {
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let service = &state.session_service;
+        let namespace = &state.profile_namespace;
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        assert!(acquire_spawn_guards(service, namespace, "s1", &cancelled)
+            .await
+            .is_some());
+
+        // A purge holds a namespace read and the instance lock; a rename queues
+        // a namespace writer, which blocks any further read.
+        let purge_lease = namespace.clone().read_owned().await;
+        let held = service.instance_lock("s1").await.lock_owned().await;
+        let writer = tokio::spawn(namespace.clone().write_owned());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while namespace.try_read().is_ok() {
+            assert!(std::time::Instant::now() < deadline, "writer never queued");
+            tokio::task::yield_now().await;
+        }
+
+        cancelled.cancel();
+        let waited = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            acquire_spawn_guards(service, namespace, "s1", &cancelled),
+        )
+        .await
+        .expect("a cancelled lease must not wait on the held guards");
+        assert!(waited.is_none());
+        drop((held, purge_lease));
+        writer.await.unwrap();
+    }
 
     #[tokio::test]
     #[serial_test::serial]
@@ -1083,6 +1148,7 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
         crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         crate::session::config::update_app_state(|state| {

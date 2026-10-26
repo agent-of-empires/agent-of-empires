@@ -8,7 +8,9 @@ use super::access::{access_policy, cityhall_gate, security_headers};
 #[cfg(feature = "web")]
 use super::assets::{serve_asset, serve_index, serve_public_file};
 use super::state::AppState;
-use crate::server::{acp_ws, api, auth, live_ws, login, passkeys, push, runtime_ws};
+use crate::server::{
+    acp_ws, api, auth, live_ws, login, passkeys, push, runtime_ws, session_status_ws,
+};
 
 pub(super) fn build_router(state: Arc<AppState>) -> Router {
     use axum::routing::{delete, get, patch, post, put};
@@ -101,6 +103,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/file/raw", get(api::session_file_raw))
         // Read-only runtime read: one Hello, one Snapshot, one clean close.
         .route("/api/runtime/read/ws", get(runtime_ws::runtime_ws))
+        .route(
+            "/api/sessions/status/ws",
+            get(session_status_ws::session_status_ws),
+        )
         .route(
             "/api/sessions/{id}/artifacts/{*path}",
             get(api::serve_session_artifact),

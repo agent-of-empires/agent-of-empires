@@ -797,6 +797,21 @@ last_seen_version = "{}"
                 shell_words::quote(path.to_str().expect("input barrier path"))
             );
         }
+        // A running tmux server keeps the environment of the client that
+        // started it, so the autostart policy goes on the command line.
+        let autostart = match self
+            .extra_env
+            .iter()
+            .rev()
+            .find(|(key, _)| key == "AOE_NO_AUTOSTART")
+        {
+            Some((_, value)) => format!(
+                "AOE_NO_AUTOSTART={}",
+                shell_words::quote(value.to_str().expect("AOE_NO_AUTOSTART value"))
+            ),
+            None => "-u AOE_NO_AUTOSTART".to_string(),
+        };
+        aoe_cmd = format!("env {autostart} {aoe_cmd}");
         for arg in args {
             aoe_cmd.push(' ');
             aoe_cmd.push_str(arg);
@@ -1121,6 +1136,33 @@ last_seen_version = "{}"
         self.synchronize_input();
     }
 
+    /// Drag the left button between 1-indexed terminal cells (SGR 1006).
+    pub fn send_mouse_drag(&self, start: (u16, u16), end: (u16, u16)) {
+        let seq = format!(
+            "\x1b[<0;{};{}M\x1b[<32;{};{}M\x1b[<0;{};{}m",
+            start.0, start.1, end.0, end.1, end.0, end.1,
+        );
+        self.tmux_ok(
+            &["send-keys", "-t", &self.session_name, "-l", &seq],
+            "send_mouse_drag",
+        );
+        self.synchronize_input();
+    }
+
+    pub fn resize_window(&self, width: u16, height: u16) {
+        self.tmux_ok(
+            &[
+                "resize-window",
+                "-t",
+                &self.session_name,
+                "-x",
+                &width.to_string(),
+                "-y",
+                &height.to_string(),
+            ],
+            "resize-window",
+        );
+    }
     fn synchronize_input(&self) {
         if !self.input_barrier || !self.session_alive() {
             return;
@@ -1588,4 +1630,59 @@ fn tui_input_barrier_handles_shell_metacharacters_in_home() {
     harness.wait_for("Quit Agent of Empires");
     harness.send_keys("y");
     harness.wait_for_exit(Duration::from_secs(5));
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::parallel]
+fn tui_launch_sets_autostart_policy_on_a_running_tmux_server() {
+    require_tmux!();
+    // (server started with, set_env, value the TUI sees)
+    let cases = [(Some("1"), None, "unset"), (None, Some("1"), "1")];
+    for (inherited, explicit, expected) in cases {
+        let mut harness = TuiTestHarness::new("autostart_policy");
+        // The first client fixes the server's environment, as a parent shell
+        // exporting the variable would.
+        let mut tmux = harness.tmux();
+        tmux.env("HOME", harness.home_path())
+            .env("XDG_CONFIG_HOME", harness.home_path().join(".config"))
+            .env("PATH", harness.env_path())
+            .env_remove("AOE_NO_AUTOSTART")
+            .envs(harness.extra_env.iter().map(|(key, value)| (key, value)));
+        for key in &harness.extra_env_remove {
+            tmux.env_remove(key);
+        }
+        if let Some(value) = inherited {
+            tmux.env("AOE_NO_AUTOSTART", value);
+        }
+        let output = tmux
+            .args(["new-session", "-d", "-s", "server", "sleep 600"])
+            .output()
+            .expect("start harness tmux server");
+        assert!(output.status.success(), "{output:?}");
+        if let Some(value) = explicit {
+            harness.set_env("AOE_NO_AUTOSTART", value);
+        }
+
+        // Stands in for the TUI: reports the policy, then acknowledges startup.
+        // Drop runs the binary with arguments to stop the daemon; those calls
+        // exit at once.
+        let report = harness.home_path().join("autostart-policy");
+        let probe = harness.home_path().join("probe");
+        write_executable(
+            &probe,
+            &format!(
+                "#!/bin/sh\n[ \"$#\" -eq 0 ] || exit 0\nprintf %s \"${{AOE_NO_AUTOSTART-unset}}\" > {}\nprintf '\\033]0;aoe-e2e-0\\007'\nexec sleep 600\n",
+                shell_words::quote(report.to_str().expect("report path"))
+            ),
+        );
+        harness.binary_path = probe;
+        harness.spawn_tui();
+
+        assert_eq!(
+            std::fs::read_to_string(&report).expect("probe report"),
+            expected,
+            "server started with {inherited:?}, set_env {explicit:?}"
+        );
+    }
 }

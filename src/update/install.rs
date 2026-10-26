@@ -1,7 +1,7 @@
 //! Self-update: detect install method, perform update.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::io::ErrorKind;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -437,6 +437,75 @@ async fn actionable_cached(
     supported
 }
 
+const CARGO_UPDATE_COMMAND: &str =
+    "cargo install --git https://github.com/agent-of-empires/agent-of-empires aoe";
+const NIX_UPDATE_COMMAND: &str = "nix profile upgrade agent-of-empires";
+
+/// How this install updates, as `/api/system/update-status` reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InstallKind {
+    Homebrew,
+    Release,
+    Cargo,
+    Nix,
+    Unknown,
+}
+
+impl From<&InstallMethod> for InstallKind {
+    fn from(method: &InstallMethod) -> Self {
+        match method {
+            InstallMethod::Homebrew => InstallKind::Homebrew,
+            InstallMethod::Tarball { .. } => InstallKind::Release,
+            InstallMethod::Cargo => InstallKind::Cargo,
+            InstallMethod::Nix => InstallKind::Nix,
+            InstallMethod::Unknown { .. } => InstallKind::Unknown,
+        }
+    }
+}
+
+impl InstallKind {
+    /// What to run on the machine running AoE. Where `aoe update` can't act it prints the way
+    /// that can, so it is also the answer for an unknown install.
+    pub fn update_command(self) -> &'static str {
+        match self {
+            InstallKind::Cargo => CARGO_UPDATE_COMMAND,
+            InstallKind::Nix => NIX_UPDATE_COMMAND,
+            InstallKind::Homebrew | InstallKind::Release | InstallKind::Unknown => "aoe update",
+        }
+    }
+}
+
+static INSTALL_KIND: tokio::sync::OnceCell<InstallKind> = tokio::sync::OnceCell::const_new();
+
+/// The running binary's install method, detected once per process (it shells out to `brew`).
+/// A detection error counts as unknown.
+pub async fn install_kind() -> InstallKind {
+    install_kind_detached(&INSTALL_KIND, || {
+        detect_install_method().map_or(InstallKind::Unknown, |method| InstallKind::from(&method))
+    })
+    .await
+}
+
+/// In its own task for the same reason as [`actionable_detached`]: a dropped request must not
+/// abandon a detection that is already running.
+async fn install_kind_detached(
+    cell: &'static tokio::sync::OnceCell<InstallKind>,
+    detect: impl FnOnce() -> InstallKind + Send + 'static,
+) -> InstallKind {
+    tokio::spawn(async move {
+        *cell
+            .get_or_init(|| async {
+                tokio::task::spawn_blocking(detect)
+                    .await
+                    .unwrap_or(InstallKind::Unknown)
+            })
+            .await
+    })
+    .await
+    .unwrap_or(InstallKind::Unknown)
+}
+
 fn update_via_brew(target_version: &str) -> Result<()> {
     let mut update_cmd = Command::new("brew");
     update_cmd.args(["update"]);
@@ -470,10 +539,9 @@ fn update_via_brew(target_version: &str) -> Result<()> {
 }
 
 fn nix_refusal_message() -> String {
-    "aoe was installed via Nix. Update by running:\n\
-     \n    nix run github:agent-of-empires/agent-of-empires\n\
-     \n(or rebuild your flake input)."
-        .to_string()
+    format!(
+        "aoe was installed via Nix. Update by running:\n\n    {NIX_UPDATE_COMMAND}\n\n(check the entry name with `nix profile list`), or, if aoe comes from a flake input (NixOS or home-manager), run `nix flake update <input>` (your flake's name for aoe) and rebuild (`nixos-rebuild switch`, `home-manager switch`, ...)."
+    )
 }
 
 fn print_nix_refusal() {
@@ -481,10 +549,9 @@ fn print_nix_refusal() {
 }
 
 fn cargo_refusal_message() -> String {
-    "aoe was installed via cargo. Update by running:\n\
-     \n    cargo install --git https://github.com/agent-of-empires/agent-of-empires aoe\n\
-     \n(or `git pull && cargo install --path .` from a local clone)."
-        .to_string()
+    format!(
+        "aoe was installed via cargo. Update by running:\n\n    {CARGO_UPDATE_COMMAND}\n\n(or `git pull && cargo install --path .` from a local clone)."
+    )
 }
 
 fn print_cargo_refusal() {
@@ -697,6 +764,67 @@ mod tests {
             .await
             .as_ref()
             .is_some_and(|e| e.target == "1.1.0" && !e.supported));
+    }
+
+    #[test]
+    fn install_kinds_serialise_and_name_the_command_the_cli_prints() {
+        let tarball = InstallMethod::Tarball {
+            binary_path: home().join(".local/bin/aoe"),
+        };
+        let unknown = InstallMethod::Unknown {
+            binary_path: PathBuf::from("/opt/aoe"),
+        };
+        let cases = [
+            (InstallMethod::Homebrew, "homebrew", "aoe update"),
+            (tarball, "release", "aoe update"),
+            (InstallMethod::Cargo, "cargo", CARGO_UPDATE_COMMAND),
+            (InstallMethod::Nix, "nix", NIX_UPDATE_COMMAND),
+            (unknown, "unknown", "aoe update"),
+        ];
+        for (method, wire, command) in cases {
+            let kind = InstallKind::from(&method);
+            assert_eq!(serde_json::to_value(kind).unwrap(), wire, "{method:?}");
+            assert_eq!(kind.update_command(), command, "{method:?}");
+        }
+        // The dashboard and the CLI refusal name the same command.
+        assert!(cargo_refusal_message().contains(InstallKind::Cargo.update_command()));
+        let nix = nix_refusal_message();
+        assert!(nix.contains(InstallKind::Nix.update_command()));
+        assert!(nix.contains("nix flake update"));
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_request_still_caches_the_install_kind() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cell: &'static _ = Box::leak(Box::new(tokio::sync::OnceCell::new()));
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        let first_calls = calls.clone();
+        let first = tokio::spawn(install_kind_detached(cell, move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            first_calls.fetch_add(1, Ordering::SeqCst);
+            InstallKind::Cargo
+        }));
+        entered_rx.await.unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+
+        let second_calls = calls.clone();
+        let second = tokio::spawn(install_kind_detached(cell, move || {
+            second_calls.fetch_add(1, Ordering::SeqCst);
+            InstallKind::Nix
+        }));
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            second.await.unwrap(),
+            InstallKind::Cargo,
+            "the first detection's answer"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one detection ran");
+        assert_eq!(cell.get(), Some(&InstallKind::Cargo));
     }
 
     #[test]

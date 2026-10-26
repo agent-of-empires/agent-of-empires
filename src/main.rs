@@ -79,7 +79,7 @@ fn main() -> Result<()> {
     }
 
     // Only a parse failure loads the plugin registry to graft plugin commands.
-    let cli = match Cli::try_parse() {
+    let mut cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(_) => {
             let matches = cli::graft::augmented_command().get_matches();
@@ -90,6 +90,7 @@ fn main() -> Result<()> {
         }
     };
 
+    cli.command = cli.command.map(Commands::resolve_daemon_alias);
     if let Some(Commands::PrimeRunner(args)) = cli.command {
         return tokio::runtime::Runtime::new()?
             .block_on(agent_of_empires::process::prime::run(args));

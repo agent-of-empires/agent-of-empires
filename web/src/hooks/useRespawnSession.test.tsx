@@ -24,6 +24,27 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+describe("useRespawnSession failure text", () => {
+  it.each([
+    ["plain text", "spawn failed: boom", "spawn failed: boom"],
+    [
+      "a JSON refusal",
+      JSON.stringify({ error: "session_archived", message: "session is archived; unarchive it first" }),
+      "session is archived; unarchive it first",
+    ],
+    ["JSON without a message", JSON.stringify({ error: "not_found" }), JSON.stringify({ error: "not_found" })],
+    ["an empty body", "", ""],
+  ])("keeps %s readable", async (_label, body, detail) => {
+    stubFetch(false, 409, body);
+    const { result } = renderRespawn();
+    await act(async () => {
+      await result.current.respawn();
+    });
+    expect(result.current.detail).toBe(detail);
+    expect(result.current.error).toBe(`Server returned 409. ${detail}`.trim());
+  });
+});
+
 describe("useRespawnSession resetKey", () => {
   it.each([
     ["a successful respawn", () => stubFetch(true, 200), "ok", "", ["reset-2"]],

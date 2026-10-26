@@ -35,6 +35,12 @@ pub enum SessionCommands {
     /// Rename a session
     Rename(RenameArgs),
 
+    /// Move sessions to another profile. Sessions that look active when the
+    /// command starts are refused; one that starts mid-batch can still move.
+    /// Each keeps its title, group and worktree; the target profile's config
+    /// applies from the next start.
+    Move(super::session_move::MoveArgs),
+
     /// Edit a managed worktree session's workdir directory name (and,
     /// optionally, its git branch). Moves the worktree directory in place;
     /// the session must not be running. See #1723.
@@ -394,6 +400,7 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::Wait(args) => wait_session(profile, args).await,
         SessionCommands::Capture(args) => capture_session(profile, args).await,
         SessionCommands::Rename(args) => rename_session(profile, args).await,
+        SessionCommands::Move(args) => super::session_move::run(profile, args).await,
         SessionCommands::SetWorktreeName(args) => set_worktree_name(profile, args).await,
         SessionCommands::Current(args) => current_session(args).await,
         SessionCommands::SetSessionId(args) => set_session_id(profile, args).await,

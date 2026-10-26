@@ -12,7 +12,7 @@ use std::time::Instant;
 use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
-use super::DialogResult;
+use super::{cycle_focus, DialogResult};
 use crate::containers;
 use crate::session::config::profile_config::resolve_config_or_warn;
 use crate::session::config::{load_config, update_app_state, DefaultTerminalMode, SandboxConfig};
@@ -1528,7 +1528,7 @@ impl NewSessionDialog {
                 if self.focused_field == fields.group {
                     self.clear_group_ghost();
                 }
-                self.focused_field = (self.focused_field + 1) % fields.count;
+                self.focused_field = cycle_focus(self.focused_field, fields.count, false);
                 if self.focused_field == self.path_field() {
                     self.recompute_path_ghost();
                 }
@@ -1545,11 +1545,7 @@ impl NewSessionDialog {
                 if self.focused_field == fields.group {
                     self.clear_group_ghost();
                 }
-                self.focused_field = if self.focused_field == 0 {
-                    fields.count - 1
-                } else {
-                    self.focused_field - 1
-                };
+                self.focused_field = cycle_focus(self.focused_field, fields.count, true);
                 if self.focused_field == self.path_field() {
                     self.recompute_path_ghost();
                 }
@@ -1686,15 +1682,13 @@ impl NewSessionDialog {
                 DialogResult::Continue
             }
             KeyCode::Tab | KeyCode::Down => {
-                self.sandbox_focused_field = (self.sandbox_focused_field + 1) % SANDBOX_MAX;
+                self.sandbox_focused_field =
+                    cycle_focus(self.sandbox_focused_field, SANDBOX_MAX, false);
                 DialogResult::Continue
             }
             KeyCode::BackTab | KeyCode::Up => {
-                self.sandbox_focused_field = if self.sandbox_focused_field == 0 {
-                    SANDBOX_MAX - 1
-                } else {
-                    self.sandbox_focused_field - 1
-                };
+                self.sandbox_focused_field =
+                    cycle_focus(self.sandbox_focused_field, SANDBOX_MAX, true);
                 DialogResult::Continue
             }
             _ => {
@@ -1904,15 +1898,12 @@ impl NewSessionDialog {
             }
             KeyCode::Tab | KeyCode::Down => {
                 self.worktree_config_focused_field =
-                    (self.worktree_config_focused_field + 1) % WT_MAX;
+                    cycle_focus(self.worktree_config_focused_field, WT_MAX, false);
                 DialogResult::Continue
             }
             KeyCode::BackTab | KeyCode::Up => {
-                self.worktree_config_focused_field = if self.worktree_config_focused_field == 0 {
-                    WT_MAX - 1
-                } else {
-                    self.worktree_config_focused_field - 1
-                };
+                self.worktree_config_focused_field =
+                    cycle_focus(self.worktree_config_focused_field, WT_MAX, true);
                 DialogResult::Continue
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
@@ -2136,12 +2127,29 @@ impl NewSessionDialog {
         }
         let profile = self.selected_profile().to_string();
         let config = self.resolve_config_for_path(&profile);
-        if let Err(msg) = crate::session::builder::structured::validate_structured_choice(
-            &self.available_tools[self.tool_index],
-            self.command_override.value(),
-            &config,
-        ) {
-            self.error_message = Some(msg);
+        let path = path_input::expand_tilde(self.path.value().trim());
+        let choice = crate::session::builder::structured::StructuredChoice {
+            tool: &self.available_tools[self.tool_index],
+            agent_name: None,
+            command_override: self.command_override.value(),
+            sandboxed: self.sandbox_enabled,
+            // A worktree or scratch session launches in a directory created later.
+            project_path: (!self.scratch && !self.worktree_enabled)
+                .then(|| std::path::Path::new(&path)),
+            // The dialog asks for hook trust itself, so an unapproved hook still counts here.
+            preparation_hooks: &|| {
+                crate::session::builder::structured::preparation_hooks_apply(
+                    &crate::session::config::profile_config::resolve_config_or_warn(&profile).hooks,
+                    std::path::Path::new(&path),
+                    self.scratch,
+                    None,
+                )
+            },
+        };
+        if let Err(e) =
+            crate::session::builder::structured::validate_structured_choice(&choice, &config)
+        {
+            self.error_message = Some(e.to_string());
             return false;
         }
         true

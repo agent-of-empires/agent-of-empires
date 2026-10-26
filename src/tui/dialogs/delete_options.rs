@@ -210,19 +210,13 @@ impl UnifiedDeleteDialog {
     }
 
     fn focus_next(&mut self) {
-        let idx = self.focus_index();
-        let next_idx = (idx + 1) % self.focusable_elements.len();
-        self.focus = self.focusable_elements[next_idx];
+        let next = super::cycle_focus(self.focus_index(), self.focusable_elements.len(), false);
+        self.focus = self.focusable_elements[next];
     }
 
     fn focus_prev(&mut self) {
-        let idx = self.focus_index();
-        let prev_idx = if idx == 0 {
-            self.focusable_elements.len() - 1
-        } else {
-            idx - 1
-        };
-        self.focus = self.focusable_elements[prev_idx];
+        let prev = super::cycle_focus(self.focus_index(), self.focusable_elements.len(), true);
+        self.focus = self.focusable_elements[prev];
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<DeleteOptions> {

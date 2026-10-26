@@ -962,7 +962,10 @@ mod tests {
                 .record(
                     &baseline_id,
                     seq,
-                    &Event::AgentMessageChunk { text: text.clone() },
+                    &Event::AgentMessageChunk {
+                        text: text.clone(),
+                        message_id: None,
+                    },
                 )
                 .unwrap();
         }
@@ -1049,7 +1052,7 @@ mod tests {
             for (index, frame) in replay.frames[..64].iter().enumerate() {
                 assert_eq!(frame.session_id, baseline_id);
                 assert_eq!(frame.seq, index as u64 + 1);
-                let Event::AgentMessageChunk { text: actual } = &*frame.event else {
+                let Event::AgentMessageChunk { text: actual, .. } = &*frame.event else {
                     panic!("expected message frame");
                 };
                 assert_eq!(actual, &text);

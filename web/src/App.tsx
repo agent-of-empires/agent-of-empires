@@ -16,6 +16,7 @@ import { diffSelectionStale } from "./lib/diffSelection";
 import { useSessions } from "./hooks/useSessions";
 import { useAttentionCounts } from "./hooks/useAttentionCounts";
 import { useStatusSounds } from "./hooks/useStatusSounds";
+import { useSessionStatusStream } from "./hooks/useSessionStatusStream";
 import { useDashboardPresence } from "./hooks/useDashboardPresence";
 import { clearAcpCache } from "./hooks/useAcpSession";
 import { clearDraft, sweepOrphanDrafts } from "./lib/acpDrafts";
@@ -97,13 +98,14 @@ import {
   restoreSession,
   fetchPlugins,
 } from "./lib/api";
-import type { DeleteSessionOptions, ServerAbout, SettingsResponse } from "./lib/api";
+import type { DeleteSessionOptions, RuntimeCursor, ServerAbout, SettingsResponse } from "./lib/api";
 import { getClientCapabilities } from "./lib/clientCapabilities";
 import { normalizeProjectPathKey } from "./lib/registeredProjects";
 import { IdleDecayWindowContext, parseIdleDecayWindowMs } from "./lib/idleDecay";
 import { parseUnreadIndicatorEnabled, UnreadIndicatorContext, useUnreadIndicatorEnabled } from "./lib/unreadIndicator";
 import { parseSessionRowTagMode, SessionRowTagContext, type SessionRowTagMode } from "./lib/sessionRowTag";
 import { parseSessionColorsEnabled, SessionColorsContext } from "./lib/sessionColors";
+import { settleSettingsIntrosReadOnly } from "./lib/settingsIntros";
 import { onSettingsChanged } from "./lib/settingsEvents";
 import { parseSystemHealthEnabled, SystemHealthEnabledContext } from "./lib/systemHealth";
 import { toastBus, reportError } from "./lib/toastBus";
@@ -398,6 +400,8 @@ function AppContent({
     applySessionMutation,
     observedById,
     runtimeEpoch,
+    refresh: refreshSessions,
+    applyPushedStatus,
   } = useSessions();
   const workspaces = useWorkspaces(sessions);
   // Creates whose outcome the wizard never learned keep reconciling here, past its unmount.
@@ -424,7 +428,15 @@ function AppContent({
   const trashedWorkspaces = useMemo(() => workspaces.filter(workspaceIsTrashed), [workspaces]);
 
   const { unreadCount, waitingCount } = useAttentionCounts(sessions, activeSessionId);
-  useStatusSounds(sessions);
+  const { onSoundDue, cancelCue } = useStatusSounds(sessions);
+  const onPushedStatus = useCallback(
+    (id: string, status: SessionResponse["status"], cursor: RuntimeCursor) => {
+      cancelCue(id);
+      applyPushedStatus(id, status, cursor);
+    },
+    [cancelCue, applyPushedStatus],
+  );
+  useSessionStatusStream({ onStatus: onPushedStatus, onSoundDue, onResync: refreshSessions });
   const attentionBadgeColors = useMemo(() => getAttentionBadgeColors(resolvedTheme), [resolvedTheme]);
 
   // Remember the active session and restore it on a PWA relaunch (#2103).
@@ -1130,6 +1142,7 @@ function AppContent({
       if (generation === serverAboutGeneration.current && about) {
         setServerAbout(about);
         setServedProfileReady(true);
+        settleSettingsIntrosReadOnly(about.read_only);
       }
     } finally {
       if (generation === serverAboutGeneration.current) setServerAboutLoaded(true);
@@ -1148,6 +1161,8 @@ function AppContent({
         if (about) {
           setServerAbout(about);
           setServedProfileReady(true);
+          // Settings intro choices made before this answer was in wait to learn where they go.
+          settleSettingsIntrosReadOnly(about.read_only);
         }
         // Read-only servers can't persist an opt-in choice, so skip the ping.
         if (about && !about.read_only) reportTelemetrySeen("web");
@@ -1347,6 +1362,9 @@ function AppContent({
   const handleSwitchView = useCallback((sessionId: string, toStructured: boolean) => {
     setSwitchViewTarget({ sessionId, toStructured });
   }, []);
+  // The startup error banner's way out, where the server allows the switch. Each
+  // mounted Structured view switches its own Session.
+  const canSwitchToTerminal = !serverAbout?.read_only && caps.canUseTerminal;
 
   const handleConfirmSwitchView = useCallback(async () => {
     if (!switchViewTarget) return;
@@ -1990,6 +2008,9 @@ function AppContent({
                             fileRefSession={session}
                             onOpenAgentsPane={openAgentsPane}
                             isSandboxed={session.is_sandboxed}
+                            onSwitchToTerminal={
+                              canSwitchToTerminal ? () => handleSwitchView(session.id, false) : undefined
+                            }
                           />
                         </Suspense>
                       )}
@@ -2202,6 +2223,7 @@ function AppContent({
           pluginPanes={pluginPanes}
           onBackToAgent={() => handlePickView("agent")}
           onOpenAgentsPane={() => handlePickView("agents")}
+          onSwitchToTerminal={canSwitchToTerminal ? (id) => handleSwitchView(id, false) : undefined}
           pairedMounted={pairedMounted}
           activeSession={activeSession ?? null}
           activeSessionId={activeSessionId}
@@ -2333,14 +2355,12 @@ function AppContent({
   });
   const tour = useTour({
     scope: tourScope,
-    readOnly: !!serverAbout?.read_only,
-    cityhall: caps.cityhall,
+    readOnly: serverAbout?.read_only,
     isDesktop: !isCoarse,
     autoLaunchReady: tourAutoLaunchReady && welcome.resolved,
     seen: tourSeen,
     seenKnown: tourSeenKnown,
     onSeen: handleTourSeen,
-    onNavigate: (tab) => (tab ? navigate(`/settings/${tab}`) : handleCloseSettings()),
   });
 
   // Auto-pop the tip-of-the-day once per load, after onboarding settles, like

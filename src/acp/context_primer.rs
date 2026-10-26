@@ -134,7 +134,7 @@ fn fold_turns(events: &[(u64, Event)], before_seq: Option<u64>) -> Folded {
                 }));
                 ended_non_success = false;
             }
-            Event::AgentMessageChunk { text } => current
+            Event::AgentMessageChunk { text, .. } => current
                 .get_or_insert_with(Turn::default)
                 .assistant_text
                 .push_str(text),

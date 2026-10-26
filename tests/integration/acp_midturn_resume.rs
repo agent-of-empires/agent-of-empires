@@ -190,7 +190,9 @@ async fn attach_in_flight_disarms_after_first_inbound_notification() {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             match client.next_event().await.expect("reattached stream open") {
-                Event::AgentMessageChunk { text } if text == "mid-turn chunk after reattach" => {
+                Event::AgentMessageChunk { text, .. }
+                    if text == "mid-turn chunk after reattach" =>
+                {
                     break
                 }
                 Event::Stopped { reason } => panic!("stopped before notification: {reason}"),
