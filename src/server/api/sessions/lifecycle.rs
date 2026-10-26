@@ -2691,11 +2691,18 @@ async fn prepare_agent_session_inner(
                 response
             } else if error.is::<crate::session::NativeStoreUnavailable>() {
                 StatusCode::SERVICE_UNAVAILABLE.into_response()
-            } else if error.is::<crate::session::ManagedResumeRefused>() {
-                crate::server::api::api_error_with_code_header(
-                    crate::daemon::ApiErrorCode::ManagedResumeRefused,
-                    crate::session::MANAGED_RESUME_RECOVERY_MESSAGE,
-                )
+            } else if let Some(refusal) =
+                error.downcast_ref::<crate::session::ManagedResumeRefused>()
+            {
+                let mut response = crate::server::api::api_error_with_code_header(
+                    crate::daemon::ApiErrorCode::ManagedResumeRefused(refusal.0),
+                    refusal.0.message(),
+                );
+                response.headers_mut().insert(
+                    crate::daemon::MANAGED_RESUME_CAUSE_HEADER,
+                    axum::http::HeaderValue::from_static(refusal.0.as_str()),
+                );
+                response
             } else {
                 tracing::warn!(target: "http.api.sessions", session = %id, %error, "session start failed");
                 api_error(
@@ -2978,6 +2985,15 @@ mod durable_stop_tests {
                 headers[crate::daemon::ERROR_CODE_HEADER],
                 "managed_resume_refused"
             );
+            let expected_cause = if failed_probe {
+                crate::session::ManagedResumeCause::PreviousResumeProbeFailed
+            } else {
+                crate::session::ManagedResumeCause::ExecutionContextUnattested
+            };
+            assert_eq!(
+                headers[crate::daemon::MANAGED_RESUME_CAUSE_HEADER],
+                expected_cause.as_str(),
+            );
             let code = crate::daemon::ApiErrorCode::from_headers(status, &headers, false).unwrap();
             assert_eq!(code.as_str(), "managed_resume_refused");
             assert_eq!(
@@ -2997,6 +3013,10 @@ mod durable_stop_tests {
             let message = body["message"].as_str().unwrap();
             assert!(message.contains("aoe session set-session-id"), "{message}");
             assert!(message.contains("--store"), "{message}");
+            assert!(
+                message.contains("aoe session set-session-id <session> \"\""),
+                "{message}"
+            );
             let public_body = body.to_string();
             for private in [
                 sid,

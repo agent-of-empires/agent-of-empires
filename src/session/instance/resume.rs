@@ -3,14 +3,87 @@
 
 use super::*;
 
-pub(crate) const MANAGED_RESUME_RECOVERY_MESSAGE: &str =
-    "Managed resume refused; the conversation is preserved. Check and restore the original agent \
-     configuration and store, then explicitly retry with aoe session set-session-id <session> \
-     <native-id>; use --store with the exact store or transcript where required.";
+macro_rules! recovery_message {
+    ($reason:literal) => {
+        concat!(
+            $reason,
+            "\nConversation preserved. Restore original context, then retry:\n",
+            "aoe session set-session-id <session> <native-id>\n",
+            "Use --store with the exact store/transcript where required.\n",
+            "Or choose fresh (abandons this AoE association):\n",
+            "aoe session set-session-id <session> \"\"\n",
+            "Then start/restart; old history is not deleted or recovered."
+        )
+    };
+}
+
+/// Finite reasons safe to present without exposing native diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ManagedResumeCause {
+    #[error("wrapper execution contract is missing")]
+    WrapperContractRequired,
+    #[error("managed command or arguments cannot be attested")]
+    UnsupportedManagedArguments,
+    #[error("OpenCode session schema cannot be attested")]
+    OpenCodeSchemaUnattested,
+    #[error("previous native resume probe failed")]
+    PreviousResumeProbeFailed,
+    #[error("native execution context cannot be attested")]
+    ExecutionContextUnattested,
+}
+
+impl ManagedResumeCause {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::WrapperContractRequired => "wrapper_contract_required",
+            Self::UnsupportedManagedArguments => "unsupported_managed_arguments",
+            Self::OpenCodeSchemaUnattested => "opencode_schema_unattested",
+            Self::PreviousResumeProbeFailed => "previous_resume_probe_failed",
+            Self::ExecutionContextUnattested => "execution_context_unattested",
+        }
+    }
+
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::WrapperContractRequired => recovery_message!(
+                "Managed resume refused: wrapper contract missing.\n\
+                 Restore truthful session.agent_execution_as and\n\
+                 session.agent_config_dir in trusted global/profile config.\n\
+                 Both must match the original agent and store."
+            ),
+            Self::UnsupportedManagedArguments => recovery_message!(
+                "Managed resume refused: unsupported command or arguments.\n\
+                 Remove native selectors and unsupported context overrides."
+            ),
+            Self::OpenCodeSchemaUnattested => recovery_message!(
+                "Managed resume refused: OpenCode schema cannot be attested.\n\
+                 Restore a verified release/build and its original database."
+            ),
+            Self::PreviousResumeProbeFailed => recovery_message!(
+                "Managed resume refused: the previous native resume failed.\n\
+                 Restoring configuration alone does not clear this blocker."
+            ),
+            Self::ExecutionContextUnattested => recovery_message!(
+                "Managed resume refused: execution context cannot be attested.\n\
+                 Restore the original agent configuration and store."
+            ),
+        }
+    }
+
+    pub(super) fn from_error(error: &anyhow::Error) -> Self {
+        if let Some(cause) = error.downcast_ref::<Self>() {
+            *cause
+        } else if error.is::<super::execution::UnattestedOpenCodeSchema>() {
+            Self::OpenCodeSchemaUnattested
+        } else {
+            Self::ExecutionContextUnattested
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
-#[error("{}", MANAGED_RESUME_RECOVERY_MESSAGE)]
-pub(crate) struct ManagedResumeRefused;
+#[error("{}", .0.message())]
+pub(crate) struct ManagedResumeRefused(pub ManagedResumeCause);
 
 /// `HonorAutoResumeSetting` permits configured fresh launches on manual restart.
 /// `Allow` preserves context for Send Message and Live Send. A failed ID requires
@@ -570,7 +643,7 @@ impl Instance {
                 "resume previously failed for conversation {sid}; identity preserved; restore its original context and explicitly retry with aoe session set-session-id {} {sid}, using --store with the exact store or transcript where required",
                 self.id
             )
-            .context(ManagedResumeRefused));
+            .context(ManagedResumeRefused(ManagedResumeCause::PreviousResumeProbeFailed)));
         }
         Ok(())
     }

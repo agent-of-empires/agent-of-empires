@@ -535,7 +535,7 @@ async fn run_command_writer(
                                 }
                                 let mut failure = match error {
                                     error @ crate::daemon::DaemonClientError::Committed {
-                                        code: crate::daemon::ApiErrorCode::ManagedResumeRefused,
+                                        code: crate::daemon::ApiErrorCode::ManagedResumeRefused(_),
                                         ..
                                     } => CommandFailure::Rejected(error.to_string()),
                                     error => CommandFailure::submitted(error),
@@ -569,7 +569,7 @@ async fn run_command_writer(
                     let failure = if matches!(
                         code,
                         crate::daemon::ApiErrorCode::PurgeFailed
-                            | crate::daemon::ApiErrorCode::ManagedResumeRefused
+                            | crate::daemon::ApiErrorCode::ManagedResumeRefused(_)
                     ) {
                         CommandFailure::Rejected(message)
                     } else {

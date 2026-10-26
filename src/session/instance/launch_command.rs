@@ -828,12 +828,13 @@ impl Instance {
                 if !matches!(self.resume_intent, ResumeIntent::Default) {
                     return Err(error);
                 }
+                let cause = ManagedResumeCause::from_error(&error);
                 Err(error
                     .context(format!(
                         "cannot attest execution context for managed conversation {sid}; launch refused without replacing it; restore the original agent configuration and store, or rebind with aoe session set-session-id {} {sid} (use --store with the exact store or transcript where required)",
                         self.id
                     ))
-                    .context(ManagedResumeRefused))
+                    .context(ManagedResumeRefused(cause)))
             }
             (Err(error), _)
                 if self.default_selector_agent().is_some_and(|agent| {

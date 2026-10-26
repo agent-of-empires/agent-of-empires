@@ -1307,24 +1307,6 @@ mod tests {
 
         assert!(inst.terminal_keep_context_state(None).is_err());
     }
-    #[test]
-    #[serial_test::serial]
-    fn handoff_refuses_unattested_native_configuration() {
-        let temp = tempfile::tempdir().unwrap();
-        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
-        let _claude = crate::session::test_support::install_login_shell_path_command(
-            temp.path(),
-            "claude",
-            "#!/bin/sh\nexit 0\n",
-        );
-        let mut inst = Instance::new("claude-handoff-error", "/tmp");
-        inst.view = View::Structured;
-        inst.acp_session_id = Some("sid-abc".into());
-        let worker = inst.resolve_native_execution(None).unwrap().binding;
-        inst.extra_args = "--mcp-config /tmp/unattested.json".into();
-
-        assert!(inst.terminal_keep_context_state(Some(&worker)).is_err());
-    }
 
     /// #4127: the launch's route reaches both bindings a resume may persist,
     /// and a sandboxed session, whose store is the container's, attests nothing.

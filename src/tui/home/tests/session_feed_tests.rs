@@ -2444,7 +2444,9 @@ fn managed_resume_refusal_keeps_recovery_visible_and_restart_available() {
                 epoch: "test".into(),
                 revision: 2,
             },
-            code: crate::daemon::ApiErrorCode::ManagedResumeRefused,
+            code: crate::daemon::ApiErrorCode::ManagedResumeRefused(
+                crate::session::ManagedResumeCause::WrapperContractRequired,
+            ),
         };
         let message = if action == "start" {
             format!("Session started; pane preparation failed: {refusal}")
@@ -2463,7 +2465,7 @@ fn managed_resume_refusal_keeps_recovery_visible_and_restart_available() {
         }
         assert!(env.view.session_feed.can_submit(&id));
         assert!(env.view.pending_indeterminate_resolution.is_none());
-        for (width, height) in [(120, 40), (200, 60)] {
+        for (width, height) in [(80, 24), (120, 40), (200, 60)] {
             let screen = render_home_to_string(&mut env.view, width, height);
             for instruction in [
                 if action == "mutation" {
@@ -2475,6 +2477,10 @@ fn managed_resume_refusal_keeps_recovery_visible_and_restart_available() {
                 "<session>",
                 "<native-id>",
                 "--store",
+                "session.agent_execution_as",
+                "session.agent_config_dir",
+                "\"\"",
+                "AoE association",
                 "[OK]",
             ] {
                 assert!(

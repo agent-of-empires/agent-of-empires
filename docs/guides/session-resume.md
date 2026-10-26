@@ -40,7 +40,7 @@ Shell pipelines, remote launchers, redirections, expansion, and unrecognized con
 
 ## Supported managed contexts
 
-- **Claude:** on a host launch, the store its conversation recorded, a declared `agent_config_dir`, the resolved `CLAUDE_CONFIG_DIR`, or the default Claude store; a sandboxed session takes a per-session child of the entry instead. Conflicting selectors resolve in a fixed order rather than being refused; see [Swapping the engine on a restart](#swapping-the-engine-on-a-restart).
+- **Claude:** on a host launch, the store its conversation recorded, a declared `agent_config_dir`, the resolved `CLAUDE_CONFIG_DIR`, or the default Claude store; a sandboxed session takes a per-session child of the entry instead. A recorded conversation store outranks a conflicting configuration-directory setting; see [Swapping the engine on a restart](#swapping-the-engine-on-a-restart). Managed arguments allow namespace-neutral `--mcp-config` with one or more files or JSON strings, and zero-arity `--strict-mcp-config`, per the [Claude CLI reference](https://code.claude.com/docs/en/cli-reference). Extra native session selectors and unsupported configuration-routing options remain refused.
 - **Codex:** a local host-readable `CODEX_HOME`, file-backed API-key authentication, and local SQLite/thread storage. Cloud, keyring, profile, project-routing, managed-policy, and host macOS contexts are not currently proven.
 - **OpenCode:** an explicit `OPENCODE_DB`, or the common database when `OPENCODE_DISABLE_CHANNEL_DB` is already enabled. Sandboxed explicit resume requires a host-readable database mount; the target working directory is still validated inside the container. Target routing is read only from the session table selected by the prepared executable's verified release/build identity. An inactive table cannot supply a missing target or override its working directory or workspace. A workspace-routed target or different stored working directory is refused. Managed current-generation launches and resumes use `--standalone` so an existing background service cannot redirect them to another database.
 - **Pi and OMP:** the verified transcript and exact store. Recovery uses `--store` with the transcript file. A Pi row that has an id but no recorded transcript path looks for `<timestamp>_<id>.jsonl` in the store, then resumes it with `--session <path>`. OMP also verifies its stored working directory and pins the resolved profile.
@@ -72,7 +72,7 @@ Disabling `agent_status_hooks` removes status writers only; identity hooks decla
 
 Automatic resume also refuses when native execution cannot be resolved in these contexts. The table describes explicit pin and fork operations, not interface status labels. `set-session-id` uses the recorded active execution when available; otherwise it resolves the current launch configuration. For agents identified by their store alone, restoring the original configuration can resolve the refusal. Pi and OMP also require their exact transcript; recover it with `--store` as described below rather than selecting a recent conversation.
 
-When native execution resolution fails for a recorded managed conversation under `Default`, including Prime Agent, the API returns HTTP `409` with `aoe-error-code: managed_resume_refused` and recovery guidance.
+When native execution resolution fails for a recorded managed conversation under `Default`, including Prime Agent, the API returns HTTP `409` with `aoe-error-code: managed_resume_refused` and a fixed recovery reason. Missing wrapper contracts identify the trusted settings to restore; their declarations must match the actual native agent and original store. The [API receipt contract](../api.md#native-mutation-completion) describes the finite cause metadata.
 
 | Context | `set-session-id` | Fork | Remedy |
 |---------|------------------|------|--------|
@@ -115,6 +115,8 @@ To start fresh once:
 ```sh
 aoe session set-session-id <session-name-or-id> ""
 ```
+
+This records fresh intent without launching. Start or restart separately to replace the current AoE conversation association. The command neither deletes nor recovers the original transcript; the recorded observed ID can remain visible until that launch.
 
 Automatic capture then takes over where supported. The abandoned conversation stays excluded only in its recorded agent, store, and filesystem namespace. Legacy exclusions without a known namespace remain ID-wide.
 

@@ -673,10 +673,23 @@ impl Instance {
         } else {
             None
         };
-        self.last_error = Some(match scope_failure {
-            Some(scope) => format!("{error:#}; scope retirement remains unproven: {scope:#}"),
-            None => format!("{error:#}"),
-        });
+        self.last_error = Some(
+            if let Some(refusal) = error.downcast_ref::<ManagedResumeRefused>() {
+                let message = refusal.0.message();
+                if scope_failure.is_some() {
+                    format!("{message}\nScope retirement remains unproven.")
+                } else {
+                    message.into()
+                }
+            } else {
+                match scope_failure {
+                    Some(scope) => {
+                        format!("{error:#}; scope retirement remains unproven: {scope:#}")
+                    }
+                    None => format!("{error:#}"),
+                }
+            },
+        );
         let _ = self.commit_lifecycle_status(
             storage,
             LifecycleOperation::Launch,

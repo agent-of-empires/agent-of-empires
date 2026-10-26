@@ -234,6 +234,13 @@ impl Instance {
         }
         self.reconcile_sidecar_into_disk_in(storage)?;
         let expected = self.apply_fresh_launch_intent_in(storage);
+        if let Err(error) = self
+            .preflight_resume_launch_in(CaptureStorage::Scoped(storage), ResumeAttemptPolicy::Allow)
+        {
+            self.adopt_conversation_state(expected);
+            self.fail_reserved_launch(storage, generation, &error, false);
+            return Err(error);
+        }
 
         let mut prepared =
             match self.prepare_launch_command_in(CaptureStorage::Scoped(storage), expected) {
@@ -1255,6 +1262,128 @@ mod tests {
         std::fs::write(&helper, format!("#!/bin/sh\nAOE_FROZEN_NATIVE_TEST_CHILD=1 exec {} --exact {} --nocapture --test-threads=1\n", crate::session::environment::shell_escape(std::env::current_exe().unwrap().to_str().unwrap()), crate::session::environment::shell_escape(&format!("{module}::{entry}")))).unwrap();
         std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
         crate::process::test_support::NativeLaunchExecutable::install(helper)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn direct_start_refuses_failed_resume_before_replacing_a_dead_pane() {
+        if std::env::var_os("AOE_FROZEN_NATIVE_TEST_CHILD").is_some() {
+            crate::process::exec_frozen_environment().unwrap();
+            return;
+        }
+        use crate::session::instance::test_helpers::{seed_claude_transcript, tool_instance};
+        use crate::tmux::test_helpers::{
+            only_pane_id, pane_field, tmux_available, wait_for_pane_command, TmuxTestSession,
+        };
+        if !tmux_available() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(root.path());
+        let _env = crate::session::test_support::EnvGuard::unset(&[
+            "TMUX",
+            "TMUX_PANE",
+            "CLAUDE_CONFIG_DIR",
+            "AOE_DAEMON_URL",
+        ])
+        .and_set("AOE_TMUX_SOCKET", root.path().join("tmux.sock"));
+        let _agent = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "claude",
+            "#!/bin/sh\nexec /bin/sleep 60\n",
+        );
+        crate::session::config::update_config(|config| {
+            config.systemd.enabled = false;
+            config.session.smart_rename = false;
+            config.session.auto_resume_on_restart = true;
+        })
+        .unwrap();
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let mut instance = tool_instance("claude", project.to_str().unwrap());
+        instance.source_profile = "direct-failed-resume".into();
+        let sid = "11111111-2222-4333-8444-555555555555";
+        seed_claude_transcript(&mut instance, sid);
+        instance.resume_probe_failed_sid = Some(sid.into());
+        instance.omp_capture_generation = Some("outgoing-generation".into());
+        assert!(instance.supports_native_resume());
+        let before = instance.conversation_state();
+        let store = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
+        store
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let name = instance.tmux_session().unwrap().name().to_owned();
+        let _pane = TmuxTestSession::from_name(&name);
+        assert!(crate::tmux::tmux_command()
+            .args([
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
+                &name,
+                "exec /bin/sleep 60",
+            ])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        let pane = only_pane_id(&name);
+        wait_for_pane_command(&pane, "sleep");
+        assert!(crate::tmux::tmux_command()
+            .args(["set-option", "-t", &name, "remain-on-exit", "on",])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        assert!(crate::tmux::tmux_command()
+            .args(["respawn-pane", "-k", "-t", &pane, "exit 17",])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pane_field(&pane, "#{pane_dead}") != "1" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture pane did not exit"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let pid = pane_field(&pane, "#{pane_pid}");
+        let _helper = frozen_test_helper(
+            root.path(),
+            "direct_start_refuses_failed_resume_before_replacing_a_dead_pane",
+        );
+        let error = instance
+            .start_with_size_opts(None, true)
+            .expect_err("a direct Default start must not retry a previously failed conversation");
+        assert!(error.is::<ManagedResumeRefused>(), "{error:#}");
+        let public_error = instance.last_error.as_deref().unwrap();
+        assert!(!public_error.contains(sid), "{public_error}");
+        assert!(
+            public_error.contains("aoe session set-session-id <session> \"\""),
+            "{public_error}"
+        );
+        assert_eq!(only_pane_id(&name), pane);
+        assert_eq!(pane_field(&pane, "#{pane_pid}"), pid);
+        assert_eq!(pane_field(&pane, "#{pane_dead}"), "1");
+        let stored = store.load().unwrap().remove(0);
+        assert_eq!(stored.conversation_state(), before);
+        assert_eq!(stored.resume_probe_failed_sid.as_deref(), Some(sid));
+        assert_eq!(
+            stored.omp_capture_generation.as_deref(),
+            Some("outgoing-generation")
+        );
+        assert!(stored.lifecycle_reservation.is_none());
     }
 
     #[cfg(unix)]

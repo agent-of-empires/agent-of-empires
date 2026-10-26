@@ -94,14 +94,14 @@ pub use instance::{
     ConversationProvenance, DetectionState, EnsureReadyError, EnsureReadyOutcome, ExecutionBinding,
     ExecutionLocation, Instance, LaunchSidOutcome, LegacyToolAdoption, LegacyToolIdentity,
     LegacyToolObservation, LifecycleOperation, LifecycleReservation, LifecycleReservationError,
-    PaneObservation, PanePresence, PendingInitialTurn, PluginCreateIdempotency, PollerStart,
-    SandboxInfo, SessionBucket, SessionGone, StartBlocked, StartOutcome, Status, TerminalInfo,
-    TmuxServerIdentity, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo, SESSION_COLORS,
-    TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR,
+    ManagedResumeCause, PaneObservation, PanePresence, PendingInitialTurn, PluginCreateIdempotency,
+    PollerStart, SandboxInfo, SessionBucket, SessionGone, StartBlocked, StartOutcome, Status,
+    TerminalInfo, TmuxServerIdentity, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
+    SESSION_COLORS, TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR,
 };
 pub(crate) use instance::{
     ConversationState, LaunchReservation, ManagedResumeRefused, ResumeAttemptPolicy,
-    ResumeLaunchOptions, TerminalContextResume, MANAGED_RESUME_RECOVERY_MESSAGE,
+    ResumeLaunchOptions, TerminalContextResume,
 };
 pub(crate) use instance::{
     TerminalHandoffContext, TerminalHandoffIntent, TerminalHandoffKey, TerminalHandoffStage,
