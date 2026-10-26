@@ -137,6 +137,16 @@ const queuePath = (sessionId: string, promptId?: string) =>
 const sessionUpdate = (id: string, action: string, init: RequestInit) =>
   fetchJson<SessionResponse>(`/api/sessions/${encodeURIComponent(id)}/${action}`, init);
 
+/** Folds a degraded worktree move's warning from the mutation `outcome` into `warnings`. */
+function withMoveWarning(
+  session: SessionResponse | null,
+  pick: (outcome: Payload) => string | undefined,
+): SessionResponse | null {
+  const outcome = (session as (SessionResponse & { outcome?: Payload }) | null)?.outcome;
+  const warning = outcome && pick(outcome);
+  return session && warning ? { ...session, warnings: [...(session.warnings ?? []), warning] } : session;
+}
+
 const mcpPath = (name: string, action: string) => `/api/mcp/servers/${encodeURIComponent(name)}/${action}`;
 
 // GET a JSON endpoint; returns null on non-2xx or network/parse errors.
@@ -2531,6 +2541,15 @@ export async function summarizeSession(id: string): Promise<{ ok: boolean; messa
   }
 }
 
+/** The server re-checks eligibility; a 409 means the session got busy or is no longer out of date. */
+export async function restartSessionForUpdate(id: string): Promise<{ ok: boolean; message?: string }> {
+  try {
+    return await okWithMessage(`/api/sessions/${encodeURIComponent(id)}/restart-for-update`, { method: "POST" });
+  } catch {
+    return { ok: false };
+  }
+}
+
 /**
  * Edit a managed worktree session's workdir name: move the worktree
  * directory and, optionally, rename its git branch. The session must not be
@@ -2749,7 +2768,9 @@ export async function setSessionArchive(
  *  it can be restored. NOT a permanent delete; use `deleteWorkspace` for that. */
 export async function trashSession(id: string, killPane = true): Promise<SessionResponse | null> {
   try {
-    return await sessionUpdate(id, "trash", jsonInit("POST", { kill_pane: killPane }));
+    return withMoveWarning(await sessionUpdate(id, "trash", jsonInit("POST", { kill_pane: killPane })), (o) =>
+      stringField(o.relocation as Payload | undefined, "warning"),
+    );
   } catch {
     return null;
   }
@@ -2759,7 +2780,7 @@ export async function trashSession(id: string, killPane = true): Promise<Session
  *  its prior bucket with its transcript and metadata intact. */
 export async function restoreSession(id: string): Promise<SessionResponse | null> {
   try {
-    return await sessionUpdate(id, "restore", jsonInit("POST"));
+    return withMoveWarning(await sessionUpdate(id, "restore", jsonInit("POST")), (o) => stringField(o, "warning"));
   } catch {
     return null;
   }

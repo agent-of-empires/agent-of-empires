@@ -90,10 +90,12 @@ export interface SessionResponse {
   clear_aliases?: string[];
   /** The agent implements ACP `session/fork` (resume-only agents do not). */
   acp_can_fork?: boolean;
+  /** The agent binary was replaced after launch and a restart is safe to offer now. */
+  update_restart?: boolean;
   /** Claude's fullscreen renderer is on, so mobile skips copy-mode scrollback workarounds. */
   claude_fullscreen: boolean;
   workspace_repos: WorkspaceRepoSummary[];
-  /** Only on the create-session response. */
+  /** Non-fatal notes: on create, rename, trash and restore responses. */
   warnings?: string[];
   plan_summary?: PlanSummary;
   /** When the agent's pending `ScheduleWakeup` fires. */

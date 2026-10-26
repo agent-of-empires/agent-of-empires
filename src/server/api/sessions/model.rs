@@ -133,6 +133,7 @@ impl SessionResponse {
             context_resume: Some(context_resume_for(inst)),
             acp_worker_state,
             acp_worker_start: None,
+            update_restart: false,
             pending_approvals: Vec::new(),
             rate_limit: None,
             rate_limit_auto_resume: None,
@@ -279,6 +280,21 @@ pub(super) fn truncate_title(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+/// A plain session keeps `RuntimeCheckRequired` until a resume probe runs, so a captured
+/// agent session id is the evidence that a restart keeps the conversation.
+pub(super) fn update_restart_resumable(
+    inst: &Instance,
+    resume: &ContextResumeAvailability,
+) -> bool {
+    match resume {
+        ContextResumeAvailability::Available => true,
+        ContextResumeAvailability::Indeterminate {
+            reason: ContextResumeIndeterminateReason::RuntimeCheckRequired,
+        } => inst.agent_session_id.is_some(),
+        _ => false,
+    }
 }
 
 pub(super) fn context_resume_for(inst: &Instance) -> ContextResumeAvailability {
