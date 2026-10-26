@@ -178,7 +178,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
         }
         Err(error) => {
             tracing::debug!(target: "acp.supervisor", session = %id, "resume not admitted: {error}");
-            return ResumeOutcome::SpawnFinished;
+            return ResumeOutcome::Retry;
         }
     };
     reservation.expected_lifecycle_generation = Some(target.lifecycle_generation);
@@ -192,7 +192,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
         .is_none()
     {
         tracing::debug!(target: "acp.supervisor", session = %id, "session left the resume set after the snapshot; not resuming");
-        return ResumeOutcome::SpawnFinished;
+        return ResumeOutcome::Retry;
     }
 
     if let Some(record) = record {
@@ -246,7 +246,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                     Ok(Err(SupervisorError::Acp(
                         crate::acp::acp_client::AcpError::AttachTimedOut,
                     ))) => {
-                        return ResumeOutcome::RetryAfterAttachTimeout;
+                        return ResumeOutcome::Retry;
                     }
                     Ok(Err(e)) => {
                         tracing::warn!(target: "acp.supervisor", session = %id, "attach failed; terminating the worker and falling back to fresh spawn: {e}");
@@ -254,12 +254,12 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                             .await
                             .is_err()
                         {
-                            return ResumeOutcome::RetryAfterAttachTimeout;
+                            return ResumeOutcome::Retry;
                         }
                     }
                     Err(_) => {
                         tracing::warn!(target: "acp.supervisor", session = %id, "attach timed out after 3s; preserving the runner for another attachment attempt");
-                        return ResumeOutcome::RetryAfterAttachTimeout;
+                        return ResumeOutcome::Retry;
                     }
                 }
                 // The failed attach released its lease; the spawn needs one that counts toward capacity.
@@ -292,7 +292,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                     .await
                     .is_err()
                 {
-                    return ResumeOutcome::RetryAfterAttachTimeout;
+                    return ResumeOutcome::Retry;
                 }
             }
             AdoptDecision::RespawnStaleIdle => {
@@ -307,7 +307,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                     .await
                     .is_err()
                 {
-                    return ResumeOutcome::RetryAfterAttachTimeout;
+                    return ResumeOutcome::Retry;
                 }
             }
             // A dead record can still hold a live pid whose socket vanished.
@@ -316,7 +316,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                     .await
                     .is_err()
                 {
-                    return ResumeOutcome::RetryAfterAttachTimeout;
+                    return ResumeOutcome::Retry;
                 }
             }
         }
@@ -324,8 +324,10 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
 
     publish_orphaned_turn_stop(&state.acp_supervisor, &id, decision, in_flight_turn);
     requeue_interrupted_monitor(&state, &id).await;
-    let Ok(req) = build_spawn_request(&state.session_service, &target).await else {
-        return ResumeOutcome::SpawnFinished;
+    let req = match build_spawn_request(&state.session_service, &target).await {
+        Ok(req) => req,
+        Err(PrepFailure::Reported) => return ResumeOutcome::SpawnFinished,
+        Err(PrepFailure::Raced) => return ResumeOutcome::Retry,
     };
     let agent = req.agent.clone();
     match state.acp_supervisor.spawn_inner(req, reservation).await {
@@ -388,15 +390,24 @@ async fn report_spawn_failure(
     .await;
 }
 
+/// Why `build_spawn_request` produced no request.
+#[derive(Debug)]
+enum PrepFailure {
+    /// A startup error was published; retrying would repeat it.
+    Reported,
+    /// The row changed under the tick; the next tick re-evaluates it.
+    Raced,
+}
+
 /// Builds a fresh-spawn request; on sandbox failure publishes a startup error and returns `Err`.
 async fn build_spawn_request(
     service: &Arc<SessionService>,
     target: &ResumeTarget,
-) -> Result<SpawnRequest, ()> {
-    let state = service.native_state().map_err(|_| ())?;
+) -> Result<SpawnRequest, PrepFailure> {
+    let state = service.native_state().map_err(|_| PrepFailure::Raced)?;
     let exclusion = crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &target.id, false)
         .await
-        .map_err(|_| ())?;
+        .map_err(|_| PrepFailure::Raced)?;
     let supervisor = &service.acp_supervisor;
 
     // Re-read under the session lock, for two reasons. A worktree rename holds
@@ -418,14 +429,14 @@ async fn build_spawn_request(
     ) = {
         let instances = service.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == target.id) else {
-            return Err(());
+            return Err(PrepFailure::Raced);
         };
         if inst.terminal_handoff.is_some()
             || !inst.launch_is_finalized()
             || inst.lifecycle_generation != target.lifecycle_generation
             || inst.source_profile != target.source_profile
         {
-            return Err(());
+            return Err(PrepFailure::Raced);
         }
         (
             PathBuf::from(&inst.project_path),
@@ -455,7 +466,7 @@ async fn build_spawn_request(
         exclusion,
     )
     .await
-    .map_err(|_| ())?;
+    .map_err(|_| PrepFailure::Raced)?;
     let (sandbox_info, _exclusion) = match crate::acp::sandbox::ensure_container_for_session(
         native.clone(),
         instance,
@@ -475,7 +486,7 @@ async fn build_spawn_request(
                 message,
             )
             .await;
-            return Err(());
+            return Err(PrepFailure::Reported);
         }
     };
 
@@ -915,7 +926,7 @@ mod tests {
         state.instances.write().await[0].archive();
 
         let outcome = resume_one(Arc::clone(&state), target).await;
-        assert!(matches!(outcome, ResumeOutcome::SpawnFinished));
+        assert!(matches!(outcome, ResumeOutcome::Retry));
         assert_eq!(
             state.acp_supervisor.worker_state(id).await,
             crate::daemon::AcpWorkerState::Absent

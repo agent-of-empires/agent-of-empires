@@ -85,8 +85,8 @@ fn park_message(project_path: &str) -> String {
 #[derive(Debug, Clone)]
 enum ResumeOutcome {
     Attached,
-    /// Attachment or retirement is unfinished; retry next tick unless parked.
-    RetryAfterAttachTimeout,
+    /// Attachment, retirement or launch prep lost a race; retry next tick unless parked.
+    Retry,
     /// Spawn finished with or without error; `attempted` stays set so a
     /// permanently failing spawn does not loop.
     SpawnFinished,
@@ -364,7 +364,7 @@ pub async fn reconcile_acp_workers(
 
     while let Some(result) = set.join_next().await {
         match result {
-            Ok((id, ResumeOutcome::RetryAfterAttachTimeout)) => {
+            Ok((id, ResumeOutcome::Retry)) => {
                 if !parked.contains(&id) {
                     attempted.remove(&id);
                 }
@@ -840,5 +840,20 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// A launch-prep race (here: memory and disk disagree on the row) must not
+    /// pin the session out of the resume set, or a queued prompt never drains.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn launch_prep_race_does_not_pin_the_session() {
+        let id = "sess-race";
+        let (_home, state, _project) = test_fixtures::test_state(id);
+        state.instances.write().await[0].title = "renamed in memory only".to_string();
+
+        let mut tick = test_fixtures::Tick::default();
+        tick.run(&state).await;
+
+        assert!(!tick.attempted.contains(id));
     }
 }
