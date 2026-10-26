@@ -241,6 +241,10 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
             canUnpin={canUnpin}
             canEditProject={canEditProject}
             close={closeMenu}
+            closeToHeader={() => {
+              closeMenu();
+              buttonRef.current?.focus();
+            }}
             startRename={() => {
               setRenameValue(group.alias ?? group.defaultDisplayName);
               setRenaming(true);
@@ -265,6 +269,7 @@ function GroupMenuItems({
   canUnpin,
   canEditProject,
   close,
+  closeToHeader,
   startRename,
 }: Props & {
   archivableCount: number;
@@ -272,13 +277,19 @@ function GroupMenuItems({
   canUnpin: boolean;
   canEditProject: boolean;
   close: () => void;
+  /** Close and return focus to the header button, for actions that leave the header in place. */
+  closeToHeader: () => void;
   startRename: () => void;
 }) {
   const canAppearance = group.capabilities.appearance;
-  const act = (fn: () => void) => () => {
-    close();
-    fn();
-  };
+  // Rename focuses its input and Project settings its dialog; every other action keeps the
+  // header, so focus goes back to it rather than to the menu item that just unmounted.
+  const act =
+    (fn: () => void, toHeader = true) =>
+    () => {
+      (toHeader ? closeToHeader : close)();
+      fn();
+    };
   return (
     <>
       {canPin && (
@@ -295,7 +306,7 @@ function GroupMenuItems({
         </MenuItem>
       )}
       {canEditProject && (
-        <MenuItem onClick={act(() => onEditProject?.(group))} testId="sidebar-group-context-menu-settings">
+        <MenuItem onClick={act(() => onEditProject?.(group), false)} testId="sidebar-group-context-menu-settings">
           Project settings
         </MenuItem>
       )}
@@ -308,7 +319,7 @@ function GroupMenuItems({
       {archivableCount > 0 && canAppearance && <MenuSeparator />}
       {canAppearance && (
         <>
-          <MenuItem onClick={act(startRename)} testId="sidebar-group-context-menu-rename">
+          <MenuItem onClick={act(startRename, false)} testId="sidebar-group-context-menu-rename">
             Rename
           </MenuItem>
           {group.alias && (

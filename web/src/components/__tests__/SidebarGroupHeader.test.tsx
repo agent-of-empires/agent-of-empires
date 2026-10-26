@@ -166,6 +166,29 @@ describe("SidebarGroupHeader", () => {
     expect(button.getAttribute("aria-expanded")).toBe("false");
   });
 
+  it("returns focus to the header after a menu action that keeps it, but not after Rename or settings", () => {
+    // (menu item, props, focus back on the header button)
+    const cases: [string, Partial<Parameters<typeof SidebarGroupHeader>[0]>, boolean][] = [
+      ["sidebar-group-context-menu-pin", { onPin: vi.fn() }, true],
+      ["sidebar-group-context-menu-archive-all", { onArchiveAll: vi.fn() }, true],
+      ["Clear alias", { group: group({ alias: "nick" }) }, true],
+      ["sidebar-group-context-menu-rename", {}, false],
+      ["sidebar-group-context-menu-settings", { onEditProject: vi.fn(), group: group({ id: "__scratch__" }) }, false],
+    ];
+    for (const [item, props, toHeader] of cases) {
+      renderHeader(props);
+      const button = screen.getByTestId("sidebar-group-header").querySelector<HTMLElement>("button[aria-expanded]")!;
+      button.focus();
+      fireEvent.keyDown(button, { key: "F10", shiftKey: true });
+      const action = screen.queryByTestId(item) ?? screen.getByText(item);
+      // Keyboard activation of a menu button is a click on the focused item.
+      action.focus();
+      fireEvent.click(action);
+      expect(document.activeElement === button, item).toBe(toHeader);
+      cleanup();
+    }
+  });
+
   it("marks the header draggable only with a drag handle", () => {
     const { rerender } = renderHeader({ dragHandle: dragHandle() });
     expect(screen.getByTestId("sidebar-group-header").getAttribute("data-draggable")).toBe("true");
