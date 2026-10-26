@@ -66,7 +66,7 @@ pub struct GroupMoveArgs {
 #[tracing::instrument(target = "cli.session", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, command: GroupCommands) -> Result<()> {
     match command {
-        GroupCommands::List(_) => unreachable!("runtime reads are handled before local dispatch"),
+        GroupCommands::List(_) => bail!("internal error: runtime read reached local dispatch"),
         GroupCommands::Create(args) => create_group(profile, args).await,
         GroupCommands::Delete(args) => delete_group(profile, args).await,
         GroupCommands::Move(args) => move_session(profile, args).await,

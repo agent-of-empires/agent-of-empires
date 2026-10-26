@@ -58,7 +58,7 @@ pub enum ProfileCommands {
 pub async fn run(profile: &str, command: Option<ProfileCommands>) -> Result<()> {
     match command {
         Some(ProfileCommands::List) | None => {
-            unreachable!("runtime reads are handled before local dispatch")
+            bail!("internal error: runtime read reached local dispatch")
         }
         Some(ProfileCommands::Create { name }) => create_profile(&name).await,
         Some(ProfileCommands::Delete { name }) => delete_profile(&name).await,

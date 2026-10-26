@@ -390,7 +390,7 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::Stop(args) => stop_session(profile, args).await,
         SessionCommands::Restart(args) => restart_session_dispatch(profile, args).await,
         SessionCommands::Attach(args) => attach_session(profile, args).await,
-        SessionCommands::Show(_) => unreachable!("runtime reads are handled before local dispatch"),
+        SessionCommands::Show(_) => bail!("internal error: runtime read reached local dispatch"),
         SessionCommands::Wait(args) => wait_session(profile, args).await,
         SessionCommands::Capture(args) => capture_session(profile, args).await,
         SessionCommands::Rename(args) => rename_session(profile, args).await,
@@ -415,7 +415,7 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::Restore(args) => restore_session(profile, args).await,
         SessionCommands::Import(args) => import_sessions(profile, args).await,
         SessionCommands::ListTrash => {
-            unreachable!("runtime reads are handled before local dispatch")
+            bail!("internal error: runtime read reached local dispatch")
         }
         SessionCommands::EmptyTrash => empty_trash(profile).await,
     }

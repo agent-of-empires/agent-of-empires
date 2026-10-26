@@ -205,6 +205,8 @@ rejects symlinks, special files, packages over 64 MiB, individual files over
 
 The covered CLI reads (`list`, `status`, `session show`, `session list-trash`, `group list`, `profile list` or bare `profile`, and `project list`) require a Daemon answer. They use `/api/runtime/read/ws` when `--daemon-url` or `AOE_DAEMON_URL` selects an HTTP endpoint. `/api/runtime/ws` remains the separate TUI stream.
 
+The covered local command handlers return an internal error if runtime dispatch is bypassed; they never read storage.
+
 Explicit and environment-selected endpoints never fall back to local storage or start a local Daemon. Invalid configuration, connection failures, authentication errors, and protocol errors are final refusals against the selected target. Unreachable targets leave stdout empty and report reconnect guidance on stderr. Environment URLs retain a one-second TCP establishment budget; each served exchange has a 15-second deadline.
 
 Covered reads still run the monolithic CLI's local startup preflight, including schema migrations, before contacting the Daemon. A local schema or migration failure can therefore block a read even with an explicit or environment-selected remote URL. Selecting an endpoint does not bypass this preflight.

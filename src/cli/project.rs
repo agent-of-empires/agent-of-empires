@@ -101,7 +101,7 @@ pub struct ProjectRemoveArgs {
 #[tracing::instrument(target = "cli.project", skip_all, fields(profile = %profile, profile_explicit))]
 pub async fn run(profile: &str, profile_explicit: bool, command: ProjectCommands) -> Result<()> {
     match command {
-        ProjectCommands::List(_) => unreachable!("runtime reads are handled before local dispatch"),
+        ProjectCommands::List(_) => bail!("internal error: runtime read reached local dispatch"),
         ProjectCommands::Add(args) => add(profile, profile_explicit, args).await,
         ProjectCommands::Remove(args) => remove(profile, profile_explicit, args).await,
     }

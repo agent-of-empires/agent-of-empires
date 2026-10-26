@@ -447,7 +447,7 @@ async fn run(
             };
             tui::run(&profile, combined).await
         }
-        _ => unreachable!(),
+        _ => anyhow::bail!("internal error: runtime read reached local dispatch"),
     };
     exit_zero(result)
 }
