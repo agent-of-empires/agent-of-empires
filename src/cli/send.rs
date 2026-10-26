@@ -28,23 +28,8 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
         bail!("Message cannot be empty");
     }
 
-    let endpoint = require_daemon().await?;
-    let daemon = endpoint.daemon_client()?;
-    let profile = if profile.is_empty() {
-        daemon.default_profile().await?
-    } else {
-        if !daemon
-            .runtime_info()
-            .await?
-            .profiles
-            .iter()
-            .any(|p| p == profile)
-        {
-            bail!("Profile '{profile}' does not exist");
-        }
-        profile.to_string()
-    };
-    let client = HttpClient::new(endpoint)?;
+    let client = HttpClient::new(require_daemon().await?)?;
+    let profile = resolve_profile(&client, profile).await?;
     let mut sessions = client.list_sessions(None).await?.sessions;
     sessions.retain(|s| s.profile == profile);
     let session = super::resolve_session(&args.identifier, &sessions)?;
@@ -67,6 +52,24 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
     let verb = result.map_err(|e| refusal(e, &args.identifier))?;
     println!("{verb} message to '{}'", session.title);
     Ok(())
+}
+
+/// Validate against and default from the daemon, through the client that carries its credentials.
+async fn resolve_profile(client: &HttpClient, profile: &str) -> Result<String> {
+    let daemon = client.daemon_client().await?;
+    if profile.is_empty() {
+        return Ok(daemon.default_profile().await?);
+    }
+    if !daemon
+        .runtime_info()
+        .await?
+        .profiles
+        .iter()
+        .any(|p| p == profile)
+    {
+        bail!("Profile '{profile}' does not exist");
+    }
+    Ok(profile.to_string())
 }
 
 /// The client carries only a validated refusal code, so the wording lives here.
@@ -133,5 +136,20 @@ mod tests {
         let error = client.send_message("other", "hi", true).await.unwrap_err();
         assert!(refusal(error, "other").to_string().contains("start_failed"));
         server.abort();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn profile_lookup_keeps_passphrase_credentials() {
+        use crate::acp::client::passphrase_session::test_daemon::{TestDaemon, PASSPHRASE};
+
+        let daemon = TestDaemon::start(PASSPHRASE).await;
+        let client = HttpClient::new(daemon.endpoint.clone()).unwrap();
+
+        assert_eq!(resolve_profile(&client, "").await.unwrap(), "default");
+        assert_eq!(resolve_profile(&client, "work").await.unwrap(), "work");
+        let error = resolve_profile(&client, "nope").await.unwrap_err();
+        assert_eq!(error.to_string(), "Profile 'nope' does not exist");
+        assert_eq!(daemon.logins(), 1);
     }
 }
