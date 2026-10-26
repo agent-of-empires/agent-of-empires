@@ -326,6 +326,25 @@ describe("StartupErrorScreen", () => {
     expect(fetchAgentInstallInfo).toHaveBeenCalledTimes(2);
   });
 
+  it("an older install-info read that lands last does not overwrite the newer one", async () => {
+    const { getByTestId } = await renderScreen(incompatible(), info());
+    let resolveOlder: (v: AgentInstallInfo) => void = () => {};
+    let resolveNewer: (v: AgentInstallInfo) => void = () => {};
+    fetchAgentInstallInfo
+      .mockReturnValueOnce(new Promise((r) => (resolveOlder = r)))
+      .mockReturnValueOnce(new Promise((r) => (resolveNewer = r)));
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+      window.dispatchEvent(new Event("focus"));
+    });
+    expect(fetchAgentInstallInfo).toHaveBeenCalledTimes(3);
+    const update = getByTestId("startup-error-update-restart") as HTMLButtonElement;
+    await act(async () => resolveNewer(info(allowed)));
+    expect(update.disabled).toBe(false);
+    await act(async () => resolveOlder(info()));
+    expect(update.disabled).toBe(false);
+  });
+
   it("Check again POSTs to /acp/spawn and surfaces a failure", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 500, text: () => Promise.resolve("boom") }));
     const { getByTestId, container } = await renderScreen(incompatible());

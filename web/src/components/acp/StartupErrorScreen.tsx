@@ -25,9 +25,12 @@ function useInstallInfo(sessionId: string): AgentInstallInfo | null {
   const [info, setInfo] = useState<AgentInstallInfo | null>(null);
   useEffect(() => {
     let alive = true;
+    // Focus and visibilitychange often fire together; only the latest read may land.
+    let latest = 0;
     const load = () => {
+      const seq = ++latest;
       void fetchAgentInstallInfo(sessionId).then((next) => {
-        if (alive && next) setInfo(next);
+        if (alive && seq === latest && next) setInfo(next);
       });
     };
     const onVisible = () => {
