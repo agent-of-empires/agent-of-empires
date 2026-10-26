@@ -439,7 +439,7 @@ async fn actionable_cached(
 
 const CARGO_UPDATE_COMMAND: &str =
     "cargo install --git https://github.com/agent-of-empires/agent-of-empires aoe";
-const NIX_UPDATE_COMMAND: &str = "nix run github:agent-of-empires/agent-of-empires";
+const NIX_UPDATE_COMMAND: &str = "nix profile upgrade agent-of-empires";
 
 /// How this install updates, as `/api/system/update-status` reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -540,7 +540,7 @@ fn update_via_brew(target_version: &str) -> Result<()> {
 
 fn nix_refusal_message() -> String {
     format!(
-        "aoe was installed via Nix. Update by running:\n\n    {NIX_UPDATE_COMMAND}\n\n(or rebuild your flake input)."
+        "aoe was installed via Nix. Update by running:\n\n    {NIX_UPDATE_COMMAND}\n\n(check the entry name with `nix profile list`), or, if aoe comes from a flake input (NixOS or home-manager), run `nix flake update <input>` (your flake's name for aoe) and rebuild (`nixos-rebuild switch`, `home-manager switch`, ...)."
     )
 }
 
@@ -788,7 +788,9 @@ mod tests {
         }
         // The dashboard and the CLI refusal name the same command.
         assert!(cargo_refusal_message().contains(InstallKind::Cargo.update_command()));
-        assert!(nix_refusal_message().contains(InstallKind::Nix.update_command()));
+        let nix = nix_refusal_message();
+        assert!(nix.contains(InstallKind::Nix.update_command()));
+        assert!(nix.contains("nix flake update"));
     }
 
     #[tokio::test]

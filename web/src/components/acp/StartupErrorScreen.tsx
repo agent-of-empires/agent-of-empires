@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
 
 import type { IncompatibleAgentDetail } from "../../lib/acpTypes";
-import { fetchSettings, installAcpAgent } from "../../lib/api";
+import { fetchSettings } from "../../lib/api";
 import { useRespawnSession } from "../../hooks/useRespawnSession";
+import { useAdapterInstall } from "./adapterRecovery";
+import { RecoveryActionRow, type RecoveryAction } from "./RecoveryActionRow";
 
 interface Props {
   detail: IncompatibleAgentDetail;
@@ -23,10 +25,7 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
 
   const { state: respawnState, error: respawnError, respawn } = useRespawnSession(sessionId);
   const [allowInstall, setAllowInstall] = useState(false);
-  const [installState, setInstallState] = useState<"idle" | "installing" | "failed">("idle");
-  const [installError, setInstallError] = useState<string | null>(null);
-  const [installOutput, setInstallOutput] = useState<string | null>(null);
-  const [recoveredCount, setRecoveredCount] = useState(0);
+  const install = useAdapterInstall(sessionId, respawn);
 
   useEffect(() => {
     let alive = true;
@@ -40,30 +39,29 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
     };
   }, []);
 
-  const busy = respawnState === "retrying" || installState === "installing";
-
-  const handleUpdateAndRestart = async () => {
-    setInstallState("installing");
-    setInstallError(null);
-    setInstallOutput(null);
-    try {
-      const res = await installAcpAgent(sessionId);
-      const log = `${res.stdout}\n${res.stderr}`.trim();
-      setInstallOutput(log || null);
-      if (!res.success) {
-        setInstallState("failed");
-        setInstallError(`Install exited with code ${res.exit_code ?? "unknown"}.`);
-        return;
-      }
-      setRecoveredCount(res.recovered_sessions);
-      setInstallState("idle");
-      // Re-run the handshake against the freshly installed version.
-      await respawn();
-    } catch (e) {
-      setInstallState("failed");
-      setInstallError(e instanceof Error ? e.message : String(e));
-    }
+  const busy = respawnState === "retrying" || install.state === "installing";
+  const restart: RecoveryAction = {
+    label: respawnState === "retrying" ? "Restarting…" : "Restart agent",
+    onClick: () => void respawn(),
+    testId: "startup-error-restart",
+    disabled: busy,
   };
+  const update: RecoveryAction = {
+    label:
+      install.state === "installing" ? "Updating…" : isSandboxed ? "Update in sandbox & restart" : "Update & restart",
+    onClick: () => void install.install(),
+    testId: "startup-error-update-restart",
+    disabled: busy,
+  };
+  const updateDisabled: RecoveryAction = {
+    label: "Update & restart",
+    onClick: () => {},
+    testId: "startup-error-update-restart-disabled",
+    disabled: true,
+    title:
+      'Turn on "Allow agent install from web" in the aoe TUI settings (Global, Acp tab, Advanced) to install from the dashboard',
+  };
+  const canUpdate = autoInstallable && allowInstall;
 
   return (
     <div
@@ -132,42 +130,12 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
 
         <DetailRows detail={detail} />
 
-        <div className="mt-5 flex flex-wrap items-center gap-2">
-          <button
-            type="button"
-            data-testid="startup-error-restart"
-            onClick={respawn}
-            disabled={busy}
-            className="rounded-md border border-surface-700 bg-surface-800 px-3 py-1.5 text-xs font-medium text-text-primary hover:bg-surface-700 disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            {respawnState === "retrying" ? "Restarting…" : "Restart agent"}
-          </button>
-          {autoInstallable && allowInstall && (
-            <button
-              type="button"
-              data-testid="startup-error-update-restart"
-              onClick={handleUpdateAndRestart}
-              disabled={busy}
-              className="rounded-md border border-status-error/60 bg-status-error/20 px-3 py-1.5 text-xs font-medium text-text-primary hover:bg-status-error/30 disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              {installState === "installing"
-                ? "Updating…"
-                : isSandboxed
-                  ? "Update in sandbox & restart"
-                  : "Update & restart"}
-            </button>
-          )}
-          {autoInstallable && !allowInstall && (
-            <button
-              type="button"
-              data-testid="startup-error-update-restart-disabled"
-              disabled
-              title="Enable acp.allow_agent_install in the aoe TUI settings (Advanced) to install from the dashboard"
-              className="cursor-not-allowed rounded-md border border-surface-700 bg-surface-800 px-3 py-1.5 text-xs font-medium text-text-dim opacity-60"
-            >
-              Update & restart
-            </button>
-          )}
+        <div className="mt-2">
+          <RecoveryActionRow
+            primary={canUpdate ? update : restart}
+            secondary={canUpdate ? [restart] : autoInstallable ? [updateDisabled] : []}
+            install={install}
+          />
         </div>
 
         {autoInstallable && !allowInstall && (
@@ -184,20 +152,12 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
         {respawnState === "ok" && (
           <div className="mt-2 text-xs text-emerald-200/90">
             Restart requested. The agent re-runs the compatibility check on the next handshake.
-            {recoveredCount > 0 &&
-              ` Also restarting ${recoveredCount} other session${recoveredCount === 1 ? "" : "s"} blocked on the same adapter.`}
+            {install.recovered > 0 &&
+              ` Also restarting ${install.recovered} other session${install.recovered === 1 ? "" : "s"} blocked on the same adapter.`}
           </div>
         )}
         {respawnState === "failed" && respawnError && (
           <div className="mt-2 text-xs text-status-error">Restart failed: {respawnError}</div>
-        )}
-        {installState === "failed" && installError && (
-          <div className="mt-2 text-xs text-status-error">{installError}</div>
-        )}
-        {installOutput && (
-          <pre className="mt-2 max-h-40 overflow-auto rounded-md border border-surface-700 bg-surface-950 p-2 font-mono text-[11px] text-text-secondary">
-            {installOutput}
-          </pre>
         )}
 
         <div className="mt-4 text-xs text-text-dim">

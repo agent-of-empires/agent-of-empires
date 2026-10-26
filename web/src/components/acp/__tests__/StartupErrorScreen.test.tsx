@@ -13,7 +13,8 @@ import { StartupErrorScreen } from "../StartupErrorScreen";
 
 const fetchSettings = vi.fn();
 const installAcpAgent = vi.fn();
-vi.mock("../../../lib/api", () => ({
+vi.mock("../../../lib/api", async (importOriginal) => ({
+  InstallAgentError: (await importOriginal<typeof import("../../../lib/api")>()).InstallAgentError,
   fetchSettings: (...args: unknown[]) => fetchSettings(...args),
   installAcpAgent: (...args: unknown[]) => installAcpAgent(...args),
 }));

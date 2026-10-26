@@ -65,6 +65,8 @@ interface Props {
   fileRefSession?: FileRefSession | null;
   isSandboxed?: boolean;
   onOpenAgentsPane?: () => void;
+  /** Opens the switch-view confirmation; omitted on a read-only server. */
+  onSwitchToTerminal?: () => void;
 }
 
 const STARTER_PROMPTS = [
@@ -252,6 +254,7 @@ function AcpChrome({
         archivedAt={view.archivedAt}
         snoozedUntil={view.snoozedUntil}
         onRestore={view.onRestore}
+        onSwitchToTerminal={view.onSwitchToTerminal}
         dismissError={ctx.dismissError}
       />
 

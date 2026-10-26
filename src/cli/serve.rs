@@ -130,9 +130,11 @@ pub struct ServeArgs {
     #[arg(long)]
     pub stop: bool,
 
-    /// Print the running daemon's PID, mode, URLs, and log path. Exits
-    /// non-zero when no daemon is running. Useful for shell scripts
-    /// that want to know whether a daemon is up without parsing `ps`.
+    /// Print the local daemon's PID, mode, URLs, and log path. With
+    /// `AOE_DAEMON_URL` set, report the remote daemon's reachability and
+    /// token state instead. Exits non-zero when no daemon is running.
+    /// Useful for shell scripts that want to know whether a daemon is up
+    /// without parsing `ps`.
     ///
     /// `--status` is read-only and incompatible with every flag that
     /// would change daemon state (`--stop`, `--daemon`, `--remote`) or

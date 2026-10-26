@@ -11,7 +11,7 @@ use axum::{
 };
 
 use super::AppState;
-use crate::daemon::{CollapseGroupBody, GroupLocation, MoveGroupBody, RuntimeHealth};
+use crate::daemon::{ApiErrorCode, CollapseGroupBody, GroupLocation, MoveGroupBody, RuntimeHealth};
 use crate::server::session_store::NativeSessionStore;
 use crate::session::{GroupMovePlan, GroupTree, Instance, SessionStore, Status};
 
@@ -20,10 +20,25 @@ use crate::session::{GroupMovePlan, GroupTree, Instance, SessionStore, Status};
 struct GroupRejected {
     status: StatusCode,
     message: &'static str,
+    code: Option<ApiErrorCode>,
 }
 
 fn reject(status: StatusCode, message: &'static str) -> anyhow::Error {
-    GroupRejected { status, message }.into()
+    GroupRejected {
+        status,
+        message,
+        code: None,
+    }
+    .into()
+}
+
+fn reject_with_code(code: ApiErrorCode, message: &'static str) -> anyhow::Error {
+    GroupRejected {
+        status: code.status(),
+        message,
+        code: Some(code),
+    }
+    .into()
 }
 
 fn belongs(path: &str, root: &str) -> bool {
@@ -72,11 +87,17 @@ fn check_members(rows: &[Instance], root: &str, ids: &[String], cityhall: bool) 
 
 async fn failure(state: &AppState, error: anyhow::Error) -> Response {
     if let Some(rejected) = error.downcast_ref::<GroupRejected>() {
-        return (
+        let mut response = (
             rejected.status,
             Json(serde_json::json!({"message": rejected.message})),
         )
             .into_response();
+        if let Some([(name, value)]) = rejected.code.map(ApiErrorCode::header) {
+            response
+                .headers_mut()
+                .insert(name, axum::http::HeaderValue::from_static(value));
+        }
+        return response;
     }
     if error.is::<crate::session::ProfileMoveRejected>() {
         return (
@@ -526,7 +547,10 @@ async fn delete_group_owned(
                 return Err(reject(StatusCode::NOT_FOUND, "Group no longer exists"));
             }
             if matches!(body.mode, DeleteGroupMode::EmptyOnly) && !ids.is_empty() {
-                return Err(reject(StatusCode::CONFLICT, "Group is not empty"));
+                return Err(reject_with_code(
+                    ApiErrorCode::GroupNotEmpty,
+                    "Group is not empty",
+                ));
             }
             tree.delete_group(&body.group.path);
             for row in rows

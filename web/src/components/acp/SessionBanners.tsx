@@ -14,6 +14,7 @@ export function SessionBanners({
   archivedAt,
   snoozedUntil,
   onRestore,
+  onSwitchToTerminal,
   dismissError,
 }: {
   sessionId: string;
@@ -23,6 +24,7 @@ export function SessionBanners({
   archivedAt: string | null;
   snoozedUntil: string | null;
   onRestore?: () => Promise<boolean> | void;
+  onSwitchToTerminal?: () => void;
   dismissError: () => void;
 }) {
   const variant = pickWorkerStoppedVariant({
@@ -37,7 +39,13 @@ export function SessionBanners({
   const idle = healthy && !state.turnActive;
   return (
     <>
-      {state.startupError && <StartupErrorBanner sessionId={sessionId} message={state.startupError} />}
+      {state.startupError && (
+        <StartupErrorBanner
+          sessionId={sessionId}
+          message={state.startupError}
+          onSwitchToTerminal={onSwitchToTerminal}
+        />
+      )}
       {variant === "trashed" && <TrashedWorkerStoppedBanner sessionId={sessionId} onRestore={onRestore} />}
       {variant === "archived" && <ArchivedWorkerStoppedBanner sessionId={sessionId} />}
       {variant === "snoozed" && snoozedUntil && (
