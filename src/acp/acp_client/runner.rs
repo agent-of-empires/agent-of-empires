@@ -152,7 +152,8 @@ fn refuse_unresolved_adapter(
 /// `current_exe()` keeps returning the original path after the binary is
 /// unlinked, so the spawn would otherwise fail with a bare ENOENT.
 fn ensure_runner_exe(exe: &std::path::Path) -> Result<(), AcpError> {
-    if exe.exists() {
+    // A stat failure is not proof of removal; spawn reports the real error.
+    if exe.try_exists().unwrap_or(true) {
         return Ok(());
     }
     Err(AcpError::Spawn(format!(
@@ -554,6 +555,8 @@ mod tests {
         assert!(message.contains("restart `aoe serve`"), "{message}");
 
         assert!(ensure_runner_exe(&std::env::current_exe().unwrap()).is_ok());
+        // A stat error other than absence must not claim the build was removed.
+        assert!(ensure_runner_exe(std::path::Path::new("a\0b")).is_ok());
     }
 
     fn prefix() -> ScopePrefix {
