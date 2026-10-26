@@ -1574,8 +1574,9 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn native_mutations_reject_read_only_before_body_extraction() {
+    async fn native_mutation_admission_preserves_body_and_elevation_precedence() {
         use axum::http::{Method, Request};
+        use base64::Engine;
         use tower::ServiceExt;
 
         let home = tempfile::tempdir().unwrap();
@@ -1642,6 +1643,66 @@ mod tests {
                 .unwrap();
             let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(body["error"], "read_only", "{method} {path}");
+        }
+
+        let login_manager =
+            std::sync::Arc::new(crate::server::login::LoginManager::new(Some("test")));
+        let binding = [0x42; 32];
+        let session = login_manager
+            .create_session(&binding, "127.0.0.1", "plugin-pane-policy")
+            .await;
+        assert!(!login_manager.is_elevated(&session).await);
+        let binding_header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(binding);
+        for (read_only, authenticated, status, code) in [
+            (false, false, StatusCode::UNAUTHORIZED, "login_required"),
+            (false, true, StatusCode::SERVICE_UNAVAILABLE, "no_host"),
+            (true, true, StatusCode::FORBIDDEN, "read_only"),
+        ] {
+            let state = crate::server::test_support::build_test_app_state_with_policy_configured(
+                Vec::new(),
+                vec!["localhost".into()],
+                vec!["http://localhost:8080".into()],
+                None,
+                |state| {
+                    state.read_only = read_only;
+                    state.login_manager = login_manager.clone();
+                    state.plugin_host = None;
+                },
+            );
+            let app = crate::server::test_support::build_router_for_test(state);
+            let mut request = Request::builder()
+                .method(Method::POST)
+                .uri("/api/plugins/missing/action")
+                .header("host", "localhost")
+                .header("origin", "http://localhost:8080")
+                .header("content-type", "application/json");
+            if authenticated {
+                request = request
+                    .header("cookie", format!("aoe_session={session}"))
+                    .header("x-aoe-device-binding", &binding_header);
+            }
+            let mut request = request
+                .body(axum::body::Body::from(
+                    r#"{"method":"github.refresh","params":{}}"#,
+                ))
+                .unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                crate::server::peer::ConnectionPeer::Tcp(([127, 0, 0, 1], 12345).into()),
+            ));
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                status,
+                "read_only={read_only}, auth={authenticated}"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                body["error"], code,
+                "read_only={read_only}, auth={authenticated}"
+            );
         }
     }
 

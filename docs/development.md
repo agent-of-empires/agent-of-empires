@@ -22,8 +22,6 @@ The binary is `target/{profile}/aoe`. Web commands and test selection live in `w
 
 When adding a mutating REST route, classify it in the CityHall allow or deny table in `src/server/access.rs`. Audit its handler or declare an exact, justified exemption in `src/server/api/mod.rs`.
 
-The handler audit accepts supported top-level guards and response-forwarding forms from Rust ASTs. Comments, literals and inert code are not admission evidence.
-
 Debug builds carry line tables only, and dependencies carry no debug info, to keep `target/` small across worktrees. Panics still name the file and line in this crate, but a debugger has no local values; rebuild with `RUSTFLAGS="-Cdebuginfo=2"` for a full debugging session.
 
 ## Running and logs
