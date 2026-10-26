@@ -849,6 +849,19 @@ fn record_retired_handoff_in(
                         .and_then(crate::agents::terminal_tool_for_acp_agent)
                         .ok_or(LifecycleReservationError::Superseded)?;
                     row.rebind_terminal_tool_fresh(tool);
+                    let config =
+                        crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+                            &row.source_profile,
+                            std::path::Path::new(&row.project_path),
+                        );
+                    let yolo = row.yolo_mode;
+                    crate::session::builder::apply_agent_launch_config(
+                        row,
+                        &config.session,
+                        "",
+                        "",
+                        Some(yolo),
+                    );
                 }
                 Some(row.conversation_state())
             }
@@ -1602,7 +1615,18 @@ mod tests {
         row.source_profile = "default".into();
         row.agent_name = Some("codex".into());
         row.terminal_rebind_pending = true;
-        row.command = "sleep 60".into();
+        row.command = "claude --old".into();
+        row.extra_args = "--old-arg".into();
+        crate::session::config::update_config(|config| {
+            config
+                .session
+                .agent_command_override
+                .insert("codex".into(), "sleep".into());
+            config
+                .session
+                .agent_extra_args
+                .insert("codex".into(), "60".into());
+        })?;
         let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(
             crate::tmux::Session::generate_name(&row.id, &row.title),
         );
@@ -1614,11 +1638,13 @@ mod tests {
             .await
             .into_response();
 
+        assert_eq!(response.status(), StatusCode::OK);
         let stored = crate::session::Storage::open_unwatched("default")?.load()?;
         let stored = stored.iter().find(|r| r.id == row.id).unwrap();
         assert_eq!(stored.view, View::Terminal);
         assert_eq!(stored.tool, "codex");
-        assert!(stored.command.is_empty());
+        assert_eq!(stored.command, "sleep");
+        assert_eq!(stored.extra_args, "60");
         assert!(!stored.terminal_rebind_pending);
         Ok(())
     }
