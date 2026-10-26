@@ -51,7 +51,7 @@ fn daemon_status_moves_a_structured_row_off_idle() {
 #[test]
 #[serial]
 fn daemon_status_carries_the_waiting_state_for_a_pending_approval() {
-    // `derive_acp_status` maps ApprovalRequested/ElicitationRequested to Waiting; the
+    // `AcpState::sidebar_status` maps a pending approval or elicitation to Waiting; the
     // yellow pill exists to spot a session blocked on you from the home list.
     let mut env = create_test_env_empty();
     let id = structured_row(&mut env, Status::Running);

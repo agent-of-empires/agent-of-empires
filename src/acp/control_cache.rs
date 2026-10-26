@@ -65,37 +65,13 @@ impl ControlStateCache {
         cached.last_seq = seq;
     }
 
-    /// Whether the session's cached state has an outstanding background
-    /// sub-agent, or `false` if nothing is cached. Used right after
-    /// `apply_if_cached` folds a `Stopped` or `BackgroundAgentCompleted`
-    /// event, to tell the sidebar status derivation whether a background
-    /// sub-agent is still keeping the session busy (#4001), and by live lag
-    /// recovery to override a stale seed event. This accessor itself never
-    /// hydrates: the live listener checks `is_hydrated` and calls
-    /// `SessionService::fold_control_state` on a miss before calling this, so
-    /// by the time it reads, a session the listener has seen an event for is
-    /// always hydrated. Lag recovery stays read-only and asks arbitrary
-    /// sessions, so a miss there may just mean the session was never opened.
-    /// Either way `false` is the same conservative verdict the derivation
-    /// fell back to before any of this existed.
-    pub fn has_active_background_agent(&self, session_id: &str) -> bool {
+    /// The cached fold's sidebar status, or `None` if nothing is cached. Never
+    /// hydrates; callers that need a verdict hydrate through
+    /// `SessionService::fold_control_state` first.
+    pub fn sidebar_status(&self, session_id: &str) -> Option<crate::session::Status> {
         let slot = self.slot(session_id);
         let guard = lock(&slot);
-        guard
-            .as_ref()
-            .is_some_and(|c| c.state.has_active_background_agent())
-    }
-
-    /// Whether the session's cached state has an active main turn, or
-    /// `false` if nothing is cached. Same rationale as
-    /// `has_active_background_agent`: this accessor never hydrates; the live
-    /// listener hydrates a cold session before calling it, lag recovery
-    /// stays read-only, and either way a miss reads as the same
-    /// quiet-session verdict as boot.
-    pub fn turn_active(&self, session_id: &str) -> bool {
-        let slot = self.slot(session_id);
-        let guard = lock(&slot);
-        guard.as_ref().is_some_and(|c| c.state.turn_active)
+        guard.as_ref().map(|c| c.state.sidebar_status())
     }
 
     /// Drop a session's fold.
