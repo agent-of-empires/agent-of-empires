@@ -3243,6 +3243,28 @@ fn cli_plugin_enable_disable_steps_up_an_unelevated_passphrase_session() {
     );
 }
 
+/// Profile and project writes read the runtime epoch before mutating; both
+/// requests must carry the passphrase session, not just the endpoint's bearer
+/// token or socket.
+#[test]
+#[parallel]
+#[cfg(feature = "web")]
+fn cli_profile_and_project_writes_authenticate_with_a_passphrase_daemon() {
+    let mut h = TuiTestHarness::new("config_writes_passphrase");
+    h.stop_daemon_on_drop();
+    let port = h.start_daemon_with(&["--auth", "passphrase", "--passphrase", "e2e-pass"]);
+    h.set_env("AOE_DAEMON_URL", format!("http://127.0.0.1:{port}"));
+    h.set_env("AOE_DAEMON_PASSPHRASE", "e2e-pass");
+
+    h.run_cli_ok(&["profile", "create", "authed"]);
+    h.run_cli_ok(&["profile", "default", "authed"]);
+    let repo = h.home_path().join("authed-repo");
+    crate::harness::init_git_repo(&repo);
+    let repo = repo.to_str().unwrap();
+    h.run_cli_ok(&["project", "add", repo]);
+    h.run_cli_ok(&["project", "remove", repo]);
+}
+
 /// The WS half of the passphrase-login fallback: `aoe acp tail` (and the
 /// TUI's live structured-view stream, same `src/acp/client/ws.rs`) must
 /// offer the literal `aoe-auth` subprotocol alongside

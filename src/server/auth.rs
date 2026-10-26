@@ -439,6 +439,7 @@ async fn run_passphrase_wall(
         );
         return (
             StatusCode::FORBIDDEN,
+            crate::daemon::ApiErrorCode::ElevationRequired.header(),
             axum::Json(serde_json::json!({
                 "error": "elevation_required",
                 "message": "Re-enter the passphrase to continue"
@@ -766,6 +767,7 @@ async fn handle_session_authenticated(
         );
         return (
             StatusCode::FORBIDDEN,
+            crate::daemon::ApiErrorCode::ElevationRequired.header(),
             axum::Json(serde_json::json!({
                 "error": "elevation_required",
                 "message": "Re-enter the passphrase to continue"
