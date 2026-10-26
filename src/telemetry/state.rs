@@ -182,11 +182,9 @@ pub fn delete_install_id() -> Result<()> {
     Ok(())
 }
 
-pub fn reset_install_id() -> Option<String> {
-    if let Err(e) = delete_install_id() {
-        tracing::debug!(target: "telemetry", "failed to delete install id during reset: {e}");
-    }
-    ensure_install_id()
+pub fn reset_install_id() -> Result<Option<String>> {
+    delete_install_id()?;
+    Ok(ensure_install_id())
 }
 
 pub fn record_cli_command(name: &str) {

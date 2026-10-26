@@ -105,7 +105,14 @@ pub async fn reset_telemetry_id(State(state): State<Arc<AppState>>) -> impl Into
     }
     let status = current_status();
     if status.enabled && !status.do_not_track {
-        crate::telemetry::reset_install_id();
+        if let Err(error) = crate::telemetry::reset_install_id() {
+            tracing::warn!(target: "http.api.telemetry", "install id reset failed: {error}");
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "reset_failed",
+                "Could not rotate the install id",
+            );
+        }
     }
     (StatusCode::OK, Json(current_mutation())).into_response()
 }
