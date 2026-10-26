@@ -429,10 +429,11 @@ pub fn parse_chord(s: &str) -> Option<Chord> {
 pub fn core_shadows(chord: &Chord) -> bool {
     BINDINGS.iter().any(|b| {
         b.non_strict.iter().chain(b.strict).any(|c| {
+            // Same rule as `chord_matches`: an unset core `shift` also matches shifted events.
             c.code == chord.code
                 && c.ctrl == chord.ctrl
                 && c.alt == chord.alt
-                && c.shift == chord.shift
+                && (!c.shift || chord.shift)
         })
     })
 }
@@ -1413,6 +1414,10 @@ mod tests {
         // A modified chord is not claimed by the bare-letter binding it resembles.
         assert!(!core_shadows(&parse_chord("M-n").unwrap()));
         assert!(core_shadows(&parse_chord("M-Up").unwrap()));
+        // Shift narrows a plugin chord only against a core chord that requires it.
+        assert!(core_shadows(&parse_chord("C-S-Up").unwrap()));
+        assert!(!core_shadows(&parse_chord("PageUp").unwrap()));
+        assert!(core_shadows(&parse_chord("S-PageUp").unwrap()));
     }
 
     #[test]
