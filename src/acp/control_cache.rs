@@ -6,10 +6,11 @@ use std::sync::{Arc, Mutex};
 use super::state::{AcpState, Event};
 use crate::session::Status;
 
-/// Per-seq sidebar statuses kept per session. Matches the ACP broadcast
-/// capacity: a listener further behind than this is lagged and recovers from
-/// the log instead.
-const RECENT_STATUS_SEQS: usize = 256;
+/// Per-seq sidebar statuses kept per session. The listener can be consuming
+/// frame N while the fold, and the 256-frame ACP broadcast, hold N+1..N+256
+/// behind it; a listener any further behind is lagged and recovers from the
+/// log. So the history must outlast that whole window: twice the capacity.
+const RECENT_STATUS_SEQS: usize = 512;
 
 /// A session's folded control state and how far it has been folded.
 #[derive(Debug, Clone)]
@@ -121,18 +122,20 @@ impl ControlStateCache {
         cached.push_recent(seq, status);
     }
 
-    /// The sidebar status right after folding `seq`, falling back to the latest
-    /// when `seq` has left the history, or `None` if nothing is cached. The
-    /// fold runs ahead of the listener, so reading the latest for an older
-    /// frame would skip the transitions in between. Never hydrates; callers
-    /// that need a verdict hydrate through `SessionService::fold_control_state`
-    /// first.
+    /// The sidebar status right after folding `seq`, or `None` if nothing is
+    /// cached or `seq` has left the history. The fold runs ahead of the
+    /// listener, so substituting the latest status for an older frame would
+    /// skip the transitions in between. Never hydrates; callers that need a
+    /// verdict hydrate through `SessionService::fold_control_state` first.
     pub fn sidebar_status_at(&self, session_id: &str, seq: u64) -> Option<Status> {
         let slot = self.slot(session_id);
         let guard = lock(&slot);
         let cached = guard.as_ref()?;
-        let at = cached.recent.iter().find(|(s, _)| *s == seq);
-        Some(at.map_or_else(|| cached.state.sidebar_status(), |(_, status)| *status))
+        cached
+            .recent
+            .iter()
+            .find(|(s, _)| *s == seq)
+            .map(|(_, status)| *status)
     }
 
     /// Drop a session's fold.
@@ -257,27 +260,36 @@ mod tests {
     }
 
     /// The listener consumes frames behind the fold, so each seq keeps its own
-    /// status; a seq that left the history reads the latest.
+    /// status for as long as a frame can still be queued behind it.
     #[test]
     fn sidebar_status_is_kept_per_folded_seq() {
         let cache = ControlStateCache::new();
         cache.get_or_hydrate("s-1", || Hydrated::at(seed(), 0));
         cache.apply_if_cached("s-1", 1, &prompt("go"));
-        cache.apply_if_cached("s-1", 2, &stopped("end_turn"));
-        assert_eq!(cache.sidebar_status_at("s-1", 1), Some(Status::Running));
-        assert_eq!(cache.sidebar_status_at("s-1", 2), Some(Status::Idle));
-        assert_eq!(cache.sidebar_status_at("s-1", 99), Some(Status::Idle));
-        assert_eq!(cache.sidebar_status_at("cold", 1), None);
-
-        let last = RECENT_STATUS_SEQS as u64 + 3;
-        for seq in 3..last {
+        let window = 256 + 1;
+        for seq in 2..=window {
             cache.apply_if_cached("s-1", seq, &prompt("again"));
         }
-        cache.apply_if_cached("s-1", last, &stopped("end_turn"));
+        cache.apply_if_cached("s-1", window + 1, &stopped("end_turn"));
         assert_eq!(
             cache.sidebar_status_at("s-1", 1),
-            Some(Status::Idle),
-            "an evicted seq falls back to the latest, not its own status"
+            Some(Status::Running),
+            "a frame a full broadcast window behind keeps its own status"
+        );
+        assert_eq!(
+            cache.sidebar_status_at("s-1", window + 1),
+            Some(Status::Idle)
+        );
+        assert_eq!(cache.sidebar_status_at("s-1", 9999), None, "never folded");
+        assert_eq!(cache.sidebar_status_at("cold", 1), None);
+
+        for seq in window + 2..window + 2 + RECENT_STATUS_SEQS as u64 {
+            cache.apply_if_cached("s-1", seq, &prompt("more"));
+        }
+        assert_eq!(
+            cache.sidebar_status_at("s-1", 1),
+            None,
+            "an evicted seq is a miss, not a later status"
         );
     }
 
