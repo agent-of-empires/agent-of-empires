@@ -55,7 +55,7 @@ set `daemon/` to mode `0700`, or remove both group and other write permissions f
 another refused ancestor, then retry. A directory owned by another user also
 requires ownership recovery; changing its mode alone is not sufficient.
 
-Paths containing non-UTF-8 bytes, control characters, or backticks receive an escaped path and manual repair instructions instead of a shell command.
+Paths containing non-UTF-8 bytes, control characters, bidirectional formatting characters, or backticks receive an escaped path and manual repair instructions instead of a shell command.
 
 ## Downgrading
 

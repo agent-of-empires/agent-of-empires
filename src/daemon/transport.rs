@@ -95,10 +95,19 @@ pub(crate) fn prepare_runtime_directory(parent: &Path) -> anyhow::Result<()> {
 }
 
 fn directory_permission_error(path: &Path, mode: &str, requirement: &str) -> anyhow::Error {
-    if let Some(text) = path
-        .to_str()
-        .filter(|text| !text.contains(|c: char| c.is_control() || c == '`'))
-    {
+    if let Some(text) = path.to_str().filter(|text| {
+        !text.contains(|c: char| {
+            // Bidi_Control characters are not covered by is_control().
+            c.is_control()
+                || matches!(
+                    c,
+                    '`' | '\u{061c}'
+                        | '\u{200e}'..='\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2066}'..='\u{2069}'
+                )
+        })
+    }) {
         anyhow::anyhow!(
             "Unsafe daemon socket directory: {text}. {requirement} with `chmod -- {mode} {}`, then retry.",
             crate::session::environment::shell_escape(text)
@@ -455,7 +464,7 @@ mod tests {
                 .path()
                 .canonicalize()
                 .unwrap()
-                .join("owner's app directory");
+                .join("owner's café directory");
             std::fs::create_dir(&app).unwrap();
             std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o700)).unwrap();
             let parent = app.join("owner's daemon directory");
@@ -538,6 +547,18 @@ mod tests {
             OsString::from("tab\tname"),
             OsString::from("delete\x7f"),
             OsString::from("c1\u{9b}"),
+            OsString::from("alm\u{061c}"),
+            OsString::from("lrm\u{200e}"),
+            OsString::from("rlm\u{200f}"),
+            OsString::from("lre\u{202a}"),
+            OsString::from("rle\u{202b}"),
+            OsString::from("pdf\u{202c}"),
+            OsString::from("lro\u{202d}"),
+            OsString::from("rlo\u{202e}"),
+            OsString::from("lri\u{2066}"),
+            OsString::from("rli\u{2067}"),
+            OsString::from("fsi\u{2068}"),
+            OsString::from("pdi\u{2069}"),
         ] {
             for (socket, mode) in [(true, 0o755), (true, 0o777), (false, 0o777)] {
                 let root = tempfile::tempdir().unwrap();
