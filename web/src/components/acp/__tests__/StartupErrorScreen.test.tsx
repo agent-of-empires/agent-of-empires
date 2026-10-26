@@ -204,7 +204,7 @@ describe("StartupErrorScreen", () => {
 
   describe("sandboxed session (#2913)", () => {
     it("hides the host install command and shows the runtime-aware container note", () => {
-      const { queryByTestId, getByTestId } = render(
+      const { queryByTestId, getByTestId, getByText } = render(
         <StartupErrorScreen detail={incompatible()} sessionId="s1" isSandboxed />,
       );
       // The host copy-paste block is misleading in a sandbox, so it is gone.
@@ -213,6 +213,10 @@ describe("StartupErrorScreen", () => {
       expect(note).toContain("inside the container");
       // The dashboard now offers the pull itself, so the note no longer sends users to the TUI.
       expect(note).toContain('the dashboard shows a "Sandbox image update available" banner');
+      // Small text, so the lifted token rather than the raw dimmed one.
+      const pointer = getByText(/the dashboard shows a "Sandbox image update available" banner/);
+      expect(pointer.className).toContain("text-text-subtle");
+      expect(pointer.className).not.toContain("text-text-dim");
       // A literal `docker pull` would be wrong for Podman / Apple Container or a custom image.
       expect(note).not.toContain("docker pull");
     });
