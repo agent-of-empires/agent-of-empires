@@ -1228,14 +1228,38 @@ mod tests {
     fn app_dir_creation_does_not_introduce_group_writable_ancestors() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         const CHILD: &str = "AOE_TEST_APP_DIR_UMASK_CHILD";
+        const CASES: [(&str, u32); 2] = [("002", 0o755), ("077", 0o700)];
         if let Ok(mask) = std::env::var(CHILD) {
+            let expected = CASES
+                .iter()
+                .find(|(value, _)| *value == mask.as_str())
+                .unwrap()
+                .1;
             let mask = libc::mode_t::from_str_radix(&mask, 8).unwrap();
-            // This branch runs alone in a subprocess.
+            // This subprocess runs one test.
             unsafe { libc::umask(mask) };
+            let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+            let config = PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap());
             get_app_dir().unwrap();
+            for path in [
+                home.join("nested"),
+                config.clone(),
+                config.join(APP_DIR_NAME_XDG),
+            ] {
+                assert_eq!(
+                    fs::metadata(&path).unwrap().mode() & 0o777,
+                    expected,
+                    "{mask:o}: {}",
+                    path.display()
+                );
+            }
+            assert_eq!(fs::metadata(&home).unwrap().mode() & 0o777, 0o700);
+            fs::set_permissions(&config, fs::Permissions::from_mode(0o775)).unwrap();
+            get_app_dir().unwrap();
+            assert_eq!(fs::metadata(&config).unwrap().mode() & 0o777, 0o775);
             return;
         }
-        for (mask, expected) in [("002", 0o755), ("077", 0o700)] {
+        for (mask, _) in CASES {
             let home = tempfile::tempdir().unwrap();
             fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).unwrap();
             let config = home.path().join("nested/config");
@@ -1262,23 +1286,6 @@ mod tests {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
-            for path in [
-                home.path().join("nested"),
-                config.clone(),
-                config.join(APP_DIR_NAME_XDG),
-            ] {
-                assert_eq!(
-                    fs::metadata(&path).unwrap().mode() & 0o777,
-                    expected,
-                    "{mask}: {}",
-                    path.display()
-                );
-            }
-            assert_eq!(fs::metadata(home.path()).unwrap().mode() & 0o777, 0o700);
-            fs::set_permissions(&config, fs::Permissions::from_mode(0o775)).unwrap();
-            let _env = super::test_support::EnvGuard::set(&[("XDG_CONFIG_HOME", &config)]);
-            get_app_dir().unwrap();
-            assert_eq!(fs::metadata(&config).unwrap().mode() & 0o777, 0o775);
         }
     }
 
