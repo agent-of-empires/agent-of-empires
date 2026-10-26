@@ -432,7 +432,13 @@ pub struct Instance {
     /// different concept with a different type and lifetime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_entered_at: Option<DateTime<Utc>>,
-
+    /// Wall-clock launch of the current agent process; `None` until the first launch after upgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    /// The absolute agent program the last host launch ran, when native launch resolved it. It is
+    /// a path only; hook output is never recorded here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_executable: Option<std::path::PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<DateTime<Utc>>,
 

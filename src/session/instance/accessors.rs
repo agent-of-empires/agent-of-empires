@@ -94,6 +94,8 @@ impl Instance {
             detection: DetectionState::default(),
             pending_host_env: Vec::new(),
             capture_started_at: None,
+            started_at: None,
+            launch_executable: None,
             pi_extension_launched: false,
             identity_publisher_launched: false,
             pi_session_path: None,

@@ -89,6 +89,44 @@ test("PATCH 500 does not silently change dataset.theme or dispatch picker event"
   const surfaceBefore = await surface900(page);
 
   await select.selectOption(await optionOtherThanCurrent(select));
+  // A 5xx leaves the write uncertain, which the picker reports as unconfirmed rather than rejected.
+  await expect(page.getByText(/Could not confirm the save/)).toBeVisible();
+  expect(await page.evaluate(() => (window as unknown as { __pickerFired?: number }).__pickerFired ?? 0)).toBe(0);
+  expect(await datasetTheme(page)).toBe(datasetBefore);
+  expect(await surface900(page)).toBe(surfaceBefore);
+});
+
+test("PATCH 400 reports a rejection without changing dataset.theme or dispatching the picker event", async ({
+  page,
+  serve,
+}) => {
+  await page.addInitScript(() => {
+    const w = window as unknown as { __pickerFired?: number };
+    w.__pickerFired = 0;
+    window.addEventListener("aoe:theme-picker-changed", () => {
+      w.__pickerFired = (w.__pickerFired ?? 0) + 1;
+    });
+  });
+  // The picker writes the global /api/theme endpoint; only that write fails.
+  await page.route(/.*\/api\/theme$/, (route) =>
+    route.request().method() === "PATCH" ? route.fulfill({ status: 400, body: "nope" }) : route.continue(),
+  );
+
+  await page.goto(`${serve.baseUrl}/settings/theme`);
+  await expect(page.getByRole("heading", { name: "Theme" })).toBeVisible({ timeout: 10_000 });
+  const select = settingsSelectByLabel(page, "Theme");
+  await expect(select).toBeVisible({ timeout: 10_000 });
+  await expect.poll(() => select.locator("option").count(), { timeout: 10_000 }).toBeGreaterThan(1);
+
+  // Let the mount-time apply settle before taking the baseline.
+  await expect.poll(async () => (await datasetTheme(page)) ?? "", { timeout: 5_000 }).not.toBe("");
+  await page.evaluate(() => {
+    (window as unknown as { __pickerFired?: number }).__pickerFired = 0;
+  });
+  const datasetBefore = await datasetTheme(page);
+  const surfaceBefore = await surface900(page);
+
+  await select.selectOption(await optionOtherThanCurrent(select));
   await expect(page.getByText("Failed to save, please try again")).toBeVisible();
   expect(await page.evaluate(() => (window as unknown as { __pickerFired?: number }).__pickerFired ?? 0)).toBe(0);
   expect(await datasetTheme(page)).toBe(datasetBefore);

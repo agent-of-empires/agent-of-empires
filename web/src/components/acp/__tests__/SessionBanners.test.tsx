@@ -5,6 +5,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import {
   ScheduledWakeupBanner,
   SnoozedWorkerStoppedBanner,
+  StartupWaitLine,
   TrashedWorkerStoppedBanner,
   WorkerRestartingBanner,
 } from "../SessionBanners";
@@ -102,5 +103,60 @@ describe("ScheduledWakeupBanner", () => {
       vi.advanceTimersByTime(10_000);
     });
     expect(container.textContent).toContain("Asleep until");
+  });
+});
+
+describe("StartupWaitLine", () => {
+  const line = () => screen.getByTestId("startup-wait-line");
+  const reducedMotion = (reduce: boolean) =>
+    vi.stubGlobal(
+      "matchMedia",
+      vi.fn((query: string) => ({ matches: reduce && query.includes("reduce"), media: query })),
+    );
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("names the Agent and counts up, then says it's still starting, with no duration", () => {
+    vi.useFakeTimers();
+    reducedMotion(false);
+    render(<StartupWaitLine agent="Claude Code" />);
+    expect(line().textContent).toContain("Starting Claude Code… You can type now.");
+    expect(screen.getByTestId("startup-wait-elapsed").textContent).toBe("0:00");
+    act(() => vi.advanceTimersByTime(6_000));
+    expect(screen.getByTestId("startup-wait-elapsed").textContent).toBe("0:06");
+    act(() => vi.advanceTimersByTime(9_000));
+    expect(line().textContent).toContain("Still starting Claude Code…");
+    expect(line().textContent).not.toContain("You can type now");
+    expect(screen.getByTestId("startup-wait-elapsed").textContent).toBe("0:15");
+    act(() => vi.advanceTimersByTime(60_000));
+    expect(screen.getByTestId("startup-wait-elapsed").textContent).toBe("1:15");
+    for (const promise of [/few seconds/, /minute/, /30 seconds/, /will send/]) {
+      expect(line().textContent).not.toMatch(promise);
+    }
+    // The count isn't announced: nothing in the line is a live region.
+    expect(line().querySelector("[aria-live], [role=status], [role=alert]")).toBeNull();
+    expect(line().getAttribute("aria-live")).toBeNull();
+  });
+
+  it.each([
+    ["animates the breathe frames", false],
+    ["holds one visible frame under reduced motion", true],
+  ])("%s", (_label, reduce) => {
+    vi.useFakeTimers();
+    reducedMotion(reduce);
+    const { unmount } = render(<StartupWaitLine agent="Codex" />);
+    const glyph = () => line().firstElementChild!.textContent;
+    const first = glyph();
+    act(() => vi.advanceTimersByTime(180 * 4));
+    if (reduce) {
+      expect(first).toBe("⣿");
+      expect(glyph()).toBe("⣿");
+      // Only the elapsed tick runs.
+      expect(vi.getTimerCount()).toBe(1);
+    } else {
+      expect(glyph()).not.toBe(first);
+      expect(vi.getTimerCount()).toBe(2);
+    }
+    unmount();
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

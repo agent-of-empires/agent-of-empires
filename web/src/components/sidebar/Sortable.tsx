@@ -1,7 +1,6 @@
-import { useEffect, type ComponentProps, type ReactNode } from "react";
+import { type ComponentProps, type ReactNode } from "react";
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { useDragSuppressRef } from "./dnd";
 import { SessionRow } from "./SessionRow";
 import type { DragHandleProps } from "./types";
 
@@ -14,21 +13,12 @@ export function SortableSessionRow({
   dragDisabled,
   ...props
 }: Omit<ComponentProps<typeof SessionRow>, "indented"> & { rowKey?: string; dragDisabled?: boolean }) {
-  const dragSuppressRef = useDragSuppressRef();
   const dragOff = !!props.readOnly || !!dragDisabled;
   const { listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: rowKey ?? props.workspace.id,
     disabled: dragOff,
     data: { type: "workspace" },
   });
-  useEffect(() => {
-    if (isDragging) {
-      dragSuppressRef.current = Date.now() + 1000;
-    } else if (dragSuppressRef.current > Date.now()) {
-      // Long enough to swallow the synthetic release click, short enough for a real tap after.
-      dragSuppressRef.current = Date.now() + 250;
-    }
-  }, [isDragging, dragSuppressRef]);
   return (
     // Only `listeners`: dnd-kit's `attributes` would add a second focusable button role.
     <div
@@ -75,7 +65,7 @@ export function SortableRepoGroup({
       }}
       className={liftClass(isDragging)}
     >
-      {children({ setActivatorNodeRef, attributes, listeners, isDragging })}
+      {children({ setActivatorNodeRef, attributes, listeners })}
     </div>
   );
 }

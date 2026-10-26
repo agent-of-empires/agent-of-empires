@@ -75,44 +75,26 @@ describe("resolveTourSteps", () => {
   const all: TourAnchorId[] = Object.values(TOUR_ANCHORS);
   const present = (anchor: TourAnchorId) => all.includes(anchor);
 
-  it("returns only dashboard-scope steps with present anchors on the dashboard", () => {
+  it("stays on the dashboard: five steps with every anchor present, none in Settings", () => {
     const steps = resolveTourSteps({
       scope: "dashboard",
       readOnly: false,
       isDesktop: true,
       hasAnchor: present,
     });
-    const ids = steps.map((s) => s.id);
-    expect(ids).toContain("sidebar");
-    expect(ids).toContain("new-session");
-    expect(ids).toContain("topbar-more");
-    expect(ids).not.toContain("composer");
-    expect(ids).not.toContain("right-panel");
+    expect(steps.map((s) => s.id)).toEqual(["topbar", "sidebar", "new-session", "settings", "topbar-more"]);
   });
 
-  it("drops steps filtered by read-only, CityHall, and coarse-pointer metadata", () => {
+  it("drops steps filtered by read-only and coarse-pointer metadata", () => {
     const ids = (opts: Partial<Parameters<typeof resolveTourSteps>[0]>) =>
       resolveTourSteps({ scope: "dashboard", readOnly: false, isDesktop: true, hasAnchor: present, ...opts }).map(
         (s) => s.id,
       );
     expect(ids({ readOnly: true })).not.toContain("new-session");
-    const cityhall = ids({ cityhall: true });
-    expect(cityhall).not.toContain("settings-worktree");
-    expect(cityhall).not.toContain("settings-agent-defaults");
-    expect(cityhall).toContain("settings-plugins");
     expect(ids({ scope: "structured-view", isDesktop: false })).not.toContain("right-panel");
   });
 
-  it("drops steps whose anchor is absent from the DOM, except deferred settings steps", () => {
-    const steps = resolveTourSteps({
-      scope: "dashboard",
-      readOnly: false,
-      isDesktop: true,
-      hasAnchor: () => false,
-    });
-    expect(steps.map((s) => s.id)).toEqual(["settings-worktree", "settings-plugins", "settings-agent-defaults"]);
-    expect(steps.every((s) => s.settingsTab)).toBe(true);
-
+  it("drops steps whose anchor is absent from the DOM", () => {
     const topbarOnly = new Set<TourAnchorId>([TOUR_ANCHORS.topbar]);
     const ids = resolveTourSteps({
       scope: "dashboard",
@@ -120,9 +102,7 @@ describe("resolveTourSteps", () => {
       isDesktop: true,
       hasAnchor: (a) => topbarOnly.has(a),
     }).map((s) => s.id);
-    expect(ids).toContain("topbar"); // present anchor -> kept
-    expect(ids).toContain("settings-worktree"); // deferred -> kept regardless
-    expect(ids).not.toContain("sidebar"); // absent non-deferred anchor -> dropped
+    expect(ids).toEqual(["topbar"]);
   });
 
   it("preserves TOUR_STEPS order", () => {

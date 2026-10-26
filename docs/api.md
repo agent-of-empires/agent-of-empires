@@ -201,6 +201,8 @@ session when login is enabled. They are unavailable in CityHall mode. Adoption
 rejects symlinks, special files, packages over 64 MiB, individual files over
 32 MiB, more than 1,024 files, and directory nesting deeper than 16 levels.
 
+Native clients classify errors from the status and one `AoE-Error-Code` response header, never from the body. A missing, repeated, unknown or status-inconsistent value means "generic status". Plain HTTP from a non-loopback peer gets `426 tls_required` before authentication unless the bind sets `--dangerously-allow-plaintext-remote`.
+
 ## Runtime CLI reads
 
 Read-only CLI commands use `/api/runtime/read/ws` when `--daemon-url` or `AOE_DAEMON_URL` selects an HTTP endpoint. `/api/runtime/ws` is reserved for the TUI stream and does not serve this one-shot protocol.
@@ -650,6 +652,18 @@ Complete purge recovery before retrying; this busy refusal does not degrade runt
 
 Purge refuses unresolved runner ownership before committing deletion. The row
 and its resources remain available for repair and retry.
+
+Delete, purge and restore share one Busy contract. Busy means another lifecycle
+operation holds the session, nothing changed, and the caller may retry once it
+finishes. It is not `KeptRestored` (restored mid-purge), already gone, or a
+cleanup failure. Over HTTP it is `409` with the `lifecycle_locked` code header
+and `{"error":"lifecycle_busy","operation":"<holder>"}`; a selection that
+changed after it was made is `409` with its own `lifecycle_superseded` code
+header; it may already be partly processed, so refresh and check before retrying. A batch delete that skips Busy sessions lists them under `busy` and
+reports `partial`; when nothing else completed it answers `409 lifecycle_busy`.
+`aoe rm --purge` and `aoe session restore` exit non-zero for Busy. `aoe session
+empty-trash` purges the rest, lists each skipped session on stderr, then exits
+non-zero.
 
 Selected-trash actions include `expected_trashed_at`, `expected_generation` and
 `expected_trash_lifecycle_id`. The durable identity distinguishes restore/retrash

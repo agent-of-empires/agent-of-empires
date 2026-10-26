@@ -2577,7 +2577,10 @@ mod tests {
     fn derive_acp_session_change_ignores_unrelated_events() {
         use crate::acp::Event;
         assert_eq!(
-            derive_acp_session_change(&Event::AgentMessageChunk { text: "x".into() }),
+            derive_acp_session_change(&Event::AgentMessageChunk {
+                text: "x".into(),
+                message_id: None
+            }),
             None
         );
         assert_eq!(
@@ -2597,7 +2600,14 @@ mod tests {
         // TaskOutput notification) streams only these events, never a
         // UserPromptSent. They must drive Running so the sidebar dot recovers.
         assert_eq!(
-            derive_acp_status(&Event::AgentMessageChunk { text: "x".into() }, false, false),
+            derive_acp_status(
+                &Event::AgentMessageChunk {
+                    text: "x".into(),
+                    message_id: None
+                },
+                false,
+                false
+            ),
             Some(StatusIntent::Set(Status::Running))
         );
         assert_eq!(
@@ -2691,7 +2701,10 @@ mod tests {
             ("ThinkingStarted", Event::ThinkingStarted),
             (
                 "AgentMessageChunk",
-                Event::AgentMessageChunk { text: "x".into() },
+                Event::AgentMessageChunk {
+                    text: "x".into(),
+                    message_id: None,
+                },
             ),
             (
                 "ToolCallStarted",

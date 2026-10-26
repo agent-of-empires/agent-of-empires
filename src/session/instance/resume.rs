@@ -1472,6 +1472,40 @@ mod tests {
 
     #[test]
     #[serial]
+    fn a_native_launch_records_the_executable_it_ran() {
+        const PROFILE: &str = "launch-executable";
+        let temp = tempdir().unwrap();
+        let _env = isolate_resume_environment(temp.path());
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let _claude = install_fake_claude(temp.path(), "#!/bin/sh\nsleep 30\n");
+        let mut inst = Instance::new("launch-executable", project.to_str().unwrap());
+        inst.tool = "claude".to_string();
+        inst.command = "claude".to_string();
+        inst.source_profile = PROFILE.to_string();
+        let storage = crate::session::storage::Storage::new_unwatched(PROFILE).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
+        let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(tmux_name);
+
+        inst.start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow)
+            .unwrap();
+
+        let recorded = inst.launch_executable.clone().expect("recorded on the row");
+        assert!(recorded.is_absolute());
+        assert_eq!(recorded.file_name().unwrap(), "claude");
+        let rows = storage.load().unwrap();
+        let row = rows.iter().find(|row| row.id == inst.id).unwrap();
+        assert_eq!(row.launch_executable.as_deref(), Some(recorded.as_path()));
+    }
+
+    #[test]
+    #[serial]
     fn start_with_resume_fallback_uses_launch_sid_for_probe_decision() {
         use crate::session::instance::start::test_support::{FinalizeObserver, FinalizePhase};
         const PROFILE: &str = "launch-sid-probe";
