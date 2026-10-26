@@ -1613,6 +1613,36 @@ impl SessionService {
         })
     }
 
+    /// The sidebar status right after `seq`. The cached history answers while
+    /// it still holds `seq`; once the fold has run past it (a listener parked
+    /// on a cold hydration while publishers carried on), the log is replayed
+    /// up to `seq`, which is slow but exact.
+    pub(crate) async fn sidebar_status_at(
+        &self,
+        id: &str,
+        seq: u64,
+    ) -> Option<crate::session::Status> {
+        use crate::acp::state::{AcpSessionId, AcpState, AgentName};
+        if let Some(status) = self.acp_control_cache.sidebar_status_at(id, seq) {
+            return Some(status);
+        }
+        let store = Arc::clone(&self.acp_event_store);
+        let sid = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut state =
+                AcpState::new(AcpSessionId(sid.clone()), AgentName(String::new()), None);
+            let mut folded = false;
+            for (at, event) in store.replay_before(&sid, seq.saturating_add(1)) {
+                let _ = state.apply_event(at, event);
+                folded = true;
+            }
+            folded.then(|| state.sidebar_status())
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// Drain the leading batch of a session's server-owned queue into the live
     /// worker once the current turn has ended. Mirrors
     /// `drain_pending_initial_turn`'s single-owner `pending_drains` claim +

@@ -326,8 +326,9 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                         .await;
                 }
                 state
-                    .acp_control_cache
+                    .session_service
                     .sidebar_status_at(&frame.session_id, frame.seq)
+                    .await
                     .map(|projected| (policy, projected))
             }
             (None, _) => None,
@@ -1785,98 +1786,115 @@ mod tests {
         assert!(load_profile_row(profile, &id).is_some_and(|i| i.unread));
     }
 
-    /// A frame a whole broadcast window behind the fold still projects at its
-    /// own seq: ApprovalResolved at N is consumed after 255 content frames and
-    /// the stop at N+256 are already folded, and must not read a later level.
+    /// A frame far behind the fold still projects at its own seq:
+    /// ApprovalResolved at N is consumed after the content frames and the stop
+    /// are already folded, and must not read a later level. 255 frames stay
+    /// inside the cached history; 600 outrun it, so the status is rebuilt from
+    /// the log (a listener parked on a cold hydration while publishers carry on).
     #[tokio::test]
     #[serial_test::serial]
-    async fn acp_event_listener_keeps_the_edge_a_full_broadcast_window_behind_the_fold() {
+    async fn acp_event_listener_keeps_the_edge_for_a_frame_far_behind_the_fold() {
         use crate::acp::approvals::ApprovalDecision;
         use crate::acp::permissions::build_approval;
         use crate::acp::state::test_support::prompt;
         use crate::acp::state::ToolCall;
         use crate::acp::Event;
-        let temp = tempfile::tempdir().expect("tempdir");
-        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
-        crate::session::set_unread_enabled(true);
+        for content_frames in [255usize, 600] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+            crate::session::set_unread_enabled(true);
 
-        let profile = "acp-listener-window";
-        let mut inst = Instance::new("acp-window", "/tmp/acp");
-        inst.view = crate::session::View::Structured;
-        inst.source_profile = profile.to_string();
-        inst.status = Status::Waiting;
-        let id = inst.id.clone();
-        seed_profile_store(profile, vec![inst.clone()]);
-        let state = test_support::build_test_app_state(vec![inst]);
+            let profile = "acp-listener-window";
+            let mut inst = Instance::new("acp-window", "/tmp/acp");
+            inst.view = crate::session::View::Structured;
+            inst.source_profile = profile.to_string();
+            inst.status = Status::Waiting;
+            let id = inst.id.clone();
+            seed_profile_store(profile, vec![inst.clone()]);
+            // A store deep enough that the 600-frame case is not pruned.
+            let store = Arc::new(
+                crate::acp::event_store::EventStore::open(&temp.path().join("acp.db"), 2000)
+                    .expect("event store"),
+            );
+            let state = test_support::build_test_app_state_impl_with_event_store(
+                vec![inst],
+                Vec::new(),
+                Vec::new(),
+                None,
+                Some(store),
+                |_| {},
+                std::convert::identity,
+            );
 
-        let tool_call = ToolCall {
-            id: "t".into(),
-            name: "shell".into(),
-            kind: "execute".into(),
-            args_preview: "{}".into(),
-            started_at: chrono::Utc::now(),
-            parent_tool_call_id: None,
-            memory_recall: None,
-            diffs: Vec::new(),
-        };
-        let approval = build_approval(tool_call, Vec::new());
-        let answered = Event::ApprovalResolved {
-            nonce: approval.nonce.clone(),
-            decision: ApprovalDecision::Allow,
-        };
-        let stopped = Event::Stopped {
-            reason: "prompt_complete".into(),
-        };
-        // Hydrate, then fold the whole window ahead of the listener: the answer
-        // at seq 3, 255 content frames, the stop at seq 259.
-        let mut log = vec![prompt("go"), Event::ApprovalRequested { approval }];
-        log.push(answered.clone());
-        log.extend((0..255).map(|i| Event::ToolCallContent {
-            tool_call_id: "t".into(),
-            content: format!("out {i}"),
-        }));
-        log.push(stopped.clone());
-        for (seq, event) in (1..).zip(&log[..2]) {
-            state
-                .acp_event_store
-                .record(&id, seq, event)
-                .expect("record");
+            let tool_call = ToolCall {
+                id: "t".into(),
+                name: "shell".into(),
+                kind: "execute".into(),
+                args_preview: "{}".into(),
+                started_at: chrono::Utc::now(),
+                parent_tool_call_id: None,
+                memory_recall: None,
+                diffs: Vec::new(),
+            };
+            let approval = build_approval(tool_call, Vec::new());
+            let answered = Event::ApprovalResolved {
+                nonce: approval.nonce.clone(),
+                decision: ApprovalDecision::Allow,
+            };
+            let stopped = Event::Stopped {
+                reason: "prompt_complete".into(),
+            };
+            // Hydrate, then fold the whole window ahead of the listener: the answer
+            // at seq 3, `content_frames` content frames, then the stop.
+            let mut log = vec![prompt("go"), Event::ApprovalRequested { approval }];
+            log.push(answered.clone());
+            log.extend((0..content_frames).map(|i| Event::ToolCallContent {
+                tool_call_id: "t".into(),
+                content: format!("out {i}"),
+            }));
+            log.push(stopped.clone());
+            for (seq, event) in (1..).zip(&log[..2]) {
+                state
+                    .acp_event_store
+                    .record(&id, seq, event)
+                    .expect("record");
+            }
+            state.session_service.fold_control_state(&id).await;
+            for (seq, event) in (3..).zip(&log[2..]) {
+                state
+                    .acp_event_store
+                    .record(&id, seq, event)
+                    .expect("record");
+                state.acp_control_cache.apply_if_cached(&id, seq, event);
+            }
+            let last = log.len() as u64;
+
+            let listener = tokio::spawn(acp_event_listener(state.clone()));
+            await_subscribed(&state).await;
+            for (seq, event) in [(3, answered), (last, stopped)] {
+                state
+                    .acp_events_tx
+                    .send(AcpBroadcastFrame {
+                        session_id: id.clone(),
+                        seq,
+                        event: Arc::new(event),
+                        worker_generation: None,
+                    })
+                    .expect("listener is subscribed");
+            }
+
+            let row = await_row(
+                &state,
+                &id,
+                |i| i.unread,
+                "the stop behind the fold must mark the row unread",
+            )
+            .await;
+            listener.abort();
+            let _ = listener.await;
+            assert_eq!(row.status, Status::Idle, "{content_frames} content frames");
+            assert!(load_profile_row(profile, &id).is_some_and(|i| i.unread));
         }
-        state.session_service.fold_control_state(&id).await;
-        for (seq, event) in (3..).zip(&log[2..]) {
-            state
-                .acp_event_store
-                .record(&id, seq, event)
-                .expect("record");
-            state.acp_control_cache.apply_if_cached(&id, seq, event);
-        }
-        let last = log.len() as u64;
-
-        let listener = tokio::spawn(acp_event_listener(state.clone()));
-        await_subscribed(&state).await;
-        for (seq, event) in [(3, answered), (last, stopped)] {
-            state
-                .acp_events_tx
-                .send(AcpBroadcastFrame {
-                    session_id: id.clone(),
-                    seq,
-                    event: Arc::new(event),
-                    worker_generation: None,
-                })
-                .expect("listener is subscribed");
-        }
-
-        let row = await_row(
-            &state,
-            &id,
-            |i| i.unread,
-            "the stop at the window's edge must mark the row unread",
-        )
-        .await;
-        listener.abort();
-        let _ = listener.await;
-        assert_eq!(row.status, Status::Idle);
-        assert!(load_profile_row(profile, &id).is_some_and(|i| i.unread));
     }
 
     /// A startup error whose event-store write failed is substituted by the

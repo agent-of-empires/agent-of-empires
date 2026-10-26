@@ -6,10 +6,9 @@ use std::sync::{Arc, Mutex};
 use super::state::{AcpState, Event};
 use crate::session::Status;
 
-/// Per-seq sidebar statuses kept per session. The listener can be consuming
-/// frame N while the fold, and the 256-frame ACP broadcast, hold N+1..N+256
-/// behind it; a listener any further behind is lagged and recovers from the
-/// log. So the history must outlast that whole window: twice the capacity.
+/// Per-seq sidebar statuses kept per session. Sized to outlast the usual
+/// listener lag (the consumed frame plus the 256-frame ACP broadcast behind
+/// it); a frame older than this is rebuilt from the log instead.
 const RECENT_STATUS_SEQS: usize = 512;
 
 /// A session's folded control state and how far it has been folded.
@@ -125,7 +124,7 @@ impl ControlStateCache {
     /// The sidebar status right after folding `seq`, or `None` if nothing is
     /// cached or `seq` has left the history. The fold runs ahead of the
     /// listener, so substituting the latest status for an older frame would
-    /// skip the transitions in between. Never hydrates; callers that need a
+    /// skip the transitions in between; callers rebuild it from the log. Never hydrates; callers that need a
     /// verdict hydrate through `SessionService::fold_control_state` first.
     pub fn sidebar_status_at(&self, session_id: &str, seq: u64) -> Option<Status> {
         let slot = self.slot(session_id);
