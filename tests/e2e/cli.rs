@@ -1446,6 +1446,25 @@ fn cli_add_effort_is_stored_and_refusals_provision_nothing() {
     }
 }
 
+/// An explicit `--agent` whose relative adapter is missing is refused after the scratch dir
+/// is provisioned, so the refusal must remove it.
+#[test]
+#[parallel]
+fn cli_add_missing_relative_adapter_leaves_no_scratch_dir() {
+    let h = TuiTestHarness::new("cli_add_missing_adapter");
+    h.append_config("[session.agent_acp_cmd]\nfake = \"./missing-acp\"");
+
+    let stderr = h.run_cli_err(&["add", "--scratch", "-t", "Refused", "--agent", "fake"]);
+    assert!(stderr.contains("is not installed"), "{stderr}");
+
+    let scratch_root = app_dir_in(h.home_path()).join("scratch");
+    assert_eq!(
+        std::fs::read_dir(&scratch_root).map_or(0, Iterator::count),
+        0,
+        "the refused add left its scratch dir behind"
+    );
+}
+
 /// #1051: `aoe ps --json` is fail-soft on an empty profile with no tmux
 /// server: an empty array and exit 0, never a failed substrate probe.
 #[test]
