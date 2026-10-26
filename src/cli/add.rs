@@ -2027,66 +2027,101 @@ mod tests {
             let hooked = config(&|c| c.host_hooks.before_session = vec!["true".into()]);
             let sandbox_default = config(&|c| c.sandbox.enabled_by_default = true);
             let dir = project.path().to_str().unwrap();
-            // (label, extra argv, config, runtime available, refused)
-            let cases: [(&str, &[&str], &crate::session::Config, bool, bool); 8] = [
-                ("found nowhere", &[], &plain, true, true),
-                ("on the configured PATH", &[], &on_path, true, false),
-                (
-                    "a before_session hook may set PATH",
-                    &[],
-                    &hooked,
-                    true,
-                    false,
-                ),
-                ("--sandbox", &["--sandbox"], &plain, true, false),
-                (
-                    "--sandbox-image",
-                    &["--sandbox-image", "img:1"],
-                    &plain,
-                    true,
-                    false,
-                ),
-                ("sandbox on by default", &[], &sandbox_default, true, false),
-                (
-                    "--sandbox without a runtime",
-                    &["--sandbox"],
-                    &plain,
-                    false,
-                    true,
-                ),
-                (
-                    "sandbox default without a runtime",
-                    &[],
-                    &sandbox_default,
-                    false,
-                    true,
-                ),
+            struct Case<'a> {
+                label: &'static str,
+                extra: &'a [&'a str],
+                config: &'a crate::session::Config,
+                runtime: bool,
+                refused: bool,
+            }
+            let cases = [
+                Case {
+                    label: "found nowhere",
+                    extra: &[],
+                    config: &plain,
+                    runtime: true,
+                    refused: true,
+                },
+                Case {
+                    label: "on the configured PATH",
+                    extra: &[],
+                    config: &on_path,
+                    runtime: true,
+                    refused: false,
+                },
+                Case {
+                    label: "a before_session hook may set PATH",
+                    extra: &[],
+                    config: &hooked,
+                    runtime: true,
+                    refused: false,
+                },
+                Case {
+                    label: "--sandbox",
+                    extra: &["--sandbox"],
+                    config: &plain,
+                    runtime: true,
+                    refused: false,
+                },
+                Case {
+                    label: "--sandbox-image",
+                    extra: &["--sandbox-image", "img:1"],
+                    config: &plain,
+                    runtime: true,
+                    refused: false,
+                },
+                Case {
+                    label: "sandbox on by default",
+                    extra: &[],
+                    config: &sandbox_default,
+                    runtime: true,
+                    refused: false,
+                },
+                Case {
+                    label: "--sandbox without a runtime",
+                    extra: &["--sandbox"],
+                    config: &plain,
+                    runtime: false,
+                    refused: true,
+                },
+                Case {
+                    label: "sandbox default without a runtime",
+                    extra: &[],
+                    config: &sandbox_default,
+                    runtime: false,
+                    refused: true,
+                },
             ];
-            for (label, extra, config, runtime, refused) in cases {
-                let argv: Vec<&str> = ["aoe", "add", dir].iter().chain(extra).copied().collect();
+            for case in cases {
+                let argv: Vec<&str> = ["aoe", "add", dir]
+                    .iter()
+                    .chain(case.extra)
+                    .copied()
+                    .collect();
                 let (_, args) = dispatch_argv(&argv);
                 let checked_runtime = std::cell::Cell::new(false);
                 let got = super::super::structured_adapter_missing(
                     &args,
-                    config,
+                    case.config,
                     &adapter,
                     project.path(),
                     || {
                         checked_runtime.set(true);
-                        runtime
+                        case.runtime
                     },
                     || false,
                 );
-                assert_eq!(got, refused, "{label}");
-                let asked_for_sandbox = !extra.is_empty() || config.sandbox.enabled_by_default;
+                assert_eq!(got, case.refused, "{}", case.label);
+                let asked_for_sandbox =
+                    !case.extra.is_empty() || case.config.sandbox.enabled_by_default;
                 assert_eq!(
                     checked_runtime.get(),
                     asked_for_sandbox,
-                    "{label}: runtime probe"
+                    "{}: runtime probe",
+                    case.label
                 );
             }
-            // An on_create hook that may install the adapter clears the refusal, and is asked
-            // about only when the adapter isn't found.
+            // Check preparation hooks only when the adapter is missing.
             let (_, args) = dispatch_argv(&["aoe", "add", dir]);
             for (label, config, missing) in [
                 ("found nowhere", &plain, true),

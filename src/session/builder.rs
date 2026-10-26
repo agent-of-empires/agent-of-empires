@@ -1959,62 +1959,83 @@ mod tests {
         let trusted = repo_with_on_launch();
         trust_repo(trusted.path(), Some(&compute_hooks_hash(&on_launch)), None).unwrap();
         let none = HooksConfig::default();
+        struct Case<'a> {
+            label: &'static str,
+            profile: &'a HooksConfig,
+            project: &'a std::path::Path,
+            scratch: bool,
+            trust_hooks: Option<bool>,
+            want: bool,
+        }
         let cases = [
-            (
-                "profile on_launch",
-                &on_launch,
-                plain.path(),
-                false,
-                None,
-                true,
-            ),
-            (
-                "profile on_create",
-                &on_create,
-                plain.path(),
-                false,
-                None,
-                true,
-            ),
-            ("no hooks", &none, plain.path(), false, None, false),
-            (
-                "repo on_launch awaiting trust",
-                &none,
-                untrusted.path(),
-                false,
-                None,
-                true,
-            ),
-            (
-                "repo on_launch, trust declined",
-                &none,
-                untrusted.path(),
-                false,
-                Some(false),
-                false,
-            ),
-            (
-                "repo on_launch, scratch",
-                &none,
-                untrusted.path(),
-                true,
-                None,
-                false,
-            ),
-            (
-                "repo on_launch trusted",
-                &none,
-                trusted.path(),
-                false,
-                Some(false),
-                true,
-            ),
+            Case {
+                label: "profile on_launch",
+                profile: &on_launch,
+                project: plain.path(),
+                scratch: false,
+                trust_hooks: None,
+                want: true,
+            },
+            Case {
+                label: "profile on_create",
+                profile: &on_create,
+                project: plain.path(),
+                scratch: false,
+                trust_hooks: None,
+                want: true,
+            },
+            Case {
+                label: "no hooks",
+                profile: &none,
+                project: plain.path(),
+                scratch: false,
+                trust_hooks: None,
+                want: false,
+            },
+            Case {
+                label: "repo on_launch awaiting trust",
+                profile: &none,
+                project: untrusted.path(),
+                scratch: false,
+                trust_hooks: None,
+                want: true,
+            },
+            Case {
+                label: "repo on_launch, trust declined",
+                profile: &none,
+                project: untrusted.path(),
+                scratch: false,
+                trust_hooks: Some(false),
+                want: false,
+            },
+            Case {
+                label: "repo on_launch, scratch",
+                profile: &none,
+                project: untrusted.path(),
+                scratch: true,
+                trust_hooks: None,
+                want: false,
+            },
+            Case {
+                label: "repo on_launch trusted",
+                profile: &none,
+                project: trusted.path(),
+                scratch: false,
+                trust_hooks: Some(false),
+                want: true,
+            },
         ];
-        for (label, profile, project, scratch, trust_hooks, want) in cases {
+        for case in cases {
             assert_eq!(
-                structured::preparation_hooks_apply(profile, project, scratch, trust_hooks),
-                want,
-                "{label}"
+                structured::preparation_hooks_apply(
+                    case.profile,
+                    case.project,
+                    case.scratch,
+                    case.trust_hooks,
+                ),
+                case.want,
+                "{}",
+                case.label
             );
         }
     }
