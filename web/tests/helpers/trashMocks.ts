@@ -170,6 +170,7 @@ export async function installTrashMocks(
     for (const id of ordered) {
       if (busyDelete.has(id)) {
         busy.push({ id, error: "busy with restore" });
+        if (opts.ownerLast) break;
         continue;
       }
       if (failDelete.has(id)) {
