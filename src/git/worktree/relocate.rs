@@ -353,10 +353,16 @@ impl GitWorktree {
         }
 
         if let Err(e) = Self::convert_git_file_to_relative(to) {
-            problems.push(format!("could not restore the relative .git pointer: {e}"));
+            problems.push(format!(
+                "could not restore the relative .git pointer ({e}); \
+                 run `git worktree repair {}` from the main repository",
+                to.display()
+            ));
         }
+        let mut submodule_failed = false;
         for checkout in &checkouts {
             if let Err(e) = Self::repoint_submodule(to, checkout) {
+                submodule_failed = true;
                 problems.push(format!(
                     "submodule {} is not repointed: {e}",
                     checkout.relative.display()
@@ -372,11 +378,14 @@ impl GitWorktree {
             problems = ?problems,
             "move_worktree: relocated the worktree but left it degraded"
         );
-        Ok(MoveOutcome::MovedDegraded(format!(
-            "{}; run `git submodule update --init --recursive` in {} to repair",
-            problems.join("; "),
-            to.display()
-        )))
+        let mut message = problems.join("; ");
+        if submodule_failed {
+            message.push_str(&format!(
+                "; run `git submodule update --init --recursive` in {} to repair",
+                to.display()
+            ));
+        }
+        Ok(MoveOutcome::MovedDegraded(message))
     }
 
     /// `git worktree repair`, which fixes both the checkout's `.git` pointer and
