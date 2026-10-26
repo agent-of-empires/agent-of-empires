@@ -225,6 +225,25 @@ pub async fn acp_context_primer(
 /// Events read per batch when looking below a `view=rows` page.
 const ROWS_PRIOR_BATCH: usize = 256;
 
+/// Only an identified chunk before the page's first user turn can use an older marker.
+fn prior_message_marker_for_page(
+    events: &[(u64, crate::acp::state::Event)],
+    lookup: impl FnOnce(u64) -> Option<crate::acp::state::Event>,
+) -> Option<crate::acp::state::Event> {
+    use crate::acp::state::Event;
+    for (_, event) in events {
+        match event {
+            Event::AgentMessageChunk {
+                message_id: Some(_),
+                ..
+            } => return lookup(events[0].0),
+            Event::UserPromptSent { .. } | Event::UserDiffCommentsPrompt { .. } => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
 /// The latest event below `before` that says which agent message a page
 /// continues: a chunk with a message id, or a user turn, which resets it.
 /// Walks retained history backward in batches until one is found.
@@ -289,10 +308,8 @@ pub async fn acp_replay(
     );
     let (frames, rows) = if q.view.as_deref() == Some("rows") {
         let mut model = crate::acp::transcript::TranscriptModel::new();
-        // A page can open mid-turn, so its first chunk may continue a message
-        // that started below it.
-        if let Some(prior) = page.events.first().and_then(|(lowest, _)| {
-            prior_message_marker(&state.acp_event_store, &id, *lowest, ROWS_PRIOR_BATCH)
+        if let Some(prior) = prior_message_marker_for_page(&page.events, |lowest| {
+            prior_message_marker(&state.acp_event_store, &id, lowest, ROWS_PRIOR_BATCH)
         }) {
             model.observe_prior(&prior);
         }
@@ -681,7 +698,7 @@ done
         // would have read, within the test store's retention.
         let thoughts = || std::iter::repeat_n(Event::ThinkingStarted, 70);
         // (events before the page, page events, message_start per page row)
-        let cases: [(Vec<Event>, Vec<Event>, Vec<bool>); 4] = [
+        let cases: [(Vec<Event>, Vec<Event>, Vec<bool>); 6] = [
             (
                 vec![prompt(), chunk("for #4656.", "m-a")],
                 vec![chunk("", "m-b"), chunk("The waiter has the lock.", "m-b")],
@@ -707,6 +724,22 @@ done
                 vec![chunk("earlier turn", "m-a"), prompt()],
                 vec![chunk("", "m-b"), chunk("New turn.", "m-b")],
                 vec![false, false],
+            ),
+            (
+                vec![chunk("earlier message", "m-a")],
+                vec![
+                    Event::AgentMessageChunk {
+                        text: "id-less prefix".into(),
+                        message_id: None,
+                    },
+                    chunk("new message", "m-b"),
+                ],
+                vec![false, true],
+            ),
+            (
+                vec![chunk("earlier turn", "m-a")],
+                vec![prompt(), chunk("new turn", "m-b")],
+                vec![false],
             ),
         ];
         for (before, page, expected) in cases {
@@ -742,6 +775,67 @@ done
                 .map(|r| r.message_start)
                 .collect();
             assert_eq!(starts, expected, "{} events before the page", before.len());
+        }
+    }
+
+    #[test]
+    fn rows_page_reads_prior_history_only_before_an_identified_chunk() {
+        let identified = Event::AgentMessageChunk {
+            text: "identified".into(),
+            message_id: Some("m-b".into()),
+        };
+        let idless = Event::AgentMessageChunk {
+            text: "id-less".into(),
+            message_id: None,
+        };
+        let prompt = Event::UserPromptSent {
+            text: "go".into(),
+            attachments: Vec::new(),
+            prompt_id: None,
+            synthesized: false,
+            origin_plugin: None,
+        };
+        let diff_prompt = Event::UserDiffCommentsPrompt {
+            intro: String::new(),
+            outro: String::new(),
+            is_multi_repo: false,
+            comments: Vec::new(),
+            assembled_markdown: "review".into(),
+        };
+        for (label, events, reads) in [
+            ("empty", vec![], 0),
+            ("id-less", vec![idless.clone()], 0),
+            ("invisible", vec![Event::ThinkingStarted], 0),
+            ("new turn", vec![prompt.clone(), identified.clone()], 0),
+            ("diff turn", vec![diff_prompt, identified.clone()], 0),
+            (
+                "id-less then identified",
+                vec![idless.clone(), identified.clone()],
+                1,
+            ),
+            (
+                "invisible then identified",
+                vec![Event::ThinkingStarted, identified.clone()],
+                1,
+            ),
+            ("identified before reset", vec![identified, prompt], 1),
+        ] {
+            let page: Vec<_> = events
+                .into_iter()
+                .enumerate()
+                .map(|(i, e)| (i as u64 + 20, e))
+                .collect();
+            let mut calls = 0;
+            let prior = prior_message_marker_for_page(&page, |before| {
+                calls += 1;
+                assert_eq!(before, 20, "{label}");
+                Some(Event::AgentMessageChunk {
+                    text: "earlier".into(),
+                    message_id: Some("m-a".into()),
+                })
+            });
+            assert_eq!(calls, reads, "{label}");
+            assert_eq!(prior.is_some(), reads == 1, "{label}");
         }
     }
 
