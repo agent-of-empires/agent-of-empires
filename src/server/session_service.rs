@@ -1599,13 +1599,8 @@ impl SessionService {
         // SQLite scan, so the whole thing goes off the runtime rather than just the scan.
         tokio::task::spawn_blocking(move || {
             cache.get_or_hydrate(&sid.clone(), || {
-                let mut reduced = AcpState::new(AcpSessionId(sid.clone()), agent, model);
-                let mut last_seq = 0;
-                for (seq, event) in store.replay_from(&sid, 0) {
-                    let _ = reduced.apply_event(seq, event);
-                    last_seq = seq;
-                }
-                (reduced, last_seq)
+                let base = AcpState::new(AcpSessionId(sid.clone()), agent, model);
+                crate::acp::control_cache::Hydrated::replay(base, store.replay_from(&sid, 0))
             })
         })
         .await

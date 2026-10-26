@@ -308,15 +308,30 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
         // `fold_control_state` hydrates through the cache's per-session lock, so
         // a second frame for the same cold session waits for the first rather
         // than double-hydrating (#4001).
+        //
+        // The fold runs ahead of this listener, so the status is read at this
+        // frame's seq: a Resolved + Stopped burst still shows Running then Idle.
+        // A startup error whose write failed is substituted by the sink and
+        // never reaches the log or the fold, so the frame itself carries it.
         let status_policy = status_policy(frame.event.as_ref());
-        if status_policy.is_some() && !state.acp_control_cache.is_hydrated(&frame.session_id) {
-            state
-                .session_service
-                .fold_control_state(&frame.session_id)
-                .await;
-        }
-        let status_update =
-            status_policy.zip(state.acp_control_cache.sidebar_status(&frame.session_id));
+        let status_update = match (status_policy, frame.event.as_ref()) {
+            (Some(policy), crate::acp::state::Event::AgentStartupError { .. }) => {
+                Some((policy, Status::Error))
+            }
+            (Some(policy), _) => {
+                if !state.acp_control_cache.is_hydrated(&frame.session_id) {
+                    state
+                        .session_service
+                        .fold_control_state(&frame.session_id)
+                        .await;
+                }
+                state
+                    .acp_control_cache
+                    .sidebar_status_at(&frame.session_id, frame.seq)
+                    .map(|projected| (policy, projected))
+            }
+            (None, _) => None,
+        };
         let acp_change = derive_acp_session_change(frame.event.as_ref());
         let load_session_capability = match (frame.event.as_ref(), frame.worker_generation) {
             (
@@ -1679,6 +1694,131 @@ mod tests {
         assert_eq!(row.status, Status::Idle, "the Stopped applied");
     }
 
+    /// The fold runs ahead of the listener, so a burst already folded to its
+    /// end must still replay each frame's own transition: Waiting -> Running on
+    /// the answer, then Running -> Idle on the stop, which is the edge the
+    /// unread mark needs.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn acp_event_listener_keeps_the_running_to_idle_edge_across_a_folded_burst() {
+        use crate::acp::approvals::ApprovalDecision;
+        use crate::acp::permissions::build_approval;
+        use crate::acp::state::ToolCall;
+        use crate::acp::Event;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+        crate::session::set_unread_enabled(true);
+
+        let profile = "acp-listener-burst";
+        let mut inst = Instance::new("acp-burst", "/tmp/acp");
+        inst.view = crate::session::View::Structured;
+        inst.source_profile = profile.to_string();
+        inst.status = Status::Waiting;
+        let id = inst.id.clone();
+        seed_profile_store(profile, vec![inst.clone()]);
+        let state = test_support::build_test_app_state(vec![inst]);
+
+        let approval = build_approval(
+            ToolCall {
+                id: "t".into(),
+                name: "shell".into(),
+                kind: "execute".into(),
+                args_preview: "{}".into(),
+                started_at: chrono::Utc::now(),
+                parent_tool_call_id: None,
+                memory_recall: None,
+                diffs: Vec::new(),
+            },
+            Vec::new(),
+        );
+        let answered = Event::ApprovalResolved {
+            nonce: approval.nonce.clone(),
+            decision: ApprovalDecision::Allow,
+        };
+        let stopped = Event::Stopped {
+            reason: "prompt_complete".into(),
+        };
+        let log = [
+            crate::acp::state::test_support::prompt("go"),
+            Event::ApprovalRequested { approval },
+            answered.clone(),
+            stopped.clone(),
+        ];
+        for (seq, event) in (1..).zip(&log) {
+            state
+                .acp_event_store
+                .record(&id, seq, event)
+                .expect("record");
+        }
+
+        let listener = tokio::spawn(acp_event_listener(state.clone()));
+        await_subscribed(&state).await;
+        // Both frames are queued behind a log that already holds the stop.
+        for (seq, event) in [(3, answered), (4, stopped)] {
+            state
+                .acp_events_tx
+                .send(AcpBroadcastFrame {
+                    session_id: id.clone(),
+                    seq,
+                    event: Arc::new(event),
+                    worker_generation: None,
+                })
+                .expect("listener is subscribed");
+        }
+
+        let row = await_row(
+            &state,
+            &id,
+            |i| i.unread,
+            "the burst's turn end must mark the row unread",
+        )
+        .await;
+        listener.abort();
+        let _ = listener.await;
+        assert_eq!(row.status, Status::Idle);
+        assert!(load_profile_row(profile, &id).is_some_and(|i| i.unread));
+    }
+
+    /// A startup error whose event-store write failed is substituted by the
+    /// sink and never reaches the log or the fold; the frame alone must still
+    /// move the row to Error.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn acp_event_listener_applies_a_startup_error_that_never_reached_the_log() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let mut inst = Instance::new("acp-unpersisted", "/tmp/acp");
+        inst.view = crate::session::View::Structured;
+        inst.status = Status::Idle;
+        let id = inst.id.clone();
+        let state = test_support::build_test_app_state(vec![inst]);
+
+        let listener = tokio::spawn(acp_event_listener(state.clone()));
+        await_subscribed(&state).await;
+        state
+            .acp_events_tx
+            .send(AcpBroadcastFrame {
+                session_id: id.clone(),
+                seq: 7,
+                event: Arc::new(crate::acp::Event::AgentStartupError {
+                    message: "event store write failed at seq 7".into(),
+                }),
+                worker_generation: None,
+            })
+            .expect("listener is subscribed");
+
+        let row = await_row(
+            &state,
+            &id,
+            |i| i.status == Status::Error,
+            "a non-persisted startup error must turn the row Error",
+        )
+        .await;
+        listener.abort();
+        let _ = listener.await;
+        assert_eq!(row.status, Status::Error);
+    }
+
     /// #4001: after a daemon restart the control cache is cold. A reattached
     /// worker's first live frame is either its sub-agent's completion with the
     /// main turn still open, or the main turn's `Stopped` with the sub-agent
@@ -1803,7 +1943,7 @@ mod tests {
             );
             assert!(state.acp_control_cache.is_hydrated(&id), "{name}");
             assert_eq!(
-                state.acp_control_cache.sidebar_status(&id),
+                state.acp_control_cache.sidebar_status_at(&id, 3),
                 Some(Status::Running),
                 "{name}"
             );
