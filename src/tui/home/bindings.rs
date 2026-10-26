@@ -428,6 +428,11 @@ pub fn parse_chord(s: &str) -> Option<Chord> {
 /// `aoe plugin info` to flag a plugin keybind that core shadows.
 pub fn core_shadows(chord: &Chord) -> bool {
     BINDINGS.iter().any(|b| {
+        // App-only chords run before the home view and only while a banner shows, so they
+        // do not statically shadow a plugin chord.
+        if b.context == Context::AppOnly {
+            return false;
+        }
         b.non_strict.iter().chain(b.strict).any(|c| {
             // Same rule as `chord_matches`: an unset core `shift` also matches shifted events.
             c.code == chord.code
@@ -1414,6 +1419,7 @@ mod tests {
         // A modified chord is not claimed by the bare-letter binding it resembles.
         assert!(!core_shadows(&parse_chord("M-n").unwrap()));
         assert!(core_shadows(&parse_chord("M-Up").unwrap()));
+        assert!(!core_shadows(&parse_chord("C-x").unwrap()));
         // Shift narrows a plugin chord only against a core chord that requires it.
         assert!(core_shadows(&parse_chord("C-S-Up").unwrap()));
         assert!(!core_shadows(&parse_chord("PageUp").unwrap()));
