@@ -114,7 +114,7 @@ struct LegacyUserManager {
     anchor_uid: u32,
     systemd_directory: std::os::fd::OwnedFd,
     private_identity: (u64, u64),
-    mountinfo: String,
+    mount_root_record: String,
 }
 
 impl LegacyUserManager {
@@ -197,7 +197,7 @@ impl LegacyUserManager {
             .context("User manager process birth is unavailable")?;
         let namespace = fs::read_link("/proc/self/ns/cgroup")?;
         let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
-        validate_legacy_cgroup_mount(&mountinfo)?;
+        let mount_root_record = validate_legacy_cgroup_mount(&mountinfo)?.to_owned();
         let process_cgroup = fs::read_to_string(format!("/proc/{}/cgroup", peer.pid))?;
         let mut manager = Self {
             stream,
@@ -212,7 +212,7 @@ impl LegacyUserManager {
             anchor_uid,
             systemd_directory,
             private_identity,
-            mountinfo,
+            mount_root_record,
         };
         manager.root = manager.manager_root()?;
         validate_legacy_manager_membership(&manager.process_cgroup, &manager.root)?;
@@ -298,7 +298,8 @@ impl LegacyUserManager {
         anyhow::ensure!(
             fs::read_link("/proc/self/ns/cgroup")? == self.namespace
                 && fs::read_to_string(format!("/proc/{}/cgroup", self.pid))? == self.process_cgroup
-                && fs::read_to_string("/proc/self/mountinfo")? == self.mountinfo
+                && validate_legacy_cgroup_mount(&fs::read_to_string("/proc/self/mountinfo")?)?
+                    == self.mount_root_record
                 && self.manager_root()? == self.root,
             "User manager inventory boundary changed during scope proof"
         );
@@ -340,8 +341,8 @@ fn validate_legacy_manager_membership(contents: &str, root: &str) -> anyhow::Res
     Ok(())
 }
 
-fn validate_legacy_cgroup_mount(contents: &str) -> anyhow::Result<()> {
-    let mut found = false;
+fn validate_legacy_cgroup_mount(contents: &str) -> anyhow::Result<&str> {
+    let mut found = None;
     for line in contents.lines() {
         let (mount, filesystem) = line
             .split_once(" - ")
@@ -355,14 +356,15 @@ fn validate_legacy_cgroup_mount(contents: &str) -> anyhow::Result<()> {
         );
         if point == "/sys/fs/cgroup" {
             anyhow::ensure!(
-                !found && root == "/" && filesystem.split_whitespace().next() == Some("cgroup2"),
+                found.is_none()
+                    && root == "/"
+                    && filesystem.split_whitespace().next() == Some("cgroup2"),
                 "A complete unified cgroup hierarchy is unavailable"
             );
-            found = true;
+            found = Some(line);
         }
     }
-    anyhow::ensure!(found, "Unified cgroup mount is unavailable");
-    Ok(())
+    found.context("Unified cgroup mount is unavailable")
 }
 
 fn validate_legacy_manager_pid(contents: &str, expected: u32) -> anyhow::Result<()> {
@@ -384,6 +386,82 @@ fn validate_legacy_manager_pid(contents: &str, expected: u32) -> anyhow::Result<
 #[cfg(test)]
 mod legacy_inventory_boundary_tests {
     use super::*;
+
+    #[test]
+    fn mount_boundary_ignores_foreign_changes_but_rejects_cgroup_changes() {
+        let root = "31 20 0:27 / /sys/fs/cgroup rw - cgroup2 cgroup rw";
+        let before = format!("{root}\n32 20 0:28 / /media/old rw - tmpfs tmpfs rw\n");
+        let after = format!("45 20 0:35 / /media/new ro - tmpfs tmpfs ro\n{root}\n");
+        assert_eq!(
+            validate_legacy_cgroup_mount(&before).unwrap(),
+            validate_legacy_cgroup_mount(&after).unwrap()
+        );
+        for changed in [
+            "33 20 0:27 / /sys/fs/cgroup rw - cgroup2 cgroup rw",
+            "31 21 0:27 / /sys/fs/cgroup rw - cgroup2 cgroup rw",
+            "31 20 0:29 / /sys/fs/cgroup rw - cgroup2 cgroup rw",
+            "31 20 0:27 / /sys/fs/cgroup ro - cgroup2 cgroup rw",
+            "31 20 0:27 / /sys/fs/cgroup rw - cgroup2 cgroup ro",
+        ] {
+            assert_ne!(
+                validate_legacy_cgroup_mount(root).unwrap(),
+                validate_legacy_cgroup_mount(changed).unwrap()
+            );
+        }
+        for invalid in [
+            format!("{root}\n{root}\n"),
+            format!("{root}\n40 31 0:30 / /sys/fs/cgroup/hidden rw - tmpfs tmpfs rw\n"),
+            root.replace(" / /sys", " /subtree /sys"),
+            root.replace(" - cgroup2 ", " - tmpfs "),
+        ] {
+            assert!(validate_legacy_cgroup_mount(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn foreign_non_utf8_cgroups_do_not_hide_matching_descendants() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let prefix = "aoe-session-byte-fixture-";
+        for population in [
+            None,
+            Some("populated 0\n"),
+            Some("populated 1\n"),
+            Some("populated unknown\n"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let foreign = root
+                .path()
+                .join(std::ffi::OsStr::from_bytes(b"foreign-\xff.service"));
+            fs::create_dir(&foreign).unwrap();
+            if let Some(population) = population {
+                let scope = foreign.join(format!("{prefix}1700000000000.scope"));
+                fs::create_dir(&scope).unwrap();
+                fs::write(scope.join("cgroup.events"), population).unwrap();
+            }
+            let result = legacy_scope_cgroups_clear(
+                open_cgroup_directory(root.path()).unwrap(),
+                prefix,
+                &std::collections::HashSet::new(),
+            );
+            match population {
+                None | Some("populated 0\n") => assert!(result.unwrap()),
+                Some("populated 1\n") => assert!(!result.unwrap()),
+                _ => assert!(result.is_err()),
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut matching = prefix.as_bytes().to_vec();
+        matching.extend_from_slice(b"\xff.scope");
+        let scope = root.path().join(std::ffi::OsStr::from_bytes(&matching));
+        fs::create_dir(&scope).unwrap();
+        fs::write(scope.join("cgroup.events"), "populated 0\n").unwrap();
+        assert!(legacy_scope_cgroups_clear(
+            open_cgroup_directory(root.path()).unwrap(),
+            prefix,
+            &std::collections::HashSet::new()
+        )
+        .is_err());
+    }
 
     #[test]
     fn existing_managerless_runtime_requires_complete_empty_kernel_inventory() {
@@ -800,11 +878,14 @@ fn kernel_scope_inventory_clear_at(
     let before = directory.metadata()?;
     let after = open_cgroup_directory(root)?.metadata()?;
     validate_physical_cgroup_root(&directory)?;
+    let mount_unchanged = !kernel
+        || validate_legacy_cgroup_mount(&fs::read_to_string("/proc/self/mountinfo")?)?
+            == validate_legacy_cgroup_mount(&mountinfo)?;
     anyhow::ensure!(
         before.dev() == after.dev()
             && before.ino() == after.ino()
             && fs::read_link("/proc/self/ns/cgroup")? == namespace
-            && fs::read_to_string("/proc/self/mountinfo")? == mountinfo,
+            && mount_unchanged,
         "Kernel scope inventory boundary changed during absence proof"
     );
     Ok(clear)
@@ -816,6 +897,7 @@ fn legacy_scope_cgroups_clear(
     retained: &std::collections::HashSet<&str>,
 ) -> anyhow::Result<bool> {
     use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
     let entries = runtime_io::read_directory(root.as_raw_fd())?;
     let mut pending = vec![(root, entries)];
     while let Some((directory, entries)) = pending.last_mut() {
@@ -837,8 +919,10 @@ fn legacy_scope_cgroups_clear(
             nix::sys::stat::Mode::empty(),
         )?
         .into();
-        let name = name.to_str().context("Non-UTF8 cgroup name")?;
-        if name.starts_with(prefix) && name.ends_with(".scope") && !retained.contains(name) {
+        if name.as_bytes().starts_with(prefix.as_bytes())
+            && name.as_bytes().ends_with(b".scope")
+            && !retained.contains(name.to_str().context("Non-UTF8 matching scope name")?)
+        {
             let events = read_cgroup_file(&child, c"cgroup.events")?;
             let mut populated = None;
             for line in events.lines() {
