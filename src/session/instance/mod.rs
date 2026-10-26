@@ -822,6 +822,12 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_pending: Option<String>,
 
+    /// Set by a structured view agent switch. The next terminal handoff then
+    /// runs the new agent's tool with a fresh conversation, and refuses when
+    /// the agent has no terminal tool.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub terminal_rebind_pending: bool,
+
     // Live process state and durable capture-generation guards.
     /// Latest ACP initialize result for session/load. A daemon restart returns
     /// this to unknown until the worker reconnects.
