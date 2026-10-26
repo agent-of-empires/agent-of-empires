@@ -242,7 +242,8 @@ export function NestedGroupList({
             const full =
               fullGroups.find((n) => n.repo.id === repo.id)?.subgroups.find((s) => (s.groupPath ?? "") === groupPath) ??
               sg;
-            const rows = rowsId(`repo:${repo.id}::${groupPath}`);
+            // Each part is encoded, so a `::` inside an id or Group path can't collide.
+            const rows = rowsId(`repo:${encodeURIComponent(repo.id)}::${encodeURIComponent(groupPath)}`);
             return (
               <IndentedLevel key={`${repo.id}::${groupPath}`} testId="sidebar-nested-subgroup" repoId={repo.id}>
                 <GroupHeader
@@ -293,7 +294,7 @@ export function OrgGroupList({
         {(ctx.hasFilter || !org.collapsed) &&
           repos.filter(sidebarGroupShouldRender).map((repo) => {
             const full = fullRepoById.get(`${org.id}::${repo.id}`) ?? repo;
-            const rows = rowsId(`org:${org.id}::${repo.id}`);
+            const rows = rowsId(`org:${encodeURIComponent(org.id)}::${encodeURIComponent(repo.id)}`);
             return (
               <IndentedLevel key={`${org.id}::${repo.id}`} testId="sidebar-org-repo" repoId={repo.id}>
                 <GroupHeader

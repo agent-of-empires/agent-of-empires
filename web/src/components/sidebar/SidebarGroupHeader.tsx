@@ -248,7 +248,11 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
             startRename={() => {
               setRenameValue(group.alias ?? group.defaultDisplayName);
               setRenaming(true);
-              requestAnimationFrame(() => renameRef.current?.select());
+              // select() alone doesn't move focus in every browser.
+              requestAnimationFrame(() => {
+                renameRef.current?.focus();
+                renameRef.current?.select();
+              });
             }}
           />
         </ContextMenu>
