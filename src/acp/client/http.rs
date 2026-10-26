@@ -346,19 +346,10 @@ impl HttpClient {
         plugin_id: &str,
         enabled: bool,
     ) -> Result<(), HttpError> {
-        let url = format!(
-            "{}/api/plugins/{}/enabled",
-            self.endpoint.base_url,
-            path_segment(plugin_id)?
-        );
-        let res = self
-            .execute_elevated(|| {
-                self.http
-                    .post(&url)
-                    .json(&serde_json::json!({ "enabled": enabled }))
-            })
+        let path = format!("/api/plugins/{}/enabled", path_segment(plugin_id)?);
+        let body = serde_json::json!({ "enabled": enabled });
+        self.mutate(reqwest::Method::POST, &path, Some(body))
             .await?;
-        check_global_status(res)?;
         Ok(())
     }
 

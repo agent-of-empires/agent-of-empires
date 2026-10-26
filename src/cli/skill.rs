@@ -30,6 +30,13 @@ pub enum SkillCommands {
     Sync(SkillSyncArgs),
 }
 
+impl SkillCommands {
+    /// Writes go through the Daemon; list and view read local files.
+    pub fn writes(&self) -> bool {
+        !matches!(self, Self::List(_) | Self::View(_))
+    }
+}
+
 #[derive(Args, Debug)]
 pub struct SkillListArgs {
     /// Output machine-readable JSON.

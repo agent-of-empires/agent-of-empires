@@ -377,7 +377,10 @@ async fn run(
             let profile = cli.profile.clone().unwrap_or_default();
             return exit_zero(cli::mcp::run(&profile, command).await);
         }
-        Some(Commands::Skill { command }) => return exit_zero(cli::skill::run(command).await),
+        // Reads need no app data; writes go through the Daemon, which needs migrated data.
+        Some(Commands::Skill { command }) if !command.writes() => {
+            return exit_zero(cli::skill::run(command).await)
+        }
         Some(Commands::Uninstall(args)) => return exit_zero(cli::uninstall::run(args).await),
         Some(Commands::Update(args)) => return exit_zero(cli::update::run(args).await),
         Some(Commands::Migrate(args)) => return exit_zero(cli::migrate::run(&args).await),
@@ -441,6 +444,7 @@ async fn run(
             cli::project::run(&profile, profile_explicit, command).await
         }
         Some(Commands::Worktree { command }) => cli::worktree::run(&profile, command).await,
+        Some(Commands::Skill { command }) => cli::skill::run(command).await,
         Some(Commands::Cityhall { command }) => cli::cityhall::run(command).await,
         Some(Commands::Telemetry { command }) => {
             return exit_zero(cli::telemetry::run(command).await)
