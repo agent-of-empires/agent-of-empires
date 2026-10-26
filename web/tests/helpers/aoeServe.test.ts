@@ -17,13 +17,17 @@ import type * as NativeTimers from "node:timers/promises";
 import { expect, it, vi } from "vitest";
 import { appDirFor, spawnAoeServe, type ServeHandle } from "./aoeServe";
 
-/** A stand-in `aoe` that only answers the harness readiness probe. */
+/** A stand-in `aoe` that answers the harness readiness probe and reports no Daemon to stop. */
 function writeFakeAoe(root: string): string {
   const binary = join(root, "aoe");
   writeFileSync(
     binary,
     `#!${process.execPath}
 const http = require("node:http");
+if (process.argv.includes("--stop")) {
+  console.error("No running daemon found");
+  process.exit(1);
+}
 const port = Number(process.argv[process.argv.indexOf("--port") + 1]);
 http.createServer((_, response) => response.end("{}")).listen(port, "127.0.0.1", () => {
   console.log("http://127.0.0.1:" + port + "/");
