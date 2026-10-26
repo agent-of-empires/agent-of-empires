@@ -113,7 +113,7 @@ const requestCases: RequestCase[] = [
     () => api.updateMachineSettings({ a: 1 }),
     { body: { a: 1 }, result: "committed" },
   ],
-  ["PATCH /api/theme", () => api.updateTheme({ name: "dracula" }), { body: { name: "dracula" }, result: true }],
+  ["PATCH /api/theme", () => api.updateTheme({ name: "dracula" }), { body: { name: "dracula" }, result: "committed" }],
   ["GET /api/app-state/web-ui-state", () => api.getWebUiState(), { respond: json({ k: "v" }), result: { k: "v" } }],
   [
     "PATCH /api/app-state/web-ui-state",
@@ -1313,6 +1313,14 @@ describe("deleteWorkspace errors", () => {
       ok: false,
       error: "Server did not confirm which sessions were deleted",
     });
+  });
+
+  it("carries the busy list on a partial 200 and on the all-busy 409", async () => {
+    const busy = [{ id: "b", error: "busy with restore" }];
+    fetchSpy.mockResolvedValueOnce(json({ status: "partial", deleted: ["a"], kept: [], failed: [], busy }));
+    expect(await api.deleteWorkspace(["a", "b"])).toEqual({ ok: true, deleted: ["a"], kept: [], failed: [], busy });
+    fetchSpy.mockResolvedValueOnce(json({ error: "lifecycle_busy", message: "busy", busy }, 409));
+    expect(await api.deleteWorkspace(["b"])).toEqual({ ok: false, error: "busy", busy });
   });
 
   it("maps server and network errors", async () => {

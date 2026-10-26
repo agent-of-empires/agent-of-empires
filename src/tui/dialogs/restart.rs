@@ -245,11 +245,11 @@ impl RestartDialog {
     }
 
     fn next_field(&mut self) {
-        self.focused_field = (self.focused_field + 1) % 2;
+        self.focused_field = super::cycle_focus(self.focused_field, 2, false);
     }
 
     fn prev_field(&mut self) {
-        self.focused_field = if self.focused_field == 0 { 1 } else { 0 };
+        self.focused_field = super::cycle_focus(self.focused_field, 2, true);
     }
 
     fn is_profile_field(&self) -> bool {

@@ -1127,14 +1127,11 @@ export function updateMachineSettings(updates: Record<string, unknown>): Promise
  * Sets the global theme (name and/or color mode). Dedicated endpoint, not
  * `PATCH /api/settings`: the theme is a global preference but cosmetic, so it
  * must not trip the passphrase/elevation wall the general settings surface
- * carries. Returns false on read-only servers (403) or network failure.
+ * carries. `rejected` on read-only servers (403); `uncertain` on a network
+ * failure or 5xx, where the write may still have landed.
  */
-export async function updateTheme(patch: { name?: string; color_mode?: string }): Promise<boolean> {
-  try {
-    return await fetchOk("/api/theme", jsonInit("PATCH", patch));
-  } catch {
-    return false;
-  }
+export function updateTheme(patch: { name?: string; color_mode?: string }): Promise<SaveOutcome> {
+  return announceOutcome(sendSave("/api/theme", jsonInit("PATCH", patch)));
 }
 
 /**
@@ -1488,6 +1485,9 @@ export function isDebugBuild(about: ServerAbout | null | undefined): boolean {
 }
 export type UpdateCheckMode = "auto" | "notify" | "off";
 
+/** How the Daemon's own binary was installed. */
+export type InstallMethod = "homebrew" | "release" | "cargo" | "nix" | "unknown";
+
 export interface UpdateStatus {
   update_check_mode: UpdateCheckMode;
   current_version: string;
@@ -1498,6 +1498,10 @@ export interface UpdateStatus {
   /** Version the user already dismissed the banner for, persisted server-side
    *  in app_state so the acknowledgement is once-per-account, not per device. */
   dismissed_version: string | null;
+  /** Absent from an older Daemon; treated as "unknown". */
+  install_method?: InstallMethod;
+  /** What to run on the Daemon's machine to update; absent alongside `install_method`. */
+  update_command?: string;
 }
 
 export function fetchUpdateStatus(): Promise<UpdateStatus | null> {
@@ -1806,26 +1810,45 @@ export interface InstallAgentResponse {
   recovered_sessions: number;
 }
 
-/** Run `npm install -g` for the session's agent on the host. Opt-in and
- *  hardened server-side (see `install_agent` in src/server/api/acp.rs).
- *  Resolves with the parsed body on 2xx; throws with the server's error
- *  message on failure (disabled, sandboxed, not npm-installable, npm
- *  missing) so the caller can surface why. The caller respawns the worker
- *  separately via `useRespawnSession` on `success`. */
+/** A refused install; `code` is the server's error code, such as `npm_missing`. */
+export class InstallAgentError extends Error {
+  readonly code: string | undefined;
+  constructor(message: string, code: string | undefined) {
+    super(message);
+    this.code = code;
+  }
+}
+
+/** Run `npm install -g` for the session's agent where it runs; throws `InstallAgentError` when refused. */
 export async function installAcpAgent(sessionId: string): Promise<InstallAgentResponse> {
   const { ok, status, payload } = await send(`/api/sessions/${encodeURIComponent(sessionId)}/acp/install-agent`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
   });
-  if (!ok) throw new Error(rawMessage(payload) || (payload?.error as string) || `Server returned ${status}`);
+  if (!ok) {
+    const code = stringField(payload, "error");
+    throw new InstallAgentError(rawMessage(payload) || code || `Server returned ${status}`, code);
+  }
   if (!payload) throw new Error("Server returned an invalid or empty response");
   return payload as unknown as InstallAgentResponse;
 }
 
-/** Fetch a markdown primer built from events `seq < beforeSeq`. Used
- *  after a `session/load` failure: the agent's model context is empty
- *  but the transcript is intact in SQLite, so the user can opt in to
- *  pre-filling the composer with a compact recap. See #1004. */
+/** How to install a session's ACP adapter, from `GET /acp/install-info`. */
+export interface AgentInstallInfo {
+  agent: string;
+  display_name: string;
+  install_command: string | null;
+  npm_installable: boolean;
+  /** Whether `install-agent` would accept a request now. */
+  install_allowed: boolean;
+  sandboxed: boolean;
+}
+
+export function fetchAgentInstallInfo(sessionId: string): Promise<AgentInstallInfo | null> {
+  return fetchJson<AgentInstallInfo>(`/api/sessions/${encodeURIComponent(sessionId)}/acp/install-info`);
+}
+
+/** Markdown recap of events `seq < beforeSeq`, offered after a `session/load` failure. */
 export function fetchContextPrimer(
   sessionId: string,
   beforeSeq: number,
@@ -1908,8 +1931,10 @@ export async function browseFilesystem(
   return { ...data, ok: true };
 }
 
-export async function fetchGroups(): Promise<GroupInfo[]> {
-  return (await fetchJson<GroupInfo[]>("/api/groups")) ?? [];
+/** The profile's groups, sorted by path; the served profile when omitted. */
+export async function fetchGroups(profile?: string): Promise<GroupInfo[]> {
+  const query = profile ? `?profile=${encodeURIComponent(profile)}` : "";
+  return (await fetchJson<GroupInfo[]>(`/api/groups${query}`)) ?? [];
 }
 
 /** Resolve a plugin `dynamic_select` widget's options from the host (#2897).
@@ -2829,6 +2854,9 @@ export interface WorkspaceDeleteFailure {
   error: string;
 }
 
+/** Another lifecycle operation holds the session; nothing changed, retry later. */
+export type WorkspaceDeleteBusy = WorkspaceDeleteFailure;
+
 export interface DeleteWorkspaceResult {
   ok: boolean;
   error?: string;
@@ -2838,6 +2866,8 @@ export interface DeleteWorkspaceResult {
   kept?: string[];
   /** Sessions that could not be deleted, with their error. */
   failed?: WorkspaceDeleteFailure[];
+  /** Sessions skipped because another operation holds them. */
+  busy?: WorkspaceDeleteBusy[];
 }
 
 /** Delete siblings before their shared-worktree owner under the selected consent. */
@@ -2853,12 +2883,14 @@ export async function deleteWorkspace(
       deleted?: string[];
       kept?: string[];
       failed?: WorkspaceDeleteFailure[];
+      busy?: WorkspaceDeleteBusy[];
     };
     if (!res.ok) {
       return {
         ok: false,
         error: data.message || `Server error (${res.status})`,
         failed: data.failed,
+        busy: data.busy,
       };
     }
     // The endpoint always reports which sessions it removed. A 2xx without a
@@ -2868,7 +2900,14 @@ export async function deleteWorkspace(
     if (!Array.isArray(data.deleted)) {
       return { ok: false, error: "Server did not confirm which sessions were deleted" };
     }
-    return { ok: true, messages: data.messages, deleted: data.deleted, kept: data.kept, failed: data.failed };
+    return {
+      ok: true,
+      messages: data.messages,
+      deleted: data.deleted,
+      kept: data.kept,
+      failed: data.failed,
+      busy: data.busy,
+    };
   } catch (e) {
     return {
       ok: false,

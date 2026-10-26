@@ -15,7 +15,7 @@
         "web/src/components/command-palette/CommandPalette.tsx",
         "web/src/components/settings/PluginJobProgressModal.tsx"
       ],
-      "notes": "Real Escape keys dismiss uninstall, plugin details and its nested lightbox, and Web dashboard disable confirmation without leaving Settings or issuing a mutation; Escape in the command palette preserves the underlying uninstall confirmation; Escape without a dialog still closes Settings. Running plugin jobs retain their dialog; successful, failed and missing jobs dismiss through the existing close callback and reload plugins without leaving Settings. The command palette retains Escape priority over a completed job."
+      "notes": "Real Escape keys dismiss uninstall, plugin details and its nested lightbox, and Web dashboard disable confirmation without leaving Settings or issuing a mutation; Escape in the command palette preserves the underlying uninstall confirmation; Escape without a dialog still closes Settings. Running plugin jobs retain their dialog; successful, failed and missing jobs dismiss through the existing close callback and reload plugins without leaving Settings. The command palette retains Escape priority over a completed job. About opened over an uninstall confirmation wraps Tab and Shift+Tab inside itself, so the first Escape closes only About."
     },
     {
       "id": "terminal.paired-shell",
@@ -147,7 +147,7 @@
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/components/__tests__/DashboardUpdateBanner.test.tsx", "src/lib/webBuildId.test.ts"],
-      "components": ["web/src/components/DashboardUpdateBanner.tsx"]
+      "components": ["web/src/components/DashboardUpdateBanner.tsx", "web/src/hooks/useDashboardUpdate.ts"]
     },
     {
       "id": "app-shell.loading-skeleton",
@@ -590,6 +590,16 @@
       ]
     },
     {
+      "id": "settings.field-deep-link",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/__tests__/SettingsView.navigation.test.tsx",
+        "src/components/__tests__/SettingsView.schema-load.test.tsx"
+      ],
+      "components": ["web/src/components/SettingsView.tsx", "web/src/App.tsx"]
+    },
+    {
       "id": "settings.tui-only-fold",
       "kind": "vitest",
       "risk": "low",
@@ -893,7 +903,12 @@
       "id": "notifications.status-sounds",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/lib/statusSounds.test.ts", "src/hooks/useStatusSounds.test.ts"],
+      "specs": [
+        "src/lib/statusSounds.test.ts",
+        "src/hooks/useStatusSounds.test.ts",
+        "src/hooks/useSessionStatusStream.test.ts",
+        "src/hooks/useSessions.test.ts"
+      ],
       "components": ["web/src/lib/statusSounds.ts", "web/src/hooks/useStatusSounds.ts", "web/src/lib/soundPlayer.ts"]
     },
     {
@@ -947,7 +962,11 @@
       "id": "sidebar.terminal-focus-handoff",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/terminal-focus-shortcut.spec.ts", "src/hooks/useKeyboardShortcuts.test.ts"],
+      "specs": [
+        "tests/terminal-focus-shortcut.spec.ts",
+        "tests/acp-retained-focus-sidebar-nav.spec.ts",
+        "src/hooks/useKeyboardShortcuts.test.ts"
+      ],
       "components": [
         "web/src/App.tsx",
         "web/src/components/WorkspaceSidebar.tsx",
@@ -1864,8 +1883,14 @@
       "id": "sidebar.reorder-click-after-drag-suppressed",
       "kind": "mocked-playwright",
       "risk": "high",
-      "specs": ["tests/sidebar-reorder.spec.ts"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+      "specs": ["tests/sidebar-reorder.spec.ts", "src/components/sidebar/dnd.test.ts"],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/SidebarGroupHeader.tsx",
+        "web/src/components/sidebar/dnd.ts",
+        "web/src/components/sidebar/Sortable.tsx"
+      ],
+      "notes": "End, cancel and mid-drag unmount suppress only the release click; a fresh press disarms the guard. Browser regressions observe installation and removal of the sensor click listener before one deliberate click, without a fixed delay or click retries."
     },
     {
       "id": "sidebar.reorder-cross-group-noop",
@@ -2178,6 +2203,7 @@
         "web/src/App.tsx",
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/EmptyTrashConfirm.tsx",
+        "web/src/lib/api.ts",
         "web/src/lib/trashActions.ts"
       ]
     },
@@ -2272,6 +2298,14 @@
       "notes": "A prompt a plugin sent through sessions.message.send carries a \"Sent by plugin\" label instead of passing for the user's own; the server stamps the sender on the row, and Send now on a queued row names it so the daemon keeps that sender."
     },
     {
+      "id": "acp.agent-message-boundaries",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/acp/activityMessages.test.ts", "tests/live/acp-transcript.spec.ts"],
+      "components": ["web/src/components/acp/activityMessages.ts", "web/src/lib/acpTypes.ts"],
+      "notes": "Back-to-back agent messages render as separate paragraphs: the server marks the row that opens a new ACP message (message_start), and only that mark breaks the text, so one streamed message never splits mid-word."
+    },
+    {
       "id": "acp.tool-group-chunking",
       "kind": "vitest",
       "risk": "medium",
@@ -2346,9 +2380,10 @@
         "web/src/components/diff/comments/SendCommentsDialog.tsx",
         "web/src/lib/paneLayout.ts",
         "web/src/components/ContentSplit.tsx",
-        "web/src/App.tsx"
+        "web/src/App.tsx",
+        "web/src/hooks/useDiffFiles.ts"
       ],
-      "notes": "Holding the first canonical session list through the diff-files effect leaves no persisted layout while the session is unknown. Releasing it pins Terminal but not Diff for a non-git session; explicitly opening Diff shows the neutral non-git message without a repository error."
+      "notes": "Holding the first canonical session list through the diff-files effect leaves no persisted layout while the session is unknown. Releasing it pins Terminal but not Diff for a non-git session; explicitly opening Diff shows the neutral non-git message without a repository error. useDiffFiles.test.ts holds the next session's response and asserts the previous session's repository state is cleared (#4847)."
     },
     {
       "id": "right-panel.markdown-viewer",
@@ -2649,6 +2684,13 @@
       "components": ["web/src/components/ConnectedDevices.tsx"]
     },
     {
+      "id": "connectivity.update-banner-how-to-update",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/update-banner.spec.ts", "src/components/__tests__/UpdateBanner.test.tsx"],
+      "components": ["web/src/components/UpdateBanner.tsx"]
+    },
+    {
       "id": "connectivity.banner-stack",
       "kind": "vitest",
       "risk": "medium",
@@ -2663,7 +2705,9 @@
         "web/src/components/DisconnectBanner.tsx",
         "web/src/components/UpdateBanner.tsx",
         "web/src/components/DashboardUpdateBanner.tsx",
-        "web/src/components/PushHealthBanner.tsx"
+        "web/src/components/PushHealthBanner.tsx",
+        "web/src/hooks/useConnectionBanner.ts",
+        "web/src/hooks/useUpdateBanner.ts"
       ]
     },
     {
@@ -3485,18 +3529,57 @@
       "components": ["web/src/components/acp/ToolErrorBody.tsx"]
     },
     {
+      "id": "acp.startup-wait-line",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/acp/__tests__/SessionBanners.test.tsx",
+        "src/components/acp/startupWait.test.ts",
+        "src/lib/agentDisplayName.test.ts",
+        "src/components/acp/SystemNotices.test.tsx",
+        "src/components/acp/QueuedPromptsStrip.test.tsx",
+        "src/components/acp/SendButton.test.tsx",
+        "tests/acp-startup-wait.spec.ts"
+      ],
+      "components": [
+        "web/src/components/acp/startupWait.ts",
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/SessionBanners.tsx",
+        "web/src/components/acp/SystemNotices.tsx",
+        "web/src/components/acp/PromptStrips.tsx",
+        "web/src/components/acp/ComposerControls.tsx"
+      ],
+      "notes": "A new Session shows one startup line naming the Agent with an elapsed count, switching to a neutral line at 15s with no duration or delivery promise; the queued strip and Send button say what they wait for. Reduced motion holds one breathe frame. First-dial backoff keeps the startup line; exhausted retries stop it and expose Reconnect even before the first successful connection. The disconnected new-Session Send and Queue follow-up labels and titles use Pending until the Agent is ready; connected Send and resumed-Session copy remain unchanged."
+    },
+    {
       "id": "acp.startup-error-screen",
       "kind": "vitest",
       "risk": "high",
+      "notes": "Changed descriptive text uses text-text-subtle, with no text-text-secondary or text-text-dim classes, asserted across installable, install-off and sandboxed states.",
       "specs": ["src/components/acp/__tests__/StartupErrorScreen.test.tsx"],
-      "components": ["web/src/components/acp/StartupErrorScreen.tsx"]
+      "components": ["web/src/components/acp/StartupErrorScreen.tsx", "web/src/components/acp/RecoveryActionRow.tsx"]
     },
     {
       "id": "acp.startup-error-banner",
       "kind": "vitest",
       "risk": "high",
       "specs": ["src/components/acp/__tests__/StartupErrorBanner.test.tsx"],
-      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/StartupErrorBanner.tsx"]
+      "components": [
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/StartupErrorBanner.tsx",
+        "web/src/components/acp/RecoveryActionRow.tsx"
+      ]
+    },
+    {
+      "id": "acp.startup-error-banner-actions",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/acp-startup-error-banner.spec.ts"],
+      "components": [
+        "web/src/components/acp/StartupErrorBanner.tsx",
+        "web/src/components/acp/RecoveryActionRow.tsx",
+        "web/src/App.tsx"
+      ]
     },
     {
       "id": "acp.startup-error-banner-live",
@@ -3879,7 +3962,8 @@
       "components": [
         "web/src/components/settings/SchemaSection.tsx",
         "web/src/components/SettingsView.tsx",
-        "web/src/hooks/useResolvedTheme.ts"
+        "web/src/hooks/useResolvedTheme.ts",
+        "web/src/lib/themeWrites.ts"
       ]
     },
     {
@@ -4349,9 +4433,10 @@
     {
       "id": "story.wizard-group-field",
       "kind": "mocked-playwright",
-      "risk": "low",
-      "specs": ["tests/wizard.spec.ts"],
-      "components": ["web/src/components/session-wizard/steps/WorktreePanel.tsx"]
+      "risk": "medium",
+      "specs": ["tests/wizard.spec.ts", "src/components/session-wizard/__tests__/GroupCombobox.test.tsx"],
+      "components": ["web/src/components/session-wizard/steps/GroupCombobox.tsx"],
+      "notes": "The Group field reads the selected canonical daemon profile and counts only non-archived, non-trashed sessions. Selecting a create row commits its displayed trimmed path; Esc and blur keep typed text. The popup opens upward inside the sheet when needed."
     },
     {
       "id": "story.wizard-extra-repos",
@@ -4634,7 +4719,26 @@
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/Dock.tsx",
         "web/src/components/acp/Composer.tsx",
-        "web/src/components/SettingsView.tsx"
+        "web/src/components/SettingsView.tsx",
+        "web/src/components/settings/SettingsIntro.tsx"
+      ]
+    },
+    {
+      "id": "onboarding.settings-tab-intros",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": [
+        "src/components/__tests__/SettingsView.intros.test.tsx",
+        "src/components/settings/__tests__/SettingsIntro.test.tsx",
+        "src/hooks/useTour.test.tsx",
+        "src/lib/__tests__/webUiSync.test.ts"
+      ],
+      "components": [
+        "web/src/components/settings/SettingsIntro.tsx",
+        "web/src/components/SettingsView.tsx",
+        "web/src/lib/settingsIntros.ts",
+        "web/src/lib/webUiSync.ts",
+        "web/src/hooks/useTour.tsx"
       ]
     },
     {
@@ -4672,7 +4776,11 @@
       "kind": "vitest",
       "risk": "low",
       "specs": ["src/components/onboarding/__tests__/ThemeIntro.test.tsx", "src/lib/__tests__/onboarding.test.ts"],
-      "components": ["web/src/components/onboarding/ThemeIntro.tsx", "web/src/hooks/useThemeMutation.ts"]
+      "components": [
+        "web/src/components/onboarding/ThemeIntro.tsx",
+        "web/src/hooks/useThemeMutation.ts",
+        "web/src/lib/themeWrites.ts"
+      ]
     },
     {
       "id": "shortcuts.single-source",
@@ -4924,6 +5032,18 @@
         "web/src/lib/api.ts"
       ],
       "notes": "Browser: isolated serve publishes advancing native epoch revision receipts for color and notifications. Uses the isolated spawnServe fixture; native HTTP receipts and canonical persistence are asserted, then a page reload verifies the sidebar without pending overlays."
+    },
+    {
+      "id": "selected-item-contrast",
+      "kind": "deferred",
+      "issue": "https://github.com/agent-of-empires/agent-of-empires/issues/4898",
+      "risk": "low",
+      "reason": "Styling-only selected-item fill; contrast is pinned across built-in themes by the Rust builtins_clear_contrast_floors test.",
+      "components": [
+        "web/src/components/acp/SessionConfigControls.tsx",
+        "web/src/components/profiles/ProfilesSection.tsx",
+        "web/src/components/sidebar/SessionRowMenu.tsx"
+      ]
     }
   ]
 }

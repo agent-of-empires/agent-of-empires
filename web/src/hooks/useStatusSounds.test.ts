@@ -29,7 +29,7 @@ const ENABLED = {
 };
 
 let played: string[] = [];
-let view: RenderHookResult<void, { s: SessionResponse[] }>;
+let view: RenderHookResult<ReturnType<typeof useStatusSounds>, { s: SessionResponse[] }>;
 
 class FakeAudio {
   volume = 1;
@@ -93,6 +93,89 @@ describe("useStatusSounds", () => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+  });
+
+  it("plays a server cue without waiting for a refresh, and the next refresh does not repeat it", async () => {
+    mount([at("a", "Running")]);
+    await step([at("a", "Waiting")]);
+    act(() => view.result.current.onSoundDue("a", "waiting"));
+    await vi.waitFor(() => expect(played).toEqual(["blob:0"]));
+    await step([at("a", "Waiting")]);
+    await step([at("a", "Waiting")]);
+    await vi.waitFor(() => expect(fetchSoundBlob).toHaveBeenCalledTimes(1));
+    expect(played).toHaveLength(1);
+  });
+
+  it("replays a cue that arrived before the refreshed list, without waiting for another poll", async () => {
+    mount([at("a", "Running")]);
+    // The reconnect snapshot is still in flight, so the list still shows the stale status.
+    act(() => view.result.current.onSoundDue("a", "idle"));
+    await step([at("a", "Idle")]);
+    await vi.waitFor(() => expect(played).toHaveLength(1));
+    await step([at("a", "Idle")]);
+    await step([at("a", "Idle")]);
+    expect(fetchSoundBlob).toHaveBeenCalledTimes(1);
+    expect(played).toHaveLength(1);
+  });
+
+  it("keeps a cue across a stale snapshot, and drops it once the session moves to another status", async () => {
+    mount([at("a", "Running"), at("b", "Running")]);
+    act(() => {
+      view.result.current.onSoundDue("a", "idle");
+      view.result.current.onSoundDue("b", "idle");
+    });
+    await step([at("a", "Running"), at("b", "Running")]);
+    await step([at("a", "Idle"), at("b", "Error")]);
+    await vi.waitFor(() => expect(played).toHaveLength(1));
+    expect(fetchSoundBlob.mock.calls.map(([name]) => name)).toEqual(["done"]);
+    // b's cue is gone: going Idle later waits for its own dwell instead of sounding at once.
+    await step([at("a", "Idle"), at("b", "Idle")]);
+    expect(played).toHaveLength(1);
+  });
+
+  it("drops a held cue when a status push starts a new interval", async () => {
+    mount([at("a", "Running")]);
+    act(() => view.result.current.onSoundDue("a", "idle")); // held against the stale Running row
+    act(() => view.result.current.cancelCue("a")); // a Running push leaves the row unchanged
+    await step([at("a", "Running")]);
+    await step([at("a", "Idle")]); // the new Idle interval has not dwelt yet
+    await expectOnlyProbeSounds([at("a", "Idle")]);
+  });
+
+  it("stays silent for a late cue about a session first seen by the refreshed list", async () => {
+    mount([at("a", "Running")]);
+    act(() => view.result.current.onSoundDue("new", "waiting"));
+    await step([at("a", "Running"), at("new", "Waiting")]);
+    await expectOnlyProbeSounds([at("a", "Running"), at("new", "Waiting")]);
+  });
+
+  it("plays one sound when several sessions cue the same event together, and a later cue still sounds", async () => {
+    mount([at("a", "Running"), at("b", "Running"), at("c", "Running")]);
+    await step([at("a", "Idle"), at("b", "Idle"), at("c", "Idle")]);
+    act(() => {
+      view.result.current.onSoundDue("a", "idle");
+      view.result.current.onSoundDue("b", "idle");
+    });
+    await vi.waitFor(() => expect(played).toHaveLength(1));
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+    });
+    act(() => view.result.current.onSoundDue("c", "idle"));
+    await vi.waitFor(() => expect(played).toHaveLength(2));
+  });
+
+  it("cues a reconnect mid-dwell once, and stays silent for a status that was there at load", async () => {
+    mount([at("old", "Waiting"), at("a", "Running")]);
+    await step([at("old", "Waiting"), at("a", "Waiting")]);
+    // A new socket's seeded cues: one for the observed transition, one for the baseline status.
+    act(() => {
+      view.result.current.onSoundDue("a", "waiting");
+      view.result.current.onSoundDue("old", "waiting");
+      view.result.current.onSoundDue("a", "waiting");
+    });
+    await vi.waitFor(() => expect(played).toHaveLength(1));
+    await step([at("old", "Waiting"), at("a", "Waiting")]);
+    expect(played).toHaveLength(1);
   });
 
   it("plays the idle sound once a session settles into Idle", async () => {

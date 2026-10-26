@@ -31,6 +31,23 @@ function mount() {
 type ActionName = keyof ShortcutActions;
 
 describe("useKeyboardShortcuts", () => {
+  it.each([
+    ["an open field that owns Escape keeps it for its list", true, "true", 0],
+    ["the same field closed lets Escape close the surface", true, "false", 1],
+    ["any other open combobox, such as the palette's, doesn't", false, "true", 1],
+  ])("%s", (_label, owns, expanded, calls) => {
+    const { actions, unmount } = mount();
+    const field = document.createElement("input");
+    field.setAttribute("role", "combobox");
+    if (owns) field.setAttribute("data-owns-escape", "");
+    field.setAttribute("aria-expanded", expanded);
+    document.body.append(field);
+    dispatch(field, { key: "Escape" });
+    expect(actions.onEscape).toHaveBeenCalledTimes(calls);
+    field.remove();
+    unmount();
+  });
+
   it.each<[string, KeyboardEventInit, ActionName | null, ActionName | null]>([
     [
       "Ctrl+Alt+B toggles the right panel, not the sidebar",

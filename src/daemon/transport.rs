@@ -50,13 +50,12 @@ pub(crate) fn prepare_runtime_directory(parent: &Path) -> anyhow::Result<()> {
     if let Some(app_dir) = parent.parent() {
         drop_group_other_write(app_dir, owner)?;
     }
-    let private_gid = user_private_gid(owner);
     for ancestor in parent.ancestors() {
         let meta = std::fs::symlink_metadata(ancestor)?;
         if meta.is_dir()
             && meta.uid() == owner
             && meta.mode() & 0o022 != 0
-            && !trusted_ancestor(meta.uid(), meta.gid(), meta.mode(), owner, private_gid)
+            && !trusted_ancestor(meta.uid(), meta.mode(), owner)
         {
             if ancestor == parent {
                 return Err(directory_permission_error(
@@ -74,7 +73,7 @@ pub(crate) fn prepare_runtime_directory(parent: &Path) -> anyhow::Result<()> {
         anyhow::ensure!(
             meta.is_dir()
                 && !meta.file_type().is_symlink()
-                && trusted_ancestor(meta.uid(), meta.gid(), meta.mode(), owner, private_gid),
+                && trusted_ancestor(meta.uid(), meta.mode(), owner),
             "Unsafe daemon socket directory: {}",
             ancestor.display()
         );
@@ -122,24 +121,9 @@ fn drop_group_other_write(dir: &Path, owner: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Accept only same-name user-private primary groups without extra members.
-pub(crate) fn user_private_gid(owner: u32) -> Option<u32> {
-    use nix::unistd::{Group, Uid, User};
-    let user = User::from_uid(Uid::from_raw(owner)).ok()??;
-    let group = Group::from_gid(user.gid).ok()??;
-    (group.name == user.name && group.mem.is_empty()).then(|| user.gid.as_raw())
-}
-
-pub(crate) fn trusted_ancestor(
-    uid: u32,
-    gid: u32,
-    mode: u32,
-    owner: u32,
-    private_gid: Option<u32>,
-) -> bool {
+pub(crate) fn trusted_ancestor(uid: u32, mode: u32, owner: u32) -> bool {
     let trusted_sticky = uid == 0 && mode & 0o1000 != 0;
-    let private_group_write = uid == owner && mode & 0o002 == 0 && private_gid == Some(gid);
-    (uid == owner || uid == 0) && (mode & 0o022 == 0 || trusted_sticky || private_group_write)
+    (uid == owner || uid == 0) && (mode & 0o022 == 0 || trusted_sticky)
 }
 
 pub(crate) async fn connect_unix(path: &Path) -> Result<tokio::net::UnixStream, DaemonClientError> {
@@ -413,24 +397,21 @@ mod tests {
     }
 
     #[test]
-    fn ancestor_trust_allows_only_owner_private_or_sticky_writes() {
+    fn ancestor_trust_allows_only_owner_or_root_sticky_writes() {
         const ME: u32 = 1000;
-        const PRIVATE: Option<u32> = Some(1000);
         let cases = [
-            (ME, 1000, 0o755, PRIVATE, true),
-            (ME, 1000, 0o775, PRIVATE, true),
-            (ME, 1000, 0o775, None, false),
-            (ME, 100, 0o775, PRIVATE, false),
-            (ME, 1000, 0o777, PRIVATE, false),
-            (0, 0, 0o1777, PRIVATE, true),
-            (0, 1000, 0o775, PRIVATE, false),
-            (2000, 2000, 0o755, PRIVATE, false),
+            (ME, 0o755, true),
+            (ME, 0o775, false),
+            (ME, 0o777, false),
+            (0, 0o1777, true),
+            (0, 0o775, false),
+            (2000, 0o755, false),
         ];
-        for (uid, gid, mode, private_gid, expected) in cases {
+        for (uid, mode, expected) in cases {
             assert_eq!(
-                trusted_ancestor(uid, gid, mode, ME, private_gid),
+                trusted_ancestor(uid, mode, ME),
                 expected,
-                "uid={uid} gid={gid} mode={mode:o} private={private_gid:?}"
+                "uid={uid} mode={mode:o}"
             );
         }
     }

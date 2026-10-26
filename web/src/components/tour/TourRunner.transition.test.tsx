@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, render, waitFor } from "@testing-library/react";
+import { act, cleanup, render } from "@testing-library/react";
 import TourRunner from "./TourRunner";
 import { TOUR_RUNNER_OPTIONS, TOUR_RUNNER_STYLES } from "./tourRunnerStyles";
 import { TOUR_ANCHORS, type TourStep } from "../../lib/tourSteps";
@@ -53,14 +53,6 @@ const dashStep2: TourStep = {
   title: "t2",
   body: "b2",
 };
-const worktreeStep: TourStep = {
-  id: "settings-worktree",
-  anchor: TOUR_ANCHORS.settingsWorktree,
-  settingsTab: "worktree",
-  scopes: ["dashboard"],
-  title: "wt",
-  body: "wt body",
-};
 
 afterEach(() => {
   cleanup();
@@ -71,42 +63,19 @@ describe("TourRunner controlled transitions", () => {
   const stepIndex = (api: ReturnType<typeof render>) => api.getByTestId("joyride").getAttribute("data-step-index");
   const renderTour = (steps: TourStep[], anchors: string[]) => {
     anchors.forEach(addAnchor);
-    const onNavigate = vi.fn();
     const onFinish = vi.fn();
-    const api = render(<TourRunner run steps={steps} onFinish={onFinish} onNavigate={onNavigate} />);
-    return { api, onNavigate, onFinish };
+    const api = render(<TourRunner run steps={steps} onFinish={onFinish} />);
+    return { api, onFinish };
   };
   const twoDash = () => renderTour([dashStep, dashStep2], [TOUR_ANCHORS.topbar, TOUR_ANCHORS.dashboardNewSession]);
 
-  it("navigates, suspends, and remounts at the new index across a settings crossing, both ways", async () => {
-    const { api, onNavigate } = renderTour([dashStep, worktreeStep], [TOUR_ANCHORS.topbar]);
-    expect(stepIndex(api)).toBe("0");
-
+  it("advances between steps and marks seen when the tour is skipped", () => {
+    const { api, onFinish } = twoDash();
     fire({ type: "step:after", index: 0, action: "next", status: "" });
-    expect(onNavigate).toHaveBeenCalledWith("worktree");
-    expect(api.queryByTestId("joyride")).toBeNull();
-    addAnchor(TOUR_ANCHORS.settingsWorktree);
-    await waitFor(() => expect(api.queryByTestId("joyride")).not.toBeNull());
     expect(stepIndex(api)).toBe("1");
-
     fire({ type: "step:after", index: 1, action: "prev", status: "" });
-    expect(onNavigate).toHaveBeenLastCalledWith(null);
-    expect(api.queryByTestId("joyride")).toBeNull();
-    await waitFor(() => expect(api.queryByTestId("joyride")).not.toBeNull());
     expect(stepIndex(api)).toBe("0");
-  });
-
-  it("does not navigate or suspend between two dashboard steps", () => {
-    const { api, onNavigate } = twoDash();
-    fire({ type: "step:after", index: 0, action: "next", status: "" });
-    expect(onNavigate).not.toHaveBeenCalled();
-    expect(stepIndex(api)).toBe("1");
-  });
-
-  it("closes settings and marks seen when the tour ends on a settings step", () => {
-    const { onNavigate, onFinish } = renderTour([worktreeStep], [TOUR_ANCHORS.settingsWorktree]);
     fire({ type: "tour:end", index: 0, action: "skip", status: "skipped" });
-    expect(onNavigate).toHaveBeenCalledWith(null);
     expect(onFinish).toHaveBeenCalledWith(true);
   });
 

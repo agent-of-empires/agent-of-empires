@@ -15,6 +15,7 @@ use crate::cli::serve::{read_serve_urls, ServeUrl};
 use crate::tui::components::hover::HoverState;
 use crate::tui::dialogs::{contains, hit, target_rects};
 use crate::tui::styles::Theme;
+use crate::tui::worker::Worker;
 use daemon::*;
 
 const TUNNEL_STARTUP_TIMEOUT_SECS: u64 = 60;
@@ -141,7 +142,51 @@ fn expire_flash(flash: &mut Flash) -> bool {
     expired
 }
 
+/// What a probe checks; each shells out to `ps` on macOS, so it runs on a worker.
+enum Probe {
+    /// A web daemon is running.
+    WebDaemon,
+    /// Any daemon is running.
+    Daemon,
+}
+
+fn run_probe(probe: Probe) -> bool {
+    match probe {
+        Probe::WebDaemon => crate::cli::serve::web_daemon_pid().is_some(),
+        Probe::Daemon => crate::cli::serve::daemon_pid().is_some(),
+    }
+}
+
+/// Probes run one at a time on a worker. Each carries an attempt id, and a result applies
+/// only while the state it was requested for is still waiting on that attempt.
+struct Probes {
+    worker: Worker<(u64, Probe), (u64, bool)>,
+    last_attempt: u64,
+    /// The in-flight liveness probe for `Starting`.
+    liveness: Option<u64>,
+}
+
+impl Probes {
+    fn new(mut handler: impl FnMut(Probe) -> bool + Send + 'static) -> Self {
+        Self {
+            worker: Worker::spawn("aoe-serve-dialog-probe", move |(attempt, probe)| {
+                (attempt, handler(probe))
+            }),
+            last_attempt: 0,
+            liveness: None,
+        }
+    }
+
+    fn request(&mut self, probe: Probe) -> u64 {
+        self.last_attempt += 1;
+        self.worker.request((self.last_attempt, probe));
+        self.last_attempt
+    }
+}
+
 enum ServeViewState {
+    /// Waiting on the probe that decides between reattaching and the mode picker.
+    Checking { attempt: u64 },
     ModePicker {
         selected: ServeMode,
         tunnel_available: bool,
@@ -272,6 +317,197 @@ impl ServeMouse {
     }
 }
 
+/// What a restart does to the link a Device opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkChange {
+    Same,
+    /// The link changes, but the Device's cookies still let it in: another port (cookies are
+    /// host-only, not per port), or a new token behind a passphrase sign-in.
+    Moved,
+    /// The Device's cookies no longer let it in: another host, which they are not sent to, or
+    /// a new token that the `aoe_token` cookie of a token-only Device doesn't match.
+    Replaced,
+}
+
+/// What a restart does to passphrase sign-ins on an unchanged host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Logins {
+    /// No passphrase wall, or the sign-ins persist across the restart.
+    Kept,
+    /// The next start doesn't persist them, or the running daemon only held them in memory.
+    Lost,
+    /// A reattached daemon's login persistence is unknown.
+    Unknown,
+}
+
+/// What a restart does to Devices. Agents keep running either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RestartEffect {
+    link: LinkChange,
+    logins: Logins,
+    /// The next daemon puts Devices behind the passphrase login wall.
+    passphrase: bool,
+}
+
+/// What the next start will do, read when R, G or help states it: the restarted daemon reads
+/// all of it afresh.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RestartProbe {
+    /// The restart takes the server's Funnel path (Tunnel only).
+    on_funnel: bool,
+    /// `auth.persist_sessions` as the next start reads it.
+    persists: bool,
+    /// The port a Local restart reuses; `None` means a fresh random one.
+    port: Option<u16>,
+    /// The hosts a Local restart publishes: this machine's addresses plus `localhost`.
+    local_hosts: Vec<String>,
+    /// A Local restart inherits `AOE_SERVE_PASSPHRASE` from this process.
+    local_passphrase: bool,
+    /// A Local restart mints a new access token (`token_renews`).
+    local_token_renews: bool,
+}
+
+impl RestartProbe {
+    fn now(mode: ServeMode, transport: Option<TunnelTransport>) -> Self {
+        match mode {
+            ServeMode::Local => RestartProbe {
+                on_funnel: false,
+                persists: persist_sessions(),
+                port: saved_port(),
+                local_hosts: crate::server::discover_tagged_ips()
+                    .into_iter()
+                    .map(|(_, ip)| ip.to_string())
+                    .chain(["localhost".to_string()])
+                    .collect(),
+                local_passphrase: std::env::var("AOE_SERVE_PASSPHRASE")
+                    .is_ok_and(|pp| !pp.is_empty()),
+                local_token_renews: token_renews(),
+            },
+            ServeMode::Tunnel => RestartProbe {
+                on_funnel: restart_on_funnel(transport),
+                persists: persist_sessions(),
+                ..RestartProbe::default()
+            },
+        }
+    }
+}
+
+impl RestartEffect {
+    /// A Tunnel keeps its host only when it is on Funnel and the restart takes the Funnel path
+    /// again: `spawn_daemon` never re-creates a named Cloudflare tunnel, and without Funnel the
+    /// server opens a fresh quick tunnel. A Local daemon republishes this machine's addresses on
+    /// the reused or a random port, with a new token once the old one has aged out. Behind the
+    /// passphrase wall, sign-ins then survive only if the running daemon wrote them to disk and
+    /// the next start reads them back.
+    fn of(
+        mode: ServeMode,
+        urls: &[ServeUrl],
+        probe: &RestartProbe,
+        running_persists: Option<bool>,
+    ) -> Self {
+        let (link, passphrase) = match mode {
+            ServeMode::Local => {
+                let hosts_stay = urls.iter().all(|u| {
+                    link_host(&u.url)
+                        .is_some_and(|host| probe.local_hosts.iter().any(|h| h == host))
+                });
+                let port_stays = probe
+                    .port
+                    .is_some_and(|port| urls.iter().all(|u| link_port(&u.url) == Some(port)));
+                let renews = probe.local_token_renews;
+                let link = if !hosts_stay || (renews && !probe.local_passphrase) {
+                    LinkChange::Replaced
+                } else if !port_stays || renews {
+                    LinkChange::Moved
+                } else {
+                    LinkChange::Same
+                };
+                (link, probe.local_passphrase)
+            }
+            ServeMode::Tunnel => {
+                let stays = probe.on_funnel && urls.iter().any(|u| is_funnel_link(&u.url));
+                (
+                    if stays {
+                        LinkChange::Same
+                    } else {
+                        LinkChange::Replaced
+                    },
+                    true,
+                )
+            }
+        };
+        let logins = if !passphrase {
+            Logins::Kept
+        } else if !probe.persists {
+            Logins::Lost
+        } else {
+            match running_persists {
+                Some(true) => Logins::Kept,
+                Some(false) => Logins::Lost,
+                None => Logins::Unknown,
+            }
+        };
+        RestartEffect {
+            link,
+            logins,
+            passphrase,
+        }
+    }
+}
+
+fn persist_sessions() -> bool {
+    crate::session::config::load_config()
+        .ok()
+        .flatten()
+        .is_none_or(|config| config.auth.persist_sessions)
+}
+
+/// Mirrors the server's choice: `--no-tailscale` for an explicit Cloudflare pick, otherwise
+/// Funnel whenever `tailscale` is installed and logged in.
+fn restart_on_funnel(transport: Option<TunnelTransport>) -> bool {
+    transport != Some(TunnelTransport::Cloudflare)
+        && crate::server::tunnel::tailscale_available_sync()
+}
+
+fn link_authority(url: &str) -> Option<&str> {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    rest.split(['/', '?', '#']).next()
+}
+
+fn link_host(url: &str) -> Option<&str> {
+    let authority = link_authority(url)?;
+    Some(
+        authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, _)| host),
+    )
+}
+
+/// The explicit port in a Local link such as `http://192.168.1.42:51234/?token=…`.
+fn link_port(url: &str) -> Option<u16> {
+    link_authority(url)?.rsplit_once(':')?.1.parse().ok()
+}
+
+/// Funnel serves the machine's stable `https://<host>.<tailnet>.ts.net` origin.
+fn is_funnel_link(url: &str) -> bool {
+    link_host(url).is_some_and(|host| host.ends_with(".ts.net"))
+}
+
+/// The error for a daemon that vanished before publishing its URL.
+fn exited_before_ready(mode: ServeMode, transport: Option<TunnelTransport>) -> ServeViewState {
+    let tail = initial_log_tail();
+    let prefix = match mode {
+        ServeMode::Tunnel => "`aoe serve --remote --daemon` exited before the tunnel came up.",
+        ServeMode::Local => "`aoe serve --daemon` exited before the server started.",
+    };
+    let hint = diagnose_daemon_exit(&tail.join("\n"), mode);
+    ServeViewState::Error {
+        message: format!("{prefix}{hint}{}", last_log_lines(&tail)),
+        mode,
+        transport,
+    }
+}
+
 fn stop_failed(e: &str) -> String {
     format!("Stop failed: {e}. Daemon may still be running; retry or use `aoe serve --stop` from a shell.")
 }
@@ -306,9 +542,16 @@ pub struct ServeView {
     mouse: RefCell<ServeMouse>,
     /// The label of the value a click last copied, shown for `FLASH_TTL`.
     copied: Option<(&'static str, Instant)>,
+    /// The setting the running daemon started with, when this view started it; `None` for a
+    /// reattached daemon.
+    running_persists: Option<bool>,
+    /// What a restart would do now. Refreshed when R, G or help is pressed rather than per
+    /// frame: the probe shells out to `tailscale`.
+    restart_probe: RestartProbe,
     pending_launch: Option<ServeLaunchRequest>,
     launch_in_flight: bool,
     stop_requested: bool,
+    probes: Probes,
 }
 
 impl Default for ServeView {
@@ -320,27 +563,41 @@ impl Default for ServeView {
 impl ServeView {
     /// Reattaches to a running daemon, otherwise opens the mode picker.
     pub fn new() -> Self {
-        let pending_passphrase = load_or_generate_passphrase();
-        let state = if crate::cli::serve::web_daemon_pid().is_some() {
-            // Daemons that predate `serve.mode` could only be Tunnel.
-            let mode = read_serve_mode().unwrap_or(ServeMode::Tunnel);
-            let passphrase = (mode == ServeMode::Tunnel)
-                .then(recall_passphrase)
-                .flatten();
-            ServeViewState::running(mode, None, passphrase, log_file_size())
-        } else {
-            ServeViewState::mode_picker()
-        };
+        Self::with_probe_handler(run_probe)
+    }
+
+    /// A view past its construction probe, for tests that need the settled screen.
+    #[cfg(test)]
+    pub(crate) fn settled() -> Self {
+        let mut view = Self::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while matches!(view.state, ServeViewState::Checking { .. }) {
+            view.tick();
+            assert!(
+                Instant::now() < deadline,
+                "construction probe never settled"
+            );
+            std::thread::yield_now();
+        }
+        view
+    }
+
+    fn with_probe_handler(handler: impl FnMut(Probe) -> bool + Send + 'static) -> Self {
+        let mut probes = Probes::new(handler);
+        let attempt = probes.request(Probe::WebDaemon);
         Self {
-            state,
-            pending_passphrase,
+            state: ServeViewState::Checking { attempt },
+            pending_passphrase: load_or_generate_passphrase(),
             pending_confirm: None,
             show_help: false,
             mouse: RefCell::default(),
             copied: None,
+            running_persists: None,
+            restart_probe: RestartProbe::default(),
             pending_launch: None,
             launch_in_flight: false,
             stop_requested: false,
+            probes,
         }
     }
 
@@ -393,6 +650,10 @@ impl ServeView {
             };
         }
         let action = match self.state {
+            ServeViewState::Checking { .. } => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => ServeAction::Close,
+                _ => ServeAction::Continue,
+            },
             ServeViewState::ModePicker { .. } => self.mode_picker_key(key.code),
             ServeViewState::Confirm { .. } => self.confirm_key(key.code),
             ServeViewState::Starting { .. } => match key.code {
@@ -548,6 +809,8 @@ impl ServeView {
 
     fn spawn(&mut self, mode: ServeMode, transport: Option<TunnelTransport>) {
         let passphrase = (mode == ServeMode::Tunnel).then(|| self.pending_passphrase.clone());
+        // Read just before the launch, which the daemon reads at startup.
+        self.running_persists = Some(persist_sessions());
         self.pending_launch = Some(ServeLaunchRequest {
             restart: false,
             mode,
@@ -595,6 +858,7 @@ impl ServeView {
         self.stop_requested = false;
         self.launch_in_flight = false;
         let (mode, transport) = match &self.state {
+            ServeViewState::Checking { .. } => (ServeMode::Local, None),
             ServeViewState::ModePicker { selected, .. } => (*selected, None),
             ServeViewState::Confirm { selected, .. } => (ServeMode::Tunnel, Some(*selected)),
             ServeViewState::Starting {
@@ -648,10 +912,11 @@ impl ServeView {
                     self.pending_passphrase = new_pp.clone();
                     self.restart(mode, transport, Some(new_pp));
                 } else {
+                    self.restart_probe = RestartProbe::now(mode, transport);
                     self.pending_confirm = Some((PendingConfirm::NewPassphrase, Instant::now()));
                 }
             }
-            // Tunnel restarts clear all login sessions; Local rebinds the port.
+            // Reusing the passphrase keeps persisted logins; see `RestartEffect`.
             KeyCode::Char('r' | 'R') => {
                 if confirmed == Some(PendingConfirm::Restart) {
                     let pp = (mode == ServeMode::Tunnel).then(|| {
@@ -661,11 +926,15 @@ impl ServeView {
                     });
                     self.restart(mode, transport, pp);
                 } else {
+                    self.restart_probe = RestartProbe::now(mode, transport);
                     self.pending_confirm = Some((PendingConfirm::Restart, Instant::now()));
                 }
             }
             KeyCode::Tab if urls.len() > 1 => *url_index = (*url_index + 1) % urls.len(),
-            KeyCode::Char('?') => self.show_help = true,
+            KeyCode::Char('?') => {
+                self.restart_probe = RestartProbe::now(mode, transport);
+                self.show_help = true;
+            }
             KeyCode::Esc | KeyCode::Char('q') => return ServeAction::Close,
             _ => {}
         }
@@ -729,6 +998,7 @@ impl ServeView {
         transport: Option<TunnelTransport>,
         passphrase: Option<String>,
     ) {
+        self.running_persists = Some(persist_sessions());
         self.pending_launch = Some(ServeLaunchRequest {
             restart: true,
             mode,
@@ -747,9 +1017,81 @@ impl ServeView {
 
     /// Poll the daemon's files and advance the state. Returns true when a redraw is needed.
     pub fn tick(&mut self) -> bool {
+        let mut changed = self.apply_probes();
         if self.launch_in_flight {
-            return false;
+            self.probes.liveness = None;
+            return changed;
         }
+        changed |= self.poll_files();
+        if !matches!(self.state, ServeViewState::Starting { .. }) {
+            self.probes.liveness = None;
+        } else if self.probes.liveness.is_none() {
+            self.probes.liveness = Some(self.probes.request(Probe::Daemon));
+        }
+        changed
+    }
+
+    fn apply_probes(&mut self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+        let mut changed = false;
+        loop {
+            match self.probes.worker.try_recv() {
+                Ok((attempt, running)) => changed |= self.apply_probe(attempt, running),
+                Err(TryRecvError::Empty) => return changed,
+                Err(TryRecvError::Disconnected) => return changed | self.fail_pending(),
+            }
+        }
+    }
+
+    fn apply_probe(&mut self, attempt: u64, running: bool) -> bool {
+        match &self.state {
+            ServeViewState::Checking { attempt: want } if *want == attempt => {
+                self.state = if running {
+                    // Daemons that predate `serve.mode` could only be Tunnel.
+                    let mode = read_serve_mode().unwrap_or(ServeMode::Tunnel);
+                    let passphrase = (mode == ServeMode::Tunnel)
+                        .then(recall_passphrase)
+                        .flatten();
+                    ServeViewState::running(mode, None, passphrase, log_file_size())
+                } else {
+                    ServeViewState::mode_picker()
+                };
+                true
+            }
+            ServeViewState::Starting {
+                mode, transport, ..
+            } if self.probes.liveness == Some(attempt) => {
+                self.probes.liveness = None;
+                // A published URL outranks a probe that saw the daemon exit.
+                if running || !read_serve_urls().is_empty() {
+                    return false;
+                }
+                self.state = exited_before_ready(*mode, *transport);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A state waiting on a dead worker becomes an error instead of hanging.
+    fn fail_pending(&mut self) -> bool {
+        let (mode, transport) = match &self.state {
+            ServeViewState::Checking { .. } => (ServeMode::Local, None),
+            ServeViewState::Starting {
+                mode, transport, ..
+            } if self.probes.liveness.is_some() => (*mode, *transport),
+            _ => return false,
+        };
+        self.probes.liveness = None;
+        self.state = ServeViewState::Error {
+            message: "The background probe worker stopped.".to_string(),
+            mode,
+            transport,
+        };
+        true
+    }
+
+    fn poll_files(&mut self) -> bool {
         match &mut self.state {
             ServeViewState::ModePicker { flash, .. } => expire_flash(flash),
             ServeViewState::Starting {
@@ -777,24 +1119,6 @@ impl ServeView {
                         passphrase,
                         opened_at: Instant::now(),
                         log_offset: log_file_size(),
-                    };
-                    return true;
-                }
-                if crate::cli::serve::daemon_pid().is_none() {
-                    let tail = initial_log_tail();
-                    let prefix = match mode {
-                        ServeMode::Tunnel => {
-                            "`aoe serve --remote --daemon` exited before the tunnel came up."
-                        }
-                        ServeMode::Local => {
-                            "`aoe serve --daemon` exited before the server started."
-                        }
-                    };
-                    let hint = diagnose_daemon_exit(&tail.join("\n"), mode);
-                    self.state = ServeViewState::Error {
-                        message: format!("{prefix}{hint}{}", last_log_lines(&tail)),
-                        mode,
-                        transport: *transport,
                     };
                     return true;
                 }
@@ -841,7 +1165,9 @@ impl ServeView {
                 }
                 log_grew
             }
-            ServeViewState::Confirm { .. } | ServeViewState::Error { .. } => false,
+            ServeViewState::Checking { .. }
+            | ServeViewState::Confirm { .. }
+            | ServeViewState::Error { .. } => false,
         }
     }
 
@@ -862,6 +1188,56 @@ mod tests {
         }
         assert_eq!(ServeMode::from_file_token("garbage"), None);
         assert_eq!(ServeMode::from_file_token(""), None);
+    }
+
+    /// The restarted daemon reads `auth.persist_sessions` afresh, so a change made while the
+    /// view is open must reach the confirm and help.
+    #[test]
+    #[serial_test::serial]
+    fn r_g_and_help_reread_persist_sessions() {
+        let _tmp = crate::session::test_support::isolate_app_dir();
+        for key in ['R', 'G', '?'] {
+            let mut view = ServeView {
+                state: ServeViewState::Active {
+                    mode: ServeMode::Tunnel,
+                    // Cloudflare skips the `tailscale` probe.
+                    transport: Some(TunnelTransport::Cloudflare),
+                    urls: vec![ServeUrl {
+                        label: None,
+                        url: "https://host.tailnet.ts.net/".to_string(),
+                    }],
+                    url_index: 0,
+                    passphrase: Some("correct-horse".to_string()),
+                    opened_at: Instant::now(),
+                    log_offset: 0,
+                },
+                pending_passphrase: String::new(),
+                pending_confirm: None,
+                show_help: false,
+                mouse: RefCell::default(),
+                copied: None,
+                running_persists: Some(true),
+                restart_probe: RestartProbe {
+                    persists: true,
+                    ..RestartProbe::default()
+                },
+                pending_launch: None,
+                launch_in_flight: false,
+                stop_requested: false,
+                probes: Probes::new(|_| false),
+            };
+            crate::session::config::update_config(|c| c.auth.persist_sessions = false).unwrap();
+            view.handle_key(KeyEvent::from(KeyCode::Char(key)));
+            assert!(
+                !view.restart_probe.persists,
+                "{key} kept the value read when the view opened"
+            );
+            crate::session::config::update_config(|c| c.auth.persist_sessions = true).unwrap();
+            view.pending_confirm = None;
+            view.show_help = false;
+            view.handle_key(KeyEvent::from(KeyCode::Char(key)));
+            assert!(view.restart_probe.persists, "{key}");
+        }
     }
 
     #[test]
@@ -911,9 +1287,12 @@ mod tests {
             show_help: false,
             mouse: RefCell::default(),
             copied: None,
+            running_persists: None,
+            restart_probe: RestartProbe::default(),
             pending_launch: None,
             launch_in_flight: false,
             stop_requested: false,
+            probes: Probes::new(|_| false),
         };
         for key in ['p', 'P', 'r', 'R'] {
             let action = view.handle_key(KeyEvent::from(KeyCode::Char(key)));
@@ -962,5 +1341,124 @@ mod tests {
         ));
         drop(transaction);
         key_thread.join().unwrap();
+    }
+
+    /// A probe handler that reports each probe it starts, then holds it until released.
+    struct Gate {
+        entered: std::sync::mpsc::Receiver<()>,
+        release: std::sync::mpsc::Sender<bool>,
+    }
+
+    impl Gate {
+        fn wait_entered(&self) {
+            self.entered
+                .recv_timeout(Duration::from_secs(10))
+                .expect("probe never reached the worker");
+        }
+    }
+
+    fn gated_view() -> (ServeView, Gate) {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let view = ServeView::with_probe_handler(move |_| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap()
+        });
+        (view, Gate { entered, release })
+    }
+
+    fn starting() -> ServeViewState {
+        ServeViewState::Starting {
+            mode: ServeMode::Local,
+            transport: None,
+            passphrase: None,
+            started_at: Instant::now(),
+            log_offset: 0,
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_held_probe_at_construction_leaves_the_dialog_responsive() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let (mut view, gate) = gated_view();
+        gate.wait_entered();
+
+        assert!(!view.tick());
+        assert!(matches!(
+            view.handle_key(KeyEvent::from(KeyCode::Char('x'))),
+            ServeAction::Continue
+        ));
+        let buffer = crate::tui::dialogs::test_render::draw(110, 40, |frame, theme| {
+            view.render(frame, frame.area(), theme)
+        });
+        crate::tui::dialogs::test_render::find(&buffer, "Checking");
+        assert!(matches!(
+            view.handle_key(KeyEvent::from(KeyCode::Esc)),
+            ServeAction::Close
+        ));
+
+        gate.release.send(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while matches!(view.state, ServeViewState::Checking { .. }) {
+            view.tick();
+            assert!(Instant::now() < deadline, "probe result never applied");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_held_probe_leaves_a_clickable_close_control() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let (mut view, gate) = gated_view();
+        gate.wait_entered();
+        let buffer = crate::tui::dialogs::test_render::draw(110, 40, |frame, theme| {
+            view.render(frame, frame.area(), theme)
+        });
+        let (col, row) = crate::tui::dialogs::test_render::find(&buffer, "[Esc] cancel");
+        let key = view.handle_click(col, row).expect("close hint is a target");
+        assert!(matches!(view.handle_key(key), ServeAction::Close));
+        gate.release.send(true).unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_starting_dialog_keeps_one_probe_in_flight_and_ignores_a_stale_result() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let (mut view, gate) = gated_view();
+        gate.wait_entered();
+        gate.release.send(true).unwrap();
+        // The construction probe's result no longer matches once the state is replaced.
+        view.state = starting();
+        view.tick();
+        gate.wait_entered();
+        let current = view.probes.liveness.expect("a liveness probe is in flight");
+        // The blocked FIFO worker hides queued requests, so count enqueues instead.
+        let enqueued = view.probes.last_attempt;
+        for _ in 0..5 {
+            view.tick();
+        }
+        assert_eq!(
+            view.probes.last_attempt, enqueued,
+            "a second probe was queued"
+        );
+
+        // A result for an attempt the state no longer awaits must not change it.
+        assert!(!view.apply_probe(current - 1, false));
+        assert!(matches!(view.state, ServeViewState::Starting { .. }));
+        assert_eq!(view.probes.liveness, Some(current));
+        gate.release.send(true).unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_liveness_probe_that_saw_the_daemon_exit_errors_only_without_a_published_url() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut view = ServeView::with_probe_handler(|_| false);
+        view.state = starting();
+        view.probes.liveness = Some(7);
+        assert!(view.apply_probe(7, false));
+        assert!(matches!(view.state, ServeViewState::Error { .. }));
     }
 }

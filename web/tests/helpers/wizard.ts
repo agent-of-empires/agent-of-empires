@@ -105,6 +105,8 @@ export interface WizardMockOptions {
   /** Per-profile settings keyed by the `?profile=` query param. */
   profileSettings?: Record<string, Record<string, unknown>>;
   docker?: boolean;
+  /** `/api/groups` body. */
+  groups?: unknown[];
   projects?: unknown[];
   sessions?: unknown[];
   /** Handle the create POST; return undefined for the default success response. */
@@ -135,6 +137,7 @@ export async function mockWizardApis(page: Page, opts: WizardMockOptions = {}) {
   await page.route("**/api/docker/status", (r) =>
     r.fulfill({ json: { available: !!opts.docker, runtime: opts.docker ? "docker" : null } }),
   );
+  await page.route("**/api/groups**", (r) => r.fulfill({ json: opts.groups ?? [] }));
   await page.route("**/api/agents", (r) => r.fulfill({ json: opts.agents ?? [CLAUDE_AGENT] }));
   await page.route("**/api/sessions/creation-trust", (r) =>
     r.fulfill({ json: opts.creationTrustReview ?? DEFAULT_CREATION_TRUST_REVIEW }),

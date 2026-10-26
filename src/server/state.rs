@@ -115,6 +115,10 @@ pub struct AppState {
     pub passkey_manager: Arc<super::passkeys::PasskeyManager>,
     pub rate_limiter: Arc<RateLimiter>,
     pub behind_tunnel: bool,
+    /// The `--remote` tunnel is a Cloudflare one, the only provider that sets `cf-connecting-ip`.
+    pub trust_cf_header: bool,
+    /// Per-bind opt-out of the 426 plaintext-remote gate (`--dangerously-allow-plaintext-remote`).
+    pub allow_plaintext_remote: bool,
     /// Coarse auth mode resolved once at launch (`"token"` / `"passphrase"` /
     /// `"none"`). `/api/about` and the opt-in telemetry snapshot both read this
     /// single value rather than re-deriving it; immutable for the daemon's

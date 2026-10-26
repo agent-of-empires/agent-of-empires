@@ -24,7 +24,13 @@ const SERVER_CLEAR_ALIASES: Record<string, string[]> = {
 function renderWithProfile(
   toolKey: string,
   queued: QueuedPrompt[],
-  opts: { onSendNow?: (prompt: QueuedPrompt) => void; canSendNow?: boolean; sendNowInterrupts?: boolean } = {},
+  opts: {
+    onSendNow?: (prompt: QueuedPrompt) => void;
+    canSendNow?: boolean;
+    sendNowInterrupts?: boolean;
+    pendingResume?: boolean;
+    waitingFor?: string | null;
+  } = {},
 ) {
   return render(
     <AgentProfileProvider toolKey={toolKey} clearAliases={SERVER_CLEAR_ALIASES[toolKey] ?? []}>
@@ -36,13 +42,24 @@ function renderWithProfile(
         onSendNow={opts.onSendNow ?? (() => {})}
         canSendNow={opts.canSendNow ?? true}
         sendNowInterrupts={opts.sendNowInterrupts ?? false}
-        pendingResume={false}
+        pendingResume={opts.pendingResume ?? false}
+        waitingFor={opts.waitingFor}
       />
     </AgentProfileProvider>,
   );
 }
 
 describe("QueuedPromptsStrip", () => {
+  it.each<[string, boolean, string | null, string]>([
+    ["a new Session names the Agent it waits for", true, "Claude Code", "Pending until Claude Code is ready (1)"],
+    ["a resumed Session waits to resume", true, null, "Pending until session resumes (1)"],
+    ["a running Session just queues", false, "Claude Code", "Queued (1)"],
+  ])("%s", (_label, pendingResume, waitingFor, header) => {
+    const { container } = renderWithProfile("claude", [mk("a", "hello")], { pendingResume, waitingFor });
+    expect(container.textContent).toContain(header);
+    expect(container.textContent).not.toContain("Held in this tab");
+  });
+
   // Two entries stay under the desktop collapse threshold, so both rows render.
   it.each([
     ["claude", ["first", "/clear"], 1],

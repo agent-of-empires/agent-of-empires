@@ -862,6 +862,10 @@ pub struct AppStateConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home_list_width: Option<u16>,
 
+    /// Requested height of the stacked TUI session list. Absent means automatic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_list_height: Option<u16>,
+
     /// Whether the home-view session list is collapsed to a narrow,
     /// click-to-expand strip. Persisted so the choice survives restarts,
     /// mirroring `home_list_width`. `None`/absent means expanded.

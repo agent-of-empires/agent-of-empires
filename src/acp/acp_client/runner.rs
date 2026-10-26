@@ -3,7 +3,7 @@
 use tracing::{info, warn};
 
 use super::errors::AcpError;
-use super::resolve_command::{resolve_agent_command, Unresolved};
+use super::resolve_command::{on_agent_path, resolve_agent_command, Unresolved};
 use super::session_sandbox::{build_sandbox_docker_argv, SessionSandbox};
 use super::spawn::{
     apply_claude_store_route, apply_env_filter, host_environment_denyreason, prepend_path_dirs,
@@ -124,9 +124,7 @@ fn append_to_log(path: &std::path::Path) -> std::process::Stdio {
 /// A Worker started for a bare adapter name that resolved nowhere can only exit
 /// before its Hello, which loses the cause (#4576). `unresolved` is `None` when
 /// the name resolved or a sandbox resolves it inside its container; paths and
-/// `${placeholder}` commands resolve elsewhere. The adapter searches the last
-/// `PATH` in `agent_environment`, else the inherited one, from its cwd, so
-/// relative entries resolve against the project.
+/// `${placeholder}` commands resolve elsewhere.
 fn refuse_unresolved_adapter(
     config: &SpawnConfig,
     unresolved: Option<&Unresolved>,
@@ -136,15 +134,12 @@ fn refuse_unresolved_adapter(
     let Some(reason) = unresolved.filter(|reason| **reason != Unresolved::NotBare) else {
         return Ok(());
     };
-    let path = agent_environment
-        .iter()
-        .rev()
-        .find(|(key, _)| key == "PATH")
-        .map(|(_, path)| std::ffi::OsStr::new(path))
-        .or(inherited_path);
-    if path
-        .is_some_and(|path| which::which_in(&config.spec.command, Some(path), &config.cwd).is_ok())
-    {
+    if on_agent_path(
+        &config.spec.command,
+        &config.cwd,
+        agent_environment,
+        inherited_path,
+    ) {
         return Ok(());
     }
     Err(AcpError::unresolved_adapter_spawn_error(

@@ -64,11 +64,11 @@ impl WorktreeNameDialog {
                 })
             }
             KeyCode::Tab | KeyCode::Down => {
-                self.focused_field = (self.focused_field + 1) % 2;
+                self.focused_field = super::cycle_focus(self.focused_field, 2, false);
                 DialogResult::Continue
             }
             KeyCode::BackTab | KeyCode::Up => {
-                self.focused_field = if self.focused_field == 0 { 1 } else { 0 };
+                self.focused_field = super::cycle_focus(self.focused_field, 2, true);
                 DialogResult::Continue
             }
             KeyCode::Char(' ') if self.toggle_focused() => {
