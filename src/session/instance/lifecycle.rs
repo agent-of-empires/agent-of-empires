@@ -678,7 +678,12 @@ impl Instance {
         self.last_error = Some(
             if let Some(refusal) = error.downcast_ref::<ManagedResumeRefused>() {
                 let message = refusal.0.message();
-                if scope_failure.is_some() {
+                if let Some(scope) = scope_failure.as_ref() {
+                    tracing::warn!(
+                        target: "session.store",
+                        session = %self.id,
+                        "scope retirement remains unproven after managed resume refusal: {scope:#}"
+                    );
                     format!("{message}\nScope retirement remains unproven.")
                 } else {
                     message.into()
@@ -704,6 +709,55 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn managed_refusal_retains_cleanup_diagnostics_without_public_reflection() {
+        use crate::process::worker_registry::ScopeOwnership;
+
+        let root = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(root.path());
+        let _env = crate::session::test_support::EnvGuard::unset(&["TMUX", "TMUX_PANE"])
+            .and_set("AOE_TMUX_SOCKET", root.path().join("tmux.sock"));
+        let storage = crate::session::Storage::new_unwatched("scope-diagnostic").unwrap();
+        let mut row = Instance::new("scope diagnostic", root.path().to_str().unwrap());
+        row.source_profile = storage.profile().into();
+        row.terminal_scopes = Some(vec![ScopeOwnership::Owned {
+            unit: "invalid-private-scope".into(),
+        }]);
+        let scope_diagnostic = format!("{:#}", row.release_scope().unwrap_err());
+        storage
+            .update(|rows, _| {
+                rows.push(row.clone());
+                Ok(())
+            })
+            .unwrap();
+        let generation = row
+            .acquire_lifecycle_reservation(
+                &storage,
+                LifecycleOperation::Launch,
+                Some(Status::Starting),
+            )
+            .unwrap();
+        let cause = ManagedResumeCause::ExecutionContextUnattested;
+        let error =
+            anyhow::anyhow!("private-primary-diagnostic").context(ManagedResumeRefused(cause));
+        let logs = crate::session::test_support::LogCapture::start();
+
+        row.fail_reserved_launch(&storage, generation, &error, true);
+
+        let public = row.last_error.as_deref().unwrap();
+        assert!(!public.contains(&scope_diagnostic), "{public}");
+        assert!(!public.contains("private-primary-diagnostic"), "{public}");
+        assert!(public.starts_with(cause.message()), "{public}");
+        let stored = storage.load().unwrap().remove(0);
+        assert_eq!(stored.status, Status::Error);
+        assert!(stored.lifecycle_reservation.is_none());
+        let diagnostics = logs.contents();
+        assert!(diagnostics.contains(&scope_diagnostic), "{diagnostics}");
+        assert!(diagnostics.contains(&row.id), "{diagnostics}");
+    }
+
     #[test]
     fn observed_native_resume_is_generation_owned_and_preserves_failed_reservations() {
         for case in ["resume", "superseded", "overflow", "busy"] {

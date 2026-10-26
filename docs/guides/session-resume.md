@@ -74,6 +74,8 @@ Automatic resume also refuses when native execution cannot be resolved in these 
 
 When native execution resolution fails for a recorded managed conversation under `Default`, including Prime Agent, the API returns HTTP `409` with `aoe-error-code: managed_resume_refused` and a fixed recovery reason. Missing wrapper contracts identify the trusted settings to restore; their declarations must match the actual native agent and original store. The [API receipt contract](../api.md#native-mutation-completion) describes the finite cause metadata.
 
+If local logs report unproven scope retirement after a managed refusal, inspect the cleanup diagnostic before retrying. A refused launch does not prove that every process in the outgoing scope has stopped.
+
 | Context | `set-session-id` | Fork | Remedy |
 |---------|------------------|------|--------|
 | Unsandboxed Codex on a macOS host | Refused | Refused | None yet; run Codex in a managed container |
