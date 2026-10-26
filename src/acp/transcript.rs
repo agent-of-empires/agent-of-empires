@@ -155,6 +155,9 @@ impl TranscriptModel {
                     self.elicitation_tool_ids.insert(id.clone());
                 }
             }
+            Event::ToolCallCompleted { tool_call_id, .. } => {
+                self.elicitation_tool_ids.remove(tool_call_id);
+            }
             Event::AgentMessageChunk {
                 message_id: Some(id),
                 ..
@@ -254,7 +257,7 @@ impl TranscriptModel {
                 completed_at,
                 async_subagent,
             } => {
-                if self.elicitation_tool_ids.contains(tool_call_id) {
+                if self.elicitation_tool_ids.remove(tool_call_id) {
                     return Vec::new();
                 }
                 let mut deltas =
@@ -1456,11 +1459,14 @@ mod tests {
             started(tool("q", "AskUserQuestion")),
             elicitation_requested("q"),
             completed("q", false, "Your questions have been answered"),
+            // The adapter reuses the id for an ordinary tool after the answer.
+            started(tool("q", "Bash")),
+            completed("q", false, "ran"),
         ];
         let full = fold(events.clone());
-        assert_eq!(count(&full, TranscriptRowKind::ToolStart), 0);
-        assert_eq!(count(&full, TranscriptRowKind::ToolComplete), 0);
-        for split in 0..=events.len() {
+        assert_eq!(count(&full, TranscriptRowKind::ToolStart), 1);
+        assert_eq!(count(&full, TranscriptRowKind::ToolComplete), 1);
+        for split in 0..events.len() {
             let mut m = TranscriptModel::new();
             for (i, e) in events.iter().enumerate() {
                 if i < split {
