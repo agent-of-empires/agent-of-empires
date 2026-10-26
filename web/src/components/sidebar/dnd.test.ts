@@ -31,7 +31,13 @@ describe("drag click guard", () => {
       // Enter on a focused control, or `element.click()`, never presses.
       [["start", "end", "key click"], [true]],
       // The drag's list goes away before any end or cancel.
-      [["start", "list unmounts", "click"], [true]],
+      [["start", "list unmounts", "click"], [false]],
+      [["start", "list unmounts", "press", "click"], [true]],
+      [
+        ["start", "list unmounts", "click", "click"],
+        [false, true],
+      ],
+      [["list unmounts", "click"], [true]],
     ];
     for (const [steps, want] of cases) {
       const ref = { current: newDragClickGuard() };
