@@ -4656,7 +4656,7 @@ impl HomeView {
                 info.current_version, info.latest_version
             )
         } else if image_update.is_some() {
-            format!(" sandbox image update available  [{update_key}] pull  [{dismiss_key}] dismiss")
+            format!(" sandbox image update available  [u] pull  [{dismiss_key}] dismiss")
         } else {
             return;
         };
