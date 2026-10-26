@@ -117,7 +117,7 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
           {detail.kind === "unsupported_protocol_version" ? "Adapter not supported" : "Adapter out of date"}
         </div>
         <h2 className="mt-2 text-lg font-semibold text-text-primary">{headlineFor(detail, name)}</h2>
-        <p data-testid="startup-error-version" className="mt-1 break-words font-mono text-[12px] text-text-secondary">
+        <p data-testid="startup-error-version" className="mt-1 break-words font-mono text-[12px] text-text-subtle">
           {versionLineFor(detail)}
         </p>
 
@@ -160,7 +160,7 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
                 restarts the agent.
                 {manualCommand && (
                   <div className="mt-2" data-testid="startup-error-fallback">
-                    <p className="text-xs text-text-dim">Or run this where the Daemon runs, then Check again:</p>
+                    <p className="text-xs text-text-subtle">Or run this where the Daemon runs, then Check again:</p>
                     <CommandBlock {...splitInstallHint(manualCommand)} testId="startup-error-install-command" scroll />
                   </div>
                 )}
@@ -228,7 +228,7 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
             Details
           </button>
           {detailsOpen && (
-            <div data-testid="startup-error-details-body" className="mt-2 space-y-2 text-xs text-text-secondary">
+            <div data-testid="startup-error-details-body" className="mt-2 space-y-2 text-xs text-text-subtle">
               <p>{rationaleFor(detail)}</p>
               {sandboxed && (
                 <p>
@@ -267,7 +267,7 @@ function Step({
       <span
         aria-hidden
         className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-xs font-semibold ${
-          done ? "bg-status-running/20 text-status-running" : "bg-surface-800 text-text-secondary"
+          done ? "bg-status-running/20 text-status-running" : "bg-surface-800 text-text-subtle"
         }`}
       >
         {done ? "✓" : n}
@@ -277,7 +277,7 @@ function Step({
           {title}
           {done && <span className="ml-2 text-xs font-normal text-status-running">Done</span>}
         </div>
-        {children && <div className="mt-0.5 text-xs text-text-secondary">{children}</div>}
+        {children && <div className="mt-0.5 text-xs text-text-subtle">{children}</div>}
       </div>
     </li>
   );
@@ -358,10 +358,10 @@ function DetailRows({ detail, sandboxed }: { detail: IncompatibleAgentDetail; sa
   }
   rows.push(["Where", sandboxed ? "This Session's container" : "Host, where the Daemon runs"]);
   return (
-    <dl className="grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 font-mono text-[11px] text-text-secondary">
+    <dl className="grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 font-mono text-[11px] text-text-subtle">
       {rows.map(([label, value]) => (
         <div key={label} className="contents">
-          <dt className="font-medium text-text-dim">{label}</dt>
+          <dt className="font-medium text-text-subtle">{label}</dt>
           <dd className="break-all">{value}</dd>
         </div>
       ))}

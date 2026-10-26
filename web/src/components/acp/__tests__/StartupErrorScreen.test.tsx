@@ -451,4 +451,18 @@ describe("StartupErrorScreen", () => {
     expect(body).toContain("initialize handshake");
     expect(body.includes("fixes new Sessions only")).toBe(sandboxed);
   });
+
+  it.each<[string, IncompatibleAgentDetail, AgentInstallInfo]>([
+    ["install off", incompatible(), info()],
+    ["installs allowed", incompatible(), info(allowed)],
+    ["sandboxed", incompatible(), info({ ...sandbox, ...allowed })],
+    ["not npm-installable", { ...incompatible(false, OPENCODE), package_name: "opencode-acp" }, opencode],
+    ["protocol", { kind: "unsupported_protocol_version", expected: "V1", received: "V2" }, info()],
+  ])("keeps every line on a validated text colour: %s", async (_label, detail, answer) => {
+    const { getByTestId } = await renderScreen(detail, answer);
+    fireEvent.click(getByTestId("startup-error-details"));
+    const screen = getByTestId("startup-error-screen");
+    expect(screen.querySelectorAll(".text-text-secondary, .text-text-dim")).toHaveLength(0);
+    expect(screen.querySelectorAll(".text-text-subtle").length).toBeGreaterThan(0);
+  });
 });
