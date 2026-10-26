@@ -24,6 +24,15 @@ impl<'a> Held<'a> {
     }
 }
 
+/// What a handoff does with an offered poller that does not serve the receiving row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unserved {
+    /// The offering row is giving it up: stop its thread.
+    Stop,
+    /// The offering row stays live and keeps it.
+    Leave,
+}
+
 /// Runtime-only. A clone shares the handle.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CapturePollerSlot {
@@ -99,7 +108,7 @@ impl CapturePollerSlot {
     }
 
     /// Take the handle `prior` offers if it serves `held`; report whether it did.
-    pub(crate) fn adopt_handle_if_serving(&mut self, prior: &Self, held: Held<'_>) -> bool {
+    fn take_handle(&mut self, prior: &Self, held: Held<'_>) -> bool {
         let serves = prior.serves(held);
         if serves {
             self.handle = prior.handle.clone();
@@ -107,26 +116,34 @@ impl CapturePollerSlot {
         serves
     }
 
-    /// As [`Self::adopt_handle_if_serving`], stopping the offered poller when it does not serve.
-    /// Settle the receiving row's own execution before asking: against the one it still holds,
-    /// a handoff's poller would be refused and stopped.
-    pub(crate) fn adopt_handle(&mut self, prior: &Self, held: Held<'_>) {
-        if !self.adopt_handle_if_serving(prior, held) {
-            prior.stop();
-        }
-    }
-
     /// Take the repair pacing of a prior row about the same execution; a row whose execution
     /// another process replaced does not inherit a window armed for the old one.
-    pub(crate) fn adopt_pacing(&mut self, prior: &Self, prior_held: Held<'_>, held: Held<'_>) {
+    fn take_pacing(&mut self, prior: &Self, prior_held: Held<'_>, held: Held<'_>) {
         if held == prior_held {
             self.repair = prior.repair.clone();
             self.retry_after = prior.retry_after;
         }
     }
 
-    /// Take what a relaunch offers: the handle, and its timing when `stamped` says the launch
-    /// re-evaluated the row's capture and the row still runs what it launched.
+    /// Take a prior row's handle and pacing for the row that now runs `held`. The slot settles
+    /// its own handle against `held` first, so the caller need not order anything.
+    pub(crate) fn adopt_reload(
+        &mut self,
+        prior: &Self,
+        prior_held: Held<'_>,
+        held: Held<'_>,
+        unserved: Unserved,
+    ) {
+        self.settle(held);
+        if !self.take_handle(prior, held) && unserved == Unserved::Stop {
+            prior.stop();
+        }
+        self.take_pacing(prior, prior_held, held);
+    }
+
+    /// Take what a relaunch offers for the row that now runs `held`: the handle (stopping one
+    /// that does not serve it), and its timing when `stamped` says the launch re-evaluated the
+    /// row's capture and the row still runs what it launched.
     pub(crate) fn adopt_relaunch(
         &mut self,
         launched: &Self,
@@ -134,7 +151,10 @@ impl CapturePollerSlot {
         stamped: bool,
         held: Held<'_>,
     ) {
-        self.adopt_handle(launched, held);
+        self.settle(held);
+        if !self.take_handle(launched, held) {
+            launched.stop();
+        }
         if stamped && held == launched_held {
             self.repair.reset();
             self.retry_after = launched.retry_after;
@@ -318,15 +338,52 @@ mod tests {
         }
     }
 
+    fn running_slot(tool: &str, execution: Option<ActiveExecution>) -> CapturePollerSlot {
+        let mut poller = SessionPoller::new("tmux".into(), tool.into(), execution);
+        assert_eq!(
+            poller.start("id".into(), Box::new(|| None), Box::new(|_| {}), None),
+            crate::session::poller::PollerSpawn::Spawned
+        );
+        let mut slot = CapturePollerSlot::default();
+        slot.set_handle(Some(Arc::new(Mutex::new(poller))));
+        slot
+    }
+
     #[test]
-    fn adopt_handle_reports_whether_the_prior_poller_serves() {
+    fn reload_adoption_settles_the_row_then_takes_what_applies() {
         let (one, two) = (execution("one"), execution("two"));
-        let prior = slot_for("claude", Some(one.clone()));
-        let mut row = CapturePollerSlot::default();
-        assert!(!row.adopt_handle_if_serving(&prior, Held::new("claude", Some(&two))));
-        assert!(row.handle().is_none());
-        assert!(row.adopt_handle_if_serving(&prior, Held::new("claude", Some(&one))));
-        assert!(Arc::ptr_eq(row.handle().unwrap(), prior.handle().unwrap()));
+        // (incoming serves, unserved policy, row takes incoming handle, incoming still running)
+        for (incoming_exec, unserved, takes, incoming_runs) in [
+            (&two, Unserved::Stop, true, true),
+            (&one, Unserved::Stop, false, false),
+            (&one, Unserved::Leave, false, true),
+        ] {
+            let mut row = running_slot("claude", Some(one.clone()));
+            let old = row.handle().unwrap().clone();
+            let prior = paced(running_slot("claude", Some(incoming_exec.clone())));
+            let prior_held = Held::new("claude", Some(incoming_exec));
+            row.adopt_reload(
+                &prior,
+                prior_held,
+                Held::new("claude", Some(&two)),
+                unserved,
+            );
+
+            assert!(
+                !row.is_running() || takes,
+                "the row's poller for the swapped-out execution is gone"
+            );
+            assert_eq!(
+                row.handle()
+                    .is_some_and(|h| Arc::ptr_eq(h, prior.handle().unwrap())),
+                takes
+            );
+            assert_eq!(prior.is_running(), incoming_runs);
+            assert!(!old.lock().unwrap().is_running());
+            // Pacing follows the run: kept only when the prior row ran the target.
+            assert_eq!(has_pacing(&row), takes);
+            prior.stop();
+        }
     }
 
     #[test]

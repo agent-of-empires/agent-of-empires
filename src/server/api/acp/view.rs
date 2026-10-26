@@ -3,7 +3,7 @@
 use serde::Serialize;
 
 use crate::server::api::{find_instance, instance_exists};
-use crate::session::{Held, Instance, ResumeIntent, SessionStore, Status, View};
+use crate::session::{Held, Instance, ResumeIntent, SessionStore, Status, Unserved, View};
 
 use super::*;
 
@@ -615,11 +615,12 @@ async fn load_handoff_row(
     if let Some(prior) = find_instance(state, id).await.filter(|prior| {
         prior.source_profile == profile && prior.lifecycle_generation <= row.lifecycle_generation
     }) {
-        let held = Held::new(&row.tool, row.active_execution.as_ref());
-        row.capture_poller
-            .adopt_handle_if_serving(&prior.capture_poller, held);
-        row.capture_poller
-            .adopt_pacing(&prior.capture_poller, prior.held(), held);
+        row.capture_poller.adopt_reload(
+            &prior.capture_poller,
+            prior.held(),
+            Held::new(&row.tool, row.active_execution.as_ref()),
+            Unserved::Leave,
+        );
     }
     Ok((native, row))
 }

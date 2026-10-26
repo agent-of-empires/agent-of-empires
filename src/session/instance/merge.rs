@@ -148,11 +148,12 @@ impl Instance {
         self.last_error_check = previous.last_error_check;
         self.last_start_time = previous.last_start_time;
         self.plugin_revival_pending = previous.plugin_revival_pending;
-        let held = Held::new(&self.tool, self.active_execution.as_ref());
-        self.capture_poller
-            .adopt_handle(&previous.capture_poller, held);
-        self.capture_poller
-            .adopt_pacing(&previous.capture_poller, previous.held(), held);
+        self.capture_poller.adopt_reload(
+            &previous.capture_poller,
+            previous.held(),
+            Held::new(&self.tool, self.active_execution.as_ref()),
+            Unserved::Stop,
+        );
         self.inherit_acp_load_capability(previous);
     }
 

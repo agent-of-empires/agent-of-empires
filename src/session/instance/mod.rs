@@ -38,7 +38,7 @@ mod accessors;
 mod capture_slot;
 mod container;
 mod execution;
-pub(crate) use capture_slot::{Handoff, Held};
+pub(crate) use capture_slot::{Handoff, Held, Unserved};
 pub(crate) use execution::{ActiveExecution, CaptureContext, ConversationKey, ConversationState};
 pub use execution::{
     ConversationBinding, ConversationProvenance, ExecutionBinding, ExecutionLocation,
