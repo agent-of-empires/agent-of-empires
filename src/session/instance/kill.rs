@@ -151,7 +151,7 @@ impl Instance {
 
     pub(super) fn kill_clean_locked(&self) -> Result<()> {
         use crate::tmux::utils::{probe_pane, PaneProbe};
-        self.stop_poller();
+        self.capture_poller.stop();
         let pane = self.tmux_session().and_then(|session| {
             match probe_pane(session.name()) {
                 PaneProbe::Missing => return Ok(()),
@@ -209,7 +209,7 @@ impl Instance {
     }
 
     pub(crate) fn kill_locked(&self) -> Result<()> {
-        self.stop_poller();
+        self.capture_poller.stop();
         let pane = self.tmux_session().and_then(|session| session.kill());
         let native = self
             .prime_runtime()
@@ -465,7 +465,7 @@ impl Instance {
             LifecycleOperation::Stop,
             Some(Status::Stopped),
         )?;
-        self.stop_poller();
+        self.capture_poller.stop();
         let teardown = (|| {
             let mut current = storage
                 .load()?
@@ -1234,11 +1234,9 @@ mod tests {
             poller.start(inst.id.clone(), Box::new(|| None), Box::new(|_| {}), None,),
             crate::session::poller::PollerSpawn::Spawned
         );
-        inst.capture_poller.handle = Some(std::sync::Arc::new(std::sync::Mutex::new(poller)));
-        assert!(
-            inst.session_id_poller_is_running(),
-            "fixture: it is running"
-        );
+        inst.capture_poller
+            .set_handle(Some(std::sync::Arc::new(std::sync::Mutex::new(poller))));
+        assert!(inst.capture_poller.is_running(), "fixture: it is running");
         assert!(
             inst.active_execution.is_none(),
             "fixture: no execution on either side"
@@ -1247,7 +1245,7 @@ mod tests {
         let _ = inst.kill_clean_locked();
 
         assert!(
-            !inst.session_id_poller_is_running(),
+            !inst.capture_poller.is_running(),
             "the poller stops before the pane it watches does"
         );
     }

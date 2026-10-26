@@ -546,8 +546,7 @@ impl Instance {
         if matches!(probe, Ok(ProbeResult::Alive)) {
             return Ok(());
         }
-        self.stop_poller();
-        self.capture_poller.handle = None;
+        self.capture_poller.clear();
         probe?;
         let detail = self.dead_pane_detail();
         anyhow::bail!("agent exited immediately when pinned to session id {sid}{detail}")
@@ -616,8 +615,7 @@ impl Instance {
         let probe = match self.probe_settle(RESUME_PROBE_MAX, RESUME_PROBE_POLL) {
             Ok(probe) => probe,
             Err(error) => {
-                self.stop_poller();
-                self.capture_poller.handle = None;
+                self.capture_poller.clear();
                 return Err(error);
             }
         };
@@ -632,8 +630,7 @@ impl Instance {
             stale_sid,
             self.id,
         );
-        self.stop_poller();
-        self.capture_poller.handle = None;
+        self.capture_poller.clear();
         self.resume_probe_failed_sid = Some(stale_sid.clone());
         self.mark_resume_probe_failed(storage, &stale_sid)?;
         let killed = self.kill_clean_locked();

@@ -1542,7 +1542,7 @@ mod tests {
             inst.status = Status::Stopped;
             seed(profile, &[&inst]);
 
-            // A poller only serves the row it watches: `settle_poller_for` stops a
+            // A poller only serves the row it watches: `CapturePollerSlot::settle` stops a
             // thread that watches another tool, so this one is built for the row's.
             let poller = crate::session::poller::SessionPoller::new(
                 "unused-tmux".to_string(),
@@ -1556,10 +1556,11 @@ mod tests {
                     generation.to_owned(),
                 ),
             );
-            inst.capture_poller.handle = Some(std::sync::Arc::new(std::sync::Mutex::new(poller)));
+            inst.capture_poller
+                .set_handle(Some(std::sync::Arc::new(std::sync::Mutex::new(poller))));
             inst.stop_and_flush_poller();
 
-            assert!(inst.capture_poller.handle.is_none());
+            assert!(inst.capture_poller.handle().is_none());
             assert_eq!(inst.agent_session_id.as_deref(), Some(sid));
             assert_eq!(disk_sid(profile, &inst.id).as_deref(), Some(sid));
         }

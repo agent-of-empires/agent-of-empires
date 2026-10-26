@@ -7,6 +7,7 @@
 use crate::session::CaptureStorage;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -37,6 +38,7 @@ mod accessors;
 mod capture_slot;
 mod container;
 mod execution;
+pub(crate) use capture_slot::{Handoff, Held};
 pub(crate) use execution::{ActiveExecution, CaptureContext, ConversationKey, ConversationState};
 pub use execution::{
     ConversationBinding, ConversationProvenance, ExecutionBinding, ExecutionLocation,

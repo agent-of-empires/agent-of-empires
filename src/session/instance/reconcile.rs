@@ -41,20 +41,10 @@ impl Instance {
         // crosses over: a poller for the launch the row gives up keeps reading
         // files this row no longer owns, and a window armed for it paces an
         // attempt this row never made.
-        let mut prior = std::mem::replace(self, disk);
-        if !prior.poller_serves(&self.tool, self.active_execution.as_ref()) {
-            prior.stop_poller();
-            prior.capture_poller.handle = None;
-        }
-        let store_repair = (
-            self.capture_poller.repair.clone(),
-            self.capture_poller.retry_after,
-        );
-        let carries_repair = self.runs(&prior.tool, prior.active_execution.as_ref());
+        let prior = std::mem::replace(self, disk);
+        let handoff = Handoff::decide(&prior.capture_poller, prior.held(), self.held());
         self.inherit_runtime(prior, preserve_errors);
-        if !carries_repair {
-            (self.capture_poller.repair, self.capture_poller.retry_after) = store_repair;
-        }
+        handoff.settle(&mut self.capture_poller);
         Ok(())
     }
 
@@ -199,9 +189,9 @@ mod tests {
         seeded(profile, &inst);
 
         let now = std::time::Instant::now();
-        inst.capture_poller.repair.defer(now);
-        inst.capture_poller.repair.defer(now);
-        assert!(!inst.capture_poller.repair.due(now));
+        inst.capture_poller.repair_mut().defer(now);
+        inst.capture_poller.repair_mut().defer(now);
+        assert!(!inst.capture_poller.repair().due(now));
         inst.identity_publisher_launched = true;
         inst.sandbox_info.as_mut().unwrap().before_start_env =
             vec![("GH_TOKEN".to_string(), "ghs_minted".to_string())];
@@ -212,7 +202,7 @@ mod tests {
         inst.reconcile_from_disk();
 
         assert!(
-            !inst.capture_poller.repair.due(now),
+            !inst.capture_poller.repair().due(now),
             "poller backoff must survive"
         );
         assert!(inst.identity_publisher_launched);
