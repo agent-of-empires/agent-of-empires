@@ -189,6 +189,8 @@ pub(crate) struct ServerConfig<'a> {
     /// `X-Forwarded-For` / `cf-connecting-ip` from loopback peers,
     /// same surface as `remote`, without spawning a tunnel.
     pub behind_proxy: bool,
+    /// Per-bind opt-out of the 426 plaintext-remote gate.
+    pub allow_plaintext_remote: bool,
     pub open_browser: bool,
     /// Operator-supplied `--allowed-host` entries, merged with the derived
     /// loopback/bind/tunnel set by `resolve_access_policy`. See #2735.
@@ -291,6 +293,7 @@ pub(crate) async fn start_server(
         is_daemon,
         passphrase,
         behind_proxy,
+        allow_plaintext_remote,
         open_browser,
         extra_allowed_hosts,
         extra_allowed_origins,
@@ -716,15 +719,29 @@ pub(crate) async fn start_server(
         }
         if auth_token.is_some() && cfg!(feature = "web") {
             println!();
-            println!(
-            "Open any URL above in a browser. Share it to access from other devices on your network."
-        );
+            if allow_plaintext_remote {
+                println!(
+                    "Open any URL above in a browser. Share it to access from other devices on your network."
+                );
+            } else {
+                println!(
+                    "Open the localhost URL in a browser. Other devices get 426 until you front aoe with HTTPS, or pass --dangerously-allow-plaintext-remote."
+                );
+            }
         }
 
         if open_browser && !is_daemon {
             if cfg!(feature = "web") {
-                if let Some((_, primary)) = labeled_urls.first() {
-                    maybe_open_browser(primary);
+                // The gate refuses plaintext LAN and tailnet URLs, so open the loopback one.
+                let openable = if allow_plaintext_remote {
+                    labeled_urls.first()
+                } else {
+                    labeled_urls
+                        .iter()
+                        .find(|(kind, _)| *kind == IpKind::Loopback)
+                };
+                if let Some((_, url)) = openable {
+                    maybe_open_browser(url);
                 }
             } else {
                 // Opening a browser on an API-only daemon lands on a 404.
@@ -777,6 +794,18 @@ pub(crate) async fn start_server(
         ?allowed_origins,
         "resolved DNS-rebinding allowlist"
     );
+    if allow_plaintext_remote {
+        tracing::warn!(
+            target: "http.access",
+            "DANGEROUS: plaintext HTTP from non-loopback peers is allowed by \
+             --dangerously-allow-plaintext-remote"
+        );
+    } else {
+        tracing::info!(
+            target: "http.access",
+            "plaintext HTTP from non-loopback peers is rejected with 426"
+        );
+    }
 
     let runtime_namespace = socket_path
         .parent()
@@ -817,6 +846,10 @@ pub(crate) async fn start_server(
         passkey_manager,
         rate_limiter: Arc::clone(&rate_limiter),
         behind_tunnel: remote || behind_proxy,
+        trust_cf_header: tunnel_handle
+            .as_ref()
+            .is_some_and(tunnel::TunnelHandle::sets_cf_connecting_ip),
+        allow_plaintext_remote,
         auth_mode,
         serve_mode,
         allowed_hosts,

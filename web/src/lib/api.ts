@@ -2854,6 +2854,9 @@ export interface WorkspaceDeleteFailure {
   error: string;
 }
 
+/** Another lifecycle operation holds the session; nothing changed, retry later. */
+export type WorkspaceDeleteBusy = WorkspaceDeleteFailure;
+
 export interface DeleteWorkspaceResult {
   ok: boolean;
   error?: string;
@@ -2863,6 +2866,8 @@ export interface DeleteWorkspaceResult {
   kept?: string[];
   /** Sessions that could not be deleted, with their error. */
   failed?: WorkspaceDeleteFailure[];
+  /** Sessions skipped because another operation holds them. */
+  busy?: WorkspaceDeleteBusy[];
 }
 
 /** Delete siblings before their shared-worktree owner under the selected consent. */
@@ -2878,12 +2883,14 @@ export async function deleteWorkspace(
       deleted?: string[];
       kept?: string[];
       failed?: WorkspaceDeleteFailure[];
+      busy?: WorkspaceDeleteBusy[];
     };
     if (!res.ok) {
       return {
         ok: false,
         error: data.message || `Server error (${res.status})`,
         failed: data.failed,
+        busy: data.busy,
       };
     }
     // The endpoint always reports which sessions it removed. A 2xx without a
@@ -2893,7 +2900,14 @@ export async function deleteWorkspace(
     if (!Array.isArray(data.deleted)) {
       return { ok: false, error: "Server did not confirm which sessions were deleted" };
     }
-    return { ok: true, messages: data.messages, deleted: data.deleted, kept: data.kept, failed: data.failed };
+    return {
+      ok: true,
+      messages: data.messages,
+      deleted: data.deleted,
+      kept: data.kept,
+      failed: data.failed,
+      busy: data.busy,
+    };
   } catch (e) {
     return {
       ok: false,

@@ -515,6 +515,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         state.clone(),
         access_policy,
     ))
+    .layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        super::ingress::plaintext_gate,
+    ))
     .layer(axum::middleware::from_fn(security_headers))
     .layer(axum::middleware::from_fn(http_request_span))
     .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))

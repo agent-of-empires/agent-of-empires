@@ -473,9 +473,8 @@ async fn upgrade_http(
     let peer = stream
         .peer_addr()
         .map_err(|_| ReadFailure::post("unavailable"))?;
-    let auth = if !request.headers().contains_key("Authorization")
-        && std::env::var_os("AOE_DAEMON_PASSPHRASE").is_some()
-    {
+    let had_bearer = request.headers().contains_key("Authorization");
+    let auth = if std::env::var_os("AOE_DAEMON_PASSPHRASE").is_some() {
         let uri = request.uri();
         let path = uri
             .path()
@@ -491,7 +490,13 @@ async fn upgrade_http(
             // Login uses the connected loopback address, never a second localhost lookup.
             format!("http://{peer}{path}")
         };
-        let endpoint = DaemonEndpoint::new(base, None, Source::Env);
+        let bearer = request
+            .headers()
+            .get("Authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .map(str::to_string);
+        let endpoint = DaemonEndpoint::new(base, bearer, Source::Env);
         endpoint
             .resolved_passphrase()
             .is_some()
@@ -499,6 +504,9 @@ async fn upgrade_http(
     } else {
         None
     };
+    // A bearer goes first. A 401 on it falls back to one passphrase login, which then
+    // replaces the bearer, the same order the HTTP client uses.
+    let mut login_now = !had_bearer;
     let mut refreshed = false;
     loop {
         let mut had_cached_session = false;
@@ -506,29 +514,33 @@ async fn upgrade_http(
             let session = match cache.get(endpoint) {
                 Some(session) => {
                     had_cached_session = true;
-                    session
+                    Some(session)
                 }
-                None => {
+                None if login_now => Some(
                     tokio::time::timeout_at(deadline, passphrase_session::login(endpoint, cache))
                         .await
                         .map_err(|_| ReadFailure::post("unavailable"))?
-                        .map_err(map_login_error)?
-                }
+                        .map_err(map_login_error)?,
+                ),
+                None => None,
             };
-            request.headers_mut().insert(
-                "Cookie",
-                session
-                    .cookie
-                    .parse()
-                    .map_err(|_| ReadFailure::post("unauthorized"))?,
-            );
-            request.headers_mut().insert(
-                "X-Aoe-Device-Binding",
-                session
-                    .binding_secret
-                    .parse()
-                    .map_err(|_| ReadFailure::post("unauthorized"))?,
-            );
+            if let Some(session) = session {
+                request.headers_mut().remove("Authorization");
+                request.headers_mut().insert(
+                    "Cookie",
+                    session
+                        .cookie
+                        .parse()
+                        .map_err(|_| ReadFailure::post("unauthorized"))?,
+                );
+                request.headers_mut().insert(
+                    "X-Aoe-Device-Binding",
+                    session
+                        .binding_secret
+                        .parse()
+                        .map_err(|_| ReadFailure::post("unauthorized"))?,
+                );
+            }
         }
         let result = tokio::time::timeout_at(
             deadline,
@@ -544,11 +556,16 @@ async fn upgrade_http(
         match result {
             Ok((stream, _)) => return Ok(stream),
             Err(WsError::Http(response))
-                if response.status().as_u16() == 401 && had_cached_session && !refreshed =>
+                if response.status().as_u16() == 401
+                    && auth.is_some()
+                    && ((had_cached_session && !refreshed) || !login_now) =>
             {
-                let (endpoint, cache) = auth.as_ref().expect("cached passphrase session");
-                cache.invalidate(endpoint);
-                refreshed = true;
+                let (endpoint, cache) = auth.as_ref().expect("passphrase auth");
+                if had_cached_session {
+                    cache.invalidate(endpoint);
+                    refreshed = true;
+                }
+                login_now = true;
                 request = match endpoint::select_endpoint(source)? {
                     SelectedEndpoint::Http { request } => *request,
                     SelectedEndpoint::Local => unreachable!("captured HTTP source"),
@@ -1229,6 +1246,78 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        state.shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// A bearer alone is refused on a token-plus-passphrase daemon, so the read falls back to
+    /// one passphrase login (which carries the bearer) instead of failing.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_bearer_refused_for_a_second_factor_falls_back_to_a_passphrase_login() {
+        use crate::server::test_support;
+        use crate::session::test_support::EnvGuard;
+        let mut _env = test_support::RuntimeEnvGuard::read_lock();
+        let dir = tempfile::tempdir().unwrap();
+        _env.bind(dir.path());
+        let phrase = "runtime read second factor";
+        let token = "a".repeat(64);
+        let _phrase = EnvGuard::set(&[("AOE_DAEMON_PASSPHRASE", phrase)]);
+        crate::session::create_profile("main").unwrap();
+        let mut row = crate::session::Instance::new("second factor evidence", "/repo");
+        row.id = "second-factor-read".into();
+        row.source_profile = "main".into();
+        row.tool = "claude".into();
+        test_support::seed_instances_on_disk_for_test("main", vec![row.clone()]);
+        let state = test_support::build_test_app_state_with_policy_configured(
+            vec![row],
+            vec!["localhost".into(), "127.0.0.1".into()],
+            Vec::new(),
+            Some(token.clone()),
+            |state| {
+                state.login_manager =
+                    std::sync::Arc::new(crate::server::login::LoginManager::new(Some(phrase)));
+            },
+        );
+        test_support::accept_runtime_read_cache_for_test(&state).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app =
+            axum::Router::new().nest("/base", test_support::build_router_for_test(state.clone()));
+        let shutdown = state.shutdown.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown.cancelled_owned())
+            .await
+            .unwrap();
+        });
+        let cli = Cli::parse_from(["aoe", "session", "show", "second-factor-read", "--json"]);
+        let source = ReadRequestSource {
+            explicit_url: None,
+            env_url: Some(format!("http://127.0.0.1:{port}/base/").into()),
+            token: Some(OsString::from(token)),
+            explicit_profile: Some("main".into()),
+            env_profile: None,
+        };
+        let ScopedRead::Answered(outcome) =
+            attempt(classify(cli.command.as_ref()).unwrap(), &source).await
+        else {
+            panic!("a bearer plus passphrase must not fall back to disk");
+        };
+        assert_eq!(outcome.exit, 0, "{:?}", outcome.stderr);
+        let value: serde_json::Value = serde_json::from_str(&outcome.stdout.unwrap()).unwrap();
+        assert_eq!(value["id"], "second-factor-read");
+        assert_eq!(
+            state.login_manager.device_snapshot(None).await.len(),
+            1,
+            "exactly one passphrase login"
+        );
         state.shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(5), server)
             .await

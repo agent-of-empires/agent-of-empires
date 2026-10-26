@@ -64,12 +64,20 @@ pub struct ServeArgs {
 
     /// Mark this server as sitting behind a reverse proxy that
     /// terminates TLS upstream. Sets cookies as `; Secure` and trusts
-    /// the `X-Forwarded-For` / `cf-connecting-ip` headers from
-    /// loopback peers. Does NOT auto-spawn a tunnel (unlike --remote).
+    /// the `X-Forwarded-For` header from loopback peers. Does NOT auto-spawn a tunnel (unlike --remote).
     /// Required when --auth=passphrase or --auth=none is combined with
     /// a non-loopback bind.
     #[arg(long)]
     pub behind_proxy: bool,
+
+    /// Accept plain HTTP from non-loopback peers. By default the server answers
+    /// those with 426 before authentication: bearer tokens and passphrases would
+    /// cross the network in the clear. A TLS proxy or tunnel in front of a
+    /// loopback listener (`--behind-proxy`, `--remote`) needs no opt-out. This
+    /// applies to this bind only, is never inferred from the address, and is
+    /// logged at every start.
+    #[arg(long)]
+    pub dangerously_allow_plaintext_remote: bool,
 
     /// Extra `Host` header value to accept (repeatable). The DNS-rebinding
     /// gate trusts loopback, any routable IP-literal `Host` (LAN/tailnet IPs
@@ -147,7 +155,7 @@ pub struct ServeArgs {
         long,
         conflicts_with_all = [
             "stop", "daemon", "remote", "restart",
-            "no_auth", "auth", "behind_proxy",
+            "no_auth", "auth", "behind_proxy", "dangerously_allow_plaintext_remote",
             "read_only", "cityhall", "passphrase", "port",
             "tunnel_name", "no_tailscale", "tunnel_url", "open",
             "allowed_host", "allowed_origin",
@@ -183,7 +191,7 @@ pub struct ServeArgs {
         long,
         conflicts_with_all = [
             "stop", "status", "daemon", "daemon_child", "core_only", "remote", "rollback",
-            "no_auth", "auth", "behind_proxy",
+            "no_auth", "auth", "behind_proxy", "dangerously_allow_plaintext_remote",
             "read_only", "cityhall", "passphrase", "port", "host",
             "tunnel_name", "no_tailscale", "tunnel_url", "open",
             "allowed_host", "allowed_origin",
@@ -268,7 +276,7 @@ fn validate_auth_combination(
             "Refusing to start with --auth={} on {}.\n\
              Reduced-auth modes on a non-loopback bind require --behind-proxy,\n\
              which signals that an upstream reverse proxy terminates TLS and\n\
-             forwards the client IP via X-Forwarded-For / cf-connecting-ip.",
+             forwards the client IP via X-Forwarded-For.",
             auth_mode.as_cli_str(),
             host
         );
@@ -583,6 +591,8 @@ pub struct ServeLaunch {
     pub auth_mode: AuthMode,
     pub has_passphrase: bool,
     pub behind_proxy: bool,
+    #[serde(default)]
+    pub allow_plaintext_remote: bool,
     pub read_only: bool,
     /// CityHall client mode. Persisted so `--restart` and the `aoe update`
     /// re-exec replay it; without this the mode would silently drop because it
@@ -619,6 +629,7 @@ impl ServeLaunch {
             auth: (!self.core_only).then_some(self.auth_mode),
             no_auth: false,
             behind_proxy: self.behind_proxy,
+            dangerously_allow_plaintext_remote: self.allow_plaintext_remote,
             read_only: self.read_only,
             cityhall: self.cityhall,
             remote: self.remote,
@@ -1264,7 +1275,16 @@ pub async fn run(profile: &str, mut args: ServeArgs, startup: Option<ServeStartu
         eprintln!("  Anyone with the auth token can execute commands");
         eprintln!("  as your user on this machine.");
         eprintln!();
-        eprintln!("  Traffic is NOT encrypted (HTTP, not HTTPS).");
+        if args.dangerously_allow_plaintext_remote {
+            eprintln!("  Traffic is NOT encrypted (HTTP, not HTTPS), and");
+            eprintln!("  --dangerously-allow-plaintext-remote lets remote clients");
+            eprintln!("  send credentials in the clear.");
+        } else {
+            eprintln!("  Plain-HTTP requests from other machines are refused");
+            eprintln!("  (426). Put a TLS proxy in front of a loopback bind");
+            eprintln!("  (--behind-proxy), or pass");
+            eprintln!("  --dangerously-allow-plaintext-remote to accept them.");
+        }
         eprintln!("  Use a VPN (Tailscale, WireGuard) or SSH tunnel");
         eprintln!("  for remote access. Do NOT expose this to the");
         eprintln!("  public internet without TLS termination.");
@@ -1351,6 +1371,7 @@ pub async fn run(profile: &str, mut args: ServeArgs, startup: Option<ServeStartu
             is_daemon: args.daemon_child,
             passphrase: args.passphrase.as_deref(),
             behind_proxy: args.behind_proxy,
+            allow_plaintext_remote: args.dangerously_allow_plaintext_remote,
             open_browser: args.open,
             extra_allowed_hosts: args.allowed_host.clone(),
             extra_allowed_origins: args.allowed_origin.clone(),
@@ -1646,6 +1667,9 @@ async fn start_daemon(
     if args.behind_proxy {
         cmd.arg("--behind-proxy");
     }
+    if args.dangerously_allow_plaintext_remote {
+        cmd.arg("--dangerously-allow-plaintext-remote");
+    }
     if args.read_only {
         cmd.arg("--read-only");
     }
@@ -1757,6 +1781,7 @@ async fn start_daemon(
         },
         has_passphrase: args.passphrase.is_some(),
         behind_proxy: args.behind_proxy,
+        allow_plaintext_remote: args.dangerously_allow_plaintext_remote,
         read_only: args.read_only,
         cityhall: args.cityhall,
         remote: args.remote,
@@ -2438,6 +2463,7 @@ mod tests {
             auth_mode: AuthMode::Passphrase,
             has_passphrase: true,
             behind_proxy: true,
+            allow_plaintext_remote: true,
             read_only: true,
             cityhall: true,
             remote: false,

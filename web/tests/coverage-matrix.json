@@ -590,6 +590,16 @@
       ]
     },
     {
+      "id": "settings.field-deep-link",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/__tests__/SettingsView.navigation.test.tsx",
+        "src/components/__tests__/SettingsView.schema-load.test.tsx"
+      ],
+      "components": ["web/src/components/SettingsView.tsx", "web/src/App.tsx"]
+    },
+    {
       "id": "settings.tui-only-fold",
       "kind": "vitest",
       "risk": "low",
@@ -952,7 +962,11 @@
       "id": "sidebar.terminal-focus-handoff",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/terminal-focus-shortcut.spec.ts", "src/hooks/useKeyboardShortcuts.test.ts"],
+      "specs": [
+        "tests/terminal-focus-shortcut.spec.ts",
+        "tests/acp-retained-focus-sidebar-nav.spec.ts",
+        "src/hooks/useKeyboardShortcuts.test.ts"
+      ],
       "components": [
         "web/src/App.tsx",
         "web/src/components/WorkspaceSidebar.tsx",
@@ -2189,6 +2203,7 @@
         "web/src/App.tsx",
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/EmptyTrashConfirm.tsx",
+        "web/src/lib/api.ts",
         "web/src/lib/trashActions.ts"
       ]
     },

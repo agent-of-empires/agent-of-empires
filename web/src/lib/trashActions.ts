@@ -4,6 +4,8 @@ import { deleteWorkspace, restoreSession, trashSession } from "./api";
 import type { DeleteSessionOptions, DeleteWorkspaceResult, TrashPurgeConsent } from "./api";
 import type { SessionResponse, SessionStatus, Workspace } from "./types";
 
+const BUSY_MESSAGE = "Some sessions are busy with another operation and were not changed; retry them when it finishes";
+
 /** A workspace is only trashed as a whole, so restore every session of the workspace containing `sessionId`. */
 export function trashedWorkspaceRestoreIds(workspaces: Workspace[], sessionId: string): string[] {
   const ws = workspaces.find((w) => w.sessions.some((s) => s.id === sessionId));
@@ -109,6 +111,11 @@ export async function deleteWorkspaceSessions(
   for (const id of ids) deps.setStatus(id, "Deleting");
 
   const result = await deleteWorkspace(ids, { ...options, trash_consents });
+  if (!result.ok && result.busy?.length) {
+    deps.clearDeleting(sessions);
+    deps.notify?.error?.(BUSY_MESSAGE);
+    return result;
+  }
   if (!result.ok) {
     for (const id of ids) deps.setStatus(id, "Error");
     deps.notify?.error?.(result.error || "Failed to delete session");
@@ -117,7 +124,9 @@ export async function deleteWorkspaceSessions(
 
   const deleted = new Set(result.deleted ?? []);
   const failed = new Set((result.failed ?? []).map((f) => f.id));
+  const busy = new Set((result.busy ?? []).map((b) => b.id));
   const retained = sessions.filter((session) => !deleted.has(session.id) && !failed.has(session.id));
+  const kept = retained.filter((session) => !busy.has(session.id)).map((session) => session.id);
   deps.clearDeleting(retained);
   for (const id of ids) {
     if (deleted.has(id)) {
@@ -130,15 +139,23 @@ export async function deleteWorkspaceSessions(
   if (activeInWorkspace && deleted.has(activeSessionId!)) deps.navigateHome();
 
   if (result.failed && result.failed.length > 0) {
-    deps.notify?.error?.("Some sessions could not be deleted");
-    return { ...result, kept: retained.map((session) => session.id) };
+    deps.notify?.error?.(
+      busy.size > 0
+        ? "Some sessions could not be deleted, and some are busy with another operation; retry the busy ones when it finishes"
+        : "Some sessions could not be deleted",
+    );
+    return { ...result, kept };
+  }
+  if (busy.size > 0) {
+    deps.notify?.error?.(BUSY_MESSAGE);
+    return { ...result, kept };
   }
   deps.notify?.info?.(
     retained.length > 0
       ? "Some selected sessions changed and were not deleted"
       : (result.messages?.[0] ?? (ids.length > 1 ? "Sessions deleted" : "Session deleted")),
   );
-  return { ...result, kept: retained.map((session) => session.id) };
+  return { ...result, kept };
 }
 
 /** Returns true iff all succeeded. */

@@ -622,6 +622,7 @@ async fn empty_trash(profile: &str) -> Result<()> {
     let mut kept_for_retry = 0usize;
     let mut being_restored_elsewhere = 0usize;
     let mut being_purged_elsewhere = 0usize;
+    let mut busy = Vec::new();
     for inst in &trashed {
         let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             profile,
@@ -655,6 +656,9 @@ async fn empty_trash(profile: &str) -> Result<()> {
                         being_restored_elsewhere += 1;
                     }
                     crate::session::deletion::DeletionDisposition::Busy => {
+                        busy.push(busy_line(inst, &result));
+                    }
+                    crate::session::deletion::DeletionDisposition::Superseded => {
                         being_purged_elsewhere += 1;
                     }
                     _ => {}
@@ -680,6 +684,9 @@ async fn empty_trash(profile: &str) -> Result<()> {
                 }
             }
             crate::session::deletion::DeletionDisposition::Busy => {
+                busy.push(busy_line(inst, &result));
+            }
+            crate::session::deletion::DeletionDisposition::Superseded => {
                 being_purged_elsewhere += 1;
             }
             crate::session::deletion::DeletionDisposition::Failed => kept_for_retry += 1,
@@ -708,9 +715,12 @@ async fn empty_trash(profile: &str) -> Result<()> {
             "{being_restored_elsewhere} being restored by another process"
         ));
     }
+    if !busy.is_empty() {
+        parts.push(format!("skipped {} busy", busy.len()));
+    }
     if being_purged_elsewhere > 0 {
         parts.push(format!(
-            "{being_purged_elsewhere} being purged by another process"
+            "{being_purged_elsewhere} changed during purge, rerun to retry"
         ));
     }
     if outcome.restored_after_teardown > 0 {
@@ -724,7 +734,24 @@ async fn empty_trash(profile: &str) -> Result<()> {
         parts.join(", "),
         storage.profile()
     );
+    if !busy.is_empty() {
+        for line in &busy {
+            eprintln!("{line}");
+        }
+        anyhow::bail!(
+            "{} session(s) were skipped because another operation holds them; nothing changed \
+             for those, retry once the operation finishes",
+            busy.len()
+        );
+    }
     Ok(())
+}
+
+fn busy_line(inst: &Instance, result: &crate::session::deletion::DeletionResult) -> String {
+    let reason = result
+        .conflict()
+        .map_or_else(|| "busy".to_owned(), |error| error.to_string());
+    format!("  Busy: {}  {} ({reason})", inst.id, inst.title)
 }
 
 async fn snooze_session(profile: &str, args: SnoozeArgs) -> Result<()> {
@@ -3786,5 +3813,65 @@ mod wait_decision_tests {
         let mut converted = adopted;
         converted.view = crate::session::View::Structured;
         assert!(adopt_stored(&live, converted).is_err());
+    }
+}
+
+#[cfg(test)]
+mod empty_trash_busy_tests {
+    use super::empty_trash;
+    use crate::session::{Instance, LifecycleOperation, Storage};
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn empty_trash_purges_the_rest_then_fails_for_a_busy_session() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let root = crate::session::get_app_dir().unwrap();
+        crate::session::purge_owners::initialize(&root).unwrap();
+        crate::tmux::tool_retirement::initialize(&root).unwrap();
+        let profile = "empty-trash-busy";
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let mut busy = Instance::new("busy", "/tmp/empty-trash-busy-a");
+        let mut free = Instance::new("free", "/tmp/empty-trash-busy-b");
+        for row in [&mut busy, &mut free] {
+            row.source_profile = profile.into();
+            row.trash();
+        }
+        let busy_id = busy.id.clone();
+        storage
+            .update(|rows, _| {
+                rows.extend([busy, free]);
+                Ok(())
+            })
+            .unwrap();
+        let generation = storage
+            .update(|rows, _| {
+                let row = rows.iter_mut().find(|row| row.id == busy_id).unwrap();
+                Ok(row
+                    .try_acquire_lifecycle_reservation(
+                        LifecycleOperation::Restore,
+                        Instance::LIFECYCLE_RESERVATION_TTL,
+                        chrono::Utc::now(),
+                    )
+                    .unwrap())
+            })
+            .unwrap();
+
+        let error = empty_trash(profile).await.unwrap_err().to_string();
+        assert!(error.contains("1 session(s) were skipped"), "{error}");
+        let left = storage.load().unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, busy_id);
+
+        storage
+            .update(|rows, _| {
+                rows[0].release_lifecycle_reservation_if_owned(
+                    LifecycleOperation::Restore,
+                    generation,
+                );
+                Ok(())
+            })
+            .unwrap();
+        empty_trash(profile).await.unwrap();
+        assert!(storage.load().unwrap().is_empty());
     }
 }

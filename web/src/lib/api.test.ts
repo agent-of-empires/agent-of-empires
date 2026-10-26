@@ -1315,6 +1315,14 @@ describe("deleteWorkspace errors", () => {
     });
   });
 
+  it("carries the busy list on a partial 200 and on the all-busy 409", async () => {
+    const busy = [{ id: "b", error: "busy with restore" }];
+    fetchSpy.mockResolvedValueOnce(json({ status: "partial", deleted: ["a"], kept: [], failed: [], busy }));
+    expect(await api.deleteWorkspace(["a", "b"])).toEqual({ ok: true, deleted: ["a"], kept: [], failed: [], busy });
+    fetchSpy.mockResolvedValueOnce(json({ error: "lifecycle_busy", message: "busy", busy }, 409));
+    expect(await api.deleteWorkspace(["b"])).toEqual({ ok: false, error: "busy", busy });
+  });
+
   it("maps server and network errors", async () => {
     const failed = [{ id: "a", error: "dirty" }];
     fetchSpy.mockResolvedValueOnce(json({ message: "dirty", failed }, 500));
