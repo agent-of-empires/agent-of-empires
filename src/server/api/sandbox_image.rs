@@ -445,8 +445,6 @@ pub struct ImageDismissBody {
     digest: String,
 }
 
-/// `POST /api/sandbox/image-dismiss`: snoozes the banner for this remote digest. The TUI reads
-/// and writes the same `app_state.dismissed_image_digest`.
 /// The only form a registry digest, and so `is_dismissed`, can match.
 fn is_sha256_digest(digest: &str) -> bool {
     digest.strip_prefix("sha256:").is_some_and(|hex| {
@@ -454,6 +452,8 @@ fn is_sha256_digest(digest: &str) -> bool {
     })
 }
 
+/// `POST /api/sandbox/image-dismiss`: snoozes the banner for this remote digest. The TUI reads
+/// and writes the same `app_state.dismissed_image_digest`.
 pub async fn sandbox_image_dismiss(
     State(state): State<Arc<AppState>>,
     body: Result<Json<ImageDismissBody>, JsonRejection>,
