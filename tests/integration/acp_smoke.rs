@@ -115,7 +115,7 @@ async fn shim_agent_round_trips_approval_allow() {
         )
     });
     let saw_yes_outcome = events.iter().any(|e| match e {
-        Event::AgentMessageChunk { text } => text.contains("permission_outcome=yes"),
+        Event::AgentMessageChunk { text, .. } => text.contains("permission_outcome=yes"),
         _ => false,
     });
 
@@ -239,7 +239,7 @@ async fn shim_agent_round_trips_a_question_option_list() {
     );
     assert!(
         events.iter().any(|e| match e {
-            Event::AgentMessageChunk { text } => text.contains("choice_outcome=choice-2"),
+            Event::AgentMessageChunk { text, .. } => text.contains("choice_outcome=choice-2"),
             _ => false,
         }),
         "agent should have received the picked option, not the first; got {events:?}"
@@ -330,7 +330,7 @@ async fn shim_agent_sees_a_dismissed_question_as_cancelled() {
 
     assert!(
         events.iter().any(|e| match e {
-            Event::AgentMessageChunk { text } => text.contains("choice_outcome=cancelled"),
+            Event::AgentMessageChunk { text, .. } => text.contains("choice_outcome=cancelled"),
             _ => false,
         }),
         "a dismissal must not answer with an option; got {events:?}"
@@ -414,7 +414,7 @@ async fn shim_agent_round_trips_fs() {
     let _ = client.shutdown().await;
 
     let saw_read = events.iter().any(|e| match e {
-        Event::AgentMessageChunk { text } => text.starts_with("fs_read=hello from shim"),
+        Event::AgentMessageChunk { text, .. } => text.starts_with("fs_read=hello from shim"),
         _ => false,
     });
     assert!(
@@ -505,7 +505,7 @@ async fn shim_agent_round_trips_terminal() {
     let _ = client.shutdown().await;
 
     let saw_terminal = events.iter().any(|e| match e {
-        Event::AgentMessageChunk { text } => {
+        Event::AgentMessageChunk { text, .. } => {
             text.contains("terminal_output=terminal-roundtrip-ok") && text.contains("exit=0")
         }
         _ => false,

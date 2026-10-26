@@ -296,6 +296,36 @@ test("structured view transcript file links open in-app, scroll to cited line, a
   }
 });
 
+test("back-to-back agent messages render as separate paragraphs, live and after reload", async ({
+  page,
+  spawnServe,
+}) => {
+  // The adapter opens each message with an empty chunk under a new messageId.
+  const say = (text: string, messageId: string) => ({ ...chunk(text), messageId });
+  const { serve, sessionId } = await startAcpSession(spawnServe, {
+    title: "acp-message-boundaries",
+    fakeAcpScript: script(
+      endTurn(
+        say("", "m-1"),
+        say("Still watching ", "m-1"),
+        say("#4656.", "m-1"),
+        say("", "m-2"),
+        say("The waiter has the lock.", "m-2"),
+      ),
+    ),
+  });
+  await openStructuredView(page, serve, sessionId);
+  expect2xx(await postPrompt(serve.baseUrl, sessionId, "status"));
+
+  for (const phase of ["live", "reload"]) {
+    if (phase === "reload") await page.reload();
+    const first = page.getByText("Still watching #4656.", { exact: true });
+    await expect(first, phase).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByText("The waiter has the lock.", { exact: true }), phase).toBeVisible();
+    await expect(page.getByText(/#4656\.The waiter/), phase).toHaveCount(0);
+  }
+});
+
 test("structured view renders synthesize memory recall as cleaned markdown", async ({ page, spawnServe }) => {
   // #2142: the SDK's recall payload is a <system-reminder> envelope around cat -n numbered markdown.
   const dirtyText =

@@ -188,8 +188,17 @@ async fn list_profiles(client: &reqwest::Client, daemon: &ServeDaemon) -> Vec<St
 #[tokio::test]
 #[serial]
 async fn permanent_scratch_delete_cancels_an_unanswered_initialize() {
+    assert_scratch_delete_cancels_initialize(ServeDaemon::spawn()).await;
+    #[cfg(target_os = "linux")]
+    if let Some(daemon) = ServeDaemon::spawn_with_scopes(true) {
+        assert_scratch_delete_cancels_initialize(daemon).await;
+    }
+}
+
+#[cfg(unix)]
+async fn assert_scratch_delete_cancels_initialize(daemon: ServeDaemon) {
     use std::os::unix::fs::PermissionsExt;
-    let daemon = ServeDaemon::spawn_with_scopes(cfg!(target_os = "linux"));
+    let scoped = daemon.scope_slice.is_some();
     let _home = set_temp_home(daemon.home.path());
     agent_of_empires::session::config::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
@@ -202,7 +211,7 @@ async fn permanent_scratch_delete_cancels_an_unanswered_initialize() {
         &adapter,
         format!(
             "#!/bin/sh\nIFS= read -r request\nif [ '{}' = true ]; then setsid sleep 120 & printf '%s' \"$!\" > '{}'; fi\nprintf '%s\n' \"$request\" > '{}.pending'\nmv '{}.pending' '{}'\nexec sleep 120\n",
-            cfg!(target_os = "linux"), escaped_marker.display(), marker.display(), marker.display(), marker.display()
+            scoped, escaped_marker.display(), marker.display(), marker.display(), marker.display()
         ),
     )
     .unwrap();
@@ -245,12 +254,13 @@ async fn permanent_scratch_delete_cancels_an_unanswered_initialize() {
         pid: u32,
         unit: Option<String>,
         slice: Option<String>,
+        runtime: PathBuf,
     }
     impl Drop for RetireOnDrop {
         fn drop(&mut self) {
             agent_of_empires::process::worker::kill_process_group(self.pid);
             if let Some(unit) = &self.unit {
-                let mut stop = Command::new("systemctl");
+                let mut stop = manager_command("systemctl", &self.runtime, true);
                 stop.args(["--user", "stop", unit]);
                 if let Some(slice) = &self.slice {
                     stop.arg(slice);
@@ -269,8 +279,9 @@ async fn permanent_scratch_delete_cancels_an_unanswered_initialize() {
         pid: record.pid,
         unit: unit.clone(),
         slice: daemon.scope_slice.clone(),
+        runtime: daemon._runtime.path().to_path_buf(),
     };
-    let escaped = if cfg!(target_os = "linux") {
+    let escaped = if scoped {
         let unit = unit
             .as_ref()
             .expect("available user manager must actually scope this native runner");
@@ -337,7 +348,7 @@ async fn permanent_scratch_delete_cancels_an_unanswered_initialize() {
             !agent_of_empires::process::worker::is_process_group_alive(escaped),
             "scope escapee remained after permanent DELETE"
         );
-        let output = Command::new("systemctl")
+        let output = manager_command("systemctl", daemon._runtime.path(), true)
             .args([
                 "--user",
                 "show",
@@ -384,6 +395,7 @@ struct ServeDaemon {
     port: u16,
     home: TempDir,
     scope_slice: Option<String>,
+    _runtime: TempDir,
 }
 
 impl ServeDaemon {
@@ -391,12 +403,18 @@ impl ServeDaemon {
     /// a fresh `HOME`. Panics on startup failure so the test gives a
     /// useful diagnostic.
     fn spawn() -> Self {
-        Self::spawn_with_scopes(false)
+        Self::spawn_with_scopes(false).expect("unscoped fixture")
     }
 
-    fn spawn_with_scopes(scoped: bool) -> Self {
+    fn spawn_with_scopes(scoped: bool) -> Option<Self> {
         let aoe = env!("CARGO_BIN_EXE_aoe");
         let home = tempfile::tempdir().expect("home tempdir");
+        let runtime = if cfg!(unix) {
+            tempfile::tempdir_in("/tmp")
+        } else {
+            tempfile::tempdir()
+        }
+        .expect("short private runtime");
         let port = pick_free_port();
         let app = if cfg!(any(target_os = "linux", target_os = "macos")) {
             home.path()
@@ -413,13 +431,26 @@ impl ServeDaemon {
                 uuid::Uuid::new_v4().simple()
             )
         });
-        let scope_config = match &scope_slice {
+        #[cfg(target_os = "linux")]
+        if let Some(slice) = &scope_slice {
+            if !scope_available(runtime.path(), slice) {
+                return None;
+            }
+        }
+        let mut daemon = Self {
+            child: None,
+            port,
+            home,
+            scope_slice,
+            _runtime: runtime,
+        };
+        let scope_config = match &daemon.scope_slice {
             Some(slice) => format!("[systemd]\nenabled = true\nslice = '{slice}'\n"),
             None => "[systemd]\nenabled = false\n".to_string(),
         };
         std::fs::write(app.join("config.toml"), scope_config).unwrap();
 
-        let mut cmd = Command::new(aoe);
+        let mut cmd = manager_command(aoe, daemon._runtime.path(), daemon.scope_slice.is_some());
         cmd.args([
             "serve",
             "--no-auth",
@@ -428,26 +459,18 @@ impl ServeDaemon {
             "--port",
             &port.to_string(),
         ]);
-        cmd.env("HOME", home.path());
-        cmd.env("XDG_CONFIG_HOME", home.path().join(".config"));
-        if !scoped {
-            cmd.env("XDG_RUNTIME_DIR", home.path().join("runtime"));
-            cmd.env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/dev/null");
-        }
+        cmd.env("HOME", daemon.home.path());
+        cmd.env("XDG_CONFIG_HOME", daemon.home.path().join(".config"));
+        cmd.env_remove("AOE_SERVE_PASSPHRASE");
+        cmd.env_remove("AOE_CITYHALL_MODE");
         cmd.env_remove("AGENT_OF_EMPIRES_DEBUG");
 
-        let mut child = cmd.spawn().expect("spawn aoe serve");
-        if !wait_for_port(port, Duration::from_secs(15)) {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("aoe serve did not bind 127.0.0.1:{} within 15s", port);
-        }
-        Self {
-            child: Some(child),
-            port,
-            home,
-            scope_slice,
-        }
+        daemon.child = Some(cmd.spawn().expect("spawn aoe serve"));
+        assert!(
+            wait_for_port(port, Duration::from_secs(15)),
+            "aoe serve did not bind 127.0.0.1:{port} within 15s"
+        );
+        Some(daemon)
     }
 
     fn url(&self, path: &str) -> String {
@@ -476,9 +499,68 @@ impl Drop for ServeDaemon {
             let _ = child.wait();
         }
         if let Some(slice) = &self.scope_slice {
-            let _ = Command::new("systemctl")
+            let _ = manager_command("systemctl", self._runtime.path(), true)
                 .args(["--user", "stop", slice])
                 .output();
         }
     }
+}
+
+/// Probe the same manager transport and scope flags the fixture daemon uses.
+#[cfg(target_os = "linux")]
+fn scope_available(runtime: &std::path::Path, slice: &str) -> bool {
+    let manager = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", nix::unistd::geteuid())));
+    for name in ["bus", "systemd"] {
+        let source = manager.join(name);
+        if source.exists() {
+            std::os::unix::fs::symlink(source, runtime.join(name)).unwrap();
+        }
+    }
+    let mut probe = manager_command("systemd-run", runtime, true);
+    probe
+        .args([
+            "--user",
+            "--scope",
+            "--quiet",
+            "--collect",
+            "--no-ask-password",
+            "--expand-environment=no",
+        ])
+        .arg(format!("--slice={slice}"))
+        .arg(format!(
+            "--unit=aoe-integration-probe-{}.scope",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .args([
+            "--description=aoe integration capability probe",
+            "--",
+            "true",
+        ]);
+    match agent_of_empires::process::run_with_timeout(&mut probe, Duration::from_secs(5)) {
+        Ok(Some(output)) if output.status.success() => true,
+        result => {
+            eprintln!("Scoped escapee coverage unavailable; unscoped cancellation was exercised: {result:?}");
+            let _ = manager_command("systemctl", runtime, true)
+                .args(["--user", "stop", slice])
+                .output();
+            false
+        }
+    }
+}
+
+fn manager_command(program: &str, runtime: &std::path::Path, scoped: bool) -> Command {
+    let bus = if !scoped {
+        "unix:path=/dev/null".to_string()
+    } else if runtime.join("bus").exists() {
+        format!("unix:path={}/bus", runtime.display())
+    } else {
+        std::env::var("DBUS_SESSION_BUS_ADDRESS")
+            .unwrap_or_else(|_| "unix:path=/dev/null".to_string())
+    };
+    let mut command = Command::new(program);
+    command.env("XDG_RUNTIME_DIR", runtime);
+    command.env("DBUS_SESSION_BUS_ADDRESS", bus);
+    command
 }

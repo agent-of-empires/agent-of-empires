@@ -1,9 +1,15 @@
 //! `agent-of-empires group` subcommands implementation
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use clap::{Args, Subcommand};
 use serde::Serialize;
 
+use crate::acp::client::require_daemon;
+use crate::daemon::{
+    ApiErrorCode, DaemonClient, DaemonClientError, DeleteGroupBody, DeleteGroupMode, GroupLocation,
+    RuntimeHealth, RUNTIME_PROTOCOL_VERSION,
+};
+use crate::session::config::resolve_default_profile;
 use crate::session::{GroupTree, Storage};
 
 #[derive(Subcommand)]
@@ -126,70 +132,79 @@ async fn list_groups(profile: &str, args: GroupListArgs) -> Result<()> {
     Ok(())
 }
 
-async fn create_group(profile: &str, args: GroupCreateArgs) -> Result<()> {
-    let storage = Storage::open_unwatched(profile)?;
+async fn daemon_client() -> Result<(DaemonClient, String)> {
+    let client = require_daemon().await?.daemon_client()?;
+    let info = client.runtime_info().await?;
+    anyhow::ensure!(
+        info.protocol_version == RUNTIME_PROTOCOL_VERSION && info.health == RuntimeHealth::Healthy,
+        "Daemon runtime is not ready"
+    );
+    Ok((client, info.epoch))
+}
 
-    let name = args.name.trim().to_string();
-    let group_path = if let Some(parent) = &args.parent {
-        format!("{}/{}", parent.trim(), name)
+fn group_location(profile: &str, path: &str) -> GroupLocation {
+    let profile = if profile.is_empty() {
+        resolve_default_profile()
     } else {
-        name.clone()
+        profile.to_string()
+    };
+    GroupLocation {
+        profile,
+        path: path.to_string(),
+    }
+}
+
+async fn create_group(profile: &str, args: GroupCreateArgs) -> Result<()> {
+    let name = args.name.trim();
+    let group_path = match args.parent.as_deref().map(str::trim) {
+        Some(parent) if !parent.is_empty() => format!("{parent}/{name}"),
+        _ => name.to_string(),
     };
 
-    storage.update(|instances, groups| {
-        let mut group_tree = GroupTree::new_with_groups(instances, groups);
-        if group_tree.group_exists(&group_path) {
-            bail!("Group already exists: {}", group_path);
-        }
-        group_tree.create_group(&group_path);
-        *groups = group_tree.get_all_groups();
-        Ok(())
-    })?;
+    let (client, epoch) = daemon_client().await?;
+    client
+        .create_group(&group_location(profile, &group_path), &epoch)
+        .await?;
 
     println!("✓ Created group: {}", group_path);
     Ok(())
 }
 
 async fn delete_group(profile: &str, args: GroupDeleteArgs) -> Result<()> {
-    let storage = Storage::open_unwatched(profile)?;
     let name = args.name.trim().to_string();
     let force = args.force;
 
-    let session_count = storage.update(|instances, groups| {
-        let mut group_tree = GroupTree::new_with_groups(instances, groups);
-        if !group_tree.group_exists(&name) {
-            bail!("Group not found: {}", name);
-        }
-
-        let session_count = instances
-            .iter()
-            .filter(|i| i.group_path == name || i.group_path.starts_with(&format!("{}/", name)))
-            .count();
-
-        if session_count > 0 {
-            if !force {
-                bail!(
-                    "Group '{}' contains {} sessions. Use --force to move them to default group.",
-                    name,
-                    session_count
-                );
+    let (client, epoch) = daemon_client().await?;
+    let body = DeleteGroupBody {
+        group: group_location(profile, &name),
+        mode: if force {
+            DeleteGroupMode::KeepSessions
+        } else {
+            DeleteGroupMode::EmptyOnly
+        },
+        cleanup: Default::default(),
+    };
+    let receipt = client.delete_group(&body, &epoch).await.map_err(|e| {
+        let not_empty = matches!(
+            &e,
+            DaemonClientError::Status {
+                code: Some(ApiErrorCode::GroupNotEmpty),
+                ..
             }
-
-            for inst in instances.iter_mut() {
-                if inst.group_path == name || inst.group_path.starts_with(&format!("{}/", name)) {
-                    inst.group_path = String::new();
-                }
-            }
+        );
+        if !force && not_empty {
+            anyhow::Error::from(e).context(format!(
+                "Group '{name}' is not empty. Use --force to move its sessions to default group."
+            ))
+        } else {
+            e.into()
         }
-
-        group_tree.delete_group(&name);
-        *groups = group_tree.get_all_groups();
-        Ok(session_count)
     })?;
 
     println!("✓ Deleted group: {}", name);
-    if force && session_count > 0 {
-        println!("  Moved {} sessions to default group", session_count);
+    let moved = receipt.outcome.sessions.len();
+    if force && moved > 0 {
+        println!("  Moved {} sessions to default group", moved);
     }
 
     Ok(())
@@ -222,4 +237,21 @@ async fn move_session(profile: &str, args: GroupMoveArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn empty_profile_resolves_to_the_configured_default() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(home.path());
+        crate::session::create_profile("configured").unwrap();
+        crate::session::config::update_config(|c| c.default_profile = "configured".into()).unwrap();
+
+        assert_eq!(group_location("", "team").profile, "configured");
+        assert_eq!(group_location("work", "team").profile, "work");
+    }
 }

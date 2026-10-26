@@ -314,11 +314,13 @@ async fn edit_session(
         }
     };
     // Never call the supervisor while a storage/publication lock is held.
-    if moves {
-        quiesce_structured_worker_for_worktree_move(state, id, before.is_structured()).await?;
+    if moves || after.source_profile != before.source_profile {
+        quiesce_structured_worker(state, id, before.is_structured()).await?;
     }
     let effect_applied = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let effect_flag = effect_applied.clone();
+    let move_warning = Arc::new(std::sync::Mutex::new(None::<String>));
+    let move_warning_slot = move_warning.clone();
     let old_title = before.title.clone();
     let new_title = after.title.clone();
     let structured = before.is_structured();
@@ -351,6 +353,7 @@ async fn edit_session(
             );
             match result {
                 Ok(result) => {
+                    *move_warning_slot.lock().expect("move warning slot") = result.warning.clone();
                     effect_flag.store(
                         result.new_path != std::path::Path::new(&before.project_path)
                             || result.new_branch.as_deref().is_some_and(|branch| {
@@ -477,6 +480,7 @@ async fn edit_session(
         }
     };
     let mut warnings = Vec::new();
+    warnings.extend(move_warning.lock().expect("move warning slot").take());
     if old_title != new_title && !structured {
         let rekey_id = id.to_owned();
         match tokio::task::spawn_blocking(move || crate::tmux::rekey_session(&rekey_id, &old_title, &new_title)).await {
@@ -579,19 +583,19 @@ fn session_edit_error(error: &anyhow::Error, partial: bool) -> axum::response::R
 #[error("session title/path already exists: {0}")]
 struct EditDuplicate(String);
 
-/// Quiesce a structured-view worker before its worktree directory moves. A live
-/// ACP worker is pinned to the current cwd, so `git worktree move` crash-loops
-/// it at the stale baked-in cwd until the reconciler parks the session with a
-/// misleading banner (#2260). `blocks_worktree_edit` misses this because a
-/// "stopped" structured session sits at Idle yet still owns a live worker.
+/// Quiesce a structured-view worker before its worktree directory or profile
+/// moves. A live ACP worker is pinned to its launch cwd and profile: moving the
+/// directory crash-loops it at the stale cwd (#2260), and a profile move leaves
+/// it running under the old profile (#4919). `blocks_worktree_edit` misses both
+/// because a "stopped" structured session sits at Idle yet still owns a worker.
 ///
-/// `shutdown` is reversible: it keeps the transcript and `acp_session_id`, so
-/// after the move the reconciler fresh-spawns at the new path and resumes via
-/// session/load. Callers hold `instance_lock` across shutdown, move and persist,
-/// and the reconciler re-reads `project_path` under it, so the respawn never
-/// targets the old path. Refuses the move (409) if a live worker cannot be
-/// stopped.
-async fn quiesce_structured_worker_for_worktree_move(
+/// The stop is reversible: it keeps the transcript and `acp_session_id`, so the
+/// reconciler fresh-spawns under the new path and profile and resumes via
+/// session/load. Callers hold `instance_lock` across shutdown, move and persist.
+/// Waits for retirement to settle, since `shutdown` also succeeds for a worker
+/// that is already stopping. Refuses the move (409) if a live worker is not
+/// proven stopped within the deadline.
+async fn quiesce_structured_worker(
     state: &Arc<AppState>,
     id: &str,
     is_structured: bool,
@@ -599,13 +603,17 @@ async fn quiesce_structured_worker_for_worktree_move(
     if !is_structured {
         return Ok(());
     }
-    match state.acp_supervisor.shutdown(id).await {
+    match state
+        .acp_supervisor
+        .shutdown_and_wait(id, std::time::Duration::from_secs(5))
+        .await
+    {
         Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => Ok(()),
         Err(e) => {
             tracing::warn!(
                 target: "http.api.sessions",
                 session = %id,
-                "could not stop structured-view worker before worktree move: {e}"
+                "could not stop structured-view worker before move: {e}"
             );
             Err(api_error(
                 StatusCode::CONFLICT,

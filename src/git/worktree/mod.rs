@@ -99,7 +99,7 @@ impl GitWorktree {
     /// Lets this instance's submodule update use `file://` URLs, which git
     /// blocks by default (CVE-2022-39253).
     #[cfg(test)]
-    fn allow_submodule_file_transport(mut self) -> Self {
+    pub(crate) fn allow_submodule_file_transport(mut self) -> Self {
         self.submodule_config
             .push("protocol.file.allow=always".to_string());
         self
@@ -229,6 +229,36 @@ impl GitWorktree {
             std::fs::write(&git_file, format!("gitdir: {}\n", relative.display()))?;
         }
         Ok(())
+    }
+
+    /// Rewrite a relative `gitdir:` pointer as an absolute one, for git versions
+    /// whose `worktree move` validation cannot follow a relative pointer.
+    /// Returns the original file bytes when it rewrote, so a failed move can
+    /// restore them. A pointer that does not resolve is left for git to report.
+    fn convert_git_file_to_absolute(worktree_path: &Path) -> Result<Option<Vec<u8>>> {
+        let git_file = worktree_path.join(".git");
+        if !git_file.is_file() {
+            return Ok(None);
+        }
+        let Some(gitdir) = crate::git::cleanup::read_linked_worktree_gitdir(worktree_path) else {
+            return Ok(None);
+        };
+        let Ok(absolute) = gitdir.canonicalize() else {
+            return Ok(None);
+        };
+        let original = std::fs::read(&git_file)?;
+        let mut pointer = b"gitdir: ".to_vec();
+        pointer.extend_from_slice(absolute.as_os_str().as_encoded_bytes());
+        pointer.push(b'\n');
+        if pointer == original {
+            return Ok(None);
+        }
+        // An exclusive, uniquely named temp file renamed into place keeps `.git`
+        // whole if the write fails, and never touches a file already in the checkout.
+        let mut tmp = tempfile::NamedTempFile::new_in(worktree_path)?;
+        std::io::Write::write_all(&mut tmp, &pointer)?;
+        tmp.persist(&git_file).map_err(|e| e.error)?;
+        Ok(Some(original))
     }
 
     /// Relative path from `base` to `target`.

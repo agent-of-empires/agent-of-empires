@@ -113,7 +113,8 @@ aoe add . --agent codex --model gpt-5
 aoe add . --agent codex --effort high
 ```
 
-`--agent` implies structured view and refuses an uninstalled adapter with an install hint. `--structured-view` without `--agent` can fall back to terminal view with a warning.
+`--agent` implies structured view and refuses an uninstalled adapter with an install hint. `--structured-view` without `--agent` can fall back to terminal view with a warning. If you decline the repository hooks needed to find the adapter, creation is refused instead. The TUI and the web dashboard refuse such a session with the same hint before anything is created. An adapter counts as installed when aoe finds it, when it is on the PATH set by [`environment`](guides/configuration.md#host-environment), or when a `before_session` hook is configured, or an `on_create` or `on_launch` hook will run first (the profile's, or the repository's unless this create skips it), since any of them may set PATH or install the adapter. A relative PATH entry is searched from the session's directory; for a new worktree or scratch session, which doesn't exist yet when the check runs, it counts. Sandboxed sessions skip the check, since the adapter runs inside the container, whose image must bundle it.
+
 ## Requirements
 
 - Node.js 22+ on `PATH` (the structured view spawns an ACP agent subprocess); `aoe-agent` needs 22.6+ for `--experimental-strip-types` and declares `engines.node: >=22.6.0`.

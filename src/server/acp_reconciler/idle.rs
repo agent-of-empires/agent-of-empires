@@ -330,6 +330,7 @@ mod tests {
                 },
                 Event::AgentMessageChunk {
                     text: "Done.".to_string(),
+                    message_id: None,
                 },
             ];
             evs.extend(extra);

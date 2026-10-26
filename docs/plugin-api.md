@@ -226,10 +226,10 @@ Writing a per-project value sends `plugin.settings.changed` with the usual `{ re
 | `project_path` | string | The session's own working directory; for a worktree session this is the worktree, not the main repo. |
 | `archived`, `snoozed`, `trashed` | bool | Lifecycle flags. |
 | `unread` | bool | The session carries the unread marker; always `false` while `session.unread_indicator` is off. |
-| `workspace_repos` | array | One `{ source_path, branch }` per repo checkout of a multi-repo workspace; empty otherwise. |
+| `workspace_repos` | array | One `{ source_path, branch, worktree_path }` per repo checkout of a multi-repo workspace; empty otherwise. `branch` is the branch recorded at workspace creation and can be stale; read `worktree_path` for the live checkout. |
 | `worktree` | object | `{ branch, main_repo_path, managed_by_aoe }`; present only for worktree sessions. |
 
-`trashed`, `unread`, `workspace_repos` and `worktree` were added after the first release; they are additive RPC fields and do not change the manifest `api_version`. Treat a missing key as absent on an older host.
+`trashed`, `unread`, `workspace_repos` (and its `worktree_path` entries) and `worktree` were added after the first release; they are additive RPC fields and do not change the manifest `api_version`. Treat a missing key as absent on an older host.
 
 ## Session-driving RPCs
 

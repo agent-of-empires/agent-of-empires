@@ -214,11 +214,11 @@ impl RuntimeBase {
                     timeout_s = PULL_TIMEOUT.as_secs(),
                     "image pull timed out; killed",
                 );
-                return Err(DockerError::ImageNotFound(format!(
-                    "{}: pull timed out after {}s",
-                    image,
-                    PULL_TIMEOUT.as_secs()
-                )));
+                return Err(DockerError::ImagePullFailed {
+                    runtime: self.name,
+                    image: image.to_string(),
+                    detail: format!("timed out after {}s", PULL_TIMEOUT.as_secs()),
+                });
             }
         };
         let dur_ms = start.elapsed().as_millis() as u64;
@@ -233,11 +233,11 @@ impl RuntimeBase {
                 stderr_summary = %stderr.trim().chars().take(200).collect::<String>(),
                 "image pull failed"
             );
-            return Err(DockerError::ImageNotFound(format!(
-                "{}: {}",
-                image,
-                stderr.trim()
-            )));
+            return Err(DockerError::ImagePullFailed {
+                runtime: self.name,
+                image: image.to_string(),
+                detail: sanitize_stderr(&stderr),
+            });
         }
 
         tracing::info!(

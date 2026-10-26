@@ -43,7 +43,7 @@ Shell pipelines, remote launchers, redirections, expansion, and unrecognized con
 - **Claude:** on a host launch, the store its conversation recorded, a declared `agent_config_dir`, the resolved `CLAUDE_CONFIG_DIR`, or the default Claude store; a sandboxed session takes a per-session child of the entry instead. Conflicting selectors resolve in a fixed order rather than being refused; see [Swapping the engine on a restart](#swapping-the-engine-on-a-restart).
 - **Codex:** a local host-readable `CODEX_HOME`, file-backed API-key authentication, and local SQLite/thread storage. Cloud, keyring, profile, project-routing, managed-policy, and host macOS contexts are not currently proven.
 - **OpenCode:** an explicit `OPENCODE_DB`, or the common database when `OPENCODE_DISABLE_CHANNEL_DB` is already enabled. Sandboxed explicit resume requires a host-readable database mount; the target working directory is still validated inside the container. Target routing is read only from the session table selected by the prepared executable's verified release/build identity. An inactive table cannot supply a missing target or override its working directory or workspace. A workspace-routed target or different stored working directory is refused. Managed current-generation launches and resumes use `--standalone` so an existing background service cannot redirect them to another database.
-- **Pi and OMP:** the verified transcript and exact store. Recovery uses `--store` with the transcript file. OMP also verifies its stored working directory and pins the resolved profile.
+- **Pi and OMP:** the verified transcript and exact store. Recovery uses `--store` with the transcript file. A Pi row that has an id but no recorded transcript path looks for `<timestamp>_<id>.jsonl` in the store, then resumes it with `--session <path>`. OMP also verifies its stored working directory and pins the resolved profile.
 - **Gemini, Cursor, Kimi, and Copilot:** their native config/share/home store inputs. AoE does not combine unrelated environment roots.
 - **Prime:** the resolved agent root and session directory, including a verified `--cwd`. A declared wrapper can resume an explicitly bound conversation but does not gain capture or fork capability.
 - **Hermes:** an explicitly declared configuration root and local `state.db`. Stored lineage and working directory must match the launch context.
@@ -160,6 +160,8 @@ Rebinding the record with `aoe session set-session-id --store` copies nothing, s
 ## Picking up an upgraded agent CLI
 
 Upgrading the agent binary from inside a session does not replace the process in the pane. Restart the session instead of creating a new one: press `e` (`E` with strict hotkeys) or `F5`, or run `aoe session restart <session>` (`--all` to restart every eligible session in the profile; from an agent session, the caller is skipped so the command can finish). A restart runs only `on_launch`, whose failures are warnings, and resumes the conversation while `session.auto_resume_on_restart` is on (the default). A new session runs `on_create`, whose failure [aborts creation](repo-config.md#hooks).
+
+AoE also notices when the agent binary was replaced after a session launched. While the session is idle, the web sidebar menu offers **Restart to apply update (keeps conversation)** and the TUI row shows an `[update]` badge, with the same restart under the context menu.
 
 ## Importing an existing conversation
 

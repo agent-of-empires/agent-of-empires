@@ -1457,6 +1457,10 @@ mod tests {
                 .body(axum::body::Body::from(serde_json::json!({"group": {"profile": profile, "path": path}, "mode": mode}).to_string()))?).await?;
             assert_eq!(response.status().as_u16(), expected);
             if expected == 409 {
+                assert_eq!(
+                    response.headers()[crate::daemon::ERROR_CODE_HEADER],
+                    "group_not_empty"
+                );
                 assert_eq!(std::fs::read(source.sessions_path())?, before);
                 continue;
             }

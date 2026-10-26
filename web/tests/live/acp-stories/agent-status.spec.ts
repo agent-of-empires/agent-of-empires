@@ -160,10 +160,14 @@ test("startup banner: native-binary branch + agent-log disclosure", async ({ pag
   expect(msg).toContain("failed to launch");
 
   await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`);
-  await expect(page.getByText("Structured view agent failed to start")).toBeVisible({ timeout: 15_000 });
+  // "Claude", not the message's "claude": the name comes from the daemon's install-info.
+  await expect(page.getByRole("heading", { name: "Claude couldn't start in Structured view" })).toBeVisible({
+    timeout: 15_000,
+  });
   await expect(page.getByText(/Architecture mismatch/i)).toBeVisible();
   await expect(page.getByText(/aoe acp doctor --fix/)).toHaveCount(0);
 
+  await page.getByTestId("startup-error-banner-details").click();
   const toggle = page.getByTestId("acp-agent-log-toggle");
   await expect(toggle).toBeVisible();
   await toggle.click();

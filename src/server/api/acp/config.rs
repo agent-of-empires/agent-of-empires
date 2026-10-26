@@ -86,50 +86,50 @@ impl PersistedSelector {
     }
 }
 
-/// Write a picked value into memory (read by the reconciler) and to disk.
+/// Write a picked value to disk, then to memory (read by the reconciler). Memory
+/// is untouched on failure so it keeps matching the stored row.
 async fn persist_selector(
     state: &Arc<AppState>,
     id: &str,
     selector: PersistedSelector,
     value: &str,
-) {
+) -> anyhow::Result<()> {
     let _reload = state.session_service.disk_mutation_guard().await;
     let profile = {
-        let mut instances = state.instances.write().await;
-        let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-            return;
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            return Ok(());
         };
+        inst.source_profile.clone()
+    };
+    crate::session::Storage::new(&profile, state.file_watch.clone())?.update(
+        |instances, _groups| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+                selector.apply(inst, value.to_string());
+            }
+            Ok(())
+        },
+    )?;
+    let mut instances = state.instances.write().await;
+    if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
         selector.apply(inst, value.to_string());
         state
             .mutation_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        inst.source_profile.clone()
-    };
-    match crate::session::Storage::new(&profile, state.file_watch.clone()) {
-        Ok(storage) => {
-            if let Err(e) = storage.update(|instances, _groups| {
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                    selector.apply(inst, value.to_string());
-                }
-                Ok(())
-            }) {
-                tracing::error!(
-                    target: "http.api.acp",
-                    session = %id,
-                    field = selector.field(),
-                    "failed to persist selector after config-option pick: {e}"
-                );
-            }
-        }
-        Err(e) => {
-            tracing::error!(
-                target: "http.api.acp",
-                session = %id,
-                field = selector.field(),
-                "failed to open storage to persist selector after config-option pick: {e}"
-            );
-        }
     }
+    Ok(())
+}
+
+/// The key the session's agent is recorded under in the option catalog.
+async fn catalog_agent(state: &Arc<AppState>, id: &str) -> Option<String> {
+    let instances = state.instances.read().await;
+    instances.iter().find(|i| i.id == id).map(|i| {
+        i.agent_name
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(i.tool.as_str())
+            .to_string()
+    })
 }
 
 /// The category the session's agent advertised for `config_id`, from the
@@ -139,16 +139,7 @@ async fn config_option_category(
     id: &str,
     config_id: &str,
 ) -> Option<ConfigOptionCategory> {
-    let agent = {
-        let instances = state.instances.read().await;
-        instances.iter().find(|i| i.id == id).map(|i| {
-            i.agent_name
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .unwrap_or(i.tool.as_str())
-                .to_string()
-        })
-    }?;
+    let agent = catalog_agent(state, id).await?;
     crate::acp::option_catalog::load()
         .agents
         .get(&agent)
@@ -182,14 +173,6 @@ pub async fn acp_set_config_option(
     else {
         return session_not_found();
     };
-    if let Err(e) = state
-        .acp_supervisor
-        .set_config_option(&id, &req.config_id, &req.value)
-        .await
-    {
-        return supervisor_error_response("set_config_option failed", &e);
-    }
-    count_plan_mode(&state, &req.value);
     // Respawns reuse persisted selector picks.
     let selector = if req.config_id == "model" {
         Some(PersistedSelector::Model)
@@ -201,15 +184,48 @@ pub async fn acp_set_config_option(
             Some(ConfigOptionCategory::Other(_)) | None => None,
         }
     };
+    // The adapter rejects a bad effort only after the pick is stored, so an
+    // unknown value must not get that far. No cached choices means accept.
+    if selector == Some(PersistedSelector::ThoughtLevel) {
+        let agent = catalog_agent(&state, &id).await.unwrap_or_default();
+        let choices = crate::acp::option_catalog::thought_level_choices(&agent);
+        if !choices.is_empty() && !choices.contains(&req.value) {
+            return super::super::api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_effort",
+                format!(
+                    "unknown effort {:?}; expected one of: {}",
+                    req.value,
+                    choices.join(", ")
+                ),
+            );
+        }
+    }
+    if let Err(e) = state
+        .acp_supervisor
+        .set_config_option(&id, &req.config_id, &req.value)
+        .await
+    {
+        return supervisor_error_response("set_config_option failed", &e);
+    }
     if let Some(selector) = selector {
+        if let Err(e) = persist_selector(&state, &id, selector, &req.value).await {
+            return persist_failure_response(
+                &state,
+                &id,
+                &format!("config-option pick for {}", selector.field()),
+                &e,
+            )
+            .await;
+        }
         if selector == PersistedSelector::Model {
             state
                 .acp_supervisor
                 .refresh_cached_model(&id, &req.value)
                 .await;
         }
-        persist_selector(&state, &id, selector, &req.value).await;
     }
+    count_plan_mode(&state, &req.value);
     StatusCode::ACCEPTED.into_response()
 }
 
@@ -218,6 +234,35 @@ mod tests {
     use super::*;
     use crate::acp::state::{ConfigOptionChoice, ConfigOptionDescriptor};
     use crate::session::test_support::isolate_app_dir;
+
+    /// The reconciler's per-process state across ticks.
+    #[derive(Default)]
+    struct ReconcilerTick {
+        attempted: std::collections::HashSet<String>,
+        respawn_history: std::collections::HashMap<String, Vec<std::time::Instant>>,
+        parked: std::collections::HashSet<String>,
+        capacity_deferred: std::collections::HashSet<String>,
+    }
+
+    impl ReconcilerTick {
+        async fn run(&mut self, state: &Arc<AppState>) {
+            let now = Some(std::time::Instant::now());
+            let mut cadence = crate::server::acp_reconciler::ReapCadence {
+                idle: now,
+                rate_limit: now,
+                terminal_repair: now,
+            };
+            crate::server::acp_reconciler::reconcile_acp_workers(
+                state,
+                &mut self.attempted,
+                &mut cadence,
+                &mut self.respawn_history,
+                &mut self.parked,
+                &mut self.capacity_deferred,
+            )
+            .await;
+        }
+    }
 
     #[tokio::test]
     #[serial_test::serial]
@@ -248,7 +293,9 @@ mod tests {
                 .mutation_epoch
                 .load(std::sync::atomic::Ordering::SeqCst);
             let metadata = state.canonical_metadata.read().await.clone();
-            persist_selector(&state, &id, selector, value).await;
+            persist_selector(&state, &id, selector, value)
+                .await
+                .unwrap();
             crate::server::reload::reload_state_instances_from_disk(
                 &state,
                 (vec![stale]).into(),
@@ -302,6 +349,228 @@ mod tests {
             let live = state.instances.read().await;
             assert_eq!(live[0].title, "accepted fresh reload");
             assert_eq!(field(&live[0]).as_deref(), Some(value));
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_failed_selector_write_leaves_memory_unchanged() {
+        for selector in [
+            PersistedSelector::Model,
+            PersistedSelector::Mode,
+            PersistedSelector::ThoughtLevel,
+        ] {
+            let _tmp = isolate_app_dir();
+            let mut inst = crate::session::Instance::new("t", "/tmp");
+            inst.source_profile = "blocked".to_string();
+            inst.agent_model = Some("old-model".to_string());
+            inst.acp_mode_id = Some("old-mode".to_string());
+            inst.acp_effort = Some("old-effort".to_string());
+            let id = inst.id.clone();
+            crate::server::test_support::block_profile_storage_for_test("blocked");
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            let before = state
+                .mutation_epoch
+                .load(std::sync::atomic::Ordering::SeqCst);
+
+            persist_selector(&state, &id, selector, "new")
+                .await
+                .unwrap_err();
+
+            let memory = state.instances.read().await;
+            assert_eq!(memory[0].agent_model.as_deref(), Some("old-model"));
+            assert_eq!(memory[0].acp_mode_id.as_deref(), Some("old-mode"));
+            assert_eq!(memory[0].acp_effort.as_deref(), Some("old-effort"));
+            assert_eq!(
+                state
+                    .mutation_epoch
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                before,
+                "{selector:?}"
+            );
+        }
+    }
+
+    /// The worker takes the pick, the stored write fails: the caller gets the
+    /// 500, the worker is stopped, and neither the plan-mode tally nor memory
+    /// records the pick.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_failed_pick_write_stops_the_worker_and_reports_it() {
+        let _tmp = isolate_app_dir();
+        let mut inst = crate::session::Instance::new("t", "/tmp");
+        inst.source_profile = "blocked".to_string();
+        inst.agent_model = Some("old-model".to_string());
+        let id = inst.id.clone();
+        crate::server::test_support::block_profile_storage_for_test("blocked");
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let cmds = state
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(&id)
+            .await;
+
+        let resp = acp_set_config_option(
+            State(state.clone()),
+            Path(id.clone()),
+            Ok(Json(SetConfigOptionRequest {
+                config_id: "model".to_string(),
+                value: "plan".to_string(),
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("persist_failed"));
+        assert!(
+            !cmds.lock().unwrap().is_empty(),
+            "the worker took the pick before the write failed"
+        );
+        assert_eq!(
+            state.acp_supervisor.worker_state(&id).await,
+            crate::daemon::AcpWorkerState::Absent
+        );
+        assert_eq!(
+            state
+                .telemetry_structured
+                .plan_mode_seen
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            state.instances.read().await[0].agent_model.as_deref(),
+            Some("old-model")
+        );
+    }
+
+    /// The write fails on a valid stored row (not an unopenable profile): the
+    /// 500 leaves both stores on the old pick and stops the worker, which the
+    /// reconciler then brings back, so the retry after recovery lands in both.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_pick_write_failing_on_a_valid_row_recovers_on_retry() {
+        use crate::server::test_support as support;
+        let _tmp = isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let mut inst = crate::session::Instance::new("t", project.path().to_str().unwrap());
+        inst.view = crate::session::View::Structured;
+        inst.status = crate::session::Status::Idle;
+        inst.source_profile = "default".to_string();
+        inst.agent_name = Some("claude".to_string());
+        inst.agent_model = Some("old-model".to_string());
+        let id = inst.id.clone();
+        support::seed_instances_on_disk_for_test("default", vec![inst.clone()]);
+        let state =
+            support::build_test_app_state_with_launcher(vec![inst], support::succeeding_launcher());
+        support::refresh_canonical_metadata_for_test(&state).await;
+        let pick = || async {
+            acp_set_config_option(
+                State(state.clone()),
+                Path(id.clone()),
+                Ok(Json(SetConfigOptionRequest {
+                    config_id: "model".to_string(),
+                    value: "new-model".to_string(),
+                })),
+            )
+            .await
+            .into_response()
+        };
+        let mut tick = ReconcilerTick::default();
+        let running = || async {
+            state.acp_supervisor.worker_state(&id).await == crate::daemon::AcpWorkerState::Running
+        };
+
+        tick.run(&state).await;
+        assert!(running().await, "the reconciler starts the worker");
+        let failure = support::fail_session_writes_for_test("default");
+        assert_eq!(pick().await.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!running().await);
+        assert_eq!(
+            state.instances.read().await[0].agent_model.as_deref(),
+            Some("old-model")
+        );
+        assert_eq!(
+            support::load_instances_from_disk_for_test("default")[0]
+                .agent_model
+                .as_deref(),
+            Some("old-model")
+        );
+
+        drop(failure);
+        tick.run(&state).await;
+        assert!(running().await, "the stopped worker is respawned");
+        assert_eq!(pick().await.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            state.instances.read().await[0].agent_model.as_deref(),
+            Some("new-model")
+        );
+        assert_eq!(
+            support::load_instances_from_disk_for_test("default")[0]
+                .agent_model
+                .as_deref(),
+            Some("new-model")
+        );
+    }
+
+    /// An unknown effort is refused before the worker or storage see it. A
+    /// known one, or any value with no cached choices, reaches the worker
+    /// (absent here, hence 404).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn unknown_effort_is_rejected_before_it_is_sent_or_stored() {
+        let _tmp = isolate_app_dir();
+        let option = |category, values: &[&str]| ConfigOptionDescriptor {
+            id: "effort".to_string(),
+            name: "effort".to_string(),
+            description: None,
+            category,
+            current_value: String::new(),
+            options: values
+                .iter()
+                .map(|v| ConfigOptionChoice {
+                    value: v.to_string(),
+                    name: v.to_string(),
+                    description: None,
+                })
+                .collect(),
+        };
+        crate::acp::option_catalog::record(
+            "codex",
+            &[option(ConfigOptionCategory::ThoughtLevel, &["low", "high"])],
+            "2026-07-24T00:00:00Z".to_string(),
+        )
+        .unwrap();
+        crate::acp::option_catalog::record(
+            "claude",
+            &[option(ConfigOptionCategory::ThoughtLevel, &[])],
+            "2026-07-24T00:00:00Z".to_string(),
+        )
+        .unwrap();
+
+        for (agent, value, expected) in [
+            ("codex", "hgih", StatusCode::BAD_REQUEST),
+            ("codex", "high", StatusCode::NOT_FOUND),
+            ("claude", "anything", StatusCode::NOT_FOUND),
+        ] {
+            let mut inst = crate::session::Instance::new(agent, "/tmp");
+            inst.agent_name = Some(agent.to_string());
+            let id = inst.id.clone();
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            let resp = acp_set_config_option(
+                State(state.clone()),
+                Path(id),
+                Ok(Json(SetConfigOptionRequest {
+                    config_id: "effort".to_string(),
+                    value: value.to_string(),
+                })),
+            )
+            .await
+            .into_response();
+            assert_eq!(resp.status(), expected, "{agent} {value}");
+            assert_eq!(state.instances.read().await[0].acp_effort, None);
         }
     }
 

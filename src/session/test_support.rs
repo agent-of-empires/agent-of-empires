@@ -130,6 +130,37 @@ pub(crate) fn path_prepended(dir: &Path) -> EnvGuard {
     guard.and_set("PATH", path)
 }
 
+/// Writes an executable stub named `name` into `dir`, for a structured create to find
+/// on hosts without the real ACP adapter (CI runners). It speaks no ACP.
+pub(crate) fn write_stub_adapter(dir: &Path, name: &str) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let stub = dir.join(name);
+    std::fs::write(&stub, "#!/bin/sh\n").expect("write stub adapter");
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+        .expect("make stub adapter executable");
+}
+
+/// Puts a stub `claude-agent-acp` on the configured `environment` PATH, ahead of the
+/// inherited one, so a structured `claude` create passes the adapter check without the
+/// real adapter. Call after isolating the app dir; keep the directory alive.
+pub(crate) fn stub_claude_adapter_on_agent_path() -> tempfile::TempDir {
+    let bin = tempfile::tempdir().expect("stub adapter dir");
+    write_stub_adapter(bin.path(), "claude-agent-acp");
+    let path = std::env::join_paths(
+        std::iter::once(bin.path().to_path_buf()).chain(
+            std::env::var_os("PATH")
+                .iter()
+                .flat_map(std::env::split_paths),
+        ),
+    )
+    .expect("join PATH");
+    crate::session::config::update_config(|config| {
+        config.environment = vec![format!("PATH={}", path.to_string_lossy())];
+    })
+    .expect("configure the stub adapter's PATH");
+    bin
+}
+
 pub(crate) fn install_login_shell_path_command(root: &Path, name: &str, script: &str) -> EnvGuard {
     let bin = root.join("bin");
     std::fs::create_dir_all(&bin).expect("create test bin directory");
@@ -359,6 +390,33 @@ impl LogCapture {
     pub(crate) fn contents(&self) -> String {
         String::from_utf8_lossy(&self.buf.lock().unwrap_or_else(PoisonError::into_inner))
             .into_owned()
+    }
+}
+
+/// A launch-owed terminal handoff: it blocks lifecycle claims without any reservation.
+pub(crate) fn launch_owed_handoff(
+    row: &crate::session::Instance,
+) -> crate::session::TerminalHandoffIntent {
+    crate::session::TerminalHandoffIntent {
+        id: uuid::Uuid::new_v4(),
+        profile: "default".into(),
+        profile_identity: (0, 0),
+        generation: row.lifecycle_generation,
+        target_generation: row.lifecycle_generation,
+        stage: crate::session::TerminalHandoffStage::TerminalLaunchOwed,
+        context: crate::session::TerminalHandoffContext::Discard,
+        source_acp_session_id: None,
+        source_event_seq: 0,
+        final_event_seq: None,
+        source_conversation: row.conversation_state(),
+        runner: crate::session::purge_owners::RunnerCapture::Unresolved {
+            error: "retained original authority".into(),
+        },
+        unborn_fence: None,
+        terminal: None,
+        launch_required: true,
+        launch_started: false,
+        launch: None,
     }
 }
 

@@ -44,7 +44,9 @@ pub use delete::DeleteSessionOutcome;
 pub use errors::{AcpError, IncompatibleAgentError};
 pub use list::{list_native_sessions, ListSessionsError};
 pub use reset::ResetSessionOutcome;
-pub use resolve_command::{resolve_agent_command, ResolvedAgentCommand, Unresolved};
+pub use resolve_command::{
+    is_bare_command, on_agent_path, resolve_agent_command, ResolvedAgentCommand, Unresolved,
+};
 pub(crate) use runner::wrap_in_scope;
 pub use session_sandbox::SessionSandbox;
 pub(crate) use spawn::host_environment_denyreason;

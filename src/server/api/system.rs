@@ -73,11 +73,8 @@ pub struct AgentInfo {
     /// valid `agent_acp_cmd`. The web wizard reads this to decide
     /// whether a session created for the agent runs in acp or tmux.
     pub acp_capable: bool,
-    /// True when the agent's ACP adapter binary (`acp_command`) is actually
-    /// resolvable on this host, not just registered. Distinct from
-    /// `installed` (the agent's own CLI binary) and `acp_capable` (registry
-    /// knows an adapter exists). The wizard's "Import from Claude" tab gates
-    /// on this so it never shows when claude-agent-acp is missing. See #2276.
+    /// Whether a non-sandboxed structured create would find this agent's ACP adapter
+    /// (the create check, with no project to search relative PATH entries from, so they count).
     pub acp_installed: bool,
     /// True when `[acp] allowed_agents` permits this agent in the structured
     /// view. Deliberately separate from `acp_capable`, which states an intrinsic
@@ -161,8 +158,7 @@ fn build_custom_agent_infos(
                 .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(name, cmd).is_ok())
                 || crate::acp::inherited_acp_base(name, agent_detect_as).is_some(),
             acp_allowed: policy.allows(name),
-            // A custom agent's acp_command is never serialized (it can hold
-            // hostnames or secrets), so its install state is not probed.
+            // Set by `list_agents`, which holds the config the probe needs.
             acp_installed: false,
             // Custom agents' command values are deliberately never
             // serialized here; they can hold hostnames or secrets.
@@ -179,9 +175,6 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
     let profile = state.served_profile().to_string();
     let result = tokio::task::spawn_blocking(move || {
         let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
-        let custom_agents = config.session.custom_agents;
-        let agent_acp_cmd = config.session.agent_acp_cmd;
-        let agent_detect_as = config.session.agent_detect_as;
         let tools = crate::tmux::AvailableTools::detect();
         let available = tools.available_list();
         let acp_registry = crate::acp::AgentRegistry::with_defaults();
@@ -204,9 +197,7 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
                     oneshot_capable: a.oneshot_flag.is_some(),
                     lifecycle: a.lifecycle,
                     acp_capable: acp_registry.get(a.name).is_some(),
-                    acp_installed: acp_command
-                        .as_deref()
-                        .is_some_and(crate::cli::acp::command_present),
+                    acp_installed: false,
                     acp_allowed: policy.allows(a.name),
                     acp_command,
                     acp_args,
@@ -214,11 +205,20 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
             })
             .collect::<Vec<_>>();
         agents.extend(build_custom_agent_infos(
-            &custom_agents,
-            &agent_acp_cmd,
-            &agent_detect_as,
+            &config.session.custom_agents,
+            &config.session.agent_acp_cmd,
+            &config.session.agent_detect_as,
             &policy,
         ));
+        let host_environment =
+            crate::session::environment::resolve_host_environment_pairs(&config.environment);
+        for agent in agents.iter_mut().filter(|a| a.acp_capable) {
+            agent.acp_installed = crate::session::builder::structured::adapter_installed(
+                &agent.name,
+                &config,
+                &host_environment,
+            );
+        }
         agents
     })
     .await
@@ -718,6 +718,9 @@ async fn save_settings_patch(
 /// Header a client stamps on each settings PATCH: `<tab id>.<sequence>`, increasing per tab.
 const WRITE_STAMP_HEADER: &str = "x-aoe-write-stamp";
 
+/// Write-gate scope of the global theme; the `@` keeps it apart from profile names.
+const THEME_SCOPE: &str = "@theme";
+
 /// Past this many tracked leaves the table is reset rather than grown without bound.
 const MAX_TRACKED_WRITES: usize = 4096;
 
@@ -925,6 +928,7 @@ pub struct ThemePatch {
 /// for the same reason). `read_only` still blocks it.
 pub async fn update_theme(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     body: Result<Json<ThemePatch>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
@@ -953,6 +957,29 @@ pub async fn update_theme(
             );
         }
     }
+    // Same late-write guard as settings saves: drop a stamped leaf a newer write already applied.
+    let stamp = WriteStamp::from_headers(&headers);
+    let mut applied = write_gate().await;
+    let mut leaves = serde_json::Map::new();
+    if let Some(name) = &patch.name {
+        leaves.insert("name".into(), name.clone().into());
+    }
+    if patch.color_mode.is_some() {
+        leaves.insert("color_mode".into(), true.into());
+    }
+    let mut written = serde_json::json!({ "theme": leaves });
+    if drop_stale_leaves(&applied, stamp.as_ref(), THEME_SCOPE, &mut written) {
+        if is_empty_patch(&written) {
+            return stale_write_response();
+        }
+        let kept = &written["theme"];
+        if kept.get("name").is_none() {
+            patch.name = None;
+        }
+        if kept.get("color_mode").is_none() {
+            patch.color_mode = None;
+        }
+    }
     let result = tokio::task::spawn_blocking(move || {
         // `update_config` re-loads via `Config::load()`, so a corrupt
         // config.toml errors out instead of being replaced with defaults.
@@ -968,6 +995,10 @@ pub async fn update_theme(
         Ok::<_, anyhow::Error>(crate::tui::styles::resolve_theme(&theme_name))
     })
     .await;
+    if matches!(result, Ok(Ok(_))) {
+        record_applied(&mut applied, stamp.as_ref(), THEME_SCOPE, &written);
+    }
+    drop(applied);
 
     match result {
         Ok(Ok(resolved)) => match serde_json::to_value(&resolved) {
@@ -1671,29 +1702,79 @@ pub async fn browse_filesystem(
     }
 }
 
-#[derive(Serialize)]
+#[derive(Debug, PartialEq, Serialize)]
 pub struct GroupInfo {
     pub path: String,
+    /// Sessions directly in this group, not in its children.
     pub session_count: usize,
+    pub archived: bool,
 }
 
-pub async fn list_groups(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let instances = state.instances.read().await;
-    let mut group_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    for inst in instances.iter() {
-        if !inst.group_path.is_empty() {
-            *group_counts.entry(inst.group_path.clone()).or_default() += 1;
-        }
+#[derive(Deserialize)]
+pub struct GroupsQuery {
+    profile: Option<String>,
+}
+
+/// `GET /api/groups[?profile=]`: the profile's groups for the wizard's Group field.
+pub async fn list_groups(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<GroupsQuery>,
+) -> impl IntoResponse {
+    let _namespace = state.profile_namespace.read().await;
+    let (profile, stored) = {
+        let metadata = state.canonical_metadata.read().await;
+        let served = state.served_profile().to_string();
+        let name = query.profile.filter(|p| !p.is_empty()).unwrap_or_else(|| {
+            if served.is_empty() {
+                metadata.default_profile.clone()
+            } else {
+                served
+            }
+        });
+        let Some(profile) = metadata.profiles.iter().find(|p| p.name == name) else {
+            return Json(Vec::<GroupInfo>::new());
+        };
+        (profile.name.clone(), profile.groups.clone())
+    };
+    let session_groups: Vec<String> = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .filter(|inst| {
+            inst.source_profile == profile
+                && inst.trashed_at.is_none()
+                && inst.archived_at.is_none()
+        })
+        .map(|inst| inst.group_path.clone())
+        .collect();
+    Json(group_infos(&session_groups, &stored))
+}
+
+/// Every group in the profile's tree (stored groups, the groups sessions are in,
+/// and each parent of a nested path), with its direct session count, sorted by
+/// path. The synthetic Archived, Trash and Scratch sections are left out.
+fn group_infos(session_groups: &[String], stored: &[crate::session::Group]) -> Vec<GroupInfo> {
+    let tree = crate::session::GroupTree::new_with_group_paths(
+        session_groups.iter().map(String::as_str),
+        stored,
+    );
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for path in session_groups {
+        *counts.entry(path.as_str()).or_default() += 1;
     }
-    let groups: Vec<GroupInfo> = group_counts
+    let mut groups: Vec<GroupInfo> = tree
+        .get_all_groups()
         .into_iter()
-        .map(|(path, session_count)| GroupInfo {
-            path,
-            session_count,
+        .filter(|g| !g.path.is_empty() && !crate::session::is_synthetic_project_header(&g.path))
+        .map(|g| GroupInfo {
+            session_count: counts.get(g.path.as_str()).copied().unwrap_or_default(),
+            archived: g.is_archived(),
+            path: g.path,
         })
         .collect();
-    Json(groups)
+    groups.sort_by(|a, b| a.path.cmp(&b.path));
+    groups
 }
 
 /// One agent row on the health readout. Every figure is optional for the same
@@ -1988,6 +2069,11 @@ pub struct UpdateStatusResponse {
     /// dismissal sticks across devices and matches the TUI (#release-notes
     /// should only be acknowledged once, not per browser).
     pub dismissed_version: Option<String>,
+    /// How the Daemon's own binary was installed, so the banner can say how to update it;
+    /// `unknown` while update checks are off, since nothing is offered then.
+    pub install_method: crate::update::install::InstallKind,
+    /// What to run on the Daemon's machine to update.
+    pub update_command: &'static str,
 }
 
 pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<UpdateStatusResponse> {
@@ -1999,6 +2085,8 @@ pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<Updat
     let mode = cfg.updates.update_check_mode;
 
     if !mode.is_enabled() {
+        // No banner shows, so don't shell out to `brew` to detect the install method.
+        let install_method = crate::update::install::InstallKind::Unknown;
         return Json(UpdateStatusResponse {
             update_check_mode: mode,
             current_version: current,
@@ -2007,8 +2095,13 @@ pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<Updat
             release_url: None,
             error: None,
             dismissed_version: cfg.app_state.dismissed_update_version.clone(),
+            install_method,
+            update_command: install_method.update_command(),
         });
     }
+
+    let install_method = crate::update::install::install_kind().await;
+    let update_command = install_method.update_command();
 
     match crate::update::check_for_update(&current, false).await {
         Ok(info) => {
@@ -2032,6 +2125,8 @@ pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<Updat
                 release_url,
                 error: None,
                 dismissed_version: cfg.app_state.dismissed_update_version.clone(),
+                install_method,
+                update_command,
             })
         }
         Err(e) => Json(UpdateStatusResponse {
@@ -2042,6 +2137,8 @@ pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<Updat
             release_url: None,
             error: Some(e.to_string()),
             dismissed_version: cfg.app_state.dismissed_update_version.clone(),
+            install_method,
+            update_command,
         }),
     }
 }
@@ -2581,6 +2678,137 @@ pub async fn serve_sound_file(
 
 #[cfg(test)]
 mod tests {
+    /// A served profile deleted from disk lists no Groups, and listing doesn't recreate it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn list_groups_never_recreates_a_missing_profile() -> anyhow::Result<()> {
+        use axum::response::IntoResponse;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let served = state.served_profile().to_string();
+        state.rename_served_profile(&served, "ghost");
+        let response = super::list_groups(
+            axum::extract::State(state),
+            axum::extract::Query(super::GroupsQuery { profile: None }),
+        )
+        .await
+        .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(body.as_ref(), b"[]");
+        let ghost = crate::session::get_app_dir()?
+            .join("profiles")
+            .join("ghost");
+        assert!(!ghost.exists(), "{}", ghost.display());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn list_groups_uses_canonical_profiles_and_counts_only_live_sessions(
+    ) -> anyhow::Result<()> {
+        use crate::daemon::ProfileSnapshot;
+        use crate::session::{Group, Instance};
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut live = Instance::new("live", "/tmp");
+        live.source_profile = "memory".into();
+        live.group_path = "client/api".into();
+        let mut archived = live.clone();
+        archived.id = "archived".into();
+        archived.archived_at = Some(chrono::Utc::now());
+        let mut trashed = live.clone();
+        trashed.id = "trashed".into();
+        trashed.trashed_at = Some(chrono::Utc::now());
+        let mut other = live.clone();
+        other.id = "other".into();
+        other.source_profile = "other".into();
+        let state =
+            crate::server::test_support::build_test_app_state(vec![live, archived, trashed, other]);
+        let served = state.served_profile().to_string();
+        state.rename_served_profile(&served, "memory");
+        {
+            let mut metadata = state.canonical_metadata.write().await;
+            metadata.default_profile = "memory".into();
+            metadata.profiles = vec![ProfileSnapshot {
+                name: "memory".into(),
+                description: None,
+                groups: vec![Group::new("empty", "empty")],
+                projects: Vec::new(),
+            }];
+        }
+        let read = |profile: Option<&str>| {
+            let state = state.clone();
+            let query = GroupsQuery {
+                profile: profile.map(str::to_owned),
+            };
+            async move {
+                let response = list_groups(State(state), axum::extract::Query(query))
+                    .await
+                    .into_response();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+            }
+        };
+        let expected = serde_json::json!([
+            {"path": "client", "session_count": 0, "archived": false},
+            {"path": "client/api", "session_count": 1, "archived": false},
+            {"path": "empty", "session_count": 0, "archived": false},
+        ]);
+        for query in [None, Some(""), Some("memory")] {
+            assert_eq!(read(query).await, expected, "{query:?}");
+        }
+        assert_eq!(read(Some("missing")).await, serde_json::json!([]));
+        state.rename_served_profile("memory", "");
+        assert_eq!(read(None).await, expected, "canonical default profile");
+        let root = crate::session::get_app_dir()?;
+        assert!(
+            !root.join("profiles/memory").exists(),
+            "reads must not create a profile"
+        );
+        Ok(())
+    }
+
+    /// The wizard's Group list holds every group the sidebar can show: stored
+    /// empty groups and the parents of nested paths, but not the synthetic shelves.
+    #[test]
+    fn group_infos_merge_the_tree_with_session_counts() {
+        use crate::session::{
+            Group, ARCHIVED_SECTION_PATH, SCRATCH_GROUP_PATH, TRASH_SECTION_PATH,
+        };
+        let mut archived = Group::new("old", "old");
+        archived.archived_at = Some(chrono::Utc::now());
+        let stored = [Group::new("empty", "empty"), archived];
+        let sessions: Vec<String> = [
+            "client/api",
+            "client/api",
+            "zeta",
+            "",
+            SCRATCH_GROUP_PATH,
+            &format!("{ARCHIVED_SECTION_PATH}/repo"),
+            TRASH_SECTION_PATH,
+        ]
+        .iter()
+        .map(|p| p.to_string())
+        .collect();
+        let got: Vec<(String, usize, bool)> = group_infos(&sessions, &stored)
+            .into_iter()
+            .map(|g| (g.path, g.session_count, g.archived))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("client".to_string(), 0, false),
+                ("client/api".to_string(), 2, false),
+                ("empty".to_string(), 0, false),
+                ("old".to_string(), 0, true),
+                ("zeta".to_string(), 1, false),
+            ]
+        );
+        assert!(group_infos(&[], &[]).is_empty());
+    }
+
     use super::*;
     use axum::body::to_bytes;
     use std::collections::HashMap;
@@ -3155,6 +3383,46 @@ mod tests {
         );
     }
 
+    /// `acp_installed` follows the structured create check, so a custom
+    /// agent counts when its adapter is on the configured `environment` PATH.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn acp_installed_matches_the_structured_create_check() {
+        use std::os::unix::fs::PermissionsExt;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let bin = tempfile::tempdir().unwrap();
+        let adapter = format!("aoe-test-adapter-{}", std::process::id());
+        std::fs::write(bin.path().join(&adapter), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(
+            bin.path().join(&adapter),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        crate::session::config::update_config(|config| {
+            for (name, acp) in [
+                ("on-path", Some(format!("{adapter} acp"))),
+                ("missing", Some(format!("{adapter}-missing acp"))),
+                ("terminal", None),
+            ] {
+                config
+                    .session
+                    .custom_agents
+                    .insert(name.into(), "true".into());
+                if let Some(acp) = acp {
+                    config.session.agent_acp_cmd.insert(name.into(), acp);
+                }
+            }
+            config.environment = vec![format!("PATH={}", bin.path().display())];
+        })
+        .unwrap();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let Json(agents) = list_agents(State(state)).await;
+        for (name, installed) in [("on-path", true), ("missing", false), ("terminal", false)] {
+            let agent = agents.iter().find(|a| a.name == name).unwrap();
+            assert_eq!(agent.acp_installed, installed, "{name}");
+        }
+    }
+
     #[test]
     fn acp_command_fields_substitute_data_dir() {
         let dir = std::path::Path::new("/tmp/aoe-data");
@@ -3334,5 +3602,55 @@ mod tests {
             .status(),
             StatusCode::OK
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn theme_save_drops_a_late_older_write_of_the_same_leaf() {
+        use crate::session::config::ColorMode;
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let save = |tab_seq: &'static str, name: Option<String>, mode: Option<ColorMode>| {
+            let state = state.clone();
+            async move {
+                let mut headers = HeaderMap::new();
+                headers.insert(WRITE_STAMP_HEADER, tab_seq.parse().unwrap());
+                update_theme(
+                    State(state),
+                    headers,
+                    Ok(Json(ThemePatch {
+                        name,
+                        color_mode: mode,
+                    })),
+                )
+                .await
+                .into_response()
+                .status()
+            }
+        };
+
+        assert_eq!(
+            save("tab1.2", None, Some(ColorMode::Palette)).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            save("tab1.1", None, Some(ColorMode::Truecolor)).await,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            crate::session::Config::load().unwrap().theme.color_mode,
+            ColorMode::Palette
+        );
+
+        // A fresh name still lands when its stale color mode is dropped from the same patch.
+        let name = crate::tui::styles::available_themes().remove(0);
+        assert_eq!(
+            save("tab1.1", Some(name.clone()), Some(ColorMode::Truecolor)).await,
+            StatusCode::OK
+        );
+        let theme = crate::session::Config::load().unwrap().theme;
+        assert_eq!(theme.name, name);
+        assert_eq!(theme.color_mode, ColorMode::Palette);
     }
 }

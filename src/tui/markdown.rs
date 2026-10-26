@@ -247,7 +247,7 @@ impl MarkdownBuilder {
 }
 
 /// Word-wrap one styled line while preserving span styles.
-fn wrap_line_into(line: Line<'static>, width: u16, out: &mut Vec<Line<'static>>) {
+pub(crate) fn wrap_line_into(line: Line<'static>, width: u16, out: &mut Vec<Line<'static>>) {
     let width = width.max(1) as usize;
     let line_style = line.style;
     let mut chars: Vec<(char, Style)> = Vec::new();

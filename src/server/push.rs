@@ -21,7 +21,7 @@ use tokio::sync::RwLock;
 use super::push_send::PUSH_TTL_SECS;
 
 /// Committed status transitions consumed by push, callbacks and plugin workers.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct StatusChange {
     pub instance_id: String,
     pub instance_title: String,
@@ -151,7 +151,7 @@ impl VapidKeypair {
             .to_string();
 
         // Public key in uncompressed SEC1 form, base64url encoded.
-        let public_bytes = verifying_key.to_encoded_point(false);
+        let public_bytes = verifying_key.to_sec1_point(false);
         let public_b64url = base64_url_encode(public_bytes.as_bytes());
 
         Ok(Self {
@@ -462,7 +462,24 @@ pub enum NotificationEvent {
 }
 
 impl NotificationEvent {
-    fn dwell_ms(self) -> u64 {
+    pub(crate) fn for_status(status: Status) -> Option<Self> {
+        match status {
+            Status::Waiting => Some(Self::Waiting),
+            Status::Idle => Some(Self::Idle),
+            Status::Error => Some(Self::Error),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Waiting => "waiting",
+            Self::Idle => "idle",
+            Self::Error => "error",
+        }
+    }
+
+    pub(crate) fn dwell_ms(self) -> u64 {
         match self {
             Self::Waiting => DWELL_WAITING_MS,
             _ => DWELL_TERMINAL_MS,
@@ -1031,12 +1048,13 @@ pub async fn get_vapid_public_key(
 /// concurrent 410 arrives for the old generation).
 pub async fn subscribe(
     State(state): State<Arc<AppState>>,
+    peer: super::peer::ConnectionPeer,
     auth: Option<Extension<AuthenticatedTokenHash>>,
     headers: HeaderMap,
     body: Result<Json<SubscribeBody>, axum::extract::rejection::JsonRejection>,
 ) -> Result<StatusCode, axum::response::Response> {
     use axum::response::IntoResponse;
-    let Some(Extension(auth)) = auth else {
+    let (Some(Extension(auth)), super::peer::ConnectionPeer::Tcp(peer)) = (auth, peer) else {
         return Err((
             StatusCode::CONFLICT,
             "Push subscriptions require browser ownership",
@@ -1082,7 +1100,8 @@ pub async fn subscribe(
         .unwrap_or("")
         .to_string();
 
-    let origin = extract_request_origin(&headers).unwrap_or_default();
+    let externally_secure = state.ingress(peer, &headers).externally_secure;
+    let origin = extract_request_origin(&headers, externally_secure).unwrap_or_default();
 
     let sub = Subscription {
         endpoint: body.endpoint,
@@ -1101,14 +1120,9 @@ pub async fn subscribe(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Extract the client's origin (scheme + host + optional port) from the
-/// request headers. Prefers the `Origin` header (sent by browsers on
-/// fetch() and cross-origin requests, and on same-origin POSTs with a
-/// JSON body, which covers /api/push/subscribe). Falls back to building
-/// from `X-Forwarded-Proto` + `Host` for reverse-proxy deployments
-/// (Cloudflare, nginx, Traefik) where `Origin` may be stripped. Returns
-/// `None` when neither produces a usable value. See #1188.
-pub fn extract_request_origin(headers: &HeaderMap) -> Option<String> {
+/// Extract the client's origin (scheme + host + optional port) from the request headers.
+/// Without an `Origin` header the scheme is `https` only when a trusted proxy asserted it.
+pub fn extract_request_origin(headers: &HeaderMap, externally_secure: bool) -> Option<String> {
     let origin_header = headers
         .get(axum::http::header::ORIGIN)
         .and_then(|v| v.to_str().ok())
@@ -1120,13 +1134,7 @@ pub fn extract_request_origin(headers: &HeaderMap) -> Option<String> {
         .get(axum::http::header::HOST)
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty())?;
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("https");
+    let scheme = if externally_secure { "https" } else { "http" };
     Some(format!("{scheme}://{host}"))
 }
 
@@ -1483,83 +1491,63 @@ mod tests {
         assert_eq!(store.snapshot().await.len(), 0);
     }
 
+    /// The push URL's origin comes from the Origin header when the browser sent one,
+    /// otherwise from the trusted proxy's asserted scheme plus Host. A `null` Origin (an opaque
+    /// context) is no signal.
     #[test]
-    fn extract_origin_prefers_origin_header() {
-        let mut h = HeaderMap::new();
-        h.insert(
-            axum::http::header::ORIGIN,
-            "http://localhost:42041".parse().unwrap(),
-        );
-        h.insert(axum::http::header::HOST, "ignored.example".parse().unwrap());
-        assert_eq!(
-            extract_request_origin(&h).as_deref(),
-            Some("http://localhost:42041")
-        );
-    }
+    fn extract_request_origin_prefers_origin_then_forwarded_host() {
+        let origin = |headers: &[(&str, &str)], secure: bool| {
+            let mut h = HeaderMap::new();
+            for (name, value) in headers {
+                h.insert(
+                    axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                    value.parse().unwrap(),
+                );
+            }
+            extract_request_origin(&h, secure)
+        };
+        let host = ("host", "aoe.example.com");
 
-    #[test]
-    fn extract_origin_trims_trailing_slash_from_origin_header() {
-        let mut h = HeaderMap::new();
-        h.insert(
-            axum::http::header::ORIGIN,
-            "https://aoe.example.com/".parse().unwrap(),
-        );
-        assert_eq!(
-            extract_request_origin(&h).as_deref(),
-            Some("https://aoe.example.com")
-        );
-    }
-
-    #[test]
-    fn extract_origin_ignores_null_origin() {
-        let mut h = HeaderMap::new();
-        h.insert(axum::http::header::ORIGIN, "null".parse().unwrap());
-        h.insert(axum::http::header::HOST, "aoe.example.com".parse().unwrap());
-        // Falls back to Host + default scheme.
-        assert_eq!(
-            extract_request_origin(&h).as_deref(),
-            Some("https://aoe.example.com")
-        );
-    }
-
-    #[test]
-    fn extract_origin_falls_back_to_forwarded_proto_and_host() {
-        let mut h = HeaderMap::new();
-        h.insert("x-forwarded-proto", "https".parse().unwrap());
-        h.insert(axum::http::header::HOST, "aoe.example.com".parse().unwrap());
-        assert_eq!(
-            extract_request_origin(&h).as_deref(),
-            Some("https://aoe.example.com")
-        );
-    }
-
-    #[test]
-    fn extract_origin_forwarded_proto_handles_chained_values() {
-        // X-Forwarded-Proto can carry a comma-separated chain when there
-        // are multiple proxies in front. Take the first value.
-        let mut h = HeaderMap::new();
-        h.insert("x-forwarded-proto", "https, http".parse().unwrap());
-        h.insert(axum::http::header::HOST, "aoe.example.com".parse().unwrap());
-        assert_eq!(
-            extract_request_origin(&h).as_deref(),
-            Some("https://aoe.example.com")
-        );
-    }
-
-    #[test]
-    fn extract_origin_defaults_scheme_to_https_when_only_host_set() {
-        let mut h = HeaderMap::new();
-        h.insert(axum::http::header::HOST, "aoe.example.com".parse().unwrap());
-        assert_eq!(
-            extract_request_origin(&h).as_deref(),
-            Some("https://aoe.example.com")
-        );
-    }
-
-    #[test]
-    fn extract_origin_returns_none_when_no_signal() {
-        let h = HeaderMap::new();
-        assert_eq!(extract_request_origin(&h), None);
+        type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], bool, Option<&'a str>);
+        let cases: &[Case] = &[
+            (
+                "origin wins over host",
+                &[
+                    ("origin", "http://localhost:42041"),
+                    ("host", "ignored.example"),
+                ],
+                false,
+                Some("http://localhost:42041"),
+            ),
+            (
+                "trailing slash trimmed",
+                &[("origin", "https://aoe.example.com/")],
+                false,
+                Some("https://aoe.example.com"),
+            ),
+            (
+                "null origin falls back to host",
+                &[("origin", "null"), host],
+                true,
+                Some("https://aoe.example.com"),
+            ),
+            (
+                "a trusted proxy's https assertion",
+                &[host],
+                true,
+                Some("https://aoe.example.com"),
+            ),
+            (
+                "an unasserted scheme is never https",
+                &[("x-forwarded-proto", "https"), host],
+                false,
+                Some("http://aoe.example.com"),
+            ),
+            ("no signal", &[], false, None),
+        ];
+        for (name, headers, secure, want) in cases {
+            assert_eq!(origin(headers, *secure).as_deref(), *want, "{name}");
+        }
     }
 
     #[test]

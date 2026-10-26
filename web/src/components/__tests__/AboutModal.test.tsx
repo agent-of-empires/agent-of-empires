@@ -75,3 +75,24 @@ describe("AboutModal session id", () => {
     }
   });
 });
+
+describe("AboutModal focus containment", () => {
+  it("wraps Tab and Shift+Tab between the first and last control", () => {
+    render(<AboutModal onClose={() => {}} sessionId={null} />);
+    const dialog = screen.getByRole("dialog");
+    const close = screen.getByRole("button", { name: "Close" });
+    const feedback = screen.getByRole("link", { name: "Send feedback" });
+    expect(document.activeElement).toBe(close);
+
+    // Shift+Tab off the first control wraps to the last, Tab off the last wraps back.
+    expect(fireEvent.keyDown(dialog, { key: "Tab", shiftKey: true })).toBe(false);
+    expect(document.activeElement).toBe(feedback);
+    expect(fireEvent.keyDown(dialog, { key: "Tab" })).toBe(false);
+    expect(document.activeElement).toBe(close);
+
+    // Mid-dialog Tab is left to the browser; other keys are ignored.
+    screen.getByRole("link", { name: /agent-of-empires\.com/ }).focus();
+    expect(fireEvent.keyDown(dialog, { key: "Tab" })).toBe(true);
+    expect(fireEvent.keyDown(dialog, { key: "a" })).toBe(true);
+  });
+});

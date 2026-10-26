@@ -75,6 +75,7 @@ use self::watchers::{RELOAD_FAILED_TITLE, WATCHER_WARNING_TITLE};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DragKind {
     ListDivider,
+    StackedListDivider,
     PreviewSelect,
     SettingsScrollbar,
 }
@@ -451,9 +452,12 @@ pub struct HomeView {
     pub(super) diff_view: Option<DiffView>,
 
     pub(super) list_width: u16,
+    pub(super) list_height: Option<u16>,
 
     pub(super) divider_col: Option<u16>,
+    pub(super) divider_row: Option<u16>,
     pub(super) main_area_width: u16,
+    pub(super) main_area_height: u16,
     pub(super) drag_state: Option<DragKind>,
 
     pub(super) mouse_forward_btn: Option<u16>,

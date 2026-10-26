@@ -23,5 +23,4 @@ export type DragHandleProps = {
   setActivatorNodeRef: (el: HTMLElement | null) => void;
   attributes: ReturnType<typeof useSortable>["attributes"];
   listeners: ReturnType<typeof useSortable>["listeners"];
-  isDragging: boolean;
 };

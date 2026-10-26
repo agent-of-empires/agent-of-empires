@@ -3,8 +3,6 @@
 use anyhow::{bail, Context, Result};
 use clap::Args;
 
-use super::serve::read_serve_urls;
-
 #[derive(Args)]
 pub struct LogLevelArgs {
     /// Bare level (trace|debug|info|warn|error). Expands to all known
@@ -25,64 +23,28 @@ pub struct LogLevelArgs {
 
 #[tracing::instrument(target = "cli.log_level", skip_all)]
 pub async fn run(args: LogLevelArgs) -> Result<()> {
-    let urls = read_serve_urls();
-    let Some(primary) = urls.first() else {
-        bail!("No aoe serve daemon is running, or serve.url is empty/missing.");
-    };
+    let endpoint = crate::acp::client::discovery::discover_local()
+        .context("No aoe serve daemon is running.")?;
+    let client = crate::acp::client::HttpClient::new(endpoint)?;
 
-    let base = primary
-        .url
-        .split('?')
-        .next()
-        .unwrap_or(&primary.url)
-        .trim_end_matches('/');
-    let endpoint = format!("{base}/api/log-level");
-    let token = crate::daemon::authorization_header(extract_token(&primary.url))?;
-    let endpoint = crate::daemon::native_url(&endpoint)?;
-    let client = crate::daemon::native_http_client(&endpoint, token.is_some())?;
-
-    if args.get || (args.level.is_none() && args.filter.is_none()) {
-        let mut req = client.get(endpoint);
-        if let Some(t) = token {
-            req = req.header(reqwest::header::AUTHORIZATION, t);
+    let patch = match (args.level.as_deref(), args.filter.as_deref()) {
+        _ if args.get => None,
+        (None, None) => None,
+        (Some(level), None) if matches_known_level(level) => {
+            Some(serde_json::json!({ "level": level }))
         }
-        let resp = req.send().await.context("GET /api/log-level")?;
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            bail!("server returned {status}: {body}");
-        }
-        println!("{body}");
-        return Ok(());
-    }
-
-    let body = match (args.level.as_deref(), args.filter.as_deref()) {
-        (Some(level), None) => {
-            if matches_known_level(level) {
-                serde_json::json!({ "level": level })
-            } else {
-                bail!(
-                    "{level:?} is not a known level. \
-                     Use trace|debug|info|warn|error, or pass --filter for raw EnvFilter syntax."
-                );
-            }
-        }
-        (None, Some(filter)) => serde_json::json!({ "filter": filter }),
+        (Some(level), None) => bail!(
+            "{level:?} is not a known level. \
+             Use trace|debug|info|warn|error, or pass --filter for raw EnvFilter syntax."
+        ),
+        (None, Some(filter)) => Some(serde_json::json!({ "filter": filter })),
         (Some(_), Some(_)) => bail!("specify exactly one of <level> or --filter"),
-        (None, None) => unreachable!("guarded above"),
     };
 
-    let mut req = client.patch(endpoint).json(&body);
-    if let Some(t) = token {
-        req = req.header(reqwest::header::AUTHORIZATION, t);
-    }
-    let resp = req.send().await.context("PATCH /api/log-level")?;
-    let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        bail!("server returned {status}: {text}");
-    }
-    println!("{text}");
+    println!(
+        "{}",
+        serde_json::to_string(&client.log_level(patch.as_ref()).await?)?
+    );
     Ok(())
 }
 
@@ -91,17 +53,4 @@ fn matches_known_level(s: &str) -> bool {
         s.trim().to_ascii_lowercase().as_str(),
         "trace" | "debug" | "info" | "warn" | "warning" | "error"
     )
-}
-
-fn extract_token(url: &str) -> Option<&str> {
-    let query = url.split_once('?').map(|(_, q)| q)?;
-    for pair in query.split('&') {
-        if let Some(rest) = pair.strip_prefix("token=") {
-            if rest.is_empty() {
-                return None;
-            }
-            return Some(rest);
-        }
-    }
-    None
 }

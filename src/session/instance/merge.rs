@@ -34,6 +34,13 @@ impl Instance {
         self.file_watch = self.file_watch.take().or(prior.file_watch);
         if let (Some(fresh), Some(previous)) = (self.sandbox_info.as_mut(), prior.sandbox_info) {
             fresh.before_start_env = previous.before_start_env;
+            // The live container's workdir outranks a stale persisted pin (#4806).
+            if fresh.container_name == previous.container_name
+                && (fresh.container_id.is_none() || fresh.container_id == previous.container_id)
+                && previous.container_workdir.is_some()
+            {
+                fresh.container_workdir = previous.container_workdir;
+            }
         }
     }
 
@@ -66,6 +73,8 @@ impl Instance {
         }
         self.sandbox_info = src.sandbox_info.clone();
         self.capture_started_at = src.capture_started_at;
+        self.started_at = src.started_at;
+        self.launch_executable = src.launch_executable.clone();
     }
 
     /// Same fields as `merge_post_start`. Resume-probe failure markers are

@@ -11,6 +11,25 @@ use super::{
 use crate::git::command::run_git_with_timeout;
 use crate::git::error::{GitError, Result};
 
+/// Where a move left the worktree. `Err` from a move means the checkout is
+/// still at the source.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MoveOutcome {
+    Moved,
+    /// The checkout is at the destination but git is broken there; the
+    /// message says how to repair it.
+    MovedDegraded(String),
+}
+
+impl MoveOutcome {
+    pub fn into_warning(self) -> Option<String> {
+        match self {
+            Self::Moved => None,
+            Self::MovedDegraded(message) => Some(message),
+        }
+    }
+}
+
 /// What a mutation that timed out actually did, judged by observing both sides.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum TimedMutationOutcome {
@@ -195,7 +214,7 @@ impl GitWorktree {
     /// Move a worktree with `git worktree move` so git's bookkeeping follows,
     /// unlocking before and re-locking after. Worktrees with submodules take
     /// `relocate_worktree_with_submodules`.
-    pub fn move_worktree(&self, from: &Path, to: &Path) -> Result<()> {
+    pub fn move_worktree(&self, from: &Path, to: &Path) -> Result<MoveOutcome> {
         if !from.exists() {
             return Err(GitError::WorktreeNotFound(from.to_path_buf()));
         }
@@ -215,23 +234,47 @@ impl GitWorktree {
             "move_worktree: invoking `git worktree move`"
         );
         self.unlock_worktree(from);
-        let Some(output) = run_git_with_timeout(
+        // A relative pointer left stale by an earlier move cannot be followed.
+        if crate::git::cleanup::read_linked_worktree_gitdir(from).is_some_and(|g| !g.exists()) {
+            if let Err(e) = self.repair_worktree(from) {
+                tracing::warn!(target: "git.worktree",
+                    from = %from.display(),
+                    error = %e,
+                    "move_worktree: could not repair a stale .git pointer"
+                );
+            }
+        }
+        let original_pointer = Self::convert_git_file_to_absolute(from).unwrap_or_else(|e| {
+            tracing::warn!(target: "git.worktree",
+                from = %from.display(),
+                error = %e,
+                "move_worktree: could not make the .git pointer absolute"
+            );
+            None
+        });
+        let restore_pointer = || {
+            if let Some(original) = &original_pointer {
+                let _ = std::fs::write(from.join(".git"), original);
+            }
+        };
+        let moved = run_git_with_timeout(
             &self.repo_path,
             ["worktree", "move", from_str, to_str],
             WORKTREE_MUTATION_TIMEOUT,
-        )?
-        else {
+        );
+        let Some(output) = moved.inspect_err(|_| restore_pointer())? else {
             let secs = WORKTREE_MUTATION_TIMEOUT.as_secs();
             match observe_worktree_move(&self.repo_path, &observation_from, &observation_to) {
                 TimedMutationOutcome::Applied => {
                     self.relock(to);
                     tracing::warn!(target: "git.worktree", to = %to.display(), "timed-out worktree move completed before termination");
-                    return Ok(());
+                    return Ok(MoveOutcome::Moved);
                 }
                 TimedMutationOutcome::Unchanged
                     if matches!(from.try_exists(), Ok(true))
                         && matches!(to.try_exists(), Ok(false)) =>
                 {
+                    restore_pointer();
                     let _ = self.lock_worktree(from);
                     return Err(GitError::WorktreeCommandFailed(format!(
                         "`git worktree move` timed out after {secs}s without moving"
@@ -254,21 +297,21 @@ impl GitWorktree {
                     return self.relocate_worktree_with_submodules(from, to);
                 }
             }
+            restore_pointer();
             let _ = self.lock_worktree(from);
             return Err(error);
         }
         self.relock(to);
-        Ok(())
+        Ok(MoveOutcome::Moved)
     }
 
     /// Rename a worktree with submodules and repair git's pointers, keeping
     /// uncommitted and untracked submodule work (`submodule deinit` would
     /// refuse or discard it).
     ///
-    /// An `Err` leaves the checkout at `from`: `session::attach_project` only
-    /// records the move once this returns `Ok`. Past the repair, the worktree
-    /// is registered at `to` and remaining failures are logged, not returned.
-    fn relocate_worktree_with_submodules(&self, from: &Path, to: &Path) -> Result<()> {
+    /// An `Err` leaves the checkout at `from`. Once the checkout is at `to`
+    /// the result is `Ok`, `MovedDegraded` when a pointer could not be fixed.
+    fn relocate_worktree_with_submodules(&self, from: &Path, to: &Path) -> Result<MoveOutcome> {
         tracing::info!(target: "git.worktree",
             from = %from.display(),
             to = %to.display(),
@@ -289,45 +332,60 @@ impl GitWorktree {
             let _ = self.lock_worktree(from);
             return Err(e.into());
         }
+        let mut problems = Vec::new();
         if let Err(e) = self.repair_worktree(to) {
-            if std::fs::rename(to, from).is_err() {
+            if let Err(rollback) = std::fs::rename(to, from) {
                 tracing::error!(target: "git.worktree",
                     to = %to.display(),
                     error = %e,
                     "move_worktree: could not repair or move back; the checkout is stranded at the new path"
                 );
+                problems.push(format!(
+                    "`git worktree repair` failed ({e}) and moving back failed ({rollback}); \
+                     run `git worktree repair {}` from the main repository",
+                    to.display()
+                ));
+            } else {
+                let _ = self.repair_worktree(from);
+                let _ = self.lock_worktree(from);
                 return Err(e);
             }
-            let _ = self.repair_worktree(from);
-            let _ = self.lock_worktree(from);
-            return Err(e);
         }
 
         if let Err(e) = Self::convert_git_file_to_relative(to) {
-            tracing::warn!(target: "git.worktree",
-                to = %to.display(),
-                error = %e,
-                "move_worktree: could not restore the relative .git pointer"
-            );
+            problems.push(format!(
+                "could not restore the relative .git pointer ({e}); \
+                 run `git worktree repair {}` from the main repository",
+                to.display()
+            ));
         }
-        let unrepaired: Vec<String> = checkouts
-            .iter()
-            .filter_map(|checkout| {
-                Self::repoint_submodule(to, checkout)
-                    .err()
-                    .map(|e| format!("{}: {e}", checkout.relative.display()))
-            })
-            .collect();
-        if !unrepaired.is_empty() {
-            tracing::error!(target: "git.worktree",
-                to = %to.display(),
-                submodules = ?unrepaired,
-                "move_worktree: relocated the worktree but left submodule pointers stale; \
-                 `git submodule update --init --recursive` in the new path restores them"
-            );
+        let mut submodule_failed = false;
+        for checkout in &checkouts {
+            if let Err(e) = Self::repoint_submodule(to, checkout) {
+                submodule_failed = true;
+                problems.push(format!(
+                    "submodule {} is not repointed: {e}",
+                    checkout.relative.display()
+                ));
+            }
         }
         self.relock(to);
-        Ok(())
+        if problems.is_empty() {
+            return Ok(MoveOutcome::Moved);
+        }
+        tracing::error!(target: "git.worktree",
+            to = %to.display(),
+            problems = ?problems,
+            "move_worktree: relocated the worktree but left it degraded"
+        );
+        let mut message = problems.join("; ");
+        if submodule_failed {
+            message.push_str(&format!(
+                "; run `git submodule update --init --recursive` in {} to repair",
+                to.display()
+            ));
+        }
+        Ok(MoveOutcome::MovedDegraded(message))
     }
 
     /// `git worktree repair`, which fixes both the checkout's `.git` pointer and
@@ -420,7 +478,7 @@ impl GitWorktree {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::test_support::{init_repo, run_git};
+    use crate::git::test_support::{init_repo, repo_with_nested_submodules, run_git};
     use tempfile::TempDir;
 
     #[test]
@@ -495,86 +553,6 @@ mod tests {
             classify_worktree_move_listing(&listing, &observed_from, &observed_to),
             Some(TimedMutationOutcome::Applied),
         );
-    }
-
-    /// `main -> .claude -> .claude/nested`, each served from a bare `file://`
-    /// clone, with `branch` on the main repo's HEAD. Two levels, since the
-    /// moved pointers sit at different depths.
-    fn repo_with_nested_submodules(branch: &str, outer_path: &Path) -> Vec<TempDir> {
-        fn commit_all(dir: &Path, message: &str) {
-            run_git(dir, &["add", "-A"]);
-            run_git(
-                dir,
-                &[
-                    "-c",
-                    "user.name=T",
-                    "-c",
-                    "user.email=t@e",
-                    "commit",
-                    "-qm",
-                    message,
-                ],
-            );
-        }
-        fn seed(name: &str) -> TempDir {
-            let dir = TempDir::new().unwrap();
-            run_git(dir.path(), &["init", "-q", "."]);
-            std::fs::write(dir.path().join(format!("{name}.md")), format!("{name}\n")).unwrap();
-            commit_all(dir.path(), "init");
-            dir
-        }
-        fn bare_url(src: &Path, dirs: &mut Vec<TempDir>) -> String {
-            let parent = TempDir::new().unwrap();
-            let bare = parent.path().join("repo.git");
-            run_git(
-                parent.path(),
-                &[
-                    "clone",
-                    "--bare",
-                    "-q",
-                    src.to_str().unwrap(),
-                    bare.to_str().unwrap(),
-                ],
-            );
-            dirs.push(parent);
-            format!("file://{}", bare.display())
-        }
-        fn add_submodule(repo: &Path, url: &str, path: &Path) {
-            let output = std::process::Command::new("git")
-                .current_dir(repo)
-                .args([
-                    "-c",
-                    "protocol.file.allow=always",
-                    "submodule",
-                    "add",
-                    "-q",
-                    "--name",
-                    "fixture",
-                ])
-                .arg(url)
-                .arg(path)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "git submodule add failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            commit_all(repo, "add submodule");
-        }
-
-        let mut dirs = Vec::new();
-        let inner = seed("inner");
-        let inner_url = bare_url(inner.path(), &mut dirs);
-        let mid = seed("mid");
-        add_submodule(mid.path(), &inner_url, Path::new("nested"));
-        let mid_url = bare_url(mid.path(), &mut dirs);
-        let repo = seed("README");
-        add_submodule(repo.path(), &mid_url, outer_path);
-        run_git(repo.path(), &["branch", branch]);
-        dirs.insert(0, repo);
-        dirs.extend([inner, mid]);
-        dirs
     }
 
     /// #3695: `git worktree move` refuses worktrees with submodules; the move
@@ -863,6 +841,54 @@ mod tests {
         assert!(!to.exists());
     }
 
+    /// A submodule gitdir that cannot be rewritten must surface as a degraded
+    /// move at the destination, never as a plain success.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn move_worktree_reports_degraded_when_submodule_repoint_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: root ignores directory permissions");
+            return;
+        }
+        let home_dir = TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home_dir.path());
+
+        let dirs = repo_with_nested_submodules("test-degraded-move", Path::new(".claude"));
+        let git_wt = GitWorktree::new(dirs[0].path().to_path_buf())
+            .unwrap()
+            .allow_submodule_file_transport();
+        let parent = TempDir::new().unwrap();
+        let from = parent.path().join("source");
+        git_wt
+            .create_worktree("test-degraded-move", &from, false, None)
+            .unwrap();
+
+        // Git cannot take `config.lock` in a read-only gitdir.
+        let gitdir = submodule_gitdir(&from.join(".claude")).unwrap();
+        std::fs::set_permissions(&gitdir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let to = parent.path().join("nested-dest/moved");
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        let result = git_wt.move_worktree(&from, &to);
+        std::fs::set_permissions(&gitdir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let Ok(MoveOutcome::MovedDegraded(message)) = result else {
+            panic!("expected a degraded move, got {result:?}");
+        };
+        assert!(message.contains(".claude"), "{message}");
+        assert!(
+            message.contains("git submodule update --init --recursive"),
+            "{message}"
+        );
+        assert!(!from.exists());
+        assert!(to.is_dir());
+        let listed = run_git(&git_wt.repo_path, &["worktree", "list", "--porcelain"]);
+        assert!(listed.contains("moved"), "{listed}");
+    }
+
     /// The backstop reaches the relocation after `move_worktree` has already
     /// unlocked the source; an inventory failure must lock it again.
     #[test]
@@ -906,5 +932,168 @@ mod tests {
             record.lines().any(|line| line.starts_with("locked")),
             "{listing}"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn move_worktree_round_trips_a_relative_gitdir_pointer_through_a_deeper_path() {
+        let home_dir = TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home_dir.path());
+
+        let (dir, _repo) = init_repo();
+        let git_wt = GitWorktree::new(dir.path().to_path_buf()).unwrap();
+        let parent = TempDir::new().unwrap();
+        let original = parent.path().join("wt");
+        git_wt
+            .create_worktree("relative-pointer", &original, true, None)
+            .unwrap();
+        let pointer = |path: &Path| std::fs::read_to_string(path.join(".git")).unwrap();
+        assert!(pointer(&original).starts_with("gitdir: ../"));
+
+        let relative = pointer(&original);
+        GitWorktree::convert_git_file_to_absolute(&original).unwrap();
+        assert!(Path::new(pointer(&original)["gitdir: ".len()..].trim()).is_absolute());
+        std::fs::write(original.join(".git"), relative).unwrap();
+
+        let trash = parent.path().join(".aoe-trash").join("id");
+        std::fs::create_dir_all(trash.parent().unwrap()).unwrap();
+        git_wt.move_worktree(&original, &trash).unwrap();
+        git_wt.move_worktree(&trash, &original).unwrap();
+        run_git(&original, &["status", "--porcelain"]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn failed_move_restores_the_relative_gitdir_pointer() {
+        let home_dir = TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home_dir.path());
+
+        let (dir, _repo) = init_repo();
+        let git_wt = GitWorktree::new(dir.path().to_path_buf()).unwrap();
+        let parent = TempDir::new().unwrap();
+        let original = parent.path().join("wt");
+        git_wt
+            .create_worktree("failed-move", &original, true, None)
+            .unwrap();
+        let before = std::fs::read(original.join(".git")).unwrap();
+
+        let missing_parent = parent.path().join("missing").join("wt");
+        assert!(git_wt.move_worktree(&original, &missing_parent).is_err());
+        assert_eq!(std::fs::read(original.join(".git")).unwrap(), before);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn move_worktree_repairs_a_relative_pointer_broken_by_an_earlier_move() {
+        let home_dir = TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home_dir.path());
+
+        let (dir, _repo) = init_repo();
+        let git_wt = GitWorktree::new(dir.path().to_path_buf()).unwrap();
+        let parent = TempDir::new().unwrap();
+        let original = parent.path().join("wt");
+        git_wt
+            .create_worktree("broken-pointer", &original, true, None)
+            .unwrap();
+
+        let trash = parent.path().join(".aoe-trash").join("id");
+        std::fs::create_dir_all(trash.parent().unwrap()).unwrap();
+        git_wt.unlock_worktree(&original);
+        std::fs::rename(&original, &trash).unwrap();
+
+        git_wt.move_worktree(&trash, &original).unwrap();
+        run_git(&original, &["status", "--porcelain"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn convert_git_file_to_absolute_preserves_non_utf8_admin_path_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = TempDir::new().unwrap();
+        let admin = root.path().join(OsStr::from_bytes(b"admin-\xff"));
+        // EILSEQ and EINVAL signal a filesystem rejecting non-UTF-8 names.
+        if let Err(err) = std::fs::create_dir(&admin) {
+            assert!(
+                matches!(err.raw_os_error(), Some(libc::EILSEQ) | Some(libc::EINVAL)),
+                "non-UTF-8 name probe failed for another reason: {err}"
+            );
+            eprintln!(
+                "skipping convert_git_file_to_absolute_preserves_non_utf8_admin_path_bytes: {} refuses non-UTF-8 names",
+                root.path().display()
+            );
+            return;
+        }
+        std::os::unix::fs::symlink(&admin, root.path().join("link")).unwrap();
+        let worktree = root.path().join("wt");
+        std::fs::create_dir(&worktree).unwrap();
+        let original = b"gitdir: ../link\n".to_vec();
+        std::fs::write(worktree.join(".git"), &original).unwrap();
+
+        let returned = GitWorktree::convert_git_file_to_absolute(&worktree).unwrap();
+
+        let mut expected = b"gitdir: ".to_vec();
+        expected.extend_from_slice(admin.canonicalize().unwrap().as_os_str().as_bytes());
+        expected.push(b'\n');
+        assert_eq!(returned, Some(original));
+        assert_eq!(std::fs::read(worktree.join(".git")).unwrap(), expected);
+        let written = std::fs::read(worktree.join(".git")).unwrap();
+        let target = written
+            .strip_prefix(b"gitdir: ")
+            .and_then(|rest| rest.strip_suffix(b"\n"))
+            .unwrap();
+        assert!(Path::new(OsStr::from_bytes(target)).exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn convert_git_file_to_absolute_never_writes_through_a_name_already_in_the_checkout() {
+        let root = TempDir::new().unwrap();
+        std::fs::create_dir(root.path().join("admin")).unwrap();
+        let worktree = root.path().join("wt");
+        std::fs::create_dir(&worktree).unwrap();
+        std::fs::write(worktree.join(".git"), b"gitdir: ../admin\n").unwrap();
+        // The name an earlier version used for its temp file, redirecting elsewhere.
+        let bystander = root.path().join("bystander");
+        std::fs::write(&bystander, b"keep").unwrap();
+        std::os::unix::fs::symlink(&bystander, worktree.join(".git.aoe-pointer.tmp")).unwrap();
+
+        let returned = GitWorktree::convert_git_file_to_absolute(&worktree).unwrap();
+
+        assert!(returned.is_some());
+        assert_eq!(std::fs::read(&bystander).unwrap(), b"keep");
+        assert!(worktree
+            .join(".git.aoe-pointer.tmp")
+            .symlink_metadata()
+            .unwrap()
+            .is_symlink());
+        let written = std::fs::read(worktree.join(".git")).unwrap();
+        assert!(written.starts_with(b"gitdir: /"), "{written:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn convert_git_file_to_absolute_leaves_the_original_when_the_write_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempDir::new().unwrap();
+        std::fs::create_dir(root.path().join("admin")).unwrap();
+        let worktree = root.path().join("wt");
+        std::fs::create_dir(&worktree).unwrap();
+        let original = b"gitdir: ../admin\n".to_vec();
+        std::fs::write(worktree.join(".git"), &original).unwrap();
+        // A read-only directory refuses the temp file. Root ignores the mode.
+        std::fs::set_permissions(&worktree, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let writable = std::fs::File::create(worktree.join("probe")).is_ok();
+
+        let result = GitWorktree::convert_git_file_to_absolute(&worktree);
+
+        std::fs::set_permissions(&worktree, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if writable {
+            eprintln!("skipping write-failure check: permissions are not enforced");
+            return;
+        }
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(worktree.join(".git")).unwrap(), original);
     }
 }

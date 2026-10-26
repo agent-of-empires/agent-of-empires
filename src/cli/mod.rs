@@ -27,6 +27,7 @@ pub mod sandbox;
 pub mod send;
 pub mod serve;
 pub mod session;
+pub mod session_move;
 pub mod settings;
 pub mod skill;
 pub mod sounds;
@@ -39,7 +40,7 @@ pub mod update;
 pub mod url;
 pub mod worktree;
 
-pub use definition::{command_name, Cli, Commands, CLI_COMMAND_NAMES};
+pub use definition::{command_name, Cli, Commands, DaemonCommands, CLI_COMMAND_NAMES};
 
 pub(crate) fn color_enabled() -> bool {
     use std::io::IsTerminal;

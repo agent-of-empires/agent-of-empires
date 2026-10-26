@@ -14,6 +14,7 @@ import {
   Pin,
   Play,
   Plus,
+  RefreshCw,
   ScrollText,
   SquareTerminal,
   Sparkles,
@@ -95,6 +96,7 @@ export interface SingleRowActions {
   summarize: (sessionId: string) => void;
   stop: (sessionId: string) => void;
   start: (sessionId: string) => void;
+  restartUpdate: (sessionId: string) => void;
   notify: (preset: NotifyPreset) => void;
   color: (color: string | null) => void;
   pin: () => void;
@@ -133,7 +135,7 @@ function QuickAction({
       data-testid={testId}
       aria-pressed={pressed}
       className={`flex flex-1 min-w-0 flex-col items-center gap-1 rounded-md px-1 py-2 text-[11px] hover:text-text-primary cursor-pointer transition-colors ${
-        pressed ? "bg-surface-700 text-text-primary" : "text-text-secondary hover:bg-surface-700/50"
+        pressed ? "bg-brand-600/20 text-text-primary" : "text-text-secondary hover:bg-surface-700/50"
       }`}
     >
       {glyph}
@@ -184,6 +186,12 @@ export function SingleRowMenuItems({
       )}
       {write && item("stop", { label: "Stop", testId: "sidebar-context-menu-stop", glyph: icon(CircleStop) })}
       {write && item("start", { label: "Start", testId: "sidebar-context-menu-start", glyph: icon(Play) })}
+      {write &&
+        item("restartUpdate", {
+          label: "Restart to apply update (keeps conversation)",
+          testId: "sidebar-context-menu-restart-update",
+          glyph: icon(RefreshCw),
+        })}
       {write &&
         item("switchView", {
           label: "Switch view",
@@ -268,7 +276,7 @@ export function SingleRowMenuItems({
               aria-pressed={model.notifyPreset === preset}
               className={`flex-1 rounded px-2 py-1 max-md:py-2 text-xs cursor-pointer transition-colors ${
                 model.notifyPreset === preset
-                  ? "bg-surface-700 text-text-primary"
+                  ? "bg-brand-600/20 text-text-primary"
                   : "text-text-secondary hover:text-text-primary"
               }`}
             >

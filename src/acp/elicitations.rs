@@ -89,6 +89,9 @@ pub struct ElicitationOption {
     /// Optional per-option description (e.g. AskUserQuestion's pros/cons
     /// text).
     pub description: Option<String>,
+    /// Option body the adapter forwards under `_meta`, e.g. a drafted reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -108,6 +111,9 @@ pub struct ElicitationAnswer {
 /// option's label and its description when flattening into the enum title
 /// (`"<label> <sep> <description>"`).
 const OPTION_DESC_SEP: &str = " \u{2014} ";
+
+/// `_meta` key under which the adapter carries an option's `preview`.
+const OPTION_META_KEY: &str = "_claude/askUserQuestionOption";
 
 /// Render the user's submitted answers into display-ready pairs, in the
 /// form's question order.
@@ -310,6 +316,13 @@ fn titled_options(options: &[EnumOption]) -> Vec<ElicitationOption> {
             value: o.value.clone(),
             label: o.title.clone(),
             description: o.description.clone(),
+            preview: o
+                .meta
+                .as_ref()
+                .and_then(|m| m.get(OPTION_META_KEY))
+                .and_then(|d| d.get("preview"))
+                .and_then(|p| p.as_str())
+                .map(str::to_owned),
         })
         .collect()
 }
@@ -321,6 +334,7 @@ fn bare_options(values: &[String]) -> Vec<ElicitationOption> {
             value: v.clone(),
             label: v.clone(),
             description: None,
+            preview: None,
         })
         .collect()
 }
@@ -652,11 +666,21 @@ mod tests {
         parse_elicitation(Nonce::new(), &request, Utc::now()).unwrap()
     }
 
+    fn preview_meta(preview: &str) -> agent_client_protocol::schema::v1::Meta {
+        let mut meta = agent_client_protocol::schema::v1::Meta::new();
+        meta.insert(
+            OPTION_META_KEY.into(),
+            serde_json::json!({ "preview": preview }),
+        );
+        meta
+    }
+
     fn option(value: &str, label: &str) -> ElicitationOption {
         ElicitationOption {
             value: value.into(),
             label: label.into(),
             description: None,
+            preview: None,
         }
     }
 
@@ -718,7 +742,9 @@ mod tests {
                 .property(
                     "question_0",
                     StringPropertySchema::new().title("Pick one").one_of(vec![
-                        EnumOption::new("Yes", "Yes").description("Ships now"),
+                        EnumOption::new("Yes", "Yes")
+                            .description("Ships now")
+                            .meta(preview_meta("draft A")),
                         EnumOption::new("No", "No"),
                     ]),
                     true,
@@ -726,7 +752,9 @@ mod tests {
                 .property(
                     "question_1",
                     MultiSelectPropertySchema::titled(vec![
-                        EnumOption::new("a", "Apple").description("Crisp"),
+                        EnumOption::new("a", "Apple")
+                            .description("Crisp")
+                            .meta(preview_meta("draft B")),
                         EnumOption::new("b", "Banana"),
                     ]),
                     false,
@@ -762,6 +790,16 @@ mod tests {
                 .map(|o| o.description.as_deref())
                 .collect()
         };
+        let previews = |i: usize| -> Vec<Option<&str>> {
+            e.questions[i]
+                .options
+                .iter()
+                .map(|o| o.preview.as_deref())
+                .collect()
+        };
+        assert_eq!(previews(0), [Some("draft A"), None]);
+        assert_eq!(previews(1), [Some("draft B"), None]);
+        assert_eq!(previews(2), [None, None]);
         assert_eq!(descriptions(0), [Some("Ships now"), None]);
         assert_eq!(descriptions(1), [Some("Crisp"), None]);
         assert_eq!(

@@ -4324,7 +4324,7 @@ mod tests {
             crate::file_watch::FileWatchService::noop(),
         )
         .unwrap();
-        app.home.serve_view = Some(crate::tui::dialogs::ServeView::new());
+        app.home.serve_view = Some(crate::tui::dialogs::ServeView::settled());
         app.home.pending_paste = Some("retained stop draft".into());
         let transaction = crate::daemon::lifecycle::Transaction::acquire()
             .await
@@ -4350,7 +4350,7 @@ mod tests {
             app.home.serve_view.is_none(),
             "input remains usable during deferred Stop"
         );
-        app.home.serve_view = Some(crate::tui::dialogs::ServeView::new());
+        app.home.serve_view = Some(crate::tui::dialogs::ServeView::settled());
         assert!(matches!(
             app.home.handle_key(KeyEvent::from(KeyCode::Enter), None),
             Some(Action::StartDashboard)
