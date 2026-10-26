@@ -478,7 +478,7 @@ async fn build_spawn_request(
         Err(e) => {
             let message = format!("sandbox container ensure failed: {e}");
             tracing::warn!(target: "acp.supervisor", session = %target.id, "reconciler container ensure failed: {message}");
-            crate::server::api::publish_startup_error_if_current(
+            let published = crate::server::api::publish_startup_error_if_current(
                 &state,
                 &target.id,
                 &target.source_profile,
@@ -486,7 +486,11 @@ async fn build_spawn_request(
                 message,
             )
             .await;
-            return Err(PrepFailure::Reported);
+            return Err(if published {
+                PrepFailure::Reported
+            } else {
+                PrepFailure::Raced
+            });
         }
     };
 

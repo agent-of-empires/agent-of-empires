@@ -1421,11 +1421,11 @@ pub(crate) async fn publish_startup_error_if_current(
     profile: &str,
     generation: u64,
     message: String,
-) {
+) -> bool {
     let _namespace = state.profile_namespace.read().await;
     let _instance = state.instance_lock(session_id).await.lock_owned().await;
     if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
-        return;
+        return false;
     }
     let current = state.instances.read().await.iter().any(|row| {
         row.id == session_id
@@ -1439,6 +1439,7 @@ pub(crate) async fn publish_startup_error_if_current(
             .acp_supervisor
             .publish_startup_error(session_id, message);
     }
+    current
 }
 
 #[cfg(test)]
