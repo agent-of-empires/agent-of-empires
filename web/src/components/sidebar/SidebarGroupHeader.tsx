@@ -136,6 +136,10 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
               e.preventDefault();
               const rect = (rowRef.current ?? e.currentTarget).getBoundingClientRect();
               openMenu({ x: rect.left + 12, y: rect.bottom + 4 });
+              // The desktop menu isn't modal, so it takes focus only when the keyboard opened it.
+              requestAnimationFrame(() =>
+                menuRef.current?.querySelector<HTMLElement>("button:not([disabled])")?.focus({ preventScroll: true }),
+              );
               return;
             }
             if (e.key === "Escape" && menu) {

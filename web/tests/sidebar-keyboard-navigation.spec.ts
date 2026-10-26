@@ -139,11 +139,12 @@ for (const [axis, compact] of [
     await press("ArrowDown", toggle(1));
     await press("ArrowUp", toggle(0));
 
-    // Shift+F10 opens the menu; Escape closes it and leaves focus on the header button.
+    // Shift+F10 opens the menu with focus on its first item; Escape closes it and focus returns to the header button.
     await expect(toggle(0)).toHaveAttribute("aria-keyshortcuts", "Shift+F10");
     await page.keyboard.press("Shift+F10");
     const menu = page.getByTestId("sidebar-group-context-menu");
     await expect(menu).toBeVisible();
+    await expect(menu.getByRole("button").first()).toBeFocused();
     await page.keyboard.press("Escape");
     await expect(menu).toBeHidden();
     await expect(toggle(0)).toBeFocused();
