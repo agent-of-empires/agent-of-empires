@@ -236,6 +236,37 @@ describe("StartupErrorBanner layout", () => {
   });
 });
 
+describe("StartupErrorBanner auth remediation", () => {
+  it.each<{ agent: string; info: AgentInstallInfo; present: string[]; absent: string[] }>([
+    {
+      agent: "claude",
+      info: claude(),
+      present: ["claude /login", "ANTHROPIC_API_KEY"],
+      absent: ["codex login"],
+    },
+    {
+      agent: "codex",
+      info: claude({ agent: "codex", display_name: "Codex" }),
+      present: ["codex login", "OPENAI_API_KEY"],
+      absent: ["claude /login", "ANTHROPIC_API_KEY"],
+    },
+    {
+      agent: "opencode",
+      info: opencode,
+      present: ["OpenCode isn't signed in"],
+      absent: ["claude /login", "codex login"],
+    },
+  ])("names the $agent login step, not another agent's", async ({ agent, info, present, absent }) => {
+    stubApi({ info: json(info) });
+    const message = `Failed to start structured view agent "${agent}": authentication required`;
+    const { findByTestId } = renderBanner({ message });
+    const banner = await findByTestId("startup-error-banner");
+    await waitFor(() => expect(banner.textContent).not.toContain("usually missing"));
+    for (const text of present) expect(banner.textContent).toContain(text);
+    for (const text of absent) expect(banner.textContent).not.toContain(text);
+  });
+});
+
 describe("StartupErrorBanner primary action", () => {
   // resolved.rs checks this label/fill pair per built-in theme; hover must not swap either colour.
   it("uses the theme's readable pair at rest and on hover", async () => {
