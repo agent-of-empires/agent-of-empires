@@ -97,11 +97,9 @@ async fn an_unknown_bearer_is_unauthorized() {
     );
 }
 
-/// The CityHall lockdown answers the route directly, and the client folds that
-/// refusal into the same unauthorized classification.
 #[tokio::test]
 #[serial_test::parallel]
-async fn a_locked_down_daemon_is_unauthorized() {
+async fn a_locked_down_daemon_reports_its_mode() {
     let state = build_test_app_state_cityhall(Vec::new());
     let address = serve(state).await;
 
@@ -113,10 +111,13 @@ async fn a_locked_down_daemon_is_unauthorized() {
     .expect("the refusal arrives inside the establishment budget");
 
     assert_eq!(outcome.exit, 4);
-    assert_eq!(
-        outcome.stderr.as_deref(),
-        Some("daemon read: unauthorized\n")
+    assert_eq!(outcome.stdout, None);
+    let stderr = outcome.stderr.unwrap();
+    assert!(
+        stderr.starts_with("daemon read: cityhall_mode\n"),
+        "{stderr}"
     );
+    assert!(!stderr.contains("unauthorized"), "{stderr}");
 }
 
 #[tokio::test]

@@ -322,6 +322,89 @@ fn malformed_temporaries_identify_the_file_without_starting_or_removing_it() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[parallel]
+async fn verified_cityhall_daemon_without_publication_has_local_guidance() {
+    use agent_of_empires::daemon::{DaemonClient, RUNTIME_PROTOCOL_VERSION};
+    use std::process::Stdio;
+    use std::time::Duration;
+    use tokio::net::UnixDatagram;
+
+    struct Foreground(std::process::Child);
+    impl Drop for Foreground {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let fixture = Fixture::new();
+    let notify_path = fixture.home.path().join("ready.sock");
+    let notify = UnixDatagram::bind(&notify_path).unwrap();
+    let log_path = fixture.home.path().join("serve.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let mut foreground = Foreground(
+        fixture
+            .command(&["serve", "--core-only", "--cityhall"])
+            .env("NOTIFY_SOCKET", &notify_path)
+            .stdout(Stdio::null())
+            .stderr(log)
+            .spawn()
+            .unwrap(),
+    );
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let mut message = [0; 1024];
+        loop {
+            let size = notify.recv(&mut message).await.unwrap();
+            if message[..size]
+                .split(|byte| *byte == b'\n')
+                .any(|field| field == b"READY=1")
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|error| {
+        panic!(
+            "Daemon did not become ready: {error}; {}",
+            std::fs::read_to_string(log_path).unwrap()
+        )
+    });
+    let client = DaemonClient::new_unix(fixture.app.join("daemon/api.sock")).unwrap();
+    let ready = client.runtime_info().await.unwrap();
+    assert_eq!(ready.protocol_version, RUNTIME_PROTOCOL_VERSION);
+    assert_eq!(ready.namespace, fixture.app.to_str().unwrap());
+    assert!(ready.local_owner && ready.cityhall_mode);
+    assert!(!ready.epoch.is_empty());
+    let pid = std::fs::read_to_string(fixture.app.join("serve.pid")).unwrap();
+    assert_eq!(pid.trim().parse::<u32>().unwrap(), foreground.0.id());
+    for path in [
+        "runtime.sock",
+        "runtime.prebind.json",
+        "runtime.postbind.json",
+    ] {
+        assert!(!fixture.app.join(path).exists(), "unexpected {path}");
+    }
+
+    let output = fixture.run(&["list", "--json", "--no-autostart"]);
+    assert_refused(&output, "daemon read: marker_missing");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("local Daemon") && stderr.contains("publication"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("--daemon-url"), "{stderr}");
+    assert!(!stderr.contains("AOE_DAEMON_URL"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(fixture.app.join("serve.pid")).unwrap(),
+        pid
+    );
+    assert!(foreground.0.try_wait().unwrap().is_none());
+}
+
 #[tokio::test]
 #[parallel]
 async fn peer_refusals_never_switch_to_a_live_local_daemon() {
@@ -337,11 +420,17 @@ async fn peer_refusals_never_switch_to_a_live_local_daemon() {
     let local_rows: serde_json::Value = serde_json::from_slice(&local.stdout).unwrap();
     assert_eq!(local_rows[0]["id"], "daemon-only-row");
     let pid = std::fs::read(fixture.app.join("serve.pid")).unwrap();
-    for (status, code) in [
-        (401, "unauthorized"),
-        (404, "server_error"),
-        (101, "protocol_mismatch"),
-    ] {
+    let cases: &[(u16, &[&str], &str)] = &[
+        (401, &[], "unauthorized"),
+        (403, &[], "unauthorized"),
+        (403, &["cityhall_mode"], "cityhall_mode"),
+        (403, &["cityhall_mode", "cityhall_mode"], "unauthorized"),
+        (401, &["cityhall_mode"], "unauthorized"),
+        (403, &["unknown_future_code"], "unauthorized"),
+        (404, &["cityhall_mode"], "server_error"),
+        (101, &[], "protocol_mismatch"),
+    ];
+    for &(status, headers, code) in cases {
         for explicit in [false, true] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
@@ -353,10 +442,13 @@ async fn peer_refusals_never_switch_to_a_live_local_daemon() {
                         if status == 101 {
                             Ok(response)
                         } else {
-                            Err(tokio_tungstenite::tungstenite::http::Response::builder()
-                                .status(status)
-                                .body(None)
-                                .unwrap())
+                            let mut refusal =
+                                tokio_tungstenite::tungstenite::http::Response::builder()
+                                    .status(status);
+                            for header in headers {
+                                refusal = refusal.header("AoE-Error-Code", *header);
+                            }
+                            Err(refusal.body(None).unwrap())
                         }
                     },
                 )

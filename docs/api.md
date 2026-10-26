@@ -221,6 +221,10 @@ Without an HTTP endpoint, Linux first reads through its verified, same-user runt
 
 An implicit local read can still refuse after acquisition if the Daemon does not publish runtime reads. Check its mode, version compatibility and publication diagnostics; CityHall intentionally disables these reads on both transports. API readiness alone does not authorize a Linux runtime read.
 
+A `403` carrying a valid `AoE-Error-Code: cityhall_mode` produces the CLI refusal code `cityhall_mode`, not `unauthorized`. This is a deployment-mode restriction; retrying authentication does not enable runtime reads. The refusal does not trigger login retries, a different target or local startup.
+
+Identity refusals such as `peer_identity` and `marker_identity` require checking the expected Daemon, app/build namespace, versions and local socket/publication ownership through its manager. Do not remove publication artifacts or start another Daemon while ownership is uncertain.
+
 A named temporary-marker decode failure may indicate an incompatible Daemon version, not necessarily an abandoned write. Check versions first. Before removing the named temporary, stop every Daemon using this app directory through its service manager or `aoe serve --stop`, and verify no publisher remains. Remove only that file if it is abandoned; do not clear publication artifacts indiscriminately.
 
 `--no-autostart` or `AOE_NO_AUTOSTART=1` disables local startup, not reuse of an existing Daemon. Startup failure or an absent Daemon with startup disabled is an error with guidance, never a disk answer. The spawning Client announces `Started aoe daemon (pid N)` only on stderr, including under `--json`. Local administrative commands keep their existing startup and configuration-recovery behavior; other reads outside this covered set remain unchanged.

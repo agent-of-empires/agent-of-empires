@@ -85,6 +85,7 @@ pub(crate) const EMITTABLE_CODES: &[&str] = &[
     // `parser_error` is clap's, raised before any read begins.
     "parser_error",
     "anchored_alias_unavailable",
+    "cityhall_mode",
     "close_timeout",
     "connection_closed",
     "default_missing",
@@ -119,6 +120,12 @@ pub const RENDERER_INTERNAL: &str = "renderer_internal";
 pub fn read_sentence(code: &str) -> String {
     if code == "protocol_mismatch" {
         return "daemon read: protocol_mismatch\nClient and daemon protocol versions differ. Restart the target daemon on its host with `aoe serve --restart` (or its service manager); update that host's aoe installation if needed.\n".into();
+    }
+    if code == "cityhall_mode" {
+        return "daemon read: cityhall_mode\nCityHall mode disables runtime CLI reads on this Daemon. This is a mode restriction, not an authentication failure. Check the deployment mode with its administrator; retrying authentication will not enable these reads.\n".into();
+    }
+    if matches!(code, "peer_identity" | "marker_identity") {
+        return format!("daemon read: {code}\nThe Daemon identity could not be verified. Check the expected Daemon, app/build namespace and CLI/Daemon versions. For local connections, inspect socket and publication ownership through the Daemon's manager. Do not remove publication artifacts or start another Daemon while ownership is uncertain.\n");
     }
     if matches!(
         code,
@@ -866,6 +873,8 @@ where
 }
 
 fn map_upgrade_error(error: WsError) -> ReadFailure {
+    use crate::daemon::ApiErrorCode;
+
     match error {
         WsError::Http(response) if response.status().as_u16() == 404 => {
             let mut failure = ReadFailure::post("server_error");
@@ -873,6 +882,12 @@ fn map_upgrade_error(error: WsError) -> ReadFailure {
                 "daemon read: server_error\nThe runtime-read route was not found. Check the selected URL and proxy routing. If the daemon predates this CLI, update it and restart it on its host with `aoe serve --restart` (or its service manager).\n".into(),
             );
             failure
+        }
+        WsError::Http(response)
+            if ApiErrorCode::from_headers(response.status(), response.headers(), false)
+                == Some(ApiErrorCode::CityhallMode) =>
+        {
+            ReadFailure::post("cityhall_mode")
         }
         WsError::Http(response) => map_http_status(response.status().as_u16()),
         _ => ReadFailure::post("unavailable"),
