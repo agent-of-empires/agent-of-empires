@@ -405,7 +405,10 @@ impl HttpClient {
             return Err(brief_server_error(status_error(&res, None, false), res).await);
         }
         let text = res.text().await?;
-        Ok(serde_json::from_str(&text).unwrap_or(serde_json::Value::Null))
+        if text.trim().is_empty() {
+            return Ok(serde_json::Value::Null);
+        }
+        serde_json::from_str(&text).map_err(|_| HttpError::Transport)
     }
 
     /// `POST /api/sessions/{id}/acp/cancel`.
@@ -946,6 +949,7 @@ async fn brief_server_error(error: HttpError, res: reqwest::Response) -> HttpErr
             "the running daemon does not support this command; restart it with `aoe serve --restart`"
                 .to_string()
         }
+        None if !text.trim().is_empty() => text,
         None => body,
     };
     HttpError::Server { status, body }
