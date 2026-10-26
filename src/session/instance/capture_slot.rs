@@ -235,3 +235,137 @@ impl CapturePollerSlot {
         &mut self.repair
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::instance::ExecutionBinding;
+
+    fn execution(launch: &str) -> ActiveExecution {
+        ActiveExecution {
+            launch_id: launch.into(),
+            binding: ExecutionBinding {
+                agent: "claude".into(),
+                stores: Vec::new(),
+                configuration: Vec::new(),
+                cwd: std::path::PathBuf::from("/tmp"),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: None,
+            },
+            capture: None,
+            container: None,
+        }
+    }
+
+    fn slot_for(tool: &str, execution: Option<ActiveExecution>) -> CapturePollerSlot {
+        let mut slot = CapturePollerSlot::default();
+        slot.set_handle(Some(Arc::new(Mutex::new(SessionPoller::new(
+            "tmux".into(),
+            tool.into(),
+            execution,
+        )))));
+        slot
+    }
+
+    fn paced(mut slot: CapturePollerSlot) -> CapturePollerSlot {
+        slot.repair_mut().reprobe(Instant::now());
+        slot.set_retry_after(Some(Instant::now()));
+        slot
+    }
+
+    fn has_pacing(slot: &CapturePollerSlot) -> bool {
+        slot.retry_after().is_some() || *slot.repair() != PollerRepairBackoff::default()
+    }
+
+    #[test]
+    fn settle_keeps_a_handle_only_while_it_serves_the_held_execution() {
+        let (one, two) = (execution("one"), execution("two"));
+        for (held_tool, held_exec, keeps) in [
+            ("claude", Some(&one), true),
+            ("claude", Some(&two), false),
+            ("claude", None, false),
+            ("codex", Some(&one), false),
+        ] {
+            let mut slot = slot_for("claude", Some(one.clone()));
+            slot.settle(Held::new(held_tool, held_exec));
+            assert_eq!(slot.handle().is_some(), keeps, "{held_tool} {held_exec:?}");
+        }
+        let mut empty = CapturePollerSlot::default();
+        empty.settle(Held::new("claude", None));
+        assert!(empty.handle().is_none());
+    }
+
+    #[test]
+    fn handoff_carries_the_handle_and_pacing_only_for_the_same_run() {
+        let (one, two) = (execution("one"), execution("two"));
+        let prior_held = Held::new("claude", Some(&one));
+        // (receiving tool, receiving execution, keeps handle, keeps pacing)
+        for (tool, exec, handle, pacing) in [
+            ("claude", Some(&one), true, true),
+            ("claude", Some(&two), false, false),
+            ("codex", Some(&one), false, false),
+            ("claude", None, false, false),
+        ] {
+            let prior = paced(slot_for("claude", Some(one.clone())));
+            let held = Held::new(tool, exec);
+            let handoff = Handoff::decide(&prior, prior_held, held);
+            let mut moved = prior;
+            handoff.settle(&mut moved);
+            assert_eq!(moved.handle().is_some(), handle, "{tool} {exec:?}");
+            assert_eq!(has_pacing(&moved), pacing, "{tool} {exec:?}");
+        }
+    }
+
+    #[test]
+    fn adopt_handle_reports_whether_the_prior_poller_serves() {
+        let (one, two) = (execution("one"), execution("two"));
+        let prior = slot_for("claude", Some(one.clone()));
+        let mut row = CapturePollerSlot::default();
+        assert!(!row.adopt_handle_if_serving(&prior, Held::new("claude", Some(&two))));
+        assert!(row.handle().is_none());
+        assert!(row.adopt_handle_if_serving(&prior, Held::new("claude", Some(&one))));
+        assert!(Arc::ptr_eq(row.handle().unwrap(), prior.handle().unwrap()));
+    }
+
+    #[test]
+    fn relaunch_timing_needs_a_stamped_launch_for_the_row_s_own_run() {
+        let (one, two) = (execution("one"), execution("two"));
+        let launched = paced(slot_for("claude", Some(one.clone())));
+        let launched_held = Held::new("claude", Some(&one));
+        // (stamped, receiving execution, takes the launch's deadline)
+        for (stamped, exec, takes) in [
+            (true, &one, true),
+            (false, &one, false),
+            (true, &two, false),
+        ] {
+            let mut row = paced(CapturePollerSlot::default());
+            row.set_retry_after(None);
+            row.adopt_relaunch(
+                &launched,
+                launched_held,
+                stamped,
+                Held::new("claude", Some(exec)),
+            );
+            assert_eq!(
+                row.retry_after().is_some(),
+                takes,
+                "stamped={stamped} {exec:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_repair_walked_on_a_clone_brings_its_deadline_and_only_a_running_poller() {
+        let mut walked = CapturePollerSlot::default();
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        walked.set_retry_after(Some(deadline));
+        let mut live = CapturePollerSlot::default();
+        live.adopt_repaired(&walked);
+        assert_eq!(live.retry_after(), Some(deadline));
+        assert!(
+            live.handle().is_none(),
+            "a walk that started nothing hands over no handle"
+        );
+    }
+}
