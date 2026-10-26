@@ -75,6 +75,8 @@ describe("SandboxImageBanner", () => {
       ["current", { state: "current" } as Partial<SandboxImageStatus>, null],
       // The Daemon can't tell, so the banner says nothing rather than "up to date".
       ["unknown", { state: "unknown", reason: "pinned" } as Partial<SandboxImageStatus>, null],
+      // Docker Desktop not started: not "not pulled", and nothing to offer.
+      ["runtime unavailable", { state: "unknown", reason: "runtime_unavailable" } as Partial<SandboxImageStatus>, null],
       ["check failed", { state: "check_failed", error: "timeout" } as Partial<SandboxImageStatus>, null],
       // The Daemon keeps its last pull; one this page didn't watch isn't news.
       ["a stale finished pull", { pull: { state: "done" } }, "Sandbox image update available"],

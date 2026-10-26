@@ -1537,7 +1537,7 @@ export type SandboxImagePull = { state: "idle" | "running" | "done" } | { state:
 export type SandboxImageState =
   | { state: "available"; remote_digest: string }
   | { state: "current" }
-  /** `pinned`, `not_pulled`, `no_local_digest`, `unparseable` or `checks_off`: the Daemon can't tell. */
+  /** `pinned`, `not_pulled`, `no_local_digest`, `runtime_unavailable`, `unparseable` or `checks_off`: the Daemon can't tell. */
   | { state: "unknown"; reason: string }
   | { state: "check_failed"; error: string };
 
