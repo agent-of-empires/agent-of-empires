@@ -107,3 +107,31 @@ fn test_aoe_add_project_flag_rejects_invalid_requests() {
         "expected message naming the unknown project, got: {stderr}"
     );
 }
+
+#[test]
+#[parallel]
+fn project_remove_resolves_a_relative_path_in_the_cli_cwd() {
+    let mut h = TuiTestHarness::new_in_tmp("project_rm_cwd");
+    h.stop_daemon_on_drop();
+    let (a, b) = (h.home_path().join("a"), h.home_path().join("b"));
+    init_git_repo(&a.join("repo"));
+    init_git_repo(&b.join("repo"));
+    let run_in = |dir: &std::path::Path, args: &[&str]| {
+        let out = h
+            .cli_command(args)
+            .current_dir(dir)
+            .output()
+            .expect("run aoe");
+        assert!(out.status.success(), "{args:?}: {out:?}");
+    };
+    // The first command autostarts the Daemon, so its cwd is `a`.
+    run_in(&a, &["project", "add", "./repo", "--name", "in-a"]);
+    run_in(&b, &["project", "add", "./repo", "--name", "in-b"]);
+
+    run_in(&b, &["project", "remove", "./repo"]);
+    let listed = h.run_cli_ok(&["project", "list"]);
+    assert!(
+        listed.contains("in-a") && !listed.contains("in-b"),
+        "{listed}"
+    );
+}

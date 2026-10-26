@@ -240,9 +240,20 @@ async fn remove(profile: &str, profile_explicit: bool, args: ProjectRemoveArgs) 
             profile: resolve_existing_profile(profile)?,
         },
     };
+    // The Daemon resolves a path in its own cwd, so a path-like argument is
+    // anchored here; a bare name still looks up by name.
+    let name_or_path = if args.name_or_path.contains(std::path::MAIN_SEPARATOR)
+        || matches!(args.name_or_path.as_str(), "." | "..")
+    {
+        std::path::absolute(&args.name_or_path)?
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        args.name_or_path.clone()
+    };
     super::mutate_project(crate::daemon::ProjectMutation::Remove {
         target,
-        name_or_path: args.name_or_path.clone(),
+        name_or_path,
     })
     .await?;
     println!(
