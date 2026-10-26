@@ -10,6 +10,7 @@ use crate::harness::{app_dir_in, init_git_repo, TuiTestHarness};
 fn config_commands_write_through_an_autostarted_daemon() {
     let mut h = TuiTestHarness::new_in_tmp("daemon_config_flow");
     h.stop_daemon_on_drop();
+    h.remove_env("DO_NOT_TRACK");
 
     let profiles = app_dir_in(h.home_path()).join("profiles");
     h.run_cli_ok(&["profile", "create", "alpha"]);

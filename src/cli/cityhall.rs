@@ -70,7 +70,13 @@ async fn run_apply(args: ApplyArgs) -> Result<()> {
                 .body(raw.clone())
                 .timeout(APPLY_TIMEOUT)
         })
-        .await?;
+        .await
+        .map_err(|error| match error {
+            crate::acp::client::HttpError::Transport => anyhow::anyhow!(
+                "no reply from the Daemon; the apply may still be running there, so check before retrying"
+            ),
+            error => error.into(),
+        })?;
     let report: cityhall_bundle::ApplyReport = serde_json::from_value(value)?;
 
     println!("Applied {} settings.", report.settings_applied);
