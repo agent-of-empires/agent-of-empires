@@ -59,7 +59,7 @@ for (const scenario of [
         const log = join(seed.home, "agent-input.jsonl");
         writeFileSync(
           join(seed.shimBin, "claude"),
-          `#!/usr/bin/python3
+          `#!/usr/bin/env python3
 import json, os, select, sys, time
 log = open(${JSON.stringify(log)}, "a", buffering=1)
 def record(event, **data):
@@ -171,7 +171,7 @@ while True:
     expect(spawnSync("tmux", ["-S", serve.tmuxSocket, "has-session", "-t", name]).status).toBe(0);
     expect(events().find((event) => event.event === "ready")?.argv).toContain(nativeId);
     expect(events().find((event) => event.event === "ready")?.argv).toContain("--resume");
-    // Observe the recovered agent beyond the wake worker's 3-second readiness deadline.
+    // Observe the full input window to catch late extra prompts.
     await expect.poll(() => events().some((event) => event.event === "window_closed"), { timeout: 15_000 }).toBe(true);
     expect(
       events()

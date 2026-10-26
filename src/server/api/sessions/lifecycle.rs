@@ -1834,6 +1834,7 @@ fn reserve_structured_restart(
     instance: &Instance,
     expected_generation: Option<u64>,
     body: &crate::daemon::RestartSessionBody,
+    restart_origin: RestartOrigin,
 ) -> anyhow::Result<(crate::server::session_store::NativeSessionStore, Instance)> {
     use crate::session::SessionStore;
     let native = crate::server::session_store::NativeSessionStore::open(
@@ -1857,6 +1858,13 @@ fn reserve_structured_restart(
             && expected_generation.is_none_or(|expected| expected == probe.lifecycle_generation),
         crate::session::LifecycleReservationError::Superseded
     );
+    if matches!(restart_origin, RestartOrigin::StartupRecovery) {
+        // Preserve stored custody errors before refusing structured recovery.
+        probe
+            .ensure_startable()
+            .map_err(LifecycleTargetError::Blocked)?;
+        return Err(LifecycleTargetError::Busy.into());
+    }
     admit_restart(&mut probe, body, false)?;
     if let Some(target) = body
         .profile
@@ -2281,14 +2289,7 @@ async fn prepare_agent_session_inner(
         }
     }
     if instance.is_structured()
-        && expected_generation.is_some()
-        && (instance.status == Status::Stopped || instance.is_idle_dormant())
-    {
-        // Recovery is not an explicit user resume and cannot consume a native stop.
-        return lifecycle_rejection(&state, &LifecycleTargetError::Busy.into())
-            .unwrap_or_else(|| StatusCode::CONFLICT.into_response());
-    }
-    if instance.is_structured()
+        && matches!(restart_origin, RestartOrigin::Explicit)
         && (instance.status == Status::Stopped || instance.is_idle_dormant())
     {
         instance = match resume_structured_stop(&state, instance).await {
@@ -2301,7 +2302,13 @@ async fn prepare_agent_session_inner(
         let candidate = instance.clone();
         let restart_body = restart.clone().expect("restart body");
         let reserved = tokio::task::spawn_blocking(move || {
-            reserve_structured_restart(worker_state, &candidate, expected_generation, &restart_body)
+            reserve_structured_restart(
+                worker_state,
+                &candidate,
+                expected_generation,
+                &restart_body,
+                restart_origin,
+            )
         })
         .await;
         let (native, reserved) = match reserved {
@@ -2975,6 +2982,7 @@ mod durable_stop_tests {
                 &row,
                 None,
                 &crate::daemon::RestartSessionBody::default(),
+                RestartOrigin::Explicit,
             )
         })
         .await
