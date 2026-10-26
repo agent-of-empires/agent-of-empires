@@ -240,6 +240,8 @@ test.describe("Sidebar multi-session (#956)", () => {
     await menu.locator("[data-testid='sidebar-group-context-menu-rename']").click();
 
     const input = page.locator("[data-testid='sidebar-group-rename-input']");
+    // Rename sends focus to its input rather than back to the header button.
+    await expect(input).toBeFocused();
     await input.fill("Client Alpha");
     await input.press("Enter");
     await expect(projectHeader.getByText("Client Alpha")).toBeVisible();
