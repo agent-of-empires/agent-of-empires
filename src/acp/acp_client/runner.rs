@@ -500,7 +500,10 @@ pub(super) async fn spawn_runner_detached(
         }
         let mut child = cmd
             .spawn()
-            .map_err(|error| AcpError::Spawn(format!("spawn runner: {error}")))?;
+            .map_err(|error| match ensure_runner_exe(&current_exe) {
+                Err(missing) if error.kind() == std::io::ErrorKind::NotFound => missing,
+                _ => AcpError::Spawn(format!("spawn runner: {error}")),
+            })?;
         let pid = child
             .id()
             .ok_or_else(|| AcpError::Spawn("runner exited before it could be identified".into()))?;
