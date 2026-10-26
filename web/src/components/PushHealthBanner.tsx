@@ -45,7 +45,7 @@ export function PushHealthBanner({ hidden = false }: { hidden?: boolean }) {
             type="button"
             onClick={() => void enable()}
             disabled={busy}
-            className="underline hover:opacity-80 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+            className="underline hover:no-underline cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {busy ? "Enabling..." : "Re-enable"}
           </button>

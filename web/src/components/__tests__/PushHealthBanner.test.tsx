@@ -59,6 +59,7 @@ describe("PushHealthBanner", () => {
     const dismiss = screen.getByRole("button", { name: "Dismiss notifications notice" });
     expect(dismiss.className).toContain("text-text-subtle");
     expect(dismiss.className).not.toMatch(/text-text-(muted|secondary)/);
+    expect(reEnable()!.className).not.toContain("hover:opacity");
     fireEvent.click(dismiss);
     expect(screen.queryByRole("alert")).toBeNull();
 
