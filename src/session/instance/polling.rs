@@ -92,7 +92,7 @@ pub enum PollerStart {
     /// Nothing to poll for this session at the moment; not a failure.
     NotApplicable,
     /// Capture prerequisites are unresolved; a retry is scheduled on
-    /// `session_id_poller_retry_after`.
+    /// `CapturePollerSlot::retry_after`.
     Deferred,
     /// The process-wide poller-thread budget is spent.
     BudgetExhausted,
@@ -318,8 +318,8 @@ impl Instance {
         use crate::session::poller::PollerSpawn;
         match spawn {
             PollerSpawn::Spawned => {
-                self.session_id_poller = Some(Arc::new(Mutex::new(poller)));
-                self.poller_repair.reset();
+                self.capture_poller.handle = Some(Arc::new(Mutex::new(poller)));
+                self.capture_poller.repair.reset();
                 PollerStart::Started
             }
             PollerSpawn::BudgetExhausted => PollerStart::BudgetExhausted,
@@ -342,7 +342,7 @@ impl Instance {
         #[cfg(test)]
         probe_delay::hold();
         if !crate::migrations::v033_isolate_sandbox_content::instance_ready(self).unwrap_or(false) {
-            self.session_id_poller = None;
+            self.capture_poller.handle = None;
             return Ok(PollerStart::NotApplicable);
         }
         if self.session_id_poller_is_running() {
@@ -353,7 +353,7 @@ impl Instance {
             // row would then keep a watcher for the launch it just gave up.
             self.stop_poller();
         }
-        self.session_id_poller = None;
+        self.capture_poller.handle = None;
         let Some((capture, context)) = self.source_session_support() else {
             return Ok(PollerStart::NotApplicable);
         };
@@ -409,7 +409,7 @@ impl Instance {
             match self.prime_agent_capture_plan_in(options, stores) {
                 Ok(plan) => Some(plan),
                 Err(error) => {
-                    self.session_id_poller_retry_after =
+                    self.capture_poller.retry_after =
                         Some(std::time::Instant::now() + MANAGED_CAPTURE_RETRY_BACKOFF);
                     tracing::warn!(target: "session.capture", session = %self.id,
                         reason = %format_args!("{error:#}"), retry_after_secs = MANAGED_CAPTURE_RETRY_BACKOFF.as_secs(),
@@ -435,7 +435,7 @@ impl Instance {
             let lease = match try_acquire_managed_capture_lease(backend, &store) {
                 Ok(lease) => lease,
                 Err(refusal) => {
-                    self.session_id_poller_retry_after =
+                    self.capture_poller.retry_after =
                         Some(std::time::Instant::now() + MANAGED_CAPTURE_RETRY_BACKOFF);
                     match refusal {
                         LeaseRefusal::Contended => {
@@ -453,7 +453,7 @@ impl Instance {
             if !stores.with_store(&self.effective_profile(), |storage| {
                 storage.managed_capture_store_is_exclusive(self, backend, &store)
             })? {
-                self.session_id_poller_retry_after =
+                self.capture_poller.retry_after =
                     Some(std::time::Instant::now() + MANAGED_CAPTURE_RETRY_BACKOFF);
                 tracing::warn!(target: "session.capture", session = %self.id, ?backend,
                 "Session capture deferred because store ownership is ambiguous");
@@ -463,7 +463,7 @@ impl Instance {
         } else {
             None
         };
-        self.session_id_poller_retry_after = None;
+        self.capture_poller.retry_after = None;
 
         // Unlike the eligibility checks above, this forks `tmux list-sessions`, so it stays behind
         // the budget gate rather than joining them.
@@ -729,7 +729,7 @@ impl Instance {
     /// Whether the poller this row holds watches `tool` on `execution`, which is what the row is
     /// taking on. A row with no poller has none to watch, whatever it used to hold.
     pub(crate) fn poller_serves(&self, tool: &str, execution: Option<&ActiveExecution>) -> bool {
-        self.session_id_poller.as_ref().is_some_and(|poller| {
+        self.capture_poller.handle.as_ref().is_some_and(|poller| {
             poller
                 .lock()
                 .map(|guard| guard.serves(tool, execution))
@@ -745,7 +745,7 @@ impl Instance {
     /// against the execution the row still held, it would refuse the handoff's poller and stop it.
     pub(crate) fn adopt_poller(&mut self, handoff: &Self) {
         if handoff.poller_serves(&self.tool, self.active_execution.as_ref()) {
-            self.session_id_poller = handoff.session_id_poller.clone();
+            self.capture_poller.handle = handoff.capture_poller.handle.clone();
         } else {
             handoff.stop_poller();
         }
@@ -757,8 +757,8 @@ impl Instance {
     /// another process replaced does not inherit a window armed for the old one.
     pub(crate) fn adopt_poller_repair(&mut self, prior: &Self) {
         if self.runs(&prior.tool, prior.active_execution.as_ref()) {
-            self.poller_repair = prior.poller_repair.clone();
-            self.session_id_poller_retry_after = prior.session_id_poller_retry_after;
+            self.capture_poller.repair = prior.capture_poller.repair.clone();
+            self.capture_poller.retry_after = prior.capture_poller.retry_after;
         }
     }
 
@@ -768,7 +768,7 @@ impl Instance {
     pub(crate) fn settle_poller_for(&mut self, execution: Option<&ActiveExecution>) {
         if !self.poller_serves(&self.tool, execution) {
             self.stop_poller();
-            self.session_id_poller = None;
+            self.capture_poller.handle = None;
         }
     }
 
@@ -782,13 +782,13 @@ impl Instance {
         if launched.last_start_time != before.last_start_time
             && self.runs(&launched.tool, launched.active_execution.as_ref())
         {
-            self.poller_repair.reset();
-            self.session_id_poller_retry_after = launched.session_id_poller_retry_after;
+            self.capture_poller.repair.reset();
+            self.capture_poller.retry_after = launched.capture_poller.retry_after;
         }
     }
 
     pub(crate) fn session_id_poller_is_running(&self) -> bool {
-        self.session_id_poller.as_ref().is_some_and(|poller| {
+        self.capture_poller.handle.as_ref().is_some_and(|poller| {
             poller
                 .lock()
                 .map(|guard| guard.is_running())
@@ -813,9 +813,9 @@ impl Instance {
         if self.is_structured()
             || self.session_id_poller_is_running()
             || self
-                .session_id_poller_retry_after
+                .capture_poller.retry_after
                 .is_some_and(|deadline| now < deadline)
-            || !self.poller_repair.due(now)
+            || !self.capture_poller.repair.due(now)
             // Agent pane, not any pane: a terminal outliving the agent is not
             // something a session-id poller can follow.
             || !self.has_live_agent_pane_in(snapshot)
@@ -825,7 +825,7 @@ impl Instance {
         if !self.supports_session_poller() {
             return false;
         }
-        self.session_id_poller = None;
+        self.capture_poller.handle = None;
         let outcome = self.maybe_start_poller();
         // Sampled after the attempt: a probe can outlast its own delay, and a deadline stamped
         // from before it would already be due on the next tick.
@@ -837,13 +837,13 @@ impl Instance {
             // its own rather than every tick (#4137). Still nothing to back off from, and
             // nothing to charge to the thread budget.
             PollerStart::NotApplicable => {
-                self.poller_repair.reprobe(after);
+                self.capture_poller.repair.reprobe(after);
                 false
             }
             // The managed store's own retry deadline governs this outcome. That is not a
             // failure either, so neither a backoff nor the thread budget is blamed for it.
             PollerStart::Deferred => {
-                self.poller_repair.reset();
+                self.capture_poller.repair.reset();
                 false
             }
             PollerStart::BudgetExhausted => {
@@ -861,7 +861,7 @@ impl Instance {
     /// (first miss, each escalation, then every ~10 min at the cap).
     fn defer_poller_repair(&mut self, now: std::time::Instant, why: &str) {
         let (active, max) = crate::session::poller::session_id_poller_budget();
-        if let Some(delay) = self.poller_repair.defer(now) {
+        if let Some(delay) = self.capture_poller.repair.defer(now) {
             tracing::warn!(
                 target: "session.create",
                 "Session-id poller for {} not restarted ({why}; {active}/{max} threads); \
@@ -869,7 +869,7 @@ impl Instance {
                  [session] session_id_poller_max_threads if the fleet outgrew the budget",
                 self.id,
                 delay.as_secs(),
-                self.poller_repair.deferrals(),
+                self.capture_poller.repair.deferrals(),
             );
         }
     }
@@ -887,7 +887,7 @@ impl Instance {
     }
 
     pub(crate) fn stop_poller(&self) {
-        if let Some(ref poller_arc) = self.session_id_poller {
+        if let Some(ref poller_arc) = self.capture_poller.handle {
             match poller_arc.lock() {
                 Ok(mut poller) => poller.stop(),
                 Err(e) => e.into_inner().stop(),
@@ -907,7 +907,7 @@ impl Instance {
             Err(error) => {
                 tracing::warn!(target: "session.sync", session = %self.id, "capture storage failed: {error}");
                 self.stop_poller();
-                self.session_id_poller = None;
+                self.capture_poller.handle = None;
                 return;
             }
         };
@@ -916,7 +916,7 @@ impl Instance {
             Err(error) => {
                 tracing::warn!(target: "session.sync", session = %self.id, "capture lifecycle lock failed: {error}");
                 self.stop_poller();
-                self.session_id_poller = None;
+                self.capture_poller.handle = None;
                 return;
             }
         };
@@ -949,7 +949,7 @@ impl Instance {
             Some(SidWrite::Failed) => Err(anyhow::anyhow!(
                 "could not persist final conversation publication"
             )),
-            _ if self.session_id_poller.is_some() => {
+            _ if self.capture_poller.handle.is_some() => {
                 let drained = crate::session::sync::drain_and_persist_session_ids_lifecycle_locked(
                     std::slice::from_mut(self),
                     storage,
@@ -975,7 +975,7 @@ impl Instance {
             }
             _ => Ok(()),
         };
-        self.session_id_poller = None;
+        self.capture_poller.handle = None;
         if native_prime
             && result.is_ok()
             && matches!(
@@ -1017,39 +1017,39 @@ mod tests {
 
         assert!(!inst.repair_session_id_poller_if_needed(&live));
         assert!(
-            inst.session_id_poller.is_none(),
+            inst.capture_poller.handle.is_none(),
             "no poller stored over budget"
         );
-        assert_eq!(inst.poller_repair.deferrals(), 1);
+        assert_eq!(inst.capture_poller.repair.deferrals(), 1);
         assert_eq!(
-            inst.poller_repair.current_delay(),
+            inst.capture_poller.repair.current_delay(),
             Some(std::time::Duration::from_secs(5))
         );
 
         // The next tick lands inside the scheduled delay: no probe, no log.
         assert!(!inst.repair_session_id_poller_if_needed(&live));
         assert_eq!(
-            inst.poller_repair.deferrals(),
+            inst.capture_poller.repair.deferrals(),
             1,
             "tick inside the delay is a no-op"
         );
 
         // Once due and still over budget, the delay escalates.
-        inst.poller_repair.expire();
+        inst.capture_poller.repair.expire();
         assert!(!inst.repair_session_id_poller_if_needed(&live));
-        assert_eq!(inst.poller_repair.deferrals(), 2);
+        assert_eq!(inst.capture_poller.repair.deferrals(), 2);
         assert_eq!(
-            inst.poller_repair.current_delay(),
+            inst.capture_poller.repair.current_delay(),
             Some(std::time::Duration::from_secs(10))
         );
 
         // Budget freed (another session stopped, or the ceiling was raised):
         // the due attempt starts the poller and clears the schedule.
         budget.set_active(0);
-        inst.poller_repair.expire();
+        inst.capture_poller.repair.expire();
         assert!(inst.repair_session_id_poller_if_needed(&live));
         assert!(inst.session_id_poller_is_running());
-        assert_eq!(inst.poller_repair, Default::default());
+        assert_eq!(inst.capture_poller.repair, Default::default());
         inst.stop_poller();
     }
 
@@ -1059,15 +1059,18 @@ mod tests {
         let _budget = crate::session::poller::test_support::IsolatedBudget::with_ceiling(1);
         let mut inst = Instance::new("direct-start", "/tmp/direct-start");
         let now = std::time::Instant::now();
-        inst.poller_repair.defer(now);
-        inst.poller_repair.defer(now);
-        assert!(!inst.poller_repair.due(now), "fixture: a pending schedule");
+        inst.capture_poller.repair.defer(now);
+        inst.capture_poller.repair.defer(now);
+        assert!(
+            !inst.capture_poller.repair.due(now),
+            "fixture: a pending schedule"
+        );
 
         assert_eq!(inst.maybe_start_poller(), PollerStart::Started);
 
         assert!(inst.session_id_poller_is_running());
         assert_eq!(
-            inst.poller_repair,
+            inst.capture_poller.repair,
             Default::default(),
             "a successful start clears the schedule whoever triggered it"
         );
@@ -1100,16 +1103,17 @@ mod tests {
         });
         assert!(!inst.repair_session_id_poller_if_needed(&live));
         let armed = inst
-            .poller_repair
+            .capture_poller
+            .repair
             .armed_at()
             .expect("a re-probe arms a deadline");
         assert!(
-            !inst.poller_repair.due(std::time::Instant::now()),
+            !inst.capture_poller.repair.due(std::time::Instant::now()),
             "the armed window has not expired"
         );
         let probing = probing.lock().unwrap().expect("the start path ran");
         assert_eq!(
-            inst.poller_repair.current_reprobe_delay(),
+            inst.capture_poller.repair.current_reprobe_delay(),
             Some(std::time::Duration::from_secs(5)),
             "a re-probe arms its own ladder, not the failure one"
         );
@@ -1146,18 +1150,18 @@ mod tests {
         assert_eq!(inst.maybe_start_poller(), PollerStart::NotApplicable);
 
         assert!(!inst.repair_session_id_poller_if_needed(&live));
-        assert!(inst.session_id_poller.is_none());
+        assert!(inst.capture_poller.handle.is_none());
         assert!(
-            !inst.poller_repair.due(std::time::Instant::now()),
+            !inst.capture_poller.repair.due(std::time::Instant::now()),
             "the next probe is scheduled, not the next tick"
         );
         assert_eq!(
-            inst.poller_repair.deferrals(),
+            inst.capture_poller.repair.deferrals(),
             0,
             "nothing to poll is not counted as a failed repair"
         );
         assert!(
-            inst.session_id_poller_retry_after.is_none(),
+            inst.capture_poller.retry_after.is_none(),
             "fixture: this row has not reached a managed store, so it holds no deadline"
         );
 
@@ -1167,14 +1171,14 @@ mod tests {
             assert!(!inst.repair_session_id_poller_if_needed(&live));
         }
         assert_eq!(
-            inst.poller_repair.current_reprobe_delay(),
+            inst.capture_poller.repair.current_reprobe_delay(),
             Some(std::time::Duration::from_secs(5))
         );
 
         // Once the window closes, the row is probed again.
-        inst.poller_repair.expire();
+        inst.capture_poller.repair.expire();
         assert!(!inst.repair_session_id_poller_if_needed(&live));
-        assert!(!inst.poller_repair.due(std::time::Instant::now()));
+        assert!(!inst.capture_poller.repair.due(std::time::Instant::now()));
     }
 
     #[test]
@@ -1202,34 +1206,34 @@ mod tests {
         assert!(inst.supports_session_poller());
         assert_eq!(inst.maybe_start_poller(), PollerStart::NotApplicable);
         assert!(!inst.repair_session_id_poller_if_needed(&live));
-        assert!(inst.session_id_poller_retry_after.is_none());
-        assert!(inst.session_id_poller.is_none());
+        assert!(inst.capture_poller.retry_after.is_none());
+        assert!(inst.capture_poller.handle.is_none());
 
         inst.extra_args.clear();
         let settings = store.join("settings.json");
         std::fs::create_dir(&settings).unwrap();
         assert_eq!(inst.maybe_start_poller(), PollerStart::BudgetExhausted);
-        inst.poller_repair.expire();
+        inst.capture_poller.repair.expire();
         assert!(!inst.repair_session_id_poller_if_needed(&live));
         assert!(
-            !inst.poller_repair.due(std::time::Instant::now()),
+            !inst.capture_poller.repair.due(std::time::Instant::now()),
             "an over-budget attempt schedules the next one"
         );
         let lease = super::try_acquire_managed_capture_lease(backend, &store)
             .expect("budget rejection releases the store lease");
 
         budget.set_active(0);
-        inst.poller_repair.expire();
+        inst.capture_poller.repair.expire();
         assert_eq!(inst.maybe_start_poller(), PollerStart::Deferred);
-        assert!(inst.session_id_poller_retry_after.is_some());
+        assert!(inst.capture_poller.retry_after.is_some());
         std::fs::remove_dir(&settings).unwrap();
         assert!(!inst.repair_session_id_poller_if_needed(&live));
-        inst.session_id_poller_retry_after = None;
+        inst.capture_poller.retry_after = None;
         assert_eq!(inst.maybe_start_poller(), PollerStart::Deferred);
-        assert!(inst.session_id_poller_retry_after.is_some());
+        assert!(inst.capture_poller.retry_after.is_some());
         drop(lease);
         assert!(!inst.repair_session_id_poller_if_needed(&live));
-        inst.session_id_poller_retry_after = None;
+        inst.capture_poller.retry_after = None;
 
         assert!(inst.repair_session_id_poller_if_needed(&live));
         assert!(inst.session_id_poller_is_running());
@@ -1374,7 +1378,7 @@ mod tests {
         // Joining the poller runs its final poll, so each start-and-stop is one
         // deterministic pass over the pane.
         let poll_once = |instances: &mut [Instance; 1]| {
-            instances[0].session_id_poller = None;
+            instances[0].capture_poller.handle = None;
             assert_eq!(instances[0].maybe_start_poller(), PollerStart::Started);
             instances[0].stop_poller();
             crate::session::sync::drain_and_persist_session_ids(instances, &file_watch).touched()
@@ -1738,13 +1742,13 @@ mod tests {
         let name = inst.tmux_session().unwrap().name().to_string();
         let live = crate::tmux::LiveSessionSnapshot::from_parts(Some(vec![name]), None);
         admit_sandbox_fixture(&inst);
-        inst.session_id_poller_retry_after =
+        inst.capture_poller.retry_after =
             Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
 
         assert!(!inst.repair_session_id_poller_if_needed(&live));
-        assert!(inst.session_id_poller.is_none());
+        assert!(inst.capture_poller.handle.is_none());
 
-        inst.session_id_poller_retry_after = None;
+        inst.capture_poller.retry_after = None;
         std::fs::create_dir_all(inst.sandbox_capture_store_dir().unwrap()).unwrap();
         assert!(inst.repair_session_id_poller_if_needed(&live));
         assert!(inst.session_id_poller_is_running());
@@ -2045,7 +2049,7 @@ mod tests {
         );
         // Present but not running, so the running check does not
         // short-circuit and the handle stays observable.
-        inst.session_id_poller = Some(std::sync::Arc::new(std::sync::Mutex::new(
+        inst.capture_poller.handle = Some(std::sync::Arc::new(std::sync::Mutex::new(
             crate::session::poller::SessionPoller::new(
                 "unstarted".to_string(),
                 "claude".to_string(),
@@ -2055,7 +2059,7 @@ mod tests {
 
         assert!(!inst.repair_session_id_poller_if_needed(&snapshot));
         assert!(
-            inst.session_id_poller.is_some(),
+            inst.capture_poller.handle.is_some(),
             "decline must happen before the handle is cleared"
         );
     }
@@ -2085,7 +2089,7 @@ mod tests {
                 Some(std::collections::HashMap::new()),
             );
             assert!(!inst.repair_session_id_poller_if_needed(&no_live));
-            assert!(inst.session_id_poller.is_none());
+            assert!(inst.capture_poller.handle.is_none());
 
             let live = crate::tmux::LiveSessionSnapshot::from_parts(
                 Some(vec![crate::tmux::Session::generate_name(
@@ -2335,12 +2339,12 @@ mod tests {
         assert!(!inst.repair_session_id_poller_if_needed(&snapshot));
 
         assert!(
-            inst.session_id_poller.is_none(),
+            inst.capture_poller.handle.is_none(),
             "no poller on the wrong pane"
         );
         assert_eq!(budget.active(), 0, "a declined start takes no budget slot");
         assert!(
-            !inst.poller_repair.due(std::time::Instant::now()),
+            !inst.capture_poller.repair.due(std::time::Instant::now()),
             "the decline is re-probed later: the live re-query that found no agent costs a fork"
         );
     }
@@ -2375,7 +2379,7 @@ mod tests {
             crate::session::poller::PollerSpawn::Spawned
         );
         let stale = std::sync::Arc::new(std::sync::Mutex::new(poller));
-        inst.session_id_poller = Some(stale.clone());
+        inst.capture_poller.handle = Some(stale.clone());
         assert!(stale.lock().unwrap().is_running());
         // The launch that replaced the execution installed none of its own.
         inst.active_execution = Some(super::ActiveExecution {
@@ -2390,7 +2394,8 @@ mod tests {
             "the poller for the superseded launch is stopped, not adopted as this row's"
         );
         assert!(
-            inst.session_id_poller
+            inst.capture_poller
+                .handle
                 .as_ref()
                 .is_none_or(|held| !std::sync::Arc::ptr_eq(held, &stale)),
             "and the row's slot does not still hold it"

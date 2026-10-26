@@ -44,16 +44,16 @@ impl Instance {
         let mut prior = std::mem::replace(self, disk);
         if !prior.poller_serves(&self.tool, self.active_execution.as_ref()) {
             prior.stop_poller();
-            prior.session_id_poller = None;
+            prior.capture_poller.handle = None;
         }
         let store_repair = (
-            self.poller_repair.clone(),
-            self.session_id_poller_retry_after,
+            self.capture_poller.repair.clone(),
+            self.capture_poller.retry_after,
         );
         let carries_repair = self.runs(&prior.tool, prior.active_execution.as_ref());
         self.inherit_runtime(prior, preserve_errors);
         if !carries_repair {
-            (self.poller_repair, self.session_id_poller_retry_after) = store_repair;
+            (self.capture_poller.repair, self.capture_poller.retry_after) = store_repair;
         }
         Ok(())
     }
@@ -199,9 +199,9 @@ mod tests {
         seeded(profile, &inst);
 
         let now = std::time::Instant::now();
-        inst.poller_repair.defer(now);
-        inst.poller_repair.defer(now);
-        assert!(!inst.poller_repair.due(now));
+        inst.capture_poller.repair.defer(now);
+        inst.capture_poller.repair.defer(now);
+        assert!(!inst.capture_poller.repair.due(now));
         inst.identity_publisher_launched = true;
         inst.sandbox_info.as_mut().unwrap().before_start_env =
             vec![("GH_TOKEN".to_string(), "ghs_minted".to_string())];
@@ -211,7 +211,10 @@ mod tests {
 
         inst.reconcile_from_disk();
 
-        assert!(!inst.poller_repair.due(now), "poller backoff must survive");
+        assert!(
+            !inst.capture_poller.repair.due(now),
+            "poller backoff must survive"
+        );
         assert!(inst.identity_publisher_launched);
         assert_eq!(
             inst.sandbox_info.as_ref().unwrap().before_start_env,

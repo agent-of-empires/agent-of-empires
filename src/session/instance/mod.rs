@@ -34,6 +34,7 @@ use crate::session::capture::{
     OmpCliCaptureOptions, OmpStoreKind, PrimeRootPublication,
 };
 mod accessors;
+mod capture_slot;
 mod container;
 mod execution;
 pub(crate) use execution::{ActiveExecution, CaptureContext, ConversationKey, ConversationState};
@@ -910,16 +911,7 @@ pub struct Instance {
     #[serde(skip)]
     pub last_error: Option<String>,
     #[serde(skip)]
-    pub session_id_poller: Option<Arc<Mutex<SessionPoller>>>,
-    /// Retry schedule for replacing a missing session-id poller when the
-    /// process-wide thread budget (or a start failure) blocked the last
-    /// attempt. Runtime-only; carried across reloads like the poller.
-    #[serde(skip)]
-    pub(crate) poller_repair: crate::session::poller::PollerRepairBackoff,
-
-    /// Runtime backoff after managed-store ownership or lease contention.
-    #[serde(skip)]
-    pub(crate) session_id_poller_retry_after: Option<std::time::Instant>,
+    pub(crate) capture_poller: capture_slot::CapturePollerSlot,
     /// Session IDs invalidated at a fresh-generation boundary. Persisting this
     /// set prevents a process restart from resurrecting an abandoned ID from a
     /// still-present upstream artifact.

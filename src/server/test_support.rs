@@ -355,7 +355,7 @@ pub fn attach_session_id_update_for_test(inst: &mut Instance, sid: &str) {
         inst.active_execution.clone(),
     );
     poller.inject_test_update(&inst.id, sid);
-    inst.session_id_poller = Some(Arc::new(std::sync::Mutex::new(poller)));
+    inst.capture_poller.handle = Some(Arc::new(std::sync::Mutex::new(poller)));
 }
 
 /// The Contract Pack's recording entry point, re-exported because

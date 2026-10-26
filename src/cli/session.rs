@@ -3177,7 +3177,7 @@ mod restart_args_tests {
             Ok(())
         })
         .unwrap();
-        assert!(inst.session_id_poller.is_none());
+        assert!(inst.capture_poller.handle.is_none());
         assert_eq!(
             storage.load().unwrap()[0].agent_session_id.as_deref(),
             Some(first)
@@ -3191,7 +3191,7 @@ mod restart_args_tests {
 
         assert_eq!(result.unwrap_err().to_string(), "fake attach failure");
         assert!(
-            inst.session_id_poller.is_none(),
+            inst.capture_poller.handle.is_none(),
             "an immediate nested attach return must not orphan its poller"
         );
         assert_eq!(

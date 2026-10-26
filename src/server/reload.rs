@@ -655,11 +655,11 @@ impl PollerHandoff {
     /// Drop whatever the inherit moved in that the fresh row cannot use.
     fn settle(self, fresh: &mut Instance) {
         if !self.keeps_poller {
-            fresh.session_id_poller = None;
+            fresh.capture_poller.handle = None;
         }
         if !self.keeps_repair {
-            fresh.poller_repair = Default::default();
-            fresh.session_id_poller_retry_after = None;
+            fresh.capture_poller.repair = Default::default();
+            fresh.capture_poller.retry_after = None;
         }
     }
 }
@@ -3110,20 +3110,20 @@ mod tests {
             // What the repair walk leaves behind on a row with no poller: a re-probe ladder and a
             // store-retry deadline.
             let mut prior = Instance::new("poller-less", "/tmp/poller-less");
-            prior.poller_repair.reprobe(now);
+            prior.capture_poller.repair.reprobe(now);
             let deadline = now + std::time::Duration::from_secs(30);
-            prior.session_id_poller_retry_after = Some(deadline);
-            assert!(prior.session_id_poller.is_none());
+            prior.capture_poller.retry_after = Some(deadline);
+            assert!(prior.capture_poller.handle.is_none());
 
             let merged = merge(prior, Instance::new("poller-less", "/tmp/poller-less"));
 
             assert_eq!(
-                merged.poller_repair.current_reprobe_delay(),
+                merged.capture_poller.repair.current_reprobe_delay(),
                 Some(std::time::Duration::from_secs(5)),
                 "the row keeps its window, or it re-resolves every tick"
             );
             assert_eq!(
-                merged.session_id_poller_retry_after,
+                merged.capture_poller.retry_after,
                 Some(deadline),
                 "and so does its store-retry deadline"
             );
@@ -3132,20 +3132,20 @@ mod tests {
             // armed for the old one and paces nothing this row can still use.
             let mut prior = Instance::new("replaced", "/tmp/replaced");
             prior.active_execution = execution("launch-1");
-            prior.poller_repair.reprobe(now);
+            prior.capture_poller.repair.reprobe(now);
             let deadline = now + std::time::Duration::from_secs(30);
-            prior.session_id_poller_retry_after = Some(deadline);
+            prior.capture_poller.retry_after = Some(deadline);
             let mut fresh = Instance::new("replaced", "/tmp/replaced");
             fresh.active_execution = execution("launch-2");
 
             let merged = merge(prior, fresh);
 
             assert!(
-                merged.poller_repair.due(std::time::Instant::now()),
+                merged.capture_poller.repair.due(std::time::Instant::now()),
                 "a window armed for the superseded execution does not hold the new one back"
             );
             assert_eq!(
-                merged.session_id_poller_retry_after, None,
+                merged.capture_poller.retry_after, None,
                 "and neither does the deadline that went with it"
             );
         }
@@ -3174,7 +3174,7 @@ mod tests {
             crate::session::poller::PollerSpawn::Spawned
         );
         let poller = std::sync::Arc::new(std::sync::Mutex::new(poller));
-        prior.session_id_poller = Some(poller.clone());
+        prior.capture_poller.handle = Some(poller.clone());
         prior.plugin_revival_pending = true;
         assert!(
             prior.active_execution.is_none(),
@@ -3197,10 +3197,10 @@ mod tests {
 
         assert_eq!(merged.tool, "codex");
         assert!(
-            merged.session_id_poller.is_none(),
+            merged.capture_poller.handle.is_none(),
             "the previous agent's watcher does not follow the row to a new one"
         );
-        // `Instance::session_id_poller` holds a `std::sync::Mutex`, so this reads the guard
+        // `Instance::capture_poller` holds a `std::sync::Mutex`, so this reads the guard
         // through `matches!` rather than unwrapping a poisoning error the type can raise.
         assert!(
             matches!(poller.lock(), Ok(poller) if !poller.is_running()),
@@ -3229,24 +3229,24 @@ mod tests {
         });
         for merge in mergers {
             let mut prior = Instance::new("poller-less", "/tmp/poller-less");
-            prior.poller_repair.reprobe(now);
+            prior.capture_poller.repair.reprobe(now);
             let deadline = now + std::time::Duration::from_secs(30);
-            prior.session_id_poller_retry_after = Some(deadline);
+            prior.capture_poller.retry_after = Some(deadline);
 
             let merged = merge(prior, Instance::new("poller-less", "/tmp/poller-less"));
 
             assert_eq!(
-                merged.poller_repair.current_reprobe_delay(),
+                merged.capture_poller.repair.current_reprobe_delay(),
                 Some(std::time::Duration::from_secs(5)),
                 "the row keeps its window, or it re-resolves every tick"
             );
-            assert_eq!(merged.session_id_poller_retry_after, Some(deadline));
+            assert_eq!(merged.capture_poller.retry_after, Some(deadline));
 
             // The same row, another agent: the window paces the previous agent's capture.
             let mut prior = Instance::new("other-agent", "/tmp/other-agent");
             prior.tool = "claude".to_string();
-            prior.poller_repair.reprobe(now);
-            prior.session_id_poller_retry_after = Some(now + std::time::Duration::from_secs(30));
+            prior.capture_poller.repair.reprobe(now);
+            prior.capture_poller.retry_after = Some(now + std::time::Duration::from_secs(30));
             let mut fresh = Instance::new("other-agent", "/tmp/other-agent");
             fresh.tool = "codex".to_string();
 
@@ -3254,11 +3254,11 @@ mod tests {
 
             assert_eq!(merged.tool, "codex");
             assert!(
-                merged.poller_repair.due(std::time::Instant::now()),
+                merged.capture_poller.repair.due(std::time::Instant::now()),
                 "a window armed for the previous agent does not hold this one back"
             );
             assert_eq!(
-                merged.session_id_poller_retry_after, None,
+                merged.capture_poller.retry_after, None,
                 "and neither does the deadline that went with it"
             );
         }
@@ -3347,7 +3347,7 @@ mod tests {
                 assert_eq!(row.unknown_since, Some(unknown));
                 assert_eq!(row.detection.pending, Some(Status::Idle));
                 assert_eq!(row.last_accessed_at, Some(accessed));
-                assert!(row.session_id_poller.is_none());
+                assert!(row.capture_poller.handle.is_none());
             }
             let replacement = tempfile::tempdir().unwrap();
             assert_ne!(identity(outside.path()), identity(replacement.path()));

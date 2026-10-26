@@ -1234,7 +1234,7 @@ mod tests {
             poller.start(inst.id.clone(), Box::new(|| None), Box::new(|_| {}), None,),
             crate::session::poller::PollerSpawn::Spawned
         );
-        inst.session_id_poller = Some(std::sync::Arc::new(std::sync::Mutex::new(poller)));
+        inst.capture_poller.handle = Some(std::sync::Arc::new(std::sync::Mutex::new(poller)));
         assert!(
             inst.session_id_poller_is_running(),
             "fixture: it is running"
