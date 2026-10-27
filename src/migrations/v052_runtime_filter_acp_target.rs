@@ -29,8 +29,10 @@ fn rename_targets(path: &Path) -> Result<()> {
     if directives.iter().all(|d| renamed(target(d)).is_none()) {
         return Ok(());
     }
+    // The level `=` follows the span; field values inside it may contain `=`.
     fn selector(d: &str) -> &str {
-        d.split_once('=').map_or(d, |(s, _)| s).trim()
+        let from = d.rfind(']').map_or(0, |i| i + 1);
+        d[..d[from..].find('=').map_or(d.len(), |i| from + i)].trim()
     }
     let existing: HashSet<&str> = directives.iter().map(|d| selector(d)).collect();
     let mut out = Vec::new();
@@ -75,6 +77,10 @@ mod tests {
             (
                 Some("acp[turn]=info,cockpit=trace"),
                 Some("acp[turn]=info,acp=trace"),
+            ),
+            (
+                Some("acp[turn{status=1}]=info,cockpit[turn{status=2}]=trace"),
+                Some("acp[turn{status=1}]=info,acp[turn{status=2}]=trace"),
             ),
             (Some("cockpit[turn]=debug"), Some("acp[turn]=debug")),
             (
