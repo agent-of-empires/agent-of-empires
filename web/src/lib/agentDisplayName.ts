@@ -15,16 +15,24 @@ export function setAgentNames(agents: AgentInfo[]) {
   listeners.forEach((l) => l());
 }
 
+function load() {
+  if (requested) return;
+  requested = true;
+  fetchAgents().then((agents) => {
+    setAgentNames(agents);
+    requested = agents.length > 0;
+  });
+}
+
 function subscribe(listener: () => void) {
   listeners.add(listener);
-  if (!requested) {
-    requested = true;
-    fetchAgents().then((agents) => {
-      setAgentNames(agents);
-      requested = agents.length > 0;
-    });
-  }
+  load();
   return () => void listeners.delete(listener);
+}
+
+// A failed first load is retried once connectivity returns, while a component still waits on a name.
+if (typeof window !== "undefined") {
+  window.addEventListener("online", () => listeners.size > 0 && load());
 }
 
 /** How copy names an Agent: the server's name, else the registry id. */

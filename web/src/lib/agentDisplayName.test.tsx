@@ -3,6 +3,7 @@ import { act, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 vi.mock("./api", () => ({ fetchAgents: vi.fn(() => Promise.resolve([])) }));
+import { fetchAgents } from "./api";
 
 import { resolveAgentDisplayName, setAgentNames, useAgentDisplayNames } from "./agentDisplayName";
 import type { AgentInfo } from "./types";
@@ -34,5 +35,21 @@ describe("useAgentDisplayNames", () => {
 
     act(() => setAgentNames([{ name: "pi", display_name: "Pi Agent" } as AgentInfo]));
     expect(screen.getByText("Pi Agent")).toBeTruthy();
+  });
+
+  it("retries a failed load when connectivity returns", async () => {
+    function Name() {
+      const nameOf = useAgentDisplayNames();
+      return <p>{nameOf("kimi")}</p>;
+    }
+    render(<Name />);
+    await act(async () => {});
+    expect(screen.getByText("kimi")).toBeTruthy();
+
+    vi.mocked(fetchAgents).mockResolvedValueOnce([{ name: "kimi", display_name: "Kimi Code" } as AgentInfo]);
+    await act(async () => {
+      window.dispatchEvent(new Event("online"));
+    });
+    expect(screen.getByText("Kimi Code")).toBeTruthy();
   });
 });
