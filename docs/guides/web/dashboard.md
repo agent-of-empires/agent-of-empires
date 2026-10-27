@@ -26,6 +26,7 @@ The **New session** wizard is one screen of one-line rows, like the TUI dialog; 
 - **Structured**, **Yolo mode**, **Worktree**, and **Sandbox** switches; the Worktree and Sandbox rows open their branch, base, image, and env options.
 
 Choosing a profile (the **Profile** row, shown when there is more than one) seeds these defaults; switching profiles after you have edited a field asks first. A create that runs `on_create` hooks shows their output while it runs, and **Continue in background** closes the wizard and reports the result when it finishes.
+If the daemon refuses the create, the wizard stays open and says what failed and at which step, outlines the row that caused it, and offers one fix, such as **Retry** once the container runtime is running or **Launch without Sandbox**. Its reference finds the failure in `debug.log`. A create that fails after **Continue in background** shows a notice whose **Reopen** brings the wizard back with the same form.
 Renaming a profile in either Settings surface refreshes the served-profile
 authority before an implicit wizard reads profile settings or projects. Failed
 refreshes keep Launch disabled and offer Retry server profile without discarding edits.
