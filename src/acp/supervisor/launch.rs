@@ -336,19 +336,25 @@ impl<S: BroadcastSink> Supervisor<S> {
         let claude_store_pin = req.claude_store_pin.clone().filter(|_| {
             req.sandbox_info.is_none() && matches!(req.agent.as_str(), "claude" | "claude-code")
         });
-        let claude_config_dir = apply_claude_store_pin(
-            &mut host_environment,
-            claude_store_pin.as_ref(),
-        )
-        .or_else(|| {
-            if req.sandbox_info.is_some() {
-                return None;
-            }
-            let native_key = wrapper_substitution
-                .as_ref()
-                .map_or(req.agent.as_str(), |(_, base)| base.as_str());
-            apply_declared_config_dir(&mut host_environment, &resolved_cfg, &req.tool, native_key)
-        });
+        let claude_config_dir =
+            apply_claude_store_pin(&mut host_environment, claude_store_pin.as_ref()).or_else(
+                || {
+                    if req.sandbox_info.is_some() {
+                        return None;
+                    }
+                    let (target, native) = wrapper_substitution.as_ref().map_or(
+                        (req.agent.as_str(), req.agent.as_str()),
+                        |(wrapper, base)| (wrapper.as_str(), base.as_str()),
+                    );
+                    apply_declared_config_dir(
+                        &mut host_environment,
+                        &resolved_cfg,
+                        &req.tool,
+                        target,
+                        native,
+                    )
+                },
+            );
 
         let mut provider_env = req.provider_env.clone();
         if let Some(model) = model.clone() {
@@ -1064,27 +1070,33 @@ pub(super) fn overlay_env(env: &mut Vec<(String, String)>, minted: Vec<(String, 
         env.push((key, value));
     }
 }
-/// Exports `tool`'s declared `agent_config_dir` as its agent's config-dir variable, as a terminal
-/// launch does. Returns the directory when the agent is Claude, for native MCP discovery.
+/// Exports the selected target's declared `agent_config_dir` as its native agent's config-dir
+/// variable, as a terminal launch does. `target` is the selected backend's own key (a wrapper's
+/// name, not its base) and `native` the backend it resolves to. Returns the directory when the
+/// agent is Claude, for native MCP discovery.
 pub(super) fn apply_declared_config_dir(
     environment: &mut Vec<(String, String)>,
     cfg: &crate::session::Config,
     tool: &str,
-    agent: &str,
+    target: &str,
+    native: &str,
 ) -> Option<std::path::PathBuf> {
     let session = &cfg.session;
-    let execution = session.agent_execution_as.get(tool).map(String::as_str);
     let native_of = |name: &str| crate::acp::agent_profiles::resolve(name).native_config_agent;
-    // After an agent switch `tool` is unchanged but names another backend: use that backend's entry.
-    let tool_runs_agent = agent == tool
-        || execution == Some(agent)
-        || session.agent_detect_as.get(tool).map(String::as_str) == Some(agent)
-        || native_of(tool).is_some_and(|native| native_of(agent) == Some(native));
-    let (key, native) = if tool_runs_agent {
-        (tool, execution.unwrap_or(agent))
-    } else {
-        (agent, agent)
-    };
+    // After an agent switch `tool` is unchanged but may name another backend: the tool's entry
+    // applies only to a target it launches itself (same key, a built-in alias, or its base).
+    let tool_runs_target = target == tool
+        || native_of(target).is_some_and(|built_in| {
+            native_of(tool) == Some(built_in)
+                || [&session.agent_execution_as, &session.agent_detect_as]
+                    .iter()
+                    .any(|map| map.get(tool).map(String::as_str) == Some(native))
+        });
+    let key = if tool_runs_target { tool } else { target };
+    let native = session
+        .agent_execution_as
+        .get(key)
+        .map_or(native, String::as_str);
     let variable = match native_of(native)? {
         "claude" => "CLAUDE_CONFIG_DIR",
         "codex" => "CODEX_HOME",
@@ -1284,7 +1296,7 @@ mod tests {
         };
         let run = |cfg: &crate::session::Config, tool: &str, agent: &str| {
             let mut env = vec![("CLAUDE_CONFIG_DIR".to_string(), "/hook".to_string())];
-            let claude_dir = apply_declared_config_dir(&mut env, cfg, tool, agent);
+            let claude_dir = apply_declared_config_dir(&mut env, cfg, tool, agent, agent);
             (env, claude_dir)
         };
         let pair = |key: &str, value: &str| (key.to_string(), value.to_string());
@@ -1400,11 +1412,57 @@ mod tests {
             assert_eq!(run(&cfg, tool, agent), (env, claude_dir), "{tool}");
         }
 
+        // Switching into a custom target selects the target's own key and identity.
+        let into = |cfg: &crate::session::Config, tool: &str, target: &str, native: &str| {
+            let mut env = vec![];
+            let claude_dir = apply_declared_config_dir(&mut env, cfg, tool, target, native);
+            (env, claude_dir)
+        };
+        let mut explicit = cfg(&[
+            ("claude", "/acct"),
+            ("work-codex", "/work"),
+            ("codex", "/c"),
+        ]);
+        explicit
+            .session
+            .agent_execution_as
+            .insert("work-codex".into(), "codex".into());
+        assert_eq!(
+            into(&explicit, "claude", "work-codex", "work-codex"),
+            (vec![pair("CODEX_HOME", "/work")], None)
+        );
+        let mut inherited = cfg(&[
+            ("claude", "/acct"),
+            ("work-codex", "/work"),
+            ("codex", "/c"),
+        ]);
+        inherited
+            .session
+            .agent_detect_as
+            .insert("work-codex".into(), "codex".into());
+        assert_eq!(
+            into(&inherited, "claude", "work-codex", "codex"),
+            (vec![pair("CODEX_HOME", "/work")], None)
+        );
+        // An unrelated wrapper of the tool's own native agent keeps its own key too.
+        let mut sibling = cfg(&[("claude", "/acct"), ("claude-d", "/d")]);
+        sibling
+            .session
+            .agent_detect_as
+            .insert("claude-d".into(), "claude".into());
+        assert_eq!(
+            into(&sibling, "claude", "claude-d", "claude"),
+            (
+                vec![pair("CLAUDE_CONFIG_DIR", "/d")],
+                Some(PathBuf::from("/d"))
+            )
+        );
+
         // A relative effective HOME would resolve differently per process: no export.
         let mut env = vec![pair("HOME", "account")];
         let relative_home = cfg(&[("claude", "~/.claude-work")]);
         assert_eq!(
-            apply_declared_config_dir(&mut env, &relative_home, "claude", "claude"),
+            apply_declared_config_dir(&mut env, &relative_home, "claude", "claude", "claude"),
             None
         );
         assert_eq!(env, vec![pair("HOME", "account")]);
@@ -1413,7 +1471,7 @@ mod tests {
         let mut cfg = cfg(&[("claude", "~/.claude-work")]);
         cfg.environment = vec!["HOME=/home/operator".into()];
         let mut env = vec![pair("HOME", "/srv/account")];
-        let claude_dir = apply_declared_config_dir(&mut env, &cfg, "claude", "claude");
+        let claude_dir = apply_declared_config_dir(&mut env, &cfg, "claude", "claude", "claude");
         assert_eq!(claude_dir, Some(PathBuf::from("/srv/account/.claude-work")));
         assert_eq!(
             env,

@@ -750,15 +750,16 @@ impl<S: BroadcastSink> Drain<S> {
                 apply_claude_store_pin(&mut host_environment, config.claude_store_pin.as_ref())
                     .or_else(|| {
                         let cfg = resolved.as_ref().ok()?;
-                        let native_key = config
-                            .wrapper_substitution
-                            .as_ref()
-                            .map_or(config.agent_key.as_str(), |(_, base)| base.as_str());
+                        let (target, native) = config.wrapper_substitution.as_ref().map_or(
+                            (config.agent_key.as_str(), config.agent_key.as_str()),
+                            |(wrapper, base)| (wrapper.as_str(), base.as_str()),
+                        );
                         apply_declared_config_dir(
                             &mut host_environment,
                             cfg,
                             &config.tool,
-                            native_key,
+                            target,
+                            native,
                         )
                     });
             config.host_environment = host_environment;
