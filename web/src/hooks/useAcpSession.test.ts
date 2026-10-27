@@ -162,6 +162,31 @@ describe("reconnect (#1130)", () => {
     expect(result.current).toMatchObject({ reconnecting: false, retryCount: 0, status: "connecting" });
   });
 
+  it("flags history arriving over replay while the socket is down, until a socket opens", async () => {
+    calls = installAcpFakes(({ url }) =>
+      url.includes("/acp/replay")
+        ? json({ frames: [], rows: [], lost: false, highest_seq: 7, next_cursor: 7 })
+        : undefined,
+    );
+    FakeWebSocket.closeFiresOnClose = true;
+    const { result } = render("sess-replay-down");
+    await flushAsync();
+    sockets[0]!.drop();
+    expect(result.current).toMatchObject({ reconnecting: true, replayedWhileDown: true });
+
+    await act(() => vi.advanceTimersByTimeAsync(acpRetryDelayMs(1)));
+    await flushAsync();
+    sockets[1]!.open();
+    expect(result.current.replayedWhileDown).toBe(false);
+  });
+
+  it("does not flag a replay that brought nothing new", async () => {
+    const { result } = render("sess-replay-empty");
+    await flushAsync();
+    sockets[0]!.drop();
+    expect(result.current).toMatchObject({ reconnecting: true, replayedWhileDown: false });
+  });
+
   it("dials without an elevation preflight", async () => {
     render("sess-no-preflight");
     await flushAsync();

@@ -82,6 +82,8 @@ export function useAcpConnection(
   const [hasMoreOlder, setHasMoreOlder] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [hasEverOpened, setHasEverOpened] = useState(false);
+  // A replay delivered events while the socket was not open, so history is live over HTTP only.
+  const [replayedWhileDown, setReplayedWhileDown] = useState(false);
 
   const lastSeqRef = useLatestRef(state.lastSeq);
   const oldestSeqRef = useLatestRef(state.oldestSeq);
@@ -100,7 +102,14 @@ export function useAcpConnection(
   // Last applied frame or submit, polled by the force-end-turn affordance without re-rendering.
   const lastActivityRef = useRef(0);
   // Setters behind a ref: the socket handlers below are not an external-store subscription.
-  const settersRef = useRef({ setStatus, setReconnecting, setRetryCount, setRetryCountdown, setHasEverOpened });
+  const settersRef = useRef({
+    setStatus,
+    setReconnecting,
+    setRetryCount,
+    setRetryCountdown,
+    setHasEverOpened,
+    setReplayedWhileDown,
+  });
 
   const clearRetryTimers = useCallback(() => {
     if (retryTimerRef.current) {
@@ -199,6 +208,7 @@ export function useAcpConnection(
     setHasMoreOlder(false);
     setLoadingOlder(false);
     setHasEverOpened(false);
+    setReplayedWhileDown(false);
   }
 
   useEffect(() => {
@@ -210,7 +220,8 @@ export function useAcpConnection(
     dispatch({ kind: "hydrate", state: cached ?? emptyAcpState() });
     retryCountRef.current = 0;
     let cancelled = false;
-    const { setStatus, setReconnecting, setRetryCount, setRetryCountdown, setHasEverOpened } = settersRef.current;
+    const { setStatus, setReconnecting, setRetryCount, setRetryCountdown, setHasEverOpened, setReplayedWhileDown } =
+      settersRef.current;
 
     const scheduleReconnect = () => {
       if (cancelled) return;
@@ -301,6 +312,7 @@ export function useAcpConnection(
       void (async () => {
         // Replay is best effort and the socket's `since=` covers the gap, so a hung fetch must not block the dial.
         // On timeout the replay is aborted so a late snapshot cannot overwrite rows the socket has since updated.
+        const seqBeforeReplay = lastSeqRef.current;
         const replay = startReplay();
         let replayTimer: ReturnType<typeof setTimeout> | undefined;
         await Promise.race([
@@ -314,6 +326,7 @@ export function useAcpConnection(
         ]);
         clearTimeout(replayTimer);
         if (!isCurrentDial()) return;
+        if (lastSeqRef.current > seqBeforeReplay) setReplayedWhileDown(true);
         const protocol = window.location.protocol === "https:" ? "wss" : "ws";
         const url = `${protocol}://${window.location.host}/sessions/${encodeURIComponent(sessionId)}/acp/ws?since=${lastSeqRef.current}`;
         const ws = new WebSocket(url, acpSocketProtocols());
@@ -334,6 +347,7 @@ export function useAcpConnection(
           }
           setStatus("open");
           setHasEverOpened(true);
+          setReplayedWhileDown(false);
           lastServerMsgRef.current = Date.now();
           retryCountRef.current = 0;
           setReconnecting(false);
@@ -388,6 +402,7 @@ export function useAcpConnection(
     retryCountdown,
     manualReconnect,
     hasEverOpened,
+    replayedWhileDown,
     loadOlder,
     hasMoreOlder,
     loadingOlder,
