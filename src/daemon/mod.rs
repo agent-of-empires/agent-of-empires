@@ -35,16 +35,16 @@ pub use wire::{
     ContextResumeUnavailableReason, CreateProfileBody, CreateProjectBody, CreateSessionBody,
     CreationTrustFingerprint, CreationTrustRequest, CreationTrustReview, DefaultProfileBody,
     DeleteGroupBody, DeleteGroupMode, DeleteGroupOutcome, DeleteProfileQuery, DeleteSessionBody,
-    EnsureToolBody, GroupLocation, GroupSessionFailure, GroupSessionFailureCode,
-    GroupSessionOutcome, ListSessionsQuery, MoveDirection, MoveGroupBody, PendingApproval,
-    PlanSummary, PromptAttachmentKind, PromptAttachmentRef, PurgeOutcome, QueuedPromptEntry,
-    RenameOutcome, RenameProfileBody, RenameSessionBody, ReorderBody, ReorderOutcome,
-    RepoBaseInput, RestartOutcome, RestartSessionBody, RestoreOutcome, SessionResponse,
-    SessionsEnvelope, SetWorktreeNameBody, StartSessionBody, StopAuxiliaryBody, TerminalSize,
-    TerminalTarget, TerminalTargetStatus, TrashOutcome, TrashRelocationOutcome, TrashSessionBody,
-    Tristate, UpdateArchiveBody, UpdateColorBody, UpdateDiffBaseBody, UpdateFavoriteBody,
-    UpdateGroupBody, UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody, UpdateUnreadBody,
-    WorkspaceRepoSummary, WorktreeEditOutcome,
+    EmptyTrashBody, EmptyTrashOutcome, EnsureToolBody, GroupLocation, GroupSessionFailure,
+    GroupSessionFailureCode, GroupSessionOutcome, ListSessionsQuery, MoveDirection, MoveGroupBody,
+    PendingApproval, PlanSummary, PromptAttachmentKind, PromptAttachmentRef, PurgeOutcome,
+    QueuedPromptEntry, RenameOutcome, RenameProfileBody, RenameSessionBody, ReorderBody,
+    ReorderOutcome, RepoBaseInput, RestartOutcome, RestartSessionBody, RestoreOutcome,
+    SessionResponse, SessionsEnvelope, SetWorktreeNameBody, StartSessionBody, StopAuxiliaryBody,
+    TerminalSize, TerminalTarget, TerminalTargetStatus, TrashOutcome, TrashRelocationOutcome,
+    TrashSessionBody, Tristate, UpdateArchiveBody, UpdateColorBody, UpdateDiffBaseBody,
+    UpdateFavoriteBody, UpdateGroupBody, UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody,
+    UpdateUnreadBody, WorkspaceRepoSummary, WorktreeEditOutcome,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -748,6 +748,19 @@ impl DaemonClient {
             .join("groups")
             .map_err(|_| DaemonClientError::Transport)?;
         self.request_mutation_with_outcome(self.http.delete(url).json(body), epoch)
+            .await
+    }
+
+    pub async fn empty_trash(
+        &self,
+        body: &EmptyTrashBody,
+        epoch: &str,
+    ) -> Result<MutationReceipt<EmptyTrashOutcome>, DaemonClientError> {
+        let url = self
+            .sessions_url
+            .join("empty-trash")
+            .map_err(|_| DaemonClientError::Transport)?;
+        self.request_mutation_with_outcome(self.http.post(url).json(body), epoch)
             .await
     }
 

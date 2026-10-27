@@ -839,6 +839,134 @@ pub async fn delete_session(
     }
 }
 
+/// Purges every trashed row of one profile. The daemon selects the rows and binds
+/// consent to each row's own trash lifecycle, so a client snapshot is never trusted.
+pub async fn empty_trash(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<crate::daemon::EmptyTrashBody>,
+) -> axum::response::Response {
+    match tokio::spawn(empty_trash_owned(state, body.profile)).await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!(target: "http.api.sessions", %error, "empty trash task failed");
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "Empty trash task failed",
+            )
+        }
+    }
+}
+
+async fn empty_trash_owned(state: Arc<AppState>, profile: String) -> axum::response::Response {
+    use crate::daemon::{
+        EmptyTrashOutcome, GroupSessionFailure, GroupSessionFailureCode, GroupSessionOutcome,
+        RuntimeHealth,
+    };
+    let _namespace = state
+        .runtime
+        .purge_namespace_lease(&state.profile_namespace)
+        .await;
+    if *state.canonical_health.read().await != RuntimeHealth::Healthy {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    if !state
+        .canonical_metadata
+        .read()
+        .await
+        .profiles
+        .iter()
+        .any(|known| known.name == profile)
+    {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "profile_not_found",
+            "Profile not found",
+        );
+    }
+    let mut ids: Vec<String> = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .filter(|row| row.is_trashed() && row.source_profile == profile)
+        .map(|row| row.id.clone())
+        .collect();
+    ids.sort_unstable();
+    let mut outcome = EmptyTrashOutcome {
+        sessions: Vec::new(),
+        failures: Vec::new(),
+    };
+    for id in ids {
+        let Some(_submission) = state
+            .session_service
+            .prompt_submission_for_session(&id)
+            .await
+        else {
+            continue;
+        };
+        let lock = state.instance_lock(&id).await;
+        let _guard = lock.lock().await;
+        let instance = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == id && row.is_trashed())
+            .cloned();
+        let Some(instance) = instance else {
+            continue;
+        };
+        let body = DeleteSessionBody {
+            force_delete: true,
+            expected_trash: true,
+            expected_trashed_at: instance.trashed_at,
+            expected_trash_lifecycle_id: instance.trash_lifecycle_id.clone(),
+            expected_generation: Some(instance.lifecycle_generation),
+            use_cleanup_defaults: true,
+            ..Default::default()
+        };
+        let recent_entry = crate::session::recent_project_entry_for(&instance);
+        match purge_session_artifacts(&state, &id, instance, &body, recent_entry, None, None).await
+        {
+            Ok(purge) => outcome
+                .sessions
+                .push(GroupSessionOutcome { id, outcome: purge }),
+            Err(error) => {
+                if error.is::<crate::session::NativeStoreUnavailable>()
+                    || *state.canonical_health.read().await != RuntimeHealth::Healthy
+                {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+                let (code, message) =
+                    match error.downcast_ref::<crate::session::LifecycleReservationError>() {
+                        Some(crate::session::LifecycleReservationError::Busy(_)) => (
+                            GroupSessionFailureCode::LifecycleBusy,
+                            "Session lifecycle is busy",
+                        ),
+                        Some(crate::session::LifecycleReservationError::Superseded) => (
+                            GroupSessionFailureCode::Superseded,
+                            "Session changed before purge",
+                        ),
+                        _ => (GroupSessionFailureCode::PurgeFailed, "Session purge failed"),
+                    };
+                tracing::warn!(target: "http.api.sessions", session = %id, %error, "empty trash purge failed");
+                outcome.failures.push(GroupSessionFailure {
+                    id,
+                    code,
+                    message: message.to_owned(),
+                });
+            }
+        }
+    }
+    match state.runtime.publish(&state).await {
+        Ok(snapshot) => {
+            crate::server::runtime::mutation_response(&snapshot.value.cursor, Json(outcome))
+        }
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
 pub async fn abandon_purge(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,

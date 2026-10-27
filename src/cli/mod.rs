@@ -166,12 +166,6 @@ fn purge_acp_transcript_rows(db_path: &std::path::Path, session_id: &str) -> Res
     Ok(())
 }
 
-pub(crate) struct EmptyTrashOutcome {
-    pub removed: usize,
-    pub restored_after_teardown: usize,
-    pub kept_for_retry: usize,
-}
-
 pub fn truncate(s: &str, max: usize) -> String {
     let char_count = s.chars().count();
     if char_count <= max {

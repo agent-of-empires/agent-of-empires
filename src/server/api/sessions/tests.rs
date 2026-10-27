@@ -7411,7 +7411,7 @@ async fn attach_receipt_preserves_added_repo_metadata_and_complete_peer_publicat
         .contains_key(crate::daemon::RUNTIME_REVISION_HEADER));
     let body: serde_json::Value =
         serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await?)?;
-    let outcome = &body["outcome"];
+    let outcome = &body;
     assert_eq!(outcome["attached"]["name"], "frontend");
     assert_eq!(outcome["attached"]["branch"], "attach-branch");
     assert_eq!(outcome["attached"]["branch_created"], true);
@@ -10031,4 +10031,107 @@ async fn recreate_container_removes_the_container_before_the_agent_restarts() ->
         }
     }
     Ok(())
+}
+
+/// One request purges the requested profile's trash, skips a busy row, and leaves
+/// other profiles and live rows alone.
+#[tokio::test]
+async fn empty_trash_purges_one_profiles_trash_and_reports_busy_rows() -> anyhow::Result<()> {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let root = crate::session::get_app_dir()?;
+    crate::session::purge_owners::initialize(&root)?;
+    crate::tmux::tool_retirement::initialize(&root)?;
+    let (profile, other) = ("empty-trash-bulk", "empty-trash-other");
+    let project = tempfile::tempdir()?;
+    let row = |title: &str, profile: &str, trashed: bool| {
+        let mut row = Instance::new(title, project.path().to_str().unwrap());
+        row.source_profile = profile.into();
+        if trashed {
+            row.trash();
+        }
+        row
+    };
+    let (a, b) = (row("a", profile, true), row("b", profile, true));
+    let mut busy = row("busy", profile, true);
+    busy.try_acquire_lifecycle_reservation(
+        LifecycleOperation::Restore,
+        Instance::LIFECYCLE_RESERVATION_TTL,
+        chrono::Utc::now(),
+    )?;
+    let live = row("live", profile, false);
+    let elsewhere = row("elsewhere", other, true);
+    for (name, rows) in [
+        (
+            profile,
+            vec![a.clone(), b.clone(), busy.clone(), live.clone()],
+        ),
+        (other, vec![elsewhere.clone()]),
+    ] {
+        crate::server::test_support::seed_instances_on_disk_for_test(name, rows);
+    }
+    let state = crate::server::test_support::build_test_app_state(vec![
+        a.clone(),
+        b.clone(),
+        busy.clone(),
+        live.clone(),
+        elsewhere.clone(),
+    ]);
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+
+    let response = empty_trash(
+        State(state.clone()),
+        Json(crate::daemon::EmptyTrashBody {
+            profile: profile.into(),
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let outcome = &body;
+    let mut purged: Vec<_> = outcome["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| (s["id"].as_str().unwrap().to_owned(), s["status"].clone()))
+        .collect();
+    purged.sort_by(|l, r| l.0.cmp(&r.0));
+    let mut expected = vec![
+        (a.id.clone(), "deleted".into()),
+        (b.id.clone(), "deleted".into()),
+    ];
+    expected.sort_by(|l: &(String, serde_json::Value), r| l.0.cmp(&r.0));
+    assert_eq!(purged, expected, "{body}");
+    let failures = outcome["failures"].as_array().unwrap();
+    assert_eq!(failures.len(), 1, "{body}");
+    assert_eq!(failures[0]["id"], busy.id);
+    assert_eq!(failures[0]["code"], "lifecycle_busy");
+
+    let mut left: Vec<_> = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .map(|row| row.id.clone())
+        .collect();
+    left.sort();
+    let mut kept = vec![busy.id, live.id, elsewhere.id];
+    kept.sort();
+    assert_eq!(left, kept);
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_trash_refuses_an_unknown_profile() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let state = crate::server::test_support::build_test_app_state(Vec::new());
+    let response = empty_trash(
+        State(state),
+        Json(crate::daemon::EmptyTrashBody {
+            profile: "no-such-profile".into(),
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
