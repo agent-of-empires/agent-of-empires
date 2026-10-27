@@ -138,6 +138,10 @@ export function ForwardScrollbar({
       // Keep focus on the terminal input.
       onMouseDown={(e) => e.preventDefault()}
       onContextMenu={(e) => e.preventDefault()}
+      // A keyboard click (detail 0) must not reach click-to-type, or the next Enter would be terminal input.
+      onClick={(e) => {
+        if (e.detail === 0) e.stopPropagation();
+      }}
     >
       <HoldButton
         label="Scroll up"

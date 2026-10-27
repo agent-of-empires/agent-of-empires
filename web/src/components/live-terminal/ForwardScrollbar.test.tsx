@@ -42,6 +42,20 @@ describe("ForwardScrollbar", () => {
     expect(scrollNotches.mock.calls.map(([n]) => n)).toEqual([-1, 1, -PAGE, PAGE, -1, PAGE]);
   });
 
+  it("keeps keyboard clicks from reaching an ancestor's click-to-type but lets mouse clicks through", () => {
+    const parentClick = vi.fn();
+    render(
+      <div onClick={parentClick}>
+        <ForwardScrollbar disabled={false} pageNotches={() => PAGE} scrollNotches={vi.fn()} cancelScroll={vi.fn()} />
+      </div>,
+    );
+    const arrow = screen.getAllByLabelText("Scroll down").at(-1)!;
+    fireEvent.click(arrow, { detail: 0 });
+    expect(parentClick).not.toHaveBeenCalled();
+    fireEvent.click(arrow, { detail: 1 });
+    expect(parentClick).toHaveBeenCalledTimes(1);
+  });
+
   it("repeats a held arrow", () => {
     const { scrollNotches } = setup();
     const up = screen.getByLabelText("Scroll up");
