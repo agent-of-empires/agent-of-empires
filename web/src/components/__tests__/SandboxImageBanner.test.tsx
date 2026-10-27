@@ -174,6 +174,13 @@ describe("SandboxImageBanner", () => {
     fetchSandboxImageStatus.mockResolvedValue({ error: "http_500" });
     await pollAfter(0);
     expect(banner()?.getAttribute("aria-label")).toBe("Couldn't download the sandbox image");
+
+    // No reply at all says the Daemon wasn't reached, not that it refused.
+    fetchSandboxImageStatus.mockResolvedValue(status({ pull: { state: "done" } }));
+    pullSandboxImage.mockResolvedValueOnce({ ok: false });
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await pollAfter(0);
+    expect(screen.getByText("Couldn't reach the Daemon.")).toBeTruthy();
   });
 
   it("keeps polling fast after an accepted pull even when the status request fails", async () => {
@@ -256,12 +263,17 @@ describe("SandboxImageBanner", () => {
     expect(banner()).toBeNull();
   });
 
-  it("shows the notice again when the Daemon doesn't keep the dismissal", async () => {
-    dismissSandboxImage.mockResolvedValueOnce(false);
-    await mount(status());
-    fireEvent.click(screen.getByRole("button", { name: "Dismiss sandbox image notice" }));
-    expect(banner()).toBeNull();
-    await pollAfter(0);
-    expect(banner()).not.toBeNull();
+  it("keeps a dismissed notice hidden even when the Daemon can't save the dismissal", async () => {
+    // Read-only and CityHall servers always refuse the save; elsewhere it can fail in transit.
+    for (const pull_blocked of [null, "read_only", "cityhall"] as const) {
+      dismissSandboxImage.mockResolvedValueOnce(false);
+      const { unmount } = await mount(status({ pull_blocked }));
+      fireEvent.click(screen.getByRole("button", { name: "Dismiss sandbox image notice" }));
+      expect(dismissSandboxImage).toHaveBeenLastCalledWith("sha256:new");
+      // The next hourly status still says it isn't dismissed.
+      await pollAfter(60 * 60_000);
+      expect(banner(), String(pull_blocked)).toBeNull();
+      unmount();
+    }
   });
 });

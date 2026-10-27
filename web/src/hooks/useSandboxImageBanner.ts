@@ -95,7 +95,7 @@ export function useSandboxImageBanner(): SandboxImageBannerView | null {
         // Nothing was pulled, and the Daemon may still hold an older pull's outcome.
         expectingPull.current = false;
         setWatchedPull(false);
-        setRefusal(reply.message ?? "The Daemon refused the pull.");
+        setRefusal(reply.message ?? "Couldn't reach the Daemon.");
       }
       pollNow.current();
     });
@@ -121,13 +121,11 @@ export function useSandboxImageBanner(): SandboxImageBannerView | null {
 
   if (status.state !== "available" || status.dismissed || dismissedDigest === status.remote_digest) return null;
   const digest = status.remote_digest;
-  // Hidden at once; if the Daemon didn't keep the dismissal, it shows again rather than coming back
-  // only on the next load.
+  // Hidden for this page whether or not the Daemon saves it, as for the AoE update banner: read-only
+  // and CityHall servers refuse to save a dismissal, so rolling back would make Dismiss do nothing.
   const onDismiss = () => {
     setDismissedDigest(digest);
-    void dismissSandboxImage(digest).then((kept) => {
-      if (!kept) setDismissedDigest((current) => (current === digest ? null : current));
-    });
+    void dismissSandboxImage(digest);
   };
   if (status.pull_blocked) {
     return { kind: "gated", image: status.image, command: status.pull_command, onDismiss };
