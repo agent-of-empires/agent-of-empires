@@ -326,10 +326,18 @@ pub(crate) fn project_base_branches(profile: &str) -> std::collections::HashMap<
             if base.is_empty() {
                 None
             } else {
-                Some((crate::session::projects::canonical_key(&p.path), base))
+                Some((project_root_key(&p.path), base))
             }
         })
         .collect()
+}
+
+/// Registry key for a project: its repo root, so a project registered at
+/// `<proj>/.git` matches the `find_main_repo` lookup in `resolve_repo_base_branch`.
+fn project_root_key(path: &str) -> String {
+    let root = GitWorktree::find_main_repo(std::path::Path::new(path))
+        .unwrap_or_else(|_| PathBuf::from(path));
+    crate::session::projects::canonical_key(root.to_string_lossy())
 }
 
 /// One repository in a multi-repo workspace, paired with the base branch its
@@ -2538,6 +2546,36 @@ mod tests {
             resolve_repo_base_branch(&wt_path, None, &bases, None),
             Some("develop".to_string())
         );
+    }
+
+    #[test]
+    fn project_root_key_matches_lookup_for_dot_git_registration() {
+        let dir = tempfile::Builder::new()
+            .prefix("aoe-test-")
+            .tempdir()
+            .unwrap();
+        let bare = dir.path().join(".git");
+        let repo = git2::Repository::init_bare(&bare).unwrap();
+        crate::git::test_support::commit(&repo, Some("HEAD"), &[], &[], None);
+        let wt = dir.path().join("main");
+        crate::git::test_support::run_git(
+            &bare,
+            &["worktree", "add", wt.to_str().unwrap(), "HEAD"],
+        );
+
+        let mut bases = std::collections::HashMap::new();
+        bases.insert(
+            project_root_key(&bare.to_string_lossy()),
+            "develop".to_string(),
+        );
+        for start in [dir.path(), wt.as_path()] {
+            assert_eq!(
+                resolve_repo_base_branch(start, None, &bases, Some("global")),
+                Some("develop".to_string()),
+                "{}",
+                start.display()
+            );
+        }
     }
 
     /// Create a repo with `main` plus a second branch holding a distinct
