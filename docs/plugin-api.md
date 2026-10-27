@@ -427,9 +427,11 @@ request({ method: "ready", params: { nonce: location.hash.slice(1) } }, (m) => p
 
 `status-bar`, `header-start`, `row-badge` and `detail-badge` take either one badge, `{ text?, icon?, tone?, href?, tooltip? }` (`status-bar`, `header-start` and `detail-badge` require `text` or `items`), or an `items` list of such badges that replaces the top-level fields. `items: []` clears the badge.
 
-`status-bar`, `header-start` and `detail-badge` also take an integer `order`, default 0, lowest first; ties keep plugin id then entry id order. In the terminal UI, `status-bar` and `header-start` render as text and tone in the status line, with `header-start` first; `row-badge` and `row-column` render on TUI session rows. The terminal UI ignores icons, tooltips and links; the web dashboard renders them.
+`status-bar`, `header-start` and `detail-badge` also take an integer `order`, default 0, lowest first; ties keep plugin id then entry id order.
 
-Give items a shared `group` to collapse them into one chip that shows one item at a time. Clicking or tapping it advances to the next item and wraps around, for example a usage badge cycling `5h`, `7d` and `opus` values:
+`row-badge` items on terminal session rows render every item with `text` or `tooltip`, using `tooltip` when `text` is absent. With no `items` list, the top-level `row-badge` uses `tooltip` as a fallback label for missing `text`. `row-column` renders text only; the TUI omits icons and links.
+
+In the web dashboard, give items a shared `group` to collapse them into one chip that shows one item at a time. Clicking or tapping it advances to the next item and wraps around, for example a usage badge cycling `5h`, `7d` and `opus` values:
 
 ```json
 { "items": [
@@ -439,7 +441,7 @@ Give items a shared `group` to collapse them into one chip that shows one item a
 ] }
 ```
 
-Items without a `group` stay separate chips, and each distinct `group` cycles independently. The position is kept per browser tab and is never sent to the worker. A cycling chip ignores `href`; a group with a single item renders as a normal chip. The TUI cannot click and shows the first item with text.
+Grouped `row-badge` items remain separate in the TUI and do not cycle.
 
 ### Pane payload
 

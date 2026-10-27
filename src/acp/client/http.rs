@@ -33,10 +33,6 @@ pub struct PluginCommandView {
     pub fqid: String,
     pub plugin_id: String,
     #[serde(default)]
-    pub title: String,
-    #[serde(default)]
-    pub description: String,
-    #[serde(default)]
     pub keybinds: Vec<String>,
     #[serde(default)]
     pub action: Option<aoe_plugin_api::ClientAction>,

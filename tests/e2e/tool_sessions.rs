@@ -133,7 +133,7 @@ command = "yazi"
 
     h.wait_for(" aoe ");
     h.send_keys("\\;");
-    h.wait_for("navigate");
+    h.wait_for("Tool Sessions");
     h.assert_screen_contains("lazygit");
     h.assert_screen_contains("yazi");
     // Footer hint added in this PR.
@@ -142,7 +142,7 @@ command = "yazi"
 
     // Re-press ; to close (toggle behavior added in this PR).
     h.send_keys("\\;");
-    h.wait_for_absent("lazygit", Duration::from_secs(5));
+    h.wait_for_absent("Tool Sessions", Duration::from_secs(5));
 }
 
 #[test]
@@ -158,7 +158,7 @@ fn test_tool_picker_does_not_open_with_no_tools_configured() {
     // With zero [tools.*] entries the picker is suppressed; the screen
     // should still be on the home view.
     std::thread::sleep(Duration::from_millis(200));
-    h.assert_screen_not_contains("Tools");
+    h.assert_screen_not_contains("Tool Sessions");
 }
 
 #[test]
@@ -251,7 +251,7 @@ background = true
 
     fs::remove_file(&output_path).expect("remove hotkey output");
     h.send_keys("\\;");
-    h.wait_for("navigate");
+    h.wait_for("Tool Sessions");
     h.assert_screen_contains("[bg]");
     h.send_keys("Enter");
     let contents = wait_for_file_contents(&output_path, Duration::from_secs(5));

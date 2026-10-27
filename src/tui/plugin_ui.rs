@@ -167,8 +167,6 @@ pub fn compare_sort_values(
     }
 }
 
-/// Map a tone to a foreground style against the active theme. `None` renders
-/// neutral. Reuses the theme's status colors rather than inventing fields.
 #[cfg(any(feature = "web", test))]
 /// Session-scoped `RowColumn` text and `RowBadge` labels, including itemized
 /// badges. Icon-only badges use their tooltip; unlabeled icons stay omitted.

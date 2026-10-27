@@ -15,7 +15,7 @@ struct PluginUiUpdate {
 }
 
 async fn fetch_plugin_ui() -> PluginUiUpdate {
-    let endpoint = match crate::acp::client::require_daemon().await {
+    let endpoint = match crate::acp::client::locate_daemon().await {
         Ok(endpoint) => endpoint,
         Err(error) => {
             tracing::trace!(target: "tui.plugin_ui", "no daemon for plugin UI: {error}");
@@ -85,9 +85,10 @@ impl PluginUiState {
     pub(crate) fn apply_pending(&mut self) -> bool {
         match self.poller.worker.try_recv() {
             Ok(update) => {
+                let changed = self.snapshot.entries != update.snapshot.entries;
                 self.snapshot = update.snapshot;
                 self.pending = false;
-                true
+                changed
             }
             Err(TryRecvError::Empty) => false,
             Err(TryRecvError::Disconnected) => {
@@ -108,6 +109,72 @@ impl Default for PluginUiState {
             poller: PluginUiPoller::new(),
             pending: false,
             last_refresh: Instant::now() - REFRESH_INTERVAL,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::time::Instant;
+
+    use super::{PluginUiPoller, PluginUiState, PluginUiUpdate};
+    use crate::plugin::ui_state::{UiEntry, UiSnapshot};
+    use crate::tui::worker::Worker;
+    use aoe_plugin_api::UiSlot;
+
+    fn entry(text: &str) -> UiEntry {
+        UiEntry {
+            plugin_id: "test.plugin".into(),
+            slot: UiSlot::RowBadge,
+            id: "status".into(),
+            session_id: Some("session-1".into()),
+            payload: serde_json::json!({"text": text}),
+        }
+    }
+
+    fn snapshot(text: &str, revision: u64) -> UiSnapshot {
+        let mut snapshot = UiSnapshot::default();
+        snapshot.entries.push(entry(text));
+        snapshot.revisions.insert(
+            "test.plugin".into(),
+            BTreeMap::from([("session-1".into(), revision)]),
+        );
+        snapshot
+    }
+
+    fn state(current: UiSnapshot, update: UiSnapshot) -> PluginUiState {
+        PluginUiState {
+            snapshot: current,
+            poller: PluginUiPoller {
+                worker: Worker::seeded_for_test(
+                    "aoe-plugin-ui-poller-test",
+                    PluginUiUpdate { snapshot: update },
+                ),
+            },
+            pending: true,
+            last_refresh: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn apply_pending_redraws_only_for_entry_changes() {
+        let cases = [
+            ("changed entries", "old", "new", 1, 2, true),
+            ("revision only", "same", "same", 1, 2, false),
+        ];
+
+        for (name, current_text, update_text, current_revision, update_revision, changed) in cases {
+            let mut state = state(
+                snapshot(current_text, current_revision),
+                snapshot(update_text, update_revision),
+            );
+            let expected = snapshot(update_text, update_revision);
+
+            assert_eq!(state.apply_pending(), changed, "{name}");
+            assert_eq!(state.snapshot.entries, expected.entries, "{name}");
+            assert_eq!(state.snapshot.revisions, expected.revisions, "{name}");
+            assert!(!state.pending, "{name}");
         }
     }
 }

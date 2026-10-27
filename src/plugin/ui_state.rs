@@ -252,7 +252,7 @@ pub struct Notification {
     pub href: Option<String>,
 }
 
-/// One entry in the snapshot the web renders.
+/// One entry in a plugin UI snapshot.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UiEntry {
     pub plugin_id: String,
