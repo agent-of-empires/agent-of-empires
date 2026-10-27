@@ -544,6 +544,7 @@ pub(crate) async fn spawn_structured_session(
                             crate::server::api::sessions::CreateHookFailed::new(
                                 error,
                                 hint.as_deref(),
+                                hook_plan.on_create_from_repo,
                             ),
                         )
                     })

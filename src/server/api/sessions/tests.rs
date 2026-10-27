@@ -4076,6 +4076,7 @@ async fn create_hook_failure_details_are_local_owner_only() {
     let error = anyhow::Error::new(CreateHookFailed::new(
         anyhow::anyhow!("command exited with status 1"),
         Some("Defined in /tmp/project/.agent-of-empires.yml"),
+        true,
     ));
     assert!(local_create_hook_error_response(&error, false).is_none());
 
@@ -4119,30 +4120,44 @@ fn public_create_session_error_forwards_typed_causes_as_fixed_templates() {
     let generic = ("create_failed", "Failed to create session".to_string());
     let rows: Vec<(&str, anyhow::Error, (&str, String))> = vec![
         (
-            "hook exit code",
-            hook("cat out.txt; cat out.txt >&2; exit 3"),
+            "repo hook exit code",
+            anyhow::Error::new(CreateHookFailed::new(
+                hook("cat out.txt; cat out.txt >&2; exit 3"),
+                Some("Defined in .agent-of-empires.yml"),
+                true,
+            )),
             (
                 "hook_failed",
                 "The Repo hook `cat out.txt; cat out.txt >&2; exit 3` exited with code 3.".into(),
             ),
         ),
         (
-            "hook under context",
-            hook("exit 7").context("on_create hooks failed"),
+            "repo hook under context",
+            anyhow::Error::new(CreateHookFailed::new(hook("exit 7"), None, true))
+                .context("create failed"),
             (
                 "hook_failed",
                 "The Repo hook `exit 7` exited with code 7.".into(),
             ),
         ),
         (
-            "hook wrapped by the create path",
+            "global or profile hook",
             anyhow::Error::new(CreateHookFailed::new(
-                hook("exit 5"),
-                Some("Defined in .agent-of-empires.yml"),
+                hook(&format!("echo {SECRET}; exit 5")),
+                Some("Defined in config.toml"),
+                false,
             )),
             (
                 "hook_failed",
-                "The Repo hook `exit 5` exited with code 5.".into(),
+                "An on_create hook exited with code 5.".into(),
+            ),
+        ),
+        (
+            "hook outside the create path",
+            hook(&format!("echo {SECRET}; exit 6")),
+            (
+                "hook_failed",
+                "An on_create hook exited with code 6.".into(),
             ),
         ),
         (
@@ -8629,20 +8644,153 @@ async fn a_failed_create_is_replayed_to_a_same_key_retry() {
     assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{failed}");
     assert_eq!(failed["error"], "working_dir_missing", "{failed}");
     assert_eq!(failed["stage"], "preparing", "{failed}");
-    // The reference shown in the browser finds the failure's log line.
+    // The reference shown in the browser finds the failure's one log line.
     let reference = failed["reference"].as_str().unwrap();
-    let log = String::from_utf8(log.lock().unwrap().clone()).unwrap();
-    assert!(
-        log.lines().any(|l| l.contains("Session creation failed")
-            && l.contains(&format!("reference={reference}"))),
-        "{log}"
-    );
+    assert_eq!(failure_log_lines(&log, reference), 1);
     // A re-run would now succeed, so a matching 400, stage and reference included,
     // proves the replay.
     std::fs::create_dir_all(&path).unwrap();
     assert_eq!(post_create(&state, body("k1")).await, (status, failed));
     let (fresh, session) = post_create(&state, body("k2")).await;
     assert_eq!(fresh, axum::http::StatusCode::CREATED, "{session}");
+}
+
+/// Failure events carrying `reference`; a hook's message can span lines, so events are
+/// split on the "Session creation failed" text rather than on newlines.
+fn failure_log_lines(log: &std::sync::Mutex<Vec<u8>>, reference: &str) -> usize {
+    String::from_utf8(log.lock().unwrap().clone())
+        .unwrap()
+        .split("Session creation failed")
+        .skip(1)
+        .filter(|event| event.contains(&format!("reference={reference}")))
+        .count()
+}
+
+/// A create whose request is dropped still logs its failure under the reference its
+/// retry replays.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_dropped_failing_create_logs_the_reference_its_retry_replays() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .expect("acknowledge the agent hook paths");
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    let gate = tempfile::tempdir().unwrap();
+    let (ready, release) = (gate.path().join("ready"), gate.path().join("release"));
+    let runs = gate.path().join("runs");
+    let hook = format!(
+        "echo run >> '{}'; : > '{}'; while [ ! -e '{}' ]; do sleep 0.01; done; exit 1",
+        runs.display(),
+        ready.display(),
+        release.display()
+    );
+    let project = project_with_on_create_hooks(&[hook.as_str()]);
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let (launcher, _launches) = support::counting_failing_launcher();
+    let state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let review = reviewed_creation_trust("test", project.path());
+    let body = serde_json::json!({
+        "title": "dropped-failure", "path": project.path(), "tool": "claude",
+        "view": "structured", "profile": "test", "trust_hooks": true,
+        "trust_review": review, "idempotency_key": "drop-fail",
+    });
+
+    let (_logs, log) = crate::server::test_helpers::capture_logs();
+    let first = tokio::spawn({
+        let (state, body) = (state.clone(), body.clone());
+        async move { post_create(&state, body).await }
+    });
+    wait_for("the on_create hook to start", || ready.exists()).await;
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    std::fs::write(&release, "").unwrap();
+
+    let (status, failed) = post_create(&state, body).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{failed}");
+    assert_eq!(failed["stage"], "running_hooks", "{failed}");
+    assert_eq!(std::fs::read_to_string(&runs).unwrap().lines().count(), 1);
+    let reference = failed["reference"].as_str().unwrap();
+    assert_eq!(failure_log_lines(&log, reference), 1);
+}
+
+/// Repo approval covers only the repo's own commands, so a failing global or profile
+/// on_create hook reaches a remote client without its command, even when the repo
+/// declares other hook types.
+#[tokio::test]
+#[serial_test::serial]
+async fn only_an_approved_repo_on_create_hook_is_named_to_a_remote_client() {
+    use crate::server::test_support as support;
+    const SENTINEL: &str = "global-hook-sentinel";
+    let global_hook = format!("echo {SENTINEL}; exit 4 # {SENTINEL}");
+    let repo_hooks = |toml: &str| {
+        let project = tempfile::tempdir().unwrap();
+        let cfg_dir = project.path().join(".agent-of-empires");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(cfg_dir.join("config.toml"), toml).unwrap();
+        project
+    };
+    let neutral = "An on_create hook exited with code 4.".to_string();
+    let rows = [
+        (
+            "no repo hooks",
+            tempfile::tempdir().unwrap(),
+            false,
+            neutral.clone(),
+        ),
+        (
+            "repo declares only on_launch",
+            repo_hooks("[hooks]\non_launch = [\"true\"]\n"),
+            true,
+            neutral,
+        ),
+        (
+            "repo declares on_create",
+            repo_hooks("[hooks]\non_create = [\"exit 4\"]\n"),
+            true,
+            "The Repo hook `exit 4` exited with code 4.".to_string(),
+        ),
+    ];
+    for (label, project, trust, expected) in rows {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .expect("acknowledge the agent hook paths");
+        crate::session::config::update_config(|c| c.hooks.on_create = vec![global_hook.clone()])
+            .unwrap();
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        support::seed_instances_on_disk_for_test("test", Vec::new());
+        let (launcher, _launches) = support::counting_failing_launcher();
+        let state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+        support::refresh_canonical_metadata_for_test(&state).await;
+        let mut body = serde_json::json!({
+            "title": "hook-origin", "path": project.path(), "tool": "claude",
+            "view": "structured", "profile": "test",
+        });
+        if trust {
+            body["trust_hooks"] = true.into();
+            body["trust_review"] =
+                serde_json::to_value(reviewed_creation_trust("test", project.path())).unwrap();
+        }
+
+        let (status, failed) = post_create(&state, body).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "{label}: {failed}"
+        );
+        assert_eq!(failed["error"], "hook_failed", "{label}: {failed}");
+        assert_eq!(failed["message"], expected.as_str(), "{label}");
+        assert!(!failed.to_string().contains(SENTINEL), "{label}: {failed}");
+    }
 }
 
 /// A full replay map must not forget a live failure: its retry would run the create,

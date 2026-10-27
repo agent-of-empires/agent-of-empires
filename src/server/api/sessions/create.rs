@@ -3,23 +3,26 @@
 use super::*;
 
 /// A failed on_create hook in the words the TUI and local owners have always seen. It keeps
-/// its cause, so the Web dashboard can still name the hook; no `source`, so `{:#}` doesn't
+/// its cause, so the Web dashboard can still name a Repo hook; no `source`, so `{:#}` doesn't
 /// repeat the cause the text already includes.
 #[derive(Debug, thiserror::Error)]
 #[error("{text}")]
 pub(crate) struct CreateHookFailed {
     text: String,
     pub(crate) cause: anyhow::Error,
+    /// The commands came from the approved repo config, not global or profile config.
+    pub(crate) from_repo: bool,
 }
 
 impl CreateHookFailed {
-    pub(crate) fn new(error: anyhow::Error, origin_hint: Option<&str>) -> Self {
+    pub(crate) fn new(error: anyhow::Error, origin_hint: Option<&str>, from_repo: bool) -> Self {
         let hint = origin_hint
             .map(|hint| format!("\n{hint}"))
             .unwrap_or_default();
         Self {
             text: format!("on_create hook failed: {error:#}{hint}"),
             cause: error,
+            from_repo,
         }
     }
 }
@@ -430,6 +433,8 @@ pub(crate) struct CreateHookPlan {
     pub(crate) hooks: Option<crate::session::config::repo_config::ResolvedHooks>,
     /// Approved hashes to persist before provisioning; absent when no new trust is needed.
     pub(crate) trust_write: Option<(Option<String>, Option<String>)>,
+    /// Repo hooks replace global and profile ones per type, so this is per type too.
+    pub(crate) on_create_from_repo: bool,
 }
 
 impl CreateHookPlan {
@@ -501,12 +506,17 @@ pub(crate) fn resolve_create_hook_plan(
     } else {
         None
     };
+    let on_create_from_repo = repo_hooks.is_some_and(|hooks| !hooks.on_create.is_empty());
     let repo_root = repo_hooks.map(|_| std::path::Path::new(&trust.project_path));
     let merged = repo_hooks
         .map(|hooks| repo_config::apply_repo_hook_overrides(base.clone(), hooks))
         .unwrap_or_else(|| base.clone());
     let hooks = repo_config::ResolvedHooks::from_merged(profile, repo_root, merged);
-    Ok(CreateHookPlan { hooks, trust_write })
+    Ok(CreateHookPlan {
+        hooks,
+        trust_write,
+        on_create_from_repo,
+    })
 }
 
 /// Run the planned `on_create` hooks (#2066) with streamed error-tail capture.
@@ -1213,19 +1223,25 @@ pub async fn create_session(
             .session_service
             .create_structured_session(spec, None, None, None)
             .await;
-        if let (Err(e), Some(key)) = (&result, &key) {
+        // Logged here, not by the waiting request, which may be gone by now.
+        if let Err(e) = &result {
             let stage = task_progress.stage();
             if let Some(failure) = create_failure(e, stage, &task_reference) {
-                task_state.create_progress.record_failure(key, failure);
+                log_create_failure(e, stage, &task_reference);
+                if let Some(key) = &key {
+                    task_state.create_progress.record_failure(key, failure);
+                }
             }
         }
         result
     })
     .await
     .unwrap_or_else(|e| {
-        Err(anyhow::Error::new(
-            crate::server::session_spawn::SessionBuildPanicked(e.to_string()),
-        ))
+        let e = anyhow::Error::new(crate::server::session_spawn::SessionBuildPanicked(
+            e.to_string(),
+        ));
+        log_create_failure(&e, progress.stage(), &reference);
+        Err(e)
     });
 
     match created {
@@ -1278,21 +1294,25 @@ pub async fn create_session(
                 )
                     .into_response();
             }
-            let stage = progress.stage();
-            if let Some(panicked) =
-                e.downcast_ref::<crate::server::session_spawn::SessionBuildPanicked>()
-            {
-                tracing::error!(target: "http.api.sessions", %reference, ?stage, "Session creation panicked: {}", panicked.0);
-            } else {
-                tracing::warn!(target: "http.api.sessions", %reference, ?stage, "Session creation failed: {}", e);
-            }
             if let Some(response) = local_create_hook_error_response(&e, local_owner) {
                 return response;
             }
-            create_failure(&e, stage, &reference)
+            create_failure(&e, progress.stage(), &reference)
                 .expect("hooks_need_trust returned above")
                 .into_response()
         }
+    }
+}
+
+fn log_create_failure(
+    e: &anyhow::Error,
+    stage: crate::server::create_progress::CreateStage,
+    reference: &str,
+) {
+    if let Some(panicked) = e.downcast_ref::<crate::server::session_spawn::SessionBuildPanicked>() {
+        tracing::error!(target: "http.api.sessions", %reference, ?stage, "Session creation panicked: {}", panicked.0);
+    } else {
+        tracing::warn!(target: "http.api.sessions", %reference, ?stage, "Session creation failed: {}", e);
     }
 }
 
@@ -1405,8 +1425,8 @@ async fn created_session_response(
 ///
 /// The full error is always logged server-side. The Web dashboard can be reached
 /// remotely, so only fixed templates go back: typed errors found anywhere in the
-/// chain fill them with a runtime name, an image reference, a Repo hook command
-/// or an exit code, never stderr, paths or git output. The well-typed `GitError`
+/// chain fill them with a runtime name, an image reference, an approved Repo hook's
+/// command or an exit code, never stderr, paths or git output. The well-typed `GitError`
 /// variants with a credential-free message pass through as before; anything
 /// else is the generic string.
 pub(super) fn public_create_session_error(e: &anyhow::Error) -> (&'static str, String) {
@@ -1415,10 +1435,11 @@ pub(super) fn public_create_session_error(e: &anyhow::Error) -> (&'static str, S
     use crate::session::config::repo_config::HookFailed;
 
     // A failed on_create hook keeps its cause, so its typed parts can still be found.
-    let e = e
+    let create_hook = e
         .chain()
-        .find_map(|cause| cause.downcast_ref::<CreateHookFailed>())
-        .map_or(e, |hook| &hook.cause);
+        .find_map(|cause| cause.downcast_ref::<CreateHookFailed>());
+    let from_repo = create_hook.is_some_and(|hook| hook.from_repo);
+    let e = create_hook.map_or(e, |hook| &hook.cause);
     let runtime = || crate::containers::get_container_runtime().display_name();
     let unavailable = |why: String| ("sandbox_unavailable", why);
     for cause in e.chain() {
@@ -1427,10 +1448,13 @@ pub(super) fn public_create_session_error(e: &anyhow::Error) -> (&'static str, S
                 Some(code) => format!("exited with code {code}"),
                 None => "was stopped before it exited".to_string(),
             };
-            return (
-                "hook_failed",
-                format!("The Repo hook `{}` {ended}.", hook.command),
-            );
+            // Repo approval covers only the repo's commands; global and profile ones stay unnamed.
+            let message = if from_repo {
+                format!("The Repo hook `{}` {ended}.", hook.command)
+            } else {
+                format!("An on_create hook {ended}.")
+            };
+            return ("hook_failed", message);
         }
         if let Some(refusal) = cause.downcast_ref::<BuildRefusal>() {
             return match refusal {
