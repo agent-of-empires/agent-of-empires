@@ -195,13 +195,17 @@ describe("reconnect (#1130)", () => {
     const sid = "sess-replay-loaded";
     const first = replayedPrompt(sid, 6);
     const forward = replayedPrompt(sid, 11);
+    let secondPageRequests = 0;
     calls = installAcpFakes(({ url }) => {
       if (!url.includes("/acp/replay")) return undefined;
       const since = new URL(url, "http://x").searchParams.get("since");
       if (since === null) {
         return json({ frames: [first.frame], rows: [first.row], lost: false, highest_seq: 10, next_cursor: 6 });
       }
-      if (Number(since) > 10) return secondPage();
+      if (Number(since) > 10) {
+        secondPageRequests += 1;
+        return secondPage();
+      }
       return json({
         frames: [forward.frame],
         rows: [forward.row],
@@ -219,8 +223,13 @@ describe("reconnect (#1130)", () => {
 
     sockets[0]!.drop();
     await act(() => vi.advanceTimersByTimeAsync(acpRetryDelayMs(1)));
+    // The first page commits only once the replay has gone on to ask for the second.
+    await act(() => vi.waitFor(() => expect(secondPageRequests).toBeGreaterThan(0)));
     await flushAsync();
+    expect(result.current.state.activity.map((r) => r.id)).toContain(forward.row.id);
     if (label.startsWith("hangs")) {
+      expect(sockets).toHaveLength(1);
+      expect(result.current.replayedWhileDown).toBe(false);
       await act(() => vi.advanceTimersByTimeAsync(ACP_DIAL_TIMEOUT_MS));
       await flushAsync();
     }
