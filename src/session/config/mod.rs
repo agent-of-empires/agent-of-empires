@@ -2735,6 +2735,18 @@ pub struct SandboxConfig {
     )]
     pub auto_cleanup: bool,
 
+    /// Let the web dashboard pull a newer sandbox image. Off, it shows the Container runtime's
+    /// pull command to run instead. Read globally by the Daemon, so it can't be set per profile.
+    #[serde(default = "default_true")]
+    #[setting(
+        label = "Allow image pull from web",
+        widget = "toggle",
+        web = "local_only:pulls images on the host as the daemon user",
+        global_only,
+        advanced
+    )]
+    pub allow_image_pull: bool,
+
     /// CPU limit for containers (e.g. "4").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[setting(
@@ -2979,6 +2991,7 @@ impl Default for SandboxConfig {
             extra_volumes: Vec::new(),
             environment: default_sandbox_environment(),
             auto_cleanup: true,
+            allow_image_pull: true,
             cpu_limit: None,
             memory_limit: None,
             port_mappings: Vec::new(),

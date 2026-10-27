@@ -9,9 +9,7 @@ use std::time::Duration;
 
 use agent_of_empires::cli::definition::Cli;
 use agent_of_empires::cli::runtime_read::classify;
-use agent_of_empires::cli::runtime_read::{
-    attempt, ReadOutcome, ReadRequestSource, ScopedCommand, ScopedRead,
-};
+use agent_of_empires::cli::runtime_read::{attempt, ReadOutcome, ReadRequestSource, ScopedCommand};
 use agent_of_empires::server::test_support::{
     build_test_app_state_with_policy, RuntimeUdsTestServer,
 };
@@ -48,19 +46,14 @@ fn local_source() -> ReadRequestSource {
     }
 }
 
-async fn attempt_read(command: ScopedCommand<'_>, source: &ReadRequestSource) -> ScopedRead {
+async fn attempt_read(command: ScopedCommand<'_>, source: &ReadRequestSource) -> ReadOutcome {
     tokio::time::timeout(Duration::from_secs(20), attempt(command, source))
         .await
         .expect("the read completes inside the establishment and exchange budgets")
 }
 
 async fn read(command: ScopedCommand<'_>) -> ReadOutcome {
-    match attempt_read(command, &local_source()).await {
-        ScopedRead::Answered(outcome) => outcome,
-        ScopedRead::NoLocalPublication(notice) => {
-            panic!("a live daemon publication must answer, not a local take-over ({notice:?})")
-        }
-    }
+    attempt_read(command, &local_source()).await
 }
 
 /// A live daemon on its own socket serves the read, and the rendered output
@@ -173,7 +166,8 @@ async fn stowed_and_search_only_namespaces_support_absent_and_served_reads() {
         if !stowed {
             std::fs::set_permissions(base, original_mode).unwrap();
         }
-        assert!(matches!(absent, ScopedRead::NoLocalPublication(None)));
+        assert_eq!(absent.exit, 2);
+        assert_eq!(absent.stdout, None);
         let server = published.expect("valid namespace layout publishes");
         let artifact_dir = if stowed { &target } else { &app };
         assert!(std::fs::metadata(artifact_dir.join("runtime.sock"))
@@ -187,9 +181,7 @@ async fn stowed_and_search_only_namespaces_support_absent_and_served_reads() {
         let served = attempt_read(command, &source).await;
         state.shutdown.cancel();
         let _guards = server.join().await;
-        let ScopedRead::Answered(outcome) = served else {
-            panic!("published namespace must answer over UDS");
-        };
+        let outcome = served;
         assert_eq!(outcome.exit, 0, "stderr: {:?}", outcome.stderr);
         let rows: serde_json::Value =
             serde_json::from_str(outcome.stdout.as_deref().unwrap()).unwrap();
@@ -244,21 +236,19 @@ async fn every_scoped_command_and_alias_round_trips_over_uds() {
     let _fixture = server.join().await;
 }
 
-/// With no daemon publishing, the local transport reports that the command is
-/// the caller's to run, rather than an error the CLI would have to interpret.
+/// A missing publication is a final refusal for the transport-only reader.
 #[tokio::test]
 #[serial_test::serial]
-async fn no_daemon_publication_leaves_the_command_to_the_local_path() {
+async fn no_daemon_publication_refuses_without_a_local_answer() {
     let _namespace = TempAppDir::new();
     let cli = Cli::try_parse_from(["aoe", "list"]).expect("list parses");
     let command = classify(cli.command.as_ref()).expect("list is a scoped read");
 
     let read = attempt_read(command, &local_source()).await;
 
-    assert!(
-        matches!(read, ScopedRead::NoLocalPublication(_)),
-        "an app dir no daemon published into must not read as an error"
-    );
+    assert_eq!(read.exit, 2);
+    assert_eq!(read.stdout, None);
+    assert!(read.stderr.unwrap().contains("marker_missing"));
 }
 
 /// Empty environment selections preserve the local profile and transport semantics.
@@ -294,12 +284,7 @@ async fn an_empty_environment_selection_is_answered_not_refused() {
         };
         let cli = Cli::try_parse_from(["aoe", "list"]).expect("list parses");
         let command = classify(cli.command.as_ref()).expect("list is a scoped read");
-        let outcome = match attempt_read(command, &source).await {
-            ScopedRead::Answered(outcome) => outcome,
-            ScopedRead::NoLocalPublication(notice) => {
-                panic!("{label}: a live daemon must answer, not a local take-over ({notice:?})")
-            }
-        };
+        let outcome = attempt_read(command, &source).await;
         assert_eq!(outcome.exit, 0, "{label}: {:?}", outcome.stderr);
         assert!(
             outcome
@@ -323,12 +308,7 @@ async fn an_empty_environment_selection_is_answered_not_refused() {
         explicit_profile: Some("   ".into()),
         env_profile: None,
     };
-    let outcome = match attempt_read(command, &source).await {
-        ScopedRead::Answered(outcome) => outcome,
-        ScopedRead::NoLocalPublication(notice) => {
-            panic!("a live daemon must answer, not a local take-over ({notice:?})")
-        }
-    };
+    let outcome = attempt_read(command, &source).await;
     assert_eq!(outcome.exit, 1, "{:?}", outcome.stderr);
     assert!(
         outcome
@@ -381,20 +361,17 @@ async fn shutdown_retracts_the_socket_and_closes_admission() {
         assert!(!app_dir.join(name).exists(), "{name} survived shutdown");
     }
     let read = attempt_read(ScopedCommand::Profile, &local_source()).await;
-    assert!(
-        matches!(read, ScopedRead::NoLocalPublication(_)),
-        "a retracted publication must not serve a read"
-    );
+    assert_eq!(read.exit, 2);
+    assert_eq!(read.stdout, None);
     use std::os::unix::fs::PermissionsExt;
     for name in ["lifetime.lock", "publisher.lock"] {
         assert!(app_dir.join(name).exists());
     }
     for changed in [app_dir.as_path(), app_dir.parent().unwrap()] {
         std::fs::set_permissions(changed, std::fs::Permissions::from_mode(0o775)).unwrap();
-        assert!(matches!(
-            attempt_read(ScopedCommand::Profile, &local_source()).await,
-            ScopedRead::NoLocalPublication(None)
-        ));
+        let absent = attempt_read(ScopedCommand::Profile, &local_source()).await;
+        assert_eq!(absent.exit, 2);
+        assert_eq!(absent.stdout, None);
         std::fs::set_permissions(changed, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 }
@@ -475,15 +452,14 @@ async fn retained_markers_without_a_live_owner_are_absent() {
     )
     .await
     .expect("retained dead markers are absence without the establishment wait");
-    assert!(
-        matches!(read, ScopedRead::NoLocalPublication(_)),
-        "retained markers with no owner must hand back to the local store"
-    );
+    assert_eq!(read.exit, 2);
+    assert_eq!(read.stdout, None);
+    assert!(read.stderr.unwrap().contains("marker_missing"));
 }
 
 #[tokio::test]
 #[serial_test::serial]
-async fn an_unpublished_writable_namespace_falls_back_but_runtime_artifacts_refuse() {
+async fn unpublished_namespaces_and_untrusted_runtime_artifacts_refuse_reads() {
     use std::os::unix::fs::PermissionsExt;
 
     for (base_mode, app_mode) in [(0o777, None), (0o777, Some(0o700)), (0o700, Some(0o775))] {
@@ -520,16 +496,8 @@ async fn an_unpublished_writable_namespace_falls_back_but_runtime_artifacts_refu
                 std::fs::write(app.join(name), b"untrusted runtime artifact").unwrap();
             }
             let result = attempt_read(ScopedCommand::Profile, &local_source()).await;
-            match (artifact, result) {
-                (None, ScopedRead::NoLocalPublication(None)) => {}
-                (Some(_), ScopedRead::Answered(outcome)) => {
-                    assert_eq!(outcome.exit, 2);
-                    assert_eq!(outcome.stdout, None);
-                }
-                (artifact, _) => {
-                    panic!("unexpected admission for {base_mode:o}/{app_mode:?}, {artifact:?}")
-                }
-            }
+            assert_eq!(result.exit, 2, "{base_mode:o}/{app_mode:?}, {artifact:?}");
+            assert_eq!(result.stdout, None);
         }
     }
 }
