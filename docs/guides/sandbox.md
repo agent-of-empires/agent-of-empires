@@ -137,6 +137,8 @@ Two official images are available:
 
 Use the dev image per session with `aoe add --sandbox-image ghcr.io/agent-of-empires/aoe-dev-sandbox:latest .`, or set `[sandbox] default_image`.
 
+A session keeps the container it was created with, so pulling a newer image only affects new sessions. To move an existing sandboxed session onto the current local image, open its context menu in the web dashboard and choose **More > Recreate container**. The container is removed and the session restarts on a new one: anything outside the working directory and the mounted folders is lost, including tools installed inside the container, and a running turn stops.
+
 ## Custom Docker Images
 
 Extend either image for project dependencies:

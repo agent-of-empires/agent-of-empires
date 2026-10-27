@@ -1783,6 +1783,23 @@
       ]
     },
     {
+      "id": "sidebar.recreate-container",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/__tests__/RecreateContainerDialog.test.tsx",
+        "src/components/__tests__/SessionRowSiblingTargets.test.tsx"
+      ],
+      "components": [
+        "web/src/components/sidebar/RecreateContainerDialog.tsx",
+        "web/src/components/sidebar/sessionActionTargets.ts",
+        "web/src/components/sidebar/SessionRowMenu.tsx",
+        "web/src/components/sidebar/SessionActions.tsx",
+        "web/src/lib/api.ts"
+      ],
+      "notes": "Offered only for a sandboxed, unarchived session that is not creating or deleting. The confirmation names what is lost, sends one POST, and stays open with the server's message on a refusal. The daemon side is covered by recreate_container_removes_the_container_before_the_agent_restarts."
+    },
+    {
       "id": "sidebar.repo-appearance",
       "kind": "mocked-playwright",
       "risk": "low",

@@ -1826,6 +1826,44 @@ pub async fn restart_session(
     .await
 }
 
+/// Restart a sandboxed session on a new container, created from the current local image. The
+/// container's filesystem outside its mounts is lost; the conversation resumes as on a restart.
+pub async fn recreate_container(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    if let Some(response) = crate::server::api::read_only_block(&state)
+        .or_else(|| crate::server::api::cityhall_block(&state))
+    {
+        return response;
+    }
+    let sandboxed = {
+        let instances = state.instances.read().await;
+        let Some(instance) = instances.iter().find(|row| row.id == id) else {
+            return crate::server::api::session_not_found();
+        };
+        instance.is_sandboxed()
+    };
+    if !sandboxed {
+        return api_error(
+            StatusCode::CONFLICT,
+            "not_sandboxed",
+            "Only a sandboxed session has a container to recreate".to_string(),
+        );
+    }
+    prepare_agent_session(
+        state,
+        id,
+        Ok(None),
+        AgentPreparation::Restart,
+        Some(Arc::new(crate::daemon::RestartSessionBody {
+            discard_sandbox_container: true,
+            ..Default::default()
+        })),
+    )
+    .await
+}
+
 /// Restart a session whose agent binary was replaced after launch (#4214). Eligibility is
 /// re-checked here because the list that offered it may be several seconds old.
 pub async fn restart_for_update(
