@@ -2744,7 +2744,8 @@
       "specs": [
         "src/components/__tests__/SandboxImageBanner.test.tsx",
         "src/components/__tests__/BannerStack.test.tsx",
-        "src/components/acp/__tests__/StartupErrorScreen.test.tsx"
+        "src/components/acp/__tests__/StartupErrorScreen.test.tsx",
+        "src/lib/api.test.ts"
       ],
       "components": [
         "web/src/components/SandboxImageBanner.tsx",

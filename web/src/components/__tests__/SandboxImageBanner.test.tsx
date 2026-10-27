@@ -226,4 +226,13 @@ describe("SandboxImageBanner", () => {
     expect(dismissSandboxImage).toHaveBeenCalledWith("sha256:new");
     expect(banner()).toBeNull();
   });
+
+  it("shows the notice again when the Daemon doesn't keep the dismissal", async () => {
+    dismissSandboxImage.mockResolvedValueOnce(false);
+    await mount(status());
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss sandbox image notice" }));
+    expect(banner()).toBeNull();
+    await pollAfter(0);
+    expect(banner()).not.toBeNull();
+  });
 });

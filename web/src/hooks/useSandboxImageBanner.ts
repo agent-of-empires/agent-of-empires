@@ -115,9 +115,13 @@ export function useSandboxImageBanner(): SandboxImageBannerView | null {
 
   if (status.state !== "available" || status.dismissed || dismissedDigest === status.remote_digest) return null;
   const digest = status.remote_digest;
+  // Hidden at once; if the Daemon didn't keep the dismissal, it shows again rather than coming back
+  // only on the next load.
   const onDismiss = () => {
     setDismissedDigest(digest);
-    void dismissSandboxImage(digest);
+    void dismissSandboxImage(digest).then((kept) => {
+      if (!kept) setDismissedDigest((current) => (current === digest ? null : current));
+    });
   };
   if (status.pull_blocked) {
     return { kind: "gated", image: status.image, command: status.pull_command, onDismiss };
