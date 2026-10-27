@@ -19,7 +19,8 @@ use serde_json::json;
 use super::{api_error, AppState};
 use crate::plugin;
 use crate::plugin::install::OperationLog;
-use crate::server::auth::{handler_elevated, AuthenticatedSession, LocalAuthorization};
+use crate::server::auth::{handler_elevated, AuthenticatedSession};
+use crate::server::principal::Principal;
 
 const CAP_COMPOSER_READ: &str = "composer.read";
 const CAP_SESSION_READ: &str = "session.read";
@@ -28,7 +29,7 @@ const CAP_SESSION_READ: &str = "session.read";
 async fn mutation_gate(
     state: &AppState,
     session: Option<&AuthenticatedSession>,
-    local: Option<&LocalAuthorization>,
+    local: Option<&Principal>,
 ) -> Result<(), Response> {
     if state.read_only {
         return Err(super::read_only_response());
@@ -37,7 +38,7 @@ async fn mutation_gate(
     if let Some(resp) = super::cityhall_block(state) {
         return Err(resp);
     }
-    if !handler_elevated(state, session, local.is_some()).await {
+    if !handler_elevated(state, session, local.is_some_and(Principal::is_local_peer)).await {
         return Err(super::api_error_with_code_header(
             crate::daemon::ApiErrorCode::ElevationRequired,
             "Re-enter the passphrase to continue",
@@ -651,7 +652,7 @@ pub struct ApplyUpdateBody {
 pub async fn apply_plugin_update(
     State(state): State<std::sync::Arc<AppState>>,
     session: Option<axum::Extension<AuthenticatedSession>>,
-    loopback: Option<axum::Extension<LocalAuthorization>>,
+    loopback: Option<axum::Extension<Principal>>,
     Path(id): Path<String>,
     Json(body): Json<ApplyUpdateBody>,
 ) -> Response {
@@ -684,7 +685,7 @@ pub struct DismissUpdateBody {
 pub async fn dismiss_plugin_update(
     State(state): State<std::sync::Arc<AppState>>,
     session: Option<axum::Extension<AuthenticatedSession>>,
-    loopback: Option<axum::Extension<LocalAuthorization>>,
+    loopback: Option<axum::Extension<Principal>>,
     Path(id): Path<String>,
     Json(body): Json<DismissUpdateBody>,
 ) -> Response {
@@ -711,7 +712,7 @@ pub struct SetEnabledBody {
 pub async fn set_plugin_enabled(
     State(state): State<std::sync::Arc<AppState>>,
     session: Option<axum::Extension<AuthenticatedSession>>,
-    loopback: Option<axum::Extension<LocalAuthorization>>,
+    loopback: Option<axum::Extension<Principal>>,
     Path(id): Path<String>,
     Json(body): Json<SetEnabledBody>,
 ) -> Response {
@@ -742,7 +743,7 @@ pub async fn set_plugin_enabled(
 pub async fn restart_plugin_worker(
     State(state): State<std::sync::Arc<AppState>>,
     session: Option<axum::Extension<AuthenticatedSession>>,
-    loopback: Option<axum::Extension<LocalAuthorization>>,
+    loopback: Option<axum::Extension<Principal>>,
     Path(id): Path<String>,
 ) -> Response {
     if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.as_deref()).await {
@@ -965,7 +966,7 @@ pub struct StartInstallBody {
 pub async fn start_plugin_install(
     State(state): State<std::sync::Arc<AppState>>,
     session: Option<axum::Extension<AuthenticatedSession>>,
-    loopback: Option<axum::Extension<LocalAuthorization>>,
+    loopback: Option<axum::Extension<Principal>>,
     Json(body): Json<StartInstallBody>,
 ) -> Response {
     if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.as_deref()).await {
@@ -992,7 +993,7 @@ pub async fn start_plugin_install(
 pub async fn start_plugin_uninstall(
     State(state): State<std::sync::Arc<AppState>>,
     session: Option<axum::Extension<AuthenticatedSession>>,
-    loopback: Option<axum::Extension<LocalAuthorization>>,
+    loopback: Option<axum::Extension<Principal>>,
     Path(id): Path<String>,
 ) -> Response {
     if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.as_deref()).await {

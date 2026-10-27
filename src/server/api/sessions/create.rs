@@ -659,12 +659,12 @@ pub(super) async fn wait_until_left_starting(
 pub async fn create_session(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<CreateSessionQuery>,
-    local: Option<axum::Extension<crate::server::auth::LocalAuthorization>>,
+    local: Option<axum::Extension<crate::server::principal::Principal>>,
     body: Result<Json<CreateSessionBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     let local_owner = matches!(
         local.as_deref(),
-        Some(crate::server::auth::LocalAuthorization::UnixOwner(_))
+        Some(crate::server::principal::Principal::LocalPeer { .. })
     );
     if state.read_only {
         return crate::server::api::read_only_response();
@@ -1318,7 +1318,7 @@ fn create_failure(e: &anyhow::Error) -> Option<crate::server::create_progress::C
 pub async fn create_session_progress(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
-    local: Option<axum::Extension<crate::server::auth::LocalAuthorization>>,
+    local: Option<axum::Extension<crate::server::principal::Principal>>,
 ) -> impl IntoResponse {
     match state.create_progress.snapshot(&key, local.as_deref()) {
         Some(snapshot) => Json(snapshot).into_response(),

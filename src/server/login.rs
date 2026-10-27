@@ -1167,10 +1167,8 @@ pub async fn login_status_handler(
     request: axum::extract::Request,
 ) -> Json<serde_json::Value> {
     if matches!(
-        request
-            .extensions()
-            .get::<super::auth::LocalAuthorization>(),
-        Some(super::auth::LocalAuthorization::UnixOwner(_))
+        request.extensions().get::<super::principal::Principal>(),
+        Some(super::principal::Principal::LocalPeer { .. })
     ) {
         return Json(serde_json::json!({
             "required": false, "authenticated": true, "elevated": true,

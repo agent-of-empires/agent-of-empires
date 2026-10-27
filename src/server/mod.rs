@@ -24,6 +24,7 @@ mod pane;
 pub mod passkeys;
 pub(crate) mod peer;
 pub mod plugin_status;
+pub mod principal;
 pub mod push;
 pub mod push_send;
 pub mod rate_limit;
