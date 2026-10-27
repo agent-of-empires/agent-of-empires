@@ -151,6 +151,8 @@ struct Construction {
     retire_previous: std::sync::atomic::AtomicBool,
     spawn_attestor:
         Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<bool>>>>,
+    /// Wall-clock ms; atomic only so tests can backdate it.
+    admitted_at_ms: std::sync::atomic::AtomicI64,
 }
 
 impl Default for Construction {
@@ -171,6 +173,9 @@ impl Default for Construction {
             previous_runner: Mutex::default(),
             retire_previous: std::sync::atomic::AtomicBool::new(false),
             spawn_attestor: Mutex::default(),
+            admitted_at_ms: std::sync::atomic::AtomicI64::new(
+                chrono::Utc::now().timestamp_millis(),
+            ),
         }
     }
 }
@@ -200,6 +205,20 @@ pub(crate) struct AdapterRetirementRoute {
 }
 
 impl Lease {
+    /// When this epoch's start was admitted, in ms since the Unix epoch.
+    pub(crate) fn admitted_at_ms(&self) -> i64 {
+        self.construction
+            .admitted_at_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_backdate_admission(&self, ms: i64) {
+        self.construction
+            .admitted_at_ms
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// An attach observes the original runner until installation or an explicit stop.
     pub(crate) fn is_borrowed_attach(&self) -> bool {
         !self
