@@ -408,8 +408,9 @@ impl RestartEffect {
         let (link, passphrase) = match mode {
             ServeMode::Local => {
                 let hosts_stay = urls.iter().all(|u| {
-                    link_host(&u.url)
-                        .is_some_and(|host| probe.local_hosts.iter().any(|h| h == host))
+                    link_host(&u.url).is_some_and(|host| {
+                        is_loopback_host(host) || probe.local_hosts.iter().any(|h| h == host)
+                    })
                 });
                 let port_stays = probe
                     .port
@@ -481,6 +482,15 @@ fn link_host(url: &str) -> Option<&str> {
             .rsplit_once(':')
             .map_or(authority, |(host, _)| host),
     )
+}
+
+/// A Local restart binds 0.0.0.0, which keeps these reachable. IPv6 is not covered: it is not
+/// bound, and `link_host` does not parse bracketed hosts.
+fn is_loopback_host(host: &str) -> bool {
+    host == "localhost"
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// The explicit port in a Local link such as `http://192.168.1.42:51234/?token=…`.

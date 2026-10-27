@@ -1204,6 +1204,7 @@ mod tests {
         use PendingConfirm::{NewPassphrase as G, Restart as R};
         use ServeMode::{Local, Tunnel};
         let lan = "http://192.168.1.42:8080/?token=t";
+        let loopback = "http://127.0.0.1:8080/?token=t";
         let funnel = "https://host.tailnet.ts.net/?token=t";
         let named = "https://aoe.example.com/?token=t";
         let quick = "https://a-b-c.trycloudflare.com/?token=t";
@@ -1295,6 +1296,23 @@ mod tests {
                 on,
                 R,
                 moved.clone(),
+            ),
+            // The restart binds 0.0.0.0, so a loopback link survives with its LAN host gone.
+            (
+                Local,
+                loopback,
+                probe(false, Some(8080), false, false, true, false),
+                on,
+                R,
+                stays.clone(),
+            ),
+            (
+                Local,
+                loopback,
+                probe(false, Some(51234), false, false, true, false),
+                on,
+                R,
+                local_moved.clone(),
             ),
             // A Local daemon behind AOE_SERVE_PASSPHRASE has LAN Devices sign in, so the same
             // host and port keep them only when the sign-ins persist.
