@@ -387,6 +387,112 @@ fn validate_legacy_manager_pid(contents: &str, expected: u32) -> anyhow::Result<
 mod legacy_inventory_boundary_tests {
     use super::*;
 
+    type BeforeOpen = Box<dyn Fn(&std::ffi::OsStr)>;
+
+    thread_local! {
+        static BEFORE_OPEN: std::cell::RefCell<Option<BeforeOpen>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
+    struct RestoreBeforeOpen(Option<BeforeOpen>);
+
+    impl Drop for RestoreBeforeOpen {
+        fn drop(&mut self) {
+            BEFORE_OPEN.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+
+    pub(super) fn before_open(name: &std::ffi::OsStr) {
+        BEFORE_OPEN.with(|slot| {
+            if let Some(before_open) = slot.borrow().as_ref() {
+                before_open(name);
+            }
+        });
+    }
+
+    #[test]
+    fn vanished_foreign_cgroup_does_not_hide_surviving_scopes() {
+        let prefix = "aoe-session-vanishing-fixture-";
+        for population in [None, Some("populated 1\n"), Some("populated unknown\n")] {
+            let root = tempfile::tempdir().unwrap();
+            let vanished = root.path().join("vanishing.service");
+            fs::create_dir(&vanished).unwrap();
+            if let Some(population) = population {
+                let scope = root.path().join(format!("{prefix}1700000000000.scope"));
+                fs::create_dir(&scope).unwrap();
+                fs::write(scope.join("cgroup.events"), population).unwrap();
+            }
+            let observed = std::rc::Rc::new(std::cell::Cell::new(0));
+            let count = observed.clone();
+            let _restore = RestoreBeforeOpen(BEFORE_OPEN.with(|slot| {
+                slot.replace(Some(Box::new(move |name| {
+                    if name == "vanishing.service" {
+                        count.set(count.get() + 1);
+                        fs::remove_dir(&vanished).unwrap();
+                    }
+                })))
+            }));
+            let result = legacy_scope_cgroups_clear(
+                open_cgroup_directory(root.path()).unwrap(),
+                prefix,
+                &std::collections::HashSet::new(),
+            );
+            match population {
+                None => assert!(result.unwrap()),
+                Some("populated 1\n") => assert!(!result.unwrap()),
+                _ => assert!(result.is_err()),
+            }
+            // The clear case must observe the vanished entry before proving absence.
+            if population.is_none() {
+                assert_eq!(observed.get(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn replaced_cgroup_directory_does_not_prove_absence() {
+        use std::os::unix::fs::symlink;
+        for link in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let target = tempfile::tempdir().unwrap();
+            let target_path = target.path().to_owned();
+            let replaced = root.path().join("replaced.service");
+            fs::create_dir(&replaced).unwrap();
+            let observed = std::rc::Rc::new(std::cell::Cell::new(false));
+            let count = observed.clone();
+            let _restore = RestoreBeforeOpen(BEFORE_OPEN.with(|slot| {
+                slot.replace(Some(Box::new(move |name| {
+                    assert_eq!(name, "replaced.service");
+                    fs::remove_dir(&replaced).unwrap();
+                    if link {
+                        symlink(&target_path, &replaced).unwrap();
+                    } else {
+                        fs::write(&replaced, "").unwrap();
+                    }
+                    count.set(true);
+                })))
+            }));
+            assert!(legacy_scope_cgroups_clear(
+                open_cgroup_directory(root.path()).unwrap(),
+                "aoe-session-replacement-fixture-",
+                &std::collections::HashSet::new(),
+            )
+            .is_err());
+            assert!(observed.get());
+        }
+    }
+
+    #[test]
+    fn native_kernel_inventory_rejects_a_fixture_filesystem() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("cgroup.controllers"), "").unwrap();
+        let prefix = "aoe-session-native-boundary-fixture-";
+        assert!(kernel_scope_inventory_clear_at(root.path(), prefix, false).unwrap());
+        assert!(require_cgroup2(&open_cgroup_directory(root.path()).unwrap()).is_err());
+        assert!(kernel_scope_inventory_clear_at(root.path(), prefix, true).is_err());
+    }
+
     #[test]
     fn mount_boundary_ignores_foreign_changes_but_rejects_cgroup_changes() {
         let root = "31 20 0:27 / /sys/fs/cgroup rw - cgroup2 cgroup rw";
@@ -814,8 +920,9 @@ fn require_cgroup2(directory: &fs::File) -> anyhow::Result<()> {
         std::io::Error::last_os_error()
     );
     // SAFETY: fstatfs succeeded and initialized stat.
+    let filesystem_type = unsafe { stat.assume_init() }.f_type;
     anyhow::ensure!(
-        unsafe { stat.assume_init() }.f_type == libc::CGROUP2_SUPER_MAGIC,
+        i128::from(filesystem_type) == i128::from(libc::CGROUP2_SUPER_MAGIC),
         "Scope inventory is not a cgroup2 filesystem"
     );
     Ok(())
@@ -912,13 +1019,18 @@ fn legacy_scope_cgroups_clear(
             continue;
         }
         let name = entry.file_name();
-        let child: fs::File = nix::fcntl::openat(
+        #[cfg(test)]
+        legacy_inventory_boundary_tests::before_open(&name);
+        let child: fs::File = match nix::fcntl::openat(
             &*directory,
             name.as_os_str(),
             LegacyRuntimeDirectories::flags(),
             nix::sys::stat::Mode::empty(),
-        )?
-        .into();
+        ) {
+            Ok(child) => child.into(),
+            Err(nix::errno::Errno::ENOENT) => continue,
+            Err(error) => return Err(error.into()),
+        };
         if name.as_bytes().starts_with(prefix.as_bytes())
             && name.as_bytes().ends_with(b".scope")
             && !retained.contains(name.to_str().context("Non-UTF8 matching scope name")?)
