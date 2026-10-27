@@ -233,16 +233,16 @@ export function NestedGroupList({
         onToggle={() => onToggleGroup(repo.id)}
         pinnable
         createsInRepo
-        rows={rowsId(`repo:${repo.id}`)}
+        rows={rowsId(`repo:${encodeURIComponent(repo.id)}`)}
       />
-      <GroupRows id={rowsId(`repo:${repo.id}`)}>
+      <GroupRows id={rowsId(`repo:${encodeURIComponent(repo.id)}`)}>
         {(ctx.hasFilter || !repo.collapsed) &&
           subgroups.filter(sidebarGroupHasLiveWorkspace).map((sg) => {
             const groupPath = sg.groupPath ?? "";
             const full =
               fullGroups.find((n) => n.repo.id === repo.id)?.subgroups.find((s) => (s.groupPath ?? "") === groupPath) ??
               sg;
-            // Each part is encoded, so a `::` inside an id or Group path can't collide.
+            // Every id part is encoded, top level included, so `::` is only ever the separator.
             const rows = rowsId(`repo:${encodeURIComponent(repo.id)}::${encodeURIComponent(groupPath)}`);
             return (
               <IndentedLevel key={`${repo.id}::${groupPath}`} testId="sidebar-nested-subgroup" repoId={repo.id}>
@@ -288,9 +288,9 @@ export function OrgGroupList({
         full={org}
         visible={repos.flatMap((r) => r.workspaces)}
         onToggle={() => onToggleOrg(org.id)}
-        rows={rowsId(`org:${org.id}`)}
+        rows={rowsId(`org:${encodeURIComponent(org.id)}`)}
       />
-      <GroupRows id={rowsId(`org:${org.id}`)}>
+      <GroupRows id={rowsId(`org:${encodeURIComponent(org.id)}`)}>
         {(ctx.hasFilter || !org.collapsed) &&
           repos.filter(sidebarGroupShouldRender).map((repo) => {
             const full = fullRepoById.get(`${org.id}::${repo.id}`) ?? repo;
