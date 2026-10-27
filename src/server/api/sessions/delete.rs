@@ -919,7 +919,7 @@ async fn empty_trash_owned(state: Arc<AppState>, profile: String) -> axum::respo
             .read()
             .await
             .iter()
-            .find(|row| row.id == id && row.is_trashed())
+            .find(|row| row.id == id && row.is_trashed() && row.source_profile == profile)
             .cloned();
         let Some(instance) = instance else {
             continue;

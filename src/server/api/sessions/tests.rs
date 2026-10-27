@@ -5186,7 +5186,7 @@ async fn permanent_deletion_waits_for_an_in_flight_submission() {
         "a delete must not tear a session down under an in-flight submission"
     );
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(10), claims.recv())
+        tokio::time::timeout(std::time::Duration::from_secs(10), claims.recv())
             .await
             .expect("contender must reach submission claim")
             .expect("submission claim watcher must remain open"),
@@ -5198,7 +5198,7 @@ async fn permanent_deletion_waits_for_an_in_flight_submission() {
         "the session must not even be marked Deleting yet"
     );
     drop(delivering);
-    tokio::time::timeout(Duration::from_secs(10), delete)
+    tokio::time::timeout(std::time::Duration::from_secs(10), delete)
         .await
         .expect("the delete lands once the submission releases the session");
 
@@ -5233,7 +5233,7 @@ async fn permanent_deletion_waits_for_an_in_flight_submission() {
         "sess-3650-owner"
     );
     drop(delivering);
-    tokio::time::timeout(Duration::from_secs(10), workspace)
+    tokio::time::timeout(std::time::Duration::from_secs(10), workspace)
         .await
         .expect("the workspace teardown lands once the submission releases");
 
@@ -5281,7 +5281,7 @@ async fn permanent_deletion_waits_for_an_in_flight_submission() {
         "no row may be marked Deleting while the sibling's submission is in flight"
     );
     drop(delivering);
-    tokio::time::timeout(Duration::from_secs(10), workspace)
+    tokio::time::timeout(std::time::Duration::from_secs(10), workspace)
         .await
         .expect("the workspace teardown lands once the sibling submission releases");
 }
@@ -5398,7 +5398,7 @@ async fn worker_stopping_handlers_wait_for_an_in_flight_submission() {
         );
 
         drop(delivering);
-        tokio::time::timeout(Duration::from_secs(10), handler)
+        tokio::time::timeout(std::time::Duration::from_secs(10), handler)
             .await
             .unwrap_or_else(|_| panic!("{which} must finish once the submission releases"));
     }
@@ -6717,7 +6717,7 @@ async fn archive_persists_under_the_lifecycle_lock() -> anyhow::Result<()> {
     );
 
     drop(send_lock);
-    let response = tokio::time::timeout(Duration::from_secs(10), archive)
+    let response = tokio::time::timeout(std::time::Duration::from_secs(10), archive)
         .await
         .expect("the archive lands once the lock is free")
         .expect("archive request");
@@ -6790,7 +6790,7 @@ async fn group_archive_gates_each_member_on_its_own_lifecycle_lock() -> anyhow::
         .map(|id| (id.clone(), archive_task(id)))
         .collect();
     for (id, member) in group.drain(..) {
-        let response = tokio::time::timeout(Duration::from_secs(10), member)
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), member)
             .await
             .unwrap_or_else(|_| panic!("{id}: a member must not wait on a sibling's lock"))
             .expect("archive request");
@@ -6803,7 +6803,7 @@ async fn group_archive_gates_each_member_on_its_own_lifecycle_lock() -> anyhow::
     );
 
     drop(send_lock);
-    let response = tokio::time::timeout(Duration::from_secs(10), &mut waiting)
+    let response = tokio::time::timeout(std::time::Duration::from_secs(10), &mut waiting)
         .await
         .expect("the held member lands once its lock is free")
         .expect("archive request");
@@ -10134,4 +10134,78 @@ async fn empty_trash_refuses_an_unknown_profile() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// A row moved to another profile while an earlier row is purging must survive.
+#[tokio::test]
+async fn empty_trash_skips_a_row_moved_to_another_profile_mid_purge() -> anyhow::Result<()> {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let root = crate::session::get_app_dir()?;
+    crate::session::purge_owners::initialize(&root)?;
+    crate::tmux::tool_retirement::initialize(&root)?;
+    let (profile, other) = ("empty-trash-race", "empty-trash-race-dest");
+    let project = tempfile::tempdir()?;
+    let row = |id: &str, profile: &str| {
+        let mut row = Instance::new(id, project.path().to_str().unwrap());
+        row.id = id.into();
+        row.source_profile = profile.into();
+        row.trash();
+        row
+    };
+    let (first, second) = (row("a-first", profile), row("b-second", profile));
+    crate::server::test_support::seed_instances_on_disk_for_test(
+        profile,
+        vec![first.clone(), second.clone()],
+    );
+    crate::server::test_support::seed_instances_on_disk_for_test(other, Vec::new());
+    let state =
+        crate::server::test_support::build_test_app_state(vec![first.clone(), second.clone()]);
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+
+    let submission = state.session_service.prompt_submission(&first.id).await;
+    let mut claims = state.session_service.watch_submission_claims();
+    let request = tokio::spawn(empty_trash(
+        State(state.clone()),
+        Ok(Json(crate::daemon::EmptyTrashBody {
+            profile: profile.into(),
+        })),
+    ));
+    let claimed = tokio::time::timeout(std::time::Duration::from_secs(10), claims.recv())
+        .await?
+        .expect("claim channel open");
+    assert_eq!(claimed, first.id, "the handler is parked on the first row");
+    let mut moved = second.clone();
+    moved.source_profile = other.into();
+    crate::server::test_support::seed_instances_on_disk_for_test(profile, vec![first.clone()]);
+    crate::server::test_support::seed_instances_on_disk_for_test(other, vec![moved.clone()]);
+    state
+        .instances
+        .write()
+        .await
+        .iter_mut()
+        .find(|row| row.id == second.id)
+        .unwrap()
+        .source_profile = other.into();
+    drop(submission);
+
+    let response = tokio::time::timeout(std::time::Duration::from_secs(10), request).await??;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let purged: Vec<_> = body["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(purged, [first.id.as_str()], "{body}");
+    assert!(body["failures"].as_array().unwrap().is_empty(), "{body}");
+    assert!(state
+        .instances
+        .read()
+        .await
+        .iter()
+        .any(|row| row.id == second.id && row.is_trashed()));
+    Ok(())
 }
