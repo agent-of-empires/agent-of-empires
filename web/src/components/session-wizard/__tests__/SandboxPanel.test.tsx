@@ -24,6 +24,15 @@ describe("SandboxPanel env lists", () => {
     expect(onChange).toHaveBeenCalledWith("hookEnv", ["H=3"]);
     expect(onChange).not.toHaveBeenCalledWith("extraEnv", expect.anything());
   });
+
+  it("names each list's controls so the two lists are distinguishable", () => {
+    const { onChange } = renderPanel({ extraEnv: ["A=1"], hookEnv: ["H=2"] });
+    expect(screen.getByRole("group", { name: "Host hook environment" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Remove Host hook environment 1" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add Container environment" }));
+    expect(onChange).toHaveBeenCalledWith("hookEnv", []);
+    expect(onChange).toHaveBeenCalledWith("extraEnv", ["A=1", ""]);
+  });
 });
 
 describe("buildCreateRequest hook_env", () => {

@@ -1145,7 +1145,8 @@
       "specs": [
         "tests/wizard.spec.ts",
         "tests/wizard-project.spec.ts",
-        "src/components/session-wizard/__tests__/SessionWizard.test.tsx"
+        "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
+        "src/components/session-wizard/__tests__/SandboxPanel.test.tsx"
       ],
       "components": [
         "web/src/components/DirectoryBrowser.tsx",
