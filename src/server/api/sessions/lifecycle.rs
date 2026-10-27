@@ -3220,11 +3220,7 @@ mod durable_stop_tests {
                 .await;
             match reason {
                 "provider_switch" => state.acp_supervisor.shutdown(&row.id).await.unwrap(),
-                "idle" => state
-                    .acp_supervisor
-                    .shutdown_idle(&row.id, None)
-                    .await
-                    .unwrap(),
+                "idle" => state.acp_supervisor.shutdown_idle(&row.id).await.unwrap(),
                 "detach" => state.acp_supervisor.detach_all().await,
                 _ => unreachable!(),
             }

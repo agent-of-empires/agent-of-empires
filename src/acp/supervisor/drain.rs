@@ -1481,7 +1481,7 @@ mod tests {
             .await
             .expect("the replacement freezes proof before its stop gate");
         assert_eq!(sup.worker_state("s-resp").await, AcpWorkerState::Resuming);
-        sup.shutdown_idle("s-resp", None).await.expect("cancel");
+        sup.shutdown_idle("s-resp").await.expect("cancel");
         gate.open.notify_one();
 
         tokio::time::timeout(Duration::from_secs(5), drain)
@@ -2067,7 +2067,7 @@ mod tests {
             flagged = sup.take_respawned_in_place();
         }
         assert_eq!(flagged, vec!["s-crash".to_string()]);
-        sup.shutdown_idle("s-crash", None).await.expect("shutdown");
+        sup.shutdown_idle("s-crash").await.expect("shutdown");
     }
 
     #[tokio::test]
@@ -2228,7 +2228,7 @@ mod tests {
             .host_environment
             .contains(&("HOOK_VALUE".into(), "kept".into())));
 
-        sup.shutdown_idle("s-store", None).await.expect("shutdown");
+        sup.shutdown_idle("s-store").await.expect("shutdown");
         held_senders.lock().unwrap().clear();
         tokio::time::timeout(Duration::from_secs(5), drain)
             .await
