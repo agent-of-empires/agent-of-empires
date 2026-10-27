@@ -2318,7 +2318,9 @@ mod tests {
             declared.to_str()
         );
 
-        sup.shutdown_idle("s-declared").await.expect("shutdown");
+        sup.shutdown_idle("s-declared", None)
+            .await
+            .expect("shutdown");
         held_senders.lock().unwrap().clear();
         tokio::time::timeout(Duration::from_secs(5), drain)
             .await
