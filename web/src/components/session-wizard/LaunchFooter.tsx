@@ -1,6 +1,7 @@
 import { useEffect, type ReactNode } from "react";
 import { useServerDown, OFFLINE_TITLE } from "../../lib/connectionState";
 import { hasFinePointer } from "../../lib/platform";
+import { launchEligible } from "./createRequest";
 
 interface LaunchData {
   path: string;
@@ -42,9 +43,7 @@ export function LaunchFooter({
   held = false,
 }: Props) {
   const offline = useServerDown();
-  // Scratch and name-only sessions get their directory from the server.
-  const canSubmit =
-    defaultsReady && !isSubmitting && !held && !offline && (nameOnly || data.scratch || !!data.path) && !!data.tool;
+  const canSubmit = !isSubmitting && !held && launchEligible(data, { ready: defaultsReady, offline, nameOnly });
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {

@@ -20,7 +20,7 @@ import {
 import { agent } from "./fixtures";
 import { toastBus } from "../../../lib/toastBus";
 import { startPendingCreates } from "../../../lib/pendingCreates";
-import type { DockerStatusResponse } from "../../../lib/types";
+import type { AgentInfo, DockerStatusResponse } from "../../../lib/types";
 
 const createSession = vi.fn();
 const reviewCreationTrust = vi.fn();
@@ -1274,7 +1274,8 @@ describe("SessionWizard create failures", () => {
     expect(screen.queryByTestId("create-failure-retry_runtime")).toBeNull();
   });
 
-  it("a background failure toasts its title and reference, and Reopen restores the box", async () => {
+  /** Backgrounds a create that then fails with `sent`, and returns what Reopen hands the next wizard. */
+  const backgroundFailure = async (sent: ReturnType<typeof failure>, tool = "claude") => {
     const toastAction = vi.fn();
     toastBus.handler = { push: vi.fn(), error: vi.fn(), info: vi.fn(), openLink: vi.fn(), action: toastAction };
     let finish!: (r: unknown) => void;
@@ -1287,34 +1288,99 @@ describe("SessionWizard create failures", () => {
         onCreated={vi.fn()}
         onCreatedInBackground={vi.fn()}
         onReopenFailure={onReopenFailure}
-        prefill={{ path: "/tmp/proj", tool: "claude" }}
+        prefill={{ path: "/tmp/proj", tool }}
       />,
     );
     await launch();
     fireEvent.click(await screen.findByText("Continue in background", undefined, { timeout: 3000 }));
+    await act(async () => finish(sent));
+    await waitFor(() => expect(toastAction).toHaveBeenCalledOnce());
+    toastBus.handler = null;
+    const [message, label, reopen] = toastAction.mock.calls[0]!;
+    reopen();
+    cleanup();
+    return { message, label, restore: onReopenFailure.mock.calls[0]![0] };
+  };
+
+  it("a background failure toasts its title and reference, and Reopen restores the box", async () => {
     const sent = failure(
       "working_dir_missing",
       "preparing",
       "The Working directory doesn't exist where the Daemon runs.",
     );
-    await act(async () => finish(sent));
-    await waitFor(() => expect(toastAction).toHaveBeenCalledOnce());
-    const [message, label, reopen] = toastAction.mock.calls[0]!;
+    const { message, label, restore } = await backgroundFailure(sent);
     expect(message).toBe(
       "Session was not created: The Working directory is missing. Reference 3f9c1a2b… · in debug.log",
     );
     expect(label).toBe("Reopen");
-    reopen();
-    const restore = onReopenFailure.mock.calls[0]![0];
     expect(restore.failure).toEqual(sent.failure);
     expect(restore.data.path).toBe("/tmp/proj");
-    toastBus.handler = null;
 
-    cleanup();
     render(<SessionWizard servedProfile="default" onClose={vi.fn()} onCreated={vi.fn()} restore={restore} />);
     expect(box().textContent).toContain("The Working directory is missing");
     expect(screen.getByTestId("wizard-project-row").textContent).toContain("not found where the Daemon runs");
     fireEvent.click(screen.getByTestId("create-failure-choose_project"));
     expect(screen.getByText("Back")).toBeTruthy();
+  });
+
+  // Try again sends the form as it stands, so it waits for the same loads as Launch.
+  it.each(["a switched Profile's defaults", "a reopened custom Agent's metadata"])(
+    "Try again waits for %s, then sends the resolved form",
+    async (pending) => {
+      const tryAgain = () => screen.getByTestId("create-failure-try_again") as HTMLButtonElement;
+      const helper = agent("helper", { kind: "custom" });
+      let release!: () => void;
+      if (pending === "a switched Profile's defaults") {
+        vi.mocked(fetchProfiles).mockResolvedValueOnce([
+          { name: "default", is_default: true },
+          { name: "work", is_default: false },
+        ]);
+        createSession.mockResolvedValueOnce(failure("create_failed", "preparing", "boom"));
+        renderWizard();
+        await launch();
+        await screen.findByTestId("create-failure");
+        let answer!: (v: never) => void;
+        vi.mocked(fetchSettings).mockReturnValueOnce(new Promise((r) => (answer = r)));
+        fireEvent.click(screen.getByText("Profile"));
+        fireEvent.click(screen.getByRole("radio", { name: /work/ }));
+        await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("work"));
+        release = () => answer({} as never);
+      } else {
+        vi.mocked(fetchAgents).mockResolvedValueOnce([helper]);
+        const { restore } = await backgroundFailure(failure("create_failed", "preparing", "boom"), "helper");
+        expect(payload(0).view).toBe("structured");
+        let answer!: (v: AgentInfo[]) => void;
+        vi.mocked(fetchAgents).mockReturnValueOnce(new Promise((r) => (answer = r)));
+        render(<SessionWizard servedProfile="default" onClose={vi.fn()} onCreated={vi.fn()} restore={restore} />);
+        release = () => answer([helper]);
+      }
+      const sent = createSession.mock.calls.length;
+      await waitFor(() => expect(tryAgain().disabled).toBe(true));
+      fireEvent.click(tryAgain());
+      await act(async () => {});
+      expect(createSession).toHaveBeenCalledTimes(sent);
+
+      await act(async () => release());
+      await waitFor(() => expect(tryAgain().disabled).toBe(false));
+      fireEvent.click(tryAgain());
+      await waitFor(() => expect(createSession).toHaveBeenCalledTimes(sent + 1));
+      expect(payload(sent)).toMatchObject(
+        pending === "a switched Profile's defaults" ? { profile: "work" } : { tool: "helper", view: "structured" },
+      );
+    },
+  );
+
+  it("Retry sends nothing when the form changed while it re-checked the runtime", async () => {
+    createSession.mockResolvedValueOnce(UNAVAILABLE);
+    sandboxed();
+    await launch();
+    let answer!: (v: DockerStatusResponse) => void;
+    vi.mocked(fetchDockerStatus).mockReturnValueOnce(new Promise((r) => (answer = r)));
+    fireEvent.click(await screen.findByTestId("create-failure-retry_runtime"));
+    fireEvent.click(screen.getByRole("switch", { name: "Yolo mode" }));
+    await act(async () => answer({ available: true, runtime: "docker", runtime_name: "Docker" }));
+    await act(async () => {});
+    expect(createSession).toHaveBeenCalledOnce();
+    expect(box()).toBeTruthy();
   });
 });

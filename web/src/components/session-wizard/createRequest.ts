@@ -39,3 +39,12 @@ export function buildCreateRequest(d: WizardData, acpCapable: boolean, alwaysYol
     import_acp_session_id: d.importAcpSessionId || undefined,
   };
 }
+
+/** Whether the form can be sent at all; Launch and the failure box's resends share it.
+ *  Scratch and name-only sessions get their directory from the server. */
+export function launchEligible(
+  data: Pick<WizardData, "path" | "tool" | "scratch">,
+  { ready, offline, nameOnly }: { ready: boolean; offline: boolean; nameOnly: boolean },
+): boolean {
+  return ready && !offline && (nameOnly || data.scratch || !!data.path) && !!data.tool;
+}

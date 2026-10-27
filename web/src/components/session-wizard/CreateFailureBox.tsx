@@ -13,6 +13,7 @@ export function CreateFailureBox({
   output,
   onAction,
   busy = false,
+  blocked,
 }: {
   failure: CreateFailure;
   view: FailureView;
@@ -20,6 +21,8 @@ export function CreateFailureBox({
   output: string[];
   onAction: (action: FailureAction) => void;
   busy?: boolean;
+  /** Actions the form can't run yet, such as a resend before Launch could send. */
+  blocked?: (action: FailureAction) => boolean;
 }) {
   const boxRef = useRef<HTMLDivElement | null>(null);
   const [copied, setCopied] = useState(false);
@@ -31,7 +34,7 @@ export function CreateFailureBox({
   const button = (action: FailureAction, primary: boolean) => (
     <button
       type="button"
-      disabled={busy}
+      disabled={busy || !!blocked?.(action)}
       onClick={() => onAction(action)}
       data-testid={`create-failure-${action}`}
       className={`min-h-8 rounded-md px-3 py-1.5 text-xs font-medium cursor-pointer disabled:cursor-not-allowed disabled:opacity-60 ${
