@@ -407,6 +407,7 @@ async fn run_passphrase_wall(
         );
         return (
             StatusCode::FORBIDDEN,
+            crate::daemon::ApiErrorCode::ElevationRequired.header(),
             axum::Json(serde_json::json!({
                 "error": "elevation_required",
                 "message": "Re-enter the passphrase to continue"
@@ -734,6 +735,7 @@ async fn handle_session_authenticated(
         );
         return (
             StatusCode::FORBIDDEN,
+            crate::daemon::ApiErrorCode::ElevationRequired.header(),
             axum::Json(serde_json::json!({
                 "error": "elevation_required",
                 "message": "Re-enter the passphrase to continue"
@@ -1229,6 +1231,62 @@ mod tests {
             for api in ["/api/sessions", "/api/plugins/github/pages/prs"] {
                 assert_eq!(get(api).await, StatusCode::UNAUTHORIZED, "{token:?} {api}");
             }
+        }
+    }
+
+    /// A native client steps up on the `AoE-Error-Code` header alone, so both elevation 403s
+    /// (passphrase wall and token + session) must carry it.
+    #[tokio::test]
+    async fn elevation_403_carries_the_error_code_header() {
+        use crate::server::login::LoginManager;
+        use base64::Engine;
+        use tower::ServiceExt;
+
+        let binding = [0xAB; 32];
+        for token in [None, Some("secret-token")] {
+            let login = Arc::new(LoginManager::new(Some("passphrase")));
+            let session_id = login
+                .create_session(&binding, "203.0.113.7", "test-agent")
+                .await;
+            let state = crate::server::test_support::build_test_app_state_with_policy_configured(
+                Vec::new(),
+                vec!["localhost".to_string()],
+                Vec::new(),
+                token.map(str::to_string),
+                |state| state.login_manager = login,
+            );
+            let cookie = match token {
+                Some(t) => format!("aoe_session={session_id}; aoe_token={t}"),
+                None => format!("aoe_session={session_id}"),
+            };
+            let mut req = Request::builder()
+                .method("DELETE")
+                .uri("/api/passkeys/abc123")
+                .header("host", "localhost")
+                .header("cookie", cookie)
+                .header(
+                    "x-aoe-device-binding",
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(binding),
+                )
+                .body(axum::body::Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(
+                "203.0.113.7:5555".parse::<SocketAddr>().unwrap(),
+            ));
+            let response = crate::server::test_support::build_router_for_test(state)
+                .oneshot(req)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{token:?}");
+            assert_eq!(
+                crate::daemon::ApiErrorCode::from_headers(
+                    response.status(),
+                    response.headers(),
+                    false
+                ),
+                Some(crate::daemon::ApiErrorCode::ElevationRequired),
+                "{token:?}"
+            );
         }
     }
 }

@@ -59,7 +59,7 @@ fn format_labeled(u: &ServeUrl) -> String {
     format!("{}\t{}", label, u.url)
 }
 
-fn extract_token(url: &str) -> Option<&str> {
+pub(super) fn extract_token(url: &str) -> Option<&str> {
     let query = url.split_once('?').map(|(_, q)| q)?;
     for pair in query.split('&') {
         if let Some(rest) = pair.strip_prefix("token=") {

@@ -446,6 +446,9 @@ impl TuiTestHarness {
             r#"[updates]
 update_check_mode = "off"
 
+[acp]
+structured_view = "off"
+
 {SYSTEMD_OFF}
 [app_state]
 has_seen_welcome = true

@@ -5,9 +5,13 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 use std::collections::HashSet;
 
+use crate::session::rename_transaction::{
+    apply_worktree_edit, ensure_unique, rekey_tmux, rekey_warning, worktree_edit_gate,
+    RenameRefusal, WorktreeChange,
+};
 use crate::session::{
-    acquire_session_identity_lock, duplicate_session_error, is_duplicate_session, GroupTree,
-    Instance, LifecycleOperation, ResumeIntent, StartOutcome, Status, Storage,
+    acquire_session_identity_lock, GroupTree, Instance, LifecycleOperation, ResumeIntent,
+    StartOutcome, Status, Storage,
 };
 
 #[derive(Subcommand)]
@@ -1805,7 +1809,6 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         .trim()
         .to_string();
     let new_group = args.group.as_ref().map(|g| g.trim().to_string());
-    let title_changed = old_title != effective_title;
 
     let config = crate::session::config::profile_config::resolve_config_or_warn(profile);
     let tied = inst.tie_workdir_applies(config.session.tie_workdir_to_name);
@@ -1818,18 +1821,10 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     } else {
         inst.project_path.clone()
     };
-    let pair_changed = title_changed
-        || duplicate_path.trim_end_matches('/') != inst.project_path.trim_end_matches('/');
-    if pair_changed
-        && is_duplicate_session(
-            authoritative_instances.iter(),
-            &effective_title,
-            &duplicate_path,
-            Some(&id),
-        )
-    {
-        return Err(duplicate_session_error(&effective_title));
-    }
+    let mut renamed = inst.clone();
+    renamed.title = effective_title.clone();
+    renamed.project_path = duplicate_path;
+    ensure_unique(&authoritative_instances, &inst, &renamed)?;
 
     let mut new_path: Option<String> = None;
     let mut new_branch: Option<String> = None;
@@ -1899,31 +1894,28 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
             live.source_profile = profile.to_string();
             crate::tmux::refresh_session_cache();
             live.update_status_with_metadata(None, None);
-            let container_holds = !live.status.blocks_worktree_edit()
-                && moves_worktree
-                && crate::session::worktree_edit::ensure_sandbox_container_released(
-                    &id,
-                    is_sandboxed,
-                );
-            if live.status.blocks_worktree_edit() || container_holds {
-                bail!("Stop the session before renaming its worktree directory or branch. Disable session.tie_workdir_to_name to relabel a running session.");
-            }
+            worktree_edit_gate(
+                &id,
+                is_sandboxed,
+                live.status.blocks_worktree_edit(),
+                WorktreeChange {
+                    moves_dir: moves_worktree,
+                    renames_branch,
+                },
+                false,
+            )?;
         }
-        match crate::session::worktree_edit::edit_worktree_workdir(
+        match apply_worktree_edit(
             crate::session::worktree_edit::WorktreeEditRequest {
                 worktree_info: &worktree_info,
                 current_path: std::path::Path::new(&current_path),
                 new_name: &leaf,
                 rename_branch: args.rename_branch,
             },
+            &id,
+            is_sandboxed,
         ) {
             Ok(outcome) => {
-                if outcome.new_path != std::path::Path::new(&current_path) {
-                    crate::session::worktree_edit::discard_sandbox_container_after_move(
-                        &id,
-                        is_sandboxed,
-                    );
-                }
                 if let Some(warning) = &outcome.warning {
                     eprintln!("Warning: {warning}");
                 }
@@ -2009,14 +2001,16 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         let rekey_id = id.clone();
         let rekey_old_title = persisted_old_title.clone();
         let rekey_new_title = committed_title.clone();
-        match tokio::task::spawn_blocking(move || {
-            crate::tmux::rekey_session(&rekey_id, &rekey_old_title, &rekey_new_title)
+        let warning = match tokio::task::spawn_blocking(move || {
+            rekey_tmux(&rekey_id, &rekey_old_title, &rekey_new_title)
         })
         .await
         {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => eprintln!("Warning: failed to rename tmux session: {error}"),
-            Err(error) => eprintln!("Warning: tmux rename task failed: {error}"),
+            Ok(warning) => warning,
+            Err(error) => Some(rekey_warning(&error)),
+        };
+        if let Some(warning) = warning {
+            eprintln!("Warning: {warning}");
         }
     }
 
@@ -2520,7 +2514,10 @@ mod rename_tests {
         .await
         .unwrap_err();
         assert!(
-            error.to_string().contains("while the session is active"),
+            matches!(
+                error.downcast_ref::<crate::session::rename_transaction::RenameRefusal>(),
+                Some(crate::session::rename_transaction::RenameRefusal::Running)
+            ),
             "{error}"
         );
         assert!(worktree.is_dir());
@@ -2587,7 +2584,7 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
             .session
             .tie_workdir_to_name,
     ) {
-        bail!("Renaming is unified while session.tie_workdir_to_name is on; use 'aoe session rename --title <name>' instead, and the worktree directory follows. Disable the setting to edit the directory independently.");
+        return Err(RenameRefusal::Tied.into());
     }
     let duplicate_path = crate::session::worktree_edit::target_worktree_path(
         std::path::Path::new(&current_path),
@@ -2596,16 +2593,9 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     .unwrap_or_else(|| std::path::PathBuf::from(&current_path))
     .to_string_lossy()
     .into_owned();
-    if duplicate_path.trim_end_matches('/') != current_path.trim_end_matches('/')
-        && is_duplicate_session(
-            authoritative_instances.iter(),
-            &inst.title,
-            &duplicate_path,
-            Some(&id),
-        )
-    {
-        return Err(duplicate_session_error(&inst.title));
-    }
+    let mut moved = inst.clone();
+    moved.project_path = duplicate_path;
+    ensure_unique(&authoritative_instances, &inst, &moved)?;
     let mut live = inst.clone();
     live.source_profile = profile.to_string();
     crate::tmux::refresh_session_cache();
@@ -2614,30 +2604,31 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
         std::path::Path::new(&current_path),
         args.name.trim(),
     );
-    if live.status.blocks_worktree_edit()
-        || (moves_worktree
-            && crate::session::worktree_edit::ensure_sandbox_container_released(
-                &id,
-                live.is_sandboxed(),
-            ))
-    {
-        bail!("Cannot edit the workdir name while the session is active; stop it first");
-    }
+    worktree_edit_gate(
+        &id,
+        live.is_sandboxed(),
+        live.status.blocks_worktree_edit(),
+        WorktreeChange {
+            moves_dir: moves_worktree,
+            renames_branch: crate::session::worktree_edit::worktree_branch_rename_required(
+                &worktree_info,
+                args.name.trim(),
+                args.rename_branch,
+            ),
+        },
+        true,
+    )?;
 
-    let outcome = crate::session::worktree_edit::edit_worktree_workdir(
+    let outcome = apply_worktree_edit(
         crate::session::worktree_edit::WorktreeEditRequest {
             worktree_info: &worktree_info,
             current_path: std::path::Path::new(&current_path),
             new_name: args.name.trim(),
             rename_branch: args.rename_branch,
         },
+        &id,
+        live.is_sandboxed(),
     )?;
-    if outcome.new_path != std::path::Path::new(&current_path) {
-        crate::session::worktree_edit::discard_sandbox_container_after_move(
-            &id,
-            live.is_sandboxed(),
-        );
-    }
     let new_path = outcome.new_path.to_string_lossy().to_string();
     let new_branch = outcome.new_branch.clone();
     if let Some(warning) = &outcome.warning {
