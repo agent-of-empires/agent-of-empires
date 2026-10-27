@@ -121,6 +121,7 @@ describe("SidebarGroupHeader", () => {
             onNewSession={() => {}}
             onUpdateAppearance={() => {}}
             offline={false}
+            rowsId="sidebar-rows-test"
           />
         </PluginUiProvider>,
       );

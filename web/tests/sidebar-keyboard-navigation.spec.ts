@@ -150,3 +150,41 @@ for (const [axis, compact] of [
     await expect(toggle(0)).toBeFocused();
   });
 }
+
+// Nested lists put a Group's rows inside its parent's. Repo "/tmp/a" with Group "b" and repo
+// "/tmp/a::b" would share a rows id if "::" weren't only ever the separator.
+const nested: MockSessionInput[] = [
+  { id: "s-n1", title: "n-one", project_path: "/tmp/a", branch: "n/one", group: "b", remote_owner: "acme" },
+  { id: "s-n2", title: "n-two", project_path: "/tmp/a::b", branch: "n/two", group: "g", remote_owner: "acme" },
+];
+
+for (const axis of ["repo+group", "org"] as const) {
+  test(`arrow keys reach a nested header and its rows (${axis} axis)`, async ({ page }) => {
+    await installSidebarMocks(page, { sessions: nested });
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto("/");
+    await showAxis(page, axis);
+
+    const ids = await page
+      .locator("[data-testid='sidebar-group-header'] button[aria-controls]")
+      .evaluateAll((buttons) => buttons.map((b) => b.getAttribute("aria-controls")));
+    expect(ids.length).toBeGreaterThan(2);
+    expect(new Set(ids).size, ids.join(" ")).toBe(ids.length);
+
+    const press = async (key: string, focused: Locator) => {
+      await page.keyboard.press(key);
+      await expect(focused, key).toBeFocused();
+    };
+    const parent = page.locator("[data-testid='sidebar-group-header'] button[aria-expanded]").first();
+    const child = page.locator(`[id="${await parent.getAttribute("aria-controls")}"] button[aria-expanded]`).first();
+    const childRows = page.locator(
+      `[id="${await child.getAttribute("aria-controls")}"] [data-testid="sidebar-session-row"]`,
+    );
+
+    // Parent header, Right to its child header, Right to the first row, Left back to the child.
+    await parent.focus();
+    await press("ArrowRight", child);
+    await press("ArrowRight", childRows.first());
+    await press("ArrowLeft", child);
+  });
+}

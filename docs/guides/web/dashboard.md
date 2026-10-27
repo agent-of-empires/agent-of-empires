@@ -37,7 +37,7 @@ The palette (top-bar button or keyboard shortcut) is a fuzzy launcher for global
 
 When an embedded agent or paired terminal, or the structured-session composer, has keyboard focus, press `Ctrl+Q` to return focus to the active session in the sidebar. Then press `a` to move to the next session needing attention; `a` works when a terminal or text field is not focused.
 
-With a session row focused, use **↑** and **↓** to move through visible rows without opening one; press **Enter** to open the focused row.
+With a session row or Group header focused, use **↑** and **↓** to move through visible headers and rows without opening one; press **Enter** on a row to open it. On a Group header, **Enter** or **Space** collapses or expands it, **←** collapses it, and **→** expands it or, once expanded, moves to its first row. **←** on a row moves to its header. **Shift+F10** or the **Menu** key opens the header's menu. Each header is a single tab stop.
 
 Individual settings appear under `Settings`: a writable toggle flips inline with a toast, while read-only servers and settings needing elevation open the settings view instead. The Settings header has its own search box (the TUI settings screen uses `/`) that filters across every tab.
 
