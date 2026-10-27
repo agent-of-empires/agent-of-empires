@@ -29,6 +29,11 @@ pub(crate) enum LifecycleSignal {
         succeeded: bool,
         off_protocol_work: Option<OffProtocolWorkKind>,
     },
+    /// An independent task snapshot may finish only a tool tracked by the
+    /// receiving watchdog; unknown ids must not count as foreground progress.
+    TaskSnapshotCompleted {
+        id: String,
+    },
     /// Cost-populated `UsageUpdate`, the adapter's end-of-turn accounting
     /// marker. Not progress.
     TerminalUsage,

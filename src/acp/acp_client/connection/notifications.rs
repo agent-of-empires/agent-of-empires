@@ -15,7 +15,7 @@ use tracing::debug;
 
 use crate::acp::acp_client::between_prompt::BetweenPromptTracker;
 use crate::acp::acp_client::lifecycle::{
-    forward_lifecycle_signals, LifecycleEnvelope, TerminalClaim,
+    forward_lifecycle_signals, LifecycleEnvelope, LifecycleSignal, TerminalClaim,
 };
 use crate::acp::acp_client::omp_tasks::OmpTaskTracker;
 use crate::acp::acp_client::rate_limit::record_rate_limit_report;
@@ -279,7 +279,11 @@ impl Shared {
             self.profile,
             suppressing,
         );
-        if lifecycle.is_some() || wakeup.is_some() {
+        if lifecycle
+            .as_ref()
+            .is_some_and(|signal| !matches!(signal, LifecycleSignal::TaskSnapshotCompleted { .. }))
+            || wakeup.is_some()
+        {
             self.first_event_after_attach.store(true, Ordering::Relaxed);
         }
         let prompt_active = self.prompt_in_flight.load(Ordering::Relaxed);
@@ -459,6 +463,7 @@ mod tests {
             "sessionId": "native",
             "update": {
                 "sessionUpdate": "tool_call_update", "toolCallId": "batch", "status": status,
+                "_meta": {"omp": {"taskLifecycle": "completed"}},
                 "rawOutput": {"details": {"async": {"type": "task"}, "progress": [{
                     "id": "Child", "agent": "task", "status": child_status,
                     "resolvedModel": "provider/model", "assignment": "Inspect code",
@@ -626,6 +631,72 @@ mod tests {
             }
             assert!(relaunched, "changed identity must clear terminal tracking");
         }
+    }
+
+    #[tokio::test]
+    async fn omp_tasks_terminal_snapshots_only_forward_conditional_cleanup() {
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::channel(32);
+        let shared = Shared::new(
+            event_tx,
+            "test".into(),
+            &OMP,
+            lifecycle_tx,
+            Arc::new(TerminalClaim::new()),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            Arc::new(SessionIngress::new(Some(SessionId::from("native")))),
+            None,
+            None,
+        );
+        shared
+            .handle_notification(task_notification("completed", "running"), true)
+            .await;
+        assert!(!shared.first_event_after_attach.load(Ordering::Relaxed));
+        assert!(!shared.between_prompt.work_state().tool_calls);
+        assert_eq!(shared.between_prompt.take_idle_fire(i64::MAX), None);
+        assert!(lifecycle_rx.try_recv().is_err());
+        while event_rx.try_recv().is_ok() {}
+
+        shared.prompt_in_flight.store(true, Ordering::Relaxed);
+        shared.prompt_epoch.store(1, Ordering::Relaxed);
+        let initial = serde_json::from_value(json!({
+            "sessionId": "native",
+            "update": {"sessionUpdate": "tool_call", "toolCallId": "batch", "title": "Task"}
+        }))
+        .unwrap();
+        shared.handle_notification(initial, true).await;
+        assert!(matches!(
+            lifecycle_rx.try_recv().unwrap().signal,
+            LifecycleSignal::ToolStarted { id, .. } if id == "batch"
+        ));
+        assert!(shared.first_event_after_attach.load(Ordering::Relaxed));
+        for status in ["pending", "in_progress"] {
+            shared
+                .handle_notification(task_notification(status, "running"), true)
+                .await;
+            assert!(lifecycle_rx.try_recv().is_err());
+        }
+        let mut rolling = task_notification("completed", "running");
+        rolling.update = serde_json::from_value(json!({
+            "sessionUpdate": "tool_call_update", "toolCallId": "batch", "status": "completed",
+            "_meta": {"omp": {"taskLifecycle": "progress"}},
+            "rawOutput": {"details": {"async": {"type": "task"}, "progress": [
+                {"id": "Child", "agent": "task", "status": "completed"},
+                {"id": "Blocking", "agent": "task", "status": "running"}
+            ]}}
+        }))
+        .unwrap();
+        shared.handle_notification(rolling, true).await;
+        assert!(lifecycle_rx.try_recv().is_err());
+        shared
+            .handle_notification(task_notification("completed", "completed"), true)
+            .await;
+        let terminal = lifecycle_rx.try_recv().unwrap();
+        assert_eq!(terminal.epoch, 1);
+        assert!(
+            matches!(terminal.signal, LifecycleSignal::TaskSnapshotCompleted { id } if id == "batch")
+        );
     }
 
     #[tokio::test]

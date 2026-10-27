@@ -17,8 +17,8 @@ const BETWEEN_PROMPT_STALL_GRACE: Duration = Duration::from_secs(120);
 pub(super) const BETWEEN_PROMPT_IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// State update for one notification's classified signals; `None` for ambient
-/// updates. Every tracked signal refreshes `last_lifecycle_at`, so the fast
-/// grace measures from the end-of-turn marker itself.
+/// updates and cleanup-only terminals. Tracked foreground signals refresh
+/// `last_lifecycle_at`, so fast grace starts at the end-of-turn marker itself.
 #[derive(Debug, PartialEq)]
 pub(super) struct BetweenPromptUpdate {
     pub(super) cost_seen: bool,
@@ -47,9 +47,10 @@ pub(super) fn between_prompt_signal_update(
     }
     match lifecycle? {
         LifecycleSignal::TerminalUsage => Some(tracked(true)),
-        // The tail of a compaction, which on cancel arrives after the turn's
-        // own terminal; arming here would claim a turn that already ended.
-        LifecycleSignal::CompactionCompleted | LifecycleSignal::CompactionFailed => None,
+        // Cleanup-only terminals must not arm or refresh a foreground turn.
+        LifecycleSignal::TaskSnapshotCompleted { .. }
+        | LifecycleSignal::CompactionCompleted
+        | LifecycleSignal::CompactionFailed => None,
         _ => Some(tracked(false)),
     }
 }
@@ -156,6 +157,12 @@ impl BetweenPromptTracker {
     ) -> bool {
         let mut state = self.state();
         let mut armed = false;
+        // A task snapshot is not evidence of a new foreground turn. Only
+        // the watchdog that saw its launching tool may consume its terminal.
+        if let Some(LifecycleSignal::TaskSnapshotCompleted { id }) = lifecycle {
+            state.tools.remove(id);
+            return false;
+        }
         if let Some(u) = between_prompt_signal_update(lifecycle, wakeup, now_ms, state.wake_at) {
             if !state.active {
                 state.active = true;
@@ -437,6 +444,12 @@ mod tests {
             ),
             (Some(LifecycleSignal::Progress), None, 0, tracked(false, 0)),
             (None, None, 42, None),
+            (
+                Some(LifecycleSignal::TaskSnapshotCompleted { id: "old".into() }),
+                None,
+                42,
+                None,
+            ),
             (None, Some(wake.clone()), 1_000, tracked(false, 600_000)),
             // A later wake never shortens suppression.
             (None, Some(wake), 900_000, tracked(false, 900_000)),
