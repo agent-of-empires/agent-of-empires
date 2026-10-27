@@ -66,21 +66,16 @@ test.describe("wizard", () => {
     await waitForView(serve.baseUrl, sessions[0]!.id, "structured");
   });
 
-  test("wizard auto-approve starts Codex in full-access mode", async ({ page, spawnServe }) => {
-    const serve = await spawnServe({
-      acp: true,
-      extraEnv: { FAKE_ACP_MODE_VIA_CONFIG_OPTION: "codex" },
-    });
+  test("wizard Yolo mode starts Codex in full-access mode", async ({ page, spawnServe }) => {
+    const serve = await spawnServe({ acp: true, extraEnv: { FAKE_ACP_MODE_VIA_CONFIG_OPTION: "codex" } });
     const wizard = await openWizard(page, serve);
     await pickScratch(wizard);
     await wizard.getByTestId("wizard-agent-row").click();
     await wizard.getByRole("button", { name: "codex", exact: true }).click();
     await wizard.getByRole("button", { name: "Done" }).click();
-    const autoApprove = wizard.getByRole("switch", {
-      name: "Auto-approve actions",
-    });
-    await autoApprove.click();
-    await expect(autoApprove).toBeChecked();
+    const yolo = wizard.getByRole("switch", { name: "Yolo mode" });
+    await yolo.click();
+    await expect(yolo).toBeChecked();
     await wizard.getByRole("button", { name: /Launch session/ }).click();
 
     await waitForStructuredView(page);

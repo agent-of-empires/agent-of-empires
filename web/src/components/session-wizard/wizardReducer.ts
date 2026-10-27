@@ -61,11 +61,15 @@ export interface WizardState {
   isSubmitting: boolean;
   error: string | null;
   agents: AgentInfo[];
+  /** Until "ready", which agents always run in Yolo mode is unknown. */
+  agentsStatus: "loading" | "ready" | "failed";
   groups: GroupInfo[];
   /** Which profile `groups` was fetched for; any other profile sees no Groups. */
   groupsFor: string | null;
   profiles: ProfileInfo[];
   dockerAvailable: boolean;
+  /** The configured Container runtime's display name; null when the probe failed. */
+  dockerRuntimeName: string | null;
   /** The Docker probe has answered, even if the answer was a failure. */
   dockerChecked: boolean;
 }
@@ -77,9 +81,10 @@ export type Action =
   | { type: "SUBMIT_SUCCESS" }
   | { type: "SUBMIT_CANCEL" }
   | { type: "SET_AGENTS"; agents: AgentInfo[] }
+  | { type: "AGENTS_FAILED" }
   | { type: "SET_GROUPS"; groups: GroupInfo[]; groupsFor: string }
   | { type: "SET_PROFILES"; profiles: ProfileInfo[] }
-  | { type: "SET_DOCKER"; available: boolean }
+  | { type: "SET_DOCKER"; available: boolean; runtimeName: string | null }
   | {
       type: "APPLY_PROFILE_DEFAULTS";
       yoloMode: boolean;
@@ -244,13 +249,20 @@ export function reducer(state: WizardState, action: Action): WizardState {
     case "SUBMIT_CANCEL":
       return { ...state, isSubmitting: false, error: null };
     case "SET_AGENTS":
-      return { ...state, agents: action.agents };
+      return { ...state, agents: action.agents, agentsStatus: "ready" };
+    case "AGENTS_FAILED":
+      return { ...state, agentsStatus: "failed" };
     case "SET_GROUPS":
       return { ...state, groups: action.groups, groupsFor: action.groupsFor };
     case "SET_PROFILES":
       return { ...state, profiles: action.profiles };
     case "SET_DOCKER":
-      return { ...state, dockerAvailable: action.available, dockerChecked: true };
+      return {
+        ...state,
+        dockerAvailable: action.available,
+        dockerRuntimeName: action.runtimeName,
+        dockerChecked: true,
+      };
     case "APPLY_PROFILE_DEFAULTS": {
       // A remembered or prefilled path can resolve its repo probe before this arrives, so the
       // seeded default must not flip a worktree back on for a scratch session or a non-repo path.

@@ -19,6 +19,7 @@ import {
 import { agent } from "./fixtures";
 import { toastBus } from "../../../lib/toastBus";
 import { startPendingCreates } from "../../../lib/pendingCreates";
+import type { DockerStatusResponse } from "../../../lib/types";
 
 const createSession = vi.fn();
 const reviewCreationTrust = vi.fn();
@@ -36,7 +37,7 @@ vi.mock("../../../lib/api", () => ({
   fetchAgents: vi.fn().mockResolvedValue([]),
   fetchIsGitRepo: vi.fn().mockResolvedValue(true),
   fetchGroups: vi.fn().mockResolvedValue([]),
-  fetchDockerStatus: vi.fn().mockResolvedValue({ available: false }),
+  fetchDockerStatus: vi.fn().mockResolvedValue({ available: false, runtime: "docker", runtime_name: "Docker" }),
   fetchProfiles: vi.fn().mockResolvedValue([]),
   fetchVolumeIgnoresPreview: vi.fn().mockResolvedValue([]),
   markVolumeIgnoresGlobsAcknowledged: vi.fn().mockResolvedValue(undefined),
@@ -491,7 +492,7 @@ describe("SessionWizard rows", () => {
       const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
       try {
         renderWizard();
-        fireEvent.click(await screen.findByRole("switch", { name: "Auto-approve actions" }));
+        fireEvent.click(await screen.findByRole("switch", { name: "Yolo mode" }));
         fireEvent.click(screen.getByText("Profile"));
         fireEvent.click(screen.getByRole("radio", { name: /work/ }));
         expect(confirmSpy).toHaveBeenCalled();
@@ -765,7 +766,7 @@ describe("SessionWizard served-profile authority", () => {
     open("Profile");
     fireEvent.click(screen.getByRole("radio", { name: profile === "" ? /Server default/ : new RegExp(profile) }));
     await waitFor(() =>
-      expect(screen.getByRole("switch", { name: "Auto-approve actions" }).getAttribute("aria-checked")).toBe(
+      expect(screen.getByRole("switch", { name: "Yolo mode" }).getAttribute("aria-checked")).toBe(
         profile === "Beta" ? "true" : "false",
       ),
     );
@@ -823,7 +824,7 @@ describe("SessionWizard served-profile authority", () => {
     await waitFor(() => expect(screen.getByText("Profile")).toBeTruthy());
     await chooseProfile("Beta");
     await act(async () => seed.resolve(settings("Alpha")));
-    expect(screen.getByRole("switch", { name: "Auto-approve actions" }).getAttribute("aria-checked")).toBe("true");
+    expect(screen.getByRole("switch", { name: "Yolo mode" }).getAttribute("aria-checked")).toBe("true");
     await launch();
     expect(payload()).toMatchObject({ profile: "Beta", yolo_mode: true });
     cleanup();
@@ -874,7 +875,7 @@ describe("SessionWizard served-profile authority", () => {
     await waitFor(() => expect(retryButton.hasAttribute("disabled")).toBe(false));
     expect(screen.getByText(/Launch session/).closest("button")!.disabled).toBe(true);
     expect(fetchSettings).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("switch", { name: "Auto-approve actions" }));
+    fireEvent.click(screen.getByRole("switch", { name: "Yolo mode" }));
     fireEvent.click(retryButton);
     await launch();
     await waitFor(() => expect(createSession).toHaveBeenCalled());
@@ -936,9 +937,9 @@ describe("SessionWizard served-profile authority", () => {
 describe("SessionWizard Docker readiness", () => {
   const launchButton = () => screen.getByText(/Launch session/).closest("button") as HTMLButtonElement;
   const pendingProbe = () => {
-    let answer!: (v: { available: boolean; runtime: string | null }) => void;
+    let answer!: (v: DockerStatusResponse) => void;
     vi.mocked(fetchDockerStatus).mockReturnValueOnce(new Promise((r) => (answer = r)));
-    return (available: boolean) => answer({ available, runtime: null });
+    return (available: boolean) => answer({ available, runtime: "docker", runtime_name: "Docker" });
   };
 
   it("enables Launch without waiting for Docker when the sandbox is off", async () => {
@@ -1037,5 +1038,112 @@ describe("SessionWizard Group field", () => {
     await launch();
     await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
     expect(payload()).toMatchObject({ group: "client/new" });
+  });
+});
+
+describe("SessionWizard Yolo mode", () => {
+  const yolo = () => screen.getByRole("switch", { name: "Yolo mode" }) as HTMLButtonElement;
+  const yoloRow = () => screen.getByTestId("wizard-yolo-row").textContent ?? "";
+  const pickAgent = (name: string) => {
+    fireEvent.click(screen.getByTestId("wizard-agent-row"));
+    fireEvent.click(screen.getByRole("button", { name: new RegExp(`^${name}`) }));
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
+  };
+
+  it("states what each value does", async () => {
+    renderWizard();
+    await waitFor(() => expect(yoloRow()).toContain("asks before running commands"));
+    expect(yolo().disabled).toBe(false);
+    fireEvent.click(yolo());
+    expect(yoloRow()).toContain("skips permission prompts");
+  });
+
+  it("locks on for an agent that always runs in Yolo mode, and gives the value back after", async () => {
+    vi.mocked(fetchAgents).mockResolvedValue([agent("claude"), agent("pi", { always_yolo: true, acp_capable: false })]);
+    vi.mocked(fetchSettings).mockResolvedValueOnce({ session: { yolo_mode_default: false }, sandbox: {} } as never);
+    renderWizard({ path: "/tmp/proj", tool: "pi" });
+    await waitFor(() => expect(yoloRow()).toContain("always on for pi"));
+    expect(yolo().disabled).toBe(true);
+    expect(yolo().getAttribute("aria-checked")).toBe("true");
+
+    pickAgent("claude");
+    await waitFor(() => expect(yoloRow()).toContain("asks before running commands"));
+    expect(yolo().getAttribute("aria-checked")).toBe("false");
+    expect(yolo().disabled).toBe(false);
+
+    pickAgent("pi");
+    await waitFor(() => expect(yoloRow()).toContain("always on for pi"));
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload()).toMatchObject({ tool: "pi", yolo_mode: true });
+  });
+
+  it("keeps a profile's Yolo mode default for an agent that can turn it off", async () => {
+    vi.mocked(fetchAgents).mockResolvedValue([agent("claude"), agent("pi", { always_yolo: true, acp_capable: false })]);
+    vi.mocked(fetchSettings).mockResolvedValueOnce({ session: { yolo_mode_default: true }, sandbox: {} } as never);
+    renderWizard({ path: "/tmp/proj", tool: "pi" });
+    await waitFor(() => expect(yoloRow()).toContain("always on for pi"));
+    pickAgent("claude");
+    await waitFor(() => expect(yoloRow()).toContain("skips permission prompts"));
+    expect(yolo().getAttribute("aria-checked")).toBe("true");
+  });
+
+  const AGENTS = [agent("claude"), agent("pi", { always_yolo: true, acp_capable: false })];
+  const launchButton = () => screen.getByText(/Launch session/).closest("button") as HTMLButtonElement;
+
+  it("waits for the agent list before promising prompts or launching", async () => {
+    let answer: (agents: typeof AGENTS) => void = () => {};
+    vi.mocked(fetchAgents).mockReturnValue(new Promise((resolve) => (answer = resolve)));
+    vi.mocked(fetchSettings).mockResolvedValueOnce({ session: { yolo_mode_default: false }, sandbox: {} } as never);
+    renderWizard({ path: "/tmp/proj", tool: "pi" });
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
+    // Let the profile defaults settle, which alone used to enable Launch.
+    await act(async () => {});
+    expect(yoloRow()).toContain("checking the agent…");
+    expect(yoloRow()).not.toContain("asks before running commands");
+    expect(launchButton().disabled).toBe(true);
+
+    await act(async () => answer(AGENTS));
+    expect(yoloRow()).toContain("always on for pi");
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload()).toMatchObject({ tool: "pi", yolo_mode: true });
+  });
+
+  it("retries a failed agent list, keeping Launch off until it loads", async () => {
+    vi.mocked(fetchAgents).mockResolvedValueOnce(null).mockResolvedValue(AGENTS);
+    renderWizard({ path: "/tmp/proj", tool: "pi" });
+    await screen.findByText(/Couldn't load the agent list/);
+    expect(yoloRow()).toContain("checking the agent…");
+    expect(launchButton().disabled).toBe(true);
+    await waitFor(() => expect(yoloRow()).toContain("always on for pi"), { timeout: 3000 });
+    expect(fetchAgents).toHaveBeenCalledTimes(2);
+    expect(screen.queryByText(/Couldn't load the agent list/)).toBeNull();
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload()).toMatchObject({ tool: "pi", yolo_mode: true });
+  });
+});
+
+describe("SessionWizard Container runtime", () => {
+  const down = (runtime: string, runtime_name: string) => () =>
+    Promise.resolve({ available: false, runtime, runtime_name });
+  it.each<[string, () => Promise<unknown>, string]>([
+    ["Docker", down("docker", "Docker"), "Docker is not running"],
+    ["Podman", down("podman", "Podman"), "Podman is not running"],
+    ["Apple Container", down("apple_container", "Apple Container"), "Apple Container is not running"],
+    // fetchDockerStatus never rejects: a failed request resolves to this fallback.
+    [
+      "a failed status request",
+      () => Promise.resolve({ available: false, runtime: null, runtime_name: null }),
+      "Container runtime is not running",
+    ],
+  ])("names %s when it isn't running, in the row and the launch error", async (_label, status, message) => {
+    vi.mocked(fetchDockerStatus).mockImplementationOnce(status as never);
+    renderWizard({ path: "/tmp/proj", tool: "claude", sandboxEnabled: true });
+    await waitFor(() => expect(screen.getByTestId("wizard-sandbox-row").textContent).toContain(message));
+    await launch();
+    expect(await screen.findByText(`Sandbox unavailable: ${message}. Turn it off to launch.`)).toBeTruthy();
+    expect(createSession).not.toHaveBeenCalled();
   });
 });

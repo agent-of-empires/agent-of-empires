@@ -752,7 +752,7 @@ const failureCases: [string, () => Promise<unknown>, unknown][] = [
   ["fetchIsGitRepo", () => api.fetchIsGitRepo("/r"), null],
   ["getHomePath", () => api.getHomePath(), null],
   ["browseFilesystem", () => api.browseFilesystem("/r"), { entries: [], has_more: false, ok: false }],
-  ["fetchDockerStatus", () => api.fetchDockerStatus(), { available: false, runtime: null }],
+  ["fetchDockerStatus", () => api.fetchDockerStatus(), { available: false, runtime: null, runtime_name: null }],
   [
     "loginStatus",
     () => api.loginStatus(),
