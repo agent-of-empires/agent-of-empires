@@ -494,8 +494,14 @@ pub struct TrashOutcome {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum TrashRelocationOutcome {
     Skipped,
-    Relocated,
-    Failed { reason: String },
+    /// `warning` is set when git is left degraded at the new path.
+    Relocated {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
+    },
+    Failed {
+        reason: String,
+    },
 }
 
 fn default_kill_pane() -> bool {
@@ -808,7 +814,11 @@ pub struct PendingApproval {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum RestoreOutcome {
-    Restored,
+    /// `warning` is set when git is left degraded at the original path.
+    Restored {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
+    },
     AlreadyRestored,
 }
 
@@ -1089,6 +1099,10 @@ pub struct SessionResponse {
     /// non-forkable agents.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub acp_can_fork: bool,
+    /// `acp.structured_view = off` for this session's profile and project: a
+    /// terminal session may not switch into the structured view.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub structured_view_off: bool,
     /// Whether switching this session between terminal and structured view
     /// preserves the conversation (only claude pairings share one
     /// CLI-resumable transcript). Server-owned via

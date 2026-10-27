@@ -85,8 +85,8 @@ fn park_message(project_path: &str) -> String {
 #[derive(Debug, Clone)]
 enum ResumeOutcome {
     Attached,
-    /// Attachment or retirement is unfinished; retry next tick unless parked.
-    RetryAfterAttachTimeout,
+    /// Attachment, retirement or launch prep lost a race; retry next tick unless parked.
+    Retry,
     /// Spawn finished with or without error; `attempted` stays set so a
     /// permanently failing spawn does not loop.
     SpawnFinished,
@@ -371,7 +371,7 @@ pub async fn reconcile_acp_workers(
 
     while let Some(result) = set.join_next().await {
         match result {
-            Ok((id, ResumeOutcome::RetryAfterAttachTimeout)) => {
+            Ok((id, ResumeOutcome::Retry)) => {
                 if !parked.contains(&id) {
                     attempted.remove(&id);
                 }
@@ -874,5 +874,57 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// A launch-prep race (here: memory and disk disagree on the row) must not
+    /// pin the session out of the resume set, or a queued prompt never drains.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn launch_prep_race_does_not_pin_the_session() {
+        let id = "sess-race";
+        let (_home, state, _project) = test_fixtures::test_state(id);
+        state.instances.write().await[0].title = "renamed in memory only".to_string();
+
+        let mut tick = test_fixtures::Tick::default();
+        tick.run(&state).await;
+
+        assert!(!tick.attempted.contains(id));
+    }
+
+    /// A durable `aoe acp stop` fence refuses automatic resume; repeated ticks
+    /// must not count that as a crash loop, and explicit resume still clears it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn durable_user_stop_does_not_crash_loop() {
+        use crate::process::worker_registry::{self, ResumeAuthority, WorkerRecord};
+
+        let id = "sess-stopped";
+        let (_home, state, project) = test_fixtures::test_state(id);
+        let record = WorkerRecord::new(
+            id.into(),
+            std::process::id(),
+            worker_registry::socket_path_for(id).unwrap(),
+            "aoe-agent".into(),
+            "aoe-agent".into(),
+            project.path().to_path_buf(),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        worker_registry::save(&record).unwrap();
+        worker_registry::request_stop(&record).unwrap();
+        worker_registry::retire_selected(&record).unwrap();
+
+        let mut tick = test_fixtures::Tick::default();
+        for _ in 0..=RECONCILER_MAX_RESPAWNS_IN_WINDOW {
+            tick.run(&state).await;
+        }
+
+        assert_eq!(test_fixtures::startup_errors(&state, id), 0);
+        assert!(tick.parked.is_empty());
+        let observed = worker_registry::stop_intent(id).unwrap();
+        worker_registry::admit_resume(id, ResumeAuthority::Explicit, &observed).unwrap();
     }
 }

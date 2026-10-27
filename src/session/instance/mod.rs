@@ -7,6 +7,7 @@
 use crate::session::CaptureStorage;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -34,8 +35,10 @@ use crate::session::capture::{
     OmpCliCaptureOptions, OmpStoreKind, PrimeRootPublication,
 };
 mod accessors;
+mod capture_slot;
 mod container;
 mod execution;
+pub(crate) use capture_slot::{Handoff, Held, Unserved};
 pub(crate) use execution::{ActiveExecution, CaptureContext, ConversationKey, ConversationState};
 pub use execution::{
     ConversationBinding, ConversationProvenance, ExecutionBinding, ExecutionLocation,
@@ -267,6 +270,23 @@ pub(crate) struct TerminalHandoffKey {
 }
 
 impl TerminalHandoffIntent {
+    pub(crate) fn validate_relationships(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.target_generation <= self.generation,
+            "terminal handoff target generation exceeds ownership generation"
+        );
+        anyhow::ensure!(
+            self.launch
+                .as_ref()
+                .is_none_or(|launch| launch.generation <= self.generation),
+            "terminal handoff attempt generation exceeds ownership generation"
+        );
+        if self.unborn_fence.is_some() {
+            self.validate_unborn_fence()?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_unborn_fence(&self) -> Result<&TerminalHandoffUnbornFence> {
         let fence = self
             .unborn_fence
@@ -828,6 +848,12 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_pending: Option<String>,
 
+    /// Set by a structured view agent switch. The next terminal handoff then
+    /// runs the new agent's tool with a fresh conversation, and refuses when
+    /// the agent has no terminal tool.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub terminal_rebind_pending: bool,
+
     // Live process state and durable capture-generation guards.
     /// Latest ACP initialize result for session/load. A daemon restart returns
     /// this to unknown until the worker reconnects.
@@ -916,16 +942,7 @@ pub struct Instance {
     #[serde(skip)]
     pub last_error: Option<String>,
     #[serde(skip)]
-    pub session_id_poller: Option<Arc<Mutex<SessionPoller>>>,
-    /// Retry schedule for replacing a missing session-id poller when the
-    /// process-wide thread budget (or a start failure) blocked the last
-    /// attempt. Runtime-only; carried across reloads like the poller.
-    #[serde(skip)]
-    pub(crate) poller_repair: crate::session::poller::PollerRepairBackoff,
-
-    /// Runtime backoff after managed-store ownership or lease contention.
-    #[serde(skip)]
-    pub(crate) session_id_poller_retry_after: Option<std::time::Instant>,
+    pub(crate) capture_poller: capture_slot::CapturePollerSlot,
     /// Session IDs invalidated at a fresh-generation boundary. Persisting this
     /// set prevents a process restart from resurrecting an abandoned ID from a
     /// still-present upstream artifact.

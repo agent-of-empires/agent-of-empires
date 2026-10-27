@@ -350,27 +350,17 @@ mod tests {
     fn recovered_terminal_scope_debt_unlocks_stop_and_purge_without_new_custody() -> Result<()> {
         let home = tempfile::tempdir()?;
         let _home = crate::session::test_support::isolate_app_dir_at(home.path());
-        // A reachable manager whose inventory fails leaves the legacy scope unresolved.
-        use std::os::unix::fs::PermissionsExt;
+        #[cfg(target_os = "linux")]
         let runtime = tempfile::tempdir()?;
-        std::fs::create_dir(runtime.path().join("systemd"))?;
-        std::fs::write(runtime.path().join("systemd/private"), "")?;
-        let bin = runtime.path().join("bin");
-        std::fs::create_dir(&bin)?;
-        std::fs::write(bin.join("systemctl"), "#!/bin/sh\nexit 1\n")?;
-        std::fs::set_permissions(
-            bin.join("systemctl"),
-            std::fs::Permissions::from_mode(0o700),
+        #[cfg(target_os = "linux")]
+        std::fs::create_dir_all(
+            runtime
+                .path()
+                .join("user")
+                .join(nix::unistd::geteuid().as_raw().to_string()),
         )?;
-        let path = format!(
-            "{}:{}",
-            bin.display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
-        let _manager = crate::session::test_support::EnvGuard::set(&[
-            ("XDG_RUNTIME_DIR", runtime.path().as_os_str()),
-            ("PATH", std::ffi::OsStr::new(&path)),
-        ]);
+        #[cfg(target_os = "linux")]
+        let _manager = crate::process::systemd::legacy_runtime_fixture::install(runtime.path());
         let mut row = crate::session::Instance::new("legacy", "/tmp/repo");
         row.view = crate::session::View::Terminal;
         row.terminal_scopes = None;

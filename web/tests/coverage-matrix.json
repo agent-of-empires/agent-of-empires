@@ -572,6 +572,20 @@
       "notes": "The real schema-driven switch persists machine-wide, rejects profile overrides, survives reload, and changes MCP route availability only after daemon restart."
     },
     {
+      "id": "settings.startup-recovery-wake",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/settings-persistence.spec.ts", "tests/live/startup-recovery.spec.ts"],
+      "components": [
+        "web/src/components/SettingsView.tsx",
+        "web/src/components/settings/SchemaSection.tsx",
+        "src/session/config/mod.rs",
+        "src/server/api/sessions/lifecycle.rs",
+        "src/server/startup_recovery.rs"
+      ],
+      "notes": "The real schema switch defaults off, validates boolean PATCH values, persists per profile, and resets to machine inheritance. Missing Idle/Waiting/Running panes still resume; opted-in default/custom text, empty opt-out, profile precedence, failed resume, and unchanged explicit API/CLI restart wake behavior use private fake agents."
+    },
+    {
       "id": "settings.list-field",
       "kind": "mocked-playwright",
       "risk": "medium",
@@ -897,7 +911,8 @@
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/components/__tests__/PushHealthBanner.test.tsx"],
-      "components": ["web/src/components/PushHealthBanner.tsx"]
+      "components": ["web/src/components/PushHealthBanner.tsx"],
+      "notes": "The dismiss test asserts the contrast-safe token classes: text-subtle dismiss, text-primary body, no hover opacity on Re-enable."
     },
     {
       "id": "notifications.status-sounds",
@@ -1162,6 +1177,25 @@
         "web/src/components/session-wizard/steps/SandboxPanel.tsx",
         "web/src/components/session-wizard/steps/LaunchFields.tsx"
       ]
+    },
+    {
+      "id": "wizard.structured-view-exposure",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/wizard.spec.ts",
+        "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
+        "src/components/session-wizard/wizardReducer.test.ts",
+        "src/components/__tests__/SessionRowSiblingTargets.test.tsx",
+        "src/hooks/__tests__/useSessionsApply.test.tsx"
+      ],
+      "components": [
+        "web/src/components/session-wizard/profileDefaults.ts",
+        "web/src/components/session-wizard/wizardReducer.ts",
+        "web/src/components/sidebar/sessionActionTargets.ts",
+        "web/src/hooks/useSessions.ts"
+      ],
+      "notes": "acp.structured_view = off hides the wizard toggle and the sidebar switch to structured view, including across profile changes, import exit and pin responses; terminal and structured preselect that view."
     },
     {
       "id": "wizard.create-progress",
@@ -1864,6 +1898,18 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/SessionRow.tsx"]
     },
     {
+      "id": "session.degraded-move-warning-shown",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/__tests__/trashActions.test.ts", "src/lib/api.test.ts"],
+      "components": [
+        "web/src/lib/api.ts",
+        "web/src/lib/trashActions.ts",
+        "web/src/components/sidebar/SessionActions.tsx"
+      ],
+      "notes": "A trash, restore or workdir rename whose worktree move landed with git degraded keeps the new path and toasts the server's warnings instead of reporting plain success."
+    },
+    {
       "id": "session.delete-shared-worktree-kept",
       "kind": "mocked-playwright",
       "risk": "high",
@@ -2395,7 +2441,7 @@
         "web/src/App.tsx",
         "web/src/hooks/useDiffFiles.ts"
       ],
-      "notes": "Holding the first canonical session list through the diff-files effect leaves no persisted layout while the session is unknown. Releasing it pins Terminal but not Diff for a non-git session; explicitly opening Diff shows the neutral non-git message without a repository error. useDiffFiles.test.ts holds the next session's response and asserts the previous session's repository state is cleared (#4847)."
+      "notes": "Holding the first canonical session list through the diff-files effect leaves no persisted layout while the session is unknown. Releasing it pins Terminal but not Diff for a non-git session; explicitly opening Diff shows the neutral non-git message without a repository error. useDiffFiles.test.ts holds the next session's response and asserts the previous session's repository state is cleared (#4847). A dock action taken while the status is unknown persists as usual, and Diff is added back once a git Session is known; covered in paneLayout.test.ts (#4846)."
     },
     {
       "id": "right-panel.markdown-viewer",
@@ -2700,7 +2746,8 @@
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": ["tests/update-banner.spec.ts", "src/components/__tests__/UpdateBanner.test.tsx"],
-      "components": ["web/src/components/UpdateBanner.tsx"]
+      "components": ["web/src/components/UpdateBanner.tsx"],
+      "notes": "The dismiss test asserts text-subtle, not text-muted or text-secondary, on the dismiss control."
     },
     {
       "id": "connectivity.banner-stack",
@@ -3547,7 +3594,7 @@
       "specs": [
         "src/components/acp/__tests__/SessionBanners.test.tsx",
         "src/components/acp/startupWait.test.ts",
-        "src/lib/agentDisplayName.test.ts",
+        "src/lib/agentDisplayName.test.tsx",
         "src/components/acp/SystemNotices.test.tsx",
         "src/components/acp/QueuedPromptsStrip.test.tsx",
         "src/components/acp/SendButton.test.tsx",
@@ -3580,7 +3627,8 @@
         "web/src/components/acp/StructuredView.tsx",
         "web/src/components/acp/StartupErrorBanner.tsx",
         "web/src/components/acp/RecoveryActionRow.tsx"
-      ]
+      ],
+      "notes": "Auth-required startup errors name the agent's own login step: Claude keeps claude /login and ANTHROPIC_API_KEY, Codex gets codex login and OPENAI_API_KEY, other agents get generic sign-in copy with no Claude or Codex commands."
     },
     {
       "id": "acp.startup-error-banner-actions",
@@ -3823,8 +3871,14 @@
       "id": "story.sidebar-keyboard-row-navigation",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/sidebar-keyboard-navigation.spec.ts"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/SessionRow.tsx"]
+      "specs": ["tests/sidebar-keyboard-navigation.spec.ts", "src/components/__tests__/SidebarGroupHeader.test.tsx"],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/components/sidebar/SidebarGroupHeader.tsx",
+        "web/src/components/sidebar/GroupLists.tsx",
+        "web/src/components/sidebar/keyboardNav.ts"
+      ]
     },
     {
       "id": "story.sidebar-plan-progress",
@@ -3998,6 +4052,13 @@
       "risk": "low",
       "specs": ["src/components/settings/__tests__/SchemaFieldPatches.test.tsx"],
       "components": ["web/src/components/settings/SchemaSection.tsx"]
+    },
+    {
+      "id": "story.settings-sound-controls",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/settings/__tests__/SchemaFieldPatches.test.tsx"],
+      "components": ["web/src/components/settings/customWidgets.tsx"]
     },
     {
       "id": "story.settings-session-id-poller-threads",

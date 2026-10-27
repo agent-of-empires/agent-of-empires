@@ -33,9 +33,10 @@ describe("resolveActionTargets", () => {
       sibling("fork", structured),
       sibling("capable", { view: "terminal", acp_capable: true }),
       sibling("stale", { status: "Idle", update_restart: true }),
+      sibling("hidden", { view: "terminal", acp_capable: true, structured_view_off: true }),
     ];
     const t = resolveActionTargets(sessions, EMPTY_OPTIMISTIC);
-    expect(ids(t.stop)).toEqual(["running", "acp", "fork", "capable", "stale"]);
+    expect(ids(t.stop)).toEqual(["running", "acp", "fork", "capable", "stale", "hidden"]);
     expect(ids(t.restartUpdate)).toEqual(["stale"]);
     expect(ids(t.start)).toEqual(["stopped"]);
     expect(ids(t.fork)).toEqual(["fork"]);

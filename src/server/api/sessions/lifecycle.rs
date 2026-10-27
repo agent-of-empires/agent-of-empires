@@ -664,8 +664,11 @@ pub async fn trash_session(
         Ok(crate::session::trash::RelocateOutcome::Skipped) => {
             crate::daemon::TrashRelocationOutcome::Skipped
         }
-        Ok(crate::session::trash::RelocateOutcome::Relocated { .. }) => {
-            crate::daemon::TrashRelocationOutcome::Relocated
+        Ok(crate::session::trash::RelocateOutcome::Relocated { warning, .. }) => {
+            if let Some(warning) = &warning {
+                tracing::warn!(target: "http.api.sessions", session = %id, %warning, "trashed worktree is degraded");
+            }
+            crate::daemon::TrashRelocationOutcome::Relocated { warning }
         }
         Err(error) => {
             if let Some(response) = lifecycle_rejection(&state, &error) {
@@ -779,9 +782,8 @@ pub async fn restore_session(
             };
             instance.source_profile = profile;
             instance.file_watch = Some(worker_state.file_watch.clone());
-            if let crate::session::trash::RestoreOutcome::Failed { reason } =
-                crate::session::trash::restore_worktree_location(&mut instance)
-            {
+            let warning = match crate::session::trash::restore_worktree_location(&mut instance) {
+                crate::session::trash::RestoreOutcome::Failed { reason } => {
                 store.update(|rows, _| {
                     let row = rows
                         .iter_mut()
@@ -796,7 +798,10 @@ pub async fn restore_session(
                     Ok(())
                 })?;
                 return Err(WorktreeFailure(reason).into());
-            }
+                }
+                crate::session::trash::RestoreOutcome::Restored { warning, .. } => warning,
+                crate::session::trash::RestoreOutcome::NoChange => None,
+            };
             store.update(|rows, _| {
                 match crate::session::claim::finalize_restore_commit(
                     rows,
@@ -814,7 +819,10 @@ pub async fn restore_session(
                     }
                 }
             })?;
-            Ok(crate::daemon::RestoreOutcome::Restored)
+            if let Some(warning) = &warning {
+                tracing::warn!(target: "http.api.sessions", session = %worker_id, %warning, "restored worktree is degraded");
+            }
+            Ok(crate::daemon::RestoreOutcome::Restored { warning })
         })
         .await
         .map_err(anyhow::Error::from)
@@ -1951,6 +1959,7 @@ fn reserve_structured_restart(
     instance: &Instance,
     expected_generation: Option<u64>,
     body: &crate::daemon::RestartSessionBody,
+    restart_origin: RestartOrigin,
 ) -> anyhow::Result<(crate::server::session_store::NativeSessionStore, Instance)> {
     use crate::session::SessionStore;
     let native = crate::server::session_store::NativeSessionStore::open(
@@ -1974,6 +1983,13 @@ fn reserve_structured_restart(
             && expected_generation.is_none_or(|expected| expected == probe.lifecycle_generation),
         crate::session::LifecycleReservationError::Superseded
     );
+    if matches!(restart_origin, RestartOrigin::StartupRecovery) {
+        // Preserve archived/trashed refusals.
+        probe
+            .ensure_startable()
+            .map_err(LifecycleTargetError::Blocked)?;
+        return Err(LifecycleTargetError::Busy.into());
+    }
     admit_restart(&mut probe, body, false)?;
     if let Some(target) = body
         .profile
@@ -2248,6 +2264,29 @@ pub(super) enum AgentPreparation {
     Ensure,
 }
 
+#[derive(Clone, Copy)]
+enum RestartOrigin {
+    Explicit,
+    StartupRecovery,
+}
+
+fn select_restart_wake_message(
+    origin: RestartOrigin,
+    requested: Option<String>,
+    profile: &str,
+) -> String {
+    requested.unwrap_or_else(|| {
+        let session = crate::session::resolve_config(profile)
+            .map(|config| config.session)
+            .unwrap_or_default();
+        if matches!(origin, RestartOrigin::StartupRecovery) && !session.startup_recovery_wake {
+            String::new()
+        } else {
+            session.restart_wake_message
+        }
+    })
+}
+
 pub(super) async fn prepare_agent_session(
     state: Arc<AppState>,
     id: String,
@@ -2258,7 +2297,16 @@ pub(super) async fn prepare_agent_session(
     preparation: AgentPreparation,
     restart: Option<Arc<crate::daemon::RestartSessionBody>>,
 ) -> axum::response::Response {
-    prepare_agent_session_inner(state, id, body, preparation, restart, None).await
+    prepare_agent_session_inner(
+        state,
+        id,
+        body,
+        preparation,
+        restart,
+        None,
+        RestartOrigin::Explicit,
+    )
+    .await
 }
 
 pub(crate) async fn recovery_restart(
@@ -2276,6 +2324,7 @@ pub(crate) async fn recovery_restart(
             ..Default::default()
         })),
         Some(expected_generation),
+        RestartOrigin::StartupRecovery,
     )
     .await
 }
@@ -2290,6 +2339,7 @@ async fn prepare_agent_session_inner(
     preparation: AgentPreparation,
     restart: Option<Arc<crate::daemon::RestartSessionBody>>,
     expected_generation: Option<u64>,
+    restart_origin: RestartOrigin,
 ) -> axum::response::Response {
     if preparation == AgentPreparation::Ensure && state.cityhall_mode {
         return crate::server::api::cityhall_response();
@@ -2373,14 +2423,7 @@ async fn prepare_agent_session_inner(
         }
     }
     if instance.is_structured()
-        && expected_generation.is_some()
-        && (instance.status == Status::Stopped || instance.is_idle_dormant())
-    {
-        // Recovery is not an explicit user resume and cannot consume a native stop.
-        return lifecycle_rejection(&state, &LifecycleTargetError::Busy.into())
-            .unwrap_or_else(|| StatusCode::CONFLICT.into_response());
-    }
-    if instance.is_structured()
+        && matches!(restart_origin, RestartOrigin::Explicit)
         && (instance.status == Status::Stopped || instance.is_idle_dormant())
     {
         instance = match resume_structured_stop(&state, instance).await {
@@ -2393,7 +2436,13 @@ async fn prepare_agent_session_inner(
         let candidate = instance.clone();
         let restart_body = restart.clone().expect("restart body");
         let reserved = tokio::task::spawn_blocking(move || {
-            reserve_structured_restart(worker_state, &candidate, expected_generation, &restart_body)
+            reserve_structured_restart(
+                worker_state,
+                &candidate,
+                expected_generation,
+                &restart_body,
+                restart_origin,
+            )
         })
         .await;
         let (native, reserved) = match reserved {
@@ -2893,13 +2942,8 @@ async fn prepare_agent_session_inner(
                     | crate::session::StartOutcome::FreshAfterFailedResume { .. }
             )
         ) {
-            let wake_message = requested_wake_message.unwrap_or_else(|| {
-                crate::session::resolve_config(&profile)
-                    .map(|config| config.session.restart_wake_message)
-                    .unwrap_or_else(|_| {
-                        crate::session::config::SessionConfig::default().restart_wake_message
-                    })
-            });
+            let wake_message =
+                select_restart_wake_message(restart_origin, requested_wake_message, &profile);
             if !wake_message.is_empty() {
                 crate::session::restart::spawn_wake_worker(
                     id.clone(),
@@ -3072,6 +3116,7 @@ mod durable_stop_tests {
                 &row,
                 None,
                 &crate::daemon::RestartSessionBody::default(),
+                RestartOrigin::Explicit,
             )
         })
         .await
@@ -3212,7 +3257,11 @@ mod durable_stop_tests {
                 .await;
             match reason {
                 "provider_switch" => state.acp_supervisor.shutdown(&row.id).await.unwrap(),
-                "idle" => state.acp_supervisor.shutdown_idle(&row.id).await.unwrap(),
+                "idle" => state
+                    .acp_supervisor
+                    .shutdown_idle(&row.id, None)
+                    .await
+                    .unwrap(),
                 "detach" => state.acp_supervisor.detach_all().await,
                 _ => unreachable!(),
             }
@@ -3398,4 +3447,72 @@ pub async fn update_session_unread(
     drop(_guard);
     drop(namespace);
     crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
+}
+
+#[cfg(test)]
+mod restart_wake_tests {
+    use super::{select_restart_wake_message, RestartOrigin};
+
+    #[test]
+    #[serial_test::serial]
+    fn restart_wake_selection_respects_origin_and_profile_policy() -> anyhow::Result<()> {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let config_path = crate::session::get_app_dir()?.join("config.toml");
+        let profile = "wake-policy";
+        let default_message = "wake up: pick up what you were doing";
+        for (global, overrides, recovered, explicit) in [
+            ("", "", "", default_message),
+            (
+                "startup_recovery_wake = false\nrestart_wake_message = '  custom text  '",
+                "",
+                "",
+                "  custom text  ",
+            ),
+            (
+                "startup_recovery_wake = true",
+                "",
+                default_message,
+                default_message,
+            ),
+            (
+                "startup_recovery_wake = true\nrestart_wake_message = '  custom text  '",
+                "",
+                "  custom text  ",
+                "  custom text  ",
+            ),
+            (
+                "startup_recovery_wake = true\nrestart_wake_message = ''",
+                "",
+                "",
+                "",
+            ),
+            (
+                "startup_recovery_wake = false",
+                "startup_recovery_wake = true\nrestart_wake_message = 'profile text'",
+                "profile text",
+                "profile text",
+            ),
+            (
+                "startup_recovery_wake = true",
+                "startup_recovery_wake = false",
+                "",
+                default_message,
+            ),
+        ] {
+            std::fs::write(&config_path, format!("[session]\n{global}\n"))?;
+            let profile_config = toml::from_str(&format!("[session]\n{overrides}\n"))?;
+            crate::session::config::profile_config::save_profile_config(profile, &profile_config)?;
+            for (origin, expected) in [
+                (RestartOrigin::StartupRecovery, recovered),
+                (RestartOrigin::Explicit, explicit),
+            ] {
+                assert_eq!(
+                    select_restart_wake_message(origin, None, profile),
+                    expected,
+                    "global={global:?}, profile={overrides:?}"
+                );
+            }
+        }
+        Ok(())
+    }
 }

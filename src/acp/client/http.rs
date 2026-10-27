@@ -11,13 +11,18 @@ use reqwest::{header, StatusCode};
 use thiserror::Error;
 
 use super::discovery::DaemonEndpoint;
-use super::passphrase_session::{self, PassphraseSessionCache};
+use super::passphrase_session::{
+    self, may_retry_with_login, select_credential, Credential, PassphraseSessionCache,
+};
 use crate::acp::elicitations::ElicitationResolution;
 use crate::acp::protocol::{
     ApprovalDecisionWire, FilesResponse, PromptRequest, ReplayResponse, ResolveApprovalRequest,
     SwitchAgentRequest, SwitchAgentResponse, SwitchProviderRequest, SwitchProviderResponse,
 };
 use crate::plugin::ui_state::UiSnapshot;
+
+/// The daemon revives, waits for readiness and delivers before it answers a terminal send.
+const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// One active plugin command as the daemon reports it (`GET
 /// /api/plugins/commands`), the source of truth the structured view resolves
@@ -299,6 +304,26 @@ impl HttpClient {
         let res = self.execute(self.http.post(&url).json(&body)).await?;
         let res = check_status(res, session_id)?;
         Ok(crate::daemon::decode_json::<PromptDispatchWire>(res).await?)
+    }
+
+    /// Types `message` into a terminal session's pane. `no_revive` fails loud on a dead pane.
+    pub async fn send_message(
+        &self,
+        session_id: &str,
+        message: &str,
+        no_revive: bool,
+    ) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/send",
+            self.endpoint.base_url,
+            path_segment(session_id)?
+        );
+        let body = serde_json::json!({ "message": message, "revive": !no_revive });
+        let res = self
+            .execute(self.http.post(&url).json(&body).timeout(SEND_TIMEOUT))
+            .await?;
+        check_status(res, session_id)?;
+        Ok(())
     }
 
     /// `GET /api/plugins/ui-state`. The daemon-wide plugin UI snapshot
@@ -623,12 +648,9 @@ impl HttpClient {
         &self,
         state: Option<crate::session::SessionScope>,
     ) -> Result<crate::daemon::SessionsEnvelope, HttpError> {
-        let had_cached_session =
-            self.can_login() && self.passphrase_session.get(&self.endpoint).is_some();
-        let bearer_only =
-            !had_cached_session && self.endpoint.bearer_token().is_some() && self.can_login();
+        let may_retry = self.may_retry_with_login();
         match self.list_sessions_once(state, false).await {
-            Err(HttpError::Unauthorized) if had_cached_session || bearer_only => {
+            Err(HttpError::Unauthorized) if may_retry => {
                 self.passphrase_session.invalidate(&self.endpoint);
                 self.list_sessions_once(state, true).await
             }
@@ -649,22 +671,21 @@ impl HttpClient {
         if let Some(path) = self.endpoint.unix_path() {
             return Ok(crate::daemon::DaemonClient::new_unix(path)?);
         }
-        let can_login = self.can_login();
-        let cached = can_login && self.passphrase_session.get(&self.endpoint).is_some();
-        if !(force_session && can_login || cached) {
-            if let Some(token) = self.endpoint.bearer_token() {
-                return Ok(crate::daemon::DaemonClient::new(base_url, Some(token))?);
-            }
-            if !can_login {
-                return Ok(crate::daemon::DaemonClient::new(base_url, None)?);
+        match self.credential(force_session) {
+            Credential::Bearer => Ok(crate::daemon::DaemonClient::new(
+                base_url,
+                self.endpoint.bearer_token(),
+            )?),
+            Credential::None => Ok(crate::daemon::DaemonClient::new(base_url, None)?),
+            Credential::Session => {
+                let session = self.ensure_passphrase_session().await?;
+                Ok(crate::daemon::DaemonClient::with_session(
+                    base_url,
+                    &session.cookie,
+                    &session.binding_secret,
+                )?)
             }
         }
-        let session = self.ensure_passphrase_session().await?;
-        Ok(crate::daemon::DaemonClient::with_session(
-            base_url,
-            &session.cookie,
-            &session.binding_secret,
-        )?)
     }
 
     async fn list_sessions_once(
@@ -791,11 +812,9 @@ impl HttpClient {
         // can reuse the built request. A body that cannot be cloned (none
         // today) simply keeps the first response.
         let retry = request.try_clone();
-        let had_cached_session = self.passphrase_session.get(&self.endpoint).is_some();
+        let may_retry = self.may_retry_with_login();
         let response = self.send_authenticated(request, false).await?;
-        let bearer_only =
-            !had_cached_session && self.endpoint.bearer_token().is_some() && self.can_login();
-        if response.status() != StatusCode::UNAUTHORIZED || !(had_cached_session || bearer_only) {
+        if response.status() != StatusCode::UNAUTHORIZED || !may_retry {
             return Ok(response);
         }
         self.passphrase_session.invalidate(&self.endpoint);
@@ -837,36 +856,34 @@ impl HttpClient {
         )
     }
 
-    /// A passphrase can be used here: never over a Unix socket, whose peer owner
-    /// already authorizes the request, and `resolved_passphrase` refuses a plaintext
-    /// `http://` non-loopback URL.
-    fn can_login(&self) -> bool {
-        self.endpoint.unix_path().is_none() && self.endpoint.resolved_passphrase().is_some()
+    fn credential(&self, force_session: bool) -> Credential {
+        select_credential(&self.endpoint, &self.passphrase_session, force_session)
     }
 
-    /// Attach whichever credential is available. A cached passphrase-login session
-    /// wins, then a bearer token (`--auth=token`), then a fresh login
-    /// (`--auth=passphrase`). `force_session` skips the bearer. Nothing resolving
+    fn may_retry_with_login(&self) -> bool {
+        may_retry_with_login(&self.endpoint, &self.passphrase_session)
+    }
+
+    /// Attach the credential [`select_credential`] picks; nothing resolving
     /// (`--auth=none`) leaves the request untouched.
     async fn attach_credential(
         &self,
         request: &mut reqwest::Request,
         force_session: bool,
     ) -> Result<(), HttpError> {
-        let can_login = self.can_login();
-        let cached = can_login && self.passphrase_session.get(&self.endpoint).is_some();
-        if !(force_session && can_login || cached) {
-            if let Some(authorization) =
-                crate::daemon::authorization_header(self.endpoint.bearer_token())?
-            {
-                request
-                    .headers_mut()
-                    .insert(header::AUTHORIZATION, authorization);
+        match self.credential(force_session) {
+            Credential::None => return Ok(()),
+            Credential::Bearer => {
+                if let Some(authorization) =
+                    crate::daemon::authorization_header(self.endpoint.bearer_token())?
+                {
+                    request
+                        .headers_mut()
+                        .insert(header::AUTHORIZATION, authorization);
+                }
                 return Ok(());
             }
-            if !can_login {
-                return Ok(());
-            }
+            Credential::Session => {}
         }
         let session = self.ensure_passphrase_session().await?;
         request.headers_mut().insert(

@@ -34,19 +34,19 @@ pub fn play_for_transition(old: Status, new: Status, config: &SoundConfig) {
         return;
     }
 
-    let override_name = match new {
-        Status::Starting => config.on_start.as_deref(),
-        Status::Running => config.on_running.as_deref(),
-        Status::Waiting => config.on_waiting.as_deref(),
-        Status::Idle => config.on_idle.as_deref(),
-        Status::Error => config.on_error.as_deref(),
-        Status::Unknown => return,
-        Status::Stopped => return,
-        Status::Deleting => return,
-        Status::Creating => return,
+    let (enabled, override_name) = match new {
+        Status::Starting => (config.server_start_enabled, config.on_start.as_deref()),
+        Status::Running => (config.server_running_enabled, config.on_running.as_deref()),
+        Status::Waiting => (config.server_waiting_enabled, config.on_waiting.as_deref()),
+        Status::Idle => (config.server_idle_enabled, config.on_idle.as_deref()),
+        Status::Error => (config.server_error_enabled, config.on_error.as_deref()),
+        Status::Unknown | Status::Stopped | Status::Deleting | Status::Creating => return,
     };
+    if !enabled {
+        return;
+    }
 
     if let Some(name) = resolve_sound_name(override_name) {
-        play_sound(&name, config.volume);
+        play_sound(&name, config.server_volume);
     }
 }

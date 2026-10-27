@@ -53,7 +53,12 @@ fn is_holding_path(path: &Path, session_id: &str) -> bool {
 pub enum RelocateOutcome {
     /// The worktree was moved into the holding area and `project_path` was
     /// repointed; `pre_trash_project_path` now holds the original location.
-    Relocated { from: PathBuf, to: PathBuf },
+    /// `warning` is set when git is left degraded at the new path.
+    Relocated {
+        from: PathBuf,
+        to: PathBuf,
+        warning: Option<String>,
+    },
     /// Nothing to do: not a managed single-repo worktree, or already
     /// relocated. `project_path` is untouched.
     Skipped,
@@ -67,7 +72,12 @@ pub enum RelocateOutcome {
 #[derive(Debug)]
 pub enum RestoreOutcome {
     /// The worktree was moved back to its pre-trash location.
-    Restored { from: PathBuf, to: PathBuf },
+    /// `warning` is set when git is left degraded at the original path.
+    Restored {
+        from: PathBuf,
+        to: PathBuf,
+        warning: Option<String>,
+    },
     /// No relocation had happened (plain/non-managed session, or a row trashed
     /// before relocation existed), so there is nothing to move. The caller
     /// still clears `trashed_at`.
@@ -192,6 +202,16 @@ pub fn relocate_worktree_to_trash(inst: &mut Instance) -> RelocateOutcome {
     }
 
     let current = PathBuf::from(&inst.project_path);
+    // Moving the checkout would pull the directory out from under the other session.
+    if crate::session::deletion::paths_in_use_except(&[&inst.id]).covers(&current) {
+        tracing::info!(
+            target: "session.trash",
+            session = %inst.id,
+            path = %inst.project_path,
+            "leaving a worktree in place that another session uses"
+        );
+        return RelocateOutcome::Skipped;
+    }
     let Some(target) = trash_holding_path(&current, &inst.id) else {
         return RelocateOutcome::Failed {
             reason: format!("worktree path {} has no parent dir", current.display()),
@@ -229,11 +249,14 @@ pub fn relocate_worktree_to_trash(inst: &mut Instance) -> RelocateOutcome {
             };
         }
     }
-    if let Err(e) = git.move_worktree(&current, &target) {
-        return RelocateOutcome::Failed {
-            reason: format!("git worktree move: {e}"),
-        };
-    }
+    let warning = match git.move_worktree(&current, &target) {
+        Ok(moved) => moved.into_warning(),
+        Err(e) => {
+            return RelocateOutcome::Failed {
+                reason: format!("git worktree move: {e}"),
+            }
+        }
+    };
 
     discard_sandbox_container_after_move(&inst.id, is_sandboxed(inst));
     inst.pre_trash_project_path = Some(inst.project_path.clone());
@@ -245,9 +268,13 @@ pub fn relocate_worktree_to_trash(inst: &mut Instance) -> RelocateOutcome {
         to = %target.display(),
         "relocated trashed worktree into holding area"
     );
+    if let Some(warning) = &warning {
+        tracing::warn!(target: "session.trash", session = %inst.id, "relocated worktree is degraded: {warning}");
+    }
     RelocateOutcome::Relocated {
         from: current,
         to: target,
+        warning,
     }
 }
 
@@ -317,7 +344,7 @@ pub fn perform_trash(request: &TrashRequest) -> TrashResult {
             return failed(format!("could not acquire lifecycle lock: {error}"));
         }
     };
-    let mut inst = match storage.update(|instances, _groups| {
+    let mut inst = match storage.update_complete(|instances, _groups| {
         Ok(instances
             .iter()
             .find(|instance| instance.id == request.session_id)
@@ -389,7 +416,8 @@ pub fn perform_trash(request: &TrashRequest) -> TrashResult {
         relocation,
         relocate_warning: match outcome {
             RelocateOutcome::Failed { reason } => Some(reason),
-            RelocateOutcome::Relocated { .. } | RelocateOutcome::Skipped => None,
+            RelocateOutcome::Relocated { warning, .. } => warning,
+            RelocateOutcome::Skipped => None,
         },
     }
 }
@@ -456,11 +484,14 @@ pub fn restore_worktree_location(inst: &mut Instance) -> RestoreOutcome {
             }
         }
     };
-    if let Err(e) = git.move_worktree(&current, &original) {
-        return RestoreOutcome::Failed {
-            reason: format!("git worktree move: {e}"),
-        };
-    }
+    let warning = match git.move_worktree(&current, &original) {
+        Ok(moved) => moved.into_warning(),
+        Err(e) => {
+            return RestoreOutcome::Failed {
+                reason: format!("git worktree move: {e}"),
+            }
+        }
+    };
     discard_sandbox_container_after_move(&inst.id, is_sandboxed(inst));
     inst.project_path = original.to_string_lossy().into_owned();
     inst.pre_trash_project_path = None;
@@ -471,9 +502,13 @@ pub fn restore_worktree_location(inst: &mut Instance) -> RestoreOutcome {
         to = %original.display(),
         "restored worktree from holding area"
     );
+    if let Some(warning) = &warning {
+        tracing::warn!(target: "session.trash", session = %inst.id, "restored worktree is degraded: {warning}");
+    }
     RestoreOutcome::Restored {
         from: current,
         to: original,
+        warning,
     }
 }
 
@@ -713,7 +748,7 @@ fn reconcile_trashed_batch(
 ) -> anyhow::Result<Vec<Instance>> {
     let _identity = crate::session::acquire_session_identity_lock()?;
     let now = Utc::now();
-    let reserved = storage.update(|instances, _groups| {
+    let reserved = storage.update_complete(|instances, _groups| {
         let mut reserved: Vec<(u64, Instance)> = Vec::new();
         for snapshot in batch {
             let Some(stored) = instances
@@ -1087,6 +1122,121 @@ mod tests {
         assert!(PathBuf::from(&original).exists());
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn a_worktree_another_session_uses_is_never_relocated() {
+        if !git_available() {
+            return;
+        }
+        let (tmp, mut inst) = real_worktree_instance();
+        let _home = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("home"));
+        let sharer = Instance::new("sharer", &inst.project_path);
+        crate::session::Storage::new_unwatched("other")
+            .unwrap()
+            .update(|instances, _groups| {
+                instances.push(sharer);
+                Ok(())
+            })
+            .unwrap();
+        let original = inst.project_path.clone();
+        inst.trash();
+
+        let out = relocate_worktree_to_trash(&mut inst);
+        assert!(
+            matches!(out, RelocateOutcome::Skipped),
+            "expected the relocation to be skipped, got {out:?}"
+        );
+        assert_eq!(inst.project_path, original);
+        assert!(inst.pre_trash_project_path.is_none());
+        assert!(PathBuf::from(&original).exists());
+    }
+
+    /// A shared worktree stays put when the other session's path is spelled through a symlink, or
+    /// when a store holds a row that cannot be decoded and so might be a sharer.
+    #[test]
+    #[serial_test::serial]
+    fn shared_worktree_guard_keeps_a_lexical_match_whose_path_resolves_elsewhere() {
+        if !git_available() {
+            return;
+        }
+        let (tmp, mut inst) = real_worktree_instance();
+        let _home = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("home"));
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = PathBuf::from(&inst.project_path).join("link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let sharer = Instance::new("sharer", link.to_str().unwrap());
+        crate::session::Storage::new_unwatched("other")
+            .unwrap()
+            .update(|instances, _groups| {
+                instances.push(sharer);
+                Ok(())
+            })
+            .unwrap();
+        inst.trash();
+
+        let out = relocate_worktree_to_trash(&mut inst);
+        assert!(
+            matches!(out, RelocateOutcome::Skipped),
+            "expected the relocation to be skipped, got {out:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn shared_worktree_guard_sees_symlinked_paths_and_undecodable_rows() {
+        if !git_available() {
+            return;
+        }
+        for undecodable in [false, true] {
+            let (tmp, mut inst) = real_worktree_instance();
+            let _home = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("home"));
+            let store = crate::session::Storage::new_unwatched("other").unwrap();
+            if undecodable {
+                store.update(|_, _| Ok(())).unwrap();
+                let mut rows: Vec<serde_json::Value> =
+                    serde_json::from_slice(&std::fs::read(store.sessions_path()).unwrap()).unwrap();
+                rows.push(serde_json::json!({ "not": "a session" }));
+                std::fs::write(store.sessions_path(), serde_json::to_vec(&rows).unwrap()).unwrap();
+            } else {
+                let alias = tmp.path().join("alias");
+                std::os::unix::fs::symlink(tmp.path().join("wt"), &alias).unwrap();
+                let sharer = Instance::new("sharer", alias.join("feature").to_str().unwrap());
+                store
+                    .update(|instances, _groups| {
+                        instances.push(sharer);
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            inst.trash();
+
+            let out = relocate_worktree_to_trash(&mut inst);
+            assert!(
+                matches!(out, RelocateOutcome::Skipped),
+                "undecodable={undecodable}: expected the relocation to be skipped, got {out:?}"
+            );
+            assert!(inst.pre_trash_project_path.is_none());
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn trash_reservation_keeps_an_undecodable_same_profile_row() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let store = crate::session::Storage::new_unwatched("default").unwrap();
+        store.update(|_, _| Ok(())).unwrap();
+        let mut rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(store.sessions_path()).unwrap()).unwrap();
+        rows.push(serde_json::json!({ "not": "a session" }));
+        let bytes = serde_json::to_vec(&rows).unwrap();
+        std::fs::write(store.sessions_path(), &bytes).unwrap();
+
+        assert!(store.update_complete(|_, _| Ok(())).is_err());
+        assert_eq!(std::fs::read(store.sessions_path()).unwrap(), bytes);
+    }
+
     /// Upgrade path for #3215: a row relocated by an earlier version. The purge
     /// now preserves the checkout, so leaving it in the holding area would
     /// orphan it once the row is cleared. Reconciliation moves it back.
@@ -1145,7 +1295,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn relocate_then_restore_round_trip() {
+        let _app = crate::session::test_support::isolate_app_dir();
         if !git_available() {
             return;
         }
@@ -1196,8 +1348,9 @@ mod tests {
     }
 
     #[test]
-
+    #[serial_test::serial]
     fn reconcile_backfills_legacy_then_is_idempotent() {
+        let _app = crate::session::test_support::isolate_app_dir();
         if !git_available() {
             return;
         }
@@ -1230,7 +1383,9 @@ mod tests {
     /// admin dir was pruned and the `.git` file is left dangling, and the one
     /// where the `.git` entry is gone outright.
     #[test]
+    #[serial_test::serial]
     fn reconcile_never_retries_a_checkout_the_repo_no_longer_registers() {
+        let _app = crate::session::test_support::isolate_app_dir();
         if !git_available() {
             return;
         }
@@ -1353,7 +1508,9 @@ mod tests {
     /// lock condition) must stay retriable, so one bad moment cannot strand the
     /// relocation for good.
     #[test]
+    #[serial_test::serial]
     fn a_move_failure_over_a_live_checkout_stays_retriable() {
+        let _app = crate::session::test_support::isolate_app_dir();
         if !git_available() {
             return;
         }
@@ -1510,7 +1667,9 @@ mod tests {
     /// A markerless row whose pointer was lost is healed to the holding path, whether or not
     /// the original path was recreated; one already pointing at holding is left alone.
     #[test]
+    #[serial_test::serial]
     fn reconcile_heals_a_markerless_pointer_to_holding_only_when_it_is_lost() {
+        let _app = crate::session::test_support::isolate_app_dir();
         if !git_available() {
             return;
         }
@@ -1680,7 +1839,9 @@ mod tests {
     /// is injected here so the wiring/ordering is verified without a live docker
     /// runtime; a non-sandbox session exercises the happy path end to end.
     #[test]
+    #[serial_test::serial]
     fn trash_prep_stops_container_before_relocating() {
+        let _app = crate::session::test_support::isolate_app_dir();
         if !git_available() {
             return;
         }
@@ -1745,6 +1906,7 @@ mod tests {
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         });
         inst.trash();
@@ -1773,7 +1935,9 @@ mod tests {
     /// undone: the worktree moves back to the original path the live row
     /// points at.
     #[test]
+    #[serial_test::serial]
     fn undo_raced_relocation_moves_worktree_back() {
+        let _app = crate::session::test_support::isolate_app_dir();
         if !git_available() {
             return;
         }

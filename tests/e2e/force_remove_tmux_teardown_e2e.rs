@@ -121,7 +121,7 @@ async fn test_force_remove_session_kills_agent_tmux_session() {
     assert_eq!(identity.split_whitespace().count(), 3);
 
     h.spawn_tui();
-    h.wait_for("Runtime ready");
+    h.wait_for_runtime_ready();
     h.wait_for("StuckDel");
 
     // Disconnect only after the daemon has admitted the purge and entered its hook.

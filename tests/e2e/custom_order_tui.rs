@@ -68,7 +68,7 @@ fn test_tui_custom_sort_reorders_and_persists() {
     add_session(&h, "beta-two");
 
     h.spawn_tui();
-    h.wait_for("Runtime ready");
+    h.wait_for_runtime_ready();
     h.wait_for("alpha-one");
     h.wait_for("beta-two");
 
@@ -88,12 +88,12 @@ fn test_tui_custom_sort_reorders_and_persists() {
     let expected = vec![before[1].clone(), before[0].clone()];
     // Input ACK fences submission, not the daemon's committed publication.
     let moved = wait_for_order(&h, &expected);
-    h.wait_for("Runtime ready");
+    h.wait_for_runtime_ready();
 
     // A fresh TUI must display the persisted order.
     h.kill_tui();
     h.spawn_tui();
-    h.wait_for("Runtime ready");
+    h.wait_for_runtime_ready();
     h.wait_for("alpha-one");
     h.wait_for("beta-two");
     wait_for_order(&h, &moved);

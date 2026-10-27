@@ -11,7 +11,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
 
 use crate::acp::client::autostart::initial_log_tail;
-use crate::cli::serve::{read_serve_urls, ServeUrl};
+use crate::cli::serve::{read_serve_urls, ServeLaunch, ServeUrl};
 use crate::tui::components::hover::HoverState;
 use crate::tui::dialogs::{contains, hit, target_rects};
 use crate::tui::styles::Theme;
@@ -84,7 +84,10 @@ impl ServeLaunchRequest {
         }
         if result.is_ok() {
             remember_last_mode(self.mode);
-            if let Some(passphrase) = self.passphrase {
+        }
+        // A failed reconnect can follow a successor that already runs the new passphrase.
+        if let Some(passphrase) = self.passphrase {
+            if result.is_ok() || crate::cli::serve::daemon_runs_passphrase(&passphrase) {
                 remember_passphrase(&passphrase);
                 save_passphrase_to_disk(&passphrase);
             }
@@ -115,6 +118,22 @@ impl ServeMode {
             _ => None,
         }
     }
+
+    /// How a running Daemon is reachable, from the `serve.mode` token it writes. A Tunnel's
+    /// token names its provider ("tailscale", or "tunnel" for Cloudflare).
+    fn reachability(s: &str) -> Option<&'static str> {
+        match s.trim() {
+            "tailscale" => Some("Tailscale"),
+            "tunnel" => Some("Cloudflare"),
+            "local" => Some("Local network"),
+            _ => None,
+        }
+    }
+}
+
+/// How the running Web dashboard is reachable, for the Connections hub.
+pub fn served_via() -> Option<&'static str> {
+    ServeMode::reachability(&read_app_file("serve.mode")?)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -347,6 +366,8 @@ struct RestartEffect {
     logins: Logins,
     /// The next daemon puts Devices behind the passphrase login wall.
     passphrase: bool,
+    /// The token is near expiry, so a standing help screen cannot say the link stays.
+    may_change: bool,
 }
 
 /// What the next start will do, read when R, G or help states it: the restarted daemon reads
@@ -361,14 +382,17 @@ struct RestartProbe {
     port: Option<u16>,
     /// The hosts a Local restart publishes: this machine's addresses plus `localhost`.
     local_hosts: Vec<String>,
+    /// The recorded named tunnel's host, which a Tunnel restart replays (Tunnel only).
+    named_host: Option<String>,
     /// A Local restart inherits `AOE_SERVE_PASSPHRASE` from this process.
     local_passphrase: bool,
-    /// A Local restart mints a new access token (`token_renews`).
-    local_token_renews: bool,
+    /// Whether a Local restart mints a new access token.
+    local_token: TokenWindow,
 }
 
 impl RestartProbe {
     fn now(mode: ServeMode, transport: Option<TunnelTransport>) -> Self {
+        let recorded = crate::cli::serve::recorded_launch();
         match mode {
             ServeMode::Local => RestartProbe {
                 on_funnel: false,
@@ -381,11 +405,15 @@ impl RestartProbe {
                     .collect(),
                 local_passphrase: std::env::var("AOE_SERVE_PASSPHRASE")
                     .is_ok_and(|pp| !pp.is_empty()),
-                local_token_renews: token_renews(),
+                local_token: effective_token_window(recorded.as_ref(), token_window()),
+                named_host: None,
             },
             ServeMode::Tunnel => RestartProbe {
                 on_funnel: restart_on_funnel(transport),
                 persists: persist_sessions(),
+                named_host: recorded
+                    .and_then(|launch| launch.tunnel_name.and(launch.tunnel_url))
+                    .and_then(|url| link_host(&url).map(str::to_owned)),
                 ..RestartProbe::default()
             },
         }
@@ -393,9 +421,9 @@ impl RestartProbe {
 }
 
 impl RestartEffect {
-    /// A Tunnel keeps its host only when it is on Funnel and the restart takes the Funnel path
-    /// again: `spawn_daemon` never re-creates a named Cloudflare tunnel, and without Funnel the
-    /// server opens a fresh quick tunnel. A Local daemon republishes this machine's addresses on
+    /// A Tunnel keeps its host when the recorded named tunnel is replayed, or when it is on
+    /// Funnel and the restart takes the Funnel path again; otherwise the server opens a fresh
+    /// quick tunnel. A Local daemon republishes this machine's addresses on
     /// the reused or a random port, with a new token once the old one has aged out. Behind the
     /// passphrase wall, sign-ins then survive only if the running daemon wrote them to disk and
     /// the next start reads them back.
@@ -408,13 +436,14 @@ impl RestartEffect {
         let (link, passphrase) = match mode {
             ServeMode::Local => {
                 let hosts_stay = urls.iter().all(|u| {
-                    link_host(&u.url)
-                        .is_some_and(|host| probe.local_hosts.iter().any(|h| h == host))
+                    link_host(&u.url).is_some_and(|host| {
+                        is_loopback_host(host) || probe.local_hosts.iter().any(|h| h == host)
+                    })
                 });
                 let port_stays = probe
                     .port
                     .is_some_and(|port| urls.iter().all(|u| link_port(&u.url) == Some(port)));
-                let renews = probe.local_token_renews;
+                let renews = probe.local_token == TokenWindow::Renews;
                 let link = if !hosts_stay || (renews && !probe.local_passphrase) {
                     LinkChange::Replaced
                 } else if !port_stays || renews {
@@ -425,7 +454,12 @@ impl RestartEffect {
                 (link, probe.local_passphrase)
             }
             ServeMode::Tunnel => {
-                let stays = probe.on_funnel && urls.iter().any(|u| is_funnel_link(&u.url));
+                let stays = match &probe.named_host {
+                    Some(named) => urls
+                        .iter()
+                        .any(|u| link_host(&u.url).is_some_and(|host| host == named)),
+                    None => probe.on_funnel && urls.iter().any(|u| is_funnel_link(&u.url)),
+                };
                 (
                     if stays {
                         LinkChange::Same
@@ -451,7 +485,20 @@ impl RestartEffect {
             link,
             logins,
             passphrase,
+            may_change: mode == ServeMode::Local && probe.local_token == TokenWindow::Boundary,
         }
+    }
+}
+
+/// Only token auth puts a token in the link, and a restart replays the recorded auth mode.
+fn effective_token_window(recorded: Option<&ServeLaunch>, window: TokenWindow) -> TokenWindow {
+    let token_auth = recorded.is_none_or(|launch| {
+        launch.core_only || launch.auth_mode == crate::cli::serve::AuthMode::Token
+    });
+    if token_auth {
+        window
+    } else {
+        TokenWindow::Reused
     }
 }
 
@@ -481,6 +528,15 @@ fn link_host(url: &str) -> Option<&str> {
             .rsplit_once(':')
             .map_or(authority, |(host, _)| host),
     )
+}
+
+/// A Local restart binds 0.0.0.0, which keeps these reachable. IPv6 is not covered: it is not
+/// bound, and `link_host` does not parse bracketed hosts.
+fn is_loopback_host(host: &str) -> bool {
+    host == "localhost"
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// The explicit port in a Local link such as `http://192.168.1.42:51234/?token=…`.
@@ -908,7 +964,6 @@ impl ServeView {
             KeyCode::Char('g' | 'G') if mode == ServeMode::Tunnel => {
                 if confirmed == Some(PendingConfirm::NewPassphrase) {
                     let new_pp = generate_passphrase();
-                    save_passphrase_to_disk(&new_pp);
                     self.pending_passphrase = new_pp.clone();
                     self.restart(mode, transport, Some(new_pp));
                 } else {
@@ -918,7 +973,16 @@ impl ServeView {
             }
             // Reusing the passphrase keeps persisted logins; see `RestartEffect`.
             KeyCode::Char('r' | 'R') => {
-                if confirmed == Some(PendingConfirm::Restart) {
+                let fresh = RestartProbe::now(mode, transport);
+                let unchanged = confirmed == Some(PendingConfirm::Restart)
+                    && RestartEffect::of(mode, urls, &fresh, self.running_persists)
+                        == RestartEffect::of(
+                            mode,
+                            urls,
+                            &self.restart_probe,
+                            self.running_persists,
+                        );
+                if unchanged {
                     let pp = (mode == ServeMode::Tunnel).then(|| {
                         passphrase
                             .clone()
@@ -926,7 +990,7 @@ impl ServeView {
                     });
                     self.restart(mode, transport, pp);
                 } else {
-                    self.restart_probe = RestartProbe::now(mode, transport);
+                    self.restart_probe = fresh;
                     self.pending_confirm = Some((PendingConfirm::Restart, Instant::now()));
                 }
             }
@@ -1302,6 +1366,189 @@ mod tests {
                 "{key}"
             );
         }
+    }
+
+    /// A refused or failed restart leaves the old daemon running, so the saved passphrase must
+    /// stay the one that daemon accepts until `ServeLaunchRequest::run` succeeds.
+    #[test]
+    #[serial_test::serial]
+    fn new_passphrase_is_saved_only_after_the_restart_succeeds() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        save_passphrase_to_disk("running daemon phrase");
+        let mut view = ServeView {
+            state: ServeViewState::Active {
+                mode: ServeMode::Tunnel,
+                transport: Some(TunnelTransport::Cloudflare),
+                urls: vec![],
+                url_index: 0,
+                passphrase: Some("running daemon phrase".to_string()),
+                opened_at: Instant::now(),
+                log_offset: 0,
+            },
+            pending_passphrase: String::new(),
+            pending_confirm: None,
+            show_help: false,
+            mouse: RefCell::default(),
+            copied: None,
+            running_persists: None,
+            restart_probe: RestartProbe::default(),
+            pending_launch: None,
+            launch_in_flight: false,
+            stop_requested: false,
+            probes: Probes::new(|_| false),
+        };
+        let key = KeyEvent::from(KeyCode::Char('G'));
+        view.handle_key(key);
+        assert!(matches!(view.handle_key(key), ServeAction::Launch(_)));
+        assert_ne!(view.pending_passphrase, "running daemon phrase");
+        assert_eq!(
+            recall_passphrase().as_deref(),
+            Some("running daemon phrase")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn restart_requires_an_uninterrupted_confirmation() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        for (cancelled, expired) in [(false, false), (true, false), (false, true)] {
+            let mut view = ServeView {
+                state: ServeViewState::Active {
+                    mode: ServeMode::Local,
+                    transport: None,
+                    urls: vec![ServeUrl {
+                        label: None,
+                        url: "http://127.0.0.1:8081/".to_string(),
+                    }],
+                    url_index: 0,
+                    passphrase: None,
+                    opened_at: Instant::now(),
+                    log_offset: 0,
+                },
+                pending_passphrase: String::new(),
+                pending_confirm: None,
+                show_help: false,
+                mouse: RefCell::default(),
+                copied: None,
+                running_persists: None,
+                restart_probe: RestartProbe::default(),
+                pending_launch: None,
+                launch_in_flight: false,
+                stop_requested: false,
+                probes: Probes::new(|_| false),
+            };
+            let restart_key = KeyEvent::from(KeyCode::Char('R'));
+            assert!(matches!(
+                view.handle_key(restart_key),
+                ServeAction::Continue
+            ));
+            assert!(matches!(&view.state, ServeViewState::Active { .. }));
+            assert!(!view.launch_in_flight);
+            assert!(view.pending_launch.is_none());
+            assert!(matches!(
+                view.pending_confirm,
+                Some((PendingConfirm::Restart, _))
+            ));
+
+            if cancelled {
+                assert!(matches!(
+                    view.handle_key(KeyEvent::from(KeyCode::Char('x'))),
+                    ServeAction::Continue
+                ));
+                assert!(view.pending_confirm.is_none());
+            }
+            let stale = Instant::now() - CONFIRM_TTL - Duration::from_secs(1);
+            if expired {
+                view.pending_confirm = Some((PendingConfirm::Restart, stale));
+            }
+            let action = view.handle_key(restart_key);
+            if cancelled || expired {
+                assert!(matches!(action, ServeAction::Continue));
+                assert!(matches!(&view.state, ServeViewState::Active { .. }));
+                assert!(!view.launch_in_flight);
+                assert!(view.pending_launch.is_none());
+                assert!(view.pending_confirm.is_some_and(|(action, when)| {
+                    action == PendingConfirm::Restart && when > stale
+                }));
+            } else {
+                let ServeAction::Launch(request) = action else {
+                    panic!("second restart key must launch");
+                };
+                assert!(request.restart);
+                assert_eq!(request.mode, ServeMode::Local);
+                assert!(matches!(&view.state, ServeViewState::Starting { .. }));
+                assert!(view.launch_in_flight);
+                assert!(view.pending_confirm.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn token_age_counts_only_under_token_auth() {
+        let recorded = |auth: &str, core_only: bool| -> ServeLaunch {
+            serde_json::from_value(serde_json::json!({
+                "schema": 4, "pid": 1, "profile": "", "core_only": core_only,
+                "host": "127.0.0.1", "port": 8080, "auth_mode": auth,
+                "has_passphrase": false, "behind_proxy": false, "read_only": false,
+                "remote": false, "tunnel_name": null, "tunnel_url": null,
+                "no_tailscale": false,
+            }))
+            .unwrap()
+        };
+        let renews = TokenWindow::Renews;
+        for (launch, want) in [
+            (None, renews),
+            (Some(recorded("token", false)), renews),
+            (Some(recorded("none", true)), renews),
+            (Some(recorded("passphrase", false)), TokenWindow::Reused),
+            (Some(recorded("none", false)), TokenWindow::Reused),
+        ] {
+            assert_eq!(effective_token_window(launch.as_ref(), renews), want);
+        }
+    }
+
+    /// The token can age out between the first and second R, so the second one confirms again
+    /// when what it would do no longer matches what the user read.
+    #[test]
+    #[serial_test::serial]
+    fn second_restart_key_reprobes_and_reconfirms_when_the_effect_changed() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let token = crate::session::get_app_dir().unwrap().join("serve.token");
+        let mut view = ServeView::new();
+        view.state = ServeViewState::Active {
+            mode: ServeMode::Local,
+            transport: None,
+            urls: vec![ServeUrl {
+                label: None,
+                url: "http://127.0.0.1:8080/?token=t".to_string(),
+            }],
+            url_index: 0,
+            passphrase: None,
+            opened_at: Instant::now(),
+            log_offset: 0,
+        };
+        let key = KeyEvent::from(KeyCode::Char('R'));
+        let write_token = |age: Duration| {
+            std::fs::write(&token, "t").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&token)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - age)
+                .unwrap();
+        };
+        write_token(Duration::from_secs(23 * 60 * 60 + 60));
+        view.handle_key(key);
+        assert_eq!(view.restart_probe.local_token, TokenWindow::Boundary);
+        write_token(Duration::from_secs(24 * 60 * 60 + 60));
+        assert!(matches!(view.handle_key(key), ServeAction::Continue));
+        assert_eq!(view.restart_probe.local_token, TokenWindow::Renews);
+        assert!(matches!(
+            view.pending_confirm,
+            Some((PendingConfirm::Restart, _))
+        ));
+        assert!(view.pending_launch.is_none());
+        assert!(matches!(view.handle_key(key), ServeAction::Launch(_)));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
