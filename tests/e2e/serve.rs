@@ -3927,6 +3927,21 @@ fn cli_serve_daemon_profile_reaches_the_served_layer() {
     }
 }
 
+/// Replace the live Daemon's worker directory with a file. The Daemon may
+/// recreate the directory between the delete and the write, so retry until
+/// the file holds; a file cannot be recreated as a directory.
+fn block_workers_dir(workers: &std::path::Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let _ = std::fs::remove_dir_all(workers);
+        if std::fs::write(workers, "not a directory").is_ok() && workers.is_file() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "could not block {workers:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// A running Daemon stays administrable when pending migrations would fail.
 #[test]
 #[parallel]
@@ -3939,8 +3954,7 @@ fn cli_serve_controls_skip_migrations_and_lock() {
     let version = app.join(".schema_version");
     std::fs::write(&version, "39").unwrap();
     let workers = app.join("acp-workers");
-    std::fs::remove_dir_all(&workers).unwrap();
-    std::fs::write(&workers, "not a directory").unwrap();
+    block_workers_dir(&workers);
 
     for flag in ["--status", "--stop"] {
         h.run_cli(&["serve", flag]);
@@ -3965,8 +3979,7 @@ fn cli_serve_restart_reports_replacement_startup_failure() {
     let app = app_dir_in(h.home_path());
     std::fs::write(app.join(".schema_version"), "39").unwrap();
     let workers = app.join("acp-workers");
-    let _ = std::fs::remove_dir_all(&workers);
-    std::fs::write(&workers, "not a directory").unwrap();
+    block_workers_dir(&workers);
 
     h.run_cli_err(&["serve", "--restart"]);
     h.run_cli_err(&["serve", "--status"]);
