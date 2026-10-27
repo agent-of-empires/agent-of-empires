@@ -897,6 +897,7 @@ async fn an_always_yolo_agent_records_yolo_mode_whatever_the_request_says() -> a
     *state.canonical_metadata.write().await =
         crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
     let mut panes = Vec::new();
+    let mut guarded = std::collections::HashSet::new();
     for (tool, expected) in [("pi", true), ("claude", false)] {
         let body = serde_json::from_value(serde_json::json!({
             "title": format!("yolo {tool}"), "path": project.path(),
@@ -915,6 +916,9 @@ async fn an_always_yolo_agent_records_yolo_mode_whatever_the_request_says() -> a
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         for instance in storage.load()? {
+            if !guarded.insert(instance.id.clone()) {
+                continue;
+            }
             panes.push(crate::tmux::test_helpers::TmuxTestSession::from_name(
                 crate::tmux::Session::generate_name(&instance.id, &instance.title),
             ));

@@ -19,6 +19,7 @@ import {
 import { agent } from "./fixtures";
 import { toastBus } from "../../../lib/toastBus";
 import { startPendingCreates } from "../../../lib/pendingCreates";
+import type { DockerStatusResponse } from "../../../lib/types";
 
 const createSession = vi.fn();
 const reviewCreationTrust = vi.fn();
@@ -936,7 +937,7 @@ describe("SessionWizard served-profile authority", () => {
 describe("SessionWizard Docker readiness", () => {
   const launchButton = () => screen.getByText(/Launch session/).closest("button") as HTMLButtonElement;
   const pendingProbe = () => {
-    let answer!: (v: { available: boolean; runtime: string | null }) => void;
+    let answer!: (v: DockerStatusResponse) => void;
     vi.mocked(fetchDockerStatus).mockReturnValueOnce(new Promise((r) => (answer = r)));
     return (available: boolean) => answer({ available, runtime: "docker", runtime_name: "Docker" });
   };

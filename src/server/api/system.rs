@@ -3357,8 +3357,6 @@ mod tests {
         );
     }
 
-    /// `acp_installed` follows the structured create check, so a custom
-    /// agent counts when its adapter is on the configured `environment` PATH.
     /// The wizard names the runtime that isn't running, so it's reported
     /// whether or not it's available.
     #[tokio::test]
@@ -3383,6 +3381,8 @@ mod tests {
         }
     }
 
+    /// `acp_installed` follows the structured create check, so a custom
+    /// agent counts when its adapter is on the configured `environment` PATH.
     #[tokio::test]
     #[serial_test::serial]
     async fn acp_installed_matches_the_structured_create_check() {
