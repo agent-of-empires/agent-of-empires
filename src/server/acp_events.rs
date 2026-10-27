@@ -491,6 +491,11 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                             &session_id_for_save,
                             acp_change_for_save.as_ref(),
                         );
+                        if let Some(AcpSessionChange::Assigned(new_id)) =
+                            acp_change_for_save.as_ref()
+                        {
+                            inst.record_observed_acp_store(new_id, observed_for_save.as_ref());
+                        }
                     }
                     Ok(())
                 })?;
@@ -505,6 +510,9 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                     let mut instances = state.instances.write().await;
                     if let Some(inst) = instances.iter_mut().find(|i| i.id == frame.session_id) {
                         inst.attest_launch_default_store(observed_mirror.as_ref());
+                        if let Some(AcpSessionChange::Assigned(new_id)) = acp_change.as_ref() {
+                            inst.record_observed_acp_store(new_id, observed_mirror.as_ref());
+                        }
                     }
                 }
                 Ok(Err(e)) => {
@@ -932,6 +940,18 @@ pub(super) fn apply_acp_session_change(
             inst.fork_pending = None;
             inst.import_pending = None;
         }
+    }
+    if let Some(stale) = inst.resume_binding.as_ref().filter(|binding| {
+        binding.provenance == crate::session::ConversationProvenance::Asserted
+            && inst.acp_session_id.as_deref() != Some(binding.session_id.as_str())
+    }) {
+        tracing::info!(
+            target: "acp.event_listener",
+            session = %session_id,
+            stale_id = %stale.session_id,
+            "dropping asserted conversation binding that no longer matches the ACP id"
+        );
+        inst.resume_binding = None;
     }
     Some(inst.source_profile.clone())
 }
@@ -2137,6 +2157,28 @@ mod tests {
             "clear drops import_pending so restart is a clean session/new"
         );
         assert!(profile.is_some(), "the clear must persist");
+    }
+
+    #[test]
+    fn a_new_acp_id_drops_only_a_stale_asserted_binding() {
+        let binding = |provenance| crate::session::ConversationBinding {
+            session_id: "old-id".into(),
+            execution: None,
+            provenance,
+            transcript_path: None,
+        };
+        let new_id = AcpSessionChange::Assigned("new-id".into());
+        for (provenance, kept) in [
+            (crate::session::ConversationProvenance::Asserted, false),
+            (crate::session::ConversationProvenance::Observed, true),
+        ] {
+            let mut inst = Instance::new("seed", "/tmp/seed");
+            inst.view = crate::session::View::Structured;
+            inst.acp_session_id = Some("old-id".into());
+            inst.resume_binding = Some(binding(provenance));
+            apply_acp_session_change(&mut inst, "sess-1", Some(&new_id));
+            assert_eq!(inst.resume_binding.is_some(), kept);
+        }
     }
 
     // Regression for the event-ordering the listener sees: an id assigned at
