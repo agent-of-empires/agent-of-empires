@@ -251,23 +251,41 @@ describe("usePaneLayout outside a repository (#4574)", () => {
     expect(dockTabs(result.current.layout, "right")).toEqual(expected);
   });
 
-  it.each([
-    // [status once known, expected right dock]
-    [false, ["diff", "terminal:0", "plugin:p:a"]],
-    [true, ["terminal:0", "plugin:p:a"]],
-  ])("replays a mutation made while status is unknown over the seed for outside=%s", (known, expected) => {
+  type Api = ReturnType<typeof usePaneLayout>;
+  const unknownThenKnown = (known: boolean, ...actions: ((api: Api) => void)[]) => {
     seededTemplate();
     localStorage.setItem("aoe-web-settings", JSON.stringify({ autoOpenDiffPane: true, autoOpenTerminalPane: true }));
     const { result, rerender } = renderHook(({ outside }) => usePaneLayout("s1", outside), {
       initialProps: { outside: null as boolean | null },
     });
-    act(() => result.current.openTab("plugin:p:a", "right"));
-    expect(dockTabs(result.current.layout, "right")).toEqual(["terminal:0"]);
+    for (const action of actions) act(() => action(result.current));
     rerender({ outside: known });
+    return result;
+  };
+
+  it.each([
+    [false, ["terminal:0", "plugin:p:a", "diff"]],
+    [true, ["terminal:0", "plugin:p:a"]],
+  ])("keeps a mutation made while status is unknown, adding Diff only for git (outside=%s)", (known, expected) => {
+    const result = unknownThenKnown(known, (api) => api.openTab("plugin:p:a", "right"));
     expect(dockTabs(result.current.layout, "right")).toEqual(expected);
   });
 
-  it("does not defer a mutation on a stored layout while status is unknown", () => {
+  it("lets a second action see the first while status is unknown", () => {
+    const result = unknownThenKnown(
+      false,
+      (api) => api.setDockCollapsed("right", true),
+      (api) => api.setDockCollapsed("right", false),
+    );
+    expect(isDockCollapsed(result.current.layout, "right")).toBe(false);
+  });
+
+  it("keeps a Diff toggled open while status is unknown", () => {
+    const result = unknownThenKnown(false, (api) => api.toggleKind("diff", "right"));
+    expect(dockTabs(result.current.layout, "right")).toEqual(["terminal:0", "diff"]);
+  });
+
+  it("leaves a stored layout alone when status becomes known", () => {
     localStorage.setItem(
       "aoe-pane-layout-v2",
       JSON.stringify({
