@@ -19,7 +19,7 @@ import { Tooltip } from "../Tooltip";
 import { useContextMenu } from "../useContextMenu";
 import { FoldChevron, PlusIcon } from "../icons";
 import { DISABLED_ICON_BUTTON } from "./styles";
-import { NAV_ITEM, onSidebarArrowKey } from "./keyboardNav";
+import { NAV_ITEM, onSidebarArrowKey, refocusNearbyWhenRemoved } from "./keyboardNav";
 import type { DragHandleProps } from "./types";
 
 interface Props {
@@ -245,6 +245,15 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
         >
           <GroupMenuItems
             {...props}
+            // Archive all can empty the Group and unmount this header; focus then moves to a neighbour.
+            onArchiveAll={
+              props.onArchiveAll &&
+              (() => {
+                const header = buttonRef.current;
+                props.onArchiveAll?.();
+                if (header) refocusNearbyWhenRemoved(header);
+              })
+            }
             archivableCount={archivableCount}
             canPin={canPin}
             canUnpin={canUnpin}

@@ -186,5 +186,77 @@ for (const axis of ["repo+group", "org"] as const) {
     await press("ArrowRight", child);
     await press("ArrowRight", childRows.first());
     await press("ArrowLeft", child);
+    // Left collapses the child, then Left again on the collapsed child goes up to its parent.
+    await press("ArrowLeft", child);
+    await expect(child).toHaveAttribute("aria-expanded", "false");
+    await press("ArrowLeft", parent);
   });
 }
+
+test("the Snoozed & archived toggle is a header for the arrow keys", async ({ page }) => {
+  const sessions: MockSessionInput[] = [
+    { id: "s-live", title: "live", project_path: "/tmp/repo-a", branch: "a/live" },
+    {
+      id: "s-old",
+      title: "old",
+      project_path: "/tmp/repo-b",
+      branch: "b/old",
+      fields: { archived_at: "2026-01-01T00:00:00Z" },
+    },
+  ];
+  await installSidebarMocks(page, { sessions });
+  await page.setViewportSize({ width: 1280, height: 720 });
+  await page.goto("/");
+
+  const press = async (key: string, focused: Locator) => {
+    await page.keyboard.press(key);
+    await expect(focused, key).toBeFocused();
+  };
+  const toggle = page.getByTestId("sidebar-sunk-toggle");
+  const live = page.getByTestId("sidebar-session-row").filter({ hasText: "live" });
+  const old = page.getByTestId("sidebar-session-row").filter({ hasText: "old" });
+
+  // Down from the last live row stops on the toggle; Right opens it, Right again reaches its row.
+  await live.focus();
+  await press("ArrowDown", toggle);
+  await expect(toggle).toHaveAttribute("aria-expanded", "false");
+  await press("ArrowRight", toggle);
+  await expect(toggle).toHaveAttribute("aria-expanded", "true");
+  await press("ArrowRight", old);
+  // Left on an archived row comes back to the toggle, which Left then folds.
+  await press("ArrowLeft", toggle);
+  await press("ArrowLeft", toggle);
+  await expect(toggle).toHaveAttribute("aria-expanded", "false");
+});
+
+test("Archive all that empties a Group moves focus to the next header", async ({ page }) => {
+  // `fields` is merged into each list response, so an archive shows up on the next refresh.
+  const sessions: MockSessionInput[] = [
+    { id: "s-a", title: "a-only", project_path: "/tmp/repo-a", branch: "a/only", fields: {} },
+    { id: "s-b", title: "b-only", project_path: "/tmp/repo-b", branch: "b/only", fields: {} },
+  ];
+  await installSidebarMocks(page, { sessions });
+  await page.route("**/api/sessions/*/archive", async (r) => {
+    const id = new URL(r.request().url()).pathname.split("/")[3];
+    const archived_at = new Date().toISOString();
+    Object.assign(sessions.find((s) => s.id === id)?.fields ?? {}, { archived_at });
+    await r.fulfill({ json: { id, archived_at } });
+  });
+  page.on("dialog", (dialog) => void dialog.accept());
+  await page.setViewportSize({ width: 1280, height: 720 });
+  await page.goto("/");
+
+  const header = (path: string) =>
+    page.locator(`[data-testid="sidebar-group-header"][data-group-id="${path}"] button[aria-expanded]`);
+  await header("/tmp/repo-a").focus();
+  await page.keyboard.press("Shift+F10");
+  const archiveAll = page.getByTestId("sidebar-group-context-menu-archive-all");
+  await expect(archiveAll).toBeVisible();
+  // The menu focuses its first item a frame after opening; wait for that, or it takes focus back.
+  await expect(page.getByTestId("sidebar-group-context-menu").getByRole("button").first()).toBeFocused();
+  await archiveAll.focus();
+  await Promise.all([page.waitForRequest("**/api/sessions/s-a/archive"), page.keyboard.press("Enter")]);
+
+  await expect(header("/tmp/repo-a")).toHaveCount(0);
+  await expect(header("/tmp/repo-b")).toBeFocused();
+});
