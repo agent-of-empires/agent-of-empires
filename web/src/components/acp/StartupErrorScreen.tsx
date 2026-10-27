@@ -118,7 +118,7 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
       className="flex h-full flex-1 items-center justify-center bg-surface-900 px-4 py-12"
     >
       <div className="w-full max-w-xl rounded-lg border border-status-error/60 bg-surface-850 p-4 text-text-primary shadow-lg sm:p-6">
-        <div className="text-[11px] font-semibold uppercase tracking-wide text-status-error">
+        <div className="text-[11px] font-semibold uppercase tracking-wide text-status-error-text">
           {detail.kind === "unsupported_protocol_version" ? "Adapter not supported" : "Adapter out of date"}
         </div>
         <h2 className="mt-2 text-lg font-semibold text-text-primary">{headlineFor(detail, name)}</h2>
@@ -127,13 +127,13 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
         </p>
 
         {failsAgain && (
-          <p data-testid="startup-error-fails-again" className="mt-3 text-sm text-status-error">
+          <p data-testid="startup-error-fails-again" className="mt-3 text-sm text-status-error-text">
             The update finished, but the adapter still fails the check, so the install didn't change the version it
             reports. Run the command below by hand, then Check again.
           </p>
         )}
         {containerDown && (
-          <p data-testid="startup-error-container-down" className="mt-3 text-sm text-status-error">
+          <p data-testid="startup-error-container-down" className="mt-3 text-sm text-status-error-text">
             This Session's container isn't running, so the update has nowhere to run. Start the container, then update
             the adapter.
           </p>
@@ -212,14 +212,14 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
         )}
 
         {respawnState === "ok" && (
-          <div className="mt-2 text-xs text-status-running">
+          <div className="mt-2 text-xs text-text-subtle">
             Checking again. The adapter's version is checked when it starts.
             {install.recovered > 0 &&
               ` Also restarting ${install.recovered} other Session${install.recovered === 1 ? "" : "s"} blocked on the same adapter.`}
           </div>
         )}
         {respawnState === "failed" && respawnError && (
-          <div className="mt-2 text-xs text-status-error">Check again failed: {respawnError}</div>
+          <div className="mt-2 text-xs text-status-error-text">Check again failed: {respawnError}</div>
         )}
 
         <div className="mt-4 border-t border-status-error/30 pt-2">
@@ -280,7 +280,7 @@ function Step({
       <div className="min-w-0 flex-1">
         <div className="font-medium text-text-primary">
           {title}
-          {done && <span className="ml-2 text-xs font-normal text-status-running">Done</span>}
+          {done && <span className="ml-2 text-xs font-normal text-text-subtle">Done</span>}
         </div>
         {children && <div className="mt-0.5 text-xs text-text-subtle">{children}</div>}
       </div>

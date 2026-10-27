@@ -69,6 +69,13 @@ const spawnCall = () =>
   expect(fetch).toHaveBeenCalledWith("/api/sessions/s1/acp/spawn", expect.objectContaining({ method: "POST" }));
 
 /** Renders once install-info has answered. */
+/** Text sits only on colours the theme contrast test holds to AA on this card. */
+function expectValidatedText(screen: HTMLElement) {
+  expect(screen.querySelectorAll(".text-text-secondary, .text-text-dim, .text-status-error")).toHaveLength(0);
+  // Status green is no text colour; it only tints the decorative step indicator.
+  expect(screen.querySelectorAll(".text-status-running:not([aria-hidden])")).toHaveLength(0);
+}
+
 async function renderScreen(detail: IncompatibleAgentDetail, answer: AgentInstallInfo | null = info()) {
   fetchAgentInstallInfo.mockResolvedValue(answer);
   const view = render(<StartupErrorScreen detail={detail} sessionId="s1" />);
@@ -359,12 +366,17 @@ describe("StartupErrorScreen", () => {
     expect(update.disabled).toBe(false);
   });
 
-  it("Check again POSTs to /acp/spawn and surfaces a failure", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 500, text: () => Promise.resolve("boom") }));
-    const { getByTestId, container } = await renderScreen(incompatible());
+  it.each([
+    ["ok", { ok: true, status: 200, json: () => Promise.resolve({}) }, "Checking again."],
+    ["failed", { ok: false, status: 500, text: () => Promise.resolve("boom") }, "Check again failed"],
+  ])("Check again POSTs to /acp/spawn and reports the outcome: %s", async (_label, response, line) => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response));
+    const { getByTestId } = await renderScreen(incompatible());
     fireEvent.click(getByTestId("startup-error-restart"));
     spawnCall();
-    await waitFor(() => expect(container.textContent).toContain("Check again failed"));
+    const screen = getByTestId("startup-error-screen");
+    await waitFor(() => expect(screen.textContent).toContain(line));
+    expectValidatedText(screen);
   });
 
   it("installing: the primary button shows progress and every action waits", async () => {
@@ -511,7 +523,7 @@ describe("StartupErrorScreen", () => {
     const { getByTestId } = await renderScreen(detail, answer);
     fireEvent.click(getByTestId("startup-error-details"));
     const screen = getByTestId("startup-error-screen");
-    expect(screen.querySelectorAll(".text-text-secondary, .text-text-dim")).toHaveLength(0);
+    expectValidatedText(screen);
     expect(screen.querySelectorAll(".text-text-subtle").length).toBeGreaterThan(0);
   });
 });
