@@ -1072,12 +1072,20 @@ pub(super) fn apply_declared_config_dir(
     tool: &str,
     agent: &str,
 ) -> Option<std::path::PathBuf> {
-    let native = cfg
-        .session
-        .agent_execution_as
-        .get(tool)
-        .map_or(agent, String::as_str);
-    let variable = match crate::acp::agent_profiles::resolve(native).native_config_agent? {
+    let session = &cfg.session;
+    let execution = session.agent_execution_as.get(tool).map(String::as_str);
+    let native_of = |name: &str| crate::acp::agent_profiles::resolve(name).native_config_agent;
+    // After an agent switch `tool` is unchanged but names another backend: use that backend's entry.
+    let tool_runs_agent = agent == tool
+        || execution == Some(agent)
+        || session.agent_detect_as.get(tool).map(String::as_str) == Some(agent)
+        || native_of(tool).is_some_and(|native| native_of(agent) == Some(native));
+    let (key, native) = if tool_runs_agent {
+        (tool, execution.unwrap_or(agent))
+    } else {
+        (agent, agent)
+    };
+    let variable = match native_of(native)? {
         "claude" => "CLAUDE_CONFIG_DIR",
         "codex" => "CODEX_HOME",
         "opencode" => "OPENCODE_CONFIG_DIR",
@@ -1095,7 +1103,7 @@ pub(super) fn apply_declared_config_dir(
         .map(std::path::PathBuf::from)
         .or_else(dirs::home_dir)
         .filter(|home| home.is_absolute())?;
-    let dir = cfg.session.agent_config_dir_for(tool, &home)?;
+    let dir = session.agent_config_dir_for(key, &home)?;
     overlay_env(
         environment,
         vec![(variable.into(), dir.to_string_lossy().into_owned())],
@@ -1283,8 +1291,15 @@ mod tests {
 
         // (config, tool, agent, expected env, expected Claude dir)
         let cases = [
+            // A wrapper reaches its base through `agent_detect_as`.
             (
-                cfg(&[("claude-c", "/acct")]),
+                {
+                    let mut cfg = cfg(&[("claude-c", "/acct")]);
+                    cfg.session
+                        .agent_detect_as
+                        .insert("claude-c".into(), "claude".into());
+                    cfg
+                },
                 "claude-c",
                 "claude",
                 vec![pair("CLAUDE_CONFIG_DIR", "/acct")],
@@ -1333,6 +1348,37 @@ mod tests {
                 "my-claude",
                 vec![pair("CLAUDE_CONFIG_DIR", "/acct")],
                 Some(PathBuf::from("/acct")),
+            ),
+            // After a switch the tool's entry is not the new backend's: use the backend's own.
+            (
+                cfg(&[("claude", "/acct"), ("codex", "/codex")]),
+                "claude",
+                "codex",
+                vec![
+                    pair("CLAUDE_CONFIG_DIR", "/hook"),
+                    pair("CODEX_HOME", "/codex"),
+                ],
+                None,
+            ),
+            (
+                cfg(&[("claude", "/acct")]),
+                "claude",
+                "codex",
+                vec![pair("CLAUDE_CONFIG_DIR", "/hook")],
+                None,
+            ),
+            (
+                {
+                    let mut cfg = cfg(&[("my-claude", "/acct")]);
+                    cfg.session
+                        .agent_execution_as
+                        .insert("my-claude".into(), "claude".into());
+                    cfg
+                },
+                "my-claude",
+                "codex",
+                vec![pair("CLAUDE_CONFIG_DIR", "/hook")],
+                None,
             ),
             // No entry for the tool, and an agent with no config-dir variable.
             (
