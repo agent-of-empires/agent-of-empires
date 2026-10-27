@@ -429,7 +429,7 @@ function AppContent({
   const trashedWorkspaces = useMemo(() => workspaces.filter(workspaceIsTrashed), [workspaces]);
 
   const { unreadCount, waitingCount } = useAttentionCounts(sessions, activeSessionId);
-  const { onSoundDue, cancelCue } = useStatusSounds(sessions);
+  const { onSoundDue, cancelCue } = useStatusSounds(sessions, activeSessionId);
   const onPushedStatus = useCallback(
     (id: string, status: SessionResponse["status"], cursor: RuntimeCursor) => {
       cancelCue(id);

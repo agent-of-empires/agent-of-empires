@@ -30,6 +30,9 @@ pub enum ApiErrorCode {
     SmartRenameFailed,
     SmartRenameTimeout,
     GroupNotEmpty,
+    SessionNotRunning,
+    SessionArchived,
+    SessionTrashed,
 }
 
 impl ApiErrorCode {
@@ -57,6 +60,9 @@ impl ApiErrorCode {
             Self::SmartRenameFailed => "smart_rename_failed",
             Self::SmartRenameTimeout => "smart_rename_timeout",
             Self::GroupNotEmpty => "group_not_empty",
+            Self::SessionNotRunning => "session_not_running",
+            Self::SessionArchived => "session_archived",
+            Self::SessionTrashed => "session_trashed",
         }
     }
 
@@ -76,7 +82,10 @@ impl ApiErrorCode {
             | Self::CreationTrustChanged
             | Self::CreationCancelled
             | Self::CreationNotPending
-            | Self::GroupNotEmpty => StatusCode::CONFLICT,
+            | Self::GroupNotEmpty
+            | Self::SessionNotRunning
+            | Self::SessionArchived
+            | Self::SessionTrashed => StatusCode::CONFLICT,
             Self::PendingTargetGone => StatusCode::NOT_FOUND,
             Self::TlsRequired => StatusCode::UPGRADE_REQUIRED,
             Self::CreateHookFailed => StatusCode::BAD_REQUEST,
@@ -125,6 +134,9 @@ impl ApiErrorCode {
             b"smart_rename_failed" => Self::SmartRenameFailed,
             b"smart_rename_timeout" => Self::SmartRenameTimeout,
             b"group_not_empty" => Self::GroupNotEmpty,
+            b"session_not_running" => Self::SessionNotRunning,
+            b"session_archived" => Self::SessionArchived,
+            b"session_trashed" => Self::SessionTrashed,
             _ => return None,
         };
         (status == code.status()).then_some(code)
@@ -206,6 +218,25 @@ mod tests {
                 false,
                 Some(ApiErrorCode::LifecycleSuperseded),
             ),
+            (
+                StatusCode::CONFLICT,
+                "session_not_running",
+                false,
+                Some(ApiErrorCode::SessionNotRunning),
+            ),
+            (
+                StatusCode::CONFLICT,
+                "session_archived",
+                false,
+                Some(ApiErrorCode::SessionArchived),
+            ),
+            (
+                StatusCode::CONFLICT,
+                "session_trashed",
+                false,
+                Some(ApiErrorCode::SessionTrashed),
+            ),
+            (StatusCode::FORBIDDEN, "session_archived", false, None),
             (
                 StatusCode::CONFLICT,
                 "managed_resume_refused",

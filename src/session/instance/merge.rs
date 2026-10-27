@@ -197,6 +197,21 @@ impl Instance {
         self.extra_args = src.extra_args.clone();
     }
 
+    /// Run `new_tool` in terminal view with a fresh conversation after a
+    /// structured view agent switch.
+    pub(crate) fn rebind_terminal_tool_fresh(&mut self, new_tool: &str) {
+        self.stop_poller();
+        self.session_id_poller = None;
+        self.adopt_tool(new_tool);
+        self.command.clear();
+        self.extra_args.clear();
+        self.set_agent_conversation(None, None, None);
+        self.resume_intent = ResumeIntent::Default;
+        self.resume_binding = None;
+        self.active_execution = None;
+        self.terminal_rebind_pending = false;
+    }
+
     /// Switch tools, parking completed conversations per tool.
     /// Pending forks retain their target for launch-time namespace validation.
     pub(crate) fn swap_tool(&mut self, new_tool: &str) {
@@ -1403,6 +1418,26 @@ mod tests {
         src.last_accessed_at = Some(later);
         stale.merge_from_tui(&src);
         assert_eq!(stale.last_accessed_at, Some(later));
+    }
+
+    #[test]
+    fn rebind_terminal_tool_fresh_drops_the_old_tools_launch_and_conversation() {
+        for new_tool in ["codex", "claude"] {
+            let mut inst = tool_instance("claude", "/home/user/project");
+            inst.command = "claude --custom".to_string();
+            inst.extra_args = "--model old".to_string();
+            inst.agent_session_id = Some("claude-session-123".to_string());
+            inst.resume_intent = ResumeIntent::Use("claude-session-123".to_string());
+            inst.terminal_rebind_pending = true;
+
+            inst.rebind_terminal_tool_fresh(new_tool);
+
+            assert_eq!(inst.tool, new_tool);
+            assert!(inst.command.is_empty() && inst.extra_args.is_empty());
+            assert_eq!(inst.agent_session_id, None);
+            assert_eq!(inst.resume_intent, ResumeIntent::Default);
+            assert!(!inst.terminal_rebind_pending);
+        }
     }
 
     /// claude -> pi -> claude resumes the parked Claude conversation, not a third one.

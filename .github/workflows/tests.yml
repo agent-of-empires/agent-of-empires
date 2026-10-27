@@ -149,6 +149,33 @@ jobs:
         run: |
           echo "TMPDIR=${TMPDIR:-unset}"
           cargo nextest run --no-fail-fast
+      - name: Require scoped cancellation coverage
+        if: matrix.leg == 'core-rest'
+        env:
+          AOE_REQUIRE_SCOPED_TESTS: '1'
+        run: |
+          uid="$(id -u)"
+          manager="user@${uid}.service"
+          started_manager=0
+          cleanup_manager() {
+            status=$?
+            if [ "$started_manager" -eq 1 ]; then
+              if ! sudo systemctl stop "$manager" && [ "$status" -eq 0 ]; then
+                status=1
+              fi
+            fi
+            exit "$status"
+          }
+          trap cleanup_manager EXIT
+          if ! sudo systemctl is-active --quiet "$manager"; then
+            started_manager=1
+            sudo systemctl start "$manager"
+          fi
+          export XDG_RUNTIME_DIR="/run/user/${uid}"
+          export DBUS_SESSION_BUS_ADDRESS=unix:path=/dev/null
+          test -S "$XDG_RUNTIME_DIR/systemd/private"
+          cargo nextest run --test integration --no-tests=fail \
+            serve_dynamic_profile_rewire::permanent_scratch_delete_cancels_an_unanswered_initialize
       # bare-core keeps OpenSSL/SQLite vendoring across flag corners:
       # default-plugins off for lib/bin and selected lifecycle e2e tests (the
       # web leg covers the rest), then flag on/web off for all-targets.

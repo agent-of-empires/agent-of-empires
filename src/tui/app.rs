@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
-use super::home::{HomeView, TerminalMode};
+use super::home::{bindings, HomeView, TerminalMode};
 use super::styles::Theme;
 use crate::containers::image_update::ImageUpdate;
 use crate::session::config::AppStateConfig;
@@ -2707,7 +2707,16 @@ impl App {
                 self.should_quit = true;
                 return Ok(());
             }
-            (KeyCode::Char('q'), modifiers) if !self.home.has_dialog() => {
+            // `quit_intent` owns the modifier rules (Ctrl+q is swallowed for live-send), so
+            // the Quit chord is probed bare.
+            (code, modifiers)
+                if !self.home.has_dialog()
+                    && bindings::is_bound(
+                        bindings::ActionId::Quit,
+                        self.home.strict_hotkeys,
+                        &KeyEvent::new(code, KeyModifiers::NONE),
+                    ) =>
+            {
                 match quit_intent(
                     modifiers,
                     self.home.is_creation_pending(),
@@ -2727,11 +2736,14 @@ impl App {
                 return Ok(());
             }
             // No `needs_redraw`: its full clear flashes the screen.
-            (KeyCode::Char('x'), KeyModifiers::CONTROL)
-                if (self.update_info.is_some()
-                    || self.update_status.is_some()
-                    || self.image_update.is_some())
-                    && !self.home.has_dialog() =>
+            _ if bindings::is_bound(
+                bindings::ActionId::DismissUpdateBanner,
+                self.home.strict_hotkeys,
+                &key,
+            ) && (self.update_info.is_some()
+                || self.update_status.is_some()
+                || self.image_update.is_some())
+                && !self.home.has_dialog() =>
             {
                 // The image banner is lowest priority, so Ctrl+x only dismisses
                 // it when it's the one actually showing. Otherwise it targets
