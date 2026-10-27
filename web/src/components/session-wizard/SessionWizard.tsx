@@ -238,6 +238,7 @@ export function SessionWizard({
   }, [unknownOutcome]);
   // Set once the user leaves a create running, so its outcome is reported, not navigated to.
   const backgroundRef = useRef(false);
+  const unmountedRef = useRef(false);
   const { keyboardHeight } = useMobileKeyboard();
 
   // Launch-command preview maps, derived from the settings already fetched.
@@ -689,10 +690,12 @@ export function SessionWizard({
   useEffect(() => {
     // Setup restores foreground ownership: StrictMode runs setup, cleanup, setup on one mount.
     backgroundRef.current = false;
+    unmountedRef.current = false;
     const adopted = unknownOutcomeRef.current;
     if (adopted) claimPendingCreate(adopted.body.idempotency_key);
     return () => {
       backgroundRef.current = true;
+      unmountedRef.current = true;
       if (unknownOutcomeRef.current) releasePendingCreate(unknownOutcomeRef.current.body.idempotency_key);
     };
   }, []);
@@ -737,6 +740,8 @@ export function SessionWizard({
         // The wizard's runtime check is from when it opened; ask again before resending.
         setRechecking(true);
         const status = await fetchDockerStatus();
+        // Closed during the check: the user dismissed this create, so don't send it.
+        if (unmountedRef.current) return;
         setRechecking(false);
         dispatch({ type: "SET_DOCKER", available: status.available, runtimeName: status.runtime_name ?? null });
         if (status.available) await handleSubmit({}, true);
@@ -1048,6 +1053,7 @@ export function SessionWizard({
             <LaunchFooter
               data={d}
               isSubmitting={state.isSubmitting}
+              held={rechecking}
               failure={
                 state.failure &&
                 failed && (

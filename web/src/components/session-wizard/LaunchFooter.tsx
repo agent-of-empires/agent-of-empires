@@ -24,6 +24,8 @@ interface Props {
   defaultsReady?: boolean;
   /** Offered while a create runs: closes the wizard and lets it finish unattended. */
   onBackground?: () => void;
+  /** Blocks Launch without showing a create, while a check that may itself resend runs. */
+  held?: boolean;
 }
 
 const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.userAgent);
@@ -37,11 +39,12 @@ export function LaunchFooter({
   nameOnly = false,
   defaultsReady = true,
   onBackground,
+  held = false,
 }: Props) {
   const offline = useServerDown();
   // Scratch and name-only sessions get their directory from the server.
   const canSubmit =
-    defaultsReady && !isSubmitting && !offline && (nameOnly || data.scratch || !!data.path) && !!data.tool;
+    defaultsReady && !isSubmitting && !held && !offline && (nameOnly || data.scratch || !!data.path) && !!data.tool;
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {

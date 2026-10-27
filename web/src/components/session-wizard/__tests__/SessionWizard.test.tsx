@@ -1214,6 +1214,35 @@ describe("SessionWizard create failures", () => {
     expect(payload(1).idempotency_key).not.toBe(payload(0).idempotency_key);
   });
 
+  it.each(["Launch", "close"])("while Retry re-checks the runtime, %s sends no second create", async (during) => {
+    createSession.mockResolvedValueOnce(UNAVAILABLE);
+    sandboxed();
+    await launch();
+    let answer!: (v: DockerStatusResponse) => void;
+    vi.mocked(fetchDockerStatus).mockReturnValueOnce(new Promise((r) => (answer = r)));
+    const checks = vi.mocked(fetchDockerStatus).mock.calls.length;
+    fireEvent.click(await screen.findByTestId("create-failure-retry_runtime"));
+    await waitFor(() => expect(fetchDockerStatus).toHaveBeenCalledTimes(checks + 1));
+
+    if (during === "Launch") {
+      const button = screen.getByText(/Launch session/).closest("button") as HTMLButtonElement;
+      expect(button.disabled).toBe(true);
+      fireEvent.click(button);
+      fireEvent.keyDown(window, { key: "Enter", metaKey: true });
+      fireEvent.keyDown(window, { key: "Enter", ctrlKey: true });
+      await act(async () => answer({ available: true, runtime: "docker", runtime_name: "Docker" }));
+      // Retry's own resend is the only one.
+      await waitFor(() => expect(createSession).toHaveBeenCalledTimes(2));
+      await act(async () => {});
+      expect(createSession).toHaveBeenCalledTimes(2);
+    } else {
+      cleanup();
+      await act(async () => answer({ available: true, runtime: "docker", runtime_name: "Docker" }));
+      await act(async () => {});
+      expect(createSession).toHaveBeenCalledOnce();
+    }
+  });
+
   it("Launch without Sandbox sends the Session on the host under a fresh key", async () => {
     createSession.mockResolvedValueOnce(
       failure("sandbox_image_pull_failed", "starting_container", "Couldn't pull the Sandbox image ghcr.io/x/y:1."),
