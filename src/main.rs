@@ -111,21 +111,6 @@ fn main() -> Result<()> {
 }
 
 async fn run_cli(mut cli: Cli, read_source: cli::runtime_read::ReadRequestSource) -> Result<()> {
-    // Keep daemon-served reads on the normal CLI preflight path.
-    let answered = match cli::runtime_read::classify(cli.command.as_ref()) {
-        Some(command) => match cli::runtime_read::attempt(command, &read_source).await {
-            cli::runtime_read::ScopedRead::Answered(outcome) => Some(outcome),
-            cli::runtime_read::ScopedRead::NoLocalPublication(notice) => {
-                // A fallback notice precedes the local answer on stderr.
-                if let Some(notice) = notice {
-                    let _ = std::io::stderr().lock().write_all(notice.as_bytes());
-                }
-                None
-            }
-        },
-        None => None,
-    };
-
     if cli.profile.is_none() {
         if let Some(profile) = read_source.env_profile.as_deref() {
             match profile.to_str() {
@@ -256,7 +241,7 @@ async fn run_cli(mut cli: Cli, read_source: cli::runtime_read::ReadRequestSource
         should_init,
         debug_namespace_drift,
         debug_log_warning,
-        answered,
+        read_source,
     )
     .await
     {
@@ -303,16 +288,14 @@ fn emit_read_outcome(outcome: cli::runtime_read::ReadOutcome) -> i32 {
     outcome.exit
 }
 
-/// Runs the command and returns the process exit code, which is 0 for every
-/// command that exits from its own handler and the served read's own code when
-/// a daemon already answered.
+/// Run preflight and dispatch, preserving the runtime read's exit status.
 async fn run(
     mut cli: Cli,
     is_daemon_child: bool,
     should_init: bool,
     debug_namespace_drift: Option<(std::path::PathBuf, std::path::PathBuf)>,
     debug_log_warning: Option<String>,
-    answered: Option<cli::runtime_read::ReadOutcome>,
+    read_source: cli::runtime_read::ReadRequestSource,
 ) -> Result<i32> {
     if cli.command.is_some() {
         if let Some((release, dev)) = debug_namespace_drift.as_ref() {
@@ -422,19 +405,17 @@ async fn run(
             eprintln!("{w}");
         }
     }
-    // A served read is finished at this point, with every shared step above
-    // already run: the command's own handler is not entered a second time.
-    if let Some(outcome) = answered {
+    // Shared bootstrap requires the normal preflight migrations to finish first.
+    if let Some(command) = cli::runtime_read::classify(cli.command.as_ref()) {
+        let outcome = cli::runtime_read::run(command, &read_source).await;
         return Ok(emit_read_outcome(outcome));
     }
 
     let result = match cli.command {
         Some(Commands::Add(args)) => cli::add::run(&profile, *args).await,
-        Some(Commands::List(args)) => cli::list::run(&profile, args).await,
         Some(Commands::Ps(args)) => cli::ps::run(&profile, profile_explicit, args).await,
         Some(Commands::Remove(args)) => cli::remove::run(&profile, args).await,
         Some(Commands::Send(args)) => cli::send::run(&profile, args).await,
-        Some(Commands::Status(args)) => cli::status::run(&profile, args).await,
         Some(Commands::Killall(args)) => cli::killall::run(args).await,
         Some(Commands::Session { command }) => cli::session::run(&profile, command).await,
         Some(Commands::Group { command }) => cli::group::run(&profile, command).await,
@@ -470,7 +451,7 @@ async fn run(
             };
             tui::run(&profile, combined).await
         }
-        _ => unreachable!(),
+        _ => anyhow::bail!("internal error: runtime read reached local dispatch"),
     };
     exit_zero(result)
 }

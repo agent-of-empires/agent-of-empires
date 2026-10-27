@@ -60,7 +60,9 @@ pub enum ProfileCommands {
 #[tracing::instrument(target = "cli.session", skip_all)]
 pub async fn run(profile: &str, command: Option<ProfileCommands>) -> Result<()> {
     match command {
-        Some(ProfileCommands::List) | None => list_profiles().await,
+        Some(ProfileCommands::List) | None => {
+            bail!("internal error: runtime read reached local dispatch")
+        }
         Some(ProfileCommands::Create { name }) => create_profile(&name).await,
         Some(ProfileCommands::Delete { name }) => delete_profile(&name).await,
         Some(ProfileCommands::Rename { old_name, new_name }) => {
@@ -77,32 +79,6 @@ pub async fn run(profile: &str, command: Option<ProfileCommands>) -> Result<()> 
             show_profile_value(profile, status_map.as_deref(), json).await
         }
     }
-}
-
-async fn list_profiles() -> Result<()> {
-    // Picker order (`default` last); resolution below stays on the plain
-    // enumeration.
-    let profiles = session::list_profiles_for_display()?;
-
-    if profiles.is_empty() {
-        println!("No profiles found.");
-        println!("Run 'aoe' to create the first profile automatically.");
-        return Ok(());
-    }
-
-    let default_profile = session::config::resolve_default_profile();
-
-    println!("Profiles:");
-    for p in &profiles {
-        if *p == default_profile {
-            println!("  * {} (default)", p);
-        } else {
-            println!("    {}", p);
-        }
-    }
-    println!("\nTotal: {} profiles", profiles.len());
-
-    Ok(())
 }
 
 async fn create_profile(name: &str) -> Result<()> {
