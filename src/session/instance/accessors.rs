@@ -85,6 +85,7 @@ impl Instance {
             acp_session_id: None,
             import_pending: None,
             fork_pending: None,
+            terminal_rebind_pending: false,
             acp_load_session_capable: None,
             last_error_check: None,
             last_start_time: None,

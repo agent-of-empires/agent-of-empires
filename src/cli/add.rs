@@ -698,6 +698,16 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             let hint = crate::acp::install_hints::install_hint_for(&spec.command)
                 .unwrap_or("install via your package manager and re-run");
             if user_picked_agent {
+                cleanup_partial_session(
+                    &path,
+                    instance.worktree_info.as_ref(),
+                    instance.workspace_info.as_ref(),
+                    args.create_branch,
+                    instance
+                        .scratch
+                        .then(|| std::path::Path::new(&instance.project_path)),
+                    None,
+                );
                 bail!(
                     "ACP adapter `{}` is not installed or not on $PATH.\n\
                          Install: {}\n\

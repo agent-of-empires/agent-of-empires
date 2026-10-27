@@ -398,6 +398,7 @@ async fn persist_agent_switch(
             instance.import_pending = None;
             instance.acp_effort = None;
             instance.agent_model = model.clone();
+            instance.terminal_rebind_pending = true;
             Ok(())
         })?;
         Ok(exclusion)
@@ -1557,6 +1558,7 @@ mod tests {
             );
             assert_eq!(stored.acp_session_id, None);
             assert_eq!(stored.acp_effort, None);
+            assert!(stored.terminal_rebind_pending);
 
             let memory = state.instances.read().await;
             let live = memory.iter().find(|i| i.id == id).expect("instance");

@@ -92,14 +92,45 @@ pub(crate) async fn runtime_write(
         .await?)
 }
 
-pub fn resolve_session<'a>(identifier: &str, instances: &'a [Instance]) -> Result<&'a Instance> {
-    if let Some(inst) = instances.iter().find(|i| i.id == identifier) {
+/// The fields `resolve_session` matches an identifier against.
+pub trait SessionRef {
+    fn id(&self) -> &str;
+    fn title(&self) -> &str;
+    fn project_path(&self) -> &str;
+}
+
+impl SessionRef for Instance {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn title(&self) -> &str {
+        &self.title
+    }
+    fn project_path(&self) -> &str {
+        &self.project_path
+    }
+}
+
+impl SessionRef for crate::daemon::SessionResponse {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn title(&self) -> &str {
+        &self.title
+    }
+    fn project_path(&self) -> &str {
+        &self.project_path
+    }
+}
+
+pub fn resolve_session<'a, S: SessionRef>(identifier: &str, instances: &'a [S]) -> Result<&'a S> {
+    if let Some(inst) = instances.iter().find(|i| i.id() == identifier) {
         return Ok(inst);
     }
 
-    let prefix_matches: Vec<&Instance> = instances
+    let prefix_matches: Vec<&S> = instances
         .iter()
-        .filter(|i| i.id.starts_with(identifier))
+        .filter(|i| i.id().starts_with(identifier))
         .collect();
     match prefix_matches.len() {
         0 => {}
@@ -107,7 +138,7 @@ pub fn resolve_session<'a>(identifier: &str, instances: &'a [Instance]) -> Resul
         _ => {
             let mut candidates: Vec<String> = prefix_matches
                 .iter()
-                .map(|i| format!("  {} ({})", i.id, i.title))
+                .map(|i| format!("  {} ({})", i.id(), i.title()))
                 .collect();
             candidates.sort();
             bail!(
@@ -119,11 +150,11 @@ pub fn resolve_session<'a>(identifier: &str, instances: &'a [Instance]) -> Resul
         }
     }
 
-    if let Some(inst) = instances.iter().find(|i| i.title == identifier) {
+    if let Some(inst) = instances.iter().find(|i| i.title() == identifier) {
         return Ok(inst);
     }
 
-    if let Some(inst) = instances.iter().find(|i| i.project_path == identifier) {
+    if let Some(inst) = instances.iter().find(|i| i.project_path() == identifier) {
         return Ok(inst);
     }
 
@@ -210,6 +241,32 @@ where
 mod tests {
     use super::*;
     use crate::session::claim::purge_restored_row_must_be_kept;
+
+    #[test]
+    fn resolve_session_matches_daemon_rows() {
+        let row = |id: &str, title: &str, path: &str| -> crate::daemon::SessionResponse {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "title": title, "project_path": path
+            }))
+            .unwrap()
+        };
+        let rows = [
+            row("abc1", "one", "/p/one"),
+            row("abc2", "two", "/p/two"),
+            row("xyz9", "three", "/p/three"),
+        ];
+        for (identifier, expected) in [
+            ("abc2", "abc2"),
+            ("xy", "xyz9"),
+            ("one", "abc1"),
+            ("/p/two", "abc2"),
+        ] {
+            assert_eq!(resolve_session(identifier, &rows).unwrap().id, expected);
+        }
+        let ambiguous = resolve_session("abc", &rows).unwrap_err().to_string();
+        assert!(ambiguous.contains("matches 2 sessions"), "{ambiguous}");
+        assert!(resolve_session("nope", &rows).is_err());
+    }
 
     #[test]
     fn truncate_id_clamps_to_char_boundaries() {
