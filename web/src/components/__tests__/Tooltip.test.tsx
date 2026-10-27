@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import { Tooltip } from "../Tooltip";
@@ -62,8 +62,14 @@ describe("Tooltip", () => {
     expect(screen.getByRole("tooltip").id).toBe("glyph-tip");
     expect(screen.getByText("⠃").getAttribute("aria-describedby")).toBeNull();
     // A controlled tooltip follows a scrolling anchor rather than dismissing itself.
+    const anchor = screen.getByText("⠃").parentElement!;
+    const at = (top: number) => vi.spyOn(anchor, "getBoundingClientRect").mockReturnValue(new DOMRect(40, top, 10, 10));
+    at(100);
     fireEvent.scroll(window);
-    expect(screen.getByRole("tooltip").id).toBe("glyph-tip");
+    expect(screen.getByRole("tooltip").style.top).toBe("116px");
+    at(200);
+    fireEvent.scroll(window);
+    expect(screen.getByRole("tooltip").style.top).toBe("216px");
 
     // A child's own description is kept alongside the bubble.
     rerender(
