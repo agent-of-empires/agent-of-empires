@@ -1800,6 +1800,17 @@
       "notes": "Offered only for a sandboxed, unarchived session that is not creating or deleting. The confirmation names what is lost, sends one POST, and stays open with the server's message on a refusal. The daemon side is covered by recreate_container_removes_the_container_before_the_agent_restarts."
     },
     {
+      "id": "sidebar.recreate-container-layout",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/sidebar-recreate-container.spec.ts"],
+      "components": [
+        "web/src/components/sidebar/RecreateContainerDialog.tsx",
+        "web/src/components/sidebar/SessionRowMenu.tsx"
+      ],
+      "notes": "The item is reachable under More on desktop and in the 375 px bottom sheet, and the dialog and both buttons fit that viewport."
+    },
+    {
       "id": "sidebar.repo-appearance",
       "kind": "mocked-playwright",
       "risk": "low",
