@@ -461,13 +461,27 @@ async fn restart_tunnel(kind: &TunnelKind, port: u16) -> anyhow::Result<Child> {
 /// True if `tailscale` is on PATH, the daemon is logged in, and Funnel is enabled for the
 /// tailnet.
 pub async fn tailscale_available() -> bool {
+    tailscale_available_with(std::ffi::OsStr::new("tailscale"), PROBE_TIMEOUT).await
+}
+
+async fn tailscale_available_with(program: &std::ffi::OsStr, timeout: std::time::Duration) -> bool {
+    // Each probe is bounded so a wedged `tailscale` falls back to Cloudflare at once instead of
+    // holding tunnel selection until the startup deadline; dropping one kills its child.
+    let probe = |arg: &'static str| async move {
+        let output = Command::new(program).arg(arg).kill_on_drop(true).output();
+        match tokio::time::timeout(timeout, output).await {
+            Ok(result) => result,
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "`tailscale {arg}` timed out after {:.1}s",
+                    timeout.as_secs_f32()
+                ),
+            )),
+        }
+    };
     // Cheapest possible check first.
-    // The startup deadline drops these probes; a wedged `tailscale` must not outlive the daemon.
-    let version = Command::new("tailscale")
-        .arg("--version")
-        .kill_on_drop(true)
-        .output()
-        .await;
+    let version = probe("--version").await;
     match &version {
         Ok(o) => debug!(
             exit = ?o.status.code(),
@@ -485,11 +499,7 @@ pub async fn tailscale_available() -> bool {
         return false;
     }
     // Then confirm the daemon is running and signed in.
-    let status = Command::new("tailscale")
-        .arg("status")
-        .kill_on_drop(true)
-        .output()
-        .await;
+    let status = probe("status").await;
     match &status {
         Ok(o) => debug!(
             exit = ?o.status.code(),
@@ -779,15 +789,15 @@ pub fn check_cloudflared() -> anyhow::Result<()> {
     }
 }
 
-/// How long a sync `tailscale` probe may take. A healthy CLI answers in well under a second;
-/// a wedged `tailscaled` must not hang `aoe serve`'s pre-flight, which runs before the
-/// Daemon's startup deadline, or freeze the TUI when R opens the view.
-const SYNC_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// How long a `tailscale` availability probe may take. A healthy CLI answers in well under a
+/// second; a wedged `tailscaled` must not hang `aoe serve`'s pre-flight, freeze the TUI when R
+/// opens the view, or hold the Daemon's tunnel selection until its startup deadline.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Sync counterpart of `tailscale_available()` for use from the TUI (which avoids spinning
 /// up a tokio runtime just to probe for a CLI).
 pub fn tailscale_available_sync() -> bool {
-    tailscale_available_sync_with(std::ffi::OsStr::new("tailscale"), SYNC_PROBE_TIMEOUT)
+    tailscale_available_sync_with(std::ffi::OsStr::new("tailscale"), PROBE_TIMEOUT)
 }
 
 fn tailscale_available_sync_with(program: &std::ffi::OsStr, timeout: std::time::Duration) -> bool {
@@ -835,7 +845,7 @@ pub fn tailscale_funnel_cap_ready_sync() -> bool {
         std::process::Command::new("tailscale")
             .args(["status", "--json"])
             .stdin(std::process::Stdio::null()),
-        SYNC_PROBE_TIMEOUT,
+        PROBE_TIMEOUT,
     );
     let Ok(Some(out)) = out else {
         debug!("tailscale_funnel_cap_ready_sync: spawn failed or timed out");
@@ -895,6 +905,10 @@ mod tests {
     fn a_wedged_tailscale_reads_as_unavailable_within_the_probe_bound() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         // (script body, expected availability)
         let cases = [
             ("exit 0", true),
@@ -905,16 +919,28 @@ mod tests {
             let fake = tmp.path().join(format!("tailscale-{i}"));
             std::fs::write(&fake, format!("#!/bin/sh\n{body}\n")).unwrap();
             std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-            let started = std::time::Instant::now();
             let timeout = std::time::Duration::from_millis(300);
+            let started = std::time::Instant::now();
             assert_eq!(
                 tailscale_available_sync_with(fake.as_os_str(), timeout),
                 expected,
-                "{body}"
+                "sync: {body}"
             );
             assert!(
                 started.elapsed() < std::time::Duration::from_secs(3),
-                "{body}: took {:?}",
+                "sync: {body}: took {:?}",
+                started.elapsed()
+            );
+            // The Daemon's async probe gets the same bound.
+            let started = std::time::Instant::now();
+            assert_eq!(
+                runtime.block_on(tailscale_available_with(fake.as_os_str(), timeout)),
+                expected,
+                "async: {body}"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(3),
+                "async: {body}: took {:?}",
                 started.elapsed()
             );
         }
