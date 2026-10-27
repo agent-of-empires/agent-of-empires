@@ -3,6 +3,10 @@ use crate::daemon::PendingApproval;
 use crate::session::Status;
 use crate::tui::approval_poller::{ApprovalResolution, ApprovalResult};
 use crate::tui::home::PermissionResponseTarget;
+use aoe_plugin_api::agent_integration::{
+    AgentIntegrationOption, AgentIntegrationPrompt, AgentIntegrationQuestion,
+    AgentIntegrationSnapshot, AgentIntegrationStatus,
+};
 
 fn add_session_with_tool(view: &mut HomeView, title: &str, tool: &str) -> String {
     let mut inst = Instance::new(title, "/tmp/test");
@@ -208,4 +212,88 @@ fn failed_structured_approval_informs_and_lets_polling_restore() {
         env.view.info_dialog.is_some(),
         "a resolve failure must surface an error dialog"
     );
+}
+
+fn integration_snapshot(
+    instance_id: &str,
+    prompt: AgentIntegrationPrompt,
+) -> AgentIntegrationSnapshot {
+    AgentIntegrationSnapshot {
+        schema_version: 1,
+        instance_id: instance_id.to_string(),
+        provider_version: "1.0.0".to_string(),
+        provider_session_id: "provider-session".to_string(),
+        writer_pid: std::process::id(),
+        revision: 1,
+        status: AgentIntegrationStatus::Waiting,
+        reply_keys: vec!["F12".to_string()],
+        prompt: Some(prompt),
+    }
+}
+
+#[test]
+#[serial]
+fn removed_integration_session_reports_response_not_sent() {
+    use crate::tui::dialogs::{AgentQuestionDialog, PermissionResponseDialog};
+
+    let prompts = [
+        AgentIntegrationPrompt::Approval {
+            id: "approval".to_string(),
+            title: "Run command?".to_string(),
+            allow_always: false,
+        },
+        AgentIntegrationPrompt::Question {
+            id: "question".to_string(),
+            title: "Choose a database".to_string(),
+            questions: vec![AgentIntegrationQuestion {
+                id: "database".to_string(),
+                question: "Which database?".to_string(),
+                options: vec![AgentIntegrationOption {
+                    label: "SQLite".to_string(),
+                    description: None,
+                }],
+                multi: false,
+                recommended: None,
+            }],
+        },
+    ];
+
+    for prompt in prompts {
+        let mut env = create_test_env_empty();
+        let id = add_session_with_tool(&mut env.view, "session-one", "claude");
+        let snapshot = integration_snapshot(&id, prompt.clone());
+        env.view.pending_permission_response = Some(PermissionResponseTarget::Integration {
+            session_id: id.clone(),
+            snapshot,
+        });
+
+        let submit_key =
+            match &prompt {
+                AgentIntegrationPrompt::Approval {
+                    title,
+                    allow_always,
+                    ..
+                } => {
+                    env.view.permission_response_dialog = Some(
+                        PermissionResponseDialog::integration("session-one", title, *allow_always),
+                    );
+                    KeyCode::Char('a')
+                }
+                AgentIntegrationPrompt::Question { .. } => {
+                    env.view.agent_question_dialog = Some(AgentQuestionDialog::new(prompt.clone()));
+                    KeyCode::Enter
+                }
+            };
+
+        env.view.remove_instance(&id);
+        assert!(env.view.get_instance(&id).is_none());
+        let _ = env.view.handle_key(key(submit_key), None);
+
+        let info = env.view.info_dialog.as_ref().expect("response warning");
+        assert_eq!(info.title(), "Response Not Sent");
+        assert_eq!(
+            info.message(),
+            "The session is no longer available. The response was not sent."
+        );
+    }
 }
