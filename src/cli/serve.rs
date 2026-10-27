@@ -650,6 +650,25 @@ impl ServeLaunch {
     }
 }
 
+impl ServeLaunch {
+    /// Replay the recorded launch, taking only what the TUI restart controls
+    /// (bind, exposure, port, dashboard enablement, passphrase) from `requested`,
+    /// so recorded policy such as `--read-only` and the allowlists survives.
+    fn overlay_tui_args(&self, requested: ServeArgs) -> ServeArgs {
+        let mut args = self.to_serve_args(None);
+        if self.core_only {
+            args.auth = requested.auth;
+        }
+        args.core_only = requested.core_only;
+        args.port = requested.port;
+        args.host = requested.host;
+        args.remote = requested.remote;
+        args.no_tailscale = requested.no_tailscale;
+        args.passphrase = requested.passphrase;
+        args
+    }
+}
+
 fn launch_file(name: &str) -> Result<crate::session::ResolvedDataFile> {
     crate::session::AnchoredDir::open(&crate::session::get_app_dir()?)?
         .bind_file(std::ffi::OsStr::new(name))
@@ -1882,7 +1901,10 @@ pub(crate) async fn restart_daemon_with_receipt(
 
     let launch = managed_launch(pid)?;
     let predecessor_passphrase = recall_serve_passphrase(&launch)?;
-    let mut args = override_args.unwrap_or_else(|| launch.to_serve_args(None));
+    let mut args = match override_args {
+        Some(requested) => launch.overlay_tui_args(requested),
+        None => launch.to_serve_args(None),
+    };
     args.passphrase = resolve_launch_passphrase(
         args.passphrase.take(),
         Some(predecessor_passphrase.as_deref()),
@@ -2447,6 +2469,54 @@ mod tests {
             allowed_origin: vec!["https://aoe.example.com:8443".to_string()],
             additional_fields: serde_json::Map::new(),
         }
+    }
+
+    #[test]
+    fn tui_restart_overlay_keeps_recorded_policy() {
+        use clap::Parser;
+        let tui_args = |argv: &[&str]| {
+            let parsed = crate::cli::Cli::try_parse_from(argv).unwrap();
+            let Some(crate::cli::Commands::Serve(args)) = parsed.command else {
+                unreachable!();
+            };
+            args
+        };
+        let mut recorded = sample_launch();
+        recorded.auth_mode = AuthMode::Token;
+        let local = recorded.overlay_tui_args(tui_args(&[
+            "aoe", "serve", "--daemon", "--port", "8080", "--host", "0.0.0.0",
+        ]));
+        let tunnel = recorded.overlay_tui_args(tui_args(&[
+            "aoe",
+            "serve",
+            "--daemon",
+            "--port",
+            "8080",
+            "--remote",
+            "--host",
+            "127.0.0.1",
+            "--no-tailscale",
+        ]));
+        for args in [&local, &tunnel] {
+            assert!(args.read_only && args.behind_proxy && args.cityhall);
+            assert!(args.dangerously_allow_plaintext_remote);
+            assert_eq!(args.allowed_host, recorded.allowed_host);
+            assert_eq!(args.allowed_origin, recorded.allowed_origin);
+            assert_eq!(args.tunnel_name, recorded.tunnel_name);
+            assert_eq!(args.tunnel_url, recorded.tunnel_url);
+            assert_eq!(args.auth, Some(AuthMode::Token));
+            assert_eq!(args.port, Some(8080));
+        }
+        assert!(!local.remote && local.host == "0.0.0.0");
+        assert!(tunnel.remote && tunnel.host == "127.0.0.1");
+
+        let mut core = sample_launch();
+        core.core_only = true;
+        let dashboard = core.overlay_tui_args(tui_args(&[
+            "aoe", "serve", "--daemon", "--port", "8080", "--host", "0.0.0.0",
+        ]));
+        assert!(!dashboard.core_only);
+        assert_eq!((dashboard.port, dashboard.auth), (Some(8080), None));
     }
 
     #[test]
