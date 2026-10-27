@@ -214,7 +214,8 @@ pub fn wait_for_port(port: u16, timeout: Duration) -> bool {
     false
 }
 
-/// Retry `Err` until `Ok` or timeout. Probe panics abort polling.
+/// Retry `Err` until `Ok`; at the deadline, panic with the last error.
+/// Probe panics abort polling immediately.
 pub fn wait_until<T>(
     timeout: Duration,
     interval: Duration,
