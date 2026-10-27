@@ -160,7 +160,18 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
         <div className="flex items-center gap-2">
           <Tooltip
             text={meaningText(glyphMeaning)}
-            detail={glyphTip === "focus" ? "Press Enter to open" : undefined}
+            detail={
+              // The attention hint lost its `title`; the tooltip is where a mouse user reads it. Waiting
+              // and Error already say it in the glyph's meaning, so only other attention adds a line.
+              [
+                attention && model.status !== "Waiting" && model.status !== "Error"
+                  ? model.attentionHint.charAt(0).toUpperCase() + model.attentionHint.slice(1)
+                  : null,
+                glyphTip === "focus" ? "Press Enter to open" : null,
+              ]
+                .filter(Boolean)
+                .join(" \u00b7 ") || undefined
+            }
             id={glyphTipId}
             open={glyphTip !== null}
           >

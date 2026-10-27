@@ -410,5 +410,11 @@ describe("SessionRow mark tooltips", () => {
     expect(testId("sidebar-unread-dot")!.closest("[title]")).toBeNull();
     fireEvent.pointerEnter(testId("sidebar-status-glyph")!, { pointerType: "mouse" });
     expect(screen.getByRole("tooltip").textContent).toMatch(/^Unread: /);
+    cleanup();
+
+    // Attention the glyph's meaning doesn't already say gets its own line, which `title` used to carry.
+    renderRow(ws({ status: "Running", urgent: true }));
+    fireEvent.pointerEnter(testId("sidebar-status-glyph")!, { pointerType: "mouse" });
+    expect(screen.getByRole("tooltip").textContent).toBe("Running: the Agent is workingNeeds your attention");
   });
 });
