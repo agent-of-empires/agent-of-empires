@@ -235,6 +235,111 @@ fn failed_local_acquisition_never_uses_the_store() {
     assert!(!fixture.app.join("daemon/api.sock").exists());
 }
 
+#[test]
+#[parallel]
+fn legacy_publication_artifacts_are_ignored() {
+    let fixture = Fixture::new();
+    std::fs::create_dir_all(&fixture.app).unwrap();
+    let artifacts = [
+        (
+            "runtime.prebind.json",
+            br#"{"schema":255,"future_field":true}"#.as_slice(),
+        ),
+        ("runtime.postbind.json", b"{]".as_slice()),
+        (
+            "runtime.postbind.json.tmp.11111111-2222-3333-4444-555555555555",
+            b"{]".as_slice(),
+        ),
+    ];
+    for (name, bytes) in artifacts {
+        std::fs::write(fixture.app.join(name), bytes).unwrap();
+    }
+    let output = fixture.run(&["list", "--json"]);
+    assert!(output.status.success(), "{output:?}");
+    let rows: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(rows[0]["id"], "daemon-only-row");
+    for (name, bytes) in artifacts {
+        assert_eq!(
+            std::fs::read(fixture.app.join(name)).unwrap(),
+            bytes,
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+#[parallel]
+async fn a_cityhall_daemon_refuses_reads_with_the_typed_cityhall_mode() {
+    use agent_of_empires::daemon::{DaemonClient, RUNTIME_PROTOCOL_VERSION};
+    use std::process::Stdio;
+    use std::time::Duration;
+    use tokio::net::UnixDatagram;
+
+    struct Foreground(std::process::Child);
+    impl Drop for Foreground {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let fixture = Fixture::new();
+    let notify_path = fixture.home.path().join("ready.sock");
+    let notify = UnixDatagram::bind(&notify_path).unwrap();
+    let log_path = fixture.home.path().join("serve.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let mut foreground = Foreground(
+        fixture
+            .command(&["serve", "--core-only", "--cityhall"])
+            .env("NOTIFY_SOCKET", &notify_path)
+            .stdout(Stdio::null())
+            .stderr(log)
+            .spawn()
+            .unwrap(),
+    );
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let mut message = [0; 1024];
+        loop {
+            let size = notify.recv(&mut message).await.unwrap();
+            if message[..size]
+                .split(|byte| *byte == b'\n')
+                .any(|field| field == b"READY=1")
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|error| {
+        panic!(
+            "Daemon did not become ready: {error}; {}",
+            std::fs::read_to_string(log_path).unwrap()
+        )
+    });
+    let client = DaemonClient::new_unix(fixture.app.join("daemon/api.sock")).unwrap();
+    let ready = client.runtime_info().await.unwrap();
+    assert_eq!(ready.protocol_version, RUNTIME_PROTOCOL_VERSION);
+    assert_eq!(
+        ready.namespace,
+        fixture.app.canonicalize().unwrap().to_str().unwrap()
+    );
+    assert!(ready.local_owner && ready.cityhall_mode);
+    assert!(!ready.epoch.is_empty());
+    let pid = std::fs::read_to_string(fixture.app.join("serve.pid")).unwrap();
+    assert_eq!(pid.trim().parse::<u32>().unwrap(), foreground.0.id());
+    let output = fixture.run(&["list", "--json", "--no-autostart"]);
+    assert_refused(&output, "daemon read: cityhall_mode");
+    assert_eq!(output.status.code(), Some(4));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("--daemon-url"), "{stderr}");
+    assert!(!stderr.contains("AOE_DAEMON_URL"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(fixture.app.join("serve.pid")).unwrap(),
+        pid
+    );
+    assert!(foreground.0.try_wait().unwrap().is_none());
+}
+
 #[tokio::test]
 #[parallel]
 async fn peer_refusals_never_switch_to_a_live_local_daemon() {

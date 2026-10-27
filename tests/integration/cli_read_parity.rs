@@ -113,7 +113,7 @@ impl Fixture {
         profile: serde_json::Value,
         mut env: agent_of_empires::server::test_support::RuntimeEnvGuard,
     ) -> Self {
-        let home = owned.path().canonicalize().expect("canonical fixture home");
+        let home = owned.path().to_path_buf();
         env.bind(&home.join(".config"));
         let app_dir = home
             .join(".config")
@@ -819,7 +819,7 @@ async fn compare_transports_with(
     let xdg_base = fixture.path().join(".config");
     let state = build_test_app_state_with_policy(
         daemon_instances(),
-        vec!["127.0.0.1".to_string()],
+        vec!["127.0.0.1".to_string(), "localhost".to_string()],
         Vec::new(),
         None,
     );
@@ -831,6 +831,8 @@ async fn compare_transports_with(
     {
         let socket = xdg_base
             .join(agent_of_empires::session::APP_DIR_NAME_XDG)
+            .canonicalize()
+            .expect("canonical app dir")
             .join("daemon/api.sock");
         let owner = serve_owner_router_for_test(
             &socket,
