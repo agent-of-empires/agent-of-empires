@@ -336,8 +336,19 @@ impl<S: BroadcastSink> Supervisor<S> {
         let claude_store_pin = req.claude_store_pin.clone().filter(|_| {
             req.sandbox_info.is_none() && matches!(req.agent.as_str(), "claude" | "claude-code")
         });
-        let claude_config_dir =
-            apply_claude_store_pin(&mut host_environment, claude_store_pin.as_ref());
+        let claude_config_dir = apply_claude_store_pin(
+            &mut host_environment,
+            claude_store_pin.as_ref(),
+        )
+        .or_else(|| {
+            if req.sandbox_info.is_some() {
+                return None;
+            }
+            let native_key = wrapper_substitution
+                .as_ref()
+                .map_or(req.agent.as_str(), |(_, base)| base.as_str());
+            apply_declared_config_dir(&mut host_environment, &resolved_cfg, &req.tool, native_key)
+        });
 
         let mut provider_env = req.provider_env.clone();
         if let Some(model) = model.clone() {
@@ -1053,6 +1064,33 @@ pub(super) fn overlay_env(env: &mut Vec<(String, String)>, minted: Vec<(String, 
         env.push((key, value));
     }
 }
+/// Exports `tool`'s declared `agent_config_dir` as its agent's config-dir variable, as a terminal
+/// launch does. Returns the directory when the agent is Claude, for native MCP discovery.
+pub(super) fn apply_declared_config_dir(
+    environment: &mut Vec<(String, String)>,
+    cfg: &crate::session::Config,
+    tool: &str,
+    agent: &str,
+) -> Option<std::path::PathBuf> {
+    let variable = match crate::acp::agent_profiles::resolve(agent).native_config_agent? {
+        "claude" => "CLAUDE_CONFIG_DIR",
+        "codex" => "CODEX_HOME",
+        "opencode" => "OPENCODE_CONFIG_DIR",
+        "pi" => "PI_CODING_AGENT_DIR",
+        _ => return None,
+    };
+    let home =
+        crate::session::environment::resolve_host_environment_value(&cfg.environment, "HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(dirs::home_dir)?;
+    let dir = cfg.session.agent_config_dir_for(tool, &home)?;
+    overlay_env(
+        environment,
+        vec![(variable.into(), dir.to_string_lossy().into_owned())],
+    );
+    (variable == "CLAUDE_CONFIG_DIR").then_some(dir)
+}
+
 pub(super) fn apply_claude_store_pin(
     environment: &mut Vec<(String, String)>,
     pin: Option<&crate::session::capture::ClaudeStorePin>,
@@ -1211,6 +1249,123 @@ mod tests {
         ];
         assert_eq!(base, expected);
         assert_eq!(host, expected);
+    }
+
+    #[test]
+    fn declared_config_dir_is_exported_under_each_agents_variable() {
+        let cfg = |entries: &[(&str, &str)]| {
+            let mut cfg = crate::session::Config::default();
+            for (tool, dir) in entries {
+                cfg.session
+                    .agent_config_dir
+                    .insert((*tool).into(), (*dir).into());
+            }
+            cfg
+        };
+        let run = |cfg: &crate::session::Config, tool: &str, agent: &str| {
+            let mut env = vec![("CLAUDE_CONFIG_DIR".to_string(), "/hook".to_string())];
+            let claude_dir = apply_declared_config_dir(&mut env, cfg, tool, agent);
+            (env, claude_dir)
+        };
+        let pair = |key: &str, value: &str| (key.to_string(), value.to_string());
+
+        // (config, tool, agent, expected env, expected Claude dir)
+        let cases = [
+            (
+                cfg(&[("claude-c", "/acct")]),
+                "claude-c",
+                "claude",
+                vec![pair("CLAUDE_CONFIG_DIR", "/acct")],
+                Some(PathBuf::from("/acct")),
+            ),
+            (
+                cfg(&[("codex", "/acct")]),
+                "codex",
+                "codex",
+                vec![
+                    pair("CLAUDE_CONFIG_DIR", "/hook"),
+                    pair("CODEX_HOME", "/acct"),
+                ],
+                None,
+            ),
+            (
+                cfg(&[("opencode", "/acct")]),
+                "opencode",
+                "opencode",
+                vec![
+                    pair("CLAUDE_CONFIG_DIR", "/hook"),
+                    pair("OPENCODE_CONFIG_DIR", "/acct"),
+                ],
+                None,
+            ),
+            (
+                cfg(&[("pi", "/acct")]),
+                "pi",
+                "pi",
+                vec![
+                    pair("CLAUDE_CONFIG_DIR", "/hook"),
+                    pair("PI_CODING_AGENT_DIR", "/acct"),
+                ],
+                None,
+            ),
+            // No entry for the tool, and an agent with no config-dir variable.
+            (
+                cfg(&[("other", "/acct")]),
+                "claude",
+                "claude",
+                vec![pair("CLAUDE_CONFIG_DIR", "/hook")],
+                None,
+            ),
+            (
+                cfg(&[("gemini", "/acct")]),
+                "gemini",
+                "gemini",
+                vec![pair("CLAUDE_CONFIG_DIR", "/hook")],
+                None,
+            ),
+        ];
+        for (cfg, tool, agent, env, claude_dir) in cases {
+            assert_eq!(run(&cfg, tool, agent), (env, claude_dir), "{tool}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn fresh_session_exports_declared_config_dir_and_a_recorded_store_outranks_it() {
+        let (_home, temp) = isolate_home();
+        let declared = temp.path().join("declared");
+        let recorded = temp.path().join("recorded");
+        std::fs::create_dir_all(&declared).unwrap();
+        std::fs::create_dir_all(&recorded).unwrap();
+        let app_dir = crate::session::get_app_dir().unwrap();
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("config.toml"),
+            format!(
+                "[session.agent_config_dir]\nclaude-code = \"{}\"\n",
+                declared.display()
+            ),
+        )
+        .unwrap();
+        let exported = |config: &SpawnConfig| {
+            config
+                .host_environment
+                .iter()
+                .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
+                .map(|(_, value)| PathBuf::from(value))
+        };
+
+        let supervisor = Supervisor::new(VecSink::new());
+        let mut request = spawn_request("fresh-declared");
+        let (config, _) = supervisor.spawn_config(&request, 1).await.unwrap();
+        assert_eq!(exported(&config), Some(declared));
+
+        request.claude_store_pin = Some(crate::session::capture::ClaudeStorePin {
+            store: recorded.clone(),
+            exported_default_store: Some(false),
+        });
+        let (config, _) = supervisor.spawn_config(&request, 1).await.unwrap();
+        assert_eq!(exported(&config), Some(recorded));
     }
 
     #[tokio::test]
