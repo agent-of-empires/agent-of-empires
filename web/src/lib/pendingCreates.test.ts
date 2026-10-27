@@ -193,4 +193,27 @@ describe("pendingCreates", () => {
     await vi.waitFor(() => expect(createSession).toHaveBeenCalled());
     expect(createSession.mock.calls[0]![0].retry_origin).toBe("unknown");
   });
+
+  it("keeps hook env out of storage, retries it from memory, and never resends it after a reload", async () => {
+    createSession.mockResolvedValue({ ok: false, error: "offline", network: true });
+    const first = await import("./pendingCreates");
+    const withHookEnv = pending("k-secret");
+    first.registerPendingCreate({ ...withHookEnv, body: { ...withHookEnv.body, hook_env: ["TOKEN=s3cret"] } });
+    await vi.waitFor(() => expect(createSession).toHaveBeenCalled());
+    expect(createSession.mock.calls[0]![0].hook_env).toEqual(["TOKEN=s3cret"]);
+    const stored = localStorage.getItem("aoe-pending-creates")!;
+    expect(stored).not.toContain("s3cret");
+    expect(JSON.parse(stored)[0].hookEnvRedacted).toBe(true);
+
+    // A reload: only the redacted record is left, and it must not run without its hook env.
+    vi.resetModules();
+    createSession.mockReset();
+    const onUnknown = vi.fn();
+    const second = await import("./pendingCreates");
+    second.startPendingCreates({ onCreated: vi.fn(), onFailed: vi.fn(), onUnknown });
+    expect(onUnknown).toHaveBeenCalledTimes(1);
+    expect(second.peekPendingCreate()).toBeNull();
+    expect(createSession).not.toHaveBeenCalled();
+    expect(localStorage.getItem("aoe-pending-creates")).toBe("[]");
+  });
 });
