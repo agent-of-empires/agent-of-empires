@@ -100,7 +100,7 @@ From the home view, press `b` (or `B` with strict hotkeys) to open a filterable 
 
 ## Web Dashboard
 
-Use the sidebar's **Projects** section to add a saved project, edit its default base branch, or remove its registration. Unpin a project first if it is displayed as a persistent repository header. Changing a registration's name, path, or scope requires removing and adding it again. Read-only servers hide mutation controls.
+Use the sidebar's **Projects, no sessions** section to add a Project, edit its default base branch, or remove its registration. Unpin a project first if it is displayed as a persistent repository header. Changing a registration's name, path, or scope requires removing and adding it again. Read-only servers hide mutation controls.
 
 Remove targets the registrations represented by that project row, using the profile captured when the action starts. It does not request deletion from unrelated profiles. Global registrations are shared, so removing one changes every profile's merged view.
 

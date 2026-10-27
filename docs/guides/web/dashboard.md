@@ -106,7 +106,7 @@ With more than one row selected, right-click (long-press on touch) any selected 
 
 ## Projects
 
-A **Projects, no sessions** section near the bottom of the sidebar (above "Snoozed & archived") lists your registered Projects that are not pinned and have no live session; a pinned one stays above as its own header. It is the same registry the new-session wizard's "Projects" list reads, and it shows on every grouping axis. Repository headers backed by a registered Project carry a ◇ marker, and a pinned one ◆. The section is expanded by default; its collapsed state persists per-browser.
+A **Projects, no sessions** section near the bottom of the sidebar (above "Snoozed & archived") lists your registered Projects that are not pinned and have no live session. It is the same registry the new-session wizard's "Projects" list reads, and it shows on every grouping axis. Repository headers backed by a registered Project carry a ◇ marker, and a pinned one ◆. The section is expanded by default; its collapsed state persists per-browser.
 
 Pinned projects always render above as their own headers, with or without sessions. Projects with live sessions also render above as normal groups.
 
