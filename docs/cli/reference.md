@@ -356,7 +356,9 @@ Remove a session
 
 ###### **Options:**
 
-* `--delete-worktree` — Delete worktree directory (default: keep worktree)
+* `--delete-worktree` — With --purge, delete the worktree directory (default: keep it).
+
+   Without --purge, trashing moves a managed worktree into a sibling `.aoe-trash` folder, unless another session uses it.
 * `--delete-branch` — Delete git branch after worktree removal (default: per config)
 * `--force` — Force worktree removal even with untracked/modified files
 * `--keep-container` — Keep container instead of deleting it (default: delete per config)

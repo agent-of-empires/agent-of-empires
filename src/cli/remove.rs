@@ -11,7 +11,10 @@ pub struct RemoveArgs {
     /// Session ID or title to remove
     identifier: String,
 
-    /// Delete worktree directory (default: keep worktree)
+    /// With --purge, delete the worktree directory (default: keep it).
+    ///
+    /// Without --purge, trashing moves a managed worktree into a sibling
+    /// `.aoe-trash` folder, unless another session uses it.
     #[arg(long = "delete-worktree")]
     delete_worktree: bool,
 
