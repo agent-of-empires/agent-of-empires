@@ -16,6 +16,8 @@ import {
   type RowLayout,
 } from "./live-terminal/pacing";
 import { FORWARD_TOUCH_GAIN, useForwardInput } from "./live-terminal/useForwardInput";
+import { ForwardScrollbar } from "./live-terminal/ForwardScrollbar";
+import { FORWARD_SCROLLBAR_WIDTH_PX, forwardPageNotches } from "../lib/forwardScrollbar";
 import { Row } from "./live-terminal/TermRow";
 import { LIVE_WINDOW_SCREENS, useLiveEdgeScroll } from "./live-terminal/useLiveEdgeScroll";
 import { useTerminalInput } from "./live-terminal/useTerminalInput";
@@ -238,6 +240,8 @@ export function MobileLiveTerminal({
     mouseSgr: frame?.mouseSgr ?? false,
   });
   const forwardGestures = forwardMode && !selectionHeld;
+  // Reserved on `forwardMode`, not `forwardGestures`, so a selection never resizes the pane.
+  const showScrollbar = settings.showForwardScrollbar && forwardMode && !coarse;
   const touchForwardYRef = useRef<number | null>(null);
   // WebKit may synthesize a click after a custom forward-mode drag; a moved touch must not raise the keyboard.
   const touchStartRef = useRef<{ x: number; y: number; t: number } | null>(null);
@@ -387,6 +391,11 @@ export function MobileLiveTerminal({
     [frame?.pane0?.rows],
   );
 
+  const inputPaneMiddleCol = useCallback(
+    () => Math.max(1, Math.round((frame?.pane0?.cols ?? renderCols) / 2)),
+    [frame?.pane0?.cols, renderCols],
+  );
+
   const forward = useForwardInput({
     streamFrame,
     lineH,
@@ -395,12 +404,14 @@ export function MobileLiveTerminal({
     mouseSgrRef,
     pointerCell,
     inputPaneMiddleRow,
+    inputPaneMiddleCol,
     forwardWheel,
     forwardButton,
     inputRef,
     armAgentClipboard,
   });
   const { wheelAccumRef, enqueueTouchWheelDelta, cancelTouchWheelQueue, startMomentum, stopMomentum } = forward;
+  const pageNotches = useCallback(() => forwardPageNotches(rowsRef.current), []);
   // Recent drag samples for the release velocity.
   const flickSamplesRef = useRef<FlickSample[]>([]);
   // Every input path funnels through here, so typing interrupts a coast instead of queueing behind it.
@@ -697,11 +708,12 @@ export function MobileLiveTerminal({
         onTouchCancel={onTouchCancel}
         // Insets, not padding: padding would inflate clientWidth/clientHeight and over-count the grid sent to tmux.
         // The desktop side inset keeps column 0 clear of the parent's 1px pane frame; touch draws no frame.
-        className={`absolute ${coarse ? "inset-x-[2px]" : "inset-x-[6px]"} top-0 bottom-[8px] font-mono flex flex-col ${
+        className={`absolute ${coarse ? "inset-x-[2px]" : showScrollbar ? "left-[6px]" : "inset-x-[6px]"} top-0 bottom-[8px] font-mono flex flex-col ${
           forwardMode ? "overflow-hidden" : "overflow-y-auto overflow-x-clip"
         }`}
         style={
           {
+            right: showScrollbar ? 6 + FORWARD_SCROLLBAR_WIDTH_PX + 2 : undefined,
             fontSize: `${fontSize}px`,
             fontFamily,
             lineHeight: `${lineH}px`,
@@ -753,6 +765,15 @@ export function MobileLiveTerminal({
           {bottomPadLines > 0 && <div style={{ height: `${bottomPadLines * lineH}px` }} aria-hidden="true" />}
         </div>
       </div>
+
+      {showScrollbar && (
+        <ForwardScrollbar
+          disabled={selectionHeld}
+          pageNotches={pageNotches}
+          scrollNotches={forward.scrollNotches}
+          cancelScroll={cancelTouchWheelQueue}
+        />
+      )}
 
       {LIVE_DEBUG && (
         <div
