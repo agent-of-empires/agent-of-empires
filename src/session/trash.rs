@@ -202,6 +202,16 @@ pub fn relocate_worktree_to_trash(inst: &mut Instance) -> RelocateOutcome {
     }
 
     let current = PathBuf::from(&inst.project_path);
+    // Moving the checkout would pull the directory out from under the other session.
+    if crate::session::deletion::paths_in_use_except(&[&inst.id]).covers(&current) {
+        tracing::info!(
+            target: "session.trash",
+            session = %inst.id,
+            path = %inst.project_path,
+            "leaving a worktree in place that another session uses"
+        );
+        return RelocateOutcome::Skipped;
+    }
     let Some(target) = trash_holding_path(&current, &inst.id) else {
         return RelocateOutcome::Failed {
             reason: format!("worktree path {} has no parent dir", current.display()),
@@ -1101,6 +1111,35 @@ mod tests {
         inst.trash();
         assert_eq!(plan_trashed_reconcile(&inst), ReconcilePlan::Nothing);
         assert!(!reconcile_trashed_location(&mut inst));
+
+        let out = relocate_worktree_to_trash(&mut inst);
+        assert!(
+            matches!(out, RelocateOutcome::Skipped),
+            "expected the relocation to be skipped, got {out:?}"
+        );
+        assert_eq!(inst.project_path, original);
+        assert!(inst.pre_trash_project_path.is_none());
+        assert!(PathBuf::from(&original).exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_worktree_another_session_uses_is_never_relocated() {
+        if !git_available() {
+            return;
+        }
+        let (tmp, mut inst) = real_worktree_instance();
+        let _home = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("home"));
+        let sharer = Instance::new("sharer", &inst.project_path);
+        crate::session::Storage::new_unwatched("other")
+            .unwrap()
+            .update(|instances, _groups| {
+                instances.push(sharer);
+                Ok(())
+            })
+            .unwrap();
+        let original = inst.project_path.clone();
+        inst.trash();
 
         let out = relocate_worktree_to_trash(&mut inst);
         assert!(
