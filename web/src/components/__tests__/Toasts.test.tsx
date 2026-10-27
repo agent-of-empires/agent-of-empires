@@ -42,6 +42,17 @@ afterEach(() => {
 });
 
 describe("ToastProvider", () => {
+  it("runs an action toast's button once and dismisses it", () => {
+    renderProvider();
+    const reopen = vi.fn();
+    act(() => toastBus.handler?.action("Session was not created", "Reopen", reopen));
+    const alert = screen.getByRole("alert");
+    expect(alert.textContent).toContain("Session was not created");
+    fireEvent.click(screen.getByRole("button", { name: "Reopen" }));
+    expect(reopen).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("renders info, push, and error toasts with their roles and dismisses on click", () => {
     const { container } = renderProvider();
     expect(container.querySelector("div.fixed")?.children.length).toBe(0);

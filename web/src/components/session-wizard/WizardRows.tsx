@@ -42,17 +42,17 @@ export function NavRow({
   placeholder?: string;
   onOpen: () => void;
   testId?: string;
-  /** Draws attention to a required, still-empty row. */
-  highlight?: boolean;
+  /** Draws attention to a required, still-empty row, or to one a failed create blames. */
+  highlight?: boolean | "error";
 }) {
   return (
     <button
       type="button"
       onClick={onOpen}
       data-testid={testId}
-      className={`${ROW} w-full text-left cursor-pointer hover:bg-surface-850 transition-colors first:rounded-t-lg last:rounded-b-lg ${
-        highlight ? "outline outline-1 outline-brand-600 -outline-offset-1" : ""
-      }`}
+      className={`${ROW} w-full text-left cursor-pointer hover:bg-surface-850 transition-colors first:rounded-t-lg last:rounded-b-lg ${highlightClass(
+        highlight,
+      )}`}
     >
       <Label>{label}</Label>
       <span className="flex-1 min-w-0 truncate text-sm font-mono text-text-primary">
@@ -73,6 +73,7 @@ export function SwitchRow({
   onConfigure,
   disabled = false,
   testId,
+  highlight,
 }: {
   label: string;
   checked: boolean;
@@ -82,10 +83,12 @@ export function SwitchRow({
   onConfigure?: () => void;
   disabled?: boolean;
   testId?: string;
+  /** Outlines a row a failed create blames; its summary carries the text cue. */
+  highlight?: "error";
 }) {
   const summaryText = <span className="flex-1 min-w-0 truncate text-xs text-text-dim">{summary}</span>;
   return (
-    <div className={ROW} data-testid={testId}>
+    <div className={`${ROW} ${highlightClass(highlight)}`} data-testid={testId}>
       <Label>{label}</Label>
       {onConfigure ? (
         <button
@@ -103,6 +106,11 @@ export function SwitchRow({
       <Toggle checked={checked} onChange={onChange} disabled={disabled} label={switchLabel} />
     </div>
   );
+}
+
+function highlightClass(highlight: boolean | "error" | undefined): string {
+  if (!highlight) return "";
+  return `outline outline-1 -outline-offset-1 ${highlight === "error" ? "outline-status-error" : "outline-brand-600"}`;
 }
 
 /** A row holding an inline control, such as the title input. */

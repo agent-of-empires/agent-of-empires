@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, type ReactNode } from "react";
 import { useServerDown, OFFLINE_TITLE } from "../../lib/connectionState";
 import { hasFinePointer } from "../../lib/platform";
 
@@ -13,6 +13,8 @@ interface Props {
   data: LaunchData;
   isSubmitting: boolean;
   error: string | null;
+  /** Shown in place of `error`: a create the server refused. */
+  failure?: ReactNode;
   onSubmit: () => void;
   /** CityHall name-only mode: the server derives the project. */
   nameOnly?: boolean;
@@ -30,6 +32,7 @@ export function LaunchFooter({
   data,
   isSubmitting,
   error,
+  failure,
   onSubmit,
   nameOnly = false,
   defaultsReady = true,
@@ -53,7 +56,8 @@ export function LaunchFooter({
 
   return (
     <div>
-      {error && <div className="text-sm text-status-error bg-status-error/10 rounded-lg p-3 mb-4">{error}</div>}
+      {failure ??
+        (error && <div className="text-sm text-status-error bg-status-error/10 rounded-lg p-3 mb-4">{error}</div>)}
       {offline && (
         <div className="text-sm text-status-error bg-status-error/10 rounded-lg p-3 mb-4">{OFFLINE_TITLE}</div>
       )}

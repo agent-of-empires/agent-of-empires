@@ -10,6 +10,7 @@ interface Toast {
   message: string;
   sessionId?: string;
   href?: string;
+  action?: { label: string; run: () => void };
 }
 
 const ToastContext = createContext<ToastApi | null>(null);
@@ -54,14 +55,24 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     [dismiss],
   );
 
+  const pushWithAction = useCallback(
+    (message: string, label: string, run: () => void) => {
+      const id = nextId.current++;
+      setToasts((t) => [...t, { id, kind: "error", message, action: { label, run } }]);
+      setTimeout(() => dismiss(id), TOAST_LIFETIME_MS);
+    },
+    [dismiss],
+  );
+
   const api = useMemo<ToastApi>(
     () => ({
       push,
       error: (m: string) => push(m, "error"),
       info: (m: string) => push(m, "info"),
       openLink: pushWithHref,
+      action: pushWithAction,
     }),
-    [push, pushWithHref],
+    [push, pushWithHref, pushWithAction],
   );
 
   // Service worker forwards incoming push payloads here when the PWA is already visible and focused, so we show
@@ -124,6 +135,19 @@ export function ToastProvider({ children }: { children: ReactNode }) {
               } ${clickable ? "cursor-pointer hover:bg-surface-700 transition-colors" : ""}`}
             >
               <span className="flex-1 break-words">{t.message}</span>
+              {t.action && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    dismiss(t.id);
+                    t.action!.run();
+                  }}
+                  className="shrink-0 font-medium text-text-primary underline-offset-2 hover:underline cursor-pointer"
+                >
+                  {t.action.label}
+                </button>
+              )}
               <button
                 onClick={(e) => {
                   e.stopPropagation();

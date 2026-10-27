@@ -1166,7 +1166,9 @@
         "tests/wizard.spec.ts",
         "tests/wizard-project.spec.ts",
         "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
-        "src/components/session-wizard/__tests__/SandboxPanel.test.tsx"
+        "src/components/session-wizard/__tests__/SandboxPanel.test.tsx",
+        "src/components/session-wizard/__tests__/CreateFailureBox.test.tsx",
+        "src/components/session-wizard/createFailureView.test.ts"
       ],
       "components": [
         "web/src/components/DirectoryBrowser.tsx",
@@ -1182,9 +1184,11 @@
         "web/src/components/session-wizard/steps/ProjectSearchList.tsx",
         "web/src/components/session-wizard/WizardRows.tsx",
         "web/src/components/session-wizard/steps/SandboxPanel.tsx",
-        "web/src/components/session-wizard/steps/LaunchFields.tsx"
+        "web/src/components/session-wizard/steps/LaunchFields.tsx",
+        "web/src/components/session-wizard/CreateFailureBox.tsx",
+        "web/src/components/session-wizard/createFailureView.ts"
       ],
-      "notes": "The Yolo mode row says what each value does and is locked on for an Agent whose /api/agents?profile= row for the selected Profile has always_yolo; the create sends the user's value and the server forces it; until /api/agents answers for that Profile (retried on failure) the row promises neither value and Launch waits; the unavailable Sandbox names the configured Container runtime from /api/docker/status."
+      "notes": "The Yolo mode row says what each value does and is locked on for an Agent whose /api/agents?profile= row for the selected Profile has always_yolo; the create sends the user's value and the server forces it; until /api/agents answers for that Profile (retried on failure) the row promises neither value and Launch waits; the unavailable Sandbox names the configured Container runtime from /api/docker/status. A refused create shows a box with its title, failed step, one recovery action per code and its reference, outlines the row it blames, and takes focus; Retry re-reads /api/docker/status, and every relaunch, Launch without Sandbox included, uses a new idempotency key. A background failure toasts with Reopen, which restores the form and the box."
     },
     {
       "id": "wizard.structured-view-exposure",
