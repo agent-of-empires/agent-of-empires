@@ -410,12 +410,18 @@ mod tests {
             }
         }
 
-        // A detail line that fills its width still fits under the indent: its last cell survives.
-        let full_line = format!("{}Q", "x".repeat(51));
-        let text = screen(&mut ConnectionsView::offline(Some(&full_line)));
-        assert!(
-            text.contains('Q'),
-            "the full-width line lost its last cell\n{text}"
+        // A detail one cell wider than the space under the indent wraps its last cell, not cuts it.
+        let fill = "x".repeat(51);
+        let text = screen(&mut ConnectionsView::offline(Some(&format!("{fill}Q"))));
+        let lines: Vec<&str> = text.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| line.contains(&fill))
+            .expect("the detail line is missing");
+        assert_eq!(
+            lines.get(at + 1).map(|line| line.trim_matches([' ', '│'])),
+            Some("Q"),
+            "the last cell did not wrap onto its own line\n{text}"
         );
 
         // A narrow terminal shrinks the dialog and wraps its details rather than cutting them.
