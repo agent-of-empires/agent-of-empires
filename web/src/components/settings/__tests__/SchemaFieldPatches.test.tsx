@@ -55,6 +55,17 @@ const SCHEMA = [
     { profile_overridable: false, advanced: true, description: "Ceiling on concurrent session-id poller threads." },
   ),
   field("sound", "enabled", "Enabled", { kind: "toggle" }, { description: "Play sounds on agent state transitions." }),
+  field("sound", "server_volume", "Server volume", { kind: "custom", id: "sound-volume" }),
+  field("sound", "browser_volume", "Browser volume", { kind: "custom", id: "sound-volume" }),
+  field("sound", "browser_scope", "Browser scope", {
+    kind: "select",
+    options: [
+      { value: "all", label: "All sessions" },
+      { value: "other_sessions", label: "Other sessions" },
+      { value: "hidden_tab", label: "Hidden tab only" },
+    ],
+  }),
+  field("sound", "browser_idle_enabled", "Browser: Idle", { kind: "toggle" }, { advanced: true }),
 ];
 
 vi.mock("../../../lib/api", () => ({
@@ -205,5 +216,42 @@ describe("schema-driven settings field PATCH payloads", () => {
     await waitFor(() =>
       expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith({ sound: { enabled: true } }, "main"),
     );
+  });
+
+  it("sound controls emit typed PATCH leaves for scope, an advanced event switch and both volumes", async () => {
+    vi.mocked(api.fetchSettings).mockResolvedValue({
+      tmux: {},
+      logging: {},
+      session: {},
+      sound: { browser_idle_enabled: true },
+    } as never);
+    const { container } = renderTab("sound");
+    await screen.findByText("Browser scope");
+
+    fireEvent.change(selectByLabel(container, "Browser scope"), { target: { value: "hidden_tab" } });
+    await waitFor(() =>
+      expect(api.updateSettings).toHaveBeenLastCalledWith({ sound: { browser_scope: "hidden_tab" } }, "main"),
+    );
+
+    const fold = Array.from(container.querySelectorAll("button[aria-expanded]")).find((b) =>
+      b.textContent?.includes("Advanced"),
+    ) as HTMLButtonElement;
+    fireEvent.click(fold);
+    await screen.findByText("Browser: Idle");
+    clickToggle(container, "Browser: Idle");
+    await waitFor(() =>
+      expect(api.updateSettings).toHaveBeenLastCalledWith({ sound: { browser_idle_enabled: false } }, "main"),
+    );
+
+    for (const [label, key, value] of [
+      ["Browser volume", "browser_volume", 0.5],
+      ["Server volume", "server_volume", 1.2],
+    ] as const) {
+      const match = Array.from(container.querySelectorAll("label")).find((l) => l.textContent === label);
+      const range = match?.parentElement?.parentElement?.querySelector('input[type="range"]') as HTMLInputElement;
+      expect(range).toBeTruthy();
+      fireEvent.change(range, { target: { value: String(value) } });
+      await waitFor(() => expect(api.updateSettings).toHaveBeenLastCalledWith({ sound: { [key]: value } }, "main"));
+    }
   });
 });

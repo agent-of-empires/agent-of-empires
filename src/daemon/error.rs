@@ -11,6 +11,7 @@ pub enum ApiErrorCode {
     AccessPolicyDenied,
     CityhallMode,
     LifecycleLocked,
+    LifecycleSuperseded,
     PendingTargetGone,
     TlsRequired,
     RuntimeEpochMismatch,
@@ -26,6 +27,9 @@ pub enum ApiErrorCode {
     SmartRenameFailed,
     SmartRenameTimeout,
     GroupNotEmpty,
+    SessionNotRunning,
+    SessionArchived,
+    SessionTrashed,
 }
 
 impl ApiErrorCode {
@@ -36,6 +40,7 @@ impl ApiErrorCode {
             Self::AccessPolicyDenied => "access_policy_denied",
             Self::CityhallMode => "cityhall_mode",
             Self::LifecycleLocked => "lifecycle_locked",
+            Self::LifecycleSuperseded => "lifecycle_superseded",
             Self::PendingTargetGone => "pending_target_gone",
             Self::StartFailed => "start_failed",
             Self::PurgeFailed => "purge_failed",
@@ -51,6 +56,9 @@ impl ApiErrorCode {
             Self::SmartRenameFailed => "smart_rename_failed",
             Self::SmartRenameTimeout => "smart_rename_timeout",
             Self::GroupNotEmpty => "group_not_empty",
+            Self::SessionNotRunning => "session_not_running",
+            Self::SessionArchived => "session_archived",
+            Self::SessionTrashed => "session_trashed",
         }
     }
 
@@ -61,6 +69,7 @@ impl ApiErrorCode {
             | Self::AccessPolicyDenied
             | Self::CityhallMode => StatusCode::FORBIDDEN,
             Self::LifecycleLocked
+            | Self::LifecycleSuperseded
             | Self::RuntimeEpochMismatch
             | Self::ResumeFailed
             | Self::PurgeFailed
@@ -68,7 +77,10 @@ impl ApiErrorCode {
             | Self::CreationTrustChanged
             | Self::CreationCancelled
             | Self::CreationNotPending
-            | Self::GroupNotEmpty => StatusCode::CONFLICT,
+            | Self::GroupNotEmpty
+            | Self::SessionNotRunning
+            | Self::SessionArchived
+            | Self::SessionTrashed => StatusCode::CONFLICT,
             Self::PendingTargetGone => StatusCode::NOT_FOUND,
             Self::TlsRequired => StatusCode::UPGRADE_REQUIRED,
             Self::CreateHookFailed => StatusCode::BAD_REQUEST,
@@ -100,6 +112,7 @@ impl ApiErrorCode {
             b"access_policy_denied" => Self::AccessPolicyDenied,
             b"cityhall_mode" => Self::CityhallMode,
             b"lifecycle_locked" => Self::LifecycleLocked,
+            b"lifecycle_superseded" => Self::LifecycleSuperseded,
             b"pending_target_gone" if resolving_pending_target => Self::PendingTargetGone,
             b"tls_required" => Self::TlsRequired,
             b"runtime_epoch_mismatch" => Self::RuntimeEpochMismatch,
@@ -115,6 +128,9 @@ impl ApiErrorCode {
             b"smart_rename_failed" => Self::SmartRenameFailed,
             b"smart_rename_timeout" => Self::SmartRenameTimeout,
             b"group_not_empty" => Self::GroupNotEmpty,
+            b"session_not_running" => Self::SessionNotRunning,
+            b"session_archived" => Self::SessionArchived,
+            b"session_trashed" => Self::SessionTrashed,
             _ => return None,
         };
         (status == code.status()).then_some(code)
@@ -176,6 +192,31 @@ mod tests {
                 Some(ApiErrorCode::NoRevive),
             ),
             (StatusCode::FORBIDDEN, "no_revive", false, None),
+            (
+                StatusCode::CONFLICT,
+                "lifecycle_superseded",
+                false,
+                Some(ApiErrorCode::LifecycleSuperseded),
+            ),
+            (
+                StatusCode::CONFLICT,
+                "session_not_running",
+                false,
+                Some(ApiErrorCode::SessionNotRunning),
+            ),
+            (
+                StatusCode::CONFLICT,
+                "session_archived",
+                false,
+                Some(ApiErrorCode::SessionArchived),
+            ),
+            (
+                StatusCode::CONFLICT,
+                "session_trashed",
+                false,
+                Some(ApiErrorCode::SessionTrashed),
+            ),
+            (StatusCode::FORBIDDEN, "session_archived", false, None),
             (
                 StatusCode::BAD_REQUEST,
                 "create_hook_failed",

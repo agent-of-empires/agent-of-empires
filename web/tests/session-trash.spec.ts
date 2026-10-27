@@ -270,6 +270,51 @@ test.describe("Empty Trash", () => {
     await expect(trashToggle(page)).toHaveCount(0, { timeout: 10_000 });
   });
 
+  test("a Busy workspace stays in Trash after another is purged, with retry guidance", async ({ page }) => {
+    const handle = await installTrashMocks(
+      page,
+      [
+        { id: "sess-a", branch: "feat/a", mainRepoPath: "/tmp/sess-a", trashed: true },
+        { id: "sess-b", branch: "feat/b", mainRepoPath: "/tmp/sess-b", trashed: true },
+      ],
+      { busyDeleteIds: ["sess-b"] },
+    );
+    await page.goto("/");
+    await openTrash(page, 2);
+
+    const dialog = await confirmEmptyTrash(page);
+    await dialog.locator('[data-testid="empty-trash-confirm"]').click();
+
+    await expect(page.getByRole("alert")).toContainText("busy with another operation", { timeout: 10_000 });
+    await expect.poll(() => [...handle.deletedIds], { timeout: 10_000 }).toEqual(["sess-a"]);
+    expect(handle.deleteBodies.length).toBe(2);
+    await expect(trashToggle(page)).toHaveCount(1, { timeout: 10_000 });
+  });
+
+  test("Busy and a failed workspace both keep their rows and the toast names both", async ({ page }) => {
+    const handle = await installTrashMocks(
+      page,
+      [
+        { id: "sess-a", branch: "feat/a", mainRepoPath: "/tmp/sess-a", trashed: true },
+        { id: "sess-b", branch: "feat/b", mainRepoPath: "/tmp/sess-b", trashed: true },
+      ],
+      { failDeleteIds: ["sess-a"], busyDeleteIds: ["sess-b"] },
+    );
+    await page.goto("/");
+    await openTrash(page, 2);
+
+    const dialog = await confirmEmptyTrash(page);
+    await dialog.locator('[data-testid="empty-trash-confirm"]').click();
+
+    const alert = page.getByRole("alert");
+    await expect(alert).toContainText("could not be deleted", { timeout: 10_000 });
+    await expect(alert).toContainText("busy with another operation");
+    expect(handle.deletedIds).toEqual([]);
+    expect(handle.deleteBodies.length).toBe(2);
+    await expect(trashToggle(page)).toHaveCount(1, { timeout: 10_000 });
+    await openTrash(page, 2);
+  });
+
   test("a partial failure keeps the failed workspace in Trash and toasts one summary (#3167)", async ({ page }) => {
     const handle = await installTrashMocks(
       page,

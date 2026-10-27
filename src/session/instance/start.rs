@@ -930,6 +930,12 @@ impl Instance {
         if let Some(canonical) = prepared.canonical_conversation.take() {
             self.adopt_conversation_state(canonical);
         }
+        // Before the `take` below consumes the execution.
+        self.launch_executable = prepared
+            .execution
+            .as_ref()
+            .filter(|execution| execution.inputs.container.is_none())
+            .map(|execution| execution.program.clone());
         if let Some(execution) = prepared.execution.take() {
             let attested = self.attested_claude_store_route(&execution);
             self.active_execution = Some(ActiveExecution {
@@ -1140,6 +1146,7 @@ impl Instance {
 
         self.status = Status::Starting;
         self.last_start_time = Some(std::time::Instant::now());
+        self.started_at = Some(Utc::now());
 
         // Apply status bar options in a background thread to avoid blocking
         // the TUI on the multiple tmux subprocess calls they require.

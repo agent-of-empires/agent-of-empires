@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { SessionStatus } from "./types";
-import { nextStatusSoundState, type StatusSoundState } from "./statusSounds";
+import { nextStatusSoundState, soundDueFor, type StatusSoundState } from "./statusSounds";
 import { session } from "../hooks/__tests__/fixtures";
 
 const at = (id: string, status: SessionStatus, over = {}) => session({ id, status, ...over });
@@ -122,5 +122,42 @@ describe("nextStatusSoundState", () => {
       { id: "a", event: "idle" },
       { id: "b", event: "error" },
     ]);
+  });
+});
+
+describe("soundDueFor", () => {
+  const tracked = (sounded: boolean): StatusSoundState =>
+    new Map([["a", { status: "Waiting" as SessionStatus, since: 0, sounded }]]);
+
+  it.each([
+    ["sounds an unsounded status", at("a", "Waiting"), "waiting", tracked(false), true],
+    ["is silent before the tracker has a baseline", at("a", "Waiting"), "waiting", null, false],
+    [
+      "is silent for a status that was already there when first seen",
+      at("a", "Waiting"),
+      "waiting",
+      tracked(true),
+      false,
+    ],
+    ["is silent once already sounded", at("a", "Waiting"), "waiting", tracked(true), false],
+    ["is silent when the status moved on", at("a", "Running"), "waiting", tracked(false), false],
+    [
+      "is silent for a muted session",
+      at("a", "Waiting", { notify_on_waiting: false }),
+      "waiting",
+      tracked(false),
+      false,
+    ],
+    ["is silent for an unknown session", undefined, "waiting", tracked(false), false],
+  ] as const)("%s", (_label, session, event, prev, play) => {
+    const result = soundDueFor(prev, session, event);
+    expect(result.play).toBe(play);
+    if (play) expect(result.state?.get("a")?.sounded).toBe(true);
+  });
+
+  it("keeps the later poll from sounding the same status again", () => {
+    const cue = soundDueFor(tracked(false), at("a", "Waiting"), "waiting");
+    const next = nextStatusSoundState(cue.state, [at("a", "Waiting")], 20_000);
+    expect(next.due).toEqual([]);
   });
 });

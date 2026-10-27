@@ -843,7 +843,30 @@ fn record_retired_handoff_in(
                     }
                 }
             }
-            TerminalHandoffContext::Discard => Some(row.conversation_state()),
+            TerminalHandoffContext::Discard => {
+                if row.terminal_rebind_pending {
+                    let tool = row
+                        .agent_name
+                        .as_deref()
+                        .and_then(crate::agents::terminal_tool_for_acp_agent)
+                        .ok_or(LifecycleReservationError::Superseded)?;
+                    row.rebind_terminal_tool_fresh(tool);
+                    let config =
+                        crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+                            &row.source_profile,
+                            std::path::Path::new(&row.project_path),
+                        );
+                    let yolo = row.yolo_mode;
+                    crate::session::builder::apply_agent_launch_config(
+                        row,
+                        &config.session,
+                        "",
+                        "",
+                        Some(yolo),
+                    );
+                }
+                Some(row.conversation_state())
+            }
         };
         intent.ensure_original_stopped(session_id)?;
         row.status = Status::Stopped;
@@ -1027,7 +1050,18 @@ async fn terminal_handoff_request(state: Arc<AppState>, id: String) -> Response 
         }
         let instance = adopt_persisted_structured_instance(cached, durable, &profile);
         let agent = pick_agent(&state, &instance, instance.agent_name.as_deref()).await;
-        let keep = crate::agents::acp_transcript_cli_resumable(&instance.tool, &agent)
+        let rebind = instance.terminal_rebind_pending;
+        if rebind && crate::agents::terminal_tool_for_acp_agent(&agent).is_none() {
+            return (
+                StatusCode::CONFLICT,
+                format!(
+                    "{agent} has no terminal tool; switch to another agent before terminal view"
+                ),
+            )
+                .into_response();
+        }
+        let keep = !rebind
+            && crate::agents::acp_transcript_cli_resumable(&instance.tool, &agent)
             && instance.acp_session_id.is_some();
         let context = if keep {
             match state
@@ -1423,11 +1457,11 @@ pub(crate) async fn publish_startup_error_if_current(
     profile: &str,
     generation: u64,
     message: String,
-) {
+) -> bool {
     let _namespace = state.profile_namespace.read().await;
     let _instance = state.instance_lock(session_id).await.lock_owned().await;
     if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
-        return;
+        return false;
     }
     let current = state.instances.read().await.iter().any(|row| {
         row.id == session_id
@@ -1441,6 +1475,7 @@ pub(crate) async fn publish_startup_error_if_current(
             .acp_supervisor
             .publish_startup_error(session_id, message);
     }
+    current
 }
 
 #[cfg(test)]
@@ -1539,6 +1574,82 @@ mod tests {
         let spawner =
             tokio::spawn(async move { supervisor.spawn_inner(request, reservation).await });
         (state, spawner, lease)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn disable_refuses_an_agent_switch_to_an_agent_without_a_terminal_tool(
+    ) -> anyhow::Result<()> {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir()?;
+        let mut row = Instance::new("acp only", project.path().to_str().unwrap());
+        row.view = View::Structured;
+        row.source_profile = "default".into();
+        row.agent_name = Some("aoe-agent".into());
+        row.terminal_rebind_pending = true;
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+        let response = acp_disable(State(state.clone()), Path(row.id.clone()))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let stored = crate::session::Storage::open_unwatched("default")?.load()?;
+        let stored = stored.iter().find(|r| r.id == row.id).unwrap();
+        assert_eq!(stored.view, View::Structured);
+        assert_eq!(stored.tool, row.tool);
+        assert!(stored.terminal_rebind_pending);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn disable_after_agent_switch_rebinds_the_terminal_tool() -> anyhow::Result<()> {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true
+        })?;
+        let project = tempfile::tempdir()?;
+        let mut row = Instance::new("switched agent", project.path().to_str().unwrap());
+        row.tool = "claude".into();
+        row.view = View::Structured;
+        row.source_profile = "default".into();
+        row.agent_name = Some("codex".into());
+        row.terminal_rebind_pending = true;
+        row.command = "claude --old".into();
+        row.extra_args = "--old-arg".into();
+        crate::session::config::update_config(|config| {
+            config
+                .session
+                .agent_command_override
+                .insert("codex".into(), "sleep".into());
+            config
+                .session
+                .agent_extra_args
+                .insert("codex".into(), "60".into());
+        })?;
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(
+            crate::tmux::Session::generate_name(&row.id, &row.title),
+        );
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+        let response = acp_disable(State(state.clone()), Path(row.id.clone()))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let stored = crate::session::Storage::open_unwatched("default")?.load()?;
+        let stored = stored.iter().find(|r| r.id == row.id).unwrap();
+        assert_eq!(stored.view, View::Terminal);
+        assert_eq!(stored.tool, "codex");
+        assert_eq!(stored.command, "sleep");
+        assert_eq!(stored.extra_args, "60");
+        assert!(!stored.terminal_rebind_pending);
+        Ok(())
     }
 
     #[tokio::test]

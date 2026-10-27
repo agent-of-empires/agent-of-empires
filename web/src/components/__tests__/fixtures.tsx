@@ -100,6 +100,7 @@ interface RowOptions {
   unread?: boolean;
   onStop?: (sessionId: string) => void;
   onStart?: (sessionId: string) => void;
+  onRestartForUpdate?: (sessionId: string) => void;
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
 }
 
@@ -111,6 +112,7 @@ function Row({
   onCreateSession,
   onStop,
   onStart,
+  onRestartForUpdate,
   onSwitchView,
 }: RowOptions & { ws: Workspace }) {
   const triage = useSidebarTriage(useMemo(() => [ws], [ws]));
@@ -148,6 +150,7 @@ function Row({
         onCreateSession={onCreateSession}
         onStop={onStop}
         onStart={onStart}
+        onRestartForUpdate={onRestartForUpdate}
         onSwitchView={onSwitchView}
         readOnly={readOnly}
         optimistic={triage.optimisticFor(ws.id)}

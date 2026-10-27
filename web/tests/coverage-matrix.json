@@ -590,6 +590,16 @@
       ]
     },
     {
+      "id": "settings.field-deep-link",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/__tests__/SettingsView.navigation.test.tsx",
+        "src/components/__tests__/SettingsView.schema-load.test.tsx"
+      ],
+      "components": ["web/src/components/SettingsView.tsx", "web/src/App.tsx"]
+    },
+    {
       "id": "settings.tui-only-fold",
       "kind": "vitest",
       "risk": "low",
@@ -887,13 +897,19 @@
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/components/__tests__/PushHealthBanner.test.tsx"],
-      "components": ["web/src/components/PushHealthBanner.tsx"]
+      "components": ["web/src/components/PushHealthBanner.tsx"],
+      "notes": "The dismiss test asserts the contrast-safe token classes: text-subtle dismiss, text-primary body, no hover opacity on Re-enable."
     },
     {
       "id": "notifications.status-sounds",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/lib/statusSounds.test.ts", "src/hooks/useStatusSounds.test.ts"],
+      "specs": [
+        "src/lib/statusSounds.test.ts",
+        "src/hooks/useStatusSounds.test.ts",
+        "src/hooks/useSessionStatusStream.test.ts",
+        "src/hooks/useSessions.test.ts"
+      ],
       "components": ["web/src/lib/statusSounds.ts", "web/src/hooks/useStatusSounds.ts", "web/src/lib/soundPlayer.ts"]
     },
     {
@@ -947,7 +963,11 @@
       "id": "sidebar.terminal-focus-handoff",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/terminal-focus-shortcut.spec.ts", "src/hooks/useKeyboardShortcuts.test.ts"],
+      "specs": [
+        "tests/terminal-focus-shortcut.spec.ts",
+        "tests/acp-retained-focus-sidebar-nav.spec.ts",
+        "src/hooks/useKeyboardShortcuts.test.ts"
+      ],
       "components": [
         "web/src/App.tsx",
         "web/src/components/WorkspaceSidebar.tsx",
@@ -1732,6 +1752,18 @@
       ]
     },
     {
+      "id": "sidebar.restart-for-update",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/SessionRowSiblingTargets.test.tsx", "src/lib/restartForUpdate.test.ts"],
+      "components": [
+        "web/src/components/sidebar/sessionActionTargets.ts",
+        "web/src/components/sidebar/SessionRowMenu.tsx",
+        "web/src/components/sidebar/SessionActions.tsx",
+        "web/src/lib/restartForUpdate.ts"
+      ]
+    },
+    {
       "id": "sidebar.repo-appearance",
       "kind": "mocked-playwright",
       "risk": "low",
@@ -1831,6 +1863,18 @@
       "risk": "high",
       "specs": ["src/components/__tests__/WorkspaceSidebarTrash.test.tsx", "tests/session-trash.spec.ts"],
       "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/SessionRow.tsx"]
+    },
+    {
+      "id": "session.degraded-move-warning-shown",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/__tests__/trashActions.test.ts", "src/lib/api.test.ts"],
+      "components": [
+        "web/src/lib/api.ts",
+        "web/src/lib/trashActions.ts",
+        "web/src/components/sidebar/SessionActions.tsx"
+      ],
+      "notes": "A trash, restore or workdir rename whose worktree move landed with git degraded keeps the new path and toasts the server's warnings instead of reporting plain success."
     },
     {
       "id": "session.delete-shared-worktree-kept",
@@ -2184,6 +2228,7 @@
         "web/src/App.tsx",
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/EmptyTrashConfirm.tsx",
+        "web/src/lib/api.ts",
         "web/src/lib/trashActions.ts"
       ]
     },
@@ -2668,7 +2713,8 @@
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": ["tests/update-banner.spec.ts", "src/components/__tests__/UpdateBanner.test.tsx"],
-      "components": ["web/src/components/UpdateBanner.tsx"]
+      "components": ["web/src/components/UpdateBanner.tsx"],
+      "notes": "The dismiss test asserts text-subtle, not text-muted or text-secondary, on the dismiss control."
     },
     {
       "id": "connectivity.banner-stack",
@@ -3548,7 +3594,8 @@
         "web/src/components/acp/StructuredView.tsx",
         "web/src/components/acp/StartupErrorBanner.tsx",
         "web/src/components/acp/RecoveryActionRow.tsx"
-      ]
+      ],
+      "notes": "Auth-required startup errors name the agent's own login step: Claude keeps claude /login and ANTHROPIC_API_KEY, Codex gets codex login and OPENAI_API_KEY, other agents get generic sign-in copy with no Claude or Codex commands."
     },
     {
       "id": "acp.startup-error-banner-actions",
@@ -3966,6 +4013,13 @@
       "risk": "low",
       "specs": ["src/components/settings/__tests__/SchemaFieldPatches.test.tsx"],
       "components": ["web/src/components/settings/SchemaSection.tsx"]
+    },
+    {
+      "id": "story.settings-sound-controls",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/settings/__tests__/SchemaFieldPatches.test.tsx"],
+      "components": ["web/src/components/settings/customWidgets.tsx"]
     },
     {
       "id": "story.settings-session-id-poller-threads",

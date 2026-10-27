@@ -2,14 +2,15 @@ use crate::harness::{app_dir_in, require_tmux, wait_until, TuiTestHarness};
 use serial_test::parallel;
 use std::time::Duration;
 
-fn seam_row(h: &TuiTestHarness) -> u16 {
-    h.capture_screen()
+fn seam_row(h: &TuiTestHarness) -> Result<u16, String> {
+    let screen = h.capture_screen();
+    screen
         .lines()
         .enumerate()
         .skip(1)
         .find(|(_, line)| line.starts_with('╭'))
         .map(|(row, _)| row as u16 + 1)
-        .expect("stacked preview border")
+        .ok_or(screen)
 }
 
 #[test]
@@ -37,9 +38,9 @@ fn test_stacked_list_resize_persists_and_restores_after_window_resize() {
             .then_some(())
             .ok_or(screen)
     });
-    let original = seam_row(&h);
+    let original = seam_row(&h).unwrap();
     h.send_mouse_drag((30, original), (30, 20));
-    assert_eq!(seam_row(&h), 20);
+    assert_eq!(seam_row(&h), Ok(20));
     h.send_paste("input-fence\n");
     wait_until(Duration::from_secs(10), Duration::from_millis(50), || {
         let input = std::fs::read_to_string(h.home_path().join("agent-input")).unwrap_or_default();
@@ -58,12 +59,12 @@ fn test_stacked_list_resize_persists_and_restores_after_window_resize() {
 
     h.resize_window(60, 18);
     wait_until(Duration::from_secs(10), Duration::from_millis(50), || {
-        let row = seam_row(&h);
+        let row = seam_row(&h)?;
         (row < 20).then_some(()).ok_or(format!("border at {row}"))
     });
     h.resize_window(60, 40);
     wait_until(Duration::from_secs(10), Duration::from_millis(50), || {
-        let row = seam_row(&h);
+        let row = seam_row(&h)?;
         (row == 20).then_some(()).ok_or(format!("border at {row}"))
     });
 }

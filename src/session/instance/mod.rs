@@ -270,6 +270,23 @@ pub(crate) struct TerminalHandoffKey {
 }
 
 impl TerminalHandoffIntent {
+    pub(crate) fn validate_relationships(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.target_generation <= self.generation,
+            "terminal handoff target generation exceeds ownership generation"
+        );
+        anyhow::ensure!(
+            self.launch
+                .as_ref()
+                .is_none_or(|launch| launch.generation <= self.generation),
+            "terminal handoff attempt generation exceeds ownership generation"
+        );
+        if self.unborn_fence.is_some() {
+            self.validate_unborn_fence()?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_unborn_fence(&self) -> Result<&TerminalHandoffUnbornFence> {
         let fence = self
             .unborn_fence
@@ -432,7 +449,13 @@ pub struct Instance {
     /// different concept with a different type and lifetime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_entered_at: Option<DateTime<Utc>>,
-
+    /// Wall-clock launch of the current agent process; `None` until the first launch after upgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    /// The absolute agent program the last host launch ran, when native launch resolved it. It is
+    /// a path only; hook output is never recorded here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_executable: Option<std::path::PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<DateTime<Utc>>,
 
@@ -824,6 +847,12 @@ pub struct Instance {
     /// non-fork sessions. Skipped in serialization when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_pending: Option<String>,
+
+    /// Set by a structured view agent switch. The next terminal handoff then
+    /// runs the new agent's tool with a fresh conversation, and refuses when
+    /// the agent has no terminal tool.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub terminal_rebind_pending: bool,
 
     // Live process state and durable capture-generation guards.
     /// Latest ACP initialize result for session/load. A daemon restart returns

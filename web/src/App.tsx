@@ -16,6 +16,7 @@ import { diffSelectionStale } from "./lib/diffSelection";
 import { useSessions } from "./hooks/useSessions";
 import { useAttentionCounts } from "./hooks/useAttentionCounts";
 import { useStatusSounds } from "./hooks/useStatusSounds";
+import { useSessionStatusStream } from "./hooks/useSessionStatusStream";
 import { useDashboardPresence } from "./hooks/useDashboardPresence";
 import { clearAcpCache } from "./hooks/useAcpSession";
 import { clearDraft, sweepOrphanDrafts } from "./lib/acpDrafts";
@@ -97,7 +98,7 @@ import {
   restoreSession,
   fetchPlugins,
 } from "./lib/api";
-import type { DeleteSessionOptions, ServerAbout, SettingsResponse } from "./lib/api";
+import type { DeleteSessionOptions, RuntimeCursor, ServerAbout, SettingsResponse } from "./lib/api";
 import { getClientCapabilities } from "./lib/clientCapabilities";
 import { normalizeProjectPathKey } from "./lib/registeredProjects";
 import { IdleDecayWindowContext, parseIdleDecayWindowMs } from "./lib/idleDecay";
@@ -108,6 +109,7 @@ import { settleSettingsIntrosReadOnly } from "./lib/settingsIntros";
 import { onSettingsChanged } from "./lib/settingsEvents";
 import { parseSystemHealthEnabled, SystemHealthEnabledContext } from "./lib/systemHealth";
 import { toastBus, reportError } from "./lib/toastBus";
+import { restartForUpdate } from "./lib/restartForUpdate";
 import { startPendingCreates } from "./lib/pendingCreates";
 import { isAbsolutePath, resolveToRepoRelative, type FileRef } from "./lib/fileRef";
 import { NAVIGATE_EVENT, OPEN_SESSION_EVENT } from "./lib/sessionRoute";
@@ -399,6 +401,8 @@ function AppContent({
     applySessionMutation,
     observedById,
     runtimeEpoch,
+    refresh: refreshSessions,
+    applyPushedStatus,
   } = useSessions();
   const workspaces = useWorkspaces(sessions);
   // Creates whose outcome the wizard never learned keep reconciling here, past its unmount.
@@ -425,7 +429,15 @@ function AppContent({
   const trashedWorkspaces = useMemo(() => workspaces.filter(workspaceIsTrashed), [workspaces]);
 
   const { unreadCount, waitingCount } = useAttentionCounts(sessions, activeSessionId);
-  useStatusSounds(sessions);
+  const { onSoundDue, cancelCue } = useStatusSounds(sessions, activeSessionId);
+  const onPushedStatus = useCallback(
+    (id: string, status: SessionResponse["status"], cursor: RuntimeCursor) => {
+      cancelCue(id);
+      applyPushedStatus(id, status, cursor);
+    },
+    [cancelCue, applyPushedStatus],
+  );
+  useSessionStatusStream({ onStatus: onPushedStatus, onSoundDue, onResync: refreshSessions });
   const attentionBadgeColors = useMemo(() => getAttentionBadgeColors(resolvedTheme), [resolvedTheme]);
 
   // Remember the active session and restore it on a PWA relaunch (#2103).
@@ -1248,6 +1260,7 @@ function AppContent({
       if (confirmed.length === 0 || emptyingTrashRef.current) return;
       emptyingTrashRef.current = true;
       let anyFailed = false;
+      let anyBusy = false;
       let anyKept = false;
       try {
         for (const ws of confirmed) {
@@ -1271,18 +1284,24 @@ function AppContent({
               notify: null,
             },
           );
-          anyFailed ||= !result.ok || (result.failed?.length ?? 0) > 0;
+          const busy = (result.busy?.length ?? 0) > 0;
+          anyBusy ||= busy;
+          anyFailed ||= (!result.ok && !busy) || (result.failed?.length ?? 0) > 0;
           anyKept ||= (result.kept?.length ?? 0) > 0;
         }
       } finally {
         emptyingTrashRef.current = false;
       }
-      toastBus.handler?.[anyFailed ? "error" : "info"](
+      toastBus.handler?.[anyFailed || anyBusy ? "error" : "info"](
         anyFailed
-          ? "Some trashed sessions could not be deleted"
-          : anyKept
-            ? "Some selected sessions changed and were not deleted"
-            : "Emptied trash",
+          ? anyBusy
+            ? "Some trashed sessions could not be deleted, and some are busy with another operation; retry the busy ones when it finishes"
+            : "Some trashed sessions could not be deleted"
+          : anyBusy
+            ? "Some trashed sessions are busy with another operation; retry when it finishes"
+            : anyKept
+              ? "Some selected sessions changed and were not deleted"
+              : "Emptied trash",
       );
     },
     [activeSessionId, setSessionStatus, clearDeletingStatus, leaveActiveSession],
@@ -2126,6 +2145,7 @@ function AppContent({
                 onDelete: handleDeleteSession,
                 onStop: handleStopSession,
                 onStart: handleStartSession,
+                onRestartForUpdate: restartForUpdate,
                 onSwitchView: handleSwitchView,
                 onCreateSession: handleCreateSession,
               }}
@@ -2159,6 +2179,7 @@ function AppContent({
             await refreshProjects();
           }}
           profile={searchParams.get("profile")}
+          field={searchParams.get("field")}
           onSelectProfile={(p) => {
             const next = new URLSearchParams(searchParams);
             next.set("profile", p);
@@ -2528,6 +2549,7 @@ function AppContent({
                 onEmptyTrash={handleEmptyTrash}
                 onStopSession={handleStopSession}
                 onStartSession={handleStartSession}
+                onRestartForUpdate={restartForUpdate}
                 onSwitchView={handleSwitchView}
                 readOnly={serverAbout?.read_only}
                 canManageProjects={caps.canManageProjects}

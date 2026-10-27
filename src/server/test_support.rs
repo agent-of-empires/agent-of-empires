@@ -136,6 +136,28 @@ pub fn build_test_app_state_configured(
     )
 }
 
+/// A state for ingress tests: optional bearer token and passphrase login, with the
+/// plaintext-remote gate and proxy mode set explicitly.
+pub fn build_test_app_state_ingress(
+    token: Option<String>,
+    passphrase: Option<&str>,
+    proxy_mode: bool,
+    allow_plaintext_remote: bool,
+) -> Arc<AppState> {
+    build_test_app_state_with_policy_configured(
+        Vec::new(),
+        vec!["localhost".to_string()],
+        vec!["http://localhost:8080".to_string()],
+        token,
+        |state| {
+            state.login_manager = Arc::new(login::LoginManager::new(passphrase));
+            state.behind_tunnel = proxy_mode;
+            state.trust_cf_header = proxy_mode;
+            state.allow_plaintext_remote = allow_plaintext_remote;
+        },
+    )
+}
+
 /// Like [`build_test_app_state`] but every worker start goes through
 /// `launcher`, so a test decides how a start ends.
 #[cfg(test)]
@@ -260,6 +282,9 @@ pub(crate) fn build_test_app_state_impl_with_event_store(
         passkey_manager: Arc::new(super::passkeys::PasskeyManager::in_memory()),
         rate_limiter: Arc::new(RateLimiter::new()),
         behind_tunnel: false,
+        trust_cf_header: false,
+        // Handler tests drive requests from arbitrary peers; the 426 gate has its own tests.
+        allow_plaintext_remote: true,
         auth_mode: "none",
         serve_mode: "local",
         allowed_hosts,
