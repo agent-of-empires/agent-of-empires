@@ -15,7 +15,14 @@ pub(super) static ADAPTER: Adapter = Adapter {
         fetch_missing_title: true,
         observe_ownership: true,
     },
-    evidence_names: &["activity", "dialog", "hidden_ask", "working_title", "error"],
+    evidence_names: &[
+        "activity",
+        "dialog",
+        "hidden_ask",
+        "working_title",
+        "error",
+        "local_history",
+    ],
     observation_token: |observation| {
         Some(if !observation.live_owned {
             0
@@ -71,6 +78,7 @@ fn with_screen<'a, T>(
         } else {
             surface.legacy_error
         },
+        live(surface.local_history),
     ];
     evaluate(&Screen::new(rows, observation.title, &evidence), &evidence)
 }
@@ -103,6 +111,7 @@ struct Surface<'a> {
     hidden_ask: Evidence<'a>,
     error: Evidence<'a>,
     legacy_error: Evidence<'a>,
+    local_history: Evidence<'a>,
 }
 
 #[derive(Clone, Copy)]
@@ -413,6 +422,54 @@ fn find_composer(lines: &[&str], blank_before: &[bool], before: usize) -> Option
     })
 }
 
+fn history_footer(lines: &[&str], composer: Composer) -> Option<usize> {
+    let start = composer.start;
+    let end = composer.end;
+    if !matches!(composer.body, Body::Box)
+        || composer.clipped
+        || end < start + 8
+        || !lines[start + 1..end]
+            .iter()
+            .all(|line| side(line) && line.trim_end().ends_with(['│', '|']))
+        || !rail_body(lines[start + 1]).is_empty()
+        || !rail_body(lines[start + 3]).is_empty()
+        || !rail_body(lines[end - 1]).is_empty()
+    {
+        return None;
+    }
+    let input = rail_body(lines[start + 2]);
+    if input != ">" && !input.starts_with("> ") {
+        return None;
+    }
+    let separator = (start + 5..end - 1)
+        .rev()
+        .find(|&i| rail_body(lines[i]).is_empty())?;
+    let results = &lines[start + 4..separator];
+    let selected = results.iter().any(|line| {
+        let body = rail_body(line);
+        body.starts_with("❯ ") || body.starts_with("\u{f054} ") || body.starts_with("> ")
+    });
+    let empty = results.len() == 1
+        && ["ⓘ ", "\u{f129} ", "[i] "]
+            .iter()
+            .any(|prefix| rail_body(results[0]).starts_with(prefix));
+    if !selected && !empty {
+        return None;
+    }
+    let mut tokens = lines[separator + 1..end - 1]
+        .iter()
+        .flat_map(|line| rail_body(line).split_whitespace());
+    for (index, action) in ["navigate", "select", "cancel"].into_iter().enumerate() {
+        if !key_hint(tokens.next()?) || tokens.next()? != action {
+            return None;
+        }
+        if index < 2 && !matches!(tokens.next()?, "·" | "-") {
+            return None;
+        }
+    }
+    tokens.next().is_none().then_some(end - 2)
+}
+
 fn dialog_footer(lines: &[&str], composer: Composer) -> Option<usize> {
     if !matches!(composer.body, Body::Box)
         || !lines[composer.end]
@@ -626,14 +683,21 @@ fn maintenance(text: &str) -> bool {
 impl<'a> Surface<'a> {
     fn new(source: &'a str, lines: &mut [&'a str], blank_before: &[bool]) -> Self {
         let current = find_composer(lines, blank_before, lines.len());
+        let history = current.and_then(|composer| history_footer(lines, composer));
+        let local_history = history.map_or_else(Evidence::default, |i| line_evidence(lines, i));
         let mut dialog = current
+            .filter(|_| history.is_none())
             .and_then(|composer| dialog_footer(lines, composer).map(|footer| (composer, footer)));
         let mut before = current.map_or(0, |composer| composer.start);
-        while dialog.is_none() {
+        while history.is_none() && dialog.is_none() {
             let Some(composer) = find_composer(lines, blank_before, before) else {
                 break;
             };
-            dialog = dialog_footer(lines, composer).map(|footer| (composer, footer));
+            if history_footer(lines, composer).is_some() {
+                mask_composer(lines, composer, None);
+            } else {
+                dialog = dialog_footer(lines, composer).map(|footer| (composer, footer));
+            }
             before = composer.start;
         }
         let error = current
@@ -689,7 +753,7 @@ impl<'a> Surface<'a> {
                         let first = words.next();
                         let second = words.next();
                         let passive = first == Some("to") && second == Some("retry");
-                        let pending = dialog.is_some()
+                        let pending = (dialog.is_some() || history.is_some())
                             && first.is_some_and(|word| word.eq_ignore_ascii_case("waiting"))
                             && second.is_none();
                         !passive && !pending
@@ -722,6 +786,18 @@ impl<'a> Surface<'a> {
                     i < composer.start && !blank_before[i + 1..=composer.start].iter().any(|b| *b)
                 })
         });
+        if history.is_some() {
+            // Covered dialogs cannot establish a new request under local navigation.
+            let mut before = current.map_or(0, |composer| composer.start);
+            while let Some(composer) = find_composer(lines, blank_before, before) {
+                if dialog_footer(lines, composer).is_some()
+                    || history_footer(lines, composer).is_some()
+                {
+                    mask_composer(lines, composer, None);
+                }
+                before = composer.start;
+            }
+        }
         if let Some(composer) = current {
             mask_composer(
                 lines,
@@ -760,6 +836,7 @@ impl<'a> Surface<'a> {
             hidden_ask: hidden.map_or_else(Evidence::default, |i| line_evidence(lines, i)),
             error,
             legacy_error,
+            local_history,
         }
     }
 }
