@@ -1002,11 +1002,16 @@ async fn native_creation_progress_reports_phases_to_the_local_stream() {
     std::fs::write(&agent, "#!/bin/sh\nexec sleep 120\n").unwrap();
     let app = crate::harness::app_dir_in(h.home_path());
     let config_path = app.join("config.toml");
-    let release = h.home_path().join("hook-release");
-    // One line then block: the first output line must reach the stream even
-    // though the hook never finishes on its own.
+    struct ReleaseHook(std::path::PathBuf);
+    impl Drop for ReleaseHook {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, []);
+        }
+    }
+    let release = ReleaseHook(h.home_path().join("hook-release"));
     let command = format!(
-        "echo building dependency graph; i=0; while [ ! -f {release:?} ] && [ \"$i\" -lt 400 ]; do i=$((i+1)); sleep 0.05; done"
+        "echo building dependency graph; while [ ! -f {release:?} ]; do sleep 0.05; done",
+        release = release.0
     );
     let mut config = std::fs::read_to_string(&config_path).unwrap();
     config.push_str(&format!(
@@ -1118,7 +1123,7 @@ async fn native_creation_progress_reports_phases_to_the_local_stream() {
         observed.session_id, pending.id,
         "the pending cancellation must name the creation it fences"
     );
-    std::fs::write(&release, "continue").unwrap();
+    std::fs::write(&release.0, "continue").unwrap();
     let cancelled = create.await.unwrap();
     assert!(
         cancelled.is_err(),
