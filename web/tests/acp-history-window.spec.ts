@@ -90,19 +90,24 @@ test("loads older events from the server when the loaded window is exhausted", a
   await expect(page.getByText("prompt number 0")).toBeVisible({ timeout: 10_000 });
 });
 
-test("persists the initial history count through synced settings and keeps the reveal step fixed", async ({ page }) => {
+async function mockHistoryPreference(
+  page: Page,
+  options: { title: string; turns: number; initialHistoryWindow?: number },
+) {
   // Register before the ACP helper so its populated session list takes precedence.
   await mockSettingsApis(page);
   const mock = await mockAcpSession(page, {
-    title: "story-history-preference",
-    initialEvents: longTranscript(320),
+    title: options.title,
+    initialEvents: longTranscript(options.turns),
   });
-  // Settings fetches the selected profile through a query parameter.
   await page.route(
     (url) => url.pathname === "/api/settings",
     (route) => route.fulfill({ json: {} }),
   );
-  const synced: Record<string, string> = {};
+  const synced: Record<string, string> =
+    options.initialHistoryWindow === undefined
+      ? {}
+      : { "aoe-web-settings": JSON.stringify({ structuredHistoryWindow: options.initialHistoryWindow }) };
   await page.route("**/api/app-state/web-ui-state", async (route) => {
     if (route.request().method() === "PATCH") {
       const patch = route.request().postDataJSON() as Record<string, string | null>;
@@ -113,20 +118,62 @@ test("persists the initial history count through synced settings and keeps the r
     }
     await route.fulfill({ json: synced });
   });
+  if (options.initialHistoryWindow !== undefined) {
+    await page.goto("/settings/structured-view");
+    await expect
+      .poll(() =>
+        page.evaluate(() => JSON.parse(localStorage.getItem("aoe-web-settings") ?? "{}").structuredHistoryWindow),
+      )
+      .toBe(options.initialHistoryWindow);
+  }
+  return { mock, synced };
+}
 
+test("persists the default history window changed to 500 through synced settings", async ({ page }) => {
+  const { mock, synced } = await mockHistoryPreference(page, {
+    title: "story-history-preference",
+    turns: 150,
+  });
   await openStructuredSession(page, mock);
   await waitForComposerConnected(page);
-  await expect(page.getByText("reply number 319", { exact: true })).toBeVisible();
-  await expect(page.getByText("prompt number 244", { exact: true })).toHaveCount(0);
-  await expect(page.getByText("prompt number 245", { exact: true })).toHaveCount(1);
+  await expect(page.getByText("reply number 149", { exact: true })).toBeVisible();
+  const prompts = page
+    .getByTestId("acp-viewport")
+    .locator("p")
+    .filter({ hasText: /^prompt number \d+$/ });
+  await expect(prompts).toHaveCount(75);
+  await expect(page.getByText("prompt number 74", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("prompt number 75", { exact: true })).toHaveCount(1);
 
   await page.goto("/settings/structured-view");
   const history = page.getByRole("spinbutton", { name: "Initial visible history" });
   await expect(history).toHaveValue("150");
-  await history.fill("200");
-  await history.press("Enter");
-  await expect.poll(() => JSON.parse(synced["aoe-web-settings"] ?? "{}").structuredHistoryWindow).toBe(200);
+  await history.fill("500");
+  await history.blur();
+  await expect.poll(() => JSON.parse(synced["aoe-web-settings"] ?? "{}").structuredHistoryWindow).toBe(500);
+  await page.evaluate(() => localStorage.removeItem("aoe-web-settings"));
+  await page.reload();
+  await expect(history).toHaveValue("500");
+  await expect
+    .poll(() =>
+      page.evaluate(() => JSON.parse(localStorage.getItem("aoe-web-settings") ?? "{}").structuredHistoryWindow),
+    )
+    .toBe(500);
 
+  await openStructuredSession(page, mock);
+  await waitForComposerConnected(page);
+  await expect(page.getByText("reply number 149", { exact: true })).toBeVisible();
+  await expect(prompts).toHaveCount(150);
+  await expect(page.getByText("prompt number 0", { exact: true })).toHaveCount(1);
+  await expect(page.getByTestId("acp-load-earlier")).toHaveCount(0);
+});
+
+test("opens 200 history rows from synced settings and reveals a fixed 150 more", async ({ page }) => {
+  const { mock } = await mockHistoryPreference(page, {
+    title: "story-history-window-200",
+    turns: 320,
+    initialHistoryWindow: 200,
+  });
   await openStructuredSession(page, mock);
   await waitForComposerConnected(page);
   await expect(page.getByText("reply number 319", { exact: true })).toBeVisible();
@@ -140,23 +187,29 @@ test("persists the initial history count through synced settings and keeps the r
   // Avoid scrolling the button into view, which separately triggers scroll-up autoload.
   await page.getByTestId("acp-load-earlier").evaluate((element) => (element as HTMLButtonElement).click());
   await expect(prompts).toHaveCount(175);
+  await expect(page.getByText("prompt number 144", { exact: true })).toHaveCount(0);
   await expect(page.getByText("prompt number 145", { exact: true })).toHaveCount(1);
+});
 
-  await page.goto("/settings/structured-view");
-  await history.fill("500");
-  await history.blur();
-  await expect.poll(() => JSON.parse(synced["aoe-web-settings"] ?? "{}").structuredHistoryWindow).toBe(500);
-  await page.evaluate(() => localStorage.removeItem("aoe-web-settings"));
-  await page.reload();
-  await expect(history).toHaveValue("500");
-
+test("opens 500 history rows from synced settings and reveals the remaining 140", async ({ page }) => {
+  const { mock } = await mockHistoryPreference(page, {
+    title: "story-history-window-500",
+    turns: 320,
+    initialHistoryWindow: 500,
+  });
   await openStructuredSession(page, mock);
   await waitForComposerConnected(page);
   await expect(page.getByText("reply number 319", { exact: true })).toBeVisible();
+  const prompts = page
+    .getByTestId("acp-viewport")
+    .locator("p")
+    .filter({ hasText: /^prompt number \d+$/ });
   await expect(prompts).toHaveCount(250);
   await expect(page.getByText("prompt number 69", { exact: true })).toHaveCount(0);
   await expect(page.getByText("prompt number 70", { exact: true })).toHaveCount(1);
+  // Avoid scrolling the button into view, which separately triggers scroll-up autoload.
   await page.getByTestId("acp-load-earlier").evaluate((element) => (element as HTMLButtonElement).click());
   await expect(prompts).toHaveCount(320);
   await expect(page.getByText("prompt number 0", { exact: true })).toHaveCount(1);
+  await expect(page.getByTestId("acp-load-earlier")).toHaveCount(0);
 });

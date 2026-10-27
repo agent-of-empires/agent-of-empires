@@ -142,6 +142,36 @@ describe("useHistoryWindow", () => {
     expect(result.current.windowedActivity).toHaveLength(100);
   });
 
+  it.each([false, true])("reinitializes the same session after empty activity (expanded: %s)", (expanded) => {
+    const activity = transcript(400, 1);
+    const { result, rerender } = render(activity, "s1", 200);
+    expect(result.current.windowedActivity).toHaveLength(200);
+    if (expanded) act(() => result.current.loadEarlier());
+    const visibleBeforeAppend = result.current.windowedActivity;
+    const appended = followUp.map((row) => ({ ...row, id: `new-${row.id}` }));
+    rerender({ sid: "s1", a: activity.concat(appended), window: 200 });
+    expect(result.current.windowedActivity).toEqual(visibleBeforeAppend.concat(appended));
+
+    rerender({ sid: "s1", a: [], window: 200 });
+    expect(result.current.windowedActivity).toEqual([]);
+    expect(result.current.canLoadEarlier).toBe(false);
+
+    const replacement = activity.map((row) => ({ ...row, id: `replacement-${row.id}` }));
+    rerender({ sid: "s1", a: replacement, window: 200 });
+    expect(result.current.windowedActivity).toEqual(replacement.slice(-200));
+    expect(result.current.canLoadEarlier).toBe(true);
+  });
+
+  it("includes the whole latest turn when the same session repopulates after empty activity", () => {
+    const activity = transcript(400, 1);
+    const { result, rerender } = render(activity, "s1", 200);
+    rerender({ sid: "s1", a: [], window: 200 });
+    const latestTurn = longTurn(100).map((row) => ({ ...row, id: `latest-${row.id}` }));
+    rerender({ sid: "s1", a: activity.concat(latestTurn), window: 200 });
+    expect(result.current.windowedActivity).toEqual(latestTurn);
+    expect(result.current.canLoadEarlier).toBe(true);
+  });
+
   it("reveals more on preference increases without hiding expanded rows on decreases", () => {
     const activity = transcript(400, 1);
     const { result, rerender } = render(activity, "s1", 100);

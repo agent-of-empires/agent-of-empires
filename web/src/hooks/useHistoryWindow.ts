@@ -24,7 +24,7 @@ export function useHistoryWindow(
   const [visibleRows, setVisibleRows] = useState(defaultWindow);
   const [windowPreference, setWindowPreference] = useState(defaultWindow);
   const [windowSessionId, setWindowSessionId] = useState(sessionId);
-  // null until first populate, so the initial page lands as the default window, not as growth.
+  // Empty transcripts have no growth baseline.
   const [anchorLen, setAnchorLen] = useState<number | null>(null);
   const [anchorRowId, setAnchorRowId] = useState<string | null>(null);
   if (windowSessionId !== sessionId) {
@@ -36,11 +36,12 @@ export function useHistoryWindow(
   } else {
     const preferenceIncreased = defaultWindow > windowPreference;
     if (defaultWindow !== windowPreference) setWindowPreference(defaultWindow);
-    if (anchorLen === null) {
-      if (activity.length > 0) {
-        setAnchorLen(activity.length);
-        setVisibleRows(initialHistoryWindow(activity, defaultWindow));
-      }
+    if (activity.length === 0) {
+      if (anchorLen !== null) setAnchorLen(null);
+      if (visibleRows !== defaultWindow) setVisibleRows(defaultWindow);
+    } else if (anchorLen === null) {
+      setAnchorLen(activity.length);
+      setVisibleRows(initialHistoryWindow(activity, defaultWindow));
     } else {
       let nextVisible = visibleRows + Math.max(0, activity.length - anchorLen);
       if (preferenceIncreased) {

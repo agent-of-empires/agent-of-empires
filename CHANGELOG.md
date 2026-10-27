@@ -12,7 +12,7 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
 ### Bug Fixes
 
-- **web:** Preserve Structured View reading position after streamed replies and history preference changes, and allow repeated scroll-to-top history loading.
+- **web:** Preserve Structured View reading position after streamed replies and history preference changes, allow repeated scroll-to-top history loading, and reset the initial history window after a transcript is emptied.
 
 ## [1.21.0](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.21.0) - 2026-10-21
 
