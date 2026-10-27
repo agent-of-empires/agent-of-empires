@@ -1032,7 +1032,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn cleared_bare_wrapper_launch_replaces_persisted_identity() {
+    fn cleared_bare_wrapper_launch_does_not_invent_a_managed_identity() {
         let temp = tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
         let _env = crate::session::test_support::EnvGuard::set(&[
@@ -1068,16 +1068,11 @@ mod tests {
                 .unwrap();
             let expected = inst.apply_fresh_launch_intent();
             let prepared = inst.prepare_launch_command(expected.clone()).unwrap();
-            let fresh = inst
-                .agent_session_id
-                .clone()
-                .expect("fresh wrapper session id");
-            assert_ne!(fresh, old);
+            assert!(inst.agent_session_id.is_none());
             assert!(!prepared.is_existing);
-            assert!(prepared
-                .command
-                .unwrap()
-                .contains(&format!("work-claude --session-id {fresh}")));
+            let command = prepared.command.unwrap();
+            assert!(!command.contains("--session-id"), "{command}");
+            assert!(!command.contains("--resume"), "{command}");
             assert_eq!(
                 inst.persist_session_id(&profile, &expected),
                 SidPersistOutcome::Published
@@ -1088,9 +1083,14 @@ mod tests {
                 .into_iter()
                 .find(|row| row.id == inst.id)
                 .unwrap();
-            assert_eq!(row.agent_session_id.as_deref(), Some(fresh.as_str()));
+            assert!(row.agent_session_id.is_none());
             assert_eq!(row.resume_probe_failed_sid, None);
             assert_eq!(row.resume_intent, ResumeIntent::Default);
+            let expected = inst.conversation_state();
+            let second = inst.prepare_launch_command(expected.clone()).unwrap();
+            assert!(!second.is_existing);
+            assert_eq!(inst.conversation_state(), expected);
+            assert!(!second.command.unwrap().contains("--session-id"));
 
             for intent in [
                 ResumeIntent::Use(old.into()),

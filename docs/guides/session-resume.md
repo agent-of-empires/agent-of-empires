@@ -34,7 +34,7 @@ Sandbox config and conversation stores are staged per AoE instance, including cu
 
 A conflicting built-in tool and command, such as tool `claude` with command `codex`, is rejected for managed resume and fork. An opaque wrapper requires both `session.agent_execution_as` and `session.agent_config_dir` in trusted global or profile configuration. This asserts that the wrapper invokes that native agent, forwards native arguments unchanged, and uses only the declared store and working-directory/filesystem context. Repository overrides are refused because a repository must not grant itself access to another native conversation store.
 
-A bare, non-path wrapper mapped by `agent_detect_as` can still start fresh and capture its pane-scoped published ID without the execution contract. Resuming that recorded ID requires the contract. An explicit fresh launch, including disabled `auto_resume_on_restart`, can still mint a new ID and capture the wrapper's pane-scoped publication. A native selector supplied by the user remains user-owned only when the row has no AoE-managed conversation state; AoE does not inject another selector. A known conversation can still be tried after an external working-directory or store move on Default when native execution resolves and its target checks pass; its old binding remains authoritative until a qualified observation updates it.
+A bare, non-path wrapper mapped by `agent_detect_as` can still start fresh and capture its pane-scoped published ID without the execution contract. AoE does not preassign a native ID from a status alias alone, including after an explicit fresh choice or disabled `auto_resume_on_restart`. Resuming a published ID still requires the contract. A native selector supplied by the user remains user-owned only when the row has no AoE-managed conversation state; AoE does not inject another selector. A known conversation can still be tried after an external working-directory or store move on Default when native execution resolves and its target checks pass; its old binding remains authoritative until a qualified observation updates it.
 
 Shell pipelines, remote launchers, redirections, expansion, and unrecognized context-changing arguments are not supported managed invocations. The program, routing environment, and native namespace arguments are fixed from one validated launch snapshot and restored after the login shell.
 
@@ -74,7 +74,7 @@ Automatic resume also refuses when native execution cannot be resolved in these 
 
 When native execution resolution fails for a recorded managed conversation under `Default`, including Prime Agent, the API returns HTTP `409` with `aoe-error-code: managed_resume_refused` and a fixed recovery reason. Missing wrapper contracts identify the trusted settings to restore; their declarations must match the actual native agent and original store. The [API receipt contract](../api.md#native-mutation-completion) describes the finite cause metadata.
 
-If local logs report unproven scope retirement after a managed refusal, inspect the cleanup diagnostic before retrying. A refused launch does not prove that every process in the outgoing scope has stopped.
+Local diagnostics include the native refusal chain and any scope-retirement error; public recovery messages exclude both. If scope retirement remains unproven, inspect its diagnostic before retrying. A refused launch does not prove that every process in the outgoing scope has stopped.
 
 | Context | `set-session-id` | Fork | Remedy |
 |---------|------------------|------|--------|

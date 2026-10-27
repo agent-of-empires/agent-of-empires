@@ -156,7 +156,7 @@ impl Instance {
             ResumeIntent::Cleared => {
                 self.set_agent_conversation(None, None, None);
                 self.resume_probe_failed_sid = None;
-                let session_id = self.fresh_launch_session_id(backend, mint_fresh_id);
+                let session_id = self.fresh_launch_session_id(backend, execution, mint_fresh_id);
                 self.set_agent_conversation(session_id.clone(), None, None);
                 return (session_id, false);
             }
@@ -267,7 +267,7 @@ impl Instance {
             }
         }
 
-        let session_id = self.fresh_launch_session_id(backend, mint_fresh_id);
+        let session_id = self.fresh_launch_session_id(backend, execution, mint_fresh_id);
         if let Some(ref id) = session_id {
             tracing::debug!(target: "session.store", "Session ID for {}: {}", self.tool, id);
             self.set_agent_conversation(session_id.clone(), None, None);
@@ -276,16 +276,19 @@ impl Instance {
         (session_id, false)
     }
 
-    /// Mint the session id for a brand-new launch. Claude and eligible Pi
-    /// launches pin a UUID. Direct host OpenCode launches pre-create a session
-    /// automatically. A preassign failure returns no id rather than guessing
-    /// from the shared store. Other supported backends capture after launch.
+    /// Preassign only when native execution identity is known.
+    /// Other launches capture the agent's own publication after launch.
     fn fresh_launch_session_id(
         &self,
         backend: Option<crate::agents::SessionCaptureBackend>,
+        execution: Option<&super::execution::NativeExecution>,
         mint_fresh_id: &dyn Fn(&str) -> Option<String>,
     ) -> Option<String> {
-        match backend? {
+        let backend = backend?;
+        execution
+            .map(|execution| execution.agent)
+            .or_else(|| self.resolved_agent())?;
+        match backend {
             crate::agents::SessionCaptureBackend::Claude => Some(generate_session_uuid()),
             crate::agents::SessionCaptureBackend::OpenCode
             | crate::agents::SessionCaptureBackend::Pi => mint_fresh_id(&self.project_path),
@@ -1334,24 +1337,11 @@ work-opencode = "opencode"
             assert_eq!((sid, existing), (Some(SID.into()), true), "{tool}");
             assert_eq!(inst.agent_session_id.as_deref(), Some(SID), "{tool}");
             if tool == "work-claude" {
-                let mut command = tool.to_string();
-                assert!(inst
-                    .apply_session_flags(
-                        &mut command,
-                        None,
-                        None,
-                        &super::execution::AgentLaunchContext::host(
-                            inst.default_selector_agent(),
-                            inst.default_selector_agent()
-                                .and_then(|agent| inst.host_agent_command(agent, None))
-                                .as_ref()
-                        ),
-                        &mut inst.conversation_state()
-                    )
-                    .unwrap());
-                assert_eq!(command, format!("{tool} --resume {SID}"));
+                let before = inst.conversation_state();
+                assert!(inst.prepare_launch_command(before.clone()).is_err());
+                assert_eq!(inst.conversation_state(), before);
             }
-            if tool == "work-pi" && crate::agents::pi_supports_session_id_flag() {
+            if tool == "work-pi" {
                 let mut fresh = tool_instance(tool, root.path().to_str().unwrap());
                 fresh.source_profile = PROFILE.into();
                 fresh.command = tool.into();
@@ -1371,10 +1361,8 @@ work-opencode = "opencode"
                         &mut fresh.conversation_state()
                     )
                     .unwrap());
-                assert!(
-                    command.starts_with(&format!("{tool} --session-id ")),
-                    "{command}"
-                );
+                assert_eq!(command, tool);
+                assert!(fresh.agent_session_id.is_none());
             }
         }
 
