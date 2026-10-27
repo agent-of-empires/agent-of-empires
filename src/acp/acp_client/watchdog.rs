@@ -11,6 +11,7 @@ use super::lifecycle::{
     classify_lifecycle_signal, wakeup_lifecycle_signal_from_update, LifecycleSignal,
     OffProtocolWorkKind,
 };
+use super::omp_tasks::is_omp_task_snapshot;
 
 /// Default silent-orphan grace, mirrored by `AcpConfig`.
 const SILENT_ORPHAN_GRACE_DEFAULT: Duration = Duration::from_secs(120);
@@ -246,15 +247,14 @@ pub(super) fn silent_orphan_check_interval() -> Duration {
         })
 }
 
-/// `(lifecycle, wakeup)` signals for a notification; none during post-load
-/// history replay so stale frames cannot affect a new prompt.
+/// `(lifecycle, wakeup)` signals, excluding replay and independent task snapshots.
 pub(super) fn classify_watchdog_notification_signals(
     update: &SessionUpdate,
     restored_title: Option<&str>,
     profile: &agent_profiles::AgentProfile,
     suppressing_history_replay: bool,
 ) -> (Option<LifecycleSignal>, Option<LifecycleSignal>) {
-    if suppressing_history_replay {
+    if suppressing_history_replay || is_omp_task_snapshot(update) {
         return (None, None);
     }
     (
@@ -587,6 +587,75 @@ mod tests {
             let sig = classify_lifecycle_signal(&text_chunk("Compacting...", Some("m1"))).unwrap();
             w.apply_signal(sig, t0, chrono::Utc::now(), CFG);
             assert!(!w.should_fire(t0 + Duration::from_millis(120_400), CFG));
+        }
+    }
+
+    #[test]
+    fn old_omp_task_snapshots_preserve_successor_terminal_grace() {
+        use agent_client_protocol::schema::v1::{Cost, UsageUpdate};
+        use serde_json::json;
+
+        for status in [
+            None,
+            Some("pending"),
+            Some("in_progress"),
+            Some("completed"),
+            Some("failed"),
+        ] {
+            let t0 = Instant::now();
+            let wall = chrono::Utc::now();
+            let mut watchdog = SilentOrphanWatchdog::default();
+            let usage = SessionUpdate::UsageUpdate(
+                UsageUpdate::new(53_000, 200_000).cost(Cost::new(0.045, "USD")),
+            );
+            for (seconds, update) in [(0, text_chunk("Successor answer", None)), (1, usage)] {
+                let (lifecycle, wakeup) = classify_watchdog_notification_signals(
+                    &update,
+                    None,
+                    &agent_profiles::OMP,
+                    false,
+                );
+                for signal in lifecycle.into_iter().chain(wakeup) {
+                    watchdog.apply_signal(signal, t0 + Duration::from_secs(seconds), wall, CFG);
+                }
+            }
+            let mut frame = json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "previous-turn-task-batch",
+                "rawOutput": {"details": {
+                    "async": {"type": "task", "jobId": "old-child"},
+                    "progress": [{
+                        "id": "old-child", "agent": "scout", "status": "running",
+                        "assignment": "Inspect previous request", "toolCount": 3,
+                        "recentOutput": ["Still inspecting"]
+                    }]
+                }}
+            });
+            if let Some(status) = status {
+                frame["status"] = json!(status);
+            }
+            let update = serde_json::from_value(frame.clone()).unwrap();
+            let (lifecycle, wakeup) =
+                classify_watchdog_notification_signals(&update, None, &agent_profiles::OMP, false);
+            assert!(lifecycle.is_none(), "snapshot status {status:?}");
+            assert!(wakeup.is_none());
+            for signal in lifecycle.into_iter().chain(wakeup) {
+                watchdog.apply_signal(signal, t0 + Duration::from_secs(10), wall, CFG);
+            }
+            assert!(watchdog.cost_seen());
+            assert_eq!(watchdog.tool_calls_in_flight_len(), 0);
+            assert!(!watchdog.should_fire(t0 + CFG.fast_grace - Duration::from_millis(1), CFG));
+            assert!(watchdog.should_fire(t0 + CFG.fast_grace, CFG));
+
+            frame["rawOutput"]["details"]["async"]["type"] = json!("command");
+            let ordinary = serde_json::from_value(frame).unwrap();
+            let (lifecycle, _) = classify_watchdog_notification_signals(
+                &ordinary,
+                None,
+                &agent_profiles::OMP,
+                false,
+            );
+            assert!(lifecycle.is_some(), "non-task status {status:?}");
         }
     }
 

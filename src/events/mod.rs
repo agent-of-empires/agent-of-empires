@@ -16,6 +16,8 @@ pub struct Schema {
     attachments_table: String,
     pending_attachments_table: String,
     rate_limit_budgets_table: String,
+    background_conversations_table: String,
+    background_agent_identities_table: String,
 }
 
 impl Schema {
@@ -29,6 +31,8 @@ impl Schema {
             attachments_table: format!("{prefix}_attachments"),
             pending_attachments_table: format!("{prefix}_pending_attachments"),
             rate_limit_budgets_table: format!("{prefix}_rate_limit_budgets"),
+            background_conversations_table: format!("{prefix}_background_conversations"),
+            background_agent_identities_table: format!("{prefix}_background_agent_identities"),
         })
     }
 
@@ -49,6 +53,14 @@ impl Schema {
     /// Outside the retention prune so the redelivery cap survives every history cap.
     pub fn rate_limit_budgets_table(&self) -> &str {
         &self.rate_limit_budgets_table
+    }
+
+    pub fn background_conversations_table(&self) -> &str {
+        &self.background_conversations_table
+    }
+
+    pub fn background_agent_identities_table(&self) -> &str {
+        &self.background_agent_identities_table
     }
 }
 
@@ -146,10 +158,32 @@ pub fn open(db_path: &Path, schema: &Schema) -> Result<Connection> {
     ))
     .context("create event log schema")?;
     ensure_discriminant_column(&conn, events)?;
+    create_background_tracking_schema(&conn, schema)?;
     Ok(conn)
 }
 
-fn ensure_discriminant_column(conn: &Connection, events: &str) -> Result<()> {
+pub(crate) fn create_background_tracking_schema(conn: &Connection, schema: &Schema) -> Result<()> {
+    let conversations = schema.background_conversations_table();
+    let identities = schema.background_agent_identities_table();
+    conn.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS {conversations} (
+            session_id    TEXT    NOT NULL PRIMARY KEY,
+            native_id     TEXT    NOT NULL,
+            epoch_seq     INTEGER NOT NULL,
+            assigned_seq  INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS {identities} (
+            session_id    TEXT    NOT NULL,
+            agent_id      TEXT    NOT NULL,
+            terminal      INTEGER NOT NULL,
+            first_seq     INTEGER NOT NULL,
+            PRIMARY KEY (session_id, agent_id)
+        );"
+    ))?;
+    Ok(())
+}
+
+pub(crate) fn ensure_discriminant_column(conn: &Connection, events: &str) -> Result<()> {
     let has_column: bool = conn
         .query_row(
             &format!(
@@ -755,6 +789,17 @@ pub fn delete_topic(conn: &Connection, schema: &Schema, topic: &str) -> usize {
         params![topic],
     ) {
         warn!(target: "events", "delete rate-limit budget {topic}: {e}");
+    }
+    for table in [
+        schema.background_agent_identities_table(),
+        schema.background_conversations_table(),
+    ] {
+        if let Err(e) = conn.execute(
+            &format!("DELETE FROM {table} WHERE session_id = ?1"),
+            params![topic],
+        ) {
+            warn!(target: "events", "delete background identities {topic}: {e}");
+        }
     }
     deleted
 }

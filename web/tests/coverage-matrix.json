@@ -2781,6 +2781,8 @@
       "specs": [
         "src/components/acp/__tests__/BackgroundAgentsPanel.test.tsx",
         "src/lib/acpTypes.reducer.test.ts",
+        "src/lib/acpTypes.test.ts",
+        "src/hooks/acpSession/stateCache.test.ts",
         "src/components/acp/ToolCards.render.test.tsx"
       ],
       "components": [

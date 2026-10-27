@@ -147,7 +147,14 @@ fn purge_acp_transcript_rows(db_path: &std::path::Path, session_id: &str) -> Res
         .map_err(|e| anyhow::anyhow!("acp transcript purge: begin transaction: {e}"))?;
     let schema = crate::events::Schema::new("acp")
         .map_err(|e| anyhow::anyhow!("acp transcript purge: schema: {e}"))?;
-    for table in [schema.events_table(), schema.attachments_table()] {
+    for table in [
+        schema.events_table(),
+        schema.attachments_table(),
+        schema.pending_attachments_table(),
+        schema.rate_limit_budgets_table(),
+        schema.background_agent_identities_table(),
+        schema.background_conversations_table(),
+    ] {
         match tx.execute(
             &format!("DELETE FROM {table} WHERE session_id = ?1"),
             rusqlite::params![session_id],
@@ -308,6 +315,23 @@ mod tests {
              INSERT INTO acp_attachments VALUES ('keep', 'a0', x'00'), ('drop', 'a1', x'01');",
         )
         .unwrap();
+        crate::events::create_background_tracking_schema(
+            &conn,
+            &crate::events::Schema::new("acp").unwrap(),
+        )
+        .unwrap();
+        for session in ["keep", "drop"] {
+            conn.execute(
+                "INSERT INTO acp_background_conversations VALUES (?1, 'native', 1, 1)",
+                rusqlite::params![session],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO acp_background_agent_identities VALUES (?1, 'child', 1, 2)",
+                rusqlite::params![session],
+            )
+            .unwrap();
+        }
         drop(conn);
 
         purge_acp_transcript_rows(&db_path, "drop").unwrap();
@@ -337,6 +361,19 @@ mod tests {
         assert_eq!(events, 0, "target event rows should be deleted");
         assert_eq!(attachments, 0, "target attachment blobs should be deleted");
         assert_eq!(kept_events, 1, "other session must be untouched");
+        for table in [
+            "acp_background_conversations",
+            "acp_background_agent_identities",
+        ] {
+            let sessions = conn
+                .prepare(&format!("SELECT session_id FROM {table}"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(sessions, vec!["keep".to_string()]);
+        }
     }
 
     #[test]

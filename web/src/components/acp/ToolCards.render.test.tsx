@@ -782,6 +782,7 @@ describe("AsyncSubagentCard", () => {
       description: "Map backend lifecycle",
       prompt: "do it",
       model: "claude-opus-4-8",
+      wireTracked: false,
       status: "running",
       startedAt: new Date().toISOString(),
       endedAt: null,

@@ -1,6 +1,7 @@
 //! Disk-backed event log for structured view sessions.
 
 mod attachments;
+mod background_tracking;
 mod rate_limit;
 mod replay;
 mod search;
@@ -18,6 +19,7 @@ use super::state::Event;
 use crate::events;
 
 pub use attachments::AttachmentBlob;
+pub use background_tracking::BackgroundAgentTrackingSeed;
 pub use rate_limit::RateLimitPark;
 pub use replay::ReplayPage;
 pub use search::ContentHit;
@@ -121,6 +123,7 @@ impl EventStore {
         let inserted = events::insert_event(&tx, &self.schema, session_id, seq, &json, now_ms)?;
         if inserted != 0 {
             rate_limit::update_rate_limit_budget(&tx, &self.schema, session_id, seq, event);
+            background_tracking::update(&tx, &self.schema, session_id, seq, event)?;
         }
         tx.commit()?;
         trace!(
@@ -160,14 +163,14 @@ impl EventStore {
         created_at_ms: i64,
     ) -> Result<()> {
         let json = serde_json::to_string(event)?;
-        events::insert_event(
-            &self.conn(),
-            &self.schema,
-            session_id,
-            seq,
-            &json,
-            created_at_ms,
-        )?;
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let inserted =
+            events::insert_event(&tx, &self.schema, session_id, seq, &json, created_at_ms)?;
+        if inserted != 0 {
+            background_tracking::update(&tx, &self.schema, session_id, seq, event)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -243,6 +246,8 @@ impl EventStore {
             self.schema.attachments_table(),
             self.schema.pending_attachments_table(),
             self.schema.rate_limit_budgets_table(),
+            self.schema.background_agent_identities_table(),
+            self.schema.background_conversations_table(),
         ] {
             tx.execute(
                 &format!("DELETE FROM {table} WHERE session_id = ?1"),

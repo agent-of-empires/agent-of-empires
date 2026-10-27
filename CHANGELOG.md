@@ -6,9 +6,9 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
 ## Unreleased
 
-### Features
+### Bug Fixes
 
-- **acp:** Consume structured omp async task rows in the background-agent panel, including every row in mixed batches, replacing rolling previews and applying resolved model updates. Post-prompt progress and completion require deployment of the native omp lifetime-update bridge.
+- **acp:** Show omp background tasks with live progress, terminal corrections and chronological previews; preserve tracking across history cleanup and matching runner reattachment without affecting foreground timeouts. Hide unsupported Stop controls for omp tasks. Post-prompt updates require the native omp lifetime-update bridge.
 
 ## [1.21.0](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.21.0) - 2026-10-21
 

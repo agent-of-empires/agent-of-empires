@@ -77,7 +77,24 @@ impl Progress {
     }
 }
 
+pub(super) fn is_omp_task_snapshot(update: &SessionUpdate) -> bool {
+    let SessionUpdate::ToolCallUpdate(update) = update else {
+        return false;
+    };
+    update
+        .fields
+        .raw_output
+        .as_ref()
+        .and_then(|output| output.pointer("/details/async/type"))
+        .and_then(|kind| kind.as_str())
+        == Some("task")
+}
+
 impl OmpTaskTracker {
+    pub(super) fn clear(&mut self) {
+        self.children.clear();
+    }
+
     pub(super) fn seed(&mut self, agent_id: String, terminal: bool) {
         let child = self.children.entry(agent_id).or_insert(Child {
             snapshot: None,
@@ -87,26 +104,24 @@ impl OmpTaskTracker {
     }
 
     pub(super) fn observe(&mut self, update: &SessionUpdate, replay: bool) -> Vec<Event> {
+        if !is_omp_task_snapshot(update) {
+            return Vec::new();
+        }
         let SessionUpdate::ToolCallUpdate(update) = update else {
             return Vec::new();
         };
-        let Some(details) = update
+        let Some(rows) = update
             .fields
             .raw_output
             .as_ref()
-            .and_then(|v| v.get("details"))
+            .and_then(|output| output.pointer("/details/progress"))
+            .and_then(|progress| progress.as_array())
         else {
-            return Vec::new();
-        };
-        if details.pointer("/async/type").and_then(|v| v.as_str()) != Some("task") {
-            return Vec::new();
-        }
-        let Some(rows) = details.get("progress").and_then(|v| v.as_array()) else {
             return Vec::new();
         };
         let mut events = Vec::new();
         for row in rows {
-            let Ok(progress) = Progress::deserialize(row) else {
+            let Ok(mut progress) = Progress::deserialize(row) else {
                 continue;
             };
             if progress.id.trim().is_empty() || progress.agent.trim().is_empty() {
@@ -116,13 +131,14 @@ impl OmpTaskTracker {
                 continue;
             };
             let terminal = status != BackgroundAgentStatus::Running;
+            progress.recent_output.reverse();
             // Suppressed adapter history seeds identity without republishing it.
             if replay {
                 let child = self.children.entry(progress.id.clone()).or_insert(Child {
                     snapshot: None,
                     terminal: false,
                 });
-                if !child.terminal {
+                if !child.terminal || child.snapshot.is_none() && terminal {
                     child.snapshot = Some(progress);
                     child.terminal = terminal;
                 }
@@ -152,13 +168,22 @@ impl OmpTaskTracker {
                     terminal: false,
                 }
             });
-            if child.terminal || child.snapshot.as_ref() == Some(&progress) {
+            if child.terminal && !terminal || child.snapshot.as_ref() == Some(&progress) {
                 continue;
             }
+            if child.terminal && child.snapshot.is_none() {
+                // Reattach seeds have no snapshot; preserve their completion time.
+                child.snapshot = Some(progress);
+                continue;
+            }
+            let completion_changed = terminal
+                && (!child.terminal
+                    || child.snapshot.as_ref().and_then(Progress::status)
+                        != Some((status, warning)));
             let tools = progress.tools();
             events.push(Event::BackgroundAgentProgress {
                 agent_id: progress.id.clone(),
-                status: BackgroundAgentStatus::Running,
+                status,
                 model: progress.resolved_model.clone(),
                 tool_count: progress.tool_count,
                 tools,
@@ -169,7 +194,7 @@ impl OmpTaskTracker {
                 last_text: Some(progress.recent_output.join("\n")),
                 at: chrono::Utc::now(),
             });
-            if terminal {
+            if completion_changed {
                 events.push(Event::BackgroundAgentCompleted {
                     agent_id: progress.id.clone(),
                     status,
@@ -207,6 +232,152 @@ mod tests {
             "assignment": "Inspect code", "resolvedModel": "provider/model",
             "toolCount": 3, "recentTools": [{"tool": "read", "args": "src", "isError": false}],
             "recentOutput": ["Found code"]})
+    }
+
+    #[test]
+    fn omp_tasks_correct_terminal_status_without_duplicate_completion() {
+        let mut tracker = OmpTaskTracker::default();
+        let mut state = AcpState::default();
+        let completed = update(json!([row("A", "completed")]), "in_progress");
+        for event in tracker.observe(&completed, false) {
+            state
+                .apply_event(state.last_seq.saturating_add(1), event)
+                .unwrap();
+        }
+        let corrected = update(json!([row("A", "failed")]), "completed");
+        let events = tracker.observe(&corrected, false);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::BackgroundAgentCompleted { .. }))
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            Event::BackgroundAgentLaunched { .. }
+                | Event::BackgroundAgentProgress {
+                    status: BackgroundAgentStatus::Running,
+                    ..
+                }
+        )));
+        for event in events {
+            state
+                .apply_event(state.last_seq.saturating_add(1), event)
+                .unwrap();
+        }
+        assert_eq!(
+            state.background_agents[0].status,
+            BackgroundAgentStatus::Error
+        );
+        assert_eq!(
+            state.background_agents[0].warning.as_deref(),
+            Some("omp task failed")
+        );
+        assert!(tracker.observe(&corrected, false).is_empty());
+        let running = update(json!([row("A", "running")]), "in_progress");
+        assert!(tracker.observe(&running, false).is_empty());
+        let mut refreshed = row("A", "failed");
+        refreshed["recentOutput"] = json!(["Merge failed"]);
+        let events = tracker.observe(&update(json!([refreshed]), "completed"), false);
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, Event::BackgroundAgentCompleted { .. })));
+        for event in tracker.observe(&completed, false) {
+            state
+                .apply_event(state.last_seq.saturating_add(1), event)
+                .unwrap();
+        }
+        assert_eq!(
+            state.background_agents[0].status,
+            BackgroundAgentStatus::Completed
+        );
+        assert!(state.background_agents[0].warning.is_none());
+        assert!(tracker.observe(&completed, false).is_empty());
+    }
+
+    #[test]
+    fn omp_tasks_seeded_terminal_snapshot_preserves_completion_identity() {
+        let mut tracker = OmpTaskTracker::default();
+        tracker.seed("A".into(), true);
+        let completed = update(json!([row("A", "completed")]), "completed");
+        assert!(tracker.observe(&completed, false).is_empty());
+        assert!(tracker.observe(&completed, false).is_empty());
+        let running = update(json!([row("A", "running")]), "in_progress");
+        assert!(tracker.observe(&running, false).is_empty());
+        let failed = update(json!([row("A", "failed")]), "completed");
+        let events = tracker.observe(&failed, false);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    Event::BackgroundAgentCompleted {
+                        status: BackgroundAgentStatus::Error,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn omp_tasks_clear_forgets_previous_conversation_identity() {
+        let mut tracker = OmpTaskTracker::default();
+        tracker.seed("A".into(), true);
+        let running = update(
+            json!([row("A", "running"), row("B", "running")]),
+            "in_progress",
+        );
+        let initial = tracker.observe(&running, false);
+        assert_eq!(
+            initial
+                .iter()
+                .filter(|event| matches!(event,
+                    Event::BackgroundAgentLaunched { agent_id, .. } if agent_id == "B"
+                ))
+                .count(),
+            1
+        );
+
+        tracker.clear();
+
+        let events = tracker.observe(&running, false);
+        let launched: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::BackgroundAgentLaunched { agent_id, .. } => Some(agent_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(launched, ["A", "B"]);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    Event::BackgroundAgentProgress {
+                        status: BackgroundAgentStatus::Running,
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn omp_tasks_recent_output_is_chronological_without_reordering_lines() {
+        let mut tracker = OmpTaskTracker::default();
+        let mut progress = row("A", "running");
+        progress["recentOutput"] = json!(["Newest first line\nNewest second line", "Oldest"]);
+        let snapshot = update(json!([progress]), "completed");
+        let events = tracker.observe(&snapshot, false);
+        assert!(events.iter().any(|event| matches!(event,
+            Event::BackgroundAgentProgress { last_text: Some(text), .. }
+                if text == "Oldest\nNewest first line\nNewest second line")));
+        assert!(tracker.observe(&snapshot, false).is_empty());
     }
 
     #[test]
@@ -256,7 +427,9 @@ mod tests {
             let events = tracker.observe(&update(json!([progress]), "completed"), false);
             let mut state = AcpState::default();
             for event in events {
-                state.apply_event(state.last_seq.saturating_add(1), event).unwrap();
+                state
+                    .apply_event(state.last_seq.saturating_add(1), event)
+                    .unwrap();
             }
             assert_eq!(
                 state.background_agents[0].last_tool.as_deref(),
@@ -276,7 +449,9 @@ mod tests {
         let events = tracker.observe(&initial, false);
         assert_eq!(events.iter().filter(|e| matches!(e, Event::BackgroundAgentLaunched { output_file, wire_tracked: true, .. } if output_file.is_empty())).count(), 2);
         for event in events {
-            state.apply_event(state.last_seq.saturating_add(1), event).unwrap();
+            state
+                .apply_event(state.last_seq.saturating_add(1), event)
+                .unwrap();
         }
         assert!(tracker.observe(&initial, false).is_empty());
         assert_eq!(state.background_agents.len(), 2);
@@ -295,7 +470,9 @@ mod tests {
             .iter()
             .any(|e| matches!(e, Event::BackgroundAgentLaunched { .. })));
         for event in events {
-            state.apply_event(state.last_seq.saturating_add(1), event).unwrap();
+            state
+                .apply_event(state.last_seq.saturating_add(1), event)
+                .unwrap();
         }
         assert!(tracker.observe(&mixed, false).is_empty());
         assert_eq!(

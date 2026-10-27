@@ -53,6 +53,20 @@ describe("loadPersistedState", () => {
     expect(loaded?.oldestSeq).toBe(42);
     expect(loaded?.pendingElicitations.map((e) => e.nonce)).toEqual(["e-1"]);
   });
+
+  it("backfills legacy background-agent provenance while retaining wire tracking", () => {
+    writeEntry("background", {
+      ...emptyAcpState(),
+      backgroundAgents: [
+        { agentId: "legacy", toolCallId: "tc1", status: "running" },
+        { agentId: "omp", toolCallId: "tc2", status: "running", wireTracked: true },
+      ],
+    });
+    expect(loadPersistedState("background")?.backgroundAgents).toEqual([
+      { agentId: "legacy", toolCallId: "tc1", status: "running", wireTracked: false },
+      { agentId: "omp", toolCallId: "tc2", status: "running", wireTracked: true },
+    ]);
+  });
 });
 
 describe("loadPersistedState mid-turn cache (#4530)", () => {
@@ -61,7 +75,9 @@ describe("loadPersistedState mid-turn cache (#4530)", () => {
   const configOptions = [
     { id: "model", name: "Model", category: "model", current_value: "opus", options: [] },
   ] as AcpState["configOptions"];
-  const backgroundAgents = [{ agentId: "a1", toolCallId: "tc1", status: "running" }] as AcpState["backgroundAgents"];
+  const backgroundAgents = [
+    { agentId: "a1", toolCallId: "tc1", status: "running", wireTracked: false },
+  ] as AcpState["backgroundAgents"];
   const entry = (activity: ActivityRow[], oldestSeq: number) => ({
     ...emptyAcpState(),
     lastSeq: 900,

@@ -1294,7 +1294,7 @@ mod tests {
                     None,
                     None,
                     None,
-                    Vec::new(),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -1363,6 +1363,15 @@ mod tests {
                         }).await.unwrap();
                     }
                     ControlBody::ResumeSession => {
+                        control_protocol::write_frame(&mut peer, &ControlBody::Notify {
+                            method: "session/update".into(),
+                            params: serde_json::json!({"sessionId":"actual","update":{
+                                "sessionUpdate":"tool_call_update","toolCallId":"batch","status":"completed",
+                                "rawOutput":{"details":{"async":{"type":"task"},"progress":[{
+                                    "id":"Child","agent":"task","status":"completed","assignment":"Inspect code"
+                                }]}}
+                            }}),
+                        }).await.unwrap();
                         for index in 0..200 {
                             control_protocol::write_frame(&mut peer, &ControlBody::Notify {
                                 method: "session/update".into(),
@@ -1465,23 +1474,36 @@ mod tests {
                 true,
                 AcpSessionId("native-resume".into()),
                 None,
-                "codex".into(),
+                "omp".into(),
                 None,
                 None,
                 None,
                 None,
-                Vec::new(),
+                Some(crate::acp::event_store::BackgroundAgentTrackingSeed {
+                    acp_session_id: "stale".into(),
+                    agents: vec![("Child".into(), true), ("StaleRunning".into(), false)],
+                }),
             )
             .await
             .unwrap();
             let mut chunks = Vec::new();
             let mut resets = 0;
             let mut assigned = false;
-            while chunks.len() < 204 || !assigned {
+            let mut task_launches = 0;
+            let mut task_completions = 0;
+            while chunks.len() < 204 || !assigned || task_completions == 0 {
                 match client.next_event().await.unwrap() {
                     Event::AgentMessageChunk { text, .. } => chunks.push(text),
                     Event::SessionContextReset { .. } => resets += 1,
                     Event::AcpSessionAssigned { .. } => assigned = true,
+                    Event::BackgroundAgentLaunched { agent_id, .. } => {
+                        assert_eq!(agent_id, "Child");
+                        task_launches += 1;
+                    }
+                    Event::BackgroundAgentCompleted { agent_id, .. } => {
+                        assert_eq!(agent_id, "Child");
+                        task_completions += 1;
+                    }
                     Event::AgentStartupError { message } => panic!("{message}"),
                     _ => {}
                 }
@@ -1489,6 +1511,11 @@ mod tests {
             callbacks_ready.await.unwrap();
             client.shutdown().await.unwrap();
             assert_eq!(resets, 1, "a different runner id announces one reset");
+            assert_eq!(
+                task_launches, 1,
+                "stale terminal seed must not suppress replay"
+            );
+            assert_eq!(task_completions, 1);
             assert_eq!(
                 chunks,
                 (0..204)
@@ -1560,7 +1587,7 @@ mod tests {
                 None,
                 None,
                 None,
-                Vec::new(),
+                None,
             )
             .await
             .unwrap();
@@ -1684,7 +1711,7 @@ mod tests {
                 None,
                 None,
                 None,
-                Vec::new(),
+                None,
             )
             .await
             .expect("producer-admitted backlog must attach");

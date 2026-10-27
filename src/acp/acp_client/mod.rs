@@ -200,7 +200,7 @@ struct Launch {
     mcp_servers: Vec<McpServer>,
     claude_home: Option<PathBuf>,
     cancellation: tokio_util::sync::CancellationToken,
-    background_agent_tracking_seed: Vec<(String, bool)>,
+    background_agent_tracking_seed: Option<crate::acp::event_store::BackgroundAgentTrackingSeed>,
 }
 
 impl Launch {
@@ -522,7 +522,7 @@ impl AcpClient {
                 .and_then(|binding| binding.stores.first())
                 .cloned(),
             cancellation: cancellation.clone(),
-            background_agent_tracking_seed: Vec::new(),
+            background_agent_tracking_seed: None,
         };
 
         if let Some(socket_path) = config.socket_path.clone() {
@@ -660,7 +660,9 @@ impl AcpClient {
         deadline: Option<tokio::time::Instant>,
         launch_lease: Option<crate::acp::runner_lifecycle::Lease>,
         claude_home: Option<PathBuf>,
-        background_agent_tracking_seed: Vec<(String, bool)>,
+        background_agent_tracking_seed: Option<
+            crate::acp::event_store::BackgroundAgentTrackingSeed,
+        >,
     ) -> Result<Self, AcpError> {
         // The binary name keeps the compatibility gate active on reattach; an
         // unknown agent maps to `Other` anyway.

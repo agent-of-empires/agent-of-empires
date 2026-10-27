@@ -20,8 +20,9 @@ function agent(over: Partial<BackgroundAgent> = {}): BackgroundAgent {
     description: "Map backend lifecycle",
     prompt: "do the thing",
     model: "claude-opus-4-8",
+    wireTracked: false,
     status: "running",
-    startedAt: new Date(Date.now() - 5000).toISOString(),
+    startedAt: "2026-06-27T00:00:00Z",
     endedAt: null,
     toolCount: 3,
     tools: [],
@@ -91,7 +92,7 @@ describe("BackgroundAgentsPanel", () => {
     expect(runIdx).toBeLessThan(doneIdx);
   });
 
-  it("shows a Stop button for active agents that POSTs the session cancel", async () => {
+  it("preserves Stop for transcript-backed agents and POSTs the session cancel", async () => {
     const fetchMock = vi.fn(() => Promise.resolve({ ok: true } as Response));
     vi.stubGlobal("fetch", fetchMock);
     agentsMock.mockReturnValue([agent({ status: "running" })]);
@@ -100,6 +101,33 @@ describe("BackgroundAgentsPanel", () => {
     fireEvent.click(stop);
     expect(fetchMock).toHaveBeenCalledWith("/api/sessions/s-1/acp/cancel", { method: "POST" });
     vi.unstubAllGlobals();
+  });
+
+  it("hides Stop for running omp-only batches", () => {
+    agentsMock.mockReturnValue([
+      agent({ wireTracked: true }),
+      agent({ agentId: "omp-2", toolCallId: "task-2", wireTracked: true }),
+    ]);
+    const { queryByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    expect(queryByRole("button", { name: /stop/i })).toBeNull();
+  });
+
+  it("shows Stop in mixed batches only while a supported child is running", () => {
+    for (const status of ["running", "stalled", "completed", "detached", "error"] as const) {
+      agentsMock.mockReturnValue([
+        agent({ wireTracked: true }),
+        agent({ agentId: "transcript", toolCallId: "task-2", status }),
+      ]);
+      const { queryByRole, unmount } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+      expect(queryByRole("button", { name: /stop/i }) !== null, status).toBe(status === "running");
+      unmount();
+    }
+  });
+
+  it("hides Stop without an attached session", () => {
+    agentsMock.mockReturnValue([agent()]);
+    const { queryByRole } = render(<BackgroundAgentsPanel sessionId={null} />);
+    expect(queryByRole("button", { name: /stop/i })).toBeNull();
   });
 
   it("hides the Stop button for finished or stalled agents (cancel would be a no-op)", () => {

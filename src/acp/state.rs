@@ -388,6 +388,8 @@ pub struct BackgroundAgentRecord {
     pub description: String,
     pub prompt: String,
     pub model: String,
+    #[serde(default)]
+    pub wire_tracked: bool,
     pub status: BackgroundAgentStatus,
     pub started_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1033,6 +1035,7 @@ impl AcpState {
                     description,
                     prompt,
                     model,
+                    wire_tracked,
                     status: BackgroundAgentStatus::Running,
                     started_at,
                     ended_at: None,
@@ -1084,7 +1087,7 @@ impl AcpState {
                     a.status = status;
                     a.ended_at = Some(ended_at);
                     replace_if_some(&mut a.result, result);
-                    replace_if_some(&mut a.warning, warning);
+                    a.warning = warning;
                     if !tools.is_empty() {
                         a.tools = tools;
                     }
@@ -1768,6 +1771,7 @@ mod tests {
             ),
         ]);
         let agent = &s.background_agents[0];
+        assert!(!agent.wire_tracked);
         assert_eq!(
             (agent.status, agent.tool_count),
             (BackgroundAgentStatus::Running, 3)
@@ -1827,31 +1831,41 @@ mod tests {
                 (true, "tc2", false),
                 (false, "tc1", false),
             ] {
-                let mut s = applied([launched()]);
-                s.apply_event(s.last_seq.saturating_add(1), Event::BackgroundAgentProgress {
-                    agent_id: "a1".into(),
-                    status: BackgroundAgentStatus::Running,
-                    tool_count: 3,
-                    tools: vec![BackgroundAgentTool {
-                        name: "Read".into(),
-                        title: Some("state.rs".into()),
-                        ok: Some(true),
-                    }],
-                    last_tool: Some("Read".into()),
-                    last_text: Some("read the source".into()),
-                    model: Some("resolved-model".into()),
-                    at: Utc::now(),
-                })
+                let mut initial = launched();
+                if let Event::BackgroundAgentLaunched { wire_tracked, .. } = &mut initial {
+                    *wire_tracked = true;
+                }
+                let mut s = applied([initial]);
+                s.apply_event(
+                    s.last_seq.saturating_add(1),
+                    Event::BackgroundAgentProgress {
+                        agent_id: "a1".into(),
+                        status: BackgroundAgentStatus::Running,
+                        tool_count: 3,
+                        tools: vec![BackgroundAgentTool {
+                            name: "Read".into(),
+                            title: Some("state.rs".into()),
+                            ok: Some(true),
+                        }],
+                        last_tool: Some("Read".into()),
+                        last_text: Some("read the source".into()),
+                        model: Some("resolved-model".into()),
+                        at: Utc::now(),
+                    },
+                )
                 .unwrap();
                 if terminal {
-                    s.apply_event(s.last_seq.saturating_add(1), Event::BackgroundAgentCompleted {
-                        agent_id: "a1".into(),
-                        status: BackgroundAgentStatus::Completed,
-                        tools: vec![],
-                        result: Some("done".into()),
-                        warning: Some("a warning".into()),
-                        ended_at: Utc::now(),
-                    })
+                    s.apply_event(
+                        s.last_seq.saturating_add(1),
+                        Event::BackgroundAgentCompleted {
+                            agent_id: "a1".into(),
+                            status: BackgroundAgentStatus::Completed,
+                            tools: vec![],
+                            result: Some("done".into()),
+                            warning: Some("a warning".into()),
+                            ended_at: Utc::now(),
+                        },
+                    )
                     .unwrap();
                 }
                 let before = serde_json::to_value(&s.background_agents[0]).unwrap();
@@ -1869,9 +1883,11 @@ mod tests {
                 assert_eq!(s.background_agents.len(), 1);
                 let agent = &s.background_agents[0];
                 if preserves_history {
+                    assert!(agent.wire_tracked);
                     assert_eq!(serde_json::to_value(agent).unwrap(), before);
                 } else {
                     assert_eq!(agent.tool_call_id, tool_call_id);
+                    assert_eq!(agent.wire_tracked, wire_tracked);
                     assert_eq!(agent.status, BackgroundAgentStatus::Running);
                     assert_eq!(agent.model, "claude-opus-4-8");
                     assert_eq!(agent.tool_count, 0);
@@ -1897,8 +1913,11 @@ mod tests {
         let mut s = applied([launched(), progress]);
         assert_eq!(s.background_agents[0].tools.len(), 1);
 
-        s.apply_event(s.last_seq.saturating_add(1), bg_progress(BackgroundAgentStatus::Running, 2))
-            .unwrap();
+        s.apply_event(
+            s.last_seq.saturating_add(1),
+            bg_progress(BackgroundAgentStatus::Running, 2),
+        )
+        .unwrap();
         assert!(s.background_agents[0].tools.is_empty());
         assert_eq!(s.background_agents[0].tool_count, 2);
     }
@@ -1906,27 +1925,38 @@ mod tests {
     #[test]
     fn background_agent_progress_replaces_model_only_when_present() {
         let mut s = applied([launched()]);
-        s.apply_event(s.last_seq.saturating_add(1), bg_progress(BackgroundAgentStatus::Running, 1))
-            .unwrap();
+        s.apply_event(
+            s.last_seq.saturating_add(1),
+            bg_progress(BackgroundAgentStatus::Running, 1),
+        )
+        .unwrap();
         assert_eq!(s.background_agents[0].model, "claude-opus-4-8");
 
         let mut progress = bg_progress(BackgroundAgentStatus::Running, 2);
         if let Event::BackgroundAgentProgress { model, .. } = &mut progress {
             *model = Some("resolved-model".into());
         }
-        s.apply_event(s.last_seq.saturating_add(1), progress.clone()).unwrap();
-        assert_eq!(s.background_agents[0].model, "resolved-model");
-
-        s.apply_event(s.last_seq.saturating_add(1), bg_progress(BackgroundAgentStatus::Running, 3))
+        s.apply_event(s.last_seq.saturating_add(1), progress.clone())
             .unwrap();
         assert_eq!(s.background_agents[0].model, "resolved-model");
 
-        s.apply_event(s.last_seq.saturating_add(1), bg_completed(BackgroundAgentStatus::Completed))
-            .unwrap();
+        s.apply_event(
+            s.last_seq.saturating_add(1),
+            bg_progress(BackgroundAgentStatus::Running, 3),
+        )
+        .unwrap();
+        assert_eq!(s.background_agents[0].model, "resolved-model");
+
+        s.apply_event(
+            s.last_seq.saturating_add(1),
+            bg_completed(BackgroundAgentStatus::Completed),
+        )
+        .unwrap();
         if let Event::BackgroundAgentProgress { model, .. } = &mut progress {
             *model = Some("late-model".into());
         }
-        s.apply_event(s.last_seq.saturating_add(1), progress).unwrap();
+        s.apply_event(s.last_seq.saturating_add(1), progress)
+            .unwrap();
         assert_eq!(s.background_agents[0].model, "resolved-model");
     }
 
@@ -1967,6 +1997,11 @@ mod tests {
         let s = applied([launch, progress]);
         assert_eq!(s.background_agents[0].model, "original-model");
         assert_eq!(s.background_agents[0].tool_count, 1);
+        assert!(!s.background_agents[0].wire_tracked);
+        let mut serialized = serde_json::to_value(&s.background_agents[0]).unwrap();
+        serialized.as_object_mut().unwrap().remove("wire_tracked");
+        let legacy: BackgroundAgentRecord = serde_json::from_value(serialized).unwrap();
+        assert!(!legacy.wire_tracked);
     }
 
     fn launched() -> Event {

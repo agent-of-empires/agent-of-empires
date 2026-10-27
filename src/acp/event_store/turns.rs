@@ -339,56 +339,6 @@ impl EventStore {
             .unwrap_or_default()
     }
 
-    /// Seed resumed wire tracking within the current native conversation.
-    /// Same-id assignments preserve terminal identities, even when launch rows
-    /// were pruned. The bool marks identities whose completion is durable.
-    pub fn background_agent_tracking_seed(&self, session_id: &str) -> Vec<(String, bool)> {
-        let conn = self.conn();
-        let what = "background_agent_tracking_seed";
-        // Assignments survive retention; only a changed native id cuts off history.
-        let sql = "WITH assignments AS (
-                       SELECT seq,
-                              json_extract(event_json, '$.AcpSessionAssigned.acp_session_id') AS native_id,
-                              LAG(json_extract(event_json, '$.AcpSessionAssigned.acp_session_id'))
-                                  OVER (ORDER BY seq) AS previous_id
-                       FROM acp_events
-                       WHERE session_id = ?1 AND discriminant = 'AcpSessionAssigned'
-                   ), current_events AS (
-                       SELECT seq, event_json, discriminant
-                       FROM acp_events
-                       WHERE session_id = ?1
-                         AND seq >= COALESCE((
-                             SELECT MAX(seq) FROM assignments WHERE native_id != previous_id
-                         ), 0)
-                         AND discriminant IN ('BackgroundAgentLaunched', 'BackgroundAgentCompleted')
-                   ), completed AS (
-                       SELECT DISTINCT json_extract(event_json, '$.BackgroundAgentCompleted.agent_id') AS agent_id
-                       FROM current_events
-                       WHERE discriminant = 'BackgroundAgentCompleted'
-                         AND json_extract(event_json, '$.BackgroundAgentCompleted.agent_id') IS NOT NULL
-                   ), seed AS (
-                       SELECT agent_id, 1 AS terminal, 0 AS seq FROM completed
-                       UNION ALL
-                       SELECT json_extract(event_json, '$.BackgroundAgentLaunched.agent_id') AS agent_id,
-                              0 AS terminal, seq
-                       FROM current_events
-                       WHERE discriminant = 'BackgroundAgentLaunched'
-                         AND json_extract(event_json, '$.BackgroundAgentLaunched.wire_tracked') = 1
-                         AND json_extract(event_json, '$.BackgroundAgentLaunched.agent_id') IS NOT NULL
-                         AND json_extract(event_json, '$.BackgroundAgentLaunched.agent_id') NOT IN (
-                             SELECT agent_id FROM completed
-                         )
-                   )
-                   SELECT agent_id, terminal FROM seed ORDER BY terminal DESC, seq ASC, agent_id ASC";
-        let Some(mut stmt) = logged(conn.prepare(sql), what, session_id) else {
-            return Vec::new();
-        };
-        let rows = stmt.query_map(params![session_id], |row| Ok((row.get(0)?, row.get(1)?)));
-        logged(rows, what, session_id)
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
-    }
-
     /// Full payloads of unresolved approval requests, in request order.
     pub fn pending_approval_requests(&self, session_id: &str) -> Vec<Approval> {
         query_strings(
@@ -1160,6 +1110,17 @@ mod tests {
     #[test]
     fn background_agent_tracking_seed_preserves_terminal_identities_and_unresolved_wire_launches() {
         let (_tmp, store) = open_store(1000);
+        for session in ["s-seed", "s-other"] {
+            store
+                .record(
+                    session,
+                    0,
+                    &Event::AcpSessionAssigned {
+                        acp_session_id: format!("native-{session}"),
+                    },
+                )
+                .unwrap();
+        }
         let at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         let launched = |agent_id: &str, wire_tracked| {
             let mut event = bg_launched(agent_id, "");
@@ -1217,7 +1178,10 @@ mod tests {
         );
 
         assert_eq!(
-            store.background_agent_tracking_seed("s-seed"),
+            store
+                .background_agent_tracking_seed("s-seed")
+                .unwrap()
+                .agents,
             [
                 ("completed-sibling".to_string(), true),
                 ("pruned-launch".to_string(), true),
@@ -1225,13 +1189,16 @@ mod tests {
             ]
         );
         assert_eq!(
-            store.background_agent_tracking_seed("s-other"),
+            store
+                .background_agent_tracking_seed("s-other")
+                .unwrap()
+                .agents,
             [
                 ("running-wire".to_string(), true),
                 ("other-wire".to_string(), false),
             ]
         );
-        assert!(store.background_agent_tracking_seed("s-missing").is_empty());
+        assert!(store.background_agent_tracking_seed("s-missing").is_none());
     }
 
     #[test]
@@ -1275,7 +1242,11 @@ mod tests {
                 assigned("native-current"),
             ],
         );
-        assert!(store.background_agent_tracking_seed("s-native").is_empty());
+        assert!(store
+            .background_agent_tracking_seed("s-native")
+            .unwrap()
+            .agents
+            .is_empty());
 
         record_from(
             &store,
@@ -1294,14 +1265,26 @@ mod tests {
             ("failed-sibling".to_string(), true),
             ("A".to_string(), false),
         ];
-        assert_eq!(store.background_agent_tracking_seed("s-native"), expected);
+        assert_eq!(
+            store
+                .background_agent_tracking_seed("s-native")
+                .unwrap()
+                .agents,
+            expected
+        );
         record_from(
             &store,
             "s-native",
             12,
             [assigned("native-current"), assigned("native-current")],
         );
-        assert_eq!(store.background_agent_tracking_seed("s-native"), expected);
+        assert_eq!(
+            store
+                .background_agent_tracking_seed("s-native")
+                .unwrap()
+                .agents,
+            expected
+        );
 
         store
             .record(
@@ -1311,7 +1294,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            store.background_agent_tracking_seed("s-native"),
+            store
+                .background_agent_tracking_seed("s-native")
+                .unwrap()
+                .agents,
             [
                 ("A".to_string(), true),
                 ("completed-sibling".to_string(), true),
@@ -1323,7 +1309,11 @@ mod tests {
         store
             .record("s-native", 15, &assigned("native-old"))
             .unwrap();
-        assert!(store.background_agent_tracking_seed("s-native").is_empty());
+        assert!(store
+            .background_agent_tracking_seed("s-native")
+            .unwrap()
+            .agents
+            .is_empty());
     }
 
     fn bg_launched(agent_id: &str, output_file: &str) -> Event {
