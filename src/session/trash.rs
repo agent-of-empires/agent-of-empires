@@ -344,7 +344,7 @@ pub fn perform_trash(request: &TrashRequest) -> TrashResult {
             return failed(format!("could not acquire lifecycle lock: {error}"));
         }
     };
-    let mut inst = match storage.update(|instances, _groups| {
+    let mut inst = match storage.update_complete(|instances, _groups| {
         Ok(instances
             .iter()
             .find(|instance| instance.id == request.session_id)
@@ -748,7 +748,7 @@ fn reconcile_trashed_batch(
 ) -> anyhow::Result<Vec<Instance>> {
     let _identity = crate::session::acquire_session_identity_lock()?;
     let now = Utc::now();
-    let reserved = storage.update(|instances, _groups| {
+    let reserved = storage.update_complete(|instances, _groups| {
         let mut reserved: Vec<(u64, Instance)> = Vec::new();
         for snapshot in batch {
             let Some(stored) = instances
@@ -1218,6 +1218,23 @@ mod tests {
             );
             assert!(inst.pre_trash_project_path.is_none());
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn trash_reservation_keeps_an_undecodable_same_profile_row() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let store = crate::session::Storage::new_unwatched("default").unwrap();
+        store.update(|_, _| Ok(())).unwrap();
+        let mut rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(store.sessions_path()).unwrap()).unwrap();
+        rows.push(serde_json::json!({ "not": "a session" }));
+        let bytes = serde_json::to_vec(&rows).unwrap();
+        std::fs::write(store.sessions_path(), &bytes).unwrap();
+
+        assert!(store.update_complete(|_, _| Ok(())).is_err());
+        assert_eq!(std::fs::read(store.sessions_path()).unwrap(), bytes);
     }
 
     /// Upgrade path for #3215: a row relocated by an earlier version. The purge

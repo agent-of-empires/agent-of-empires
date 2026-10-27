@@ -2309,6 +2309,14 @@ impl Storage {
             .map(|(result, _, _)| result)
     }
 
+    /// Like [`Self::update`], but refuses to rewrite a store holding an undecodable row.
+    pub(crate) fn update_complete<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
+    {
+        self.update_with_snapshot(f).map(|(result, _, _)| result)
+    }
+
     /// Return the committed rows and groups without rereading after releasing the flock.
     pub(crate) fn update_with_snapshot<F, R>(&self, f: F) -> Result<(R, Vec<Instance>, Vec<Group>)>
     where

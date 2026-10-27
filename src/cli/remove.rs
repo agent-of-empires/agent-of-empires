@@ -99,7 +99,7 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         let _lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&removed_id)
             .map_err(|error| anyhow::anyhow!("failed to acquire instance trash lock: {error}"))?;
-        let mut inst = storage.update(|all_instances, _groups| {
+        let mut inst = storage.update_complete(|all_instances, _groups| {
             let stored = all_instances
                 .iter_mut()
                 .find(|instance| instance.id == removed_id)
