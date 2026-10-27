@@ -7411,7 +7411,7 @@ async fn attach_receipt_preserves_added_repo_metadata_and_complete_peer_publicat
         .contains_key(crate::daemon::RUNTIME_REVISION_HEADER));
     let body: serde_json::Value =
         serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await?)?;
-    let outcome = &body;
+    let outcome = &body["outcome"];
     assert_eq!(outcome["attached"]["name"], "frontend");
     assert_eq!(outcome["attached"]["branch"], "attach-branch");
     assert_eq!(outcome["attached"]["branch_created"], true);

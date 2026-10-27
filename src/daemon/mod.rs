@@ -756,10 +756,7 @@ impl DaemonClient {
         body: &EmptyTrashBody,
         epoch: &str,
     ) -> Result<MutationReceipt<EmptyTrashOutcome>, DaemonClientError> {
-        let url = self
-            .sessions_url
-            .join("empty-trash")
-            .map_err(|_| DaemonClientError::Transport)?;
+        let url = format!("{}/empty-trash", self.sessions_url);
         self.request_mutation_with_outcome(self.http.post(url).json(body), epoch)
             .await
     }
@@ -1461,6 +1458,39 @@ mod tests {
         assert_eq!(captured.path, "/api/sessions/sess-1/stop");
         assert_eq!(captured.epoch.as_deref(), Some("epoch-1"));
         assert!(captured.body.is_empty(), "stop sends no body");
+    }
+
+    #[tokio::test]
+    async fn empty_trash_posts_profile_to_the_sessions_route() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let base = serve_mutation_once(
+            "/api/sessions/empty-trash",
+            200,
+            vec![
+                (RUNTIME_EPOCH_HEADER, "epoch-1"),
+                (RUNTIME_REVISION_HEADER, "3"),
+            ],
+            r#"{"sessions":[],"failures":[]}"#,
+            tx,
+        )
+        .await;
+        let client = DaemonClient::new(&base, None).expect("test client");
+        let receipt = client
+            .empty_trash(
+                &EmptyTrashBody {
+                    profile: "work".into(),
+                },
+                "epoch-1",
+            )
+            .await
+            .expect("empty trash");
+        assert!(receipt.outcome.sessions.is_empty());
+        let captured = next_request(rx).await;
+        assert_eq!(captured.method, "POST");
+        assert_eq!(captured.path, "/api/sessions/empty-trash");
+        assert_eq!(captured.epoch.as_deref(), Some("epoch-1"));
+        let body: serde_json::Value = serde_json::from_slice(&captured.body).unwrap();
+        assert_eq!(body["profile"], "work");
     }
 
     #[tokio::test]
