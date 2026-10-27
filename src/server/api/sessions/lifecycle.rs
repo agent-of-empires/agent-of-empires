@@ -1894,7 +1894,7 @@ fn reserve_structured_restart(
         crate::session::LifecycleReservationError::Superseded
     );
     if matches!(restart_origin, RestartOrigin::StartupRecovery) {
-        // Preserve stored custody errors before refusing structured recovery.
+        // Preserve archived/trashed refusals.
         probe
             .ensure_startable()
             .map_err(LifecycleTargetError::Blocked)?;
