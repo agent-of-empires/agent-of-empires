@@ -1084,14 +1084,31 @@ async fn native_creation_progress_reports_phases_to_the_local_stream() {
         "progress must carry the hook's first line, got: {:?}",
         observed.output
     );
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !connection
+            .snapshot()
+            .contents
+            .sessions
+            .iter()
+            .any(|row| row.id == observed.session_id)
+        {
+            connection
+                .next_snapshot()
+                .await
+                .expect("runtime stream stayed connected");
+        }
+    })
+    .await
+    .expect("the reservation reached the canonical snapshot");
     let pending = sdk
         .list_sessions(None)
         .await
         .unwrap()
         .sessions
         .into_iter()
-        .find(|row| row.title == "progress")
+        .find(|row| row.id == observed.session_id)
         .expect("the reservation is published while provisioning");
+    assert_eq!(pending.title, "progress");
     assert!(
         sdk.cancel_creation(&pending.id, &epoch).await.is_ok(),
         "a pending creation accepts cancellation"

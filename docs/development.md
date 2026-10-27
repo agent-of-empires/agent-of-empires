@@ -23,6 +23,10 @@ The core-rest CI leg requires the scoped cancellation case to run with
 may skip the scoped case when no usable user manager exists; unscoped
 cancellation still runs.
 
+Creation-progress events are advisory and publish independently of session
+snapshots. Tests that need a published session must wait for its ID in the
+canonical snapshot.
+
 The binary is `target/{profile}/aoe`. Web commands and test selection live in `web/AGENTS.md`.
 
 Debug builds carry line tables only, and dependencies carry no debug info, to keep `target/` small across worktrees. Panics still name the file and line in this crate, but a debugger has no local values; rebuild with `RUSTFLAGS="-Cdebuginfo=2"` for a full debugging session.
