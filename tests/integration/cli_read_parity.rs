@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use agent_of_empires::server::test_support::{
-    build_test_app_state_with_policy, RuntimeUdsTestServer,
+    build_test_app_state_with_policy, serve_owner_router_for_test,
 };
 use agent_of_empires::session::{Instance, Status, View};
 
@@ -829,8 +829,14 @@ async fn compare_transports_with(
 
     let mut served: Vec<(Vec<String>, Run)> = Vec::new();
     {
-        let daemon = RuntimeUdsTestServer::start_in(&xdg_base, state.clone())
-            .unwrap_or_else(|reason| panic!("the fixture home is a trusted namespace: {reason}"));
+        let socket = xdg_base
+            .join(agent_of_empires::session::APP_DIR_NAME_XDG)
+            .join("daemon/api.sock");
+        let owner = serve_owner_router_for_test(
+            &socket,
+            agent_of_empires::server::test_support::build_router_for_test(state.clone()),
+        )
+        .await;
         for (index, args) in commands.iter().enumerate() {
             let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
             let result = run(home.clone(), args.clone()).await;
@@ -876,7 +882,8 @@ async fn compare_transports_with(
             compare(args, expected, &remote);
         }
         shutdown.cancel();
-        let _fixture = daemon.join().await;
+        owner.abort();
+        let _ = owner.await;
         http.await.unwrap();
     }
     for (args, _) in &served {

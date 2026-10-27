@@ -1,5 +1,5 @@
 //! Validate and render a daemon snapshot after a two-frame WebSocket exchange.
-//! Production reads acquire a local Daemon only after proven publication absence.
+//! Production reads acquire a local Daemon only after its socket is proven absent.
 
 /// Shared with the producer's contract checks against the real client decoder.
 pub(crate) mod dto;
@@ -9,9 +9,6 @@ pub(crate) mod pack;
 #[cfg(test)]
 mod pack_tests;
 mod render;
-/// Linux descriptor admission shared with the local publisher.
-#[cfg(target_os = "linux")]
-pub(crate) mod uds;
 
 use std::time::Duration;
 use tokio::time::Instant;
@@ -32,8 +29,6 @@ use self::dto::{
 /// endpoint; production callers use [`read_request_source`].
 pub use self::endpoint::ReadRequestSource;
 use self::endpoint::SelectedEndpoint;
-#[cfg(target_os = "linux")]
-use self::uds::UdsIdentity;
 use super::group::GroupListArgs;
 use super::list::ListArgs;
 use super::project::ProjectListArgs;
@@ -264,7 +259,7 @@ async fn acquire_local_read(
     command: ScopedCommand<'_>,
     source: &ReadRequestSource,
 ) -> Result<render::Projection, ReadFailure> {
-    let endpoint = crate::acp::client::daemon_manager::require_local_read_daemon()
+    crate::acp::client::daemon_manager::require_local_read_daemon()
         .await
         .map_err(|error| {
             ReadFailure::pre_exact(
@@ -272,15 +267,7 @@ async fn acquire_local_read(
                 format!("daemon read: unavailable\n{error}\n"),
             )
         })?;
-    #[cfg(target_os = "linux")]
-    {
-        drop(endpoint);
-        execute_inner(command, source).await
-    }
-    #[cfg(target_os = "macos")]
-    {
-        execute_local_api(command, source, &endpoint).await
-    }
+    execute_inner(command, source).await
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -350,32 +337,14 @@ async fn execute_inner(
     let establishment_deadline = Instant::now() + CONNECTION_BUDGET;
     match endpoint {
         SelectedEndpoint::Local => {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             {
-                let connection = uds::connect(establishment_deadline).await?;
-                let request = "ws://localhost/api/runtime/read/ws"
-                    .into_client_request()
-                    .map_err(|_| ReadFailure::post("unavailable"))?;
-                let exchange = connection.upgrade(request).await?;
-                let uds::UdsExchange {
-                    stream,
-                    identity,
-                    home,
-                    deadline,
-                    _admission,
-                } = exchange;
-                exchange_stream(
-                    stream,
-                    deadline,
-                    ExpectedPeer::Local(identity),
-                    Some(home.as_path()),
-                    command,
-                    source,
-                )
-                .await
+                let _ = establishment_deadline;
+                let path = crate::daemon::transport::local_socket_path()
+                    .map_err(|_| ReadFailure::pre("unavailable"))?;
+                execute_local_api(command, source, &path).await
             }
-            // No local publisher on this platform.
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             {
                 let _ = establishment_deadline;
                 Err(ReadFailure::local_absence())
@@ -407,15 +376,12 @@ async fn execute_inner(
     }
 }
 
-#[cfg(any(target_os = "macos", all(test, unix)))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn execute_local_api(
     command: ScopedCommand<'_>,
     source: &ReadRequestSource,
-    endpoint: &crate::acp::client::DaemonEndpoint,
+    path: &std::path::Path,
 ) -> Result<render::Projection, ReadFailure> {
-    let path = endpoint
-        .unix_path()
-        .ok_or_else(|| ReadFailure::pre("unavailable"))?;
     let deadline = Instant::now() + CONNECTION_BUDGET;
     let stream = tokio::time::timeout_at(deadline, async {
         let stream =
@@ -425,7 +391,7 @@ async fn execute_local_api(
                     crate::daemon::DaemonClientError::PeerIdentity => {
                         ReadFailure::pre("peer_identity")
                     }
-                    _ => ReadFailure::pre("unavailable"),
+                    _ => ReadFailure::local_absence(),
                 })?;
         let request = "ws://localhost/api/runtime/read/ws"
             .into_client_request()
@@ -636,10 +602,8 @@ fn websocket_config() -> WebSocketConfig {
 #[derive(Debug)]
 enum ExpectedPeer {
     Remote,
-    #[cfg(any(target_os = "macos", all(test, unix)))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     ApiUnix,
-    #[cfg(target_os = "linux")]
-    Local(UdsIdentity),
 }
 
 async fn exchange_stream<S>(
@@ -675,9 +639,9 @@ async fn exchange_inner<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    #[cfg(any(target_os = "macos", all(test, unix)))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let server_closes = matches!(&expected, ExpectedPeer::ApiUnix);
-    #[cfg(not(any(target_os = "macos", all(test, unix))))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let server_closes = false;
     let hello_text = match read_application(&mut stream).await {
         Ok(text) => text,
@@ -693,20 +657,6 @@ where
     if let Err(code) = validate_hello(&hello) {
         return Err(ReadFailure::post_no_close(code));
     }
-    // The local transport proves the peer it reached is the publisher whose
-    // markers it admitted; a named endpoint has no such claim to check.
-    #[cfg(target_os = "linux")]
-    if let ExpectedPeer::Local(identity) = &expected {
-        if hello.namespace != identity.namespace
-            || hello.prebind_instance_id != identity.prebind_instance_id
-            || hello.runtime_instance_id != identity.runtime_instance_id
-            || hello.runtime_epoch != identity.runtime_epoch
-            || hello.owner.uid != Some(identity.owner_uid)
-        {
-            return Err(ReadFailure::post_no_close("peer_identity"));
-        }
-    }
-
     let snapshot_text = match read_application(&mut stream).await {
         Ok(text) => text,
         Err(error) => return Err(error),
@@ -732,14 +682,7 @@ where
         )
         .await;
     }
-    let local_uid = match &expected {
-        ExpectedPeer::Remote => None,
-        #[cfg(any(target_os = "macos", all(test, unix)))]
-        ExpectedPeer::ApiUnix => None,
-        #[cfg(target_os = "linux")]
-        ExpectedPeer::Local(identity) => Some(identity.owner_uid),
-    };
-    if let Err(code) = validate_cross_message(&hello, &snapshot, local_uid) {
+    if let Err(code) = validate_cross_message(&hello, &snapshot, None) {
         return finish_with_close(
             &mut stream,
             deadline,
@@ -901,7 +844,7 @@ mod tests {
     use std::ffi::OsString;
 
     #[tokio::test]
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[serial_test::serial]
     async fn local_api_reads_keep_unix_transport_and_remote_wire_shape() {
         use crate::server::test_support::{
@@ -920,7 +863,6 @@ mod tests {
         accept_runtime_read_cache_for_test(&state).await;
         let path = crate::daemon::transport::local_socket_path().unwrap();
         let server = serve_owner_router_for_test(&path, build_router_for_test(state.clone())).await;
-        let endpoint = crate::acp::client::DaemonEndpoint::local_unix(path);
         let source = ReadRequestSource {
             explicit_url: None,
             env_url: None,
@@ -929,14 +871,12 @@ mod tests {
             env_profile: None,
         };
         let cli = Cli::parse_from(["aoe", "list", "--json"]);
-        let projection =
-            execute_local_api(classify(cli.command.as_ref()).unwrap(), &source, &endpoint)
-                .await
-                .unwrap();
+        let projection = execute_local_api(classify(cli.command.as_ref()).unwrap(), &source, &path)
+            .await
+            .unwrap();
         let rows: serde_json::Value = serde_json::from_str(&projection.stdout).unwrap();
         assert_eq!(rows[0]["id"], "api-uds-row");
         assert_eq!(rows[0]["title"], "API UDS only");
-        assert!(endpoint.dashboard_url().is_none());
         state.shutdown.cancel();
         server.abort();
         let _ = server.await;

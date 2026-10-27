@@ -22,8 +22,6 @@ mod cli_read_parity;
 mod cli_read_record;
 #[cfg(debug_assertions)]
 mod cli_read_server;
-#[cfg(all(target_os = "linux", debug_assertions))]
-mod cli_read_uds;
 mod common;
 #[cfg(unix)]
 mod frozen_environment;

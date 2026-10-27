@@ -1,30 +1,28 @@
 //! Read-only runtime read endpoint: `GET /api/runtime/read/ws`.
 //!
-//! One connection carries a Hello and a Snapshot. HTTP closes after sending;
-//! the local transport waits for the client's close handshake. Reads never
-//! mutate session, profile, group or project state.
+//! One connection carries a Hello and a Snapshot, then the server closes. Reads
+//! never mutate session, profile, group or project state.
 //!
-//! Authentication for the HTTP route is the router's existing credential gate, so
-//! a caller without a valid credential never reaches the upgrade. The same two
-//! frames are also served over the daemon's own UNIX socket, where the peer is
-//! the same uid the daemon runs as, so that transport declares the local owner.
+//! Authentication is the router's existing credential gate, so a caller without
+//! a valid credential never reaches the upgrade. The same route serves the TCP
+//! listener and the daemon's Unix socket.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
-#[cfg(any(target_os = "linux", test))]
+#[cfg(test)]
 use tokio::net::UnixStream;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
-#[cfg(any(target_os = "linux", test))]
+#[cfg(test)]
 use futures_util::SinkExt;
 use futures_util::StreamExt;
 
 use serde::Serialize;
-#[cfg(any(target_os = "linux", test))]
+#[cfg(test)]
 use tokio_tungstenite::tungstenite;
 
 use super::AppState;
@@ -41,8 +39,7 @@ pub(crate) const PROTOCOL_VERSION: u16 = 4;
 pub(crate) const CONNECTION_BUDGET: Duration = Duration::from_secs(15);
 /// Shared incoming and outgoing frame/message ceiling for both transports.
 pub(crate) const MESSAGE_LIMIT: usize = crate::cli::runtime_read::APPLICATION_LIMIT;
-/// The trusted namespace this build publishes for itself, and the name the
-/// UDS marker files carry.
+/// The trusted namespace this build publishes for itself.
 pub(crate) const NAMESPACE: &str = if cfg!(debug_assertions) {
     "debug:agent-of-empires-dev"
 } else {
@@ -75,29 +72,10 @@ async fn serve_runtime_read(socket: WebSocket, state: Arc<AppState>) {
     run_read(ReadSocket::Web(socket), state, Owner::remote(), true).await;
 }
 
-/// The same two frames over the daemon's own UNIX socket. The peer is admitted
-/// by [`super::runtime_uds`], which checks the connecting uid before the
-/// upgrade, so the declared owner is this process's own uid.
-#[cfg(target_os = "linux")]
-pub(crate) async fn serve_runtime_read_uds(
-    socket: tokio_tungstenite::WebSocketStream<UnixStream>,
-    state: Arc<AppState>,
-) {
-    if state.cityhall_mode {
-        tracing::warn!(
-            target: "runtime.uds",
-            "refusing the local runtime read while CityHall lockdown is on"
-        );
-        return;
-    }
-    let uid = crate::process::effective_uid();
-    run_read(ReadSocket::Unix(socket), state, Owner::local(uid), false).await;
-}
-
-/// Both transports share snapshot production and the two application frames.
+/// Frame transports for `run_read`; the Unix one exists only to drive it in tests.
 enum ReadSocket {
     Web(WebSocket),
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(test)]
     Unix(tokio_tungstenite::WebSocketStream<UnixStream>),
 }
 
@@ -108,7 +86,7 @@ impl ReadSocket {
                 .send(Message::Text(text.into()))
                 .await
                 .map_err(|_| ()),
-            #[cfg(any(target_os = "linux", test))]
+            #[cfg(test)]
             ReadSocket::Unix(socket) => socket
                 .send(tungstenite::Message::Text(text.into()))
                 .await
@@ -125,7 +103,7 @@ impl ReadSocket {
                     }
                 }
             }
-            #[cfg(any(target_os = "linux", test))]
+            #[cfg(test)]
             ReadSocket::Unix(socket) => {
                 while let Some(Ok(message)) = socket.next().await {
                     if matches!(message, tungstenite::Message::Close(_)) {
@@ -140,7 +118,7 @@ impl ReadSocket {
             ReadSocket::Web(socket) => {
                 let _ = socket.send(Message::Close(None)).await;
             }
-            #[cfg(any(target_os = "linux", test))]
+            #[cfg(test)]
             ReadSocket::Unix(socket) => {
                 let _ = socket.send(tungstenite::Message::Close(None)).await;
                 let _ = socket.close(None).await;

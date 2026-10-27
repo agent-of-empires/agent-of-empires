@@ -522,128 +522,6 @@ pub async fn reload_tmux_applied_for_test(
     .expect("Tmux-applied reload did not finish within 30 seconds");
 }
 
-/// A temporary XDG base whose whole ancestor chain satisfies the client's
-/// trusted walk, with the environment bound to it, so a test that publishes or
-/// reads never touches the developer's real app directory. `None` means this
-/// host has no such chain, which every caller treats as a failure.
-#[cfg(all(test, target_os = "linux"))]
-pub(crate) fn trusted_namespace() -> Option<(tempfile::TempDir, RuntimeEnvGuard)> {
-    let mut guard = RuntimeEnvGuard::read_lock();
-    let euid = crate::process::effective_uid();
-    let mut candidates = Vec::new();
-    if let Some(base) = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from) {
-        candidates.push(base);
-    }
-    candidates.push(std::env::temp_dir());
-    if let Some(home) = dirs::home_dir() {
-        candidates.push(home);
-    }
-    for base in candidates {
-        if crate::cli::runtime_read::uds::open_trusted_directory(&base, euid).is_err() {
-            continue;
-        }
-        let Ok(base) = tempfile::tempdir_in(&base) else {
-            continue;
-        };
-        guard.bind(base.path());
-        return Some((base, guard));
-    }
-    None
-}
-
-/// A live local runtime read, in a namespace of the test's own.
-///
-/// The producer resolves the app dir from the environment, so the harness
-/// points `XDG_CONFIG_HOME` at a temporary base first. Bases are tried in
-/// order and the real publisher is the oracle: a base whose ancestor chain the
-/// trusted walk would reject is reported as `app_dir_untrusted` and skipped.
-#[cfg(target_os = "linux")]
-pub struct RuntimeUdsTestServer {
-    /// The temporary base a publication owns, when this harness created it.
-    _namespace: Option<tempfile::TempDir>,
-    app_dir: std::path::PathBuf,
-    _env: RuntimeEnvGuard,
-    listener: tokio::task::JoinHandle<()>,
-}
-
-#[cfg(target_os = "linux")]
-impl RuntimeUdsTestServer {
-    pub fn start(state: Arc<AppState>) -> Result<Self, String> {
-        let mut env = RuntimeEnvGuard::read_lock();
-        let mut bases: Vec<std::path::PathBuf> = Vec::new();
-        if let Some(base) = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from) {
-            bases.push(base);
-        }
-        bases.push(std::env::temp_dir());
-        if let Some(home) = dirs::home_dir() {
-            bases.push(home);
-        }
-        let mut rejected = Vec::new();
-        for base in bases {
-            let namespace = match tempfile::tempdir_in(&base) {
-                Ok(namespace) => namespace,
-                Err(error) => {
-                    rejected.push(format!("{}: {error}", base.display()));
-                    continue;
-                }
-            };
-            env.bind(namespace.path());
-            match super::runtime_uds::try_publish() {
-                Ok(published) => {
-                    let listener = crate::task_util::spawn_supervised(
-                        "runtime.uds.test",
-                        crate::task_util::PanicPolicy::Log,
-                        super::runtime_uds::serve(state, published),
-                    );
-                    return Ok(Self {
-                        app_dir: namespace.path().join(crate::session::APP_DIR_NAME_XDG),
-                        _namespace: Some(namespace),
-                        _env: env,
-                        listener,
-                    });
-                }
-                Err(error) => {
-                    if error.code() != "app_dir_untrusted" {
-                        return Err(error.to_string());
-                    }
-                    rejected.push(format!("{}: {error}", base.display()));
-                }
-            }
-        }
-        Err(format!("no trusted app dir base: {rejected:?}"))
-    }
-
-    /// Publish beneath xdg_base/<APP_DIR_NAME_XDG>, matching client discovery.
-    pub fn start_in(xdg_base: &std::path::Path, state: Arc<AppState>) -> Result<Self, String> {
-        let env = RuntimeEnvGuard::set(xdg_base);
-        let app_dir = xdg_base.join(crate::session::APP_DIR_NAME_XDG);
-        std::fs::create_dir_all(&app_dir).map_err(|error| error.to_string())?;
-        let published = super::runtime_uds::try_publish().map_err(|error| error.to_string())?;
-        let listener = crate::task_util::spawn_supervised(
-            "runtime.uds.test",
-            crate::task_util::PanicPolicy::Log,
-            super::runtime_uds::serve(state, published),
-        );
-        Ok(Self {
-            app_dir,
-            _namespace: None,
-            _env: env,
-            listener,
-        })
-    }
-
-    /// The app dir this publication owns, for assertions on its artifacts.
-    pub fn app_dir(&self) -> std::path::PathBuf {
-        self.app_dir.clone()
-    }
-
-    /// Wait for retraction; retain the returned guards for post-shutdown reads.
-    pub async fn join(self) -> (Option<tempfile::TempDir>, RuntimeEnvGuard) {
-        let _ = self.listener.await;
-        (self._namespace, self._env)
-    }
-}
-
 /// Install a global `before_session` hook that creates `<label>-ready` in `dir` and blocks
 /// until `<label>-release` exists, so a test can commit a peer write inside a launch's hook
 /// window. Returns `(ready, release)`.
@@ -746,9 +624,8 @@ pub(crate) async fn archive_while_hook_waits(
     target.is_some()
 }
 
-#[cfg(test)]
 /// Serve a fixture router through the real owner-authenticated private listener.
-pub(crate) async fn serve_owner_router_for_test(
+pub async fn serve_owner_router_for_test(
     socket: &std::path::Path,
     router: axum::Router,
 ) -> tokio::task::JoinHandle<()> {

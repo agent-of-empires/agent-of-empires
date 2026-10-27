@@ -1804,8 +1804,6 @@ async fn start_daemon(
     let client = endpoint.daemon_client()?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
     let ready = tokio::time::timeout_at(deadline, async {
-        #[cfg(target_os = "linux")]
-        let mut require_local_read = None;
         loop {
             if let Some(status) = child.try_wait()? {
                 anyhow::bail!("Daemon exited before readiness: {status}");
@@ -1819,27 +1817,6 @@ async fn start_daemon(
                 && crate::process::process_birth_identity(pid)
                     .is_ok_and(|current| current.as_ref() == Some(&birth))
             {
-                #[cfg(target_os = "linux")]
-                {
-                    use crate::cli::runtime_read::uds::{self, TrustedPathError};
-                    let required = *require_local_read.get_or_insert_with(|| {
-                        !args.cityhall
-                            && match uds::existing_app_namespace() {
-                                Ok(_) | Err(TrustedPathError::Missing) => true,
-                                Err(TrustedPathError::Invalid | TrustedPathError::Refused(_)) => {
-                                    false
-                                }
-                            }
-                    });
-                    if required
-                        && !uds::connect(deadline)
-                            .await
-                            .is_ok_and(|connection| connection.owned_by(pid))
-                    {
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                        continue;
-                    }
-                }
                 return Ok::<(), anyhow::Error>(());
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;

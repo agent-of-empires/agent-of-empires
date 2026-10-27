@@ -205,7 +205,7 @@ Native clients classify errors from the status and one `AoE-Error-Code` response
 
 ## Runtime CLI reads
 
-The covered CLI reads (`list`, `status`, `session show`, `session list-trash`, `group list`, `profile list` or bare `profile`, and `project list`) require a Daemon answer. They use `/api/runtime/read/ws` when `--daemon-url` or `AOE_DAEMON_URL` selects an HTTP endpoint. `/api/runtime/ws` remains the separate TUI stream.
+The covered CLI reads (`list`, `status`, `session show`, `session list-trash`, `group list`, `profile list` or bare `profile`, and `project list`) require a Daemon answer. They use `/api/runtime/read/ws`, over the Daemon's local Unix socket by default and over HTTP when `--daemon-url` or `AOE_DAEMON_URL` selects an endpoint. `/api/runtime/ws` remains the separate TUI stream.
 
 The covered local command handlers return an internal error if runtime dispatch is bypassed; they never read storage.
 
