@@ -5,6 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use super::DaemonClientError;
+use crate::util::{runtime_path_refusal, RuntimePathRemedy};
 
 const PATH_SEGMENT: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
     .add(b' ')
@@ -58,65 +59,64 @@ pub(crate) fn prepare_runtime_directory(parent: &Path) -> anyhow::Result<()> {
             && !trusted_ancestor(meta.uid(), meta.mode(), owner)
         {
             if ancestor == parent {
-                return Err(directory_permission_error(
+                return Err(anyhow::anyhow!(runtime_path_refusal(
                     ancestor,
-                    "0700",
-                    "Set this directory to mode 0700",
-                ));
+                    meta.mode(),
+                    "not private to its owner",
+                    RuntimePathRemedy::Command {
+                        template: "chmod -- 0700 {path}",
+                        manual: "Set this directory to mode 0700",
+                    },
+                )));
             }
-            return Err(directory_permission_error(
+            return Err(anyhow::anyhow!(runtime_path_refusal(
                 ancestor,
-                "go-w",
-                "Remove group/other write permission from this directory",
-            ));
+                meta.mode(),
+                "writable by its group or by others",
+                RuntimePathRemedy::Command {
+                    template: "chmod -- go-w {path}",
+                    manual: "Remove group/other write permission from this directory",
+                },
+            )));
         }
         anyhow::ensure!(
             meta.is_dir()
                 && !meta.file_type().is_symlink()
                 && trusted_ancestor(meta.uid(), meta.mode(), owner),
-            "Unsafe daemon socket directory: {}",
-            ancestor.display()
+            "{}",
+            runtime_path_refusal(
+                ancestor,
+                meta.mode(),
+                "not a trusted real directory",
+                RuntimePathRemedy::Advice(
+                    "Inspect ownership and symlinks; select a real directory owned by this user or root.",
+                ),
+            )
         );
     }
     let directory = std::fs::symlink_metadata(parent)?;
     anyhow::ensure!(
         directory.uid() == owner,
-        "Daemon socket directory must be owned by this user: {}",
-        parent.display()
+        "{}",
+        runtime_path_refusal(
+            parent,
+            directory.mode(),
+            "owned by another user",
+            RuntimePathRemedy::Advice("Select a socket directory owned by this user."),
+        )
     );
     if directory.mode() & 0o777 != 0o700 {
-        return Err(directory_permission_error(
+        return Err(anyhow::anyhow!(runtime_path_refusal(
             parent,
-            "0700",
-            "Set this directory to mode 0700",
-        ));
+            directory.mode(),
+            "not private to its owner",
+            RuntimePathRemedy::Command {
+                template: "chmod -- 0700 {path}",
+                manual: "Set this directory to mode 0700",
+            },
+        )));
     }
     Ok(())
-}
-
-fn directory_permission_error(path: &Path, mode: &str, requirement: &str) -> anyhow::Error {
-    if let Some(text) = path.to_str().filter(|text| {
-        !text.contains(|c: char| {
-            // Bidi_Control characters are not covered by is_control().
-            c.is_control()
-                || matches!(
-                    c,
-                    '`' | '\u{061c}'
-                        | '\u{200e}'..='\u{200f}'
-                        | '\u{202a}'..='\u{202e}'
-                        | '\u{2066}'..='\u{2069}'
-                )
-        })
-    }) {
-        anyhow::anyhow!(
-            "Unsafe daemon socket directory: {text}. {requirement} with `chmod -- {mode} {}`, then retry.",
-            crate::session::environment::shell_escape(text)
-        )
-    } else {
-        anyhow::anyhow!(
-            "Unsafe daemon socket directory: {path:?}. {requirement} manually, then retry. No copyable shell command is available for this path."
-        )
-    }
 }
 
 /// The app dir belongs to aoe, but a umask of 002 creates it group-writable.
@@ -529,13 +529,18 @@ mod tests {
 
         // Filesystems need not accept non-UTF-8 names.
         let invalid = std::path::PathBuf::from(OsString::from_vec(b"invalid-\xff".to_vec()));
-        for mode in ["0700", "go-w"] {
-            let diagnostic =
-                directory_permission_error(&invalid, mode, "Repair directory permissions")
-                    .to_string();
+        for template in ["chmod -- 0700 {path}", "chmod -- go-w {path}"] {
+            let diagnostic = runtime_path_refusal(
+                &invalid,
+                0o777,
+                "not private to its owner",
+                RuntimePathRemedy::Command {
+                    template,
+                    manual: "Repair directory permissions",
+                },
+            );
             assert!(!diagnostic.contains("`chmod"), "{diagnostic}");
             assert!(diagnostic.contains(&format!("{invalid:?}")), "{diagnostic}");
-            assert!(diagnostic.contains("manually, then retry"), "{diagnostic}");
         }
 
         for name in [
@@ -589,6 +594,32 @@ mod tests {
                     .unwrap();
                 prepare_runtime_directory(&parent).unwrap();
             }
+        }
+    }
+
+    #[test]
+    fn untrusted_ancestor_diagnostics_escape_controls() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        for name in ["escape\x1b[31m", "bidi\u{202e}"] {
+            let root = tempfile::tempdir().unwrap();
+            let base = root.path().canonicalize().unwrap();
+            let target = base.join("real");
+            let parent = target.join("app/daemon");
+            std::fs::create_dir_all(&parent).unwrap();
+            for path in [&target, &target.join("app"), &parent] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let alias = base.join(name);
+            symlink(&target, &alias).unwrap();
+            let error = prepare_runtime_directory(&alias.join("app/daemon")).unwrap_err();
+            let diagnostic = error.to_string();
+            assert!(!diagnostic.contains(['\x1b', '\u{202e}']), "{diagnostic:?}");
+            assert!(diagnostic.contains(&format!("{alias:?}")), "{diagnostic:?}");
+            assert!(std::fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink());
         }
     }
 

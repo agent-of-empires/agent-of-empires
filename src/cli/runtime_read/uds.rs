@@ -24,6 +24,7 @@ use crate::server::runtime_uds::{
     is_temporary_of, LOCK_FILE, MARKER_LIMIT, POSTBIND_FILE, PREBIND_FILE, PUBLISHER_LOCK_FILE,
     SCHEMA, SOCKET_FILE, TEMPORARY_SEPARATOR,
 };
+use crate::util::{runtime_path_refusal, RuntimePathRemedy};
 
 /// Backoff avoids spinning within the bounded publication-establishment budget.
 const RETRY_INTERVAL: Duration = Duration::from_millis(50);
@@ -40,16 +41,16 @@ pub(crate) enum TrustedPathError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RefusedComponent {
     path: PathBuf,
-    mode: String,
+    mode: u32,
     cause: &'static str,
-    remedy: &'static str,
+    remedy: RuntimePathRemedy,
 }
 
 impl RefusedComponent {
-    fn new(path: &Path, mode: u32, cause: &'static str, remedy: &'static str) -> Self {
+    fn new(path: &Path, mode: u32, cause: &'static str, remedy: RuntimePathRemedy) -> Self {
         Self {
             path: path.to_path_buf(),
-            mode: format!("{mode:04o}"),
+            mode,
             cause,
             remedy,
         }
@@ -57,22 +58,8 @@ impl RefusedComponent {
 
     /// Identify the refused directory, its mode, cause and safe remedy.
     fn message(&self) -> String {
-        format!(
-            "refused to read the daemon's runtime state: {} is {} (mode {}).\n\
-             Resolve this by: {}\n",
-            self.path.display(),
-            self.cause,
-            self.mode,
-            self.remedy
-                .replace("{path}", &shell_word(&self.path.to_string_lossy())),
-        )
+        runtime_path_refusal(&self.path, self.mode, self.cause, self.remedy)
     }
-}
-
-/// A path quoted for the shell the remedy is typed into, so a home with a
-/// space in it is still one word.
-fn shell_word(value: &str) -> String {
-    format!("'{}'", value.replace('\'', r"'\''"))
 }
 
 pub(crate) struct OwnedNamespace {
@@ -402,7 +389,12 @@ fn unopenable_component(
     let mode = std::fs::symlink_metadata(path)
         .map(|meta| os::metadata_mode(&meta) & 0o7777)
         .unwrap_or(0);
-    TrustedPathError::Refused(RefusedComponent::new(path, mode, cause, remedy))
+    TrustedPathError::Refused(RefusedComponent::new(
+        path,
+        mode,
+        cause,
+        RuntimePathRemedy::Advice(remedy),
+    ))
 }
 
 fn open_dir(path: &Path) -> Result<OwnedFd, TrustedPathError> {
@@ -434,7 +426,9 @@ fn validate_directory_owner(
             path,
             mode,
             "not a directory",
-            "Select a real directory at {path}; inspect the existing path before replacing it.",
+            RuntimePathRemedy::Advice(
+                "Select a real directory at {path}; inspect the existing path before replacing it.",
+            ),
         )));
     }
     if stat.st_mode & 0o111 == 0 {
@@ -442,7 +436,10 @@ fn validate_directory_owner(
             path,
             mode,
             "not searchable by its own owner",
-            "chmod u+x {path}",
+            RuntimePathRemedy::Command {
+                template: "chmod -- u+x {path}",
+                manual: "Grant owner search permission on this directory",
+            },
         )));
     }
     let owned = if final_component {
@@ -455,7 +452,9 @@ fn validate_directory_owner(
             path,
             mode,
             "owned by another user",
-            "Run as the directory's owner, or select HOME/XDG_CONFIG_HOME for the intended user.",
+            RuntimePathRemedy::Advice(
+                "Run as the directory's owner, or select HOME/XDG_CONFIG_HOME for the intended user.",
+            ),
         )));
     }
     Ok(())
@@ -476,7 +475,9 @@ fn validate_directory_stat(
             path,
             mode,
             "not a directory",
-            "Inspect the existing path at {path}; select a directory without removing configuration.",
+            RuntimePathRemedy::Advice(
+                "Inspect the existing path at {path}; select a directory without removing configuration.",
+            ),
         )));
     }
     if !group_other_writes_allowed(&stat, final_component, euid) {
@@ -484,7 +485,10 @@ fn validate_directory_stat(
             path,
             mode,
             "writable by its group or by others",
-            "chmod go-w {path}",
+            RuntimePathRemedy::Command {
+                template: "chmod -- go-w {path}",
+                manual: "Remove group/other write permission from this directory",
+            },
         )));
     }
     if root_check {
@@ -506,7 +510,10 @@ fn validate_directory_stat(
             path,
             mode,
             message,
-            "setfacl -b {path}",
+            RuntimePathRemedy::Command {
+                template: "setfacl -b {path}",
+                manual: "Remove the directory's untrusted POSIX ACL",
+            },
         ))
     })?;
     Ok(())
@@ -963,6 +970,42 @@ fn socket_mode_allowed(stat: &os::Stat, euid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refused_directory_diagnostics_escape_unrepresentable_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::{ffi::OsStringExt, fs::PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        for name in [
+            OsString::from("escape\x1b[31m"),
+            OsString::from("bidi\u{202e}"),
+            OsString::from("line\nbreak"),
+            OsString::from_vec(b"invalid-\xff".to_vec()),
+        ] {
+            let path = root.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777)).unwrap();
+            let error = match open_trusted_directory(&path, crate::process::effective_uid()) {
+                Err(error) => error,
+                Ok(_) => panic!("unsafe directory admitted"),
+            };
+            let failure = trusted_path_failure(error);
+            assert_eq!(failure.code(), "marker_invalid");
+            assert_eq!(failure.exit, 2);
+            let diagnostic = failure.exact.unwrap();
+            assert!(
+                !diagnostic.contains(['\x1b', '\u{202e}', '\u{fffd}']),
+                "{diagnostic:?}"
+            );
+            assert!(diagnostic.contains(&format!("{path:?}")), "{diagnostic:?}");
+            assert!(!diagnostic.contains("chmod"), "{diagnostic:?}");
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o777
+            );
+        }
+    }
 
     #[tokio::test]
     #[serial_test::serial]

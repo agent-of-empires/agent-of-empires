@@ -1229,6 +1229,8 @@ mod tests {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         const CHILD: &str = "AOE_TEST_APP_DIR_UMASK_CHILD";
         const CASES: [(&str, u32); 2] = [("002", 0o755), ("077", 0o700)];
+        let thread = std::thread::current();
+        let test = thread.name().unwrap();
         if let Ok(mask) = std::env::var(CHILD) {
             let expected = CASES
                 .iter()
@@ -1257,6 +1259,7 @@ mod tests {
             fs::set_permissions(&config, fs::Permissions::from_mode(0o775)).unwrap();
             get_app_dir().unwrap();
             assert_eq!(fs::metadata(&config).unwrap().mode() & 0o777, 0o775);
+            fs::write(home.join("entered"), test).unwrap();
             return;
         }
         for (mask, _) in CASES {
@@ -1265,12 +1268,7 @@ mod tests {
             let config = home.path().join("nested/config");
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
             command
-                .args([
-                    "--exact",
-                    std::thread::current().name().unwrap(),
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
+                .args(["--exact", test, "--nocapture", "--test-threads=1"])
                 .env(CHILD, mask)
                 .env("HOME", home.path())
                 .env("XDG_CONFIG_HOME", &config);
@@ -1285,6 +1283,10 @@ mod tests {
                 "{}\n{}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                fs::read_to_string(home.path().join("entered")).unwrap(),
+                test
             );
         }
     }
