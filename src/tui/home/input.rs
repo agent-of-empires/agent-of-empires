@@ -3746,6 +3746,8 @@ impl HomeView {
         use crate::tui::dialogs::{served_via, WebState};
         if web_plugin_disabled() {
             WebState::Disabled
+        } else if matches!(self.dashboard_launch, Some(DashboardLaunch::Failed { .. })) {
+            WebState::Failed
         } else if !self.serve_running {
             WebState::Off
         } else if let Some(WebState::On(Some(via))) = known {

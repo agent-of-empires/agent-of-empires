@@ -71,6 +71,8 @@ pub enum WebState {
     On(Option<&'static str>),
     Disabled,
     NeedsDaemon,
+    /// A launch failed while no view was open; Enter on the row shows why, once.
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,14 +93,23 @@ pub struct ConnectionsView {
 
 impl ConnectionsView {
     pub fn new(daemon: Option<DaemonAttention>, web: WebState) -> Self {
-        Self {
+        let mut view = Self {
             host: host_name(),
             daemon,
             reason: None,
             web,
             selected: 0,
             row_rects: Vec::new(),
+        };
+        // A failed launch opens on its row, so Enter shows why at once.
+        if view.web == WebState::Failed {
+            view.selected = view
+                .rows()
+                .iter()
+                .position(|row| *row == Row::Web)
+                .unwrap_or(0);
         }
+        view
     }
 
     /// The home screen's takeover while the Daemon can't be reached.
@@ -249,6 +260,12 @@ impl ConnectionsView {
                             "Needs the Daemon".to_string(),
                             dim,
                         ),
+                        WebState::Failed => (
+                            "\u{25CF}",
+                            theme.error,
+                            "Didn't start \u{00B7} Enter shows why".to_string(),
+                            Style::default().fg(theme.text),
+                        ),
                     };
                     (dot, color, name, status, style, Vec::new())
                 }
@@ -358,7 +375,7 @@ mod tests {
         };
         let offline = || ConnectionsView::offline(Some("connection refused"));
         // (view, text shown, text absent)
-        let cases: [(ConnectionsView, &[&str], &[&str]); 6] = [
+        let cases: [(ConnectionsView, &[&str], &[&str]); 7] = [
             // Healthy: no Daemon row and one row, so no move hint.
             (
                 ConnectionsView::new(None, WebState::Off),
@@ -384,6 +401,11 @@ mod tests {
                 ConnectionsView::new(None, WebState::Disabled),
                 &["aoe.web plugin is disabled"],
                 &[],
+            ),
+            (
+                ConnectionsView::new(None, WebState::Failed),
+                &["Didn't start \u{00B7} Enter shows why"],
+                &["Off"],
             ),
             // The offline takeover: what still works, the reason, and today's r and q.
             (
@@ -465,6 +487,13 @@ mod tests {
         assert!(matches!(
             press(&mut view, KeyCode::Enter),
             DialogResult::Continue
+        ));
+
+        // A failed launch opens on its own row, so the first Enter shows why.
+        let mut failed = ConnectionsView::new(Some(DaemonAttention::ReadOnly), WebState::Failed);
+        assert!(matches!(
+            press(&mut failed, KeyCode::Enter),
+            DialogResult::Submit(())
         ));
 
         // A refresh follows the Daemon and keeps the selected row when the rows change.

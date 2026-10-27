@@ -2634,8 +2634,9 @@ impl App {
                     } else {
                         "API server"
                     };
-                    self.home
-                        .flash_status(format!("{what} didn't start. Press R for details."));
+                    self.home.flash_status(format!(
+                        "{what} didn't start. Press R, then Enter, for details."
+                    ));
                 }
                 self.home.set_sidebar_source(
                     crate::tui::session_feed::SidebarSource::Disconnected,
@@ -4383,7 +4384,26 @@ mod tests {
             crate::file_watch::FileWatchService::noop(),
         )
         .unwrap();
-        let open = KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT);
+        // R opens Connections; Enter on its Web dashboard row opens the view.
+        let open = |app: &mut App| {
+            app.home
+                .handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT), None);
+            assert!(app.home.connections_view.is_some(), "R opens Connections");
+            // Down reaches the Web dashboard row whether or not a Daemon row is above it.
+            app.home.handle_key(KeyEvent::from(KeyCode::Down), None);
+            app.home.handle_key(KeyEvent::from(KeyCode::Enter), None);
+            assert!(app.home.connections_view.is_none());
+        };
+        let hub = |app: &mut App| {
+            let view = app
+                .home
+                .connections_view
+                .as_mut()
+                .expect("Connections open");
+            test_render::text(&test_render::draw(110, 40, |frame, theme| {
+                view.render(frame, frame.area(), theme)
+            }))
+        };
         let screen = |app: &App| {
             let view = app.home.serve_view.as_ref().expect("serve view open");
             test_render::text(&test_render::draw(110, 40, |frame, theme| {
@@ -4400,7 +4420,7 @@ mod tests {
             app.dashboard_launch = Some(launch);
 
             // Reopened mid-launch, it counts from the launch and leaves the bound to the App.
-            app.home.handle_key(open, None);
+            open(&mut app);
             assert!(elapsed.is_match(&screen(&app)), "{}", screen(&app));
             assert!(app.home.serve_view.as_mut().is_some_and(|v| !v.tick()));
             if !view_open {
@@ -4413,12 +4433,20 @@ mod tests {
             assert!(app.poll_dashboard_launch());
             let flash = app.home.status_flash_text().unwrap_or_default().to_owned();
             assert_eq!(
-                flash.ends_with("didn't start. Press R for details."),
+                flash.ends_with("didn't start. Press R, then Enter, for details."),
                 flashed,
                 "{view_open}: {flash:?}"
             );
             if !view_open {
-                app.home.handle_key(open, None);
+                // The hub says it didn't start, on the row Enter opens.
+                app.home
+                    .handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT), None);
+                assert!(
+                    hub(&mut app).contains("Didn't start \u{00B7} Enter shows why"),
+                    "{}",
+                    hub(&mut app)
+                );
+                app.home.handle_key(KeyEvent::from(KeyCode::Enter), None);
             }
             assert!(
                 screen(&app).contains("Dashboard start failed."),
