@@ -18,9 +18,10 @@ to configure their private network namespace. The
 [web-e2e CI leg](../.github/workflows/tests.yml) requires this coverage with
 `AOE_REQUIRE_LOCAL_NETWORK_TESTS=1`; unavailable confinement fails the job.
 
-The core-rest CI leg requires real systemd scope cancellation coverage with
-`AOE_REQUIRE_SCOPED_TESTS=1`. Local runs may skip the scoped case when no usable
-user manager exists; unscoped cancellation still runs.
+The core-rest CI leg requires the scoped cancellation case to run with
+`AOE_REQUIRE_SCOPED_TESTS=1`; any setup path that skips it must fail. Local runs
+may skip the scoped case when no usable user manager exists; unscoped
+cancellation still runs.
 
 The binary is `target/{profile}/aoe`. Web commands and test selection live in `web/AGENTS.md`.
 
