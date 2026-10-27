@@ -417,6 +417,7 @@ function ComposerDock({
           status !== "open" || acpWorkerState !== "running" || state.workerStopped || state.workerRestarting
         }
         waitingFor={startingAgent}
+        agent={agentDisplayName(state.agent ?? acpAgent)}
       />
 
       <RejectedPromptsStrip
