@@ -7812,9 +7812,9 @@ async fn creation_progress_http_preserves_web_access_and_hides_unix_owner_entrie
             .create_progress
             .snapshot(
                 "visible-key",
-                Some(&crate::server::auth::LocalAuthorization::UnixOwner(
-                    nix::unistd::geteuid().as_raw()
-                ))
+                Some(&crate::server::principal::Principal::LocalPeer {
+                    uid: nix::unistd::geteuid().as_raw(),
+                })
             )
             .is_none());
     }
@@ -8665,9 +8665,9 @@ async fn a_dropped_create_finishes_and_its_retry_returns_the_same_session() {
                     State(state),
                     axum::extract::Query(CreateSessionQuery { wait: None }),
                     native_origin.then_some(axum::Extension(
-                        crate::server::auth::LocalAuthorization::UnixOwner(
-                            nix::unistd::geteuid().as_raw(),
-                        ),
+                        crate::server::principal::Principal::LocalPeer {
+                            uid: nix::unistd::geteuid().as_raw(),
+                        },
                     )),
                     Ok(Json(serde_json::from_value(body).unwrap())),
                 )
@@ -8676,8 +8676,9 @@ async fn a_dropped_create_finishes_and_its_retry_returns_the_same_session() {
             }
         });
         wait_for("the on_create hook to start", || ready.exists()).await;
-        let local =
-            crate::server::auth::LocalAuthorization::UnixOwner(nix::unistd::geteuid().as_raw());
+        let local = crate::server::principal::Principal::LocalPeer {
+            uid: nix::unistd::geteuid().as_raw(),
+        };
         wait_for("hook output to reach the progress registry", || {
             state
                 .create_progress
@@ -8704,9 +8705,9 @@ async fn a_dropped_create_finishes_and_its_retry_returns_the_same_session() {
                 State(state.clone()),
                 Path(public_key.clone()),
                 owner.then_some(axum::Extension(
-                    crate::server::auth::LocalAuthorization::UnixOwner(
-                        nix::unistd::geteuid().as_raw(),
-                    ),
+                    crate::server::principal::Principal::LocalPeer {
+                        uid: nix::unistd::geteuid().as_raw(),
+                    },
                 )),
             )
             .await

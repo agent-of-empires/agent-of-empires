@@ -362,7 +362,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
         // Every worker runs through `aoe __acp-runner` so it survives `aoe serve --stop`.
         let socket_path = worker_registry::socket_path_for(&req.session_id).map_err(|e| {
-            SupervisorError::Acp(AcpError::Spawn(format!("worker socket path: {e}")))
+            SupervisorError::Acp(AcpError::Spawn(format!("worker socket path: {e:#}")))
         })?;
         let mcp_servers = resolve_mcp_servers(
             &req.agent,

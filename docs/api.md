@@ -215,7 +215,7 @@ Native clients classify errors from the status and one `AoE-Error-Code` response
 
 ## Runtime CLI reads
 
-The covered CLI reads (`list`, `status`, `session show`, `session list-trash`, `group list`, `profile list` or bare `profile`, and `project list`) require a Daemon answer. They use `/api/runtime/read/ws` when `--daemon-url` or `AOE_DAEMON_URL` selects an HTTP endpoint. `/api/runtime/ws` remains the separate TUI stream.
+The covered CLI reads (`list`, `status`, `session show`, `session list-trash`, `group list`, `profile list` or bare `profile`, and `project list`) require a Daemon answer. They use `/api/runtime/read/ws`, over the Daemon's local Unix socket by default and over HTTP when `--daemon-url` or `AOE_DAEMON_URL` selects an endpoint. `/api/runtime/ws` remains the separate TUI stream.
 
 The covered local command handlers return an internal error if runtime dispatch is bypassed; they never read storage.
 
@@ -227,15 +227,13 @@ CLI commands that still write storage directly, such as `session archive`, `sess
 
 After upgrading the CLI, a `protocol_mismatch` means the target daemon uses a different protocol version. On that daemon's host, run `aoe serve --restart` for a detached daemon; otherwise restart the foreground daemon or its service through the service manager. Update that host's installation if needed. A missing runtime-read route can also indicate an older daemon, but first check the selected URL and proxy routing.
 
-Without an HTTP endpoint, Linux first reads through its verified, same-user runtime socket. Only proven publication absence permits the [shared local auto-start policy](adr/0004-cli-writes-through-the-daemon.md), followed by one read through that same transport. Invalid or unverifiable publication artifacts, including unknown marker schemas and complete malformed temporary markers, refuse without starting or changing targets. Empty or genuinely truncated temporary writes alone do not establish a publication. macOS acquires the local Daemon through the same policy and reads through its returned API Unix socket, with peer-UID verification. The API route retains its existing wire shape; it does not claim Linux marker identity. A Client without a local backend requires a remote URL.
+Without an HTTP endpoint, the CLI acquires the local Daemon through the [shared local auto-start policy](adr/0004-cli-writes-through-the-daemon.md), which starts one only when the API Unix socket is proven absent, then reads through that socket with peer-UID verification on Linux and macOS. A Client without a local backend requires a remote URL.
 
-An implicit local read can still refuse after acquisition if the Daemon does not publish runtime reads. Check its mode, version compatibility and publication diagnostics; CityHall intentionally disables these reads on both transports. API readiness alone does not authorize a Linux runtime read.
+An implicit local read can still refuse after acquisition if the Daemon does not serve runtime reads. Check its mode and version compatibility; CityHall intentionally disables these reads on both transports.
 
 A `403` carrying a valid `AoE-Error-Code: cityhall_mode` produces the CLI refusal code `cityhall_mode`, not `unauthorized`. This is a deployment-mode restriction; retrying authentication does not enable runtime reads. The refusal does not trigger login retries, a different target or local startup.
 
-Identity refusals such as `peer_identity` and `marker_identity` require checking the expected Daemon, app/build namespace, versions and local socket/publication ownership through its manager. Do not remove publication artifacts or start another Daemon while ownership is uncertain.
-
-A named temporary-marker decode failure may indicate an incompatible Daemon version, not necessarily an abandoned write. Check versions first. Before removing the named temporary, stop every Daemon using this app directory through its service manager or `aoe serve --stop`, and verify no publisher remains. Remove only that file if it is abandoned; do not clear publication artifacts indiscriminately.
+Identity refusals such as `peer_identity` require checking the expected Daemon, app/build namespace, versions and socket ownership through its manager. Do not start another Daemon while ownership is uncertain.
 
 `--no-autostart` or `AOE_NO_AUTOSTART=1` disables local startup, not reuse of an existing Daemon. Startup failure or an absent Daemon with startup disabled is an error with guidance, never a disk answer. The spawning Client announces `Started aoe daemon (pid N)` only on stderr, including under `--json`. Local administrative commands keep their existing startup and configuration-recovery behavior; other reads outside this covered set remain unchanged.
 
@@ -245,7 +243,7 @@ On a genuine first run with no configured default, an unscoped read retains the 
 
 The route follows the daemon's authentication mode. CLI clients use `AOE_DAEMON_TOKEN` or `AOE_DAEMON_PASSPHRASE`; passphrase login shares the ACP client's device-bound session cache. Environment URLs discard query parameters, including query tokens. Explicit endpoints reject queries. HTTP on a non-loopback host is accepted only without credentials; remote authentication requires HTTPS. Localhost connections bypass proxies and pin both loopback address families.
 
-Loopback HTTP does not verify the listener's OS user. If another local user binds the selected port, that process can receive the CLI's bearer token or passphrase. Use it only with trusted local users and port ownership; unset the HTTP endpoint to use verified same-user UDS discovery on Linux.
+Loopback HTTP does not verify the listener's OS user. If another local user binds the selected port, that process can receive the CLI's bearer token or passphrase. Use it only with trusted local users and port ownership; unset the HTTP endpoint to use the verified same-user Unix socket.
 
 Runtime snapshots include stored launch commands on both transports to preserve CLI output. Commands may contain inline secrets; treat clients allowed to read snapshots as trusted, and do not expose `--auth none` to untrusted peers. Human output from served reads strips C0/C1 control characters from daemon-provided fields; JSON retains the original values.
 

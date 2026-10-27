@@ -99,6 +99,62 @@ test("structured view settings persist through PATCH + reload, node_path is stri
   expect(fetched?.acp?.node_path).not.toBe("/tmp/evil-node");
 });
 
+test("startup recovery wake stays opt-in and persists per profile without changing restart text", async ({
+  serve,
+  page,
+}, testInfo) => {
+  const profile = await defaultProfile(serve);
+  const settingsUrl = `${serve.baseUrl}/api/settings`;
+  const machineUrl = `${settingsUrl}?layer=machine`;
+  const effectiveUrl = `${settingsUrl}?profile=${encodeURIComponent(profile)}`;
+  const profileUrl = `${serve.baseUrl}/api/profiles/${encodeURIComponent(profile)}/settings`;
+  const message = "wake up: pick up what you were doing";
+  expect((await getJson(machineUrl)).session).toMatchObject({
+    startup_recovery_wake: false,
+    restart_wake_message: message,
+  });
+  await page.goto(`${serve.baseUrl}/settings/session`);
+  const toggle = page.locator('[data-settings-field="session.startup_recovery_wake"]').getByRole("switch");
+  await expect(toggle).toHaveAttribute("aria-checked", "false");
+  const invalid = await fetch(profileUrl, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session: { startup_recovery_wake: "true" } }),
+  });
+  expect(invalid.status).toBe(400);
+  const saved = page.waitForResponse(
+    (response) => response.url().startsWith(settingsUrl) && response.request().method() === "PATCH",
+  );
+  await toggle.click();
+  expect((await saved).ok()).toBe(true);
+  expect((await getJson(profileUrl)).session.startup_recovery_wake).toBe(true);
+  expect((await getJson(machineUrl)).session.startup_recovery_wake).toBe(false);
+  expect((await getJson(effectiveUrl)).session).toMatchObject({
+    startup_recovery_wake: true,
+    restart_wake_message: message,
+  });
+  await serve.restart();
+  await page.reload();
+  await expect(toggle).toHaveAttribute("aria-checked", "true");
+  await toggle.scrollIntoViewIfNeeded();
+  await testInfo.attach("startup-recovery-wake-setting", {
+    body: await page.screenshot(),
+    contentType: "image/png",
+  });
+  const reset = await fetch(profileUrl, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session: { startup_recovery_wake: null } }),
+  });
+  expect(reset.ok).toBe(true);
+  expect((await getJson(effectiveUrl)).session).toMatchObject({
+    startup_recovery_wake: false,
+    restart_wake_message: message,
+  });
+  await page.reload();
+  await expect(toggle).toHaveAttribute("aria-checked", "false");
+});
+
 test("MCP switch persists globally and changes route availability only after restart", async ({ serve, page }) => {
   const settingsUrl = `${serve.baseUrl}/api/settings`;
   const machineUrl = `${settingsUrl}?layer=machine`;

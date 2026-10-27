@@ -572,6 +572,20 @@
       "notes": "The real schema-driven switch persists machine-wide, rejects profile overrides, survives reload, and changes MCP route availability only after daemon restart."
     },
     {
+      "id": "settings.startup-recovery-wake",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/settings-persistence.spec.ts", "tests/live/startup-recovery.spec.ts"],
+      "components": [
+        "web/src/components/SettingsView.tsx",
+        "web/src/components/settings/SchemaSection.tsx",
+        "src/session/config/mod.rs",
+        "src/server/api/sessions/lifecycle.rs",
+        "src/server/startup_recovery.rs"
+      ],
+      "notes": "The real schema switch defaults off, validates boolean PATCH values, persists per profile, and resets to machine inheritance. Missing Idle/Waiting/Running panes still resume; opted-in default/custom text, empty opt-out, profile precedence, failed resume, and unchanged explicit API/CLI restart wake behavior use private fake agents."
+    },
+    {
       "id": "settings.list-field",
       "kind": "mocked-playwright",
       "risk": "medium",
@@ -3299,8 +3313,16 @@
       "id": "acp.ws-reconnect-liveness",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/hooks/useAcpSession.test.ts", "tests/acp-reconnect-hung-dial.spec.ts"],
-      "components": ["web/src/hooks/useAcpSession.ts", "web/src/hooks/acpSession/useAcpConnection.ts"]
+      "specs": [
+        "src/hooks/useAcpSession.test.ts",
+        "src/components/acp/SystemNotices.test.tsx",
+        "tests/acp-reconnect-hung-dial.spec.ts"
+      ],
+      "components": [
+        "web/src/hooks/useAcpSession.ts",
+        "web/src/hooks/acpSession/useAcpConnection.ts",
+        "web/src/components/acp/SystemNotices.tsx"
+      ]
     },
     {
       "id": "acp.args",
