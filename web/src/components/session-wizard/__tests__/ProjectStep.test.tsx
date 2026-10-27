@@ -174,6 +174,7 @@ describe("recent and saved projects", () => {
         onSelectSavedProject={onSelectSavedProject}
       />,
     );
+    expect((await screen.findByRole("alert")).textContent).toMatch(/^Projects could not be loaded\./);
     fireEvent.click((await screen.findByText("/repo/alpha")).closest("button")!);
     expect(onSelectSavedProject.mock.calls).toEqual([[null, "/repo/alpha"]]);
   });
