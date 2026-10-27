@@ -926,9 +926,12 @@ pub(crate) fn plan_instance(
         } else {
             &params.extra_env
         };
-        warnings.extend(crate::session::validate_env_entries(
-            effective_env.iter().chain(&params.before_start_hook_env),
-        ));
+        warnings.extend(crate::session::validate_env_entries(effective_env));
+        warnings.extend(
+            crate::session::validate_env_entries(&params.before_start_hook_env)
+                .into_iter()
+                .map(|w| w.replace("empty in the container", "skipped by the host hook")),
+        );
 
         instance.sandbox_info = Some(SandboxInfo {
             enabled: true,
@@ -2855,6 +2858,10 @@ mod tests {
     fn build_instance_keeps_hook_env_off_the_container_env() {
         let _home = crate::session::test_support::isolate_app_dir();
         let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
+        let runtime = containers::get_container_runtime();
+        if !runtime.is_available() || !runtime.is_daemon_running() {
+            return;
+        }
         let project = tempfile::tempdir().unwrap();
         let mut params = custom_agent_params(project.path(), "claude");
         params.sandbox = true;
