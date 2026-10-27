@@ -2672,6 +2672,29 @@
       ]
     },
     {
+      "id": "settings.structured-history-window",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/acp-history-window.spec.ts",
+        "src/components/settings/__tests__/StructuredViewDisplaySettings.test.tsx",
+        "src/hooks/__tests__/useHistoryWindow.test.tsx",
+        "src/lib/acpHistoryWindow.test.ts",
+        "src/components/acp/useTranscriptScroll.test.tsx",
+        "src/lib/__tests__/webUiSync.test.ts"
+      ],
+      "components": [
+        "web/src/components/settings/StructuredViewDisplaySettings.tsx",
+        "web/src/components/settings/FormFields.tsx",
+        "web/src/hooks/useWebSettings.ts",
+        "web/src/hooks/useHistoryWindow.ts",
+        "web/src/lib/acpHistoryWindow.ts",
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/useTranscriptScroll.ts"
+      ]
+    },
+    {
       "id": "settings.persistent-structured-views",
       "kind": "vitest",
       "risk": "low",

@@ -8,19 +8,27 @@ function FieldShell({
   label,
   description,
   labelClassName,
+  htmlFor,
   children,
 }: {
   label?: string;
   description?: string;
   labelClassName?: string;
+  htmlFor?: string;
   children: ReactNode;
 }) {
   return (
     <div>
       {label !== undefined && (
-        <label className={labelClassName ?? "block text-sm text-text-bright mb-1"}>{label}</label>
+        <label htmlFor={htmlFor} className={labelClassName ?? "block text-sm text-text-bright mb-1"}>
+          {label}
+        </label>
       )}
-      {description && <div className="text-xs text-text-dim mb-1">{description}</div>}
+      {description && (
+        <div id={htmlFor ? `${htmlFor}-description` : undefined} className="text-xs text-text-dim mb-1">
+          {description}
+        </div>
+      )}
       {children}
     </div>
   );
@@ -254,14 +262,17 @@ export function NumberField({
   min?: number;
   max?: number;
 }) {
+  const id = useId();
   const draft = useDraft(String(value), (next) => {
     const n = Number(next);
     if (!isNaN(n) && n !== value) onChange(n);
   });
 
   return (
-    <FieldShell label={label} description={description}>
+    <FieldShell label={label} description={description} htmlFor={id}>
       <input
+        id={id}
+        aria-describedby={description ? `${id}-description` : undefined}
         type="number"
         {...draft.props}
         onKeyDown={(e) => {

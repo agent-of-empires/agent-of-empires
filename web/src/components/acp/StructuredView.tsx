@@ -194,6 +194,7 @@ function AcpChrome({
     canLoadEarlierHistory: ctx.canLoadEarlierHistory,
     loadEarlierHistory: ctx.loadEarlierHistory,
     loadingEarlierHistory: ctx.loadingEarlierHistory,
+    historyRows: ctx.visibleHistory,
     composerCollapsed,
     promptSeq: state.promptSeq,
     hasEverOpened: ctx.hasEverOpened,

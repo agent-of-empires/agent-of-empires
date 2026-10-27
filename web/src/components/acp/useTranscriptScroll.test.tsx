@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useTranscriptScroll } from "./useTranscriptScroll";
 import { saveScrollState } from "../../lib/acpScrollState";
+import type { ActivityRow } from "../../lib/acpTypes";
 const originalMatchMedia = Object.getOwnPropertyDescriptor(window, "matchMedia");
 
 class FakeResizeObserver {
@@ -40,6 +41,8 @@ type HarnessProps = {
   folded: boolean;
   closed: boolean;
   streamed: boolean;
+  historyRows?: readonly ActivityRow[];
+  loadEarlier?: () => void;
 };
 
 function box(top: number, bottom: number): DOMRect {
@@ -56,12 +59,13 @@ function box(top: number, bottom: number): DOMRect {
   };
 }
 
-function Harness({ metrics, sessionId, folded, closed, streamed }: HarnessProps) {
-  const { viewportRef, belowViewportRef, messagesContentRef } = useTranscriptScroll({
+function Harness({ metrics, sessionId, folded, closed, streamed, historyRows, loadEarlier }: HarnessProps) {
+  const { viewportRef, belowViewportRef, messagesContentRef, requestEarlierHistory } = useTranscriptScroll({
     sessionId,
-    canLoadEarlierHistory: false,
-    loadEarlierHistory: () => {},
+    canLoadEarlierHistory: Boolean(loadEarlier),
+    loadEarlierHistory: loadEarlier ?? (() => {}),
     loadingEarlierHistory: false,
+    historyRows,
     composerCollapsed: false,
     promptSeq: 0,
     hasEverOpened: true,
@@ -112,6 +116,9 @@ function Harness({ metrics, sessionId, folded, closed, streamed }: HarnessProps)
 
   return (
     <div ref={viewportRef} data-testid="viewport">
+      <button type="button" onClick={requestEarlierHistory}>
+        Earlier
+      </button>
       <div ref={messagesContentRef} data-testid="content">
         {card}
         {streamed && <p>Follow-up text</p>}
@@ -138,11 +145,192 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
   if (originalMatchMedia) Object.defineProperty(window, "matchMedia", originalMatchMedia);
   else Reflect.deleteProperty(window, "matchMedia");
 });
+describe("useTranscriptScroll history anchors", () => {
+  it("keeps the explicit request anchor when preference growth overlaps its pending load", () => {
+    const metrics: Metrics = { clientHeight: 100, scrollHeight: 1200, scrollTop: 550, cardPageTop: 630 };
+    const sessionId = "history-overlap";
+    saveScrollState(sessionId, { stuck: false, top: 550 });
+    const recent: ActivityRow = { id: "recent", kind: "message", text: "recent" };
+    const older: ActivityRow = { id: "older", kind: "message", text: "older" };
+    const loadEarlier = vi.fn();
+    const props = { metrics, sessionId, folded: false, closed: true, streamed: true, loadEarlier };
+    const view = render(<Harness {...props} historyRows={[recent]} />);
+    const viewport = view.getByTestId("viewport") as HTMLDivElement;
+    const content = view.getByTestId("content");
+    act(() => viewport.dispatchEvent(new Event("scroll")));
+    act(() => view.getByRole("button", { name: "Earlier" }).click());
+    expect(loadEarlier).toHaveBeenCalledTimes(1);
+    metrics.scrollHeight += 100;
+    act(() => viewport.dispatchEvent(new Event("scroll")));
+    metrics.scrollHeight += 300;
+    view.rerender(<Harness {...props} historyRows={[older, recent]} />);
+    act(() => contentObserver(content).fire());
+    expect(viewport.scrollTop).toBe(950);
+  });
+
+  it("uses settled streamed growth as the baseline for a later preference prepend", () => {
+    const metrics: Metrics = { clientHeight: 100, scrollHeight: 1200, scrollTop: 550, cardPageTop: 630 };
+    const sessionId = "history-stream-before-prepend";
+    saveScrollState(sessionId, { stuck: false, top: 550 });
+    const recent: ActivityRow = { id: "recent", kind: "message", text: "recent" };
+    const older: ActivityRow = { id: "older", kind: "message", text: "older" };
+    const props = { metrics, sessionId, folded: false, closed: true, streamed: true };
+    const view = render(<Harness {...props} historyRows={[recent]} />);
+    const viewport = view.getByTestId("viewport") as HTMLDivElement;
+    const content = view.getByTestId("content");
+    act(() => viewport.dispatchEvent(new Event("scroll")));
+    metrics.scrollHeight = 1300;
+    act(() => contentObserver(content).fire());
+    expect(viewport.scrollTop).toBe(550);
+    metrics.scrollHeight = 1600;
+    view.rerender(<Harness {...props} historyRows={[older, recent]} />);
+    act(() => contentObserver(content).fire());
+    expect(viewport.scrollTop).toBe(850);
+    act(() => contentObserver(content).fire());
+    expect(viewport.scrollTop).toBe(850);
+  });
+
+  it("expires an invisible prepend anchor before later streamed text grows", () => {
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => frames.push(callback));
+    const metrics: Metrics = { clientHeight: 100, scrollHeight: 1200, scrollTop: 550, cardPageTop: 630 };
+    const sessionId = "history-invisible-prepend";
+    saveScrollState(sessionId, { stuck: false, top: 550 });
+    const recent: ActivityRow = { id: "recent", kind: "message", text: "recent" };
+    const older: ActivityRow = { id: "older", kind: "message", text: "hidden before clear" };
+    const props = { metrics, sessionId, folded: false, closed: true, streamed: true };
+    const view = render(<Harness {...props} historyRows={[recent]} />);
+    const viewport = view.getByTestId("viewport") as HTMLDivElement;
+    const content = view.getByTestId("content");
+    act(() => viewport.dispatchEvent(new Event("scroll")));
+    view.rerender(<Harness {...props} historyRows={[older, recent]} />);
+    act(() => {
+      while (frames.length > 0) frames.shift()!(0);
+    });
+    metrics.scrollHeight += 300;
+    act(() => contentObserver(content).fire());
+    expect(viewport.scrollTop).toBe(550);
+  });
+});
 
 describe("useTranscriptScroll fold corrections", () => {
+  it.each([false, true])("preserves text-only history prepends (pinned=%s)", (pinned) => {
+    const metrics: Metrics = {
+      clientHeight: 100,
+      scrollHeight: 1200,
+      scrollTop: pinned ? 1100 : 550,
+      cardPageTop: 630,
+    };
+    const sessionId = `history-prepend-${pinned}`;
+    saveScrollState(sessionId, { stuck: pinned, top: metrics.scrollTop });
+    const recent: ActivityRow = { id: "recent", kind: "message", text: "recent" };
+    const older: ActivityRow = { id: "older", kind: "message", text: "older" };
+    const props = { metrics, sessionId, folded: false, closed: true, streamed: true };
+    const view = render(<Harness {...props} historyRows={[recent]} />);
+    const viewport = view.getByTestId("viewport") as HTMLDivElement;
+    const content = view.getByTestId("content");
+    act(() => viewport.dispatchEvent(new Event("scroll")));
+    metrics.scrollHeight += 300;
+    view.rerender(<Harness {...props} historyRows={[older, recent]} />);
+    act(() => contentObserver(content).fire());
+    expect(viewport.scrollTop).toBe(pinned ? 1400 : 850);
+    act(() => contentObserver(content).fire());
+    expect(viewport.scrollTop).toBe(pinned ? 1400 : 850);
+  });
+
+  it.each(["append", "trim", "replace", "session"])("does not compensate a history %s as a prepend", (change) => {
+    const metrics: Metrics = { clientHeight: 100, scrollHeight: 1200, scrollTop: 550, cardPageTop: 630 };
+    const sessionId = `history-non-prepend-${change}`;
+    saveScrollState(sessionId, { stuck: false, top: 550 });
+    saveScrollState(`${sessionId}-next`, { stuck: false, top: 550 });
+    const first: ActivityRow = { id: "first", kind: "message", text: "first" };
+    const last: ActivityRow = { id: "last", kind: "message", text: "last" };
+    const newRow: ActivityRow = { id: "new", kind: "message", text: "new" };
+    const props = { metrics, sessionId, folded: false, closed: true, streamed: true };
+    const view = render(<Harness {...props} historyRows={[first, last]} />);
+    const viewport = view.getByTestId("viewport") as HTMLDivElement;
+    act(() => viewport.dispatchEvent(new Event("scroll")));
+    metrics.scrollHeight += 300;
+    const rows = change === "append" ? [first, last, newRow] : change === "trim" ? [last] : [newRow];
+    view.rerender(
+      <Harness {...props} sessionId={change === "session" ? `${sessionId}-next` : sessionId} historyRows={rows} />,
+    );
+    act(() => contentObserver(view.getByTestId("content")).fire());
+    expect(viewport.scrollTop).toBe(550);
+  });
+
+  it("loads earlier only on reader scrolling, not initial or delayed content layout", () => {
+    vi.spyOn(performance, "now").mockReturnValue(1000);
+    const loadEarlier = vi.fn();
+    const metrics: Metrics = { clientHeight: 100, scrollHeight: 1200, scrollTop: 0, cardPageTop: 630 };
+    const sessionId = "history-layout-no-autoload";
+    saveScrollState(sessionId, { stuck: false, top: 0 });
+    const view = render(
+      <Harness
+        metrics={metrics}
+        sessionId={sessionId}
+        folded={false}
+        closed={true}
+        streamed
+        loadEarlier={loadEarlier}
+      />,
+    );
+    const viewport = view.getByTestId("viewport") as HTMLDivElement;
+    act(() => contentObserver(view.getByTestId("content")).fire());
+    expect(loadEarlier).not.toHaveBeenCalled();
+    metrics.scrollHeight += 300;
+    act(() => contentObserver(view.getByTestId("content")).fire());
+    act(() => viewport.dispatchEvent(new Event("scroll")));
+    expect(loadEarlier).not.toHaveBeenCalled();
+    act(() => {
+      viewport.scrollTop = 300;
+      viewport.dispatchEvent(new Event("scroll"));
+      viewport.scrollTop = 0;
+      viewport.dispatchEvent(new Event("scroll"));
+    });
+    expect(loadEarlier).toHaveBeenCalledTimes(1);
+    vi.restoreAllMocks();
+  });
+
+  it("rearms after prepend compensation so Home loads again without layout loading", () => {
+    const now = vi.spyOn(performance, "now").mockReturnValue(1000);
+    const loadEarlier = vi.fn();
+    const metrics: Metrics = { clientHeight: 100, scrollHeight: 1200, scrollTop: 550, cardPageTop: 630 };
+    const sessionId = "history-compensation-rearm";
+    saveScrollState(sessionId, { stuck: false, top: 550 });
+    const recent: ActivityRow = { id: "recent", kind: "message", text: "recent" };
+    const older: ActivityRow = { id: "older", kind: "message", text: "older" };
+    const props = { metrics, sessionId, folded: false, closed: true, streamed: true, loadEarlier };
+    const view = render(<Harness {...props} historyRows={[recent]} />);
+    const viewport = view.getByTestId("viewport") as HTMLDivElement;
+    const content = view.getByTestId("content");
+    act(() => viewport.dispatchEvent(new Event("scroll")));
+    act(() => {
+      viewport.scrollTop = 0;
+      viewport.dispatchEvent(new Event("scroll"));
+    });
+    expect(loadEarlier).toHaveBeenCalledTimes(1);
+    metrics.scrollHeight += 300;
+    view.rerender(<Harness {...props} historyRows={[older, recent]} />);
+    act(() => contentObserver(content).fire());
+    expect(viewport.scrollTop).toBe(300);
+    act(() => viewport.dispatchEvent(new Event("scroll")));
+    expect(loadEarlier).toHaveBeenCalledTimes(1);
+    now.mockReturnValue(2000);
+    act(() => contentObserver(content).fire());
+    expect(loadEarlier).toHaveBeenCalledTimes(1);
+    act(() => {
+      viewport.dispatchEvent(new KeyboardEvent("keydown", { key: "Home" }));
+      viewport.scrollTop = 0;
+      viewport.dispatchEvent(new Event("scroll"));
+    });
+    expect(loadEarlier).toHaveBeenCalledTimes(2);
+  });
+
   it("preserves escape scrolling coalesced with the observer's bottom-following scroll", () => {
     const metrics: Metrics = { clientHeight: 100, scrollHeight: 1200, scrollTop: 1100, cardPageTop: 1150 };
     const sessionId = "streaming-reader-escape";

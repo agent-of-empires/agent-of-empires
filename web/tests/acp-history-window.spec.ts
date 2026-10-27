@@ -3,6 +3,7 @@
 import type { Page } from "@playwright/test";
 
 import { test, expect } from "./helpers/mockedTest";
+import { mockSettingsApis } from "./helpers/apiMocks";
 import {
   mockAcpSession,
   openStructuredSession,
@@ -17,9 +18,9 @@ function userPrompt(text: string) {
 
 const TURNS = 100;
 
-function longTranscript(): unknown[] {
+function longTranscript(turns = TURNS): unknown[] {
   const events: unknown[] = [];
-  for (let i = 0; i < TURNS; i += 1) {
+  for (let i = 0; i < turns; i += 1) {
     events.push(userPrompt(`prompt number ${i}`));
     events.push(agentMessageChunk(`reply number ${i}`));
     events.push(stopped());
@@ -87,4 +88,75 @@ test("loads older events from the server when the loaded window is exhausted", a
   const [response] = await Promise.all([olderPage, revealOldestTurn(page)]);
   expect(response.status()).toBe(200);
   await expect(page.getByText("prompt number 0")).toBeVisible({ timeout: 10_000 });
+});
+
+test("persists the initial history count through synced settings and keeps the reveal step fixed", async ({ page }) => {
+  // Register before the ACP helper so its populated session list takes precedence.
+  await mockSettingsApis(page);
+  const mock = await mockAcpSession(page, {
+    title: "story-history-preference",
+    initialEvents: longTranscript(320),
+  });
+  // Settings fetches the selected profile through a query parameter.
+  await page.route(
+    (url) => url.pathname === "/api/settings",
+    (route) => route.fulfill({ json: {} }),
+  );
+  const synced: Record<string, string> = {};
+  await page.route("**/api/app-state/web-ui-state", async (route) => {
+    if (route.request().method() === "PATCH") {
+      const patch = route.request().postDataJSON() as Record<string, string | null>;
+      for (const [key, value] of Object.entries(patch)) {
+        if (value === null) delete synced[key];
+        else synced[key] = value;
+      }
+    }
+    await route.fulfill({ json: synced });
+  });
+
+  await openStructuredSession(page, mock);
+  await waitForComposerConnected(page);
+  await expect(page.getByText("reply number 319", { exact: true })).toBeVisible();
+  await expect(page.getByText("prompt number 244", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("prompt number 245", { exact: true })).toHaveCount(1);
+
+  await page.goto("/settings/structured-view");
+  const history = page.getByRole("spinbutton", { name: "Initial visible history" });
+  await expect(history).toHaveValue("150");
+  await history.fill("200");
+  await history.press("Enter");
+  await expect.poll(() => JSON.parse(synced["aoe-web-settings"] ?? "{}").structuredHistoryWindow).toBe(200);
+
+  await openStructuredSession(page, mock);
+  await waitForComposerConnected(page);
+  await expect(page.getByText("reply number 319", { exact: true })).toBeVisible();
+  const prompts = page
+    .getByTestId("acp-viewport")
+    .locator("p")
+    .filter({ hasText: /^prompt number \d+$/ });
+  await expect(prompts).toHaveCount(100);
+  await expect(page.getByText("prompt number 219", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("prompt number 220", { exact: true })).toHaveCount(1);
+  // Avoid scrolling the button into view, which separately triggers scroll-up autoload.
+  await page.getByTestId("acp-load-earlier").evaluate((element) => (element as HTMLButtonElement).click());
+  await expect(prompts).toHaveCount(175);
+  await expect(page.getByText("prompt number 145", { exact: true })).toHaveCount(1);
+
+  await page.goto("/settings/structured-view");
+  await history.fill("500");
+  await history.blur();
+  await expect.poll(() => JSON.parse(synced["aoe-web-settings"] ?? "{}").structuredHistoryWindow).toBe(500);
+  await page.evaluate(() => localStorage.removeItem("aoe-web-settings"));
+  await page.reload();
+  await expect(history).toHaveValue("500");
+
+  await openStructuredSession(page, mock);
+  await waitForComposerConnected(page);
+  await expect(page.getByText("reply number 319", { exact: true })).toBeVisible();
+  await expect(prompts).toHaveCount(250);
+  await expect(page.getByText("prompt number 69", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("prompt number 70", { exact: true })).toHaveCount(1);
+  await page.getByTestId("acp-load-earlier").evaluate((element) => (element as HTMLButtonElement).click());
+  await expect(prompts).toHaveCount(320);
+  await expect(page.getByText("prompt number 0", { exact: true })).toHaveCount(1);
 });

@@ -11,6 +11,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type
 
 import { useAcpSession } from "../../hooks/useAcpSession";
 import { useHistoryWindow } from "../../hooks/useHistoryWindow";
+import { useWebSettings } from "../../hooks/useWebSettings";
 import {
   clearDraft,
   exclusiveRestore,
@@ -20,7 +21,13 @@ import {
 } from "../../lib/acpDrafts";
 import { MAX_ATTACHMENTS } from "./composerInput";
 import { isVisiblyBusy } from "../../lib/acpTypes";
-import type { AcpState, ApprovalDecision, ElicitationResolution, PromptAttachmentInput } from "../../lib/acpTypes";
+import type {
+  AcpState,
+  ActivityRow,
+  ApprovalDecision,
+  ElicitationResolution,
+  PromptAttachmentInput,
+} from "../../lib/acpTypes";
 import { useAgentProfile } from "../../lib/agentProfileContext";
 import { canOfferEarlier, earlierAction } from "../../lib/historyScroll";
 import { activityToThreadMessages, clearFoldGeneration } from "./activityMessages";
@@ -77,6 +84,7 @@ export interface AcpContext {
   /** Reveal loaded older rows first, then fetch the next page. */
   loadEarlierHistory: () => void;
   loadingEarlierHistory: boolean;
+  visibleHistory: readonly ActivityRow[];
 }
 
 /** Owns the external store so a new `key` builds a fresh runtime. A `/clear`
@@ -147,6 +155,7 @@ export function AcpRuntime({
 }: Props) {
   const acp = useAcpSession(sessionId, acpWorkerState, archivedAt, snoozedUntil);
   const agentProfile = useAgentProfile();
+  const { settings } = useWebSettings();
   const { pendingAttachments, setPendingAttachments, pendingAttachmentsRef } = usePendingAttachments(sessionId);
   const onCancel = useCancelEscalation(
     sessionId,
@@ -160,6 +169,7 @@ export function AcpRuntime({
     sessionId,
     acp.state.activity,
     showClearedTurns,
+    settings.structuredHistoryWindow,
   );
   const { loadOlder, hasMoreOlder, loadingOlder } = acp;
   const loadEarlierHistory = useCallback(() => {
@@ -255,6 +265,7 @@ export function AcpRuntime({
         canLoadEarlierHistory: canOfferEarlier(canLoadEarlier, hasMoreOlder),
         loadEarlierHistory,
         loadingEarlierHistory: loadingOlder,
+        visibleHistory: windowedActivity,
       })}
     </RuntimeHost>
   );

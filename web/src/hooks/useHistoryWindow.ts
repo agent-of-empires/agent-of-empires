@@ -19,27 +19,36 @@ export function useHistoryWindow(
   sessionId: string,
   activity: ActivityRow[],
   showClearedTurns: boolean,
+  defaultWindow: number = DEFAULT_HISTORY_WINDOW,
 ): HistoryWindowState {
-  const [visibleRows, setVisibleRows] = useState(DEFAULT_HISTORY_WINDOW);
+  const [visibleRows, setVisibleRows] = useState(defaultWindow);
+  const [windowPreference, setWindowPreference] = useState(defaultWindow);
   const [windowSessionId, setWindowSessionId] = useState(sessionId);
   // null until first populate, so the initial page lands as the default window, not as growth.
   const [anchorLen, setAnchorLen] = useState<number | null>(null);
   const [anchorRowId, setAnchorRowId] = useState<string | null>(null);
   if (windowSessionId !== sessionId) {
     setWindowSessionId(sessionId);
-    setVisibleRows(initialHistoryWindow(activity));
+    setWindowPreference(defaultWindow);
+    setVisibleRows(initialHistoryWindow(activity, defaultWindow));
     setAnchorLen(activity.length > 0 ? activity.length : null);
     setAnchorRowId(null);
-  } else if (anchorLen === null) {
-    if (activity.length > 0) {
-      setAnchorLen(activity.length);
-      setVisibleRows(initialHistoryWindow(activity));
+  } else {
+    const preferenceIncreased = defaultWindow > windowPreference;
+    if (defaultWindow !== windowPreference) setWindowPreference(defaultWindow);
+    if (anchorLen === null) {
+      if (activity.length > 0) {
+        setAnchorLen(activity.length);
+        setVisibleRows(initialHistoryWindow(activity, defaultWindow));
+      }
+    } else {
+      let nextVisible = visibleRows + Math.max(0, activity.length - anchorLen);
+      if (preferenceIncreased) {
+        nextVisible = Math.max(nextVisible, initialHistoryWindow(activity, defaultWindow));
+      }
+      if (nextVisible !== visibleRows) setVisibleRows(nextVisible);
+      if (activity.length !== anchorLen) setAnchorLen(activity.length);
     }
-  } else if (activity.length !== anchorLen) {
-    if (activity.length > anchorLen) {
-      setVisibleRows((v) => v + (activity.length - anchorLen));
-    }
-    setAnchorLen(activity.length);
   }
   const computed = useMemo(
     () => historyWindow(activity, visibleRows, showClearedTurns),

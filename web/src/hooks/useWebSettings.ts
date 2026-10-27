@@ -1,5 +1,6 @@
 import { useCallback, useSyncExternalStore } from "react";
 
+import { DEFAULT_HISTORY_WINDOW, normalizeHistoryWindow } from "../lib/acpHistoryWindow";
 import { DEFAULT_CONVERSATION_FONT_SIZE, normalizeConversationFontSize } from "../lib/conversationFontSize";
 import {
   DEFAULT_PERSISTENT_STRUCTURED_VIEWS,
@@ -16,6 +17,7 @@ export interface WebSettings {
   desktopFontSize: number;
   structuredMobileFontSize: number;
   structuredDesktopFontSize: number;
+  structuredHistoryWindow: number;
   terminalFontFamily: string;
   autoOpenKeyboard: boolean;
   persistentTerminals: boolean;
@@ -42,6 +44,7 @@ function getDefaults(): WebSettings {
     desktopFontSize: 14,
     structuredMobileFontSize: DEFAULT_CONVERSATION_FONT_SIZE,
     structuredDesktopFontSize: DEFAULT_CONVERSATION_FONT_SIZE,
+    structuredHistoryWindow: DEFAULT_HISTORY_WINDOW,
     terminalFontFamily: "",
     autoOpenKeyboard: true,
     persistentTerminals: false,
@@ -76,6 +79,7 @@ function normalizeSnapshot(settings: WebSettings): WebSettings {
     maxPersistentStructuredViews: normalizePersistentStructuredViewLimit(settings.maxPersistentStructuredViews),
     structuredMobileFontSize: normalizeConversationFontSize(settings.structuredMobileFontSize),
     structuredDesktopFontSize: normalizeConversationFontSize(settings.structuredDesktopFontSize),
+    structuredHistoryWindow: normalizeHistoryWindow(settings.structuredHistoryWindow),
     sidebarCompact: normalizeBool(settings.sidebarCompact, defaults.sidebarCompact),
     autoOpenDiffPane: normalizeBool(settings.autoOpenDiffPane, defaults.autoOpenDiffPane),
     autoOpenTerminalPane: normalizeBool(settings.autoOpenTerminalPane, defaults.autoOpenTerminalPane),

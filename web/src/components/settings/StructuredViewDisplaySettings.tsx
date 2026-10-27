@@ -1,10 +1,12 @@
 import { useWebSettings } from "../../hooks/useWebSettings";
+import { MAX_HISTORY_WINDOW, MIN_HISTORY_WINDOW, normalizeHistoryWindow } from "../../lib/acpHistoryWindow";
 import {
   MAX_PERSISTENT_STRUCTURED_VIEWS,
   MIN_PERSISTENT_STRUCTURED_VIEWS,
   normalizePersistentStructuredViewLimit,
 } from "../../lib/persistentStructuredViews";
 import { FontSizeControl } from "./FontSizeControl";
+import { NumberField } from "./FormFields";
 
 /** Structured view display preferences, stored in `aoe-web-settings` (already clamped). */
 export function StructuredViewDisplaySettings() {
@@ -28,6 +30,15 @@ export function StructuredViewDisplaySettings() {
         value={settings.structuredDesktopFontSize}
         onChange={(value) => update({ structuredDesktopFontSize: value })}
         description="Font size for Structured View conversation content on desktop devices. Separate from the terminal font size, and shared with your other browsers like the rest of the dashboard preferences."
+      />
+
+      <NumberField
+        label="Initial visible history"
+        description="Activity rows shown when opening a conversation (50–1000). Higher values show more history but use more browser resources. Whole turns may exceed this count. Lowering it does not hide rows already shown; Load earlier messages still reveals 150 rows at a time."
+        value={settings.structuredHistoryWindow}
+        min={MIN_HISTORY_WINDOW}
+        max={MAX_HISTORY_WINDOW}
+        onChange={(value) => update({ structuredHistoryWindow: normalizeHistoryWindow(value) })}
       />
 
       <label className="flex items-center justify-between gap-3 cursor-pointer">

@@ -10,6 +10,7 @@ vi.mock("../api", () => ({
 
 import { hydrateWebUiStateFromServer, isSyncedKey } from "../webUiSync";
 import { configureStorageSync, safeRemoveItem, safeSetItem } from "../safeStorage";
+import { getWebSettingsSnapshot } from "../../hooks/useWebSettings";
 
 beforeEach(() => {
   localStorage.clear();
@@ -97,6 +98,19 @@ describe("hydrateWebUiStateFromServer", () => {
     await hydrateWebUiStateFromServer();
 
     expect(localStorage.getItem("aoe-sidebar-axis")).toBe("group");
+    expect(patchWebUiState).not.toHaveBeenCalled();
+  });
+
+  it("restores the synced initial history preference over the browser's cached value", async () => {
+    localStorage.setItem("aoe-web-settings", JSON.stringify({ structuredHistoryWindow: 50 }));
+    const blob = JSON.stringify({ structuredHistoryWindow: 300, desktopFontSize: 18 });
+    getWebUiState.mockResolvedValue({ "aoe-web-settings": blob });
+
+    await hydrateWebUiStateFromServer();
+
+    expect(localStorage.getItem("aoe-web-settings")).toBe(blob);
+    expect(getWebSettingsSnapshot().structuredHistoryWindow).toBe(300);
+    expect(getWebSettingsSnapshot().desktopFontSize).toBe(18);
     expect(patchWebUiState).not.toHaveBeenCalled();
   });
 

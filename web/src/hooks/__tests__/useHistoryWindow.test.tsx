@@ -30,10 +30,12 @@ const followUp: ActivityRow[] = [
   { id: "m-1-0", kind: "message", text: "short answer" },
 ];
 
-const render = (a: ActivityRow[], sid = "s1") =>
-  renderHook(({ sid, a }: { sid: string; a: ActivityRow[] }) => useHistoryWindow(sid, a, false), {
-    initialProps: { sid, a },
-  });
+const render = (a: ActivityRow[], sid = "s1", window = DEFAULT_HISTORY_WINDOW) =>
+  renderHook(
+    ({ sid, a, window = DEFAULT_HISTORY_WINDOW }: { sid: string; a: ActivityRow[]; window?: number }) =>
+      useHistoryWindow(sid, a, false, window),
+    { initialProps: { sid, a, window } },
+  );
 
 describe("useHistoryWindow", () => {
   it("renders a short transcript whole, and windows a long one until loadEarlier shows it all", () => {
@@ -126,5 +128,57 @@ describe("useHistoryWindow", () => {
     expect(result.current.windowedActivity[0]!.id).toBe("u-0");
     expect(result.current.windowedActivity).toHaveLength(long.length);
     expect(result.current.canLoadEarlier).toBe(false);
+  });
+
+  it("uses the preference on initial population and session changes, with a fixed load-earlier step", () => {
+    const activity = transcript(400, 1);
+    const { result, rerender } = render([], "s1", 300);
+    rerender({ sid: "s1", a: activity, window: 300 });
+    expect(result.current.windowedActivity[0]!.id).toBe("u-250");
+    act(() => result.current.loadEarlier());
+    expect(result.current.windowedActivity).toHaveLength(450);
+    rerender({ sid: "s2", a: activity, window: 100 });
+    expect(result.current.windowedActivity[0]!.id).toBe("u-350");
+    expect(result.current.windowedActivity).toHaveLength(100);
+  });
+
+  it("reveals more on preference increases without hiding expanded rows on decreases", () => {
+    const activity = transcript(400, 1);
+    const { result, rerender } = render(activity, "s1", 100);
+    expect(result.current.windowedActivity).toHaveLength(100);
+    rerender({ sid: "s1", a: activity, window: 300 });
+    expect(result.current.windowedActivity[0]!.id).toBe("u-250");
+    act(() => result.current.loadEarlier());
+    const expanded = result.current.windowedActivity;
+    rerender({ sid: "s1", a: activity, window: 50 });
+    expect(result.current.windowedActivity).toEqual(expanded);
+    rerender({ sid: "s1", a: activity, window: 200 });
+    expect(result.current.windowedActivity).toEqual(expanded);
+    rerender({ sid: "s2", a: activity, window: 200 });
+    expect(result.current.windowedActivity).toHaveLength(200);
+  });
+
+  it("preserves the oldest displayed row across preference changes with appended and prepended history", () => {
+    const activity = transcript(400, 1);
+    const { result, rerender } = render(activity, "s1", 100);
+    const top = result.current.windowedActivity[0]!.id;
+    const appended = activity.concat(followUp.map((r) => ({ ...r, id: `new-${r.id}` })));
+    rerender({ sid: "s1", a: appended, window: 50 });
+    expect(result.current.windowedActivity[0]!.id).toBe(top);
+    const older = transcript(100, 1).map((r) => ({ ...r, id: `old-${r.id}` }));
+    rerender({ sid: "s1", a: older.concat(appended), window: 300 });
+    expect(result.current.windowedActivity).toHaveLength(302);
+    expect(result.current.windowedActivity.map((r) => r.id)).toContain(top);
+    expect(result.current.windowedActivity.at(-1)!.id).toBe("new-m-1-0");
+  });
+
+  it("keeps a whole oversized last turn when the preference decreases", () => {
+    const activity = longTurn(100);
+    const { result, rerender } = render(activity, "s1", 50);
+    expect(result.current.windowedActivity).toEqual(activity);
+    rerender({ sid: "s1", a: activity.concat(followUp), window: 100 });
+    expect(result.current.windowedActivity[0]!.id).toBe("u-0");
+    rerender({ sid: "s1", a: activity.concat(followUp), window: 50 });
+    expect(result.current.windowedActivity).toEqual(activity.concat(followUp));
   });
 });
