@@ -135,10 +135,16 @@ struct Composer {
 
 const DISMISSAL: &str = "Dismissed when you send your next message";
 
+macro_rules! modifier_pattern {
+    () => {
+        r"(?:(?:c\s*t\s*r\s*l|a\s*l\s*t|s\s*h\s*i\s*f\s*t|m\s*e\s*t\s*a|c\s*m\s*d|s\s*u\s*p\s*e\s*r|o\s*p\s*t\s*i\s*o\s*n)\+\s*|[⌃⌥⇧⌘\x{f0633}-\x{f0636}]\s*)"
+    };
+}
+
 macro_rules! key_pattern {
     () => {
         concat!(
-            r"(?:(?:(?:c\s*t\s*r\s*l|a\s*l\s*t|s\s*h\s*i\s*f\s*t|m\s*e\s*t\s*a|c\s*m\s*d|s\s*u\s*p\s*e\s*r|o\s*p\s*t\s*i\s*o\s*n)\+\s*|[⌃⌥⇧⌘\x{f0633}-\x{f0636}]\s*))*",
+            r"(?:", modifier_pattern!(), r")*",
             r"(?:e\s*s\s*c(?:\s*a\s*p\s*e)?|e\s*n\s*t\s*e\s*r|r\s*e\s*t\s*u\s*r\s*n|s\s*p\s*a\s*c\s*e|t\s*a\s*b|b\s*a\s*c\s*k\s*s\s*p\s*a\s*c\s*e|d\s*e\s*l\s*e\s*t\s*e|i\s*n\s*s(?:\s*e\s*r\s*t)?|h\s*o\s*m\s*e|e\s*n\s*d|p\s*(?:a\s*g\s*e|g)\s*(?:u\s*p|d\s*(?:o\s*w\s*n|n))|u\s*p|d\s*o\s*w\s*n|l\s*e\s*f\s*t|r\s*i\s*g\s*h\s*t|f\s*[1-9]\s*[0-9]?|↑↓|[\p{L}\p{N}\x21-\x2f\x3a-\x40\x5b-\x60\x7b-\x7e⎋⏎⇥⌫⌦␣↑↓←→\x{f12b7}\x{f0311}\x{f0312}\x{f006e}\x{f0e7e}\x{f1050}])"
         )
     };
@@ -146,6 +152,7 @@ macro_rules! key_pattern {
 
 struct Patterns {
     key: Regex,
+    modifiers: Regex,
     duration: Regex,
     hidden: Regex,
     card_heading: Regex,
@@ -156,6 +163,7 @@ struct Patterns {
 static PATTERNS: LazyLock<Patterns> = LazyLock::new(|| {
     Patterns {
         key: Regex::new(concat!(r"(?i)^", key_pattern!(), r"(?:/", key_pattern!(), r")*(?:\s+|$)")).unwrap(),
+        modifiers: Regex::new(concat!(r"(?i)^(?:", modifier_pattern!(), r")+$")).unwrap(),
         duration: Regex::new(r"^(?:0|[1-9][0-9]*)[smh]$").unwrap(),
         hidden: Regex::new(r"^Ask(?: \([0-9]+s\))? hidden:").unwrap(),
         card_heading: Regex::new(r"#[1-9][0-9]*").unwrap(),
@@ -459,8 +467,20 @@ fn history_footer(lines: &[&str], composer: Composer) -> Option<usize> {
     let mut tokens = lines[separator + 1..end - 1]
         .iter()
         .flat_map(|line| rail_body(line).split_whitespace());
+    let modifiers = |text: &str| PATTERNS.modifiers.is_match(text);
     for (index, action) in ["navigate", "select", "cancel"].into_iter().enumerate() {
-        if !key_hint(tokens.next()?) || tokens.next()? != action {
+        let mut key = tokens.next()?;
+        while !key_hint(key) {
+            if !modifiers(key)
+                && !key
+                    .rsplit_once('/')
+                    .is_some_and(|(prefix, suffix)| key_hint(prefix) && modifiers(suffix))
+            {
+                return None;
+            }
+            key = tokens.next()?;
+        }
+        if tokens.next()? != action {
             return None;
         }
         if index < 2 && !matches!(tokens.next()?, "·" | "-") {

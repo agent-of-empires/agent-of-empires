@@ -2723,6 +2723,26 @@ Final prose line.\n";
                 }
             }
         }
+        for keys in [
+            "\u{f0636} ↑/↓ navigate · \u{f0311} select · \u{f12b7} cancel",
+            "\u{f0636} ↑/\u{f0636} ↓ navigate · \u{f0311} select · \u{f12b7} cancel",
+            "\u{f0636} │\n│ ↑/\u{f0636} │\n│ ↓ navigate · \u{f0311} select · \u{f12b7} cancel",
+            "Ctrl+\u{f0636} ↑/Ctrl+\u{f0636} ↓ navigate · \u{f0311} select · \u{f12b7} cancel",
+            "Ctrl+\u{f0636} │\n│ ↑/Ctrl+\u{f0636} │\n│ ↓ navigate · \u{f0311} select · \u{f12b7} cancel",
+        ] {
+            let pane = OMP_HISTORY_SEARCH
+                .replace("↑/↓ navigate · ⏎ select · ⎋ cancel", keys)
+                .replace('❯', "\u{f054}");
+            for owned in [true, false] {
+                assert_eq!(
+                    crate::tmux::detect::detect("omp", &pane, &Observation::new("", None, owned))
+                        .unwrap()
+                        .status,
+                    if owned { None } else { Some(Status::Idle) },
+                    "{keys}, owned={owned}"
+                );
+            }
+        }
 
         let old_ask = "╭─ Ask ─────────╮\n│ ❯ Yes │\n│   No │\n│ Enter select · n note · Esc cancel │\n╰───────────────╯";
         for (prefix, title, expected) in [
