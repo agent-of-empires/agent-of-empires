@@ -4,6 +4,12 @@ All notable changes to Agent of Empires will be documented in this file.
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## Unreleased
+
+### Bug Fixes
+
+- **acp:** Keep macOS host Codex local-gateway requests off implicit system proxies with loopback-only `NO_PROXY`/`no_proxy` defaults in stdio and detached launches; preserve explicit proxy and bypass environment settings, including empty values.
+
 ## [1.21.0](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.21.0) - 2026-10-21
 
 

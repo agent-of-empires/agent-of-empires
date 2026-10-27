@@ -440,6 +440,9 @@ pub(super) async fn spawn_runner_detached(
         cmd.env("PATH", prepend_path_dirs(&current, &extra_path_dirs));
     }
 
+    #[cfg(target_os = "macos")]
+    super::spawn::apply_host_codex_loopback_bypass(cmd.as_std_mut(), config, &host_environment);
+
     // Reads the runner env, so it runs before the scope wrapper adds its own.
     let native_store = super::spawn::native_store_snapshot(config, cmd.as_std(), &host_environment);
     let mut cmd = match &prefix {
@@ -539,6 +542,44 @@ mod tests {
     use crate::process::systemd::ScopePrefix;
     use crate::session::test_support::EnvGuard;
     use std::ffi::{OsStr, OsString};
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn codex_loopback_bypass_runner_respects_final_carrier_environment() {
+        let mut config = super::super::test_helpers::env_test_spawn_config(std::env::temp_dir());
+        config.agent_key = "codex".into();
+        for setting in [None, Some(("HTTPS_PROXY", "")), Some(("no_proxy", ""))] {
+            let mut runner = tokio::process::Command::new("unused");
+            runner.env_clear();
+            let overrides: Vec<(String, String)> = setting
+                .map(|(key, value)| vec![(key.into(), value.into())])
+                .unwrap_or_default();
+            if !overrides.is_empty() {
+                runner.env(
+                    crate::process::runner::ACP_AGENT_ENV,
+                    serde_json::to_string(&overrides).unwrap(),
+                );
+            }
+            super::super::spawn::apply_host_codex_loopback_bypass(
+                runner.as_std_mut(),
+                &config,
+                &overrides,
+            );
+            for key in ["NO_PROXY", "no_proxy"] {
+                let value = runner
+                    .as_std()
+                    .get_envs()
+                    .find_map(|(name, value)| (name == key).then_some(value).flatten());
+                assert_eq!(
+                    value,
+                    setting
+                        .is_none()
+                        .then_some(OsStr::new("localhost,127.0.0.1,::1")),
+                    "{setting:?}: {key}"
+                );
+            }
+        }
+    }
 
     const XDG: &str = "XDG_RUNTIME_DIR";
     const BUS: &str = "DBUS_SESSION_BUS_ADDRESS";

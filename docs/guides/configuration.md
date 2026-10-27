@@ -354,6 +354,8 @@ executable advertises it. The probe uses that frozen executable and environment,
 including the profile's `PATH`; it does not resolve another installation.
 Wrappers, sandboxed launches and unattested executables are not probed for this flag.
 
+On macOS, host Codex structured-view launches default `NO_PROXY` and `no_proxy` to `localhost,127.0.0.1,::1` so local gateways bypass implicit system proxies. This fallback applies only when the final agent environment has neither an explicit `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY` (uppercase or lowercase) nor either bypass variable. Explicit values, including empty strings, are preserved; other agents and sandboxed sessions are unchanged. Codex's native `features.respect_system_proxy = true` setting is separate and lets supported Codex versions honor the system proxy exceptions directly.
+
 ### What host sessions inherit automatically
 
 Independent of that list, AoE forwards `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY`, `DBUS_SESSION_BUS_ADDRESS`, `SSH_AUTH_SOCK`, and every `XDG_*` variable into host sessions, so a browser the agent launches (an OIDC login) can reach your desktop. Worth knowing what that grants: `DISPLAY` plus `XAUTHORITY` is X11 access to your whole session, which includes screen capture and input injection. A sandboxed session never receives them.
