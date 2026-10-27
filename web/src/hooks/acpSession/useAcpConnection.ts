@@ -251,13 +251,20 @@ export function useAcpConnection(
       }, delayMs);
     };
 
-    const startReplay = (): { done: Promise<number | null>; abort: () => void } => {
+    const startReplay = (): { done: Promise<void>; abort: () => void; delivered: () => boolean } => {
       replayAbortRef.current?.abort();
       const controller = new AbortController();
       replayAbortRef.current = controller;
+      // Pages land one by one, so a later failure or the dial timeout must not hide what already did.
+      let delivered = false;
+      const track: Dispatch<Action> = (action) => {
+        if (action.kind === "frames" && (action.frames.length > 0 || (action.rows?.length ?? 0) > 0)) delivered = true;
+        dispatch(action);
+      };
       return {
-        done: fetchReplay(sessionId, lastSeqRef, oldestSeqRef.current, dispatch, setHasMoreOlder, controller.signal),
+        done: fetchReplay(sessionId, lastSeqRef, oldestSeqRef.current, track, setHasMoreOlder, controller.signal),
         abort: () => controller.abort(),
+        delivered: () => delivered,
       };
     };
 
@@ -312,21 +319,20 @@ export function useAcpConnection(
       void (async () => {
         // Replay is best effort and the socket's `since=` covers the gap, so a hung fetch must not block the dial.
         // On timeout the replay is aborted so a late snapshot cannot overwrite rows the socket has since updated.
-        const seqBeforeReplay = lastSeqRef.current;
         const replay = startReplay();
         let replayTimer: ReturnType<typeof setTimeout> | undefined;
-        const replayedTo = await Promise.race([
+        await Promise.race([
           replay.done,
-          new Promise<null>((resolve) => {
+          new Promise<void>((resolve) => {
             replayTimer = setTimeout(() => {
               replay.abort();
-              resolve(null);
+              resolve();
             }, ACP_DIAL_TIMEOUT_MS);
           }),
         ]);
         clearTimeout(replayTimer);
         if (!isCurrentDial()) return;
-        if (replayedTo !== null && replayedTo > seqBeforeReplay) setReplayedWhileDown(true);
+        if (replay.delivered()) setReplayedWhileDown(true);
         const protocol = window.location.protocol === "https:" ? "wss" : "ws";
         const url = `${protocol}://${window.location.host}/sessions/${encodeURIComponent(sessionId)}/acp/ws?since=${lastSeqRef.current}`;
         const ws = new WebSocket(url, acpSocketProtocols());

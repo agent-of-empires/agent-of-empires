@@ -162,10 +162,16 @@ describe("reconnect (#1130)", () => {
     expect(result.current).toMatchObject({ reconnecting: false, retryCount: 0, status: "connecting" });
   });
 
+  const replayedPrompt = (sid: string, seq: number) => ({
+    frame: { session_id: sid, seq, event: { UserPromptSent: { text: `p${seq}` } } },
+    row: { id: `user-seq-${seq}`, kind: "user_prompt", at: "t", text: `p${seq}` },
+  });
+
   it("flags history arriving over replay while the socket is down, until a socket opens", async () => {
+    const { frame, row } = replayedPrompt("sess-replay-down", 7);
     calls = installAcpFakes(({ url }) =>
       url.includes("/acp/replay")
-        ? json({ frames: [], rows: [], lost: false, highest_seq: 7, next_cursor: 7 })
+        ? json({ frames: [frame], rows: [row], lost: false, highest_seq: 7, next_cursor: 7 })
         : undefined,
     );
     FakeWebSocket.closeFiresOnClose = true;
@@ -180,22 +186,33 @@ describe("reconnect (#1130)", () => {
     expect(result.current.replayedWhileDown).toBe(false);
   });
 
-  it("flags history replayed forward onto already loaded history", async () => {
-    const prompt = (seq: number) => ({
-      session_id: "sess-replay-loaded",
-      seq,
-      event: { UserPromptSent: { text: `p${seq}` } },
-    });
-    const row = { id: "user-seq-6", kind: "user_prompt", at: "t", text: "p6" };
+  // A page that landed stays on screen whatever happens to the later pages.
+  it.each<[string, () => Response | Promise<Response>]>([
+    ["completes", () => json({ frames: [], rows: [], lost: false, highest_seq: 30, next_cursor: 30 })],
+    ["fails", () => new Response("boom", { status: 500 })],
+    ["hangs until the dial timeout", () => new Promise<Response>(() => {})],
+  ])("flags history replayed forward onto loaded history when the second page %s", async (label, secondPage) => {
+    const sid = "sess-replay-loaded";
+    const first = replayedPrompt(sid, 6);
+    const forward = replayedPrompt(sid, 11);
     calls = installAcpFakes(({ url }) => {
       if (!url.includes("/acp/replay")) return undefined;
-      if (new URL(url, "http://x").searchParams.has("since")) {
-        return json({ frames: [], rows: [], lost: false, highest_seq: 20, next_cursor: 20, has_more: false });
+      const since = new URL(url, "http://x").searchParams.get("since");
+      if (since === null) {
+        return json({ frames: [first.frame], rows: [first.row], lost: false, highest_seq: 10, next_cursor: 6 });
       }
-      return json({ frames: [prompt(6)], rows: [row], lost: false, highest_seq: 10, next_cursor: 6, has_more: false });
+      if (Number(since) > 10) return secondPage();
+      return json({
+        frames: [forward.frame],
+        rows: [forward.row],
+        lost: false,
+        highest_seq: 30,
+        next_cursor: 11,
+        has_more: true,
+      });
     });
     FakeWebSocket.closeFiresOnClose = true;
-    const { result } = render("sess-replay-loaded");
+    const { result } = render(sid);
     await flushAsync();
     sockets[0]!.open();
     expect(result.current).toMatchObject({ replayedWhileDown: false, state: { oldestSeq: 6 } });
@@ -203,6 +220,10 @@ describe("reconnect (#1130)", () => {
     sockets[0]!.drop();
     await act(() => vi.advanceTimersByTimeAsync(acpRetryDelayMs(1)));
     await flushAsync();
+    if (label.startsWith("hangs")) {
+      await act(() => vi.advanceTimersByTimeAsync(ACP_DIAL_TIMEOUT_MS));
+      await flushAsync();
+    }
     expect(sockets).toHaveLength(2);
     expect(result.current).toMatchObject({ reconnecting: true, replayedWhileDown: true });
   });
