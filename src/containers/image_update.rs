@@ -9,6 +9,51 @@ pub struct ImageUpdate {
     pub remote_digest: String,
 }
 
+/// What the Container runtime knows about the local copy of an image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalDigest {
+    Digest(String),
+    /// Present, but with no repo digest to compare: built locally, or Apple Container,
+    /// whose `image inspect` exposes none.
+    NoDigest,
+    Missing,
+    /// The runtime didn't answer (not installed, or its daemon isn't running), so whether the
+    /// image is pulled is unknown too.
+    Unavailable,
+}
+
+/// Why a newer image can't be detected. Never "current": the dashboard must not say an
+/// image is up to date when it can't know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnknownReason {
+    Unparseable,
+    /// Pinned by digest, so it never changes.
+    Pinned,
+    NotPulled,
+    NoLocalDigest,
+    RuntimeUnavailable,
+}
+
+impl UnknownReason {
+    pub fn code(self) -> &'static str {
+        match self {
+            UnknownReason::Unparseable => "unparseable",
+            UnknownReason::Pinned => "pinned",
+            UnknownReason::NotPulled => "not_pulled",
+            UnknownReason::NoLocalDigest => "no_local_digest",
+            UnknownReason::RuntimeUnavailable => "runtime_unavailable",
+        }
+    }
+}
+
+/// The result of asking the registry. An `Err` from [`check_image`] means it couldn't be asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageCheck {
+    Available(ImageUpdate),
+    Current,
+    Unknown(UnknownReason),
+}
+
 const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.index.v1+json, \
      application/vnd.docker.distribution.manifest.list.v2+json, \
      application/vnd.docker.distribution.manifest.v2+json, \
@@ -221,53 +266,115 @@ pub fn pick_repo_digest(image: &str, repo_digests: &str) -> Option<String> {
     first
 }
 
-pub async fn check_for_image_update(image: &str) -> Result<Option<ImageUpdate>> {
-    let Some(reference) = RegistryRef::parse(image) else {
-        return Ok(None);
-    };
+/// Everything decided before the registry is asked: the reference and local digest to
+/// compare, or the reason there is nothing to compare.
+fn pre_check(
+    image: &str,
+    local: impl FnOnce() -> LocalDigest,
+) -> std::result::Result<(RegistryRef, String), UnknownReason> {
+    let reference = RegistryRef::parse(image).ok_or(UnknownReason::Unparseable)?;
     if reference.pinned {
-        return Ok(None);
+        return Err(UnknownReason::Pinned);
     }
+    match local() {
+        LocalDigest::Digest(digest) => Ok((reference, digest)),
+        LocalDigest::NoDigest => Err(UnknownReason::NoLocalDigest),
+        LocalDigest::Missing => Err(UnknownReason::NotPulled),
+        LocalDigest::Unavailable => Err(UnknownReason::RuntimeUnavailable),
+    }
+}
 
+fn compare(image: &str, local: &str, remote: String) -> ImageCheck {
+    if remote == local {
+        return ImageCheck::Current;
+    }
+    tracing::info!(
+        target: "containers.image_update",
+        %image,
+        %local,
+        %remote,
+        "sandbox image update available"
+    );
+    ImageCheck::Available(ImageUpdate {
+        image: image.to_string(),
+        remote_digest: remote,
+    })
+}
+
+/// `Err` means the registry couldn't be asked (network, auth, timeout), not that the image is
+/// current.
+pub async fn check_image(
+    runtime: crate::containers::ContainerRuntime,
+    image: &str,
+) -> Result<ImageCheck> {
     let image_owned = image.to_string();
-    let local = tokio::task::spawn_blocking(move || {
-        crate::containers::get_container_runtime().local_image_digest(&image_owned)
+    let pre = tokio::task::spawn_blocking(move || {
+        pre_check(&image_owned, || runtime.local_image_digest(&image_owned))
     })
     .await
-    .ok()
-    .flatten();
-
-    let Some(local) = local else {
-        return Ok(None);
+    .map_err(|e| anyhow!("local image check panicked: {e}"))?;
+    let (reference, local) = match pre {
+        Ok(pair) => pair,
+        Err(reason) => return Ok(ImageCheck::Unknown(reason)),
     };
 
     let client = reqwest::Client::builder()
         .user_agent(crate::github::DEFAULT_USER_AGENT)
         .timeout(std::time::Duration::from_secs(8))
         .build()?;
-
     let remote = reference.fetch_remote_digest(&client).await?;
-
-    if remote != local {
-        tracing::info!(
-            target: "containers.image_update",
-            %image,
-            local = %local,
-            remote = %remote,
-            "sandbox image update available"
-        );
-        Ok(Some(ImageUpdate {
-            image: image.to_string(),
-            remote_digest: remote,
-        }))
-    } else {
-        Ok(None)
-    }
+    Ok(compare(image, &local, remote))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_local_outcome_maps_to_its_own_state_never_current() {
+        const IMAGE: &str = "ghcr.io/agent-of-empires/aoe-sandbox:latest";
+        let digest = || LocalDigest::Digest("sha256:aaa".into());
+        let cases: [(&str, fn() -> LocalDigest, Option<UnknownReason>); 6] = [
+            ("", digest, Some(UnknownReason::Unparseable)),
+            ("ubuntu@sha256:0123", digest, Some(UnknownReason::Pinned)),
+            (
+                IMAGE,
+                || LocalDigest::Missing,
+                Some(UnknownReason::NotPulled),
+            ),
+            // Docker Desktop not started: not "not pulled", which a pull would contradict.
+            (
+                IMAGE,
+                || LocalDigest::Unavailable,
+                Some(UnknownReason::RuntimeUnavailable),
+            ),
+            // Apple Container, or an image built locally.
+            (
+                IMAGE,
+                || LocalDigest::NoDigest,
+                Some(UnknownReason::NoLocalDigest),
+            ),
+            (IMAGE, digest, None),
+        ];
+        for (image, local, unknown) in cases {
+            let pre = pre_check(image, local);
+            assert_eq!(pre.as_ref().err().copied(), unknown, "{image:?}");
+            if let Ok((_, local)) = pre {
+                assert_eq!(local, "sha256:aaa");
+            }
+        }
+        assert_eq!(
+            compare(IMAGE, "sha256:aaa", "sha256:aaa".into()),
+            ImageCheck::Current
+        );
+        assert_eq!(
+            compare(IMAGE, "sha256:aaa", "sha256:bbb".into()),
+            ImageCheck::Available(ImageUpdate {
+                image: IMAGE.into(),
+                remote_digest: "sha256:bbb".into(),
+            })
+        );
+    }
 
     #[test]
     fn registry_ref_parse_splits_host_repository_and_reference() {
