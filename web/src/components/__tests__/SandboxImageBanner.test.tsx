@@ -238,6 +238,30 @@ describe("SandboxImageBanner", () => {
     expect(banner()?.getAttribute("aria-label")).toBe("Sandbox image updated");
   });
 
+  it("keeps showing the pull it asked for when an older status lands before the reply", async () => {
+    await mount(status());
+    let reply: (value: { ok: boolean; message?: string }) => void = () => {};
+    pullSandboxImage.mockImplementationOnce(() => new Promise((resolve) => (reply = resolve)));
+    fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+    // A poll from before the pull started still says idle.
+    fetchSandboxImageStatus.mockResolvedValue(status());
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(banner()?.getAttribute("aria-label")).toBe("Downloading sandbox image");
+    // And polling stays fast.
+    const calls = fetchSandboxImageStatus.mock.calls.length;
+    await pollAfter(2000);
+    expect(fetchSandboxImageStatus.mock.calls.length).toBe(calls + 1);
+    fetchSandboxImageStatus.mockResolvedValue(status({ state: "current", pull: { state: "done" } } as never));
+    await act(async () => {
+      reply({ ok: true });
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(banner()?.getAttribute("aria-label")).toBe("Sandbox image updated");
+  });
+
   it("hides an earlier available update once a check fails", async () => {
     await mount(status());
     expect(banner()).not.toBeNull();
