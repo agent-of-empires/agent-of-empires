@@ -181,6 +181,16 @@ describe("SandboxImageBanner", () => {
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     await pollAfter(0);
     expect(screen.getByText("Couldn't reach the Daemon.")).toBeTruthy();
+
+    // Refused, and the status check after it fails too: dismissing the error must not leave this
+    // page's own "Downloading" guess standing in for a pull that never started.
+    fetchSandboxImageStatus.mockResolvedValue({ error: "http_500" });
+    pullSandboxImage.mockResolvedValueOnce({ ok: false, message: "Pulling sandbox images from the web is off." });
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await pollAfter(0);
+    expect(banner()?.getAttribute("aria-label")).toBe("Couldn't download the sandbox image");
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss sandbox image notice" }));
+    expect(banner()?.getAttribute("aria-label")).not.toBe("Downloading sandbox image");
   });
 
   it("keeps polling fast after an accepted pull even when the status request fails", async () => {

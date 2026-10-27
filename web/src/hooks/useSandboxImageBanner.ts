@@ -105,9 +105,11 @@ export function useSandboxImageBanner(): SandboxImageBannerView | null {
     void pullSandboxImage().then((reply) => {
       replyPending.current = false;
       if (!reply.ok && !pullConfirmed.current) {
-        // Nothing was pulled, and the Daemon may still hold an older pull's outcome.
+        // Nothing was pulled, and the Daemon may still hold an older pull's outcome. No status has
+        // shown a pull since the click, so the "running" in `status` is this page's own guess.
         expectingPull.current = false;
         setWatchedPull(false);
+        setStatus((s) => s && (s.pull.state === "running" ? { ...s, pull: { state: "idle" } } : s));
         setRefusal(reply.message ?? "Couldn't reach the Daemon.");
       }
       pollNow.current();
