@@ -202,7 +202,7 @@ impl ReadFailure {
         Self::refuse(RENDERER_INTERNAL, exit, message)
     }
 
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(test)]
     pub(crate) fn code(&self) -> &str {
         self.code
     }

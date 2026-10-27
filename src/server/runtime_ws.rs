@@ -337,12 +337,6 @@ impl RuntimeState {
 /// minted once and reused by every Hello this process emits.
 static RUNTIME: LazyLock<RuntimeState> = LazyLock::new(RuntimeState::new);
 
-/// Handshake identities shared with the local publisher's marker pair.
-#[cfg(target_os = "linux")]
-pub(crate) fn identity() -> &'static RuntimeIdentity {
-    &RUNTIME.identity
-}
-
 /// Keep the latched cursor nonzero so unavailable freshness is not a malformed snapshot.
 const LATCHED_CURSOR: u64 = u64::MAX;
 
