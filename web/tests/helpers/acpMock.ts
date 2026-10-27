@@ -29,6 +29,8 @@ export interface AcpSessionMockOptions {
   workerState?: "absent" | "resuming" | "running" | "stopping";
   /** The Session's `acp_session_id`, set once its Agent session exists. */
   acpSessionId?: string;
+  /** An import whose history hasn't loaded yet; its `acp_session_id` is set from creation. */
+  importPending?: boolean;
 }
 
 export interface AcpSessionMock {
@@ -208,6 +210,7 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
               (opts.trashedAt || opts.archivedAt ? "stopped" : opts.workerStarting ? "resuming" : "running"),
             ...(opts.workerStarting ? { acp_agent: opts.startingAgent ?? "claude" } : {}),
             ...(opts.acpSessionId ? { acp_session_id: opts.acpSessionId } : {}),
+            ...(opts.importPending ? { import_pending: true } : {}),
             claude_fullscreen: false,
           },
         ],

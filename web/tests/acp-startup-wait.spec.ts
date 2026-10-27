@@ -55,6 +55,17 @@ test("an older Session resuming never shows the startup line, even before its ev
   expect(await page.evaluate(() => (window as unknown as { __startupLineSeen: number }).__startupLineSeen)).toBe(0);
 });
 
+test("an imported Session shows the startup line while its Agent loads the history", async ({ page }) => {
+  const mock = await mockAcpSession(page, {
+    title: "story-import",
+    workerStarting: true,
+    acpSessionId: "imported-acp-session",
+    importPending: true,
+  });
+  await openStructuredSession(page, mock);
+  await expect(page.getByTestId("startup-wait-line")).toContainText("Starting Claude Code… You can type now.");
+});
+
 test.describe("at 375px", () => {
   test.use({ viewport: { width: 375, height: 812 } });
 

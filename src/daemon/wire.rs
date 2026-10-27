@@ -1063,6 +1063,10 @@ pub struct SessionResponse {
     /// sessions, or structured ones whose worker has not minted an id yet).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acp_session_id: Option<String>,
+    /// An imported session whose history arrives only once its agent loads it,
+    /// so `acp_session_id` is set before the session has ever run here.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub import_pending: bool,
     /// The session's resolved ACP registry key (`agent_name` when set, else
     /// `tool`), matching the `name` entries `/api/acp/agents` returns. The
     /// structured view's switch-agent modal reads this as the current-agent
