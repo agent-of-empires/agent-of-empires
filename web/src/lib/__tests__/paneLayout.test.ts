@@ -251,6 +251,40 @@ describe("usePaneLayout outside a repository (#4574)", () => {
     expect(dockTabs(result.current.layout, "right")).toEqual(expected);
   });
 
+  it.each([
+    // [status once known, expected right dock]
+    [false, ["diff", "terminal:0", "plugin:p:a"]],
+    [true, ["terminal:0", "plugin:p:a"]],
+  ])("replays a mutation made while status is unknown over the seed for outside=%s", (known, expected) => {
+    seededTemplate();
+    localStorage.setItem("aoe-web-settings", JSON.stringify({ autoOpenDiffPane: true, autoOpenTerminalPane: true }));
+    const { result, rerender } = renderHook(({ outside }) => usePaneLayout("s1", outside), {
+      initialProps: { outside: null as boolean | null },
+    });
+    act(() => result.current.openTab("plugin:p:a", "right"));
+    expect(dockTabs(result.current.layout, "right")).toEqual(["terminal:0"]);
+    rerender({ outside: known });
+    expect(dockTabs(result.current.layout, "right")).toEqual(expected);
+  });
+
+  it("does not defer a mutation on a stored layout while status is unknown", () => {
+    localStorage.setItem(
+      "aoe-pane-layout-v2",
+      JSON.stringify({
+        version: 2,
+        template: { ...layout(["diff"]), nextTerminalIndex: 1 },
+        sessions: { s1: { ...layout([]), nextTerminalIndex: 1 } },
+      }),
+    );
+    const { result, rerender } = renderHook(({ outside }) => usePaneLayout("s1", outside), {
+      initialProps: { outside: null as boolean | null },
+    });
+    act(() => result.current.openTab("plugin:p:a", "right"));
+    expect(dockTabs(result.current.layout, "right")).toEqual(["plugin:p:a"]);
+    rerender({ outside: false });
+    expect(dockTabs(result.current.layout, "right")).toEqual(["plugin:p:a"]);
+  });
+
   it("applies a flag that arrives after seeding, but never closes a Diff the user opened", () => {
     seededTemplate();
     const { result, rerender } = renderHook(({ outside }) => usePaneLayout("s1", outside), {

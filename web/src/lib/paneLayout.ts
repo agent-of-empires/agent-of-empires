@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useLatestRef } from "../hooks/useLatestRef";
 import { getWebSettingsSnapshot, useWebSettings } from "../hooks/useWebSettings";
@@ -422,9 +422,17 @@ export function usePaneLayout(sessionId: string | null, outsideRepository: boole
     [store, sessionId, autoOpenDiffPane, autoOpenTerminalPane, outsideRepository],
   );
 
+  const storeRef = useLatestRef(store);
+  const deferredRef = useRef<{ sessionId: string; fn: (l: DockLayout) => DockLayout }[]>([]);
+
   const mutate = useCallback(
     (fn: (l: DockLayout) => DockLayout) => {
       if (!sessionId) return;
+      // Persisting now would freeze the Diff-less seed; replay once the status is known.
+      if (outsideRepositoryRef.current === null && !(sessionId in storeRef.current.sessions)) {
+        deferredRef.current.push({ sessionId, fn });
+        return;
+      }
       setStore((s) => {
         // Read prefs synchronously: depending on `settings` would rebuild the pane API on any setting change.
         const prefs = getWebSettingsSnapshot();
@@ -439,8 +447,16 @@ export function usePaneLayout(sessionId: string | null, outsideRepository: boole
         return { ...s, sessions: { ...s.sessions, [sessionId]: updated } };
       });
     },
-    [sessionId, outsideRepositoryRef],
+    [sessionId, outsideRepositoryRef, storeRef],
   );
+
+  useEffect(() => {
+    // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
+    if (outsideRepository === null) return;
+    const deferred = deferredRef.current.filter((d) => d.sessionId === sessionId);
+    deferredRef.current = [];
+    for (const { fn } of deferred) mutate(fn);
+  }, [outsideRepository, sessionId, mutate]);
 
   const openTab = useCallback(
     (tabId: TabId, dock: DockLocation) => mutate((l) => openOrRevealTab(l, tabId, dock)),
