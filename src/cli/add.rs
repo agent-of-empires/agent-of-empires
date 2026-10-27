@@ -786,7 +786,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 );
             }
         } else {
-            for w in crate::session::validate_env_entries(&config.sandbox.environment) {
+            for w in sandbox_env_warnings(&config.sandbox.environment, &args.hook_env) {
                 eprintln!("⚠ {}", w);
             }
 
@@ -1587,6 +1587,10 @@ fn resolve_named_tool(tool: &str, config: &crate::session::Config) -> Result<Nam
     )
 }
 
+fn sandbox_env_warnings(sandbox_env: &[String], hook_env: &[String]) -> Vec<String> {
+    crate::session::validate_env_entries(sandbox_env.iter().chain(hook_env))
+}
+
 fn resolve_sandbox_image(
     flag: Option<&str>,
     merged_default: &str,
@@ -1675,6 +1679,16 @@ mod tests {
         let err = super::run("default", parse(&[])).await.unwrap_err();
         assert!(err.to_string().contains("--hook-env requires --sandbox"));
         assert_eq!(parse(&["-s"]).hook_env, ["MINT_REPO=a/b"]);
+    }
+
+    #[test]
+    fn sandbox_env_warnings_cover_hook_env() {
+        let unset = "AOE_TEST_HOOK_ENV_UNSET_9f3a";
+        let hook = vec![format!("GH_TOKEN=${unset}")];
+        let warnings = super::sandbox_env_warnings(&[], &hook);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains(unset));
+        assert!(super::sandbox_env_warnings(&[], &[]).is_empty());
     }
 
     #[test]
