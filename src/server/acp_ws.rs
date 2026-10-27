@@ -341,6 +341,7 @@ async fn drain_replay_into_socket(
             seq,
             event: Arc::new(event),
             worker_generation: None,
+            sidebar_status: None,
         };
         let payload = match serde_json::to_string(&frame) {
             Ok(s) => s,
@@ -1092,6 +1093,7 @@ mod tests {
                 seq: 7,
                 event: Arc::new(event),
                 worker_generation: None,
+                sidebar_status: None,
             },
         );
         let repeated = receive_kind(&mut socket, "reduced_state").await;
@@ -1138,6 +1140,7 @@ mod tests {
                     seq,
                     event: Arc::new(event),
                     worker_generation: None,
+                    sidebar_status: None,
                 },
             );
         }

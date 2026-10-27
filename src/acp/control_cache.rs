@@ -1,15 +1,10 @@
 //! Live per-session control state, folded once at the publish choke point.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use super::state::{AcpState, Event};
 use crate::session::Status;
-
-/// Per-seq sidebar statuses kept per session. Sized to outlast the usual
-/// listener lag (the consumed frame plus the 256-frame ACP broadcast behind
-/// it); a frame older than this is rebuilt from the log instead.
-const RECENT_STATUS_SEQS: usize = 512;
 
 /// A session's folded control state and how far it has been folded.
 #[derive(Debug, Clone)]
@@ -17,54 +12,6 @@ struct Cached {
     state: AcpState,
     /// Highest seq folded in.
     last_seq: u64,
-    /// The sidebar status after each of the latest folded seqs, so a listener
-    /// consuming a frame behind the fold still sees that frame's transition.
-    recent: VecDeque<(u64, Status)>,
-}
-
-impl Cached {
-    fn push_recent(&mut self, seq: u64, status: Status) {
-        if self.recent.len() == RECENT_STATUS_SEQS {
-            self.recent.pop_front();
-        }
-        self.recent.push_back((seq, status));
-    }
-}
-
-/// A freshly folded session, as returned by a hydrate closure.
-pub struct Hydrated {
-    state: AcpState,
-    last_seq: u64,
-    recent: VecDeque<(u64, Status)>,
-}
-
-impl Hydrated {
-    /// A fold whose history is only its latest status.
-    pub fn at(state: AcpState, last_seq: u64) -> Self {
-        let recent = VecDeque::from([(last_seq, state.sidebar_status())]);
-        Self {
-            state,
-            last_seq,
-            recent,
-        }
-    }
-
-    /// Fold `events` onto `base`, keeping the per-seq status tail.
-    pub fn replay(base: AcpState, events: impl IntoIterator<Item = (u64, Event)>) -> Self {
-        let mut folded = Self::at(base, 0);
-        folded.recent.clear();
-        for (seq, event) in events {
-            let _ = folded.state.apply_event(seq, event);
-            folded.last_seq = seq;
-            if folded.recent.len() == RECENT_STATUS_SEQS {
-                folded.recent.pop_front();
-            }
-            folded
-                .recent
-                .push_back((seq, folded.state.sidebar_status()));
-        }
-        folded
-    }
 }
 
 /// Per-session slot.
@@ -96,45 +43,33 @@ impl ControlStateCache {
         )
     }
 
-    /// Fold `event` into the session's cached state, if it has one.
-    pub fn apply_if_cached(&self, session_id: &str, seq: u64, event: &Event) {
+    /// Fold `event` into the session's cached state, if it has one. Returns the
+    /// sidebar status right after this event, so the caller can carry it with
+    /// the frame instead of a later reader finding the fold already ahead.
+    pub fn apply_if_cached(&self, session_id: &str, seq: u64, event: &Event) -> Option<Status> {
         let slot = self.slot(session_id);
         let mut guard = lock(&slot);
-        let Some(cached) = guard.as_mut() else {
-            return;
-        };
+        let cached = guard.as_mut()?;
         if seq == cached.last_seq {
             // Exact repeat of the seq we already folded: a benign publish
             // retry (the store reports these as primary-key collisions).
-            return;
+            return None;
         }
-        if seq != cached.last_seq + 1 {
+        if seq != cached.last_seq + 1 || cached.state.apply_event(seq, event.clone()).is_err() {
             *guard = None;
-            return;
-        }
-        if cached.state.apply_event(seq, event.clone()).is_err() {
-            *guard = None;
-            return;
+            return None;
         }
         cached.last_seq = seq;
-        let status = cached.state.sidebar_status();
-        cached.push_recent(seq, status);
+        Some(cached.state.sidebar_status())
     }
 
-    /// The sidebar status right after folding `seq`, or `None` if nothing is
-    /// cached or `seq` has left the history. The fold runs ahead of the
-    /// listener, so substituting the latest status for an older frame would
-    /// skip the transitions in between; callers rebuild it from the log. Never hydrates; callers that need a
-    /// verdict hydrate through `SessionService::fold_control_state` first.
-    pub fn sidebar_status_at(&self, session_id: &str, seq: u64) -> Option<Status> {
+    /// The cached fold's sidebar status, or `None` if nothing is cached. Never
+    /// hydrates; callers that need a verdict hydrate through
+    /// `SessionService::fold_control_state` first.
+    pub fn sidebar_status(&self, session_id: &str) -> Option<crate::session::Status> {
         let slot = self.slot(session_id);
         let guard = lock(&slot);
-        let cached = guard.as_ref()?;
-        cached
-            .recent
-            .iter()
-            .find(|(s, _)| *s == seq)
-            .map(|(_, status)| *status)
+        guard.as_ref().map(|c| c.state.sidebar_status())
     }
 
     /// Drop a session's fold.
@@ -144,21 +79,20 @@ impl ControlStateCache {
     }
 
     /// The session's control state, running `hydrate` on a miss.
-    pub fn get_or_hydrate(&self, session_id: &str, hydrate: impl FnOnce() -> Hydrated) -> AcpState {
+    pub fn get_or_hydrate(
+        &self,
+        session_id: &str,
+        hydrate: impl FnOnce() -> (AcpState, u64),
+    ) -> AcpState {
         let slot = self.slot(session_id);
         let mut guard = lock(&slot);
         if let Some(cached) = guard.as_ref() {
             return cached.state.clone();
         }
-        let Hydrated {
-            state,
-            last_seq,
-            recent,
-        } = hydrate();
+        let (state, last_seq) = hydrate();
         *guard = Some(Cached {
             state: state.clone(),
             last_seq,
-            recent,
         });
         state
     }
@@ -197,7 +131,7 @@ mod tests {
         let mut hydrated = 0;
         let state = cache.get_or_hydrate("s-1", || {
             hydrated += 1;
-            Hydrated::at(seed(), 0)
+            (seed(), 0)
         });
         assert!(!state.turn_active);
         assert_eq!(hydrated, 1);
@@ -212,12 +146,12 @@ mod tests {
         };
         cache.get_or_hydrate("s-1", || {
             hydrate_count();
-            Hydrated::at(seed(), 0)
+            (seed(), 0)
         });
         cache.apply_if_cached("s-1", 1, &prompt("go"));
         let state = cache.get_or_hydrate("s-1", || {
             hydrate_count();
-            Hydrated::at(seed(), 0)
+            (seed(), 0)
         });
         assert!(state.turn_active, "the live fold reached the reader");
 
@@ -247,7 +181,7 @@ mod tests {
         cache.apply_if_cached("s-1", 3, &stopped("end_turn"));
         let state = cache.get_or_hydrate("s-1", || {
             hydrate_count();
-            Hydrated::at(seed(), 0)
+            (seed(), 0)
         });
         assert!(!state.turn_active);
         assert_eq!(state.pending_approvals.len(), 1);
@@ -258,37 +192,25 @@ mod tests {
         assert!(!cache.is_hydrated("s-1"));
     }
 
-    /// The listener consumes frames behind the fold, so each seq keeps its own
-    /// status for as long as a frame can still be queued behind it.
+    /// Each fold reports the status right after its own event, which is what
+    /// rides on the broadcast frame; a cold session or a retry reports none.
     #[test]
-    fn sidebar_status_is_kept_per_folded_seq() {
+    fn apply_if_cached_reports_the_status_after_its_own_event() {
         let cache = ControlStateCache::new();
-        cache.get_or_hydrate("s-1", || Hydrated::at(seed(), 0));
-        cache.apply_if_cached("s-1", 1, &prompt("go"));
-        let window = 256 + 1;
-        for seq in 2..=window {
-            cache.apply_if_cached("s-1", seq, &prompt("again"));
-        }
-        cache.apply_if_cached("s-1", window + 1, &stopped("end_turn"));
+        assert_eq!(cache.apply_if_cached("s-1", 1, &prompt("go")), None);
+        cache.get_or_hydrate("s-1", || (seed(), 0));
         assert_eq!(
-            cache.sidebar_status_at("s-1", 1),
-            Some(Status::Running),
-            "a frame a full broadcast window behind keeps its own status"
+            cache.apply_if_cached("s-1", 1, &prompt("go")),
+            Some(Status::Running)
         );
         assert_eq!(
-            cache.sidebar_status_at("s-1", window + 1),
-            Some(Status::Idle)
-        );
-        assert_eq!(cache.sidebar_status_at("s-1", 9999), None, "never folded");
-        assert_eq!(cache.sidebar_status_at("cold", 1), None);
-
-        for seq in window + 2..window + 2 + RECENT_STATUS_SEQS as u64 {
-            cache.apply_if_cached("s-1", seq, &prompt("more"));
-        }
-        assert_eq!(
-            cache.sidebar_status_at("s-1", 1),
+            cache.apply_if_cached("s-1", 1, &prompt("go")),
             None,
-            "an evicted seq is a miss, not a later status"
+            "retry"
+        );
+        assert_eq!(
+            cache.apply_if_cached("s-1", 2, &stopped("end_turn")),
+            Some(Status::Idle)
         );
     }
 
@@ -309,7 +231,7 @@ mod tests {
         ];
         for (name, first, second, still_cached) in cases {
             let cache = ControlStateCache::new();
-            cache.get_or_hydrate("s-1", || Hydrated::at(seed(), first - 1));
+            cache.get_or_hydrate("s-1", || (seed(), first - 1));
             cache.apply_if_cached("s-1", first, &prompt("go"));
             cache.apply_if_cached("s-1", second, &stopped("end_turn"));
             assert_eq!(cache.is_hydrated("s-1"), still_cached, "{name}");

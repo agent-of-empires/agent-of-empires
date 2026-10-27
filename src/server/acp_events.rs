@@ -301,36 +301,36 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                 });
         }
 
-        // A cold cache (nothing has hydrated this session since the daemon
-        // started, e.g. right after a restart with a reattached worker) is
-        // hydrated here. The replay picks up this frame's own event too, since
-        // it is persisted to the store before being broadcast, and
-        // `fold_control_state` hydrates through the cache's per-session lock, so
-        // a second frame for the same cold session waits for the first rather
-        // than double-hydrating (#4001).
-        //
-        // The fold runs ahead of this listener, so the status is read at this
-        // frame's seq: a Resolved + Stopped burst still shows Running then Idle.
-        // A startup error whose write failed is substituted by the sink and
-        // never reaches the log or the fold, so the frame itself carries it.
+        // The sink folds before broadcasting, so a frame published to a warm
+        // cache carries its own status and no later reader depends on how far
+        // the fold has run. A frame published cold (right after a restart with
+        // a reattached worker) carries none and is rebuilt from the log. A
+        // startup error whose write failed is substituted by the sink and
+        // never reaches the log, so the frame itself says Error.
         let status_policy = status_policy(frame.event.as_ref());
         let status_update = match (status_policy, frame.event.as_ref()) {
             (Some(policy), crate::acp::state::Event::AgentStartupError { .. }) => {
                 Some((policy, Status::Error))
             }
-            (Some(policy), _) => {
-                if !state.acp_control_cache.is_hydrated(&frame.session_id) {
-                    state
+            (Some(policy), _) => match frame.sidebar_status {
+                Some(projected) => Some((policy, projected)),
+                None => {
+                    // Hydrates once; frames published after it carry a status.
+                    let fold = state
                         .session_service
                         .fold_control_state(&frame.session_id)
                         .await;
-                }
-                state
-                    .session_service
-                    .sidebar_status_at(&frame.session_id, frame.seq)
-                    .await
+                    if fold.last_seq == frame.seq {
+                        Some(fold.sidebar_status())
+                    } else {
+                        state
+                            .session_service
+                            .sidebar_status_at(&frame.session_id, frame.seq)
+                            .await
+                    }
                     .map(|projected| (policy, projected))
-            }
+                }
+            },
             (None, _) => None,
         };
         let acp_change = derive_acp_session_change(frame.event.as_ref());
@@ -1495,6 +1495,7 @@ mod tests {
                         steering: false,
                     }),
                     worker_generation: Some(worker_generation),
+                    sidebar_status: None,
                 })
                 .expect("listener is subscribed");
         };
@@ -1546,6 +1547,7 @@ mod tests {
                     acp_session_id: "replacement-acp-id".to_string(),
                 }),
                 worker_generation: None,
+                sidebar_status: None,
             })
             .expect("listener is subscribed");
         for _ in 0..500 {
@@ -1663,6 +1665,7 @@ mod tests {
                 seq: 1,
                 event: Arc::new(stopped),
                 worker_generation: None,
+                sidebar_status: None,
             })
             .expect("listener is subscribed");
 
@@ -1769,6 +1772,7 @@ mod tests {
                     seq,
                     event: Arc::new(event),
                     worker_generation: None,
+                    sidebar_status: None,
                 })
                 .expect("listener is subscribed");
         }
@@ -1786,11 +1790,11 @@ mod tests {
         assert!(load_profile_row(profile, &id).is_some_and(|i| i.unread));
     }
 
-    /// A frame far behind the fold still projects at its own seq:
-    /// ApprovalResolved at N is consumed after the content frames and the stop
-    /// are already folded, and must not read a later level. 255 frames stay
-    /// inside the cached history; 600 outrun it, so the status is rebuilt from
-    /// the log (a listener parked on a cold hydration while publishers carry on).
+    /// A frame far behind the fold keeps its own transition: ApprovalResolved
+    /// at N is consumed after the content frames and the stop are already
+    /// folded, and must not read a later level. The status rides on the frame,
+    /// so it holds even when a finite retention cap has pruned the answer out
+    /// of the journal.
     #[tokio::test]
     #[serial_test::serial]
     async fn acp_event_listener_keeps_the_edge_for_a_frame_far_behind_the_fold() {
@@ -1799,7 +1803,7 @@ mod tests {
         use crate::acp::state::test_support::prompt;
         use crate::acp::state::ToolCall;
         use crate::acp::Event;
-        for content_frames in [255usize, 600] {
+        for (retained, content_frames) in [(2000usize, 255usize), (2000, 600), (42, 600)] {
             let temp = tempfile::tempdir().expect("tempdir");
             let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
             crate::session::set_unread_enabled(true);
@@ -1811,9 +1815,8 @@ mod tests {
             inst.status = Status::Waiting;
             let id = inst.id.clone();
             seed_profile_store(profile, vec![inst.clone()]);
-            // A store deep enough that the 600-frame case is not pruned.
             let store = Arc::new(
-                crate::acp::event_store::EventStore::open(&temp.path().join("acp.db"), 2000)
+                crate::acp::event_store::EventStore::open(&temp.path().join("acp.db"), retained)
                     .expect("event store"),
             );
             let state = test_support::build_test_app_state_impl_with_event_store(
@@ -1860,18 +1863,27 @@ mod tests {
                     .expect("record");
             }
             state.session_service.fold_control_state(&id).await;
+            // What the sink does: record, fold, and keep the status after each seq.
+            let mut folded = Vec::new();
             for (seq, event) in (3..).zip(&log[2..]) {
                 state
                     .acp_event_store
                     .record(&id, seq, event)
                     .expect("record");
-                state.acp_control_cache.apply_if_cached(&id, seq, event);
+                folded.push(state.acp_control_cache.apply_if_cached(&id, seq, event));
             }
             let last = log.len() as u64;
+            let answered_status = folded[0];
+            let stopped_status = *folded.last().expect("folded");
+            assert_eq!(answered_status, Some(Status::Running));
+            assert_eq!(stopped_status, Some(Status::Idle));
 
             let listener = tokio::spawn(acp_event_listener(state.clone()));
             await_subscribed(&state).await;
-            for (seq, event) in [(3, answered), (last, stopped)] {
+            for (seq, event, sidebar_status) in [
+                (3, answered, answered_status),
+                (last, stopped, stopped_status),
+            ] {
                 state
                     .acp_events_tx
                     .send(AcpBroadcastFrame {
@@ -1879,6 +1891,7 @@ mod tests {
                         seq,
                         event: Arc::new(event),
                         worker_generation: None,
+                        sidebar_status,
                     })
                     .expect("listener is subscribed");
             }
@@ -1892,7 +1905,11 @@ mod tests {
             .await;
             listener.abort();
             let _ = listener.await;
-            assert_eq!(row.status, Status::Idle, "{content_frames} content frames");
+            assert_eq!(
+                row.status,
+                Status::Idle,
+                "{content_frames} frames, retention {retained}"
+            );
             assert!(load_profile_row(profile, &id).is_some_and(|i| i.unread));
         }
     }
@@ -1922,6 +1939,7 @@ mod tests {
                     message: "event store write failed at seq 7".into(),
                 }),
                 worker_generation: None,
+                sidebar_status: None,
             })
             .expect("listener is subscribed");
 
@@ -1945,7 +1963,7 @@ mod tests {
     /// and the row stays Running.
     #[tokio::test]
     #[serial_test::serial]
-    async fn acp_event_listener_hydrates_a_cold_cache_before_projecting_a_frame() {
+    async fn acp_event_listener_rebuilds_a_frame_published_to_a_cold_cache() {
         use crate::acp::Event;
         let completed = Event::BackgroundAgentCompleted {
             agent_id: "bg-1".into(),
@@ -2032,6 +2050,7 @@ mod tests {
                     seq: 3,
                     event: Arc::new(live_frame),
                     worker_generation: None,
+                    sidebar_status: None,
                 })
                 .expect("listener is subscribed");
 
@@ -2061,7 +2080,7 @@ mod tests {
             );
             assert!(state.acp_control_cache.is_hydrated(&id), "{name}");
             assert_eq!(
-                state.acp_control_cache.sidebar_status_at(&id, 3),
+                state.acp_control_cache.sidebar_status(&id),
                 Some(Status::Running),
                 "{name}"
             );
@@ -2740,6 +2759,7 @@ mod tests {
                     acp_session_id: "attested-acp-id".to_string(),
                 }),
                 worker_generation: None,
+                sidebar_status: None,
             })
             .expect("listener is subscribed");
 

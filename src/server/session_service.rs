@@ -1599,8 +1599,13 @@ impl SessionService {
         // SQLite scan, so the whole thing goes off the runtime rather than just the scan.
         tokio::task::spawn_blocking(move || {
             cache.get_or_hydrate(&sid.clone(), || {
-                let base = AcpState::new(AcpSessionId(sid.clone()), agent, model);
-                crate::acp::control_cache::Hydrated::replay(base, store.replay_from(&sid, 0))
+                let mut reduced = AcpState::new(AcpSessionId(sid.clone()), agent, model);
+                let mut last_seq = 0;
+                for (seq, event) in store.replay_from(&sid, 0) {
+                    let _ = reduced.apply_event(seq, event);
+                    last_seq = seq;
+                }
+                (reduced, last_seq)
             })
         })
         .await
@@ -1613,19 +1618,15 @@ impl SessionService {
         })
     }
 
-    /// The sidebar status right after `seq`. The cached history answers while
-    /// it still holds `seq`; once the fold has run past it (a listener parked
-    /// on a cold hydration while publishers carried on), the log is replayed
-    /// up to `seq`, which is slow but exact.
+    /// The sidebar status right after `seq`, rebuilt from the durable log. For
+    /// a frame published while the control cache was cold, so no status rode
+    /// with it; exact for whatever the journal's retention still holds.
     pub(crate) async fn sidebar_status_at(
         &self,
         id: &str,
         seq: u64,
     ) -> Option<crate::session::Status> {
         use crate::acp::state::{AcpSessionId, AcpState, AgentName};
-        if let Some(status) = self.acp_control_cache.sidebar_status_at(id, seq) {
-            return Some(status);
-        }
         let store = Arc::clone(&self.acp_event_store);
         let sid = id.to_string();
         tokio::task::spawn_blocking(move || {
