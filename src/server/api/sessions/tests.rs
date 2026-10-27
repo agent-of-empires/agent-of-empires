@@ -5186,7 +5186,7 @@ async fn permanent_deletion_waits_for_an_in_flight_submission() {
         "a delete must not tear a session down under an in-flight submission"
     );
     assert_eq!(
-        tokio::time::timeout(std::time::Duration::from_secs(10), claims.recv())
+        tokio::time::timeout(Duration::from_secs(10), claims.recv())
             .await
             .expect("contender must reach submission claim")
             .expect("submission claim watcher must remain open"),
@@ -5198,7 +5198,7 @@ async fn permanent_deletion_waits_for_an_in_flight_submission() {
         "the session must not even be marked Deleting yet"
     );
     drop(delivering);
-    tokio::time::timeout(std::time::Duration::from_secs(10), delete)
+    tokio::time::timeout(Duration::from_secs(10), delete)
         .await
         .expect("the delete lands once the submission releases the session");
 
@@ -5233,7 +5233,7 @@ async fn permanent_deletion_waits_for_an_in_flight_submission() {
         "sess-3650-owner"
     );
     drop(delivering);
-    tokio::time::timeout(std::time::Duration::from_secs(10), workspace)
+    tokio::time::timeout(Duration::from_secs(10), workspace)
         .await
         .expect("the workspace teardown lands once the submission releases");
 
@@ -5281,7 +5281,7 @@ async fn permanent_deletion_waits_for_an_in_flight_submission() {
         "no row may be marked Deleting while the sibling's submission is in flight"
     );
     drop(delivering);
-    tokio::time::timeout(std::time::Duration::from_secs(10), workspace)
+    tokio::time::timeout(Duration::from_secs(10), workspace)
         .await
         .expect("the workspace teardown lands once the sibling submission releases");
 }
@@ -5398,7 +5398,7 @@ async fn worker_stopping_handlers_wait_for_an_in_flight_submission() {
         );
 
         drop(delivering);
-        tokio::time::timeout(std::time::Duration::from_secs(10), handler)
+        tokio::time::timeout(Duration::from_secs(10), handler)
             .await
             .unwrap_or_else(|_| panic!("{which} must finish once the submission releases"));
     }
@@ -6717,7 +6717,7 @@ async fn archive_persists_under_the_lifecycle_lock() -> anyhow::Result<()> {
     );
 
     drop(send_lock);
-    let response = tokio::time::timeout(std::time::Duration::from_secs(10), archive)
+    let response = tokio::time::timeout(Duration::from_secs(10), archive)
         .await
         .expect("the archive lands once the lock is free")
         .expect("archive request");
@@ -6790,7 +6790,7 @@ async fn group_archive_gates_each_member_on_its_own_lifecycle_lock() -> anyhow::
         .map(|id| (id.clone(), archive_task(id)))
         .collect();
     for (id, member) in group.drain(..) {
-        let response = tokio::time::timeout(std::time::Duration::from_secs(10), member)
+        let response = tokio::time::timeout(Duration::from_secs(10), member)
             .await
             .unwrap_or_else(|_| panic!("{id}: a member must not wait on a sibling's lock"))
             .expect("archive request");
@@ -6803,7 +6803,7 @@ async fn group_archive_gates_each_member_on_its_own_lifecycle_lock() -> anyhow::
     );
 
     drop(send_lock);
-    let response = tokio::time::timeout(std::time::Duration::from_secs(10), &mut waiting)
+    let response = tokio::time::timeout(Duration::from_secs(10), &mut waiting)
         .await
         .expect("the held member lands once its lock is free")
         .expect("archive request");
