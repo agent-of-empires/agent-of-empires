@@ -70,6 +70,13 @@ describe("Tooltip", () => {
     at(200);
     fireEvent.scroll(window);
     expect(screen.getByRole("tooltip").style.top).toBe("216px");
+    // A touch or pen on a controlled tooltip's trigger leaves it to its caller: it stays visible.
+    for (const pointerType of ["touch", "pen"]) {
+      fireEvent.pointerDown(anchor, { pointerType });
+      expect(screen.getByRole("tooltip").style.visibility, pointerType).toBe("visible");
+    }
+    // Back to a mouse, as the next part of this test assumes.
+    fireEvent.pointerDown(anchor, { pointerType: "mouse" });
 
     // A child's own description is kept alongside the bubble.
     rerender(

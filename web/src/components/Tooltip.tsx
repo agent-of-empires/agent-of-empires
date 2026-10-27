@@ -107,8 +107,9 @@ export function Tooltip({
       // tooltip over whatever opens next; a touch-started interaction shows nothing.
       onPointerDown={(e) => {
         touchRef.current = e.pointerType !== "mouse";
-        // A touch entry event can open it before this lands; a tap never shows it.
-        if (touchRef.current) hide();
+        // A touch entry event can open it before this lands; a tap never shows it. A controlled
+        // tooltip is its caller's to close: hiding here would only clear its position.
+        if (touchRef.current && !controlled) hide();
       }}
       onPointerEnter={(e) => {
         if (e.pointerType === "mouse") touchRef.current = false;
