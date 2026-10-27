@@ -347,6 +347,8 @@ struct RestartEffect {
     logins: Logins,
     /// The next daemon puts Devices behind the passphrase login wall.
     passphrase: bool,
+    /// The token is near expiry, so a standing help screen cannot say the link stays.
+    may_change: bool,
 }
 
 /// What the next start will do, read when R, G or help states it: the restarted daemon reads
@@ -363,8 +365,8 @@ struct RestartProbe {
     local_hosts: Vec<String>,
     /// A Local restart inherits `AOE_SERVE_PASSPHRASE` from this process.
     local_passphrase: bool,
-    /// A Local restart mints a new access token (`token_renews`).
-    local_token_renews: bool,
+    /// Whether a Local restart mints a new access token.
+    local_token: TokenWindow,
 }
 
 impl RestartProbe {
@@ -381,7 +383,7 @@ impl RestartProbe {
                     .collect(),
                 local_passphrase: std::env::var("AOE_SERVE_PASSPHRASE")
                     .is_ok_and(|pp| !pp.is_empty()),
-                local_token_renews: token_renews(),
+                local_token: token_window(),
             },
             ServeMode::Tunnel => RestartProbe {
                 on_funnel: restart_on_funnel(transport),
@@ -415,7 +417,7 @@ impl RestartEffect {
                 let port_stays = probe
                     .port
                     .is_some_and(|port| urls.iter().all(|u| link_port(&u.url) == Some(port)));
-                let renews = probe.local_token_renews;
+                let renews = probe.local_token == TokenWindow::Renews;
                 let link = if !hosts_stay || (renews && !probe.local_passphrase) {
                     LinkChange::Replaced
                 } else if !port_stays || renews {
@@ -452,6 +454,7 @@ impl RestartEffect {
             link,
             logins,
             passphrase,
+            may_change: mode == ServeMode::Local && probe.local_token == TokenWindow::Boundary,
         }
     }
 }
@@ -927,7 +930,16 @@ impl ServeView {
             }
             // Reusing the passphrase keeps persisted logins; see `RestartEffect`.
             KeyCode::Char('r' | 'R') => {
-                if confirmed == Some(PendingConfirm::Restart) {
+                let fresh = RestartProbe::now(mode, transport);
+                let unchanged = confirmed == Some(PendingConfirm::Restart)
+                    && RestartEffect::of(mode, urls, &fresh, self.running_persists)
+                        == RestartEffect::of(
+                            mode,
+                            urls,
+                            &self.restart_probe,
+                            self.running_persists,
+                        );
+                if unchanged {
                     let pp = (mode == ServeMode::Tunnel).then(|| {
                         passphrase
                             .clone()
@@ -935,7 +947,7 @@ impl ServeView {
                     });
                     self.restart(mode, transport, pp);
                 } else {
-                    self.restart_probe = RestartProbe::now(mode, transport);
+                    self.restart_probe = fresh;
                     self.pending_confirm = Some((PendingConfirm::Restart, Instant::now()));
                 }
             }
@@ -1426,6 +1438,50 @@ mod tests {
                 assert!(view.pending_confirm.is_none());
             }
         }
+    }
+
+    /// The token can age out between the first and second R, so the second one confirms again
+    /// when what it would do no longer matches what the user read.
+    #[test]
+    #[serial_test::serial]
+    fn second_restart_key_reprobes_and_reconfirms_when_the_effect_changed() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let token = crate::session::get_app_dir().unwrap().join("serve.token");
+        let mut view = ServeView::new();
+        view.state = ServeViewState::Active {
+            mode: ServeMode::Local,
+            transport: None,
+            urls: vec![ServeUrl {
+                label: None,
+                url: "http://127.0.0.1:8080/?token=t".to_string(),
+            }],
+            url_index: 0,
+            passphrase: None,
+            opened_at: Instant::now(),
+            log_offset: 0,
+        };
+        let key = KeyEvent::from(KeyCode::Char('R'));
+        let write_token = |age: Duration| {
+            std::fs::write(&token, "t").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&token)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - age)
+                .unwrap();
+        };
+        write_token(Duration::from_secs(23 * 60 * 60 + 60));
+        view.handle_key(key);
+        assert_eq!(view.restart_probe.local_token, TokenWindow::Boundary);
+        write_token(Duration::from_secs(24 * 60 * 60 + 60));
+        assert!(matches!(view.handle_key(key), ServeAction::Continue));
+        assert_eq!(view.restart_probe.local_token, TokenWindow::Renews);
+        assert!(matches!(
+            view.pending_confirm,
+            Some((PendingConfirm::Restart, _))
+        ));
+        assert!(view.pending_launch.is_none());
+        assert!(matches!(view.handle_key(key), ServeAction::Launch(_)));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

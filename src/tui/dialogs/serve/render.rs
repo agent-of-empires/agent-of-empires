@@ -807,6 +807,7 @@ fn restart_help(effect: RestartEffect) -> String {
         LinkChange::Replaced if effect.passphrase => "new link, sign in again".to_string(),
         LinkChange::Replaced => "new link".to_string(),
         LinkChange::Moved => format!("new link; {logins}"),
+        LinkChange::Same if effect.may_change => format!("link may change; {logins}"),
         LinkChange::Same => logins.to_string(),
     };
     format!("Restart the Daemon ({what}; agents keep running)")
@@ -1200,7 +1201,7 @@ mod tests {
 
     #[test]
     fn restart_and_passphrase_copy_say_what_happens_to_devices() {
-        use super::super::RestartProbe;
+        use super::super::{RestartProbe, TokenWindow};
         use PendingConfirm::{NewPassphrase as G, Restart as R};
         use ServeMode::{Local, Tunnel};
         let lan = "http://192.168.1.42:8080/?token=t";
@@ -1244,7 +1245,11 @@ mod tests {
                     "localhost".to_string(),
                 ],
                 local_passphrase,
-                local_token_renews: renews,
+                local_token: if renews {
+                    TokenWindow::Renews
+                } else {
+                    TokenWindow::Reused
+                },
             };
         let tunnel = |on_funnel, persists| probe(on_funnel, None, true, false, persists, false);
         // (mode, url, next start, running daemon's persist_sessions (None = reattached), key
@@ -1259,6 +1264,18 @@ mod tests {
                 None,
                 R,
                 stays.clone(),
+            ),
+            // In the token's last hour the confirm is exact, but a standing help screen can't be.
+            (
+                Local,
+                lan,
+                RestartProbe {
+                    local_token: TokenWindow::Boundary,
+                    ..probe(false, Some(8080), true, false, false, false)
+                },
+                None,
+                R,
+                (format!("{kept}."), format!("link may change; {kept}")),
             ),
             // A CLI-started Local daemon on another port, or no saved port, moves the link.
             (
