@@ -1207,6 +1207,100 @@ mod tests {
             state_call(&value.base, delegate?, state)
         }
 
+        fn rejection_branch(block: &syn::Block, condition: &syn::Expr) -> bool {
+            let binding = match ungroup(condition) {
+                syn::Expr::Let(value) => match &*value.pat {
+                    syn::Pat::TupleStruct(pattern) => {
+                        pattern.elems.first().and_then(|pattern| match pattern {
+                            syn::Pat::Ident(binding)
+                                if binding.attrs.is_empty() && binding.subpat.is_none() =>
+                            {
+                                Some(&binding.ident)
+                            }
+                            _ => None,
+                        })
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            fn direct(expression: &syn::Expr, binding: Option<&syn::Ident>) -> bool {
+                match ungroup(expression) {
+                    syn::Expr::Path(path) => {
+                        path.attrs.is_empty()
+                            && binding.is_some()
+                            && path.path.get_ident() == binding
+                    }
+                    syn::Expr::Call(call) => {
+                        call.attrs.is_empty()
+                            && call.args.is_empty()
+                            && matches!(ungroup(&call.func), syn::Expr::Path(path)
+                                if path.attrs.is_empty() && path.qself.is_none()
+                                && path.path.segments.last().is_some_and(|segment|
+                                    segment.ident == "read_only_response"))
+                    }
+                    _ => false,
+                }
+            }
+            fn forbidden(expression: &syn::Expr) -> bool {
+                let syn::Expr::Path(path) = ungroup(expression) else {
+                    return false;
+                };
+                if !path.attrs.is_empty() || path.qself.is_some() {
+                    return false;
+                }
+                let mut segments = path.path.segments.iter().rev();
+                segments
+                    .next()
+                    .is_some_and(|segment| segment.ident == "FORBIDDEN")
+                    && segments
+                        .next()
+                        .is_some_and(|segment| segment.ident == "StatusCode")
+            }
+            fn forbidden_value(expression: &syn::Expr) -> bool {
+                match ungroup(expression) {
+                    syn::Expr::MethodCall(call) => {
+                        call.attrs.is_empty()
+                            && call.method == "into_response"
+                            && call.args.is_empty()
+                            && forbidden(&call.receiver)
+                    }
+                    syn::Expr::Tuple(tuple) if tuple.attrs.is_empty() && tuple.elems.len() == 2 => {
+                        forbidden(&tuple.elems[0])
+                            && matches!(ungroup(&tuple.elems[1]), syn::Expr::MethodCall(call)
+                                if call.attrs.is_empty() && call.method == "into"
+                                && call.args.is_empty()
+                                && matches!(ungroup(&call.receiver), syn::Expr::Lit(value)
+                                    if value.attrs.is_empty() && matches!(value.lit, syn::Lit::Str(_))))
+                    }
+                    _ => false,
+                }
+            }
+            let [syn::Stmt::Expr(syn::Expr::Return(returned), _)] = block.stmts.as_slice() else {
+                return false;
+            };
+            let Some(value) = returned
+                .expr
+                .as_deref()
+                .filter(|_| returned.attrs.is_empty())
+            else {
+                return false;
+            };
+            direct(value, binding)
+                || matches!(ungroup(value), syn::Expr::Call(call)
+                    if call.attrs.is_empty() && call.args.len() == 1
+                    && matches!(ungroup(&call.func), syn::Expr::Path(path)
+                        if path.attrs.is_empty() && path.path.is_ident("Err"))
+                    && (direct(&call.args[0], binding) || forbidden_value(&call.args[0])))
+        }
+
+        struct Propagates(bool);
+        impl<'ast> Visit<'ast> for Propagates {
+            fn visit_expr_try(&mut self, _: &'ast syn::ExprTry) {
+                self.0 = true;
+            }
+        }
+
         fn guarded_before(
             body: &syn::Block,
             state: Option<&syn::Ident>,
@@ -1217,12 +1311,17 @@ mod tests {
                 if let syn::Stmt::Expr(syn::Expr::If(guard), _) = statement {
                     if guard.attrs.is_empty()
                         && guard.span().byte_range().end <= position
-                        && exits(&guard.then_branch)
+                        && rejection_branch(&guard.then_branch, &guard.cond)
                         && (read_only_condition(&guard.cond, state)
                             || delegated_condition(&guard.cond, state, delegate))
                     {
                         return true;
                     }
+                }
+                let mut propagates = Propagates(false);
+                propagates.visit_stmt(statement);
+                if propagates.0 {
+                    break;
                 }
                 // Opaque control flow is not admission evidence.
                 match statement {
@@ -1408,28 +1507,37 @@ mod tests {
             "fn write(State(state): State<Arc<AppState>>, body: Result<Json<Body>, JsonRejection>)";
         let shared = "fn gate(state: &AppState)";
         for (signature, body, delegate, expected) in [
-            (signature, "{ if state.read_only { return forbidden(); } work(); }", None, true),
-            (signature, "{ if other_gate() { return denied(); } if state.read_only { return forbidden(); } work(); }", None, true),
+            (signature, "{ if state.read_only { return read_only_response(); } work(); }", None, true),
+            (signature, "{ if other_gate() { return denied(); } if state.read_only { return read_only_response(); } work(); }", None, true),
             (signature, "{ if let Some(resp) = crate::server::api::read_only_block(&state) { return resp; } work(); }", None, true),
             (shared, "{ if let Some(resp) = read_only_block(state).or_else(|| cityhall_block(state)) { return Err(resp); } Ok(()) }", None, true),
             (signature, "{ prepare_agent_session(state, id, body, mode, None).await }", Some("prepare_agent_session"), true),
             (signature, "{ return super::lifecycle::prepare_agent_session(state, id, body, mode, None).await; }", Some("prepare_agent_session"), true),
             (signature, "{ if let Err(resp) = install_gate(&state) { return resp; } work(); }", Some("install_gate"), true),
-            (signature, "{ /* if state.read_only { return forbidden(); } */ work(); }", None, false),
+            (signature, "{ if state.read_only { return Err(read_only_response()); } work(); }", None, true),
+            (signature, "{ if state.read_only { return Err(StatusCode::FORBIDDEN.into_response()); } work(); }", None, true),
+            (signature, "{ if state.read_only { return Err((StatusCode::FORBIDDEN, \"read-only\".into())); } work(); }", None, true),
+            (signature, "{ check()?; if state.read_only { return read_only_response(); } work(); }", None, false),
+            (signature, "{ let value = wrap(check()?); if state.read_only { return read_only_response(); } work(); }", None, false),
+            (signature, "{ if state.read_only { return StatusCode::OK.into_response(); } work(); }", None, false),
+            (signature, "{ if let Some(resp) = read_only_block(&state) { return other; } work(); }", None, false),
+            (signature, "{ if let Some(resp) = read_only_block(&state) { return Ok(resp); } work(); }", None, false),
+            (signature, "{ if state.read_only { mutate(); return read_only_response(); } work(); }", None, false),
+            (signature, "{ /* if state.read_only { return read_only_response(); } */ work(); }", None, false),
             (signature, "{ let text = \"state.read_only\"; work(); }", None, false),
-            (signature, r##"{ let text = r#"if state.read_only { return forbidden(); }"#; work(); }"##, None, false),
+            (signature, r##"{ let text = r#"if state.read_only { return read_only_response(); }"#; work(); }"##, None, false),
             (signature, "{ work(); // read_only_block(&state)\n }", None, false),
-            (signature, "{ let callback = || { if state.read_only { return forbidden(); } }; work(); }", None, false),
-            (signature, "{ let future = async { if state.read_only { return forbidden(); } }; work(); }", None, false),
-            (signature, "{ fn nested(state: &AppState) { if state.read_only { return forbidden(); } } work(); }", None, false),
-            (signature, "{ if false { if state.read_only { return forbidden(); } } work(); }", None, false),
+            (signature, "{ let callback = || { if state.read_only { return read_only_response(); } }; work(); }", None, false),
+            (signature, "{ let future = async { if state.read_only { return read_only_response(); } }; work(); }", None, false),
+            (signature, "{ fn nested(state: &AppState) { if state.read_only { return read_only_response(); } } work(); }", None, false),
+            (signature, "{ if false { if state.read_only { return read_only_response(); } } work(); }", None, false),
             (signature, "{ if state.read_only { record(); } work(); }", None, false),
-            (signature, "{ if state.read_only && condition { return forbidden(); } work(); }", None, false),
-            (signature, "{ return ok(); if state.read_only { return forbidden(); } work(); }", None, false),
-            (signature, "{ let stopped = { return ok(); }; if state.read_only { return forbidden(); } work(); }", None, false),
-            (signature, "{ { return ok(); } if state.read_only { return forbidden(); } work(); }", None, false),
-            (signature, "{ if flag { return a(); } else { return b(); } if state.read_only { return forbidden(); } work(); }", None, false),
-            (signature, "{ #[cfg(any())] if state.read_only { return forbidden(); } work(); }", None, false),
+            (signature, "{ if state.read_only && condition { return read_only_response(); } work(); }", None, false),
+            (signature, "{ return ok(); if state.read_only { return read_only_response(); } work(); }", None, false),
+            (signature, "{ let stopped = { return ok(); }; if state.read_only { return read_only_response(); } work(); }", None, false),
+            (signature, "{ { return ok(); } if state.read_only { return read_only_response(); } work(); }", None, false),
+            (signature, "{ if flag { return a(); } else { return b(); } if state.read_only { return read_only_response(); } work(); }", None, false),
+            (signature, "{ #[cfg(any())] if state.read_only { return read_only_response(); } work(); }", None, false),
             (signature, "{ let text = \"prepare_agent_session(state, id, body, mode, None)\"; work(); }", Some("prepare_agent_session"), false),
             (signature, "{ let future = prepare_agent_session(state, id, body, mode, None); work(); }", Some("prepare_agent_session"), false),
             (signature, "{ let callback = || prepare_agent_session(state, id, body, mode, None); work(); }", Some("prepare_agent_session"), false),
@@ -1464,7 +1572,7 @@ mod tests {
                     format!("consume!({parameter});"),
                 ] {
                     for guard in [
-                        "if app.read_only { return forbidden() }",
+                        "if app.read_only { return read_only_response() }",
                         "if let Some(response) = read_only_block(&app) { return response }",
                     ] {
                         assert!(body_admission_guards(
@@ -1475,11 +1583,15 @@ mod tests {
                         ).1);
                     }
                     for not_a_guard in [
-                        r#"let text = "if app.read_only { return forbidden() }";"#,
-                        "/* if app.read_only { return forbidden() } */",
+                        "if app.read_only { return StatusCode::OK.into_response(); }",
+                        "if let Some(response) = read_only_block(&app) { return other }",
+                        "check()?; if app.read_only { return read_only_response(); }",
+                        "let value = wrap(check()?); if app.read_only { return read_only_response(); }",
+                        r#"let text = "if app.read_only { return read_only_response() }";"#,
+                        "/* if app.read_only { return read_only_response() } */",
                         "if app.read_only { record() }",
-                        "if app.read_only && condition { return forbidden() }",
-                        "if condition { if app.read_only { return forbidden() } }",
+                        "if app.read_only && condition { return read_only_response() }",
+                        "if condition { if app.read_only { return read_only_response() } }",
                     ] {
                         assert!(!body_admission_guards(
                             &signature, &format!("{{ {not_a_guard} {consumer} }}"), None
