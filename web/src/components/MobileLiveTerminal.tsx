@@ -411,7 +411,10 @@ export function MobileLiveTerminal({
     armAgentClipboard,
   });
   const { wheelAccumRef, enqueueTouchWheelDelta, cancelTouchWheelQueue, startMomentum, stopMomentum } = forward;
-  const pageNotches = useCallback(() => forwardPageNotches(rowsRef.current), []);
+  const pageNotches = useCallback(
+    () => forwardPageNotches(frame?.pane0?.rows ?? rowsRef.current),
+    [frame?.pane0?.rows],
+  );
   // Recent drag samples for the release velocity.
   const flickSamplesRef = useRef<FlickSample[]>([]);
   // Every input path funnels through here, so typing interrupts a coast instead of queueing behind it.

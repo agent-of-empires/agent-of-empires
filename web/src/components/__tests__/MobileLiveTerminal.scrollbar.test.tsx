@@ -38,6 +38,15 @@ describe("MobileLiveTerminal forward scrollbar", () => {
     ]);
   });
 
+  it("sizes a page to pane 0's rows, not the grid's", () => {
+    // The pacer's first burst is a quarter of the backlog: 3 for a 9-notch page, 1 for the 2-row grid's page.
+    const { container, props } = renderLiveTerminal({
+      frame: liveFrame({ ...alt, pane0: { cols: 80, rows: 10 } }),
+    });
+    fireEvent.click(container.querySelector<HTMLElement>("[aria-label='Page down']")!);
+    expect(props.forwardWheel).toHaveBeenCalledTimes(3);
+  });
+
   it.each([
     ["a normal-screen app", { frame: liveFrame() }, false],
     ["a read-only view", { frame: liveFrame({ ...alt }), readOnly: true }, false],
