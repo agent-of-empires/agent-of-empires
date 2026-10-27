@@ -9734,6 +9734,12 @@ async fn create_refuses_a_structured_session_without_its_adapter() {
             "{extra}: {body}"
         );
         assert_eq!(body["error"], "acp_adapter_missing", "{extra}: {body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(&adapter)),
+            "{extra}: {body}"
+        );
         assert!(state.instances.read().await.is_empty(), "{extra}");
         assert!(
             crate::server::test_support::load_instances_from_disk_for_test("default").is_empty(),

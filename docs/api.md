@@ -333,6 +333,10 @@ consuming both surfaces must not compare the two directly.
 Create a session. The web dashboard uses this endpoint for the new-session
 dialog, and external orchestrators may call it directly.
 
+When structured-view preflight finds a missing host ACP adapter, creation returns
+`400 acp_adapter_missing` before provisioning a session. The `message` identifies
+the selected adapter command so the caller knows which dependency to install.
+
 Successful creation returns `201`; an idempotent replay returns `200`. Both
 include `aoe-runtime-epoch` and `aoe-runtime-revision`, and the response row
 comes from that published snapshot. The session and its group hierarchy are
