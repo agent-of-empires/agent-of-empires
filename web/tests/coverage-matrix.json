@@ -1635,8 +1635,12 @@
       "id": "sidebar.compact-mode",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/sidebar-chrome.spec.ts"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+      "specs": ["tests/sidebar-chrome.spec.ts", "tests/sidebar-legend.spec.ts"],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/SidebarToolbar.tsx",
+        "web/src/components/sidebar/SidebarLegend.tsx"
+      ]
     },
     {
       "id": "sidebar.drawer-swipe",
@@ -2011,8 +2015,12 @@
       "kind": "vitest",
       "risk": "low",
       "specs": ["src/components/__tests__/SessionRowTriage.test.tsx"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/SessionRow.tsx"],
-      "reason": "Favorite markers remain distinct from pin in normal and compact rows, including favorite-to-nonfavorite updates."
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/lib/sidebarMarks.ts"
+      ],
+      "reason": "Favorite markers remain distinct from pin in normal and compact rows, including favorite-to-nonfavorite updates, and explain themselves with a Tooltip rather than title."
     },
     {
       "id": "sidebar.unread-indicator",
@@ -2023,7 +2031,44 @@
         "src/lib/api.test.ts",
         "src/lib/__tests__/sidebarOptimistic.test.ts"
       ],
-      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/lib/sidebarMarks.ts"
+      ]
+    },
+    {
+      "id": "sidebar.status-legend",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/sidebar-legend.spec.ts"],
+      "components": [
+        "web/src/components/sidebar/SidebarLegend.tsx",
+        "web/src/components/sidebar/SidebarToolbar.tsx",
+        "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/components/sidebar/SidebarGroupHeader.tsx",
+        "web/src/components/Tooltip.tsx"
+      ],
+      "reason": "The ? legend opens as a popover on desktop and a sheet at 375px with touch; a keyboard-focused row is described by its glyph's tooltip; a tap opens the Session without a tooltip."
+    },
+    {
+      "id": "sidebar.status-legend-unit",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/lib/__tests__/statusLegend.test.ts",
+        "src/components/__tests__/SidebarLegend.test.tsx",
+        "src/components/__tests__/Tooltip.test.tsx",
+        "src/components/__tests__/SessionRowTriage.test.tsx"
+      ],
+      "components": [
+        "web/src/lib/statusLegend.ts",
+        "web/src/lib/sidebarMarks.ts",
+        "web/src/components/StatusGlyph.tsx",
+        "web/src/components/Tooltip.tsx",
+        "web/src/components/sidebar/SidebarLegend.tsx"
+      ],
+      "reason": "Every SessionStatus has a legend row; animated glyphs hold still under reduced motion; Tooltip describes its trigger; row marks carry no title."
     },
     {
       "id": "sidebar.row-tag",

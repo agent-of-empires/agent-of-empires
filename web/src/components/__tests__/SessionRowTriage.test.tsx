@@ -384,3 +384,31 @@ describe("SessionRow keyboard navigation", () => {
     expect(document.activeElement).toBe(row);
   });
 });
+
+describe("SessionRow mark tooltips", () => {
+  it("explains marks with tooltips, not title, and describes the focused row with its glyph", () => {
+    renderRow(ws({ status: "Waiting", favorited: true, pinned_at: PAST }));
+    const row = testId("sidebar-session-row")!;
+    expect(row.hasAttribute("title")).toBe(false);
+    for (const id of ["sidebar-status-glyph", "sidebar-pinned-mark", "sidebar-favorite-mark"]) {
+      expect(testId(id)!.closest("[title]"), id).toBeNull();
+    }
+
+    // A mouse over the glyph shows what it means; a touch never does.
+    const glyph = testId("sidebar-status-glyph")!;
+    fireEvent.pointerEnter(glyph, { pointerType: "touch" });
+    expect(screen.queryByRole("tooltip")).toBeNull();
+    fireEvent.pointerEnter(glyph, { pointerType: "mouse" });
+    expect(screen.getByRole("tooltip").textContent).toBe("Waiting: the Agent needs your input");
+    fireEvent.pointerLeave(glyph, { pointerType: "mouse" });
+    expect(screen.queryByRole("tooltip")).toBeNull();
+
+    // Keyboard focus (jsdom has no :focus-visible) is covered by sidebar-legend.spec.ts.
+    cleanup();
+
+    renderRow(ws({ status: "Idle", unread: true }), { unread: true });
+    expect(testId("sidebar-unread-dot")!.closest("[title]")).toBeNull();
+    fireEvent.pointerEnter(testId("sidebar-status-glyph")!, { pointerType: "mouse" });
+    expect(screen.getByRole("tooltip").textContent).toMatch(/^Unread: /);
+  });
+});

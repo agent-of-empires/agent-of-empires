@@ -16,6 +16,7 @@ import { OFFLINE_TITLE } from "../../lib/connectionState";
 import { ContextMenu, MenuChoiceRow, MenuItem, MenuSeparator, MenuSwatches } from "../ContextMenu";
 import { OwnerAvatar } from "../OwnerAvatar";
 import { Tooltip } from "../Tooltip";
+import { GROUP_DOT_STATE, MARK_MEANING, meaningText } from "../../lib/sidebarMarks";
 import { useContextMenu } from "../useContextMenu";
 import { FoldChevron, PlusIcon } from "../icons";
 import { DISABLED_ICON_BUTTON } from "./styles";
@@ -64,7 +65,11 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
   const dotClass = STATUS_DOT_CLASS[group.status === "active" ? "Running" : "Idle"] ?? "bg-status-idle";
   const rowClass = `${group.color ? "" : "hover:bg-surface-800/50"} ${hasActiveChild ? "border-l-2 border-session-active" : ""}`;
   const headerStyle = repoColorStyle(group.color);
-  const dot = <span className={`w-2 h-2 rounded-full shrink-0 ${dotClass}`} />;
+  const dot = (
+    <Tooltip text={group.status === "active" ? GROUP_DOT_STATE.active : GROUP_DOT_STATE.inactive}>
+      <span data-testid="sidebar-group-dot" className={`w-2 h-2 rounded-full shrink-0 ${dotClass}`} />
+    </Tooltip>
+  );
 
   const commitRename = () => {
     setRenaming(false);
@@ -186,14 +191,15 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
             </span>
           </span>
           {group.pinned && (
-            <span
-              className="shrink-0 text-[10px] leading-none text-text-dim"
-              data-testid="sidebar-group-pinned-marker"
-              title="Pinned project (persists without sessions)"
-              aria-label="Pinned project"
-            >
-              ◆
-            </span>
+            <Tooltip text={meaningText(MARK_MEANING.pinnedProject)}>
+              <span
+                className="shrink-0 text-[10px] leading-none text-text-dim"
+                data-testid="sidebar-group-pinned-marker"
+                aria-label="Pinned project"
+              >
+                ◆
+              </span>
+            </Tooltip>
           )}
           <span
             className="text-[13px] md:text-[14px] font-medium truncate flex-1"

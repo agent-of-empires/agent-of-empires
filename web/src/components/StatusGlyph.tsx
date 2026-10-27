@@ -37,11 +37,14 @@ export function StatusGlyph({
   createdAt,
   idleEnteredAt,
   dormant = false,
+  animate = true,
 }: {
   status: SessionStatus;
   createdAt: string | null;
   idleEnteredAt?: string | null;
   dormant?: boolean;
+  /** Off for reduced motion: an animated glyph holds its first frame. */
+  animate?: boolean;
 }) {
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const isFresh =
@@ -57,7 +60,7 @@ export function StatusGlyph({
   });
 
   useEffect(() => {
-    if (!rattle) return;
+    if (!rattle || !animate) return;
     const r = rattle;
     const computeFrame = () => Math.floor((Date.now() - epoch) / r.interval) % r.frames.length;
     const initial = setTimeout(() => setFrame(computeFrame()), 0);
@@ -66,10 +69,10 @@ export function StatusGlyph({
       clearTimeout(initial);
       clearInterval(id);
     };
-  }, [rattle, epoch]);
+  }, [rattle, epoch, animate]);
 
   if (!rattle) {
     return <>{dormant ? DORMANT_GLYPH : STATIC_GLYPH[status]}</>;
   }
-  return <>{rattle.frames[frame]}</>;
+  return <>{rattle.frames[animate ? frame : 0]}</>;
 }

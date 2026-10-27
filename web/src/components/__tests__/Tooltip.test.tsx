@@ -31,6 +31,38 @@ describe("Tooltip", () => {
     expect(screen.queryByRole("tooltip")).toBeNull();
   });
 
+  it("describes its trigger with the bubble while open, and a controlled one ignores hover", () => {
+    const { rerender } = render(
+      <Tooltip text="New session">
+        <button type="button">+</button>
+      </Tooltip>,
+    );
+    const button = screen.getByRole("button");
+    expect(button.getAttribute("aria-describedby")).toBeNull();
+    fireEvent.focus(button);
+    const tip = screen.getByRole("tooltip");
+    expect(tip.id).not.toBe("");
+    expect(button.getAttribute("aria-describedby")).toBe(tip.id);
+    fireEvent.blur(button);
+    expect(button.getAttribute("aria-describedby")).toBeNull();
+
+    // Controlled: the caller decides when it shows, and describes its own focus target.
+    rerender(
+      <Tooltip text="Waiting: the Agent needs your input" id="glyph-tip" open={false}>
+        <span>⠃</span>
+      </Tooltip>,
+    );
+    fireEvent.mouseEnter(screen.getByText("⠃").parentElement!);
+    expect(screen.queryByRole("tooltip")).toBeNull();
+    rerender(
+      <Tooltip text="Waiting: the Agent needs your input" id="glyph-tip" open>
+        <span>⠃</span>
+      </Tooltip>,
+    );
+    expect(screen.getByRole("tooltip").id).toBe("glyph-tip");
+    expect(screen.getByText("⠃").getAttribute("aria-describedby")).toBeNull();
+  });
+
   it("opens on focus and closes on blur", () => {
     render(
       <Tooltip text="New session">

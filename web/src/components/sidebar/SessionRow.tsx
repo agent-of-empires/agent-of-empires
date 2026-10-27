@@ -1,15 +1,18 @@
-import { memo, useRef, useState } from "react";
+import { memo, useId, useRef, useState } from "react";
 import { Pin } from "lucide-react";
 import type { Workspace } from "../../lib/types";
 import { renameSession, type RuntimeCursor, type SessionMutation } from "../../lib/api";
-import { isSessionActive } from "../../lib/session";
+import { isFreshIdle, isSessionActive } from "../../lib/session";
 import { useIdleDecayWindowMs } from "../../lib/idleDecay";
 import { sessionRowChromeClass } from "../../lib/sessionRowChrome";
 import { useSessionColorsEnabled } from "../../lib/sessionColors";
 import { useSidebarCompact } from "../../lib/sidebarCompact";
 import type { OptimisticTriage } from "../../lib/sidebarOptimistic";
 import { reportError, reportInfo } from "../../lib/toastBus";
+import { MARK_MEANING, meaningText } from "../../lib/sidebarMarks";
+import { statusMeaning } from "../../lib/statusLegend";
 import { StatusGlyph } from "../StatusGlyph";
+import { Tooltip } from "../Tooltip";
 import { useContextMenu } from "../useContextMenu";
 import { RowSubRows, RowTrailingBadges } from "./RowBadges";
 import { NAV_ITEM, onSidebarArrowKey } from "./keyboardNav";
@@ -44,6 +47,10 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
   const [renameValue, setRenameValue] = useState(label);
   const renameRef = useRef<HTMLInputElement>(null);
   const rowRef = useRef<HTMLAnchorElement>(null);
+  // The glyph's tooltip: on hovering the glyph, or on keyboard focus of the row, which stays the
+  // focus target and is described by it.
+  const [glyphTip, setGlyphTip] = useState<"hover" | "focus" | null>(null);
+  const glyphTipId = useId();
 
   const openedAtRef = useRef(0);
   const { menu, menuRef, openMenu, closeMenu } = useContextMenu<SessionMenuState>(openedAtRef);
@@ -104,6 +111,12 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
       : isActive
         ? "text-text-primary"
         : "text-text-secondary";
+  const glyphMeaning = model.showUnreadGlyph
+    ? MARK_MEANING.unread
+    : statusMeaning(model.status, {
+        dormant: model.dormant,
+        fresh: isFreshIdle({ status: model.status, idle_entered_at: model.idleEnteredAt }, idleDecayWindowMs),
+      });
   const navigationSessionId = navigationSession?.id ?? null;
   const sessionPath = navigationSessionId ? `/session/${encodeURIComponent(navigationSessionId)}` : "/";
 
@@ -117,10 +130,14 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
         aria-current={isActive && sessionPath === window.location.pathname ? "page" : undefined}
         data-active-session-row={isActive || undefined}
         data-testid="sidebar-session-row"
-        title={model.needsAttention ? `${label} · ${model.attentionHint}` : label}
+        aria-describedby={glyphTip ? glyphTipId : undefined}
         draggable={false}
         {...{ [NAV_ITEM]: "" }}
         onKeyDown={onSidebarArrowKey}
+        onFocus={(e) => {
+          if (e.target === e.currentTarget && e.currentTarget.matches(":focus-visible")) setGlyphTip("focus");
+        }}
+        onBlur={() => setGlyphTip(null)}
         onClick={(e) => {
           // Middle-click and Alt+click keep the browser's href behavior.
           if (e.button !== 0 || e.altKey) return;
@@ -141,26 +158,37 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
       >
         {isSelected && <span className="sr-only">Selected</span>}
         <div className="flex items-center gap-2">
-          <span
-            className={`text-sm shrink-0 leading-none font-mono ${model.showUnreadGlyph ? "text-status-unread font-semibold" : model.textClass} ${
-              attention ? "motion-safe:animate-pulse font-semibold" : ""
-            }`}
-            data-attention={attention ? "true" : undefined}
-            aria-label={attention ? `${model.status} · ${model.attentionHint}` : undefined}
+          <Tooltip
+            text={meaningText(glyphMeaning)}
+            detail={glyphTip === "focus" ? "Press Enter to open" : undefined}
+            id={glyphTipId}
+            open={glyphTip !== null}
           >
-            {model.showUnreadGlyph ? (
-              <span title="Unread" aria-label="Unread" data-testid="sidebar-unread-dot">
-                ●
-              </span>
-            ) : (
-              <StatusGlyph
-                status={model.status}
-                createdAt={model.createdAt}
-                idleEnteredAt={model.idleEnteredAt}
-                dormant={model.dormant}
-              />
-            )}
-          </span>
+            <span
+              className={`text-sm shrink-0 leading-none font-mono ${model.showUnreadGlyph ? "text-status-unread font-semibold" : model.textClass} ${
+                attention ? "motion-safe:animate-pulse font-semibold" : ""
+              }`}
+              data-attention={attention ? "true" : undefined}
+              data-testid="sidebar-status-glyph"
+              aria-label={attention ? `${model.status} · ${model.attentionHint}` : undefined}
+              // Only a mouse hover opens it; a tap fires emulated mouse events and must not.
+              onPointerEnter={(e) => e.pointerType === "mouse" && setGlyphTip((tip) => tip ?? "hover")}
+              onPointerLeave={() => setGlyphTip((tip) => (tip === "hover" ? null : tip))}
+            >
+              {model.showUnreadGlyph ? (
+                <span aria-label="Unread" data-testid="sidebar-unread-dot">
+                  ●
+                </span>
+              ) : (
+                <StatusGlyph
+                  status={model.status}
+                  createdAt={model.createdAt}
+                  idleEnteredAt={model.idleEnteredAt}
+                  dormant={model.dormant}
+                />
+              )}
+            </span>
+          </Tooltip>
           <div className="min-w-0 flex-1">
             <span
               className={`flex items-center gap-1.5 text-[13px] md:text-[14px] ${labelTone} ${model.effectivePinned ? "font-semibold" : ""} ${model.effectiveArchived || model.effectiveSnoozed ? "italic opacity-70" : ""}`}
@@ -175,14 +203,22 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
                 />
               )}
               {!compact && model.effectivePinned && (
-                <span title="Pinned" aria-label="Pinned" className="shrink-0 inline-flex text-brand-400">
-                  <Pin className="h-3 w-3 -rotate-45" />
-                </span>
+                <Tooltip text={meaningText(MARK_MEANING.pinned)}>
+                  <span
+                    aria-label="Pinned"
+                    data-testid="sidebar-pinned-mark"
+                    className="shrink-0 inline-flex text-brand-400"
+                  >
+                    <Pin className="h-3 w-3 -rotate-45" />
+                  </span>
+                </Tooltip>
               )}
               {model.isFavorited && (
-                <span title="Favorited" aria-label="Favorited" className="shrink-0 text-favorite">
-                  ✦
-                </span>
+                <Tooltip text={meaningText(MARK_MEANING.favorite)}>
+                  <span aria-label="Favorited" data-testid="sidebar-favorite-mark" className="shrink-0 text-favorite">
+                    ✦
+                  </span>
+                </Tooltip>
               )}
               <span className="truncate" title={label}>
                 {label}
