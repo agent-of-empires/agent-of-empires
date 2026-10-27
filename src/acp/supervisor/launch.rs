@@ -779,6 +779,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             Some(tokio::time::Instant::now() + std::time::Duration::from_secs(3)),
             Some(reservation.lease().clone()),
             claude_home,
+            self.sink.background_agent_tracking_seed(&session_id),
         )
         .await;
         let mut client = match client {
@@ -1949,6 +1950,7 @@ mod tests {
                 description: "do a thing".into(),
                 prompt: "do a thing".into(),
                 model: "claude".into(),
+                wire_tracked: false,
                 output_file: "/tmp/nonexistent.jsonl".into(),
                 started_at: chrono::Utc::now(),
             },
@@ -1963,6 +1965,7 @@ mod tests {
                 tools: Vec::new(),
                 last_tool: None,
                 last_text: None,
+                model: None,
                 at: chrono::Utc::now(),
             },
         );
@@ -2141,6 +2144,7 @@ mod tests {
                 description: "do a thing".into(),
                 prompt: "do a thing".into(),
                 model: "claude".into(),
+                wire_tracked: false,
                 output_file: output_file.into(),
                 started_at: chrono::Utc::now(),
             },
@@ -2155,6 +2159,7 @@ mod tests {
                 tools: Vec::new(),
                 last_tool: None,
                 last_text: None,
+                model: None,
                 at: chrono::Utc::now(),
             },
         );

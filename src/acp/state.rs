@@ -351,7 +351,7 @@ pub enum BackgroundAgentStatus {
     Completed,
     /// The parent session ended before the agent finished.
     Detached,
-    /// The transcript could not be read or parsed.
+    /// The agent failed or its progress could not be read.
     Error,
 }
 
@@ -648,6 +648,9 @@ pub enum Event {
         description: String,
         prompt: String,
         model: String,
+        /// Lifecycle updates arrive over ACP instead of a transcript tailer.
+        #[serde(default)]
+        wire_tracked: bool,
         /// Local transcript path the daemon tails. Persisted so a daemon that
         /// restarts mid-run can re-tail a sub-agent that survived it; an event
         /// from before this field existed defaults to empty, which the resume
@@ -668,6 +671,8 @@ pub enum Event {
         last_tool: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         last_text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
         at: DateTime<Utc>,
     },
     /// Terminal state for a background sub-agent.
@@ -1018,24 +1023,28 @@ impl AcpState {
                 description,
                 prompt,
                 model,
+                wire_tracked,
                 output_file: _,
                 started_at,
-            } => self.launch_background_agent(BackgroundAgentRecord {
-                agent_id,
-                tool_call_id,
-                description,
-                prompt,
-                model,
-                status: BackgroundAgentStatus::Running,
-                started_at,
-                ended_at: None,
-                tool_count: 0,
-                tools: Vec::new(),
-                last_tool: None,
-                last_text: None,
-                result: None,
-                warning: None,
-            }),
+            } => self.launch_background_agent(
+                BackgroundAgentRecord {
+                    agent_id,
+                    tool_call_id,
+                    description,
+                    prompt,
+                    model,
+                    status: BackgroundAgentStatus::Running,
+                    started_at,
+                    ended_at: None,
+                    tool_count: 0,
+                    tools: Vec::new(),
+                    last_tool: None,
+                    last_text: None,
+                    result: None,
+                    warning: None,
+                },
+                wire_tracked,
+            ),
             Event::BackgroundAgentProgress {
                 agent_id,
                 status,
@@ -1043,6 +1052,7 @@ impl AcpState {
                 tools,
                 last_tool,
                 last_text,
+                model,
                 ..
             } => {
                 // A terminal record never reopens. `ended_at` is part of the
@@ -1054,11 +1064,12 @@ impl AcpState {
                 {
                     a.status = status;
                     a.tool_count = tool_count;
+                    if let Some(model) = model {
+                        a.model = model;
+                    }
                     replace_if_some(&mut a.last_tool, last_tool);
                     replace_if_some(&mut a.last_text, last_text);
-                    if !tools.is_empty() {
-                        a.tools = tools;
-                    }
+                    a.tools = tools;
                 }
             }
             Event::BackgroundAgentCompleted {
@@ -1175,9 +1186,9 @@ impl AcpState {
         });
     }
 
-    /// Idempotent on replay: a relaunch replaces the record for the same agent id.
-    fn launch_background_agent(&mut self, record: BackgroundAgentRecord) {
+    fn launch_background_agent(&mut self, record: BackgroundAgentRecord, wire_tracked: bool) {
         match self.background_agent(&record.agent_id) {
+            Some(existing) if wire_tracked && existing.tool_call_id == record.tool_call_id => {}
             Some(existing) => *existing = record,
             None => self.background_agents.push(record),
         }
@@ -1733,6 +1744,7 @@ mod tests {
             tools,
             last_tool: Some("Read".into()),
             last_text: None,
+            model: None,
             at: Utc::now(),
         };
         let mut s = applied([
@@ -1742,6 +1754,7 @@ mod tests {
                 description: "map backend".into(),
                 prompt: "do the thing".into(),
                 model: "claude-opus-4-8".into(),
+                wire_tracked: false,
                 output_file: "/tmp/a1.output".into(),
                 started_at: Utc::now(),
             },
@@ -1806,6 +1819,156 @@ mod tests {
         );
     }
 
+    #[test]
+    fn duplicate_wire_launch_preserves_history_but_other_launches_replace_it() {
+        for terminal in [false, true] {
+            for (wire_tracked, tool_call_id, preserves_history) in [
+                (true, "tc1", true),
+                (true, "tc2", false),
+                (false, "tc1", false),
+            ] {
+                let mut s = applied([launched()]);
+                s.apply_event(s.last_seq.saturating_add(1), Event::BackgroundAgentProgress {
+                    agent_id: "a1".into(),
+                    status: BackgroundAgentStatus::Running,
+                    tool_count: 3,
+                    tools: vec![BackgroundAgentTool {
+                        name: "Read".into(),
+                        title: Some("state.rs".into()),
+                        ok: Some(true),
+                    }],
+                    last_tool: Some("Read".into()),
+                    last_text: Some("read the source".into()),
+                    model: Some("resolved-model".into()),
+                    at: Utc::now(),
+                })
+                .unwrap();
+                if terminal {
+                    s.apply_event(s.last_seq.saturating_add(1), Event::BackgroundAgentCompleted {
+                        agent_id: "a1".into(),
+                        status: BackgroundAgentStatus::Completed,
+                        tools: vec![],
+                        result: Some("done".into()),
+                        warning: Some("a warning".into()),
+                        ended_at: Utc::now(),
+                    })
+                    .unwrap();
+                }
+                let before = serde_json::to_value(&s.background_agents[0]).unwrap();
+                let mut replay = launched();
+                if let Event::BackgroundAgentLaunched {
+                    wire_tracked: replay_tracking,
+                    tool_call_id: replay_tool_call_id,
+                    ..
+                } = &mut replay
+                {
+                    *replay_tracking = wire_tracked;
+                    *replay_tool_call_id = tool_call_id.into();
+                }
+                s.apply_event(s.last_seq.saturating_add(1), replay).unwrap();
+                assert_eq!(s.background_agents.len(), 1);
+                let agent = &s.background_agents[0];
+                if preserves_history {
+                    assert_eq!(serde_json::to_value(agent).unwrap(), before);
+                } else {
+                    assert_eq!(agent.tool_call_id, tool_call_id);
+                    assert_eq!(agent.status, BackgroundAgentStatus::Running);
+                    assert_eq!(agent.model, "claude-opus-4-8");
+                    assert_eq!(agent.tool_count, 0);
+                    assert!(agent.tools.is_empty());
+                    assert!(agent.ended_at.is_none());
+                    assert!(agent.result.is_none());
+                    assert!(agent.warning.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_background_progress_snapshot_clears_tools() {
+        let mut progress = bg_progress(BackgroundAgentStatus::Running, 1);
+        if let Event::BackgroundAgentProgress { tools, .. } = &mut progress {
+            tools.push(BackgroundAgentTool {
+                name: "Read".into(),
+                title: None,
+                ok: Some(true),
+            });
+        }
+        let mut s = applied([launched(), progress]);
+        assert_eq!(s.background_agents[0].tools.len(), 1);
+
+        s.apply_event(s.last_seq.saturating_add(1), bg_progress(BackgroundAgentStatus::Running, 2))
+            .unwrap();
+        assert!(s.background_agents[0].tools.is_empty());
+        assert_eq!(s.background_agents[0].tool_count, 2);
+    }
+
+    #[test]
+    fn background_agent_progress_replaces_model_only_when_present() {
+        let mut s = applied([launched()]);
+        s.apply_event(s.last_seq.saturating_add(1), bg_progress(BackgroundAgentStatus::Running, 1))
+            .unwrap();
+        assert_eq!(s.background_agents[0].model, "claude-opus-4-8");
+
+        let mut progress = bg_progress(BackgroundAgentStatus::Running, 2);
+        if let Event::BackgroundAgentProgress { model, .. } = &mut progress {
+            *model = Some("resolved-model".into());
+        }
+        s.apply_event(s.last_seq.saturating_add(1), progress.clone()).unwrap();
+        assert_eq!(s.background_agents[0].model, "resolved-model");
+
+        s.apply_event(s.last_seq.saturating_add(1), bg_progress(BackgroundAgentStatus::Running, 3))
+            .unwrap();
+        assert_eq!(s.background_agents[0].model, "resolved-model");
+
+        s.apply_event(s.last_seq.saturating_add(1), bg_completed(BackgroundAgentStatus::Completed))
+            .unwrap();
+        if let Event::BackgroundAgentProgress { model, .. } = &mut progress {
+            *model = Some("late-model".into());
+        }
+        s.apply_event(s.last_seq.saturating_add(1), progress).unwrap();
+        assert_eq!(s.background_agents[0].model, "resolved-model");
+    }
+
+    #[test]
+    fn legacy_background_events_default_tracking_and_progress_model() {
+        let launch: Event = serde_json::from_value(serde_json::json!({
+            "BackgroundAgentLaunched": {
+                "agent_id": "a1",
+                "tool_call_id": "tc1",
+                "description": "map backend",
+                "prompt": "do the thing",
+                "model": "original-model",
+                "started_at": "2026-06-27T00:00:00Z"
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            &launch,
+            Event::BackgroundAgentLaunched { wire_tracked: false, output_file, .. }
+                if output_file.is_empty()
+        ));
+
+        let progress: Event = serde_json::from_value(serde_json::json!({
+            "BackgroundAgentProgress": {
+                "agent_id": "a1",
+                "status": "running",
+                "tool_count": 1,
+                "at": "2026-06-27T00:00:01Z"
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            &progress,
+            Event::BackgroundAgentProgress { model: None, .. }
+        ));
+        let serialized = serde_json::to_value(&progress).unwrap();
+        assert!(serialized["BackgroundAgentProgress"].get("model").is_none());
+        let s = applied([launch, progress]);
+        assert_eq!(s.background_agents[0].model, "original-model");
+        assert_eq!(s.background_agents[0].tool_count, 1);
+    }
+
     fn launched() -> Event {
         Event::BackgroundAgentLaunched {
             agent_id: "a1".into(),
@@ -1813,6 +1976,7 @@ mod tests {
             description: "map backend".into(),
             prompt: "do the thing".into(),
             model: "claude-opus-4-8".into(),
+            wire_tracked: false,
             output_file: "/tmp/a1.output".into(),
             started_at: Utc::now(),
         }
@@ -1826,6 +1990,7 @@ mod tests {
             tools: vec![],
             last_tool: None,
             last_text: None,
+            model: None,
             at: Utc::now(),
         }
     }

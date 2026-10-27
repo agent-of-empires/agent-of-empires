@@ -712,6 +712,7 @@ mod tests {
             description: "map backend".into(),
             prompt: "do the thing".into(),
             model: "claude-opus-4-8".into(),
+            wire_tracked: false,
             output_file: "/tmp/a1.output".into(),
             started_at: chrono::Utc::now(),
         }]);

@@ -38,9 +38,8 @@ describe("BackgroundAgentsPanel", () => {
     agentsMock.mockReturnValue([agent()]);
     const { container } = render(<BackgroundAgentsPanel sessionId="s-1" />);
     expect(container.textContent).toContain("Background agents · 1");
-    // Persistent hint: async-only scope + where the sync ones live.
-    expect(container.textContent).toContain("Only async");
-    expect(container.textContent).toContain("Synchronous sub-agents run inline in the transcript");
+    expect(container.textContent).toContain("Background Task sub-agents show here");
+    expect(container.textContent).toContain("Mixed omp batches also include their synchronous sub-agents");
     expect(container.textContent).toContain("Map backend lifecycle");
     expect(container.textContent).toContain("running");
     expect(container.textContent).toContain("3 tools");

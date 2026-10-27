@@ -28,6 +28,7 @@ pub struct TerminalRepairProbe {
 pub struct UnresolvedBackgroundAgentLaunch {
     pub agent_id: String,
     pub output_file: String,
+    pub wire_tracked: bool,
 }
 
 /// Launches with no matching completion, shared by both unresolved-launch
@@ -319,7 +320,8 @@ impl EventStore {
         let what = "unresolved_background_agent_launches";
         let sql = format!(
             "SELECT json_extract(event_json, '$.BackgroundAgentLaunched.agent_id'),\
-                    json_extract(event_json, '$.BackgroundAgentLaunched.output_file')\
+                    json_extract(event_json, '$.BackgroundAgentLaunched.output_file'),\
+                    COALESCE(json_extract(event_json, '$.BackgroundAgentLaunched.wire_tracked'), 0)\
              {UNRESOLVED_BACKGROUND_AGENT_WHERE}"
         );
         let Some(mut stmt) = logged(conn.prepare(&sql), what, session_id) else {
@@ -329,8 +331,59 @@ impl EventStore {
             Ok(UnresolvedBackgroundAgentLaunch {
                 agent_id: row.get(0)?,
                 output_file: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                wire_tracked: row.get(2)?,
             })
         });
+        logged(rows, what, session_id)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Seed resumed wire tracking within the current native conversation.
+    /// Same-id assignments preserve terminal identities, even when launch rows
+    /// were pruned. The bool marks identities whose completion is durable.
+    pub fn background_agent_tracking_seed(&self, session_id: &str) -> Vec<(String, bool)> {
+        let conn = self.conn();
+        let what = "background_agent_tracking_seed";
+        // Assignments survive retention; only a changed native id cuts off history.
+        let sql = "WITH assignments AS (
+                       SELECT seq,
+                              json_extract(event_json, '$.AcpSessionAssigned.acp_session_id') AS native_id,
+                              LAG(json_extract(event_json, '$.AcpSessionAssigned.acp_session_id'))
+                                  OVER (ORDER BY seq) AS previous_id
+                       FROM acp_events
+                       WHERE session_id = ?1 AND discriminant = 'AcpSessionAssigned'
+                   ), current_events AS (
+                       SELECT seq, event_json, discriminant
+                       FROM acp_events
+                       WHERE session_id = ?1
+                         AND seq >= COALESCE((
+                             SELECT MAX(seq) FROM assignments WHERE native_id != previous_id
+                         ), 0)
+                         AND discriminant IN ('BackgroundAgentLaunched', 'BackgroundAgentCompleted')
+                   ), completed AS (
+                       SELECT DISTINCT json_extract(event_json, '$.BackgroundAgentCompleted.agent_id') AS agent_id
+                       FROM current_events
+                       WHERE discriminant = 'BackgroundAgentCompleted'
+                         AND json_extract(event_json, '$.BackgroundAgentCompleted.agent_id') IS NOT NULL
+                   ), seed AS (
+                       SELECT agent_id, 1 AS terminal, 0 AS seq FROM completed
+                       UNION ALL
+                       SELECT json_extract(event_json, '$.BackgroundAgentLaunched.agent_id') AS agent_id,
+                              0 AS terminal, seq
+                       FROM current_events
+                       WHERE discriminant = 'BackgroundAgentLaunched'
+                         AND json_extract(event_json, '$.BackgroundAgentLaunched.wire_tracked') = 1
+                         AND json_extract(event_json, '$.BackgroundAgentLaunched.agent_id') IS NOT NULL
+                         AND json_extract(event_json, '$.BackgroundAgentLaunched.agent_id') NOT IN (
+                             SELECT agent_id FROM completed
+                         )
+                   )
+                   SELECT agent_id, terminal FROM seed ORDER BY terminal DESC, seq ASC, agent_id ASC";
+        let Some(mut stmt) = logged(conn.prepare(sql), what, session_id) else {
+            return Vec::new();
+        };
+        let rows = stmt.query_map(params![session_id], |row| Ok((row.get(0)?, row.get(1)?)));
         logged(rows, what, session_id)
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
             .unwrap_or_default()
@@ -640,6 +693,7 @@ mod tests {
             tools: Vec::new(),
             last_tool: None,
             last_text: None,
+            model: None,
             at: chrono::Utc::now(),
         };
         let startup_error = Event::AgentStartupError {
@@ -1080,6 +1134,198 @@ mod tests {
         assert!(store.unresolved_background_task_ids("s-2").is_empty());
     }
 
+    #[test]
+    fn structured_background_launch_retains_wire_tracking_on_replay() {
+        let (_tmp, store) = open_store(1000);
+        let mut wire = bg_launched("omp-child", "");
+        if let Event::BackgroundAgentLaunched { wire_tracked, .. } = &mut wire {
+            *wire_tracked = true;
+        }
+        record_from(&store, "s-wire", 1, [wire, bg_launched("legacy", "")]);
+        let launches = store.unresolved_background_agent_launches("s-wire");
+        assert_eq!(launches.len(), 2);
+        assert!(launches[0].wire_tracked);
+        assert!(!launches[1].wire_tracked);
+        assert!(launches.iter().all(|l| l.output_file.is_empty()));
+        let mut state = crate::acp::state::AcpState::default();
+        for (_, event) in store.replay_from("s-wire", 0) {
+            state
+                .apply_event(state.last_seq.saturating_add(1), event)
+                .unwrap();
+        }
+        assert_eq!(state.background_agents.len(), 2);
+        assert_eq!(state.background_agents[0].agent_id, "omp-child");
+    }
+
+    #[test]
+    fn background_agent_tracking_seed_preserves_terminal_identities_and_unresolved_wire_launches() {
+        let (_tmp, store) = open_store(1000);
+        let at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let launched = |agent_id: &str, wire_tracked| {
+            let mut event = bg_launched(agent_id, "");
+            if let Event::BackgroundAgentLaunched {
+                wire_tracked: tracked,
+                started_at,
+                ..
+            } = &mut event
+            {
+                *tracked = wire_tracked;
+                *started_at = at;
+            }
+            event
+        };
+        let completed = |agent_id: &str| Event::BackgroundAgentCompleted {
+            agent_id: agent_id.into(),
+            status: BackgroundAgentStatus::Completed,
+            tools: Vec::new(),
+            result: None,
+            warning: None,
+            ended_at: at,
+        };
+        record_from(
+            &store,
+            "s-seed",
+            1,
+            [
+                completed("pruned-launch"),
+                launched("completed-sibling", true),
+                completed("completed-sibling"),
+                completed("pruned-launch"),
+                launched("running-wire", true),
+                launched("transcript-only", false),
+            ],
+        );
+        store
+            .conn()
+            .execute(
+                "INSERT INTO acp_events (session_id, seq, event_json, created_at, discriminant)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    "s-seed",
+                    7_i64,
+                    "{\"BackgroundAgentCompleted\":{\"agent_id\":null}}",
+                    0_i64,
+                    "BackgroundAgentCompleted",
+                ],
+            )
+            .unwrap();
+        record_from(
+            &store,
+            "s-other",
+            1,
+            [completed("running-wire"), launched("other-wire", true)],
+        );
+
+        assert_eq!(
+            store.background_agent_tracking_seed("s-seed"),
+            [
+                ("completed-sibling".to_string(), true),
+                ("pruned-launch".to_string(), true),
+                ("running-wire".to_string(), false),
+            ]
+        );
+        assert_eq!(
+            store.background_agent_tracking_seed("s-other"),
+            [
+                ("running-wire".to_string(), true),
+                ("other-wire".to_string(), false),
+            ]
+        );
+        assert!(store.background_agent_tracking_seed("s-missing").is_empty());
+    }
+
+    #[test]
+    fn background_agent_tracking_seed_scopes_native_conversations_and_preserves_reattaches() {
+        let (_tmp, store) = open_store(1000);
+        let at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let assigned = |native_id: &str| Event::AcpSessionAssigned {
+            acp_session_id: native_id.into(),
+        };
+        let launched = |agent_id: &str| {
+            let mut event = bg_launched(agent_id, "");
+            if let Event::BackgroundAgentLaunched {
+                wire_tracked,
+                started_at,
+                ..
+            } = &mut event
+            {
+                *wire_tracked = true;
+                *started_at = at;
+            }
+            event
+        };
+        let completed = |agent_id: &str, status| Event::BackgroundAgentCompleted {
+            agent_id: agent_id.into(),
+            status,
+            tools: Vec::new(),
+            result: None,
+            warning: None,
+            ended_at: at,
+        };
+        record_from(
+            &store,
+            "s-native",
+            1,
+            [
+                assigned("native-old"),
+                launched("A"),
+                completed("A", BackgroundAgentStatus::Completed),
+                launched("old-running"),
+                assigned("native-old"),
+                assigned("native-current"),
+            ],
+        );
+        assert!(store.background_agent_tracking_seed("s-native").is_empty());
+
+        record_from(
+            &store,
+            "s-native",
+            7,
+            [
+                launched("A"),
+                launched("completed-sibling"),
+                completed("completed-sibling", BackgroundAgentStatus::Completed),
+                launched("failed-sibling"),
+                completed("failed-sibling", BackgroundAgentStatus::Error),
+            ],
+        );
+        let expected = vec![
+            ("completed-sibling".to_string(), true),
+            ("failed-sibling".to_string(), true),
+            ("A".to_string(), false),
+        ];
+        assert_eq!(store.background_agent_tracking_seed("s-native"), expected);
+        record_from(
+            &store,
+            "s-native",
+            12,
+            [assigned("native-current"), assigned("native-current")],
+        );
+        assert_eq!(store.background_agent_tracking_seed("s-native"), expected);
+
+        store
+            .record(
+                "s-native",
+                14,
+                &completed("A", BackgroundAgentStatus::Completed),
+            )
+            .unwrap();
+        assert_eq!(
+            store.background_agent_tracking_seed("s-native"),
+            [
+                ("A".to_string(), true),
+                ("completed-sibling".to_string(), true),
+                ("failed-sibling".to_string(), true),
+            ]
+        );
+
+        // Returning to a previous native id still starts a new conversation epoch.
+        store
+            .record("s-native", 15, &assigned("native-old"))
+            .unwrap();
+        assert!(store.background_agent_tracking_seed("s-native").is_empty());
+    }
+
     fn bg_launched(agent_id: &str, output_file: &str) -> Event {
         Event::BackgroundAgentLaunched {
             agent_id: agent_id.into(),
@@ -1087,6 +1333,7 @@ mod tests {
             description: "map backend".into(),
             prompt: "do it".into(),
             model: "claude-opus-4-8".into(),
+            wire_tracked: false,
             output_file: output_file.into(),
             started_at: chrono::Utc::now(),
         }

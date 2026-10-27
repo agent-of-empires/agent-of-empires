@@ -376,11 +376,13 @@ export type AcpEvent =
         prompt: string;
         model: string;
         started_at: string;
+        wire_tracked?: boolean;
       };
     }
   | {
       BackgroundAgentProgress: {
         agent_id: string;
+        model?: string;
         status: BackgroundAgentStatus;
         tool_count: number;
         tools?: BackgroundAgentTool[];
@@ -1236,6 +1238,8 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   if ("BackgroundAgentLaunched" in event) {
     const e = event.BackgroundAgentLaunched;
+    const i = next.backgroundAgents.findIndex((a) => a.agentId === e.agent_id);
+    if (e.wire_tracked && next.backgroundAgents[i]?.toolCallId === e.tool_call_id) return next;
     const record: BackgroundAgent = {
       agentId: e.agent_id,
       toolCallId: e.tool_call_id,
@@ -1252,8 +1256,6 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       result: null,
       warning: null,
     };
-    // Idempotent on replay.
-    const i = next.backgroundAgents.findIndex((a) => a.agentId === e.agent_id);
     next.backgroundAgents =
       i >= 0 ? next.backgroundAgents.map((a, idx) => (idx === i ? record : a)) : [...next.backgroundAgents, record];
     return next;
@@ -1269,9 +1271,10 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       if (a.endedAt || a.status === "completed" || a.status === "detached" || a.status === "error") return a;
       return {
         ...a,
+        model: e.model ?? a.model,
         status: e.status,
         toolCount: e.tool_count,
-        tools: e.tools && e.tools.length > 0 ? e.tools : a.tools,
+        tools: e.tools ?? a.tools,
         // A Progress never ends an agent; only the terminal
         // BackgroundAgentCompleted sets endedAt (#4001).
         endedAt: null,

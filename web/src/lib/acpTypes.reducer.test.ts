@@ -295,6 +295,65 @@ describe("applyEvent / background agents", () => {
     expect(agent(launched, running, completed)[0]).toMatchObject({ status: "completed", result: "done" });
   });
 
+  it("replaces progress snapshots, including empty tools and preview text", () => {
+    const first = progress("running", 2, "2026-06-27T00:00:02Z", {
+      tools: [{ name: "Read" }, { name: "Bash" }],
+      last_text: "first preview",
+    });
+    const replacement = progress("running", 3, "2026-06-27T00:00:03Z", {
+      tools: [{ name: "Write" }],
+      last_text: "latest preview",
+    });
+    const empty = progress("running", 3, "2026-06-27T00:00:04Z", { tools: [], last_text: "" });
+    const omitted = progress("running", 3, "2026-06-27T00:00:05Z");
+    expect(agent(launched, first, replacement, omitted)[0]).toMatchObject({
+      tools: [{ name: "Write" }],
+      lastText: "latest preview",
+    });
+    expect(agent(launched, first, replacement, empty, omitted)[0]).toMatchObject({ tools: [], lastText: "" });
+  });
+
+  it("updates a resolved model from progress and preserves it when omitted", () => {
+    const resolved = progress("running", 1, "2026-06-27T00:00:02Z", { model: "resolved-model" });
+    const unchanged = progress("running", 2, "2026-06-27T00:00:03Z");
+    expect(agent(launched, unchanged)[0].model).toBe("claude-opus-4-8");
+    expect(agent(launched, resolved)[0].model).toBe("resolved-model");
+    expect(agent(launched, resolved, unchanged)[0].model).toBe("resolved-model");
+    expect(agent(launched, completed, resolved)[0].model).toBe("claude-opus-4-8");
+  });
+
+  it("preserves wire-tracked history on duplicate launches but replaces other launches", () => {
+    const wireLaunch: AcpEvent = {
+      BackgroundAgentLaunched: { ...launched.BackgroundAgentLaunched, wire_tracked: true },
+    };
+    const running = progress("running", 4, "2026-06-27T00:00:05Z", {
+      model: "resolved-model",
+      last_text: "scanning",
+    });
+    for (const history of [
+      [wireLaunch, running],
+      [wireLaunch, running, completed],
+    ]) {
+      expect(agent(...history, wireLaunch)).toEqual(agent(...history));
+    }
+    expect(agent(wireLaunch, running, completed, launched)[0]).toMatchObject({
+      status: "running",
+      toolCount: 0,
+      model: "claude-opus-4-8",
+      endedAt: null,
+      result: null,
+    });
+    const differentCall: AcpEvent = {
+      BackgroundAgentLaunched: { ...wireLaunch.BackgroundAgentLaunched, tool_call_id: "task-2" },
+    };
+    expect(agent(wireLaunch, running, completed, differentCall)[0]).toMatchObject({
+      toolCallId: "task-2",
+      status: "running",
+      toolCount: 0,
+      endedAt: null,
+    });
+  });
+
   it("leaves endedAt null on a stall, so the elapsed timer keeps ticking (#4001)", () => {
     const stalled = progress("stalled", 1, "2026-06-27T00:01:30Z");
     expect(agent(launched, stalled)[0]).toMatchObject({ status: "stalled", endedAt: null });

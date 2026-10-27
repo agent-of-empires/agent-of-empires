@@ -102,6 +102,14 @@ Features depend on the ACP adapter and its profile:
 
 Capabilities depend on channels the adapter advertises; unavailable mode, slash-command or usage controls stay empty rather than stale. Codex currently advertises no Plan-mode channel. OpenCode 1.16.0 or newer improves edit/think classification, read output and permission context; older versions use generic cards and prompts. Report unexpected `tool.kind` and `tool.name` values. See [agent profiles](development/internals/structured-view.md#agent-profiles).
 
+### omp async tasks
+
+The background-agent panel consumes structured omp task details, not rendered tool text. An async batch contributes every task row, including mixed batches; rows do not need a `detached` flag. Rolling snapshots replace the previous preview rather than appending duplicate output. Previews show `recentOutput`, not the full async final result, and a resolved model can appear in a later update.
+
+After a daemon restart, resumed task snapshots retain completed siblings' original completion times without launching or completing them again; unresolved tasks continue tracking. The last-tool preview uses the current tool when present, otherwise the newest `recentTools` entry.
+
+Live progress and completion after the parent prompt ends require the native `omp acp` adapter to forward task updates for the session's lifetime. AoE support alone does not guarantee those source updates: that bridge must be deployed in the installed omp adapter. See the [task update contract](development/internals/structured-view.md#omp-async-task-updates).
+
 ## Quickstart
 
 In the web dashboard, create a session and choose an ACP-capable agent; **Structured** defaults on. The CLI and TUI default to terminal view unless configured otherwise. In the TUI, enable the offered **Structured** field; from the CLI:

@@ -274,12 +274,8 @@ fn publish_background_agent_detached<S: BroadcastSink>(
     );
 }
 
-/// The attach-path counterpart of [`detach_orphaned_background_agents_on`]:
-/// the worker just attached is provably alive, so a sub-agent it launched may
-/// still be running. Detaches only the launches with no transcript path to
-/// resume from and returns the rest for `AcpClient::resume_background_tailing`.
-/// Sync so the query and those publishes can run before the drain starts,
-/// while the resume send stays an await outside the caller's lock.
+/// Resume only launches with a transcript path or structured lifetime updates.
+/// Query before the drain starts; send the resume command outside its lock.
 pub(super) fn collect_resumable_background_agent_launches<S: BroadcastSink>(
     sink: &S,
     next_seqs: &SeqMap,
@@ -288,7 +284,7 @@ pub(super) fn collect_resumable_background_agent_launches<S: BroadcastSink>(
     let (resumable, untrackable): (Vec<_>, Vec<_>) = sink
         .unresolved_background_agent_launches(session_id)
         .into_iter()
-        .partition(|l| !l.output_file.is_empty());
+        .partition(|l| l.wire_tracked || !l.output_file.is_empty());
     for launch in untrackable {
         publish_background_agent_detached(
             sink,
@@ -351,6 +347,58 @@ mod tests {
     use super::*;
     use crate::acp::approvals::Nonce;
     use crate::process::worker_registry;
+
+    #[test]
+    fn attach_resumes_wire_tasks_without_starting_empty_path_tailers() {
+        let (sink, store, _rx, _tmp) = channel_sink();
+        for (seq, id, wire_tracked, output_file) in [
+            (1, "omp", true, ""),
+            (2, "claude", false, "/tmp/transcript.jsonl"),
+            (3, "legacy", false, ""),
+        ] {
+            sink.publish(
+                "s-wire",
+                seq,
+                &Event::BackgroundAgentLaunched {
+                    agent_id: id.into(),
+                    tool_call_id: format!("tc-{id}"),
+                    description: "inspect".into(),
+                    prompt: "inspect".into(),
+                    model: String::new(),
+                    output_file: output_file.into(),
+                    wire_tracked,
+                    started_at: chrono::Utc::now(),
+                },
+            );
+        }
+        let sup = Supervisor::new(sink.clone());
+        sup.hydrate_seqs(store.all_session_seqs());
+        let resumable =
+            collect_resumable_background_agent_launches(&*sink, &sup.next_seqs, "s-wire");
+        assert_eq!(
+            resumable
+                .iter()
+                .map(|l| l.agent_id.as_str())
+                .collect::<Vec<_>>(),
+            ["omp", "claude"]
+        );
+        assert!(resumable[0].wire_tracked && resumable[0].output_file.is_empty());
+        let detached: Vec<_> = store
+            .replay_from("s-wire", 0)
+            .into_iter()
+            .filter_map(|(_, event)| match event {
+                Event::BackgroundAgentCompleted {
+                    agent_id,
+                    status: BackgroundAgentStatus::Detached,
+                    ..
+                } => Some(agent_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(detached, ["legacy"]);
+        sup.detach_orphaned_background_agents("s-wire");
+        assert!(store.unresolved_background_agent_ids("s-wire").is_empty());
+    }
 
     #[tokio::test]
     async fn seq_counters_are_per_session_hydratable_and_forgettable() {

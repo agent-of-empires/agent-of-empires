@@ -4,6 +4,12 @@ All notable changes to Agent of Empires will be documented in this file.
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## Unreleased
+
+### Features
+
+- **acp:** Consume structured omp async task rows in the background-agent panel, including every row in mixed batches, replacing rolling previews and applying resolved model updates. Post-prompt progress and completion require deployment of the native omp lifetime-update bridge.
+
 ## [1.21.0](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.21.0) - 2026-10-21
 
 

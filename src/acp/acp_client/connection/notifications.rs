@@ -16,6 +16,7 @@ use crate::acp::acp_client::between_prompt::BetweenPromptTracker;
 use crate::acp::acp_client::lifecycle::{
     forward_lifecycle_signals, LifecycleEnvelope, TerminalClaim,
 };
+use crate::acp::acp_client::omp_tasks::OmpTaskTracker;
 use crate::acp::acp_client::rate_limit::record_rate_limit_report;
 use crate::acp::acp_client::session_identity::SessionIngress;
 use crate::acp::acp_client::session_sandbox::SessionSandbox;
@@ -70,6 +71,7 @@ pub(super) struct Shared {
     /// Scoped to one turn; see `AgentMessageDedup` (#2281).
     pub(super) agent_msg_dedup: std::sync::Mutex<AgentMessageDedup>,
     compaction: std::sync::Mutex<CompactionTracker>,
+    omp_tasks: std::sync::Mutex<OmpTaskTracker>,
     pub(super) tool_context_cache: ToolContextCache,
     bg_transcript_source: TranscriptSource,
     pub(super) bg_tasks: Arc<ActiveTasks>,
@@ -116,6 +118,7 @@ impl Shared {
             context_reset_emitted: AtomicBool::new(false),
             agent_msg_dedup: Default::default(),
             compaction: Default::default(),
+            omp_tasks: Default::default(),
             tool_context_cache: Arc::new(std::sync::Mutex::new(ToolCallContextCache::default())),
             bg_transcript_source,
             bg_tasks: Arc::default(),
@@ -150,17 +153,41 @@ impl Shared {
         }
     }
 
-    /// Re-tail sub-agents a previous daemon launched and left unresolved.
-    pub(super) fn resume_background_tailing(&self, launches: Vec<(String, String)>) {
-        for (agent_id, output_file) in launches {
-            spawn_tailer(
-                agent_id,
-                output_file,
-                self.bg_transcript_source.clone(),
-                self.event_tx.clone(),
-                self.between_prompt.bg_agents.clone(),
-                TailerStart::Resumed,
-            );
+    /// Restore durable identities before any resumed notification is admitted.
+    pub(super) fn seed_background_tracking(&self, seed: Vec<(String, bool)>) {
+        let mut tracker = self
+            .omp_tasks
+            .lock()
+            .expect("omp task tracker mutex poisoned");
+        let mut running = self
+            .between_prompt
+            .bg_agents
+            .lock()
+            .expect("background agent mutex poisoned");
+        for (agent_id, terminal) in seed {
+            tracker.seed(agent_id.clone(), terminal);
+            if !terminal {
+                running.insert(agent_id);
+            }
+        }
+    }
+
+    /// Resume transcript tailers or structured tracking for a surviving runner.
+    pub(super) fn resume_background_tailing(
+        &self,
+        launches: Vec<crate::acp::event_store::UnresolvedBackgroundAgentLaunch>,
+    ) {
+        for launch in launches {
+            if !launch.wire_tracked && !launch.output_file.is_empty() {
+                spawn_tailer(
+                    launch.agent_id,
+                    launch.output_file,
+                    self.bg_transcript_source.clone(),
+                    self.event_tx.clone(),
+                    self.between_prompt.bg_agents.clone(),
+                    TailerStart::Resumed,
+                );
+            }
         }
     }
 
@@ -249,8 +276,14 @@ impl Shared {
         self.capture_rate_limit(&notification.update);
         let session_id = notification.session_id.0.to_string();
         let update_for_tool_context = notification.update.clone();
+        let task_events = self
+            .omp_tasks
+            .lock()
+            .expect("omp task tracker mutex poisoned")
+            .observe(&notification.update, suppressing);
         let mut events = map_update_to_events(notification.update, self.profile);
         events.extend(restored_wake_event);
+        events.extend(task_events);
         // Signals go first: if the event send backpressures, the watchdog must
         // not evaluate without a suppression-bearing signal.
         forward_lifecycle_signals(
@@ -318,6 +351,27 @@ impl Shared {
                 }
                 continue;
             }
+            match &event {
+                Event::BackgroundAgentLaunched {
+                    agent_id,
+                    wire_tracked: true,
+                    ..
+                } => {
+                    self.between_prompt
+                        .bg_agents
+                        .lock()
+                        .expect("background agent mutex poisoned")
+                        .insert(agent_id.clone());
+                }
+                Event::BackgroundAgentCompleted { agent_id, .. } => {
+                    self.between_prompt
+                        .bg_agents
+                        .lock()
+                        .expect("background agent mutex poisoned")
+                        .remove(agent_id);
+                }
+                _ => {}
+            }
             update_tool_context_cache(&self.tool_context_cache, &event, &update_for_tool_context);
             if self.event_tx.send(event).await.is_err() {
                 break;
@@ -366,5 +420,169 @@ impl Shared {
             retained,
             "observed adapter rate-limit meta"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::acp::agent_profiles::OMP;
+    use serde_json::json;
+
+    fn task_notification(status: &str, child_status: &str) -> SessionNotification {
+        serde_json::from_value(json!({
+            "sessionId": "native",
+            "update": {
+                "sessionUpdate": "tool_call_update", "toolCallId": "batch", "status": status,
+                "rawOutput": {"details": {"async": {"type": "task"}, "progress": [{
+                    "id": "Child", "agent": "task", "status": child_status,
+                    "resolvedModel": "provider/model", "assignment": "Inspect code",
+                    "toolCount": 1, "recentTools": [{"tool": "read", "args": "src"}],
+                    "recentOutput": ["Preview"]
+                }]}}
+            }
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn omp_tasks_resume_preserves_terminal_siblings_and_settles_unresolved() {
+        use crate::acp::state::{AcpState, BackgroundAgentStatus};
+
+        let ended_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let mut state = AcpState::default();
+        let mut original = OmpTaskTracker::default();
+        let initial = task_notification("completed", "completed");
+        for mut event in original.observe(&initial.update, false) {
+            if let Event::BackgroundAgentCompleted { ended_at: at, .. } = &mut event {
+                *at = ended_at;
+            }
+            state.apply_event(state.last_seq.saturating_add(1), event).unwrap();
+        }
+        let mut pending = serde_json::to_value(task_notification("completed", "running")).unwrap();
+        pending["update"]["rawOutput"]["details"]["progress"][0]["id"] = json!("Pending");
+        let pending: SessionNotification = serde_json::from_value(pending).unwrap();
+        for event in original.observe(&pending.update, false) {
+            state.apply_event(state.last_seq.saturating_add(1), event).unwrap();
+        }
+
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(32);
+        let shared = Shared::new(
+            event_tx,
+            "test".into(),
+            &OMP,
+            lifecycle_tx,
+            Arc::new(TerminalClaim::new()),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            None,
+            Arc::new(SessionIngress::new(Some(SessionId::from("native")))),
+        );
+        shared.seed_background_tracking(vec![("Child".into(), true), ("Pending".into(), false)]);
+        assert_eq!(
+            *shared.between_prompt.bg_agents.lock().unwrap(),
+            std::collections::HashSet::from(["Pending".to_string()])
+        );
+
+        let mut aggregate = serde_json::to_value(initial).unwrap();
+        let mut completed_pending = serde_json::to_value(pending).unwrap()["update"]["rawOutput"]
+            ["details"]["progress"][0]
+            .clone();
+        completed_pending["status"] = json!("completed");
+        aggregate["update"]["rawOutput"]["details"]["progress"]
+            .as_array_mut()
+            .unwrap()
+            .push(completed_pending);
+        let aggregate: SessionNotification = serde_json::from_value(aggregate).unwrap();
+        shared.handle_notification(aggregate.clone(), false).await;
+        let mut completions = 0;
+        while let Ok(event) = event_rx.try_recv() {
+            assert!(!matches!(&event, Event::BackgroundAgentLaunched { .. }));
+            if let Event::BackgroundAgentCompleted { agent_id, .. } = &event {
+                assert_eq!(agent_id, "Pending");
+                completions += 1;
+            }
+            state.apply_event(state.last_seq.saturating_add(1), event).unwrap();
+        }
+        assert_eq!(completions, 1);
+        assert_eq!(state.background_agents.len(), 2);
+        assert_eq!(state.background_agents[0].ended_at, Some(ended_at));
+        assert!(state
+            .background_agents
+            .iter()
+            .all(|agent| agent.status == BackgroundAgentStatus::Completed));
+        assert!(shared.between_prompt.bg_agents.lock().unwrap().is_empty());
+
+        shared.handle_notification(aggregate, false).await;
+        while let Ok(event) = event_rx.try_recv() {
+            assert!(!matches!(
+                event,
+                Event::BackgroundAgentLaunched { .. }
+                    | Event::BackgroundAgentProgress { .. }
+                    | Event::BackgroundAgentCompleted { .. }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn omp_tasks_preserve_tool_cards_without_transcript_tailing() {
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(32);
+        let shared = Shared::new(
+            event_tx,
+            "test".into(),
+            &OMP,
+            lifecycle_tx,
+            Arc::new(TerminalClaim::new()),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            None,
+            Arc::new(SessionIngress::new(Some(SessionId::from("native")))),
+        );
+        shared
+            .handle_notification(task_notification("completed", "running"), false)
+            .await;
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::ToolCallCompleted { .. })));
+        assert!(events.iter().any(|e| matches!(e, Event::BackgroundAgentLaunched { output_file, wire_tracked: true, .. } if output_file.is_empty())));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, Event::BackgroundAgentCompleted { .. })));
+        assert!(shared
+            .between_prompt
+            .bg_agents
+            .lock()
+            .unwrap()
+            .contains("Child"));
+
+        shared
+            .handle_notification(task_notification("completed", "completed"), false)
+            .await;
+        let mut terminal = 0;
+        while let Ok(event) = event_rx.try_recv() {
+            assert!(!matches!(event, Event::BackgroundAgentLaunched { .. }));
+            terminal += usize::from(matches!(event, Event::BackgroundAgentCompleted { .. }));
+        }
+        assert_eq!(terminal, 1);
+        assert!(!shared
+            .between_prompt
+            .bg_agents
+            .lock()
+            .unwrap()
+            .contains("Child"));
+
+        shared
+            .suppress_history_replay
+            .store(true, Ordering::Relaxed);
+        shared
+            .handle_notification(task_notification("completed", "running"), false)
+            .await;
+        assert!(event_rx.try_recv().is_err());
     }
 }

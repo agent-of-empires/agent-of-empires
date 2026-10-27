@@ -24,7 +24,7 @@ Invariants worth knowing before touching this code:
 - **Exact scope retirement.** Scoped runners persist their exact transient unit alongside PID and generation; unscoped and unresolved ownership are distinct. Explicit stop waits for only the captured unit to stop and become empty before settling. Rejected or timed-out scope retirement keeps its lease and retry debt, even after the leader exits. A SID wildcard never authorizes ACP retirement or recovered purge cleanup.
 - **Callback parity and replay accounting.** Session-scoped filesystem, terminal, and permission callbacks wait for that announcement with either named or positional parameters, while request-scoped elicitation stays independent of session authority. Pending replay charges each original control frame, its four-byte prefix included, against the runner's 4096-frame / 128 MiB budget; typed re-serialization can expand native JSON and is not a substitute.
 - **Mid-turn reattach.** `ResumeSession` adopts the runner's committed session identity and never sends ACP `session/new` or `session/load`. A new local prompt supersedes adoption, and only the matching canonical request id may resolve it; a 30-second resume-idle watchdog is the fallback.
-- **Background sub-agents across a restart.** The async-Task tailer (see [Stuck-turn watchdogs](#stuck-turn-watchdogs)) is per connection, so a `BackgroundAgentLaunched` can be left with no completion when its worker dies. The next owner reconciles that: `attach` re-tails every unresolved launch that still carries a transcript path, since the runner it adopted is provably alive; `spawn`, the drain task's respawn, and every terminal drain arm detach unconditionally. `output_file` is persisted for that resume and stripped from every client-facing frame.
+- **Background sub-agents across a restart.** Connection-local tracking resumes only when attaching to a surviving runner: unresolved transcript-backed launches restart their tailers, while omp `wire_tracked` rows seed the lifetime-update tracker without a tailer. Replacing the runner or ending its drain detaches unresolved rows. This does not recreate omp jobs after the omp process restarts. `output_file` is persisted for tailer resume and stripped from every client-facing frame.
 
 ## Terminal handoff
 
@@ -98,6 +98,14 @@ The daemon folds the event stream once per WebSocket connection into two project
 Raw event frames still stream for what the daemon does not model (worker lifecycle latches, monitor and wakeup badges, the usage cost baseline, rejected prompts). A client reading only the projections passes `?frames=0`, as the native view does. A `notice` row carries a failed startup, a dead turn, a refused mode switch, or an auto-resume; the native view renders it inline while the web shows the same information as a dismissible banner.
 
 The daemon also owns prompt dispatch: `POST /acp/prompt` runs `acp::dispatch::decide` and returns `sent`, `steered`, or `queued`, and the server-owned queue persists follow-ups until its turn-end drain. Cancelling and compacting turns always queue; a dormant worker is sent the prompt so the request wakes it.
+
+### omp async task updates
+
+The omp tracker consumes structured task details from ACP tool updates, not display text. A mixed async batch registers every task row without requiring a per-row `detached` flag. Repeated rolling snapshots replace the prior snapshot, rather than appending output or duplicating task rows. Preview text comes from `recentOutput`; the full async final result is not a preview source.
+
+Task records use the shared `BackgroundAgentLaunched`, `BackgroundAgentProgress`, and `BackgroundAgentCompleted` events. Launches mark lifetime wire tracking with `wire_tracked` (default false for older events). A duplicate wire-tracked launch with the same agent and tool-call IDs preserves existing progress and terminal history; other launches retain replacement behavior. Progress may carry a resolved `model`; an omitted model preserves the existing value. Terminal records do not reopen on late progress.
+
+The native `omp acp` adapter must forward lifetime task updates after `session/prompt` returns, including progress and terminal transitions. AoE cannot reconstruct source updates that the adapter never forwards. Until that bridge is deployed in the installed omp adapter, neither continued progress nor completion after the prompt ends is guaranteed.
 
 ## Persistence and the context primer
 

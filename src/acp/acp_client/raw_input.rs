@@ -139,6 +139,7 @@ pub(super) fn background_agent_launched_from_value(v: &serde_json::Value) -> Opt
         description: str_field("description"),
         prompt: str_field("prompt"),
         model: str_field("resolvedModel"),
+        wire_tracked: false,
         output_file: str_field("outputFile"),
         started_at: chrono::Utc::now(),
     })

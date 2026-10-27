@@ -52,6 +52,11 @@ pub trait BroadcastSink: Send + Sync + 'static {
     ) -> Vec<UnresolvedBackgroundAgentLaunch> {
         Vec::new()
     }
+    /// Durable terminal identities and unresolved wire launches for resume tracking.
+    /// The bool is true when a completion is already stored.
+    fn background_agent_tracking_seed(&self, _session_id: &str) -> Vec<(String, bool)> {
+        Vec::new()
+    }
     /// Persist a prompt attachment keyed to its `UserPromptSent` seq.
     fn record_attachment(&self, _session_id: &str, _seq: u64, _blob: &AttachmentBlob) -> bool {
         true
@@ -113,6 +118,10 @@ impl BroadcastSink for ChannelSink {
     ) -> Vec<UnresolvedBackgroundAgentLaunch> {
         self.event_store
             .unresolved_background_agent_launches(session_id)
+    }
+
+    fn background_agent_tracking_seed(&self, session_id: &str) -> Vec<(String, bool)> {
+        self.event_store.background_agent_tracking_seed(session_id)
     }
 
     fn record_attachment(&self, session_id: &str, seq: u64, blob: &AttachmentBlob) -> bool {

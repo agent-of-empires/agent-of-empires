@@ -2090,6 +2090,7 @@ mod tests {
                     description: "map backend".into(),
                     prompt: "do it".into(),
                     model: "claude-opus-4-8".into(),
+                    wire_tracked: false,
                     output_file: "/tmp/bg-real.output".into(),
                     started_at: chrono::Utc::now(),
                 },

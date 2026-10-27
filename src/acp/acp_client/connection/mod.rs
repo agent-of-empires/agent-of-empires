@@ -86,6 +86,7 @@ pub(super) struct ConnectionParams {
     pub(super) runner: Option<RunnerLink>,
     pub(super) cancellation: tokio_util::sync::CancellationToken,
     pub(super) shutdown: tokio_util::sync::CancellationToken,
+    pub(super) background_agent_tracking_seed: Vec<(String, bool)>,
 }
 
 /// Handlers compute an answer without knowing whether the request arrived over
@@ -155,6 +156,7 @@ pub(super) async fn run_connection_task<W, R>(
         runner,
         cancellation,
         shutdown,
+        background_agent_tracking_seed,
     } = params;
     let label = resources.label.clone();
     let (lifecycle_tx, lifecycle_rx) = mpsc::channel(128);
@@ -195,6 +197,7 @@ pub(super) async fn run_connection_task<W, R>(
         ingress.clone(),
         claude_home,
     ));
+    shared.seed_background_tracking(background_agent_tracking_seed);
     let ready_tx = Arc::new(Mutex::new(Some(ready_tx)));
 
     let builder = Client

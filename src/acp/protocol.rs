@@ -316,6 +316,7 @@ mod tests {
                 description: "d".into(),
                 prompt: "p".into(),
                 model: "m".into(),
+                wire_tracked: false,
                 output_file: "/home/user/.aoe/transcripts/a1.jsonl".into(),
                 started_at: chrono::Utc::now(),
             }),
