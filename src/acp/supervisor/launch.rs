@@ -1072,7 +1072,12 @@ pub(super) fn apply_declared_config_dir(
     tool: &str,
     agent: &str,
 ) -> Option<std::path::PathBuf> {
-    let variable = match crate::acp::agent_profiles::resolve(agent).native_config_agent? {
+    let native = cfg
+        .session
+        .agent_execution_as
+        .get(tool)
+        .map_or(agent, String::as_str);
+    let variable = match crate::acp::agent_profiles::resolve(native).native_config_agent? {
         "claude" => "CLAUDE_CONFIG_DIR",
         "codex" => "CODEX_HOME",
         "opencode" => "OPENCODE_CONFIG_DIR",
@@ -1307,6 +1312,20 @@ mod tests {
                     pair("PI_CODING_AGENT_DIR", "/acct"),
                 ],
                 None,
+            ),
+            // A custom tool's declared native identity selects the variable.
+            (
+                {
+                    let mut cfg = cfg(&[("my-claude", "/acct")]);
+                    cfg.session
+                        .agent_execution_as
+                        .insert("my-claude".into(), "claude".into());
+                    cfg
+                },
+                "my-claude",
+                "my-claude",
+                vec![pair("CLAUDE_CONFIG_DIR", "/acct")],
+                Some(PathBuf::from("/acct")),
             ),
             // No entry for the tool, and an agent with no config-dir variable.
             (
