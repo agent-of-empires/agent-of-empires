@@ -9686,7 +9686,9 @@ async fn workspace_trash_consent_follows_siblings_and_protects_the_shared_owner(
     Ok(())
 }
 
-/// Missing structured adapters refuse before provisioning; exempt creates do not.
+/// A structured create whose adapter resolves nowhere is refused with a
+/// stable code before anything is provisioned; the cases the check exempts
+/// never get that code.
 #[tokio::test]
 #[serial_test::serial]
 async fn create_refuses_a_structured_session_without_its_adapter() {
