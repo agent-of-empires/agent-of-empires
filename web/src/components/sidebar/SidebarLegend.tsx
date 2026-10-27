@@ -1,4 +1,4 @@
-import { useRef, useSyncExternalStore, type ReactNode } from "react";
+import { useEffect, useRef, useSyncExternalStore, type ReactNode } from "react";
 import { Pin } from "lucide-react";
 import { ContextMenu } from "../ContextMenu";
 import { StatusGlyph } from "../StatusGlyph";
@@ -21,13 +21,13 @@ function prefersReducedMotion() {
 }
 
 function LegendGlyph({ row, animate }: { row: StatusLegendRow; animate: boolean }) {
-  // A fresh-idle glyph needs an Idle that just started; any status draws Idle's glyph for Dormant.
+  // The fresh and Dormant rows draw Idle's glyph in their variant.
   const status = row.statuses[0] ?? "Idle";
   return (
     <StatusGlyph
       status={status}
       createdAt={null}
-      idleEnteredAt={row.variant === "fresh" ? new Date().toISOString() : null}
+      fresh={row.variant === "fresh"}
       dormant={row.variant === "dormant"}
       animate={animate}
     />
@@ -59,6 +59,19 @@ export function SidebarLegend() {
     closeMenu();
     buttonRef.current?.focus();
   };
+  // An outside click closes the popover without `close`, after focus has moved: back to "?" when
+  // the click landed on nothing focusable, left alone when a control took it.
+  const wasOpen = useRef(false);
+  useEffect(() => {
+    if (menu) {
+      wasOpen.current = true;
+      return;
+    }
+    if (!wasOpen.current) return;
+    wasOpen.current = false;
+    const active = document.activeElement;
+    if (!active || active === document.body) buttonRef.current?.focus({ preventScroll: true });
+  }, [menu]);
   const toggle = () => {
     if (menu) return close();
     const rect = buttonRef.current?.getBoundingClientRect();

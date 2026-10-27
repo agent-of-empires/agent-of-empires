@@ -43,9 +43,18 @@ test.describe("sidebar legend on desktop", () => {
     await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
     await page.mouse.click(1200, 680);
     await expect(legend).toBeHidden();
+    // Blank space takes no focus, so it returns to "?".
+    await expect(toggle).toBeFocused();
 
-    // Compact mode keeps "?", where the glyph is the only signal left on a row.
-    await page.getByRole("button", { name: "Compact sidebar" }).click();
+    // A control clicked outside keeps the focus it took. Compact mode keeps "?", where the
+    // glyph is the only signal left on a row.
+    await toggle.click();
+    await expect(legend).toBeVisible();
+    await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
+    const compact = page.getByRole("button", { name: "Compact sidebar" });
+    await compact.click();
+    await expect(legend).toBeHidden();
+    await expect(page.getByRole("button", { name: "Expand sidebar" })).toBeFocused();
     await toggle.click();
     await expect(legend).toBeVisible();
   });
