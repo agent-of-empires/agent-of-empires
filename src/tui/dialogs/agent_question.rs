@@ -7,6 +7,7 @@ use ratatui::{
 use tui_input::{backend::crossterm::EventHandler, Input};
 
 use super::{dialog_block, render_dialog_frame, DialogResult};
+use crate::tui::components::text::rendered_width;
 use crate::tui::styles::Theme;
 
 /// Answer editor for a provider-native choice prompt.
@@ -17,6 +18,10 @@ pub struct AgentQuestionDialog {
     option_cursor: Vec<usize>,
     custom: Vec<Input>,
     editing_custom: bool,
+    scroll_offsets: Vec<usize>,
+    scroll_max: Vec<usize>,
+    page_rows: usize,
+    follow_focus: bool,
 }
 
 impl AgentQuestionDialog {
@@ -38,6 +43,7 @@ impl AgentQuestionDialog {
             .map(|q| q.recommended.unwrap_or(0))
             .collect();
         let custom = questions.iter().map(|_| Input::default()).collect();
+        let question_count = questions.len();
         Self {
             prompt,
             question: 0,
@@ -45,10 +51,26 @@ impl AgentQuestionDialog {
             option_cursor,
             custom,
             editing_custom: false,
+            scroll_offsets: vec![0; question_count],
+            scroll_max: vec![0; question_count],
+            page_rows: 1,
+            follow_focus: true,
         }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<Vec<AgentIntegrationAnswer>> {
+        match key.code {
+            KeyCode::PageUp => {
+                self.scroll_question(false);
+                return DialogResult::Continue;
+            }
+            KeyCode::PageDown => {
+                self.scroll_question(true);
+                return DialogResult::Continue;
+            }
+            _ => {}
+        }
+        self.follow_focus = true;
         let AgentIntegrationPrompt::Question { questions, .. } = &self.prompt else {
             unreachable!()
         };
@@ -176,10 +198,24 @@ impl AgentQuestionDialog {
     }
     pub fn handle_paste(&mut self, text: &str) {
         if self.editing_custom {
+            self.follow_focus = true;
             for ch in text.chars().filter(|ch| *ch != '\n' && *ch != '\r') {
                 self.custom[self.question].handle(tui_input::InputRequest::InsertChar(ch));
             }
         }
+    }
+
+    fn scroll_question(&mut self, down: bool) {
+        let question = self.question;
+        let page_rows = self.page_rows;
+        let max_scroll = self.scroll_max[question];
+        let offset = &mut self.scroll_offsets[question];
+        if down {
+            *offset = offset.saturating_add(page_rows).min(max_scroll);
+        } else {
+            *offset = offset.saturating_sub(page_rows);
+        }
+        self.follow_focus = false;
     }
 
     fn select(selected: &mut Vec<String>, custom: &mut Input, label: String, multi: bool) {
@@ -237,14 +273,139 @@ impl AgentQuestionDialog {
                 option.label
             )));
         }
+        let custom_focused = self.editing_custom || q.options.is_empty();
+        let custom_line = lines.len();
         lines.push(Line::from(format!(
-            "Custom answer (press c): {}",
+            "{} Custom answer (press c): {}",
+            if custom_focused { ">" } else { " " },
             self.custom[self.question].value()
         )));
-        lines.push(Line::from(
-            "Tab/Enter: next question • Enter: submit • Esc: cancel",
-        ));
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+        let focus_line = if custom_focused {
+            custom_line
+        } else {
+            2 + self.option_cursor[self.question].min(q.options.len().saturating_sub(1))
+        };
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(2)])
+            .split(inner);
+        let content = chunks[0];
+        let footer = chunks[1];
+        let visible_height = content.height as usize;
+        let row_counts: Vec<usize> = lines
+            .iter()
+            .map(|line| wrapped_line_count(line, content.width.max(1)))
+            .collect();
+        let mut row_starts = Vec::with_capacity(row_counts.len() + 1);
+        let mut total_rows = 0usize;
+        for rows in &row_counts {
+            row_starts.push(total_rows);
+            total_rows += rows;
+        }
+        row_starts.push(total_rows);
+
+        self.page_rows = visible_height.saturating_sub(1).max(1);
+        let max_scroll = total_rows.saturating_sub(visible_height);
+        self.scroll_max[self.question] = max_scroll;
+        let mut scroll = self.scroll_offsets[self.question].min(max_scroll);
+        if visible_height > 0 && self.follow_focus {
+            let focus_start = row_starts[focus_line];
+            let focus_end = row_starts[focus_line + 1];
+            if focus_start < scroll {
+                scroll = focus_start;
+            }
+            if focus_end > scroll.saturating_add(visible_height) {
+                scroll = focus_end.saturating_sub(visible_height);
+            }
+        }
+        self.scroll_offsets[self.question] = scroll;
+        self.follow_focus = false;
+
+        if visible_height > 0 {
+            let first = (0..lines.len())
+                .find(|&index| row_starts[index + 1] > scroll)
+                .unwrap_or(lines.len());
+            let visible_end = scroll.saturating_add(visible_height);
+            let end = (first..lines.len())
+                .find(|index| row_starts[*index] >= visible_end)
+                .unwrap_or(lines.len());
+            if first < end {
+                let line_scroll = scroll
+                    .saturating_sub(row_starts[first])
+                    .min(u16::MAX as usize) as u16;
+                frame.render_widget(
+                    Paragraph::new(lines[first..end].to_vec())
+                        .wrap(Wrap { trim: true })
+                        .scroll((line_scroll, 0)),
+                    content,
+                );
+            }
+        }
+
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from("Up/Down: move  Space: select  c: custom  PgUp/PgDn: scroll"),
+                Line::from("Tab: next question  Enter: continue/submit  Esc: cancel"),
+            ])
+            .style(Style::default().fg(theme.dimmed)),
+            footer,
+        );
+    }
+}
+
+fn wrapped_line_count(line: &Line<'_>, width: u16) -> usize {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    let width = width.max(1) as usize;
+    let mut rows = 1;
+    let mut used = 0;
+    let mut spaces = 0;
+    let mut word = 0;
+    for grapheme in line
+        .spans
+        .iter()
+        .flat_map(|span| span.content.graphemes(true))
+    {
+        let cells = rendered_width(grapheme);
+        if cells > width {
+            continue;
+        }
+        if grapheme.chars().all(char::is_whitespace) {
+            if word > 0 {
+                add_wrapped_word(word, spaces, width, &mut rows, &mut used);
+                word = 0;
+                spaces = 0;
+            }
+            spaces += cells;
+        } else {
+            word += cells;
+        }
+    }
+    add_wrapped_word(word, spaces, width, &mut rows, &mut used);
+    rows
+}
+
+fn add_wrapped_word(word: usize, spaces: usize, width: usize, rows: &mut usize, used: &mut usize) {
+    if word == 0 {
+        return;
+    }
+    if *used > 0 {
+        if *used + spaces + word > width {
+            *rows += 1;
+            *used = 0;
+        } else {
+            *used += spaces;
+        }
+    }
+    if word > width {
+        if *used > 0 {
+            *rows += 1;
+        }
+        *rows += (word - 1) / width;
+        *used = (word - 1) % width + 1;
+    } else {
+        *used += word;
     }
 }
 
@@ -398,5 +559,76 @@ mod tests {
                         && answers[2].selected_options.is_empty()
             ));
         }
+    }
+
+    #[test]
+    fn long_questions_scroll_with_option_and_custom_focus() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let key = |code| KeyEvent::new(code, crossterm::event::KeyModifiers::NONE);
+        let options = (0..24)
+            .map(|index| AgentIntegrationOption {
+                label: format!("option-{index:02}"),
+                description: Some(format!(
+                    "{}tail-{index:02}",
+                    "wrapped option details ".repeat(4)
+                )),
+            })
+            .collect();
+        let prompt = AgentIntegrationPrompt::Question {
+            id: "prompt".into(),
+            title: "Configure".into(),
+            questions: vec![AgentIntegrationQuestion {
+                id: "question".into(),
+                question: "Choose an option".into(),
+                options,
+                multi: false,
+                recommended: None,
+            }],
+        };
+        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        let mut dialog = AgentQuestionDialog::new(prompt);
+        let render = |dialog: &mut AgentQuestionDialog| {
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            terminal
+                .draw(|frame| dialog.render(frame, frame.area(), &theme))
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+
+        let initial = render(&mut dialog);
+        assert!(initial.contains("PgUp/PgDn: scroll"));
+        for _ in 0..23 {
+            dialog.handle_key(key(KeyCode::Down));
+        }
+        let focused = render(&mut dialog);
+        assert!(focused.contains("option-23"));
+        assert!(focused.contains("tail-23"));
+        assert_eq!(dialog.selected[0], vec!["option-23".to_owned()]);
+
+        let bottom = dialog.scroll_offsets[0];
+        dialog.handle_key(key(KeyCode::PageUp));
+        assert!(dialog.scroll_offsets[0] < bottom);
+        assert_eq!(dialog.option_cursor[0], 23);
+        while dialog.scroll_offsets[0] > 0 {
+            dialog.handle_key(key(KeyCode::PageUp));
+        }
+        assert!(render(&mut dialog).contains("option-00"));
+        while dialog.scroll_offsets[0] < dialog.scroll_max[0] {
+            dialog.handle_key(key(KeyCode::PageDown));
+        }
+        assert!(render(&mut dialog).contains("option-23"));
+
+        dialog.handle_key(key(KeyCode::Char('c')));
+        let custom = format!("{}custom-answer-tail", "custom answer ".repeat(20));
+        dialog.handle_paste(&custom);
+        assert!(render(&mut dialog).contains("custom-answer-tail"));
     }
 }

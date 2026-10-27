@@ -2492,6 +2492,11 @@ impl HomeView {
                                 self.info_dialog =
                                     Some(InfoDialog::new("Response Not Sent", &error.to_string()));
                             }
+                        } else {
+                            self.info_dialog = Some(InfoDialog::new(
+                                "Response Not Sent",
+                                "The session is no longer available. The response was not sent.",
+                            ));
                         }
                     }
                 }
@@ -2521,7 +2526,13 @@ impl HomeView {
                                 session_id,
                                 snapshot,
                             } => {
-                                let instance = self.get_instance(&session_id)?;
+                                let Some(instance) = self.get_instance(&session_id) else {
+                                    self.info_dialog = Some(InfoDialog::new(
+                                        "Response Not Sent",
+                                        "The session is no longer available. The response was not sent.",
+                                    ));
+                                    return None;
+                                };
                                 let response = aoe_plugin_api::agent_integration::AgentIntegrationResponse::Approval {
                                     choice: match choice {
                                         crate::tui::dialogs::PermissionResponseChoice::Allow => aoe_plugin_api::agent_integration::IntegrationApprovalChoice::Allow,
