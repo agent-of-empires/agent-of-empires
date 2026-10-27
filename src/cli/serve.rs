@@ -1199,6 +1199,18 @@ pub fn daemon_pid() -> Option<u32> {
     }
 }
 
+/// The verified daemon's recorded launch, which a TUI restart replays.
+pub(crate) fn recorded_launch() -> Option<ServeLaunch> {
+    managed_launch(daemon_pid()?).ok()
+}
+
+/// Whether the verified daemon already runs `passphrase`.
+pub(crate) fn daemon_runs_passphrase(passphrase: &str) -> bool {
+    recorded_launch()
+        .and_then(|launch| recall_serve_passphrase(&launch).ok().flatten())
+        .is_some_and(|running| running == passphrase)
+}
+
 /// Returns a verified daemon only when it exposes the web dashboard.
 pub(crate) fn web_daemon_pid() -> Option<u32> {
     let pid = daemon_pid()?;

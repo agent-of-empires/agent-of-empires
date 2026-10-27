@@ -11,7 +11,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
 
 use crate::acp::client::autostart::initial_log_tail;
-use crate::cli::serve::{read_serve_urls, ServeUrl};
+use crate::cli::serve::{read_serve_urls, ServeLaunch, ServeUrl};
 use crate::tui::components::hover::HoverState;
 use crate::tui::dialogs::{contains, hit, target_rects};
 use crate::tui::styles::Theme;
@@ -84,7 +84,10 @@ impl ServeLaunchRequest {
         }
         if result.is_ok() {
             remember_last_mode(self.mode);
-            if let Some(passphrase) = self.passphrase {
+        }
+        // A failed reconnect can follow a successor that already runs the new passphrase.
+        if let Some(passphrase) = self.passphrase {
+            if result.is_ok() || crate::cli::serve::daemon_runs_passphrase(&passphrase) {
                 remember_passphrase(&passphrase);
                 save_passphrase_to_disk(&passphrase);
             }
@@ -363,6 +366,8 @@ struct RestartProbe {
     port: Option<u16>,
     /// The hosts a Local restart publishes: this machine's addresses plus `localhost`.
     local_hosts: Vec<String>,
+    /// The recorded named tunnel's host, which a Tunnel restart replays (Tunnel only).
+    named_host: Option<String>,
     /// A Local restart inherits `AOE_SERVE_PASSPHRASE` from this process.
     local_passphrase: bool,
     /// Whether a Local restart mints a new access token.
@@ -371,6 +376,7 @@ struct RestartProbe {
 
 impl RestartProbe {
     fn now(mode: ServeMode, transport: Option<TunnelTransport>) -> Self {
+        let recorded = crate::cli::serve::recorded_launch();
         match mode {
             ServeMode::Local => RestartProbe {
                 on_funnel: false,
@@ -383,11 +389,15 @@ impl RestartProbe {
                     .collect(),
                 local_passphrase: std::env::var("AOE_SERVE_PASSPHRASE")
                     .is_ok_and(|pp| !pp.is_empty()),
-                local_token: token_window(),
+                local_token: effective_token_window(recorded.as_ref(), token_window()),
+                named_host: None,
             },
             ServeMode::Tunnel => RestartProbe {
                 on_funnel: restart_on_funnel(transport),
                 persists: persist_sessions(),
+                named_host: recorded
+                    .and_then(|launch| launch.tunnel_name.and(launch.tunnel_url))
+                    .and_then(|url| link_host(&url).map(str::to_owned)),
                 ..RestartProbe::default()
             },
         }
@@ -395,9 +405,9 @@ impl RestartProbe {
 }
 
 impl RestartEffect {
-    /// A Tunnel keeps its host only when it is on Funnel and the restart takes the Funnel path
-    /// again: `spawn_daemon` never re-creates a named Cloudflare tunnel, and without Funnel the
-    /// server opens a fresh quick tunnel. A Local daemon republishes this machine's addresses on
+    /// A Tunnel keeps its host when the recorded named tunnel is replayed, or when it is on
+    /// Funnel and the restart takes the Funnel path again; otherwise the server opens a fresh
+    /// quick tunnel. A Local daemon republishes this machine's addresses on
     /// the reused or a random port, with a new token once the old one has aged out. Behind the
     /// passphrase wall, sign-ins then survive only if the running daemon wrote them to disk and
     /// the next start reads them back.
@@ -428,7 +438,12 @@ impl RestartEffect {
                 (link, probe.local_passphrase)
             }
             ServeMode::Tunnel => {
-                let stays = probe.on_funnel && urls.iter().any(|u| is_funnel_link(&u.url));
+                let stays = match &probe.named_host {
+                    Some(named) => urls
+                        .iter()
+                        .any(|u| link_host(&u.url).is_some_and(|host| host == named)),
+                    None => probe.on_funnel && urls.iter().any(|u| is_funnel_link(&u.url)),
+                };
                 (
                     if stays {
                         LinkChange::Same
@@ -456,6 +471,18 @@ impl RestartEffect {
             passphrase,
             may_change: mode == ServeMode::Local && probe.local_token == TokenWindow::Boundary,
         }
+    }
+}
+
+/// Only token auth puts a token in the link, and a restart replays the recorded auth mode.
+fn effective_token_window(recorded: Option<&ServeLaunch>, window: TokenWindow) -> TokenWindow {
+    let token_auth = recorded.is_none_or(|launch| {
+        launch.core_only || launch.auth_mode == crate::cli::serve::AuthMode::Token
+    });
+    if token_auth {
+        window
+    } else {
+        TokenWindow::Reused
     }
 }
 
@@ -1437,6 +1464,30 @@ mod tests {
                 assert!(view.launch_in_flight);
                 assert!(view.pending_confirm.is_none());
             }
+        }
+    }
+
+    #[test]
+    fn token_age_counts_only_under_token_auth() {
+        let recorded = |auth: &str, core_only: bool| -> ServeLaunch {
+            serde_json::from_value(serde_json::json!({
+                "schema": 4, "pid": 1, "profile": "", "core_only": core_only,
+                "host": "127.0.0.1", "port": 8080, "auth_mode": auth,
+                "has_passphrase": false, "behind_proxy": false, "read_only": false,
+                "remote": false, "tunnel_name": null, "tunnel_url": null,
+                "no_tailscale": false,
+            }))
+            .unwrap()
+        };
+        let renews = TokenWindow::Renews;
+        for (launch, want) in [
+            (None, renews),
+            (Some(recorded("token", false)), renews),
+            (Some(recorded("none", true)), renews),
+            (Some(recorded("passphrase", false)), TokenWindow::Reused),
+            (Some(recorded("none", false)), TokenWindow::Reused),
+        ] {
+            assert_eq!(effective_token_window(launch.as_ref(), renews), want);
         }
     }
 

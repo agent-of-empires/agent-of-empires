@@ -1250,6 +1250,7 @@ mod tests {
                 } else {
                     TokenWindow::Reused
                 },
+                named_host: None,
             };
         let tunnel = |on_funnel, persists| probe(on_funnel, None, true, false, persists, false);
         // (mode, url, next start, running daemon's persist_sessions (None = reattached), key
@@ -1405,6 +1406,29 @@ mod tests {
             // spawn_daemon never re-creates a named tunnel, whether or not Funnel replaces it.
             (Tunnel, named, tunnel(false, true), on, R, moved.clone()),
             (Tunnel, named, tunnel(true, true), on, R, moved.clone()),
+            // A recorded named tunnel is replayed, so its link stays whatever Funnel does.
+            (
+                Tunnel,
+                named,
+                RestartProbe {
+                    named_host: Some("aoe.example.com".to_string()),
+                    ..tunnel(false, true)
+                },
+                on,
+                R,
+                stays.clone(),
+            ),
+            (
+                Tunnel,
+                quick,
+                RestartProbe {
+                    named_host: Some("aoe.example.com".to_string()),
+                    ..tunnel(true, true)
+                },
+                on,
+                R,
+                moved.clone(),
+            ),
             (Tunnel, quick, tunnel(false, true), on, R, moved.clone()),
             (
                 Tunnel,
