@@ -59,6 +59,8 @@ pub async fn post_dashboard_presence(
 pub struct AgentInfo {
     pub kind: String,
     pub name: String,
+    /// How copy names the agent; custom agents are named by `name`.
+    pub display_name: String,
     pub binary: String,
     pub host_only: bool,
     pub installed: bool,
@@ -148,6 +150,7 @@ fn build_custom_agent_infos(
             lifecycle: crate::agents::AgentLifecycle::Active,
             kind: "custom".to_string(),
             name: name.clone(),
+            display_name: name.clone(),
             binary: name.clone(),
             host_only: false,
             installed: true,
@@ -190,6 +193,9 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
                 AgentInfo {
                     kind: "builtin".to_string(),
                     name: a.name.to_string(),
+                    display_name: crate::acp::display_name_for(a.name)
+                        .unwrap_or(a.name)
+                        .to_string(),
                     binary: a.binary.to_string(),
                     host_only: a.host_only,
                     installed: available.iter().any(|s| s == a.name),
@@ -3420,7 +3426,10 @@ mod tests {
         for (name, installed) in [("on-path", true), ("missing", false), ("terminal", false)] {
             let agent = agents.iter().find(|a| a.name == name).unwrap();
             assert_eq!(agent.acp_installed, installed, "{name}");
+            assert_eq!(agent.display_name, name);
         }
+        let claude = agents.iter().find(|a| a.name == "claude").unwrap();
+        assert_eq!(claude.display_name, "Claude Code");
     }
 
     #[test]
