@@ -6,7 +6,6 @@ import {
   useLayoutEffect,
   useRef,
   useState,
-  type ReactElement,
   type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
@@ -54,10 +53,9 @@ export function Tooltip({
     setPos(null);
   };
 
-  // Measure the trigger and the tooltip after mount, center the tooltip below the trigger, and clamp it inside the
-  // viewport.
-  useLayoutEffect(() => {
-    if (!open || !triggerRef.current || !tipRef.current) return;
+  // Measure the trigger and the tooltip, center the tooltip below the trigger, and clamp it inside the viewport.
+  const place = () => {
+    if (!triggerRef.current || !tipRef.current) return;
     const anchor = triggerRef.current.getBoundingClientRect();
     const tip = tipRef.current.getBoundingClientRect();
     setPos(
@@ -70,26 +68,34 @@ export function Tooltip({
         viewportHeight: window.innerHeight,
       }),
     );
+  };
+  useLayoutEffect(() => {
+    if (open) place();
   }, [open, text, detail]);
 
-  // A fixed tooltip detaches from its trigger when an ancestor scrolls or the window resizes; dismiss it rather
-  // than tracking the moving anchor.
+  // A fixed tooltip detaches from its trigger when an ancestor scrolls or the window resizes. An uncontrolled
+  // one is dismissed. A controlled one follows its anchor, since focusing a row scrolls it into view and
+  // hiding then would drop the row's description.
   useEffect(() => {
-    if (!open || controlled) return;
-    window.addEventListener("scroll", hide, true);
-    window.addEventListener("resize", hide);
+    if (!open) return;
+    const onMove = controlled ? place : hide;
+    window.addEventListener("scroll", onMove, true);
+    window.addEventListener("resize", onMove);
     return () => {
-      window.removeEventListener("scroll", hide, true);
-      window.removeEventListener("resize", hide);
+      window.removeEventListener("scroll", onMove, true);
+      window.removeEventListener("resize", onMove);
     };
   }, [open, controlled]);
 
   // The description belongs on what takes focus: the single child when it's an element, else
-  // this wrapper. A controlled tooltip's caller describes its own target.
+  // this wrapper, added to any description the child already has. A controlled tooltip's caller
+  // describes its own target.
   const describedBy = open && !controlled ? tipId : undefined;
   const describable = isValidElement<{ "aria-describedby"?: string }>(children);
   const trigger = describable
-    ? cloneElement(children as ReactElement<{ "aria-describedby"?: string }>, { "aria-describedby": describedBy })
+    ? cloneElement(children, {
+        "aria-describedby": [children.props["aria-describedby"], describedBy].filter(Boolean).join(" ") || undefined,
+      })
     : children;
 
   return (

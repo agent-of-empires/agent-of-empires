@@ -1,4 +1,4 @@
-import { memo, useRef, useState } from "react";
+import { memo, useId, useRef, useState } from "react";
 import { Folder } from "lucide-react";
 import { archivableWorkspaces, type SidebarGroup } from "../../lib/sidebarGroups";
 import { SCRATCH_GROUP_ID } from "../../hooks/useRepoGroups";
@@ -65,9 +65,21 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
   const dotClass = STATUS_DOT_CLASS[group.status === "active" ? "Running" : "Idle"] ?? "bg-status-idle";
   const rowClass = `${group.color ? "" : "hover:bg-surface-800/50"} ${hasActiveChild ? "border-l-2 border-session-active" : ""}`;
   const headerStyle = repoColorStyle(group.color);
+  // Like a Session row's glyph: the header button takes focus and is described by the dot.
+  const [dotTip, setDotTip] = useState<"hover" | "focus" | null>(null);
+  const dotTipId = useId();
   const dot = (
-    <Tooltip text={group.status === "active" ? GROUP_DOT_STATE.active : GROUP_DOT_STATE.inactive}>
-      <span data-testid="sidebar-group-dot" className={`w-2 h-2 rounded-full shrink-0 ${dotClass}`} />
+    <Tooltip
+      text={group.status === "active" ? GROUP_DOT_STATE.active : GROUP_DOT_STATE.inactive}
+      id={dotTipId}
+      open={dotTip !== null}
+    >
+      <span
+        data-testid="sidebar-group-dot"
+        className={`w-2 h-2 rounded-full shrink-0 ${dotClass}`}
+        onPointerEnter={(e) => e.pointerType === "mouse" && setDotTip((tip) => tip ?? "hover")}
+        onPointerLeave={() => setDotTip((tip) => (tip === "hover" ? null : tip))}
+      />
     </Tooltip>
   );
 
@@ -167,6 +179,9 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
           aria-expanded={!group.collapsed}
           aria-controls={rowsId}
           aria-keyshortcuts={hasMenu ? "Shift+F10" : undefined}
+          aria-describedby={dotTip ? dotTipId : undefined}
+          onFocus={(e) => e.currentTarget.matches(":focus-visible") && setDotTip("focus")}
+          onBlur={() => setDotTip(null)}
           className="flex items-center gap-2 flex-1 min-w-0 text-left cursor-pointer rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500"
         >
           <span className="relative h-4 w-4 shrink-0">

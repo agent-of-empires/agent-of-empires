@@ -61,6 +61,20 @@ describe("Tooltip", () => {
     );
     expect(screen.getByRole("tooltip").id).toBe("glyph-tip");
     expect(screen.getByText("⠃").getAttribute("aria-describedby")).toBeNull();
+    // A controlled tooltip follows a scrolling anchor rather than dismissing itself.
+    fireEvent.scroll(window);
+    expect(screen.getByRole("tooltip").id).toBe("glyph-tip");
+
+    // A child's own description is kept alongside the bubble.
+    rerender(
+      <Tooltip text="New session">
+        <button type="button" aria-describedby="hint">
+          +
+        </button>
+      </Tooltip>,
+    );
+    fireEvent.focus(screen.getByRole("button"));
+    expect(screen.getByRole("button").getAttribute("aria-describedby")).toBe(`hint ${screen.getByRole("tooltip").id}`);
   });
 
   it("opens on focus and closes on blur", () => {

@@ -68,6 +68,16 @@ test.describe("sidebar legend on desktop", () => {
     await page.keyboard.press("Enter");
     await expect(page).toHaveURL(/\/session\/s-b$/, { timeout: 5_000 });
   });
+
+  test("a keyboard-focused Group header is described by its dot's tooltip", async ({ page }) => {
+    await page.getByTestId("sidebar-session-row").first().focus();
+    await page.keyboard.press("ArrowUp");
+    const header = page.getByTestId("sidebar-group-header").first().getByRole("button").first();
+    await expect(header).toBeFocused();
+    const tip = page.getByRole("tooltip");
+    await expect(tip).toContainText("Active: a Session is Running");
+    await expect(header).toHaveAttribute("aria-describedby", (await tip.getAttribute("id")) ?? "missing");
+  });
 });
 
 test.describe("sidebar legend on a phone", () => {
