@@ -21,7 +21,7 @@ const ELIGIBLE: Record<SessionAction, (s: SessionResponse, archived: boolean) =>
   restartUpdate: (s) => !!s.update_restart,
   fork: (s) => isStructured(s) && !!s.acp_session_id && !!s.acp_can_fork,
   switchAgent: isStructured,
-  switchView: (s) => isStructured(s) || !!s.acp_capable,
+  switchView: (s) => isStructured(s) || (!!s.acp_capable && !s.structured_view_off),
   autoName: isStructured,
   summarize: isStructured,
 };

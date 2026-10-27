@@ -75,10 +75,10 @@ means ownership or liveness could not be established; requests never guess an
 owner. An explicit stop may still finish an already-authorized original
 retirement, even when the current pane is absent or ownership is unknown.
 
-While the TUI shows **Runtime applying**, a change to that session is still
-pending. Wait for **Runtime ready** before another change to the same session.
-A pane disappearing does not establish completion: the TUI must receive the
-command acknowledgement and apply its matching runtime snapshot.
+A change to a session stays pending until the TUI receives the command
+acknowledgement and applies its matching runtime snapshot; let it settle before
+another change to the same session. A pane disappearing does not establish
+completion.
 
 If a TUI runtime change loses its acknowledgement, its session stays blocked because the outcome is unknown. Check the current daemon state before choosing **Unlock**; resolution does not replay the lost change. **Keep Blocked** leaves the quarantine intact. Reopen the prompt with `Ctrl+K`, then **Resolve unknown runtime change**, even if the session has disappeared from the list. A failed resolution remains blocked until a healthy, current daemon snapshot has been applied.
 

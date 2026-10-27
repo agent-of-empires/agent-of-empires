@@ -40,8 +40,18 @@ with `403 read_only`. Read endpoints work normally.
 Set `[web] mcp_enabled = true` in global `config.toml`, then restart the
 Daemon to enable Streamable HTTP at `/mcp`. The route is absent by default.
 It shares the existing API router and does not expose TCP or web assets when
-running core-only. TCP uses the API's token and login policy; the private
-`daemon/api.sock` accepts the authenticated same-UID owner peer without a token.
+running core-only. With token authentication, `/mcp` requires a valid token,
+sent as an `Authorization: Bearer` header (the form `aoe mcp config`
+generates), an `aoe_token` cookie, or a `?token=` query parameter, and returns
+`401` when it is missing or invalid. With passphrase authentication, a request
+needs a valid `aoe_session` login cookie, accepts no bearer token, and gets
+`401 login_required` without one. The login wall covers loopback callers as
+well as remote ones. A token-authenticated daemon that also has a passphrase,
+such as `--remote`, still requires that login session on `/mcp`, so a bearer
+token alone is not enough. A daemon running `--auth none` needs no credential.
+The private `daemon/api.sock` accepts the authenticated same-UID owner peer
+without a token. To connect an agent, see
+[Controlling AoE over MCP](guides/mcp-control.md).
 
 | Tool | Arguments | Returns |
 | --- | --- | --- |
@@ -205,13 +215,33 @@ Native clients classify errors from the status and one `AoE-Error-Code` response
 
 ## Runtime CLI reads
 
-Read-only CLI commands use `/api/runtime/read/ws` when `--daemon-url` or `AOE_DAEMON_URL` selects an HTTP endpoint. `/api/runtime/ws` is reserved for the TUI stream and does not serve this one-shot protocol.
+The covered CLI reads (`list`, `status`, `session show`, `session list-trash`, `group list`, `profile list` or bare `profile`, and `project list`) require a Daemon answer. They use `/api/runtime/read/ws` when `--daemon-url` or `AOE_DAEMON_URL` selects an HTTP endpoint. `/api/runtime/ws` remains the separate TUI stream.
 
-An explicit endpoint requires a served answer and never falls back. Environment discovery falls back to local storage, with a notice on stderr, if its configuration is unusable or no TCP peer is reached within one second. Authentication, upgrade and protocol failures after reaching a peer never fall back. Each served exchange has a 15-second deadline.
+The covered local command handlers return an internal error if runtime dispatch is bypassed; they never read storage.
+
+Explicit and environment-selected endpoints never fall back to local storage or start a local Daemon. Invalid configuration, connection failures, authentication errors, and protocol errors are final refusals against the selected target. Unreachable targets leave stdout empty and report reconnect guidance on stderr. Environment URLs retain a one-second TCP establishment budget; each served exchange has a 15-second deadline.
+
+Covered reads still run the monolithic CLI's local startup preflight, including schema migrations, before contacting the Daemon. A local schema or migration failure can therefore block a read even with an explicit or environment-selected remote URL. Selecting an endpoint does not bypass this preflight.
+
+CLI commands that still write storage directly, such as `session archive`, `session snooze` and `rm`, can finish before the Daemon adopts their changes. Covered reads are eventually consistent with those writes, including when the Daemon was already running: a successful write does not guarantee immediate visibility in the next `list`, `session show` or `session list-trash`. Automation must wait for the expected state rather than assume read-after-write consistency; no fixed adoption deadline is guaranteed. The remaining writer cutover is tracked by [#4467](https://github.com/agent-of-empires/agent-of-empires/issues/4467), following [ADR 0004](adr/0004-cli-writes-through-the-daemon.md).
 
 After upgrading the CLI, a `protocol_mismatch` means the target daemon uses a different protocol version. On that daemon's host, run `aoe serve --restart` for a detached daemon; otherwise restart the foreground daemon or its service through the service manager. Update that host's installation if needed. A missing runtime-read route can also indicate an older daemon, but first check the selected URL and proxy routing.
 
-Without an HTTP endpoint, Linux reads use a verified, same-user local daemon socket when published; otherwise they use local storage. Invalid or unverifiable publication artifacts refuse fallback. Other platforms use local storage.
+Without an HTTP endpoint, Linux first reads through its verified, same-user runtime socket. Only proven publication absence permits the [shared local auto-start policy](adr/0004-cli-writes-through-the-daemon.md), followed by one read through that same transport. Invalid or unverifiable publication artifacts, including unknown marker schemas and complete malformed temporary markers, refuse without starting or changing targets. Empty or genuinely truncated temporary writes alone do not establish a publication. macOS acquires the local Daemon through the same policy and reads through its returned API Unix socket, with peer-UID verification. The API route retains its existing wire shape; it does not claim Linux marker identity. A Client without a local backend requires a remote URL.
+
+An implicit local read can still refuse after acquisition if the Daemon does not publish runtime reads. Check its mode, version compatibility and publication diagnostics; CityHall intentionally disables these reads on both transports. API readiness alone does not authorize a Linux runtime read.
+
+A `403` carrying a valid `AoE-Error-Code: cityhall_mode` produces the CLI refusal code `cityhall_mode`, not `unauthorized`. This is a deployment-mode restriction; retrying authentication does not enable runtime reads. The refusal does not trigger login retries, a different target or local startup.
+
+Identity refusals such as `peer_identity` and `marker_identity` require checking the expected Daemon, app/build namespace, versions and local socket/publication ownership through its manager. Do not remove publication artifacts or start another Daemon while ownership is uncertain.
+
+A named temporary-marker decode failure may indicate an incompatible Daemon version, not necessarily an abandoned write. Check versions first. Before removing the named temporary, stop every Daemon using this app directory through its service manager or `aoe serve --stop`, and verify no publisher remains. Remove only that file if it is abandoned; do not clear publication artifacts indiscriminately.
+
+`--no-autostart` or `AOE_NO_AUTOSTART=1` disables local startup, not reuse of an existing Daemon. Startup failure or an absent Daemon with startup disabled is an error with guidance, never a disk answer. The spawning Client announces `Started aoe daemon (pid N)` only on stderr, including under `--json`. Local administrative commands keep their existing startup and configuration-recovery behavior; other reads outside this covered set remain unchanged.
+
+The startup profile does not determine read scope. Reusing an existing Daemon does not resolve or validate a startup profile. A missing configured default does not block an explicitly scoped read or a profile-independent read; an unscoped read still reports that missing default from the Daemon snapshot. Only automatic read acquisition preserves a configured missing default in an empty profile registry. Administrative startup and native acquisition retain their initial profile creation. Configured aliases retain their read scope without becoming physical startup profiles.
+
+On a genuine first run with no configured default, an unscoped read retains the existing `main` bootstrap during local preflight, even with auto-start disabled.
 
 The route follows the daemon's authentication mode. CLI clients use `AOE_DAEMON_TOKEN` or `AOE_DAEMON_PASSPHRASE`; passphrase login shares the ACP client's device-bound session cache. Environment URLs discard query parameters, including query tokens. Explicit endpoints reject queries. HTTP on a non-loopback host is accepted only without credentials; remote authentication requires HTTPS. Localhost connections bypass proxies and pin both loopback address families.
 

@@ -121,7 +121,9 @@ pub struct App {
     /// Snoozed via Ctrl+x until a newer release ships.
     dismissed_update_version: Option<String>,
     image_update: Option<ImageUpdate>,
-    image_update_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<Option<ImageUpdate>>>>,
+    image_update_rx: Option<
+        tokio::sync::oneshot::Receiver<anyhow::Result<crate::containers::image_update::ImageCheck>>,
+    >,
     image_pull_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<()>>>,
     /// Snoozed via Ctrl+x while the registry still resolves to this digest.
     dismissed_image_digest: Option<String>,
@@ -586,6 +588,8 @@ impl App {
         draw_result?;
         end_result?;
         self.sync_host_title(terminal)?;
+        #[cfg(feature = "e2e-tests")]
+        e2e_report_runtime(self.home.runtime_settled());
         Ok(())
     }
 
@@ -2150,11 +2154,13 @@ impl App {
         if self.image_update_rx.is_some() {
             return;
         }
-        let image = Config::load_or_warn().sandbox.default_image.clone();
+        let sandbox = Config::load_or_warn().sandbox;
+        let image = sandbox.default_image;
+        let runtime = crate::containers::ContainerRuntime::from(sandbox.container_runtime);
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.image_update_rx = Some(rx);
         tokio::spawn(async move {
-            let result = crate::containers::image_update::check_for_image_update(&image).await;
+            let result = crate::containers::image_update::check_image(runtime, &image).await;
             let _ = tx.send(result);
         });
     }
@@ -2166,7 +2172,7 @@ impl App {
             return false;
         };
         match rx.try_recv() {
-            Ok(Ok(Some(update))) => {
+            Ok(Ok(crate::containers::image_update::ImageCheck::Available(update))) => {
                 // Honor the per-digest snooze; a newer image clears it
                 // automatically because its digest no longer matches.
                 if self.dismissed_image_digest.as_deref() == Some(update.remote_digest.as_str()) {
@@ -2175,7 +2181,8 @@ impl App {
                 self.image_update = Some(update);
                 true
             }
-            Ok(Ok(None)) => false,
+            // The TUI banner only offers an update; it has no row for "can't tell".
+            Ok(Ok(_)) => false,
             Ok(Err(e)) => {
                 tracing::debug!(target: "containers.image_update", error = %e, "image update check failed");
                 false
@@ -2632,6 +2639,23 @@ fn quit_intent(
         return QuitIntent::Confirm;
     }
     QuitIntent::Quit
+}
+
+/// Writes `ready` or `busy` to `AOE_E2E_RUNTIME_STATE` when it changes, so e2e tests can wait
+/// for an applied receipt without a footer label.
+#[cfg(feature = "e2e-tests")]
+fn e2e_report_runtime(settled: bool) {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static LAST: AtomicU8 = AtomicU8::new(u8::MAX);
+    let Some(path) = std::env::var_os("AOE_E2E_RUNTIME_STATE") else {
+        return;
+    };
+    // Recorded only once written, so a failed write is retried on the next draw.
+    if LAST.load(Ordering::SeqCst) != u8::from(settled)
+        && std::fs::write(path, if settled { "ready" } else { "busy" }).is_ok()
+    {
+        LAST.store(u8::from(settled), Ordering::SeqCst);
+    }
 }
 
 #[cfg(feature = "e2e-tests")]

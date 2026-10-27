@@ -115,6 +115,22 @@ impl ServeMode {
             _ => None,
         }
     }
+
+    /// How a running Daemon is reachable, from the `serve.mode` token it writes. A Tunnel's
+    /// token names its provider ("tailscale", or "tunnel" for Cloudflare).
+    fn reachability(s: &str) -> Option<&'static str> {
+        match s.trim() {
+            "tailscale" => Some("Tailscale"),
+            "tunnel" => Some("Cloudflare"),
+            "local" => Some("Local network"),
+            _ => None,
+        }
+    }
+}
+
+/// How the running Web dashboard is reachable, for the Connections hub.
+pub fn served_via() -> Option<&'static str> {
+    ServeMode::reachability(&read_app_file("serve.mode")?)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

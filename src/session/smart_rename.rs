@@ -1066,12 +1066,8 @@ fn apply_title_outcome(
     if !title_is_auto_overwritable(instance, force) || instance.title == title {
         return None;
     }
-    if crate::session::is_duplicate_session(
-        instances.iter(),
-        &title,
-        &instance.project_path,
-        Some(id),
-    ) {
+    if crate::session::rename_transaction::ensure_unique_title(instances, instance, &title).is_err()
+    {
         tracing::warn!(target: "smart_rename", session = %id, title = %title, "skipped duplicate auto-title");
         return None;
     }
@@ -1095,8 +1091,10 @@ fn apply_terminal_title(
         .update(|instances, _groups| Ok(apply_title_outcome(instances, id, new_title, force)))?;
     drop(identity_lock);
     if let Some((old_title, new_title)) = rekey {
-        if let Err(error) = crate::tmux::rekey_session(id, &old_title, &new_title) {
-            tracing::warn!(target: "smart_rename", session = %id, "tmux rename failed: {error}");
+        if let Some(warning) =
+            crate::session::rename_transaction::rekey_tmux(id, &old_title, &new_title)
+        {
+            tracing::warn!(target: "smart_rename", session = %id, "{warning}");
         }
     }
     Ok(())
@@ -1637,12 +1635,11 @@ mod serve {
                             if !title_is_auto_overwritable(instance, force) {
                                 return Err(skipped("Session was renamed in the meantime"));
                             }
-                            if crate::session::is_duplicate_session(
-                                instances.iter(),
-                                title,
-                                &instance.project_path,
-                                Some(&id_owned),
-                            ) {
+                            if crate::session::rename_transaction::ensure_unique_title(
+                                instances, instance, title,
+                            )
+                            .is_err()
+                            {
                                 return Err(SmartRenameError::Skipped(format!(
                                     "Another session in this folder is already titled \"{title}\""
                                 )));
@@ -1690,18 +1687,16 @@ mod serve {
             Err(error) => (None, Err(error)),
         };
         if let Some((old, new)) = rekey {
-            let rekeyed = tokio::task::spawn_blocking(move || {
-                crate::tmux::rekey_session(&id_owned, &old, &new)
+            let warning = match tokio::task::spawn_blocking(move || {
+                crate::session::rename_transaction::rekey_tmux(&id_owned, &old, &new)
             })
-            .await;
-            match rekeyed {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => {
-                    tracing::warn!(target: "smart_rename", session = %id, %error, "tmux rename failed")
-                }
-                Err(error) => {
-                    tracing::warn!(target: "smart_rename", session = %id, %error, "tmux rename task failed")
-                }
+            .await
+            {
+                Ok(warning) => warning,
+                Err(error) => Some(crate::session::rename_transaction::rekey_warning(&error)),
+            };
+            if let Some(warning) = warning {
+                tracing::warn!(target: "smart_rename", session = %id, "{warning}");
             }
         }
         drop(lifecycle);
