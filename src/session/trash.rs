@@ -1278,7 +1278,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn relocate_then_restore_round_trip() {
+        let _app = crate::session::test_support::isolate_app_dir();
         if !git_available() {
             return;
         }
@@ -1329,8 +1331,9 @@ mod tests {
     }
 
     #[test]
-
+    #[serial_test::serial]
     fn reconcile_backfills_legacy_then_is_idempotent() {
+        let _app = crate::session::test_support::isolate_app_dir();
         if !git_available() {
             return;
         }
@@ -1363,7 +1366,9 @@ mod tests {
     /// admin dir was pruned and the `.git` file is left dangling, and the one
     /// where the `.git` entry is gone outright.
     #[test]
+    #[serial_test::serial]
     fn reconcile_never_retries_a_checkout_the_repo_no_longer_registers() {
+        let _app = crate::session::test_support::isolate_app_dir();
         if !git_available() {
             return;
         }
@@ -1486,7 +1491,9 @@ mod tests {
     /// lock condition) must stay retriable, so one bad moment cannot strand the
     /// relocation for good.
     #[test]
+    #[serial_test::serial]
     fn a_move_failure_over_a_live_checkout_stays_retriable() {
+        let _app = crate::session::test_support::isolate_app_dir();
         if !git_available() {
             return;
         }
@@ -1643,7 +1650,9 @@ mod tests {
     /// A markerless row whose pointer was lost is healed to the holding path, whether or not
     /// the original path was recreated; one already pointing at holding is left alone.
     #[test]
+    #[serial_test::serial]
     fn reconcile_heals_a_markerless_pointer_to_holding_only_when_it_is_lost() {
+        let _app = crate::session::test_support::isolate_app_dir();
         if !git_available() {
             return;
         }
@@ -1813,7 +1822,9 @@ mod tests {
     /// is injected here so the wiring/ordering is verified without a live docker
     /// runtime; a non-sandbox session exercises the happy path end to end.
     #[test]
+    #[serial_test::serial]
     fn trash_prep_stops_container_before_relocating() {
+        let _app = crate::session::test_support::isolate_app_dir();
         if !git_available() {
             return;
         }
@@ -1906,7 +1917,9 @@ mod tests {
     /// undone: the worktree moves back to the original path the live row
     /// points at.
     #[test]
+    #[serial_test::serial]
     fn undo_raced_relocation_moves_worktree_back() {
+        let _app = crate::session::test_support::isolate_app_dir();
         if !git_available() {
             return;
         }
