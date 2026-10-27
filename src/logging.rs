@@ -890,8 +890,12 @@ fn unknown_target_roots(directive: &str) -> Vec<&str> {
     directive
         .split(',')
         .filter_map(|d| {
-            let (selector, _) = d.split_once('=')?;
-            let root = selector.split(['.', ':', '[']).next()?.trim();
+            let d = d.trim();
+            // A bare target means `target=trace`; a bare level names no target.
+            if d.is_empty() || LogLevel::parse(d).is_some() {
+                return None;
+            }
+            let root = d.split(['.', ':', '[', '=']).next()?.trim();
             (!root.is_empty()
                 && !DEFAULT_TARGET_ROOTS.contains(&root)
                 && !EXTERNAL_TARGET_ROOTS.contains(&root))
@@ -959,6 +963,7 @@ mod tests {
                 vec![],
             ),
             ("agent_of_empires::tui=debug,hyper=debug", vec!["hyper"]),
+            ("info,cockpit", vec!["cockpit"]),
         ];
         for (directive, want) in cases {
             assert_eq!(unknown_target_roots(directive), want, "{directive}");
