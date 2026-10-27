@@ -416,21 +416,31 @@ mod legacy_inventory_boundary_tests {
         let prefix = "aoe-session-vanishing-fixture-";
         for population in [None, Some("populated 1\n"), Some("populated unknown\n")] {
             let root = tempfile::tempdir().unwrap();
-            let vanished = root.path().join("vanishing.service");
-            fs::create_dir(&vanished).unwrap();
-            if let Some(population) = population {
-                let scope = root.path().join(format!("{prefix}1700000000000.scope"));
-                fs::create_dir(&scope).unwrap();
-                fs::write(scope.join("cgroup.events"), population).unwrap();
+            for name in ["first.service", "second.service"] {
+                fs::create_dir(root.path().join(name)).unwrap();
             }
+            let fixture_root = root.path().to_owned();
             let observed = std::rc::Rc::new(std::cell::Cell::new(0));
             let count = observed.clone();
             let _restore = RestoreBeforeOpen(BEFORE_OPEN.with(|slot| {
                 slot.replace(Some(Box::new(move |name| {
-                    if name == "vanishing.service" {
-                        count.set(count.get() + 1);
-                        fs::remove_dir(&vanished).unwrap();
+                    if count.get() != 0 {
+                        return;
                     }
+                    let survivor = match name.to_str().unwrap() {
+                        "first.service" => "second.service",
+                        "second.service" => "first.service",
+                        _ => panic!("scope opened before directory disappearance"),
+                    };
+                    fs::remove_dir(fixture_root.join(name)).unwrap();
+                    if let Some(population) = population {
+                        let scope = fixture_root
+                            .join(survivor)
+                            .join(format!("{prefix}1700000000000.scope"));
+                        fs::create_dir(&scope).unwrap();
+                        fs::write(scope.join("cgroup.events"), population).unwrap();
+                    }
+                    count.set(1);
                 })))
             }));
             let result = legacy_scope_cgroups_clear(
@@ -443,10 +453,7 @@ mod legacy_inventory_boundary_tests {
                 Some("populated 1\n") => assert!(!result.unwrap()),
                 _ => assert!(result.is_err()),
             }
-            // The clear case must observe the vanished entry before proving absence.
-            if population.is_none() {
-                assert_eq!(observed.get(), 1);
-            }
+            assert_eq!(observed.get(), 1);
         }
     }
 
@@ -1028,6 +1035,7 @@ fn legacy_scope_cgroups_clear(
             nix::sys::stat::Mode::empty(),
         ) {
             Ok(child) => child.into(),
+            // Callers require cgroup2, whose removal requires no live tasks or child cgroups.
             Err(nix::errno::Errno::ENOENT) => continue,
             Err(error) => return Err(error.into()),
         };
