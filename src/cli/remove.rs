@@ -8,6 +8,7 @@ use crate::daemon::{
     DeleteSessionBody, PurgeOutcome, RuntimeHealth, SessionResponse, TrashRelocationOutcome,
     TrashSessionBody, RUNTIME_PROTOCOL_VERSION,
 };
+use crate::session::deletion::CleanupIntent;
 
 #[derive(Args)]
 pub struct RemoveArgs {
@@ -122,18 +123,14 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         }
     }
 
-    if !body.delete_worktree && session.has_cleanable_worktree {
+    if !args.delete_worktree && session.has_cleanable_worktree {
         println!(
             "Worktree preserved at: {} (use --delete-worktree to remove)",
             session.project_path
         );
     }
-    if session.is_sandboxed {
-        if args.keep_container {
-            println!("Container preserved (--keep-container)");
-        } else if !body.delete_sandbox {
-            println!("Container preserved (auto_cleanup disabled in config)");
-        }
+    if session.is_sandboxed && args.keep_container {
+        println!("Container preserved (--keep-container)");
     }
     println!("  Removed session: {title} (from profile '{profile}')");
     Ok(())
@@ -141,13 +138,12 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
 
 /// A trashed row carries its own consent so a concurrent restore is refused.
 fn purge_body(session: &SessionResponse, args: &RemoveArgs) -> Result<DeleteSessionBody> {
-    let defaults = &session.cleanup_defaults;
-    let delete_worktree = args.delete_worktree && session.has_cleanable_worktree;
     let mut body = DeleteSessionBody {
-        delete_worktree,
-        delete_branch: session.has_cleanable_worktree
-            && (args.delete_branch || (delete_worktree && defaults.delete_branch)),
-        delete_sandbox: session.is_sandboxed && !args.keep_container && defaults.delete_sandbox,
+        cleanup_intent: Some(CleanupIntent {
+            delete_worktree: args.delete_worktree,
+            delete_branch: args.delete_branch,
+            keep_container: args.keep_container,
+        }),
         force_delete: args.force,
         keep_scratch: args.keep_scratch,
         ..Default::default()
@@ -198,28 +194,21 @@ mod tests {
     }
 
     #[test]
-    fn purge_body_resolves_cleanup_flags() {
+    fn purge_body_sends_cli_intent_not_resolved_policy() {
         let live = row(serde_json::json!({}));
-        // Default keeps the worktree and its branch; config only drives the sandbox.
-        let b = purge_body(&live, &args(|_| {})).unwrap();
-        assert!(!b.delete_worktree && !b.delete_branch && b.delete_sandbox);
-        // --delete-worktree pulls the branch in via the config default.
-        let b = purge_body(&live, &args(|a| a.delete_worktree = true)).unwrap();
-        assert!(b.delete_worktree && b.delete_branch);
-        // --keep-container wins over the config default.
-        let b = purge_body(&live, &args(|a| a.keep_container = true)).unwrap();
-        assert!(!b.delete_sandbox);
-        // No managed worktree: nothing to delete regardless of flags.
-        let plain = row(serde_json::json!({"has_cleanable_worktree": false}));
         let b = purge_body(
-            &plain,
+            &live,
             &args(|a| {
                 a.delete_worktree = true;
-                a.delete_branch = true;
+                a.keep_container = true;
+                a.force = true;
             }),
         )
         .unwrap();
-        assert!(!b.delete_worktree && !b.delete_branch);
+        let intent = b.cleanup_intent.unwrap();
+        assert!(intent.delete_worktree && intent.keep_container && !intent.delete_branch);
+        assert!(b.force_delete);
+        assert!(!b.delete_worktree && !b.delete_branch && !b.delete_sandbox);
     }
 
     #[test]

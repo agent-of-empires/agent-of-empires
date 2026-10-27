@@ -144,6 +144,8 @@ pub(crate) async fn purge_session_artifacts(
     };
     let transaction = if body.use_cleanup_defaults {
         tokio::task::spawn_blocking(move || transaction.resolve_cleanup_defaults()).await??
+    } else if let Some(intent) = body.cleanup_intent.clone() {
+        tokio::task::spawn_blocking(move || transaction.resolve_cleanup_intent(&intent)).await??
     } else {
         transaction
     };
@@ -719,13 +721,14 @@ pub async fn delete_session(
             "Trash consent requires a selected trash timestamp, UUID, and lifecycle generation",
         );
     }
-    if body.use_cleanup_defaults
+    if (body.use_cleanup_defaults || body.cleanup_intent.is_some())
         && (body.delete_worktree || body.delete_branch || body.delete_sandbox)
+        || (body.use_cleanup_defaults && body.cleanup_intent.is_some())
     {
         return api_error(
             StatusCode::BAD_REQUEST,
             "invalid_cleanup_mode",
-            "Default cleanup policy cannot be combined with explicit cleanup flags",
+            "Resolved cleanup policy cannot be combined with explicit cleanup flags",
         );
     }
     let join = tokio::spawn(async move {
