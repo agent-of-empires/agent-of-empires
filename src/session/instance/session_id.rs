@@ -276,8 +276,7 @@ impl Instance {
         (session_id, false)
     }
 
-    /// Preassign only when native execution identity is known.
-    /// Other launches capture the agent's own publication after launch.
+    /// Preassign with known execution identity; otherwise capture the agent's publication.
     fn fresh_launch_session_id(
         &self,
         backend: Option<crate::agents::SessionCaptureBackend>,
@@ -285,9 +284,9 @@ impl Instance {
         mint_fresh_id: &dyn Fn(&str) -> Option<String>,
     ) -> Option<String> {
         let backend = backend?;
-        execution
-            .map(|execution| execution.agent)
-            .or_else(|| self.resolved_agent())?;
+        if execution.is_none() && self.resolved_agent().is_none() {
+            return None;
+        }
         match backend {
             crate::agents::SessionCaptureBackend::Claude => Some(generate_session_uuid()),
             crate::agents::SessionCaptureBackend::OpenCode
