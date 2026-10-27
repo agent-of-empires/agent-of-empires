@@ -1,10 +1,9 @@
 //! `agent-of-empires status` command implementation
 
-use anyhow::Result;
 use clap::Args;
 use serde::Serialize;
 
-use crate::session::{Status, Storage};
+use crate::session::Status;
 
 #[derive(Args)]
 pub struct StatusArgs {
@@ -112,78 +111,4 @@ pub(crate) fn count_statuses(statuses: impl Iterator<Item = Status>) -> StatusCo
         counts.total += 1;
     }
     counts
-}
-
-#[tracing::instrument(target = "cli.session", skip_all, fields(profile = %profile))]
-pub async fn run(profile: &str, args: StatusArgs) -> Result<()> {
-    let storage = Storage::open_reference(profile)?;
-    let (mut instances, _) = storage.load_with_groups()?;
-    for inst in &mut instances {
-        inst.source_profile = storage.profile().to_string();
-    }
-
-    if instances.is_empty() {
-        if args.json {
-            println!("{}", status_json(&StatusCounts::default()));
-        } else if args.quiet {
-            println!("0");
-        } else {
-            println!("No sessions in profile '{}'.", storage.profile());
-        }
-        return Ok(());
-    }
-
-    crate::session::config::profile_config::resolve_config_or_warn(profile);
-
-    crate::tmux::refresh_session_cache();
-
-    let contended = crate::session::Instance::contended_capture_cwds(&instances);
-    for inst in &mut instances {
-        inst.update_status_once(None, None);
-        inst.self_heal_session_id(profile, &contended);
-    }
-
-    let counts = count_statuses(instances.iter().map(|inst| inst.status));
-
-    if args.json {
-        println!("{}", status_json(&counts));
-    } else if args.quiet {
-        println!("{}", counts.waiting);
-    } else if args.verbose {
-        for (label, symbol, status) in VERBOSE_GROUPS {
-            let rows: Vec<(&str, &str, String)> = instances
-                .iter()
-                .filter(|inst| inst.status == status)
-                .map(|inst| {
-                    (
-                        inst.title.as_str(),
-                        inst.tool.as_str(),
-                        crate::util::collapse_tilde(&inst.project_path),
-                    )
-                })
-                .collect();
-            print!("{}", verbose_group(label, symbol, &rows));
-        }
-        println!(
-            "Total: {} sessions in profile '{}'",
-            counts.total,
-            storage.profile()
-        );
-    } else if counts.stopped > 0 {
-        println!(
-            "{} waiting • {} running • {} idle • {} stopped",
-            counts.waiting, counts.running, counts.idle, counts.stopped
-        );
-    } else {
-        println!(
-            "{} waiting • {} running • {} idle",
-            counts.waiting, counts.running, counts.idle
-        );
-    }
-
-    if !args.json && !args.quiet {
-        crate::update::print_update_notice().await;
-    }
-
-    Ok(())
 }

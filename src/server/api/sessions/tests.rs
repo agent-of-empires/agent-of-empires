@@ -635,6 +635,11 @@ async fn committed_structured_purge_releases_admission_exclusion_before_retireme
     crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
     crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir()?)?;
     for (recovered, running) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut exited = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()?;
+        let pid = exited.id();
+        anyhow::ensure!(exited.wait()?.success(), "process fixture failed");
         let mut row = Instance::new("purge admission", "");
         let scratch = crate::session::scratch::provision_scratch_dir(&row.id)?;
         row.project_path = scratch.to_string_lossy().into_owned();
@@ -643,16 +648,16 @@ async fn committed_structured_purge_releases_admission_exclusion_before_retireme
         row.source_profile = "default".into();
         crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
         let control = Arc::new(FakeProcessControl::default());
-        control.alive(4849);
+        control.alive(pid);
         let gate = Gate::default();
         let (launcher, _) = recording_gated_launcher(
             &gate,
-            4849,
+            pid,
             &row.id,
             "native-purge-admission",
             Some(crate::process::ProcessBirthIdentity {
                 boot_id: "fixture-boot".into(),
-                start_id: format!("gated-original-4849-{}", row.id),
+                start_id: format!("gated-original-{pid}-{}", row.id),
             }),
         );
         let state = crate::server::test_support::build_test_app_state_impl(
