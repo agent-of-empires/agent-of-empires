@@ -422,11 +422,23 @@ export interface CreateSessionRequest {
   retry_origin?: string;
 }
 
+export type CreateStage = "preparing" | "starting_container" | "running_hooks" | "starting";
+
 export interface CreateProgress {
-  stage: "preparing" | "starting_container" | "running_hooks" | "starting";
+  stage: CreateStage;
   /** The `on_create` command currently running. */
   hook: string | null;
   output: string[];
+}
+
+/** A create the server refused, in the credential-free terms it sends to any client. */
+export interface CreateFailure {
+  code: string;
+  message: string;
+  /** Unknown for a refusal made before the create started. */
+  stage: CreateStage | null;
+  /** Finds the failure's line in the Daemon log; null when the server sent none. */
+  reference: string | null;
 }
 
 export interface ImportableSession {

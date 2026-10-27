@@ -1,6 +1,7 @@
-import { useEffect } from "react";
+import { useEffect, type ReactNode } from "react";
 import { useServerDown, OFFLINE_TITLE } from "../../lib/connectionState";
 import { hasFinePointer } from "../../lib/platform";
+import { launchEligible } from "./createRequest";
 
 interface LaunchData {
   path: string;
@@ -13,6 +14,8 @@ interface Props {
   data: LaunchData;
   isSubmitting: boolean;
   error: string | null;
+  /** Shown in place of `error`: a create the server refused. */
+  failure?: ReactNode;
   onSubmit: () => void;
   /** CityHall name-only mode: the server derives the project. */
   nameOnly?: boolean;
@@ -22,6 +25,8 @@ interface Props {
   defaultsReady?: boolean;
   /** Offered while a create runs: closes the wizard and lets it finish unattended. */
   onBackground?: () => void;
+  /** Blocks Launch without showing a create, while a check that may itself resend runs. */
+  held?: boolean;
 }
 
 const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.userAgent);
@@ -30,15 +35,15 @@ export function LaunchFooter({
   data,
   isSubmitting,
   error,
+  failure,
   onSubmit,
   nameOnly = false,
   defaultsReady = true,
   onBackground,
+  held = false,
 }: Props) {
   const offline = useServerDown();
-  // Scratch and name-only sessions get their directory from the server.
-  const canSubmit =
-    defaultsReady && !isSubmitting && !offline && (nameOnly || data.scratch || !!data.path) && !!data.tool;
+  const canSubmit = !isSubmitting && !held && launchEligible(data, { ready: defaultsReady, offline, nameOnly });
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -53,7 +58,8 @@ export function LaunchFooter({
 
   return (
     <div>
-      {error && <div className="text-sm text-status-error bg-status-error/10 rounded-lg p-3 mb-4">{error}</div>}
+      {failure ??
+        (error && <div className="text-sm text-status-error bg-status-error/10 rounded-lg p-3 mb-4">{error}</div>)}
       {offline && (
         <div className="text-sm text-status-error bg-status-error/10 rounded-lg p-3 mb-4">{OFFLINE_TITLE}</div>
       )}

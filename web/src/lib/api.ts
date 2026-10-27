@@ -15,7 +15,9 @@ import type {
   ProjectInfo,
   ProjectOverrides,
   DockerStatusResponse,
+  CreateFailure,
   CreateProgress,
+  CreateStage,
   CreateSessionRequest,
   CreationTrustFingerprint,
   ImportableSession,
@@ -2204,6 +2206,8 @@ export async function createSession(body: CreateSessionRequest): Promise<{
   network?: boolean;
   /** A restarted daemon cannot tell whether the first attempt ran; retrying stops here. */
   outcomeUnknown?: boolean;
+  /** Set for any typed refusal other than the ones flagged above. */
+  failure?: CreateFailure;
 }> {
   try {
     const res = await fetch("/api/sessions", jsonInit("POST", body));
@@ -2231,7 +2235,13 @@ export async function createSession(body: CreateSessionRequest): Promise<{
     if (data.error === "create_outcome_unknown") {
       return { ok: false, error: data.message || "Whether the session was created is unknown.", outcomeUnknown: true };
     }
-    if (data.error !== "hooks_need_trust") return { ok: false, error: data.message || `Server error (${res.status})` };
+    if (data.error !== "hooks_need_trust") {
+      const message = data.message || `Server error (${res.status})`;
+      if (typeof data.error !== "string") return { ok: false, error: message };
+      const stage = typeof data.stage === "string" ? (data.stage as CreateStage) : null;
+      const reference = typeof data.reference === "string" ? data.reference : res.headers.get("x-request-id");
+      return { ok: false, error: message, failure: { code: data.error, message, stage, reference } };
+    }
     return {
       ok: false,
       error: data.message || "Repository hooks require trust",
