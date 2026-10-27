@@ -8411,6 +8411,31 @@ async fn post_create_raw(
     (status, code, serde_json::from_slice(&bytes).unwrap())
 }
 #[tokio::test]
+async fn create_rejects_hook_env_without_sandbox() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let state = crate::server::test_support::build_test_app_state_impl(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        |_| {},
+        |supervisor| supervisor,
+    );
+    let (status, body) = post_create(
+        &state,
+        serde_json::json!({
+            "title": "hook-env", "path": "", "tool": "claude",
+            "scratch": true, "view": "structured", "hook_env": ["A=1"],
+        }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "validation_failed");
+    assert!(state.instances.read().await.is_empty());
+}
+
+#[tokio::test]
 async fn scratch_create_resolves_profile_before_publication_and_purge() {
     use axum::response::IntoResponse;
 
