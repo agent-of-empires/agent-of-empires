@@ -29,15 +29,22 @@ fn rename_targets(path: &Path) -> Result<()> {
     if directives.iter().all(|d| renamed(target(d)).is_none()) {
         return Ok(());
     }
-    let existing: HashSet<&str> = directives.iter().map(|d| target(d)).collect();
+    fn selector(d: &str) -> &str {
+        d.split_once('=').map_or(d, |(s, _)| s).trim()
+    }
+    let existing: HashSet<&str> = directives.iter().map(|d| selector(d)).collect();
     let mut out = Vec::new();
     for d in &directives {
         let t = target(d);
         match renamed(t) {
             None => out.push(d.to_string()),
-            // An explicit `acp` directive wins over the renamed one.
-            Some(new) if existing.contains(new.as_str()) => {}
-            Some(new) => out.push(format!("{new}{}", &d[t.len()..])),
+            Some(new) => {
+                let renamed = format!("{new}{}", &d[t.len()..]);
+                // An explicit `acp` directive with the same selector wins.
+                if !existing.contains(selector(&renamed)) {
+                    out.push(renamed);
+                }
+            }
         }
     }
     std::fs::write(path, out.join(",")).with_context(|| format!("writing {}", path.display()))?;
@@ -57,6 +64,10 @@ mod tests {
                 Some("agent_of_empires=trace,acp=trace,acp.event_store=debug,http=info"),
             ),
             (Some("acp=info,cockpit=trace"), Some("acp=info")),
+            (
+                Some("acp[turn]=info,cockpit=trace"),
+                Some("acp[turn]=info,acp=trace"),
+            ),
             (Some("cockpit[turn]=debug"), Some("acp[turn]=debug")),
             (
                 Some("agent_of_empires=info,acp=info\n"),
