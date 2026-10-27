@@ -611,12 +611,12 @@ fn release_restore_reservation(storage: &Storage, restore_id: &str, generation: 
 async fn empty_trash(profile: &str) -> Result<()> {
     use crate::daemon::{EmptyTrashBody, GroupSessionFailureCode, PurgeOutcome};
 
+    let (client, epoch) = super::group::daemon_client().await?;
     let profile = if profile.is_empty() {
-        crate::session::config::resolve_default_profile()
+        client.default_profile().await?
     } else {
         profile.to_string()
     };
-    let (client, epoch) = super::group::daemon_client().await?;
     let outcome = client
         .empty_trash(
             &EmptyTrashBody {
