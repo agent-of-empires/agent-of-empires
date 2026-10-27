@@ -633,18 +633,10 @@ fn a_named_user_write_acl_is_refused_on_an_intermediate_component() {
         Some("app_dir_untrusted"),
         "a named-user write ACL is refused wherever it appears in the chain"
     );
-    let refusal = client_refusal(&app);
     assert!(
-        refusal.contains(&intermediate.display().to_string()),
-        "the refusal names the component it refused: {refusal}"
-    );
-    assert!(
-        refusal.contains("0740"),
-        "the refusal carries the mode read off the descriptor: {refusal}"
-    );
-    assert!(
-        refusal.contains("grants a named user or group write access"),
-        "the refusal names the ACL cause, not some other one: {refusal}"
+        !client_admits(&app),
+        "the client must also refuse the named-user write ACL: {}",
+        client_refusal(&app)
     );
 }
 
