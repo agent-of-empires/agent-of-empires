@@ -2,7 +2,16 @@
 
 import type { Page } from "@playwright/test";
 import { test, expect } from "./helpers/mockedTest";
-import { launch, mockWizardApis, openPanel, openWizard, sessionStub, startWizard, wizard } from "./helpers/wizard";
+import {
+  CLAUDE_AGENT,
+  launch,
+  mockWizardApis,
+  openPanel,
+  openWizard,
+  sessionStub,
+  startWizard,
+  wizard,
+} from "./helpers/wizard";
 
 const option = (page: Page, text: string) => page.getByRole("option").filter({ hasText: text });
 
@@ -72,6 +81,21 @@ test.describe("project tabs", () => {
     await page.getByRole("button", { name: /Advanced/ }).click();
     await expect(page.locator("#clone-dest")).toBeVisible();
     await expect(page.locator("label", { hasText: "Shallow clone" }).locator("input[type=checkbox]")).toBeVisible();
+  });
+});
+
+test.describe("project new session", () => {
+  test("a project with no sessions opens on the profile default agent (#5008)", async ({ page }) => {
+    const vibe = { ...CLAUDE_AGENT, name: "vibe", binary: "vibe" };
+    await startWizard(page, {
+      sessions: [],
+      projects: [{ name: "example", path: "/work/example", scope: "global", pinned: false }],
+      agents: [CLAUDE_AGENT, vibe],
+      settings: { session: { default_tool: "vibe" } },
+      project: false,
+    });
+    await page.getByRole("button", { name: "New session in example" }).click();
+    await expect(wizard(page).getByTestId("wizard-agent-row")).toContainText("vibe");
   });
 });
 

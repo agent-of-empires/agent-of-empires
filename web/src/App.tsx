@@ -1426,7 +1426,7 @@ function AppContent({
 
       setWizardPrefill({
         path: repoPath,
-        tool: latest?.tool ?? "claude",
+        tool: latest?.tool,
         yoloMode: latest?.yolo_mode ?? false,
         sandboxEnabled: latest?.is_sandboxed ?? false,
         profile,
