@@ -11,7 +11,10 @@ pub struct RemoveArgs {
     /// Session ID or title to remove
     identifier: String,
 
-    /// Delete worktree directory (default: keep worktree)
+    /// With --purge, delete the worktree directory (default: keep it).
+    ///
+    /// Without --purge, trashing moves a managed worktree into a sibling
+    /// `.aoe-trash` folder, unless another session uses it.
     #[arg(long = "delete-worktree")]
     delete_worktree: bool,
 
@@ -96,7 +99,7 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         let _lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&removed_id)
             .map_err(|error| anyhow::anyhow!("failed to acquire instance trash lock: {error}"))?;
-        let mut inst = storage.update(|all_instances, _groups| {
+        let mut inst = storage.update_complete(|all_instances, _groups| {
             let stored = all_instances
                 .iter_mut()
                 .find(|instance| instance.id == removed_id)

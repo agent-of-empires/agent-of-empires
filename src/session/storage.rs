@@ -2190,6 +2190,20 @@ impl Storage {
         Ok(bundle)
     }
 
+    /// Read every session row without taking the storage flock, failing on any
+    /// row that cannot be decoded instead of skipping it.
+    pub(crate) fn load_instances_complete(&self) -> Result<Vec<Instance>> {
+        let opened;
+        let files = match self.files.as_deref() {
+            Some(files) => files,
+            None => {
+                opened = ProfileFiles::open(&self.sessions_path, ProfileRootPolicy::Canonical)?;
+                &opened
+            }
+        };
+        self.load_instances(ReadPolicy::Complete(files))
+    }
+
     pub(crate) fn verify_bound_profile(&self) -> Result<()> {
         self.files
             .as_deref()
@@ -2293,6 +2307,14 @@ impl Storage {
     {
         self.update_with_policy(ReadPolicy::Recover, f)
             .map(|(result, _, _)| result)
+    }
+
+    /// Like [`Self::update`], but refuses to rewrite a store holding an undecodable row.
+    pub(crate) fn update_complete<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
+    {
+        self.update_with_snapshot(f).map(|(result, _, _)| result)
     }
 
     /// Return the committed rows and groups without rereading after releasing the flock.

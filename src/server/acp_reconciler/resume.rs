@@ -350,18 +350,14 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
 }
 
 async fn seed_in_flight_status(state: &AppState, id: &str) {
-    let tasks_active = state.acp_event_store.has_unresolved_background_tasks(id);
-    let main_active = state.acp_event_store.has_in_flight_main_turn(id);
-    let Some(intent) = state
-        .acp_event_store
-        .latest_seed_status_event(id)
-        .and_then(|event| crate::server::derive_acp_status(&event, main_active, tasks_active))
+    let Some(projected) =
+        crate::server::acp_events::folded_sidebar_status(&state.session_service, id).await
     else {
         return;
     };
     let mut instances = state.instances.write().await;
     if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-        crate::server::acp_events::apply_status_seed(inst, intent, &state.status_tx);
+        crate::server::acp_events::apply_status_seed(inst, projected, &state.status_tx);
     }
 }
 

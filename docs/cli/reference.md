@@ -101,6 +101,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe mcp add`↴](#aoe-mcp-add)
 * [`aoe mcp edit`↴](#aoe-mcp-edit)
 * [`aoe mcp remove`↴](#aoe-mcp-remove)
+* [`aoe mcp config`↴](#aoe-mcp-config)
 * [`aoe skill`↴](#aoe-skill)
 * [`aoe skill list`↴](#aoe-skill-list)
 * [`aoe skill view`↴](#aoe-skill-view)
@@ -230,6 +231,7 @@ Add a new session
 * `--no-submodules` — Skip `git submodule update --init --recursive` after creating the worktree, overriding the `worktree.init_submodules` config (default true). Useful for repos with large or deeply nested submodule trees that you don't need inside the agent session
 * `-s`, `--sandbox` — Run session in a container sandbox
 * `--sandbox-image <SANDBOX_IMAGE>` — Custom container image for sandbox (implies --sandbox)
+* `--hook-env <KEY[=VALUE]>` — Env var for the host `before_start` hook only, never the container (`KEY=VALUE` or `KEY`; repeatable; requires --sandbox)
 * `-y`, `--yolo` — Enable YOLO mode (skip permission prompts)
 * `--trust-hooks` — Automatically trust this repository's hooks and project-local MCP servers without prompting
 * `--extra-args <EXTRA_ARGS>` — Extra arguments to append after the agent binary
@@ -356,7 +358,9 @@ Remove a session
 
 ###### **Options:**
 
-* `--delete-worktree` — Delete worktree directory (default: keep worktree)
+* `--delete-worktree` — With --purge, delete the worktree directory (default: keep it).
+
+   Without --purge, trashing moves a managed worktree into a sibling `.aoe-trash` folder, unless another session uses it.
 * `--delete-branch` — Delete git branch after worktree removal (default: per config)
 * `--force` — Force worktree removal even with untracked/modified files
 * `--keep-container` — Keep container instead of deleting it (default: delete per config)
@@ -1515,6 +1519,7 @@ Inspect the effective MCP server set (provenance, conflicts, drift)
 * `add` — Add an AoE-owned MCP server to the global mcp.json
 * `edit` — Edit an AoE-owned MCP server. Secrets you do not mention keep their stored value
 * `remove` — Remove an AoE-owned MCP server
+* `config` — Print an MCP client config for the running daemon's `/mcp` server, ready to paste into an agent's `mcpServers` (for example a Claude Code `.mcp.json`)
 
 
 
@@ -1589,6 +1594,14 @@ Remove an AoE-owned MCP server
 ###### **Arguments:**
 
 * `<NAME>` — Name of the AoE-owned server to remove
+
+
+
+## `aoe mcp config`
+
+Print an MCP client config for the running daemon's `/mcp` server, ready to paste into an agent's `mcpServers` (for example a Claude Code `.mcp.json`)
+
+**Usage:** `aoe mcp config`
 
 
 

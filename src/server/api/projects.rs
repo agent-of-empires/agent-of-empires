@@ -15,7 +15,8 @@ use super::{api_error, AppState};
 use crate::daemon::{
     CreateProjectBody, ProfileSnapshot, ProjectResponse, ReloadFailureCode, RuntimeHealth,
 };
-use crate::server::auth::{handler_elevated, AuthenticatedSession, LocalAuthorization};
+use crate::server::auth::{handler_elevated, AuthenticatedSession};
+use crate::server::principal::{authorize, Capability, Principal};
 use crate::session::config::settings_schema::validate_project_plugin_setting;
 use crate::session::projects::{self, ProjectPatch, RegistryError};
 use crate::session::{Project, ProjectScope};
@@ -313,7 +314,7 @@ async fn commit_project(
 pub async fn create_project(
     State(state): State<Arc<AppState>>,
     session: Option<axum::Extension<AuthenticatedSession>>,
-    loopback: Option<axum::Extension<LocalAuthorization>>,
+    loopback: Option<axum::Extension<Principal>>,
     body: Result<Json<CreateProjectBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     if let Some(response) = super::cityhall_block(&state) {
@@ -389,7 +390,12 @@ pub async fn create_project(
             )
         })
         .collect();
-    let elevated = handler_elevated(&state, session.as_deref(), loopback.is_some()).await;
+    let elevated = handler_elevated(
+        &state,
+        session.as_deref(),
+        authorize(loopback.as_deref(), Capability::SkipElevation),
+    )
+    .await;
     if !elevated && !plugin_settings.values().all(BTreeMap::is_empty) {
         return elevation_required();
     }
@@ -421,7 +427,7 @@ pub async fn delete_project(
     Path(name): Path<String>,
     Query(query): Query<ProjectQuery>,
     session: Option<axum::Extension<AuthenticatedSession>>,
-    loopback: Option<axum::Extension<LocalAuthorization>>,
+    loopback: Option<axum::Extension<Principal>>,
 ) -> Response {
     if let Some(response) = super::cityhall_block(&state) {
         return response;
@@ -433,7 +439,12 @@ pub async fn delete_project(
         Ok(scope) => scope,
         Err(response) => return response,
     };
-    let elevated = handler_elevated(&state, session.as_deref(), loopback.is_some()).await;
+    let elevated = handler_elevated(
+        &state,
+        session.as_deref(),
+        authorize(loopback.as_deref(), Capability::SkipElevation),
+    )
+    .await;
     let anchored_path = query.path;
     commit_project(
         state,
@@ -630,7 +641,7 @@ pub async fn update_project(
     Path(name): Path<String>,
     Query(query): Query<ProjectQuery>,
     session: Option<axum::Extension<AuthenticatedSession>>,
-    loopback: Option<axum::Extension<LocalAuthorization>>,
+    loopback: Option<axum::Extension<Principal>>,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     if let Some(response) = super::cityhall_block(&state) {
@@ -652,7 +663,12 @@ pub async fn update_project(
         Err((code, message)) => return project_error(StatusCode::BAD_REQUEST, code, message),
     };
     if !patch.plugin_settings.values().all(BTreeMap::is_empty)
-        && !handler_elevated(&state, session.as_deref(), loopback.is_some()).await
+        && !handler_elevated(
+            &state,
+            session.as_deref(),
+            authorize(loopback.as_deref(), Capability::SkipElevation),
+        )
+        .await
     {
         return elevation_required();
     }

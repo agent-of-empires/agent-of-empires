@@ -16,7 +16,10 @@ use tokio::{
 };
 use tracing::Instrument;
 
-use super::{auth::LocalAuthorization, AppState};
+use super::{
+    principal::{authorize, Capability, Principal},
+    AppState,
+};
 use crate::daemon::{
     CreationProgress, RuntimeCapabilities, RuntimeContents, RuntimeCursor, RuntimeFrame,
     RuntimeHealth, RuntimeInfo, RuntimeSnapshot, RUNTIME_PROTOCOL_VERSION,
@@ -369,7 +372,7 @@ impl NativeRuntime {
     fn info(
         &self,
         state: &AppState,
-        local: Option<&LocalAuthorization>,
+        local: Option<&Principal>,
         snapshot: &RuntimeSnapshot,
     ) -> RuntimeInfo {
         let profiles = snapshot
@@ -378,9 +381,11 @@ impl NativeRuntime {
             .iter()
             .map(|profile| profile.name.clone())
             .collect();
-        let local_owner = matches!(local, Some(LocalAuthorization::UnixOwner(_)));
+        let local_owner = local.is_some_and(Principal::is_local_peer);
+        let owner_detail = authorize(local, Capability::OwnerDiagnostics);
         let mut interaction_capabilities = snapshot.contents.capabilities.clone();
-        interaction_capabilities.native_interaction &= local_owner;
+        interaction_capabilities.native_interaction &=
+            authorize(local, Capability::NativeInteraction);
         RuntimeInfo {
             protocol_version: RUNTIME_PROTOCOL_VERSION,
             epoch: self.epoch.clone(),
@@ -392,7 +397,7 @@ impl NativeRuntime {
             cityhall_mode: state.cityhall_mode,
             health: snapshot.contents.health.clone(),
             interaction_capabilities,
-            owner_diagnostics: if local_owner && snapshot.contents.health != RuntimeHealth::Healthy
+            owner_diagnostics: if owner_detail && snapshot.contents.health != RuntimeHealth::Healthy
             {
                 state
                     .canonical_diagnostics
@@ -402,7 +407,7 @@ impl NativeRuntime {
             } else {
                 Vec::new()
             },
-            owner_instance_id: if local_owner {
+            owner_instance_id: if owner_detail {
                 std::env::var("AOE_SERVE_INSTANCE_ID").ok()
             } else {
                 None
@@ -511,7 +516,7 @@ pub(crate) fn mutation_response(cursor: &RuntimeCursor, body: impl IntoResponse)
 
 pub(crate) async fn get_runtime_info(
     State(state): State<Arc<AppState>>,
-    local: Option<Extension<LocalAuthorization>>,
+    local: Option<Extension<Principal>>,
 ) -> Response {
     match state.runtime.publish(&state).await {
         Ok(snapshot) => Json(
@@ -534,7 +539,7 @@ pub(crate) async fn get_runtime_snapshot(State(state): State<Arc<AppState>>) -> 
 pub(crate) async fn runtime_ws(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
-    local: Option<Extension<LocalAuthorization>>,
+    local: Option<Extension<Principal>>,
 ) -> Response {
     ws.max_message_size(1024)
         .max_frame_size(1024)
@@ -568,15 +573,11 @@ async fn send_creation_progress(
 /// channel for session environment values, so only a peer the daemon
 /// authorized as the local owner may receive it. A loopback TCP bearer client
 /// is deliberately excluded: it is the same machine, not the same identity.
-fn creation_progress_granted(local: Option<&LocalAuthorization>) -> bool {
-    matches!(local, Some(LocalAuthorization::UnixOwner(_)))
+fn creation_progress_granted(local: Option<&Principal>) -> bool {
+    authorize(local, Capability::CreationProgress)
 }
 
-async fn follow_runtime(
-    mut socket: WebSocket,
-    state: Arc<AppState>,
-    local: Option<LocalAuthorization>,
-) {
+async fn follow_runtime(mut socket: WebSocket, state: Arc<AppState>, local: Option<Principal>) {
     let first_subscriber = !state.runtime.has_subscribers();
     let mut snapshots = state.runtime.snapshots.subscribe();
     let progress_granted = creation_progress_granted(local.as_ref());
@@ -899,9 +900,9 @@ mod tests {
     /// Only kernel-authenticated Unix owners receive hook output.
     #[test]
     fn creation_progress_is_granted_only_to_the_local_owner() {
-        assert!(creation_progress_granted(Some(
-            &LocalAuthorization::UnixOwner(501)
-        )));
+        assert!(creation_progress_granted(Some(&Principal::LocalPeer {
+            uid: 501
+        })));
         assert!(!creation_progress_granted(None));
     }
 
@@ -942,8 +943,9 @@ mod tests {
             *state.canonical_diagnostics.write().unwrap() = diagnostics;
             let snapshot = state.runtime.publish(&state).await.unwrap();
             for owner in [false, true] {
-                let authorization =
-                    owner.then(|| LocalAuthorization::UnixOwner(nix::unistd::geteuid().as_raw()));
+                let authorization = owner.then(|| Principal::LocalPeer {
+                    uid: nix::unistd::geteuid().as_raw(),
+                });
                 let info = state
                     .runtime
                     .info(&state, authorization.as_ref(), &snapshot.value);

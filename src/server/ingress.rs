@@ -47,7 +47,8 @@ impl Ingress {
         let forwarded_proto = via_trusted_proxy
             .then(|| last_list_element(headers, "x-forwarded-proto"))
             .flatten();
-        let externally_secure = forwarded_proto.is_some_and(|p| p.eq_ignore_ascii_case("https"));
+        let externally_secure = forwarded_proto
+            .is_some_and(|p| p.eq_ignore_ascii_case("https") || p.eq_ignore_ascii_case("wss"));
         let forwarded_plaintext = forwarded_proto.is_some() && !externally_secure;
         Self {
             client_ip: if via_trusted_proxy {
@@ -158,6 +159,14 @@ mod tests {
         let proxied = resolve("127.0.0.1", &forged, true);
         assert_eq!(proxied.client_ip, ip("203.0.113.50"));
         assert!(proxied.externally_secure && !proxied.plaintext_remote);
+        // Some proxies label a WebSocket upgrade `wss`, which is TLS; `ws` and `http` are not.
+        for (proto, secure) in [("wss", true), ("WSS", true), ("ws", false), ("http", false)] {
+            let ingress = resolve("127.0.0.1", &[("x-forwarded-proto", proto)], true);
+            assert_eq!(ingress.externally_secure, secure, "{proto}");
+            assert_eq!(ingress.plaintext_remote, !secure, "{proto}");
+        }
+        let remote = resolve("198.51.100.7", &[("x-forwarded-proto", "wss")], true);
+        assert!(remote.plaintext_remote && !remote.externally_secure);
     }
 
     /// A proxy that names no client, or a malformed or repeated one, never keys login or

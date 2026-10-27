@@ -363,15 +363,19 @@ pub(crate) fn native_context_notice_command(message: &str) -> String {
 /// `KEY=value` is literal, `KEY=$VAR` reads the host env, `KEY=$$literal`
 /// escapes a `$`, and a bare `KEY` passes through from the host env. Unset host
 /// references and bare keys are skipped. Deduplicates by key (first wins).
+///
+/// `before_start_hook_env` is listed first so it wins a key clash. It is never read by
+/// [`collect_environment`], so it stays out of the container.
 pub(crate) fn session_host_env_pairs(
     trusted: &[String],
     repo_aware: &[String],
     sandbox_info: &SandboxInfo,
 ) -> Vec<(String, String)> {
-    match sandbox_info.extra_env.as_deref() {
-        None => resolve_hook_env_pairs(trusted),
-        Some(extra) => resolve_hook_env_pairs(host_hook_entries(extra, trusted, repo_aware)),
-    }
+    let sandbox_env: Vec<&String> = match sandbox_info.extra_env.as_deref() {
+        None => trusted.iter().collect(),
+        Some(extra) => host_hook_entries(extra, trusted, repo_aware).collect(),
+    };
+    resolve_hook_env_pairs(sandbox_info.before_start_hook_env.iter().chain(sandbox_env))
 }
 
 /// Exclude repository-only entries from the host hook environment.
@@ -1152,6 +1156,7 @@ environment = ["GH_TOKEN=write_token"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
         let project_path = temp_home.path().join("nonexistent_project");
@@ -1227,6 +1232,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
         let env = build_docker_env_args("default", &sandbox, &project).env;
@@ -1433,6 +1439,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         }
     }
@@ -1556,6 +1563,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
 
@@ -1638,6 +1646,34 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
     }
 
     #[test]
+    fn hook_only_env_reaches_hook_but_not_container() {
+        let info = SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "img".to_string(),
+            container_name: "ctr".to_string(),
+            extra_env: Some(vec!["SHARED=sandbox".to_string(), "OTHER=bar".to_string()]),
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: vec![
+                "MINT_REPO=a/b".to_string(),
+                "SHARED=hook".to_string(),
+                "BAD KEY=x".to_string(),
+            ],
+            container_workdir: None,
+        };
+        assert_eq!(
+            session_host_env_pairs(&[], &[], &info),
+            owned(&[("MINT_REPO", "a/b"), ("SHARED", "hook"), ("OTHER", "bar")])
+        );
+
+        let container = collect_environment(&SandboxConfig::default(), &info);
+        assert!(find_entry(&container, "MINT_REPO").is_none());
+        assert_eq!(find_entry(&container, "SHARED").unwrap().value(), "sandbox");
+    }
+
+    #[test]
     fn test_session_host_env_pairs_uses_extra_env() {
         // With no repository contribution, per-session entries reach the hook.
         let info = SandboxInfo {
@@ -1649,6 +1685,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             extra_env: Some(vec!["TEST_VAR=foo".to_string(), "OTHER=bar".to_string()]),
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
         let pairs = session_host_env_pairs(&[], &[], &info);
@@ -1679,6 +1716,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: vec![("GH_TOKEN".to_string(), "ghs_fresh".to_string())],
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
 
@@ -1716,6 +1754,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
                 ),
                 ("VALID_HOOK".to_string(), "minted".to_string()),
             ],
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
         let configured = collect_environment(&config, &base);
@@ -1752,6 +1791,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
 
@@ -1773,6 +1813,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
 
@@ -1812,6 +1853,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             ]),
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
 
@@ -1845,6 +1887,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             extra_env: Some(vec!["AOE_TEST_EXTRA".to_string(), "FOO=bar".to_string()]),
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
 
@@ -1873,6 +1916,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             extra_env: Some(vec!["DUP_KEY=from_session".to_string()]),
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
 
@@ -1897,6 +1941,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
 
@@ -1922,6 +1967,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
 
@@ -1947,6 +1993,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
 
@@ -2068,6 +2115,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             extra_env: Some(vec!["AOE_TEST_TOKEN=$AOE_TEST_TOKEN".to_string()]),
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
         let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
@@ -2092,6 +2140,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             extra_env: Some(vec!["MY_MAPPED=$AOE_TEST_SOURCE".to_string()]),
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
         let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
@@ -2116,6 +2165,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             extra_env: Some(vec!["AOE_TEST_BARE".to_string()]),
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
         let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
@@ -2138,6 +2188,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             extra_env: Some(vec!["MY_LITERAL=literal-secret".to_string()]),
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
         let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
@@ -2165,6 +2216,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             ]),
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
         let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
@@ -2203,6 +2255,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
                 extra_env: extra_env.map(|entry| vec![entry.to_string()]),
                 custom_instruction: None,
                 before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
                 container_workdir: None,
             };
             let result = build_docker_env_args_with_managed_codex_home(
@@ -2288,6 +2341,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
 
@@ -2322,6 +2376,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
 
@@ -2348,6 +2403,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
 
@@ -2373,6 +2429,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
 
@@ -2401,6 +2458,7 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
 

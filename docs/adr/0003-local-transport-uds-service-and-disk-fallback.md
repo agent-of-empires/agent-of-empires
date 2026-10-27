@@ -6,7 +6,7 @@ Issue #3839 settled the same REST+WS routes over a local Unix socket and remote 
 
 ## Decision
 
-- **A Unix socket is the local channel.** #4136 ships as a bounded wave 1: its distinct Hello+Snapshot contract is an accepted exception to "same REST+WS routes over the local Unix socket and remote TCP" (#3839). Converging onto the shared router and a typed `LocalPeer` Principal is an explicit obligation of #3897. The one-shot read moves to a path distinct from `/api/runtime/ws`, which #4009's TUI stream uses at protocol v2; #4136 sets the path.
+- **A Unix socket is the local channel.** #4136 ships as a bounded wave 1: its distinct Hello+Snapshot contract is an accepted exception to "same REST+WS routes over the local Unix socket and remote TCP" (#3839). #3897 removed that exception: the one-shot read is `/api/runtime/read/ws` on the shared router, reached over the same Unix socket as every other route, and the separate runtime socket with its publication markers is gone. Requests carry a typed `Principal`, and a Unix socket peer is `LocalPeer`. The path stays distinct from `/api/runtime/ws`, which #4009's TUI stream uses at protocol v2.
 - **macOS uses the same Unix socket with `LOCAL_PEERCRED`**, implemented in `src/process/macos.rs` and mirroring Linux `SO_PEERCRED` (#4431).
 - **The Windows CLI has no local transport.** There is no Windows Daemon for now, so the Windows CLI is always a remote Client: no named pipe, no loopback TCP to a local Daemon. Revisit only if a Windows Daemon is planned.
 - **#4136's transitional CLI disk-read exception is superseded by #4470.** It allowed direct reads of authoritative storage, not a Client-side cache, on supported non-Linux hosts, on Linux without a published Daemon, and when `AOE_DAEMON_URL` got no answer. [Consequences](#consequences) specifies the current behavior and auto-start prerequisite. Mutations (#4400), the TUI and Windows never use a disk fallback.
@@ -25,5 +25,5 @@ Issue #3839 settled the same REST+WS routes over a local Unix socket and remote 
 ## Consequences
 
 - CLI auto-start landed in #4778 for #4465. #4470 removes all three transitional disk read paths together. Covered CLI reads now use the Daemon or hard fail with reconnect guidance, following ADR 0004's local-only startup policy.
-- Tracking: router and `LocalPeer` convergence is #3897, the macOS UDS listener is #4431, projection convergence is #4432.
+- Tracking: router and `LocalPeer` convergence is #3897 (done), the macOS UDS listener is #4431, projection convergence is #4432.
 - Nothing here precludes a later multi-user layer (ADR 0002).

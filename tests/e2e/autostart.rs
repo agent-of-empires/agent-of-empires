@@ -73,7 +73,7 @@ fn native_opt_out_refuses_spawn_and_reuses_existing_core() {
         } else {
             h.spawn(&["--no-autostart"]);
         }
-        h.wait_for("Runtime unavailable");
+        h.wait_for("Not responding");
         let app = app_dir_in(h.home_path());
         assert!(!app.join("serve.pid").exists(), "opt-out started a daemon");
         assert!(
@@ -84,7 +84,7 @@ fn native_opt_out_refuses_spawn_and_reuses_existing_core() {
         h.run_cli_ok(&["serve", "--core-only", "--daemon"]);
         let original_pid = std::fs::read_to_string(app.join("serve.pid")).unwrap();
         h.send_keys("r");
-        h.wait_for("Runtime ready");
+        h.wait_for_runtime_ready();
         assert_eq!(
             std::fs::read_to_string(app.join("serve.pid")).unwrap(),
             original_pid,

@@ -10,6 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
+use super::principal::Principal;
 use super::AppState;
 
 /// Constant-time string comparison to prevent timing attacks on token values.
@@ -258,13 +259,6 @@ pub struct AuthenticatedTokenHash(pub [u8; 32]);
 #[derive(Clone, Debug)]
 pub struct AuthenticatedSession(pub String);
 
-/// Kernel-authenticated owner authority from the Unix listener.
-#[derive(Clone, Copy, Debug)]
-pub enum LocalAuthorization {
-    /// The peer on the daemon's Unix socket, with its uid from the kernel.
-    UnixOwner(u32),
-}
-
 /// Pure elevation decision, extracted so the matrix is unit-testable without standing up
 /// `AppState`.
 fn elevation_verdict(
@@ -420,6 +414,7 @@ async fn run_passphrase_wall(
     request
         .extensions_mut()
         .insert(AuthenticatedSession(session_id.clone()));
+    request.extensions_mut().insert(Principal::Device);
 
     let mut response = next.run(request).await;
 
@@ -470,7 +465,7 @@ pub async fn auth_middleware(
         // never reaches a state that can fail them.
         request
             .extensions_mut()
-            .insert(LocalAuthorization::UnixOwner(uid));
+            .insert(Principal::LocalPeer { uid });
         return next.run(request).await;
     }
 
@@ -520,6 +515,7 @@ pub async fn auth_middleware(
         request
             .extensions_mut()
             .insert(AuthenticatedTokenHash([0u8; 32]));
+        request.extensions_mut().insert(Principal::TokenHolder);
         return next.run(request).await;
     }
 
@@ -656,6 +652,7 @@ pub async fn auth_middleware(
             .extensions_mut()
             .insert(AuthenticatedTokenHash(hash));
     }
+    request.extensions_mut().insert(Principal::TokenHolder);
     let path = request.uri().path().to_string();
     let should_attach_token =
         matches!(source, TokenSource::QueryParam | TokenSource::Bearer) || needs_upgrade;
@@ -747,6 +744,7 @@ async fn handle_session_authenticated(
     request
         .extensions_mut()
         .insert(AuthenticatedSession(session_id.clone()));
+    request.extensions_mut().insert(Principal::Device);
 
     let mut response = next.run(request).await;
 
@@ -801,6 +799,58 @@ mod tests {
             (true, false, Some(true), true),
         ] {
             assert_eq!(elevation_verdict(enabled, owner, elevated), expected);
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn middleware_stamps_the_principal_of_each_credential() {
+        use tower::ServiceExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(home.path());
+        let state = crate::server::test_support::build_test_app_state_with_policy_configured(
+            Vec::new(),
+            vec!["localhost".into()],
+            Vec::new(),
+            Some("test-token".to_string()),
+            |_| {},
+        );
+        let app = axum::Router::new()
+            .route(
+                "/api/probe",
+                axum::routing::get(|principal: Option<axum::Extension<Principal>>| async move {
+                    format!("{:?}", principal.map(|p| p.0))
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(state, auth_middleware));
+        let uid = nix::unistd::geteuid().as_raw();
+        let tcp = || {
+            ConnectInfo(super::super::peer::ConnectionPeer::Tcp(
+                "127.0.0.1:1234".parse().unwrap(),
+            ))
+        };
+        for (peer, bearer, expected) in [
+            (
+                ConnectInfo(super::super::peer::ConnectionPeer::UnixOwner { uid }),
+                None,
+                format!("Some(LocalPeer {{ uid: {uid} }})"),
+            ),
+            (tcp(), Some("test-token"), "Some(TokenHolder)".to_string()),
+        ] {
+            let mut request = Request::builder()
+                .uri("/api/probe")
+                .header("host", "localhost");
+            if let Some(token) = bearer {
+                request = request.header("authorization", format!("Bearer {token}"));
+            }
+            let mut request = request.body(axum::body::Body::empty()).unwrap();
+            request.extensions_mut().insert(peer);
+            let response = app.clone().oneshot(request).await.unwrap();
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(body, expected.as_bytes());
         }
     }
 
@@ -1231,6 +1281,62 @@ mod tests {
             for api in ["/api/sessions", "/api/plugins/github/pages/prs"] {
                 assert_eq!(get(api).await, StatusCode::UNAUTHORIZED, "{token:?} {api}");
             }
+        }
+    }
+
+    /// A native client steps up on the `AoE-Error-Code` header alone, so both elevation 403s
+    /// (passphrase wall and token + session) must carry it.
+    #[tokio::test]
+    async fn elevation_403_carries_the_error_code_header() {
+        use crate::server::login::LoginManager;
+        use base64::Engine;
+        use tower::ServiceExt;
+
+        let binding = [0xAB; 32];
+        for token in [None, Some("secret-token")] {
+            let login = Arc::new(LoginManager::new(Some("passphrase")));
+            let session_id = login
+                .create_session(&binding, "203.0.113.7", "test-agent")
+                .await;
+            let state = crate::server::test_support::build_test_app_state_with_policy_configured(
+                Vec::new(),
+                vec!["localhost".to_string()],
+                Vec::new(),
+                token.map(str::to_string),
+                |state| state.login_manager = login,
+            );
+            let cookie = match token {
+                Some(t) => format!("aoe_session={session_id}; aoe_token={t}"),
+                None => format!("aoe_session={session_id}"),
+            };
+            let mut req = Request::builder()
+                .method("DELETE")
+                .uri("/api/passkeys/abc123")
+                .header("host", "localhost")
+                .header("cookie", cookie)
+                .header(
+                    "x-aoe-device-binding",
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(binding),
+                )
+                .body(axum::body::Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(
+                "203.0.113.7:5555".parse::<SocketAddr>().unwrap(),
+            ));
+            let response = crate::server::test_support::build_router_for_test(state)
+                .oneshot(req)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{token:?}");
+            assert_eq!(
+                crate::daemon::ApiErrorCode::from_headers(
+                    response.status(),
+                    response.headers(),
+                    false
+                ),
+                Some(crate::daemon::ApiErrorCode::ElevationRequired),
+                "{token:?}"
+            );
         }
     }
 }

@@ -45,7 +45,7 @@ fn apply_poller_repair_if_lifecycle_unchanged(
         && live.omp_capture_generation == baseline.2
         && live.tool == baseline.0.tool
     {
-        live.poller_repair = backoff.clone();
+        live.capture_poller.set_repair(backoff.clone());
     }
 }
 
@@ -57,16 +57,13 @@ fn apply_poller_runtime_if_unchanged(
     if live.tool == repaired.tool
         && live.active_execution == repaired.active_execution
         && live.omp_capture_generation == repaired.omp_capture_generation
-        && live.session_id_poller_retry_after == baseline.3
+        && live.capture_poller.retry_after() == baseline.3
         && live.capture_started_at == baseline.4
         && live.lifecycle_generation == baseline.5
         && live.status == baseline.6
-        && !live.session_id_poller_is_running()
+        && !live.capture_poller.is_running()
     {
-        live.session_id_poller_retry_after = repaired.session_id_poller_retry_after;
-        if repaired.session_id_poller_is_running() {
-            live.session_id_poller = repaired.session_id_poller.clone();
-        }
+        live.capture_poller.adopt_repaired(&repaired.capture_poller);
     }
 }
 
@@ -97,7 +94,7 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
                         inst.conversation_state(),
                         inst.resume_probe_failed_sid.clone(),
                         inst.omp_capture_generation.clone(),
-                        inst.session_id_poller_retry_after,
+                        inst.capture_poller.retry_after(),
                         inst.capture_started_at,
                         inst.lifecycle_generation,
                         inst.status,
@@ -124,8 +121,8 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
         let runtime_changed: std::collections::HashSet<String> = snapshot
             .iter_mut()
             .filter_map(|inst| {
-                let retry_before = inst.session_id_poller_retry_after;
-                let started = inst.repair_session_id_poller_if_needed(&live);
+                let retry_before = inst.capture_poller.retry_after();
+                let started = inst.reconcile_capture_poller(&live);
                 let generation_before = inst.lifecycle_generation;
                 if inst.repair_finished_execution_identity(&live, &contended, repair_now) {
                     outcome.applied.push(inst.id.clone());
@@ -133,7 +130,7 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
                 if inst.lifecycle_generation != generation_before {
                     outcome.lifecycle_advanced.push(inst.id.clone());
                 }
-                (started || inst.session_id_poller_retry_after != retry_before)
+                (started || inst.capture_poller.retry_after() != retry_before)
                     .then(|| inst.id.clone())
             })
             .collect();
@@ -195,7 +192,7 @@ fn repair_backoffs(
 ) -> std::collections::HashMap<String, crate::session::poller::PollerRepairBackoff> {
     instances
         .iter()
-        .map(|inst| (inst.id.clone(), inst.poller_repair.clone()))
+        .map(|inst| (inst.id.clone(), inst.capture_poller.repair().clone()))
         .collect()
 }
 
@@ -207,8 +204,8 @@ fn changed_repair_backoffs(
 ) -> std::collections::HashMap<String, crate::session::poller::PollerRepairBackoff> {
     after
         .iter()
-        .filter(|inst| before.get(&inst.id) != Some(&inst.poller_repair))
-        .map(|inst| (inst.id.clone(), inst.poller_repair.clone()))
+        .filter(|inst| before.get(&inst.id) != Some(inst.capture_poller.repair()))
+        .map(|inst| (inst.id.clone(), inst.capture_poller.repair().clone()))
         .collect()
 }
 
@@ -311,7 +308,7 @@ mod migrated_tui_identity_tests {
     }
     async fn stop_pollers(state: &Arc<AppState>) {
         for row in state.instances.read().await.iter() {
-            if let Some(poller) = &row.session_id_poller {
+            if let Some(poller) = row.capture_poller.handle() {
                 poller.lock().unwrap_or_else(|p| p.into_inner()).stop();
             }
         }
@@ -538,11 +535,13 @@ mod migrated_tui_identity_tests {
             rows.iter_mut()
                 .find(|row| row.id == terminal.id)
                 .unwrap()
-                .session_id_poller = Some(terminal_stopped.clone());
+                .capture_poller
+                .set_handle(Some(terminal_stopped.clone()));
             rows.iter_mut()
                 .find(|row| row.id == structured.id)
                 .unwrap()
-                .session_id_poller = Some(structured_stopped.clone());
+                .capture_poller
+                .set_handle(Some(structured_stopped.clone()));
         }
         let _tmux = TmuxSession::create(&terminal.id, &terminal.title);
         let before =
@@ -553,8 +552,9 @@ mod migrated_tui_identity_tests {
             .iter()
             .find(|row| row.id == terminal.id)
             .unwrap()
-            .session_id_poller
-            .clone()
+            .capture_poller
+            .handle()
+            .cloned()
             .expect("live pane replacement poller");
         assert!(!Arc::ptr_eq(&repaired, &terminal_stopped));
         assert!(repaired
@@ -565,8 +565,8 @@ mod migrated_tui_identity_tests {
             rows.iter()
                 .find(|row| row.id == structured.id)
                 .unwrap()
-                .session_id_poller
-                .as_ref()
+                .capture_poller
+                .handle()
                 .unwrap(),
             &structured_stopped
         ));
@@ -674,13 +674,17 @@ mod tests {
         );
         let mut walked = live.clone();
         let now = std::time::Instant::now();
-        walked.poller_repair.reprobe(now);
+        walked.capture_poller.repair_mut().reprobe(now);
 
         // Same lifecycle: the walk's schedule lands.
-        live.poller_repair = Default::default();
-        apply_poller_repair_if_lifecycle_unchanged(&mut live, &walked.poller_repair, &baseline);
+        live.capture_poller.set_repair(Default::default());
+        apply_poller_repair_if_lifecycle_unchanged(
+            &mut live,
+            walked.capture_poller.repair(),
+            &baseline,
+        );
         assert_eq!(
-            live.poller_repair.current_reprobe_delay(),
+            live.capture_poller.repair().current_reprobe_delay(),
             Some(std::time::Duration::from_secs(5))
         );
 
@@ -690,11 +694,15 @@ mod tests {
         let mut relaunched = live.clone();
         // A relaunch that reached the launch stamp: new start time, cleared schedule.
         relaunched.last_start_time = Some(std::time::Instant::now());
-        relaunched.poller_repair.reset();
+        relaunched.capture_poller.repair_mut().reset();
         live.merge_post_restart_with_baseline(&live.clone(), &relaunched);
-        apply_poller_repair_if_lifecycle_unchanged(&mut live, &walked.poller_repair, &baseline);
+        apply_poller_repair_if_lifecycle_unchanged(
+            &mut live,
+            walked.capture_poller.repair(),
+            &baseline,
+        );
         assert_eq!(
-            live.poller_repair.current_reprobe_delay(),
+            live.capture_poller.repair().current_reprobe_delay(),
             None,
             "a lifecycle that moved under the walk discards its verdict"
         );
@@ -714,34 +722,35 @@ mod tests {
         let mut live = Instance::new("session", "/tmp/project");
         let mut repaired = live.clone();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        repaired.session_id_poller_retry_after = Some(deadline);
+        repaired.capture_poller.set_retry_after(Some(deadline));
 
         apply_poller_runtime_if_unchanged(&mut live, &repaired, &baseline);
 
-        assert_eq!(live.session_id_poller_retry_after, Some(deadline));
+        assert_eq!(live.capture_poller.retry_after(), Some(deadline));
 
         let concurrent = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        live.session_id_poller_retry_after = Some(concurrent);
+        live.capture_poller.set_retry_after(Some(concurrent));
         apply_poller_runtime_if_unchanged(&mut live, &repaired, &baseline);
-        assert_eq!(live.session_id_poller_retry_after, Some(concurrent));
+        assert_eq!(live.capture_poller.retry_after(), Some(concurrent));
 
-        live.session_id_poller_retry_after = None;
+        live.capture_poller.set_retry_after(None);
         live.capture_started_at = Some(std::time::SystemTime::now());
         apply_poller_runtime_if_unchanged(&mut live, &repaired, &baseline);
         assert_eq!(
-            live.session_id_poller_retry_after, None,
+            live.capture_poller.retry_after(),
+            None,
             "a concurrent non-OMP relaunch must reject the stale runtime state"
         );
 
         live.capture_started_at = None;
         live.status = crate::session::Status::Stopped;
         apply_poller_runtime_if_unchanged(&mut live, &repaired, &baseline);
-        assert_eq!(live.session_id_poller_retry_after, None);
+        assert_eq!(live.capture_poller.retry_after(), None);
 
         live.status = crate::session::Status::Idle;
         live.lifecycle_generation = 1;
         apply_poller_runtime_if_unchanged(&mut live, &repaired, &baseline);
-        assert_eq!(live.session_id_poller_retry_after, None);
+        assert_eq!(live.capture_poller.retry_after(), None);
     }
 
     #[test]
@@ -817,22 +826,33 @@ mod tests {
             crate::session::Status::Idle,
         );
         let mut walked = live.clone();
-        walked.poller_repair.reprobe(std::time::Instant::now());
+        walked
+            .capture_poller
+            .repair_mut()
+            .reprobe(std::time::Instant::now());
 
-        live.poller_repair = Default::default();
-        apply_poller_repair_if_lifecycle_unchanged(&mut live, &walked.poller_repair, &baseline);
+        live.capture_poller.set_repair(Default::default());
+        apply_poller_repair_if_lifecycle_unchanged(
+            &mut live,
+            walked.capture_poller.repair(),
+            &baseline,
+        );
         assert_eq!(
-            live.poller_repair.current_reprobe_delay(),
+            live.capture_poller.repair().current_reprobe_delay(),
             Some(std::time::Duration::from_secs(5)),
             "fixture: nothing moved, so the verdict lands"
         );
 
         // The row swapped tool under the walk: same lifecycle counter, different execution.
         live.active_execution = execution("launch-2");
-        live.poller_repair = Default::default();
-        apply_poller_repair_if_lifecycle_unchanged(&mut live, &walked.poller_repair, &baseline);
+        live.capture_poller.set_repair(Default::default());
+        apply_poller_repair_if_lifecycle_unchanged(
+            &mut live,
+            walked.capture_poller.repair(),
+            &baseline,
+        );
         assert_eq!(
-            live.poller_repair.current_reprobe_delay(),
+            live.capture_poller.repair().current_reprobe_delay(),
             None,
             "a window armed for the execution the row gave up is not written onto the new one"
         );
@@ -855,21 +875,32 @@ mod tests {
             crate::session::Status::Idle,
         );
         let mut walked = live.clone();
-        walked.poller_repair.reprobe(std::time::Instant::now());
+        walked
+            .capture_poller
+            .repair_mut()
+            .reprobe(std::time::Instant::now());
 
-        live.poller_repair = Default::default();
-        apply_poller_repair_if_lifecycle_unchanged(&mut live, &walked.poller_repair, &baseline);
+        live.capture_poller.set_repair(Default::default());
+        apply_poller_repair_if_lifecycle_unchanged(
+            &mut live,
+            walked.capture_poller.repair(),
+            &baseline,
+        );
         assert_eq!(
-            live.poller_repair.current_reprobe_delay(),
+            live.capture_poller.repair().current_reprobe_delay(),
             Some(std::time::Duration::from_secs(5)),
             "fixture: nothing moved, so the verdict lands"
         );
 
         live.tool = "codex".to_string();
-        live.poller_repair = Default::default();
-        apply_poller_repair_if_lifecycle_unchanged(&mut live, &walked.poller_repair, &baseline);
+        live.capture_poller.set_repair(Default::default());
+        apply_poller_repair_if_lifecycle_unchanged(
+            &mut live,
+            walked.capture_poller.repair(),
+            &baseline,
+        );
         assert_eq!(
-            live.poller_repair.current_reprobe_delay(),
+            live.capture_poller.repair().current_reprobe_delay(),
             None,
             "a window armed for the previous agent is not written onto this one"
         );

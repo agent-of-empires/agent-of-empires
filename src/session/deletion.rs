@@ -11,7 +11,7 @@ use crate::containers::DockerContainer;
 use crate::git::cleanup::{remove_managed_worktree, WorktreeCleanupOptions};
 use crate::git::GitWorktree;
 use crate::session::config::repo_config;
-use crate::session::path_identity::CleanupProtection;
+use crate::session::path_identity::{canonicalize_or_raw, CleanupProtection};
 use crate::session::storage::StorageFlock;
 use crate::session::{
     Instance, LifecycleOperation, LifecycleReservationError, SessionStore, Storage,
@@ -1221,7 +1221,12 @@ pub(crate) enum PathsInUse {
 impl PathsInUse {
     pub(crate) fn covers(&self, root: &Path) -> bool {
         match self {
-            Self::Known(paths) => paths.iter().any(|path| path.starts_with(root)),
+            Self::Known(paths) => {
+                let canonical_root = canonicalize_or_raw(root);
+                paths.iter().any(|path| {
+                    path.starts_with(root) || canonicalize_or_raw(path).starts_with(&canonical_root)
+                })
+            }
             Self::Unknown(_) => true,
         }
     }
@@ -1257,7 +1262,7 @@ fn all_profile_storages() -> std::result::Result<(Vec<String>, Vec<Storage>), St
 fn scan_paths_in_use(storages: &[Storage], except_ids: &[&str]) -> PathsInUse {
     let mut paths = Vec::new();
     for storage in storages {
-        match storage.load() {
+        match storage.load_instances_complete() {
             Ok(instances) => paths.extend(other_sessions_paths(&instances, except_ids)),
             Err(error) => {
                 return PathsInUse::Unknown(format!(
@@ -4402,6 +4407,7 @@ mod tests {
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         });
 
@@ -4621,6 +4627,7 @@ mod tests {
                 extra_env: None,
                 custom_instruction: None,
                 before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
                 container_workdir: None,
             });
             DeletionRequest {
@@ -5019,6 +5026,7 @@ mod tests {
                 extra_env: None,
                 custom_instruction: None,
                 before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
                 container_workdir: None,
             });
             let request = DeletionRequest {
@@ -6026,6 +6034,7 @@ mod tests {
                 extra_env: None,
                 custom_instruction: None,
                 before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
                 container_workdir: None,
             });
 
