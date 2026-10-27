@@ -55,7 +55,7 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
 }
 
 /// Validate against and default from the daemon, through the client that carries its credentials.
-async fn resolve_profile(client: &HttpClient, profile: &str) -> Result<String> {
+pub(super) async fn resolve_profile(client: &HttpClient, profile: &str) -> Result<String> {
     let daemon = client.daemon_client().await?;
     if profile.is_empty() {
         return Ok(daemon.default_profile().await?);

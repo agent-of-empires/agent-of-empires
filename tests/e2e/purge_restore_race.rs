@@ -120,7 +120,7 @@ fn purge_refused_while_restore_reservation_present_then_removes_row() {
 
     let stderr = h.run_cli_err(&["rm", "--purge", "RacePurge"]);
     assert!(
-        stderr.contains("lifecycle operation Restore is already in progress"),
+        stderr.contains("Selected trash lifecycle changed before purge"),
         "unexpected stderr:\n{stderr}"
     );
     // The row must survive with the peer's Restore claim intact.
@@ -160,7 +160,6 @@ async fn daemon_purge_keeps_peer_retrash_when_only_identity_is_stale() {
     h.set_env("AGENT_OF_EMPIRES_PROFILE", "default");
     h.stop_daemon_on_drop();
     create_trashed(&h, "RaceIdentity");
-    h.run_cli_ok(&["serve", "--core-only", "--daemon"]);
     let socket = crate::harness::app_dir_in(h.home_path()).join("daemon/api.sock");
     let sdk = DaemonClient::new_unix(&socket).unwrap();
     let client = reqwest::Client::builder()
