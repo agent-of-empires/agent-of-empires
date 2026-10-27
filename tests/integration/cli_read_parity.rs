@@ -113,7 +113,7 @@ impl Fixture {
         profile: serde_json::Value,
         mut env: agent_of_empires::server::test_support::RuntimeEnvGuard,
     ) -> Self {
-        let home = owned.path().to_path_buf();
+        let home = owned.path().canonicalize().expect("canonical fixture home");
         env.bind(&home.join(".config"));
         let app_dir = home
             .join(".config")
