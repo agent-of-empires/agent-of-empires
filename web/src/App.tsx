@@ -161,7 +161,7 @@ import { useWelcomePhase } from "./hooks/useWelcomePhase";
 import { ThemeIntro } from "./components/onboarding/ThemeIntro";
 import type { TourScope } from "./lib/tourSteps";
 import { SessionWizard } from "./components/session-wizard/SessionWizard";
-import type { WizardPrefill } from "./components/session-wizard/SessionWizard";
+import type { WizardPrefill, WizardRestore } from "./components/session-wizard/SessionWizard";
 import type { ProjectInfo, RepoGroup, SessionResponse, Workspace } from "./lib/types";
 import { Dashboard } from "./components/Dashboard";
 import { LoginPage } from "./components/LoginPage";
@@ -1113,6 +1113,8 @@ function AppContent({
   }, [navigate]);
 
   const [wizardPrefill, setWizardPrefill] = useState<WizardPrefill | undefined>(undefined);
+  // A background create's failure to reopen on; the count remounts a wizard already open.
+  const [wizardRestore, setWizardRestore] = useState<{ restore: WizardRestore; n: number } | null>(null);
   const [deletingSessions, setDeletingSessions] = useState<SessionResponse[]>([]);
   const [stoppingSessionId, setStoppingSessionId] = useState<string | null>(null);
   const [switchViewTarget, setSwitchViewTarget] = useState<{ sessionId: string; toStructured: boolean } | null>(null);
@@ -2543,11 +2545,18 @@ function AppContent({
 
           {showSessionWizard && (
             <SessionWizard
+              key={wizardRestore?.n ?? 0}
+              restore={wizardRestore?.restore}
+              onReopenFailure={(restore) => {
+                setWizardRestore((prev) => ({ restore, n: (prev?.n ?? 0) + 1 }));
+                setShowSessionWizard(true);
+              }}
               servedProfile={servedProfileReady ? serverAbout?.profile : undefined}
               onRetryServedProfile={refreshServerAbout}
               onClose={() => {
                 setShowSessionWizard(false);
                 setWizardPrefill(undefined);
+                setWizardRestore(null);
               }}
               onCreated={(session?: SessionResponse) => {
                 if (session) {
@@ -2557,6 +2566,7 @@ function AppContent({
                 }
                 setShowSessionWizard(false);
                 setWizardPrefill(undefined);
+                setWizardRestore(null);
               }}
               onCreatedInBackground={(session?: SessionResponse) => {
                 if (!session) return;

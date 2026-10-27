@@ -14,6 +14,7 @@ import {
   fetchProfiles,
   fetchProjects,
   fetchSettings,
+  fetchVolumeIgnoresPreview,
   type SettingsResponse,
 } from "../../../lib/api";
 import { agent } from "./fixtures";
@@ -1145,5 +1146,146 @@ describe("SessionWizard Container runtime", () => {
     await launch();
     expect(await screen.findByText(`Sandbox unavailable: ${message}. Turn it off to launch.`)).toBeTruthy();
     expect(createSession).not.toHaveBeenCalled();
+  });
+});
+
+describe("SessionWizard create failures", () => {
+  const failure = (code: string, stage: string | null, message: string) => ({
+    ok: false,
+    error: message,
+    failure: { code, stage, message, reference: "3f9c1a2b-77d0-4e0b-9b1f-0d3b5c2a11a1" },
+  });
+  const UNAVAILABLE = failure(
+    "sandbox_unavailable",
+    "starting_container",
+    "Docker isn't running, so the Sandbox can't start. Start Docker, then try again.",
+  );
+  const box = () => screen.getByTestId("create-failure");
+  // A failed case must not leave a queued Docker answer for the next one.
+  afterEach(() => {
+    vi.mocked(fetchDockerStatus)
+      .mockReset()
+      .mockResolvedValue({ available: false, runtime: "docker", runtime_name: "Docker" });
+    vi.mocked(fetchCreateProgress).mockResolvedValue(null);
+  });
+  const sandboxed = () => {
+    vi.mocked(fetchDockerStatus).mockResolvedValueOnce({ available: true, runtime: "docker", runtime_name: "Docker" });
+    vi.mocked(fetchVolumeIgnoresPreview).mockResolvedValue(null);
+    return renderWizard({ path: "/tmp/proj", tool: "claude", sandboxEnabled: true });
+  };
+
+  it("Retry asks the Container runtime again and, still down, makes Launch without Sandbox the way forward", async () => {
+    createSession.mockResolvedValueOnce(UNAVAILABLE);
+    sandboxed();
+    await launch();
+    await screen.findByTestId("create-failure");
+    expect(document.activeElement).toBe(box());
+    expect(screen.getByTestId("wizard-sandbox-row").textContent).toContain("couldn't start");
+    vi.mocked(fetchDockerStatus).mockResolvedValueOnce({ available: false, runtime: "docker", runtime_name: "Docker" });
+    const checks = vi.mocked(fetchDockerStatus).mock.calls.length;
+
+    fireEvent.click(screen.getByTestId("create-failure-retry_runtime"));
+    await waitFor(() => expect(fetchDockerStatus).toHaveBeenCalledTimes(checks + 1));
+    const actions = await waitFor(() => {
+      const buttons = Array.from(box().querySelectorAll("button")).map((b) => b.textContent);
+      expect(buttons[0]).toBe("Launch without Sandbox");
+      return buttons;
+    });
+    expect(actions.slice(0, 2)).toEqual(["Launch without Sandbox", "Retry"]);
+    expect(screen.getByTestId("wizard-sandbox-row").textContent).toContain("Docker is not running");
+    expect(createSession).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["on the first Retry", [true]],
+    ["after a Retry that found it still down", [false, true]],
+  ])("Retry resends under a new key once the Container runtime answers %s", async (_label, answers) => {
+    createSession.mockResolvedValueOnce(UNAVAILABLE);
+    sandboxed();
+    await launch();
+    for (const available of answers) {
+      vi.mocked(fetchDockerStatus).mockResolvedValueOnce({ available, runtime: "docker", runtime_name: "Docker" });
+      const checks = vi.mocked(fetchDockerStatus).mock.calls.length;
+      fireEvent.click(await screen.findByTestId("create-failure-retry_runtime"));
+      await waitFor(() => expect(fetchDockerStatus).toHaveBeenCalledTimes(checks + 1));
+    }
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(2));
+    expect(payload(1).sandbox).toBe(payload(0).sandbox);
+    expect(payload(1).idempotency_key).not.toBe(payload(0).idempotency_key);
+  });
+
+  it("Launch without Sandbox sends the Session on the host under a fresh key", async () => {
+    createSession.mockResolvedValueOnce(
+      failure("sandbox_image_pull_failed", "starting_container", "Couldn't pull the Sandbox image ghcr.io/x/y:1."),
+    );
+    sandboxed();
+    await launch();
+    expect((await screen.findByTestId("create-failure")).textContent).toContain("ghcr.io/x/y:1");
+    fireEvent.click(screen.getByTestId("create-failure-launch_without_sandbox"));
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(2));
+    expect(payload(0).sandbox).toBeTruthy();
+    expect(payload(1).sandbox).toBeFalsy();
+    expect(payload(1).idempotency_key).toBeTruthy();
+    expect(payload(1).idempotency_key).not.toBe(payload(0).idempotency_key);
+  });
+
+  it("a failed hook shows the message as sent and its last output, with no Sandbox action", async () => {
+    let finish!: (r: unknown) => void;
+    createSession.mockReturnValueOnce(new Promise((r) => (finish = r)));
+    vi.mocked(fetchCreateProgress).mockResolvedValue({ stage: "running_hooks", hook: null, output: ["npm ERR! 404"] });
+    sandboxed();
+    await launch();
+    await waitFor(() => expect(fetchCreateProgress).toHaveBeenCalled(), { timeout: 3000 });
+    await act(async () => {});
+    await act(async () => finish(failure("hook_failed", "running_hooks", "An on_create hook exited with code 1.")));
+    const shown = await screen.findByTestId("create-failure");
+    expect(shown.textContent).toContain("An on_create hook exited with code 1.");
+    expect(screen.getByTestId("create-failure-output").textContent).toContain("npm ERR! 404");
+    expect(screen.queryByTestId("create-failure-launch_without_sandbox")).toBeNull();
+    expect(screen.queryByTestId("create-failure-retry_runtime")).toBeNull();
+  });
+
+  it("a background failure toasts its title and reference, and Reopen restores the box", async () => {
+    const toastAction = vi.fn();
+    toastBus.handler = { push: vi.fn(), error: vi.fn(), info: vi.fn(), openLink: vi.fn(), action: toastAction };
+    let finish!: (r: unknown) => void;
+    createSession.mockReturnValueOnce(new Promise((r) => (finish = r)));
+    const onReopenFailure = vi.fn();
+    render(
+      <SessionWizard
+        servedProfile="default"
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+        onCreatedInBackground={vi.fn()}
+        onReopenFailure={onReopenFailure}
+        prefill={{ path: "/tmp/proj", tool: "claude" }}
+      />,
+    );
+    await launch();
+    fireEvent.click(await screen.findByText("Continue in background", undefined, { timeout: 3000 }));
+    const sent = failure(
+      "working_dir_missing",
+      "preparing",
+      "The Working directory doesn't exist where the Daemon runs.",
+    );
+    await act(async () => finish(sent));
+    await waitFor(() => expect(toastAction).toHaveBeenCalledOnce());
+    const [message, label, reopen] = toastAction.mock.calls[0]!;
+    expect(message).toBe(
+      "Session was not created: The Working directory is missing. Reference 3f9c1a2b… · in debug.log",
+    );
+    expect(label).toBe("Reopen");
+    reopen();
+    const restore = onReopenFailure.mock.calls[0]![0];
+    expect(restore.failure).toEqual(sent.failure);
+    expect(restore.data.path).toBe("/tmp/proj");
+    toastBus.handler = null;
+
+    cleanup();
+    render(<SessionWizard servedProfile="default" onClose={vi.fn()} onCreated={vi.fn()} restore={restore} />);
+    expect(box().textContent).toContain("The Working directory is missing");
+    expect(screen.getByTestId("wizard-project-row").textContent).toContain("not found where the Daemon runs");
+    fireEvent.click(screen.getByTestId("create-failure-choose_project"));
+    expect(screen.getByText("Back")).toBeTruthy();
   });
 });

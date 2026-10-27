@@ -7,6 +7,7 @@ function makeState(data: Partial<WizardData> = {}): WizardState {
     data: { ...initialData, ...data },
     isSubmitting: false,
     error: null,
+    failure: null,
     agents: [],
     agentsStatus: "ready",
     groups: [],
@@ -345,5 +346,17 @@ describe("SEED_PROJECT_OVERRIDES sandbox", () => {
     expect(withB.data).toMatchObject({ sandboxEnabled: false, projectSandboxOverride: false });
     const switched = reducer(withB, defaults({ sandboxEnabled: true, skipIfDirty: false }));
     expect(switched.data).toMatchObject({ sandboxEnabled: false, sandboxDirty: false });
+  });
+});
+
+describe("submit failures", () => {
+  const failure = { code: "hook_failed", message: "m", stage: "running_hooks" as const, reference: "r" };
+  it.each<[string, Action, Partial<WizardState>]>([
+    ["a refused create is kept for the box", { type: "SUBMIT_FAILED", failure }, { failure, error: null }],
+    ["a new Launch clears it", { type: "SUBMIT_START" }, { failure: null, isSubmitting: true }],
+    ["a plain error replaces it", { type: "SUBMIT_ERROR", error: "e" }, { failure: null, error: "e" }],
+  ])("%s", (_label, action, expected) => {
+    const failed = reducer(makeState(), { type: "SUBMIT_FAILED", failure });
+    expect(reducer(action.type === "SUBMIT_FAILED" ? makeState() : failed, action)).toMatchObject(expected);
   });
 });
