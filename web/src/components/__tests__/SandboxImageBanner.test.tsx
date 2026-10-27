@@ -217,6 +217,27 @@ describe("SandboxImageBanner", () => {
     expect(banner()?.getAttribute("aria-label")).toBe("Sandbox image updated");
   });
 
+  it("keeps a pull a status confirmed when its Update now reply fails later", async () => {
+    await mount(status());
+    let reply: (value: { ok: boolean; message?: string }) => void = () => {};
+    pullSandboxImage.mockImplementationOnce(() => new Promise((resolve) => (reply = resolve)));
+    fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+    expect(pullSandboxImage).toHaveBeenCalledTimes(1);
+    // A status poll lands while the reply is still out and sees the pull running.
+    fetchSandboxImageStatus.mockResolvedValue(status({ pull: { state: "running" } }));
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(banner()?.getAttribute("aria-label")).toBe("Downloading sandbox image");
+    fetchSandboxImageStatus.mockResolvedValue(status({ state: "current", pull: { state: "done" } } as never));
+    await act(async () => {
+      reply({ ok: false });
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(banner()?.getAttribute("aria-label")).toBe("Sandbox image updated");
+  });
+
   it("hides an earlier available update once a check fails", async () => {
     await mount(status());
     expect(banner()).not.toBeNull();

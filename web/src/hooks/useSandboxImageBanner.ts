@@ -27,6 +27,9 @@ export function useSandboxImageBanner(): SandboxImageBannerView | null {
   // Set from "Update now" until a status answer confirms the pull, so polling stays fast even when
   // the status request itself fails.
   const expectingPull = useRef(false);
+  // Set once a status shows the pull this page asked for running; a failed reply arriving after
+  // that can't undo it, since the Daemon starts the pull before it answers.
+  const pullConfirmed = useRef(false);
   // The Daemon refuses checks and pulls while it can't read its configuration.
   const [configUnreadable, setConfigUnreadable] = useState(false);
   const [configNoticeDismissed, setConfigNoticeDismissed] = useState(false);
@@ -51,6 +54,7 @@ export function useSandboxImageBanner(): SandboxImageBannerView | null {
       if (answer) {
         setStatus(answer);
         if (answer.pull.state === "running") {
+          pullConfirmed.current = true;
           setWatchedPull(true);
           // The Daemon is pulling after all, e.g. the "Update now" reply was lost on the way.
           setRefusal(null);
@@ -89,9 +93,10 @@ export function useSandboxImageBanner(): SandboxImageBannerView | null {
     setNoticeDismissed(false);
     setRefusal(null);
     expectingPull.current = true;
+    pullConfirmed.current = false;
     setStatus((s) => s && { ...s, pull: { state: "running" } });
     void pullSandboxImage().then((reply) => {
-      if (!reply.ok) {
+      if (!reply.ok && !pullConfirmed.current) {
         // Nothing was pulled, and the Daemon may still hold an older pull's outcome.
         expectingPull.current = false;
         setWatchedPull(false);
