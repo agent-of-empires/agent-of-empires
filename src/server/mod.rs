@@ -59,7 +59,6 @@ pub mod tunnel;
 /// `crate::server::` so existing supervisor/WS call sites keep resolving without churn.
 pub use crate::acp::protocol::AcpBroadcastFrame;
 pub(crate) use access::{is_untrusted_ip_literal, is_wildcard_bind, norm_host};
-pub(crate) use acp_events::derive_acp_status;
 #[cfg(feature = "web")]
 pub use assets::web_build_id;
 

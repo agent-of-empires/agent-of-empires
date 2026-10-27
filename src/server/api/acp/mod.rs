@@ -901,6 +901,7 @@ mod tests {
                     seq: seq as u64 + 1,
                     event: Arc::new(event),
                     worker_generation: None,
+                    sidebar_status: None,
                 })
                 .unwrap();
         }
@@ -948,6 +949,7 @@ mod tests {
                     acp_session_id: "drained".into(),
                 }),
                 worker_generation: None,
+                sidebar_status: None,
             })
             .unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {

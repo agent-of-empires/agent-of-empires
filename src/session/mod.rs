@@ -32,6 +32,7 @@ pub(crate) mod projection;
 pub mod projects;
 pub(crate) mod purge_owners;
 pub(crate) mod recovery;
+pub mod rename_transaction;
 pub mod restart;
 pub mod sandbox_store_reclaim;
 pub mod scope;
@@ -104,6 +105,7 @@ pub(crate) use instance::{
     ConversationState, LaunchReservation, ResumeAttemptPolicy, ResumeLaunchOptions,
     TerminalContextResume,
 };
+pub(crate) use instance::{Handoff, Held, Unserved};
 pub(crate) use instance::{
     TerminalHandoffContext, TerminalHandoffIntent, TerminalHandoffKey, TerminalHandoffStage,
     TerminalHandoffUnbornFence,

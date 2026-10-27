@@ -1165,6 +1165,25 @@
       ]
     },
     {
+      "id": "wizard.structured-view-exposure",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/wizard.spec.ts",
+        "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
+        "src/components/session-wizard/wizardReducer.test.ts",
+        "src/components/__tests__/SessionRowSiblingTargets.test.tsx",
+        "src/hooks/__tests__/useSessionsApply.test.tsx"
+      ],
+      "components": [
+        "web/src/components/session-wizard/profileDefaults.ts",
+        "web/src/components/session-wizard/wizardReducer.ts",
+        "web/src/components/sidebar/sessionActionTargets.ts",
+        "web/src/hooks/useSessions.ts"
+      ],
+      "notes": "acp.structured_view = off hides the wizard toggle and the sidebar switch to structured view, including across profile changes, import exit and pin responses; terminal and structured preselect that view."
+    },
+    {
       "id": "wizard.create-progress",
       "kind": "mocked-playwright",
       "risk": "high",
@@ -2408,7 +2427,7 @@
         "web/src/App.tsx",
         "web/src/hooks/useDiffFiles.ts"
       ],
-      "notes": "Holding the first canonical session list through the diff-files effect leaves no persisted layout while the session is unknown. Releasing it pins Terminal but not Diff for a non-git session; explicitly opening Diff shows the neutral non-git message without a repository error. useDiffFiles.test.ts holds the next session's response and asserts the previous session's repository state is cleared (#4847)."
+      "notes": "Holding the first canonical session list through the diff-files effect leaves no persisted layout while the session is unknown. Releasing it pins Terminal but not Diff for a non-git session; explicitly opening Diff shows the neutral non-git message without a repository error. useDiffFiles.test.ts holds the next session's response and asserts the previous session's repository state is cleared (#4847). A dock action taken while the status is unknown persists as usual, and Diff is added back once a git Session is known; covered in paneLayout.test.ts (#4846)."
     },
     {
       "id": "right-panel.markdown-viewer",
@@ -3561,7 +3580,7 @@
       "specs": [
         "src/components/acp/__tests__/SessionBanners.test.tsx",
         "src/components/acp/startupWait.test.ts",
-        "src/lib/agentDisplayName.test.ts",
+        "src/lib/agentDisplayName.test.tsx",
         "src/components/acp/SystemNotices.test.tsx",
         "src/components/acp/QueuedPromptsStrip.test.tsx",
         "src/components/acp/SendButton.test.tsx",
