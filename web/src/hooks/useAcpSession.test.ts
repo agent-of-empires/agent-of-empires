@@ -237,6 +237,28 @@ describe("reconnect (#1130)", () => {
     expect(result.current).toMatchObject({ reconnecting: true, replayedWhileDown: true });
   });
 
+  it("does not flag a reconnect whose replay only repeats the overlap window", async () => {
+    const sid = "sess-replay-overlap";
+    const known = replayedPrompt(sid, 6);
+    calls = installAcpFakes(({ url }) => {
+      if (!url.includes("/acp/replay")) return undefined;
+      const since = new URL(url, "http://x").searchParams.get("since");
+      // The forward request re-reads an overlap window, so the page repeats a frame already held.
+      const next = since === null ? { next_cursor: 6 } : { next_cursor: 10 };
+      return json({ frames: [known.frame], rows: [known.row], lost: false, highest_seq: 6, ...next });
+    });
+    FakeWebSocket.closeFiresOnClose = true;
+    const { result } = render(sid);
+    await flushAsync();
+    sockets[0]!.open();
+    sockets[0]!.drop();
+    await act(() => vi.advanceTimersByTimeAsync(acpRetryDelayMs(1)));
+    await flushAsync();
+    expect(sockets).toHaveLength(2);
+    expect(calls.some((c) => new URL(c.url, "http://x").searchParams.has("since"))).toBe(true);
+    expect(result.current).toMatchObject({ reconnecting: true, replayedWhileDown: false });
+  });
+
   it("does not flag a replay that brought nothing new", async () => {
     const { result } = render("sess-replay-empty");
     await flushAsync();

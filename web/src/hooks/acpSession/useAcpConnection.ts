@@ -255,10 +255,12 @@ export function useAcpConnection(
       replayAbortRef.current?.abort();
       const controller = new AbortController();
       replayAbortRef.current = controller;
-      // Pages land one by one, so a later failure or the dial timeout must not hide what already did.
+      // Pages land one by one, so a later failure or the dial timeout must not hide what already did. Only a
+      // frame past the starting cursor counts: the forward request re-reads an overlap window of known events.
+      const startSeq = lastSeqRef.current;
       let delivered = false;
       const track: Dispatch<Action> = (action) => {
-        if (action.kind === "frames" && (action.frames.length > 0 || (action.rows?.length ?? 0) > 0)) delivered = true;
+        if (action.kind === "frames" && action.frames.some((frame) => frame.seq > startSeq)) delivered = true;
         dispatch(action);
       };
       return {
