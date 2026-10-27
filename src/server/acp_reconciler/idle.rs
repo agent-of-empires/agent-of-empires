@@ -174,7 +174,11 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
     let mut live = Vec::new();
     for (id, profile) in candidates {
         let idle_secs = idle_by_profile.get(&profile).copied().unwrap_or(0);
-        if idle_secs > 0 && state.acp_supervisor.is_running(&id).await {
+        // A starting worker has no event newer than the stop it resumes from.
+        if idle_secs > 0
+            && state.acp_supervisor.worker_state(&id).await
+                == crate::daemon::AcpWorkerState::Running
+        {
             live.push((id, profile, idle_secs));
         }
     }
@@ -271,6 +275,45 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// A prompt resuming a long-quiet session has no newer event until its
+    /// worker is ready, so the start itself must not read as idle (#4990).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reaper_spares_a_worker_that_is_still_starting() {
+        let id = "resuming-session";
+        let (_home, state, _project) = super::super::test_fixtures::test_state(id);
+        let app_dir = crate::session::get_app_dir().unwrap();
+        std::fs::write(
+            app_dir.join("config.toml"),
+            "[acp]\nauto_stop_idle_secs = 60\n",
+        )
+        .unwrap();
+        let stale_ms = Utc::now().timestamp_millis() - 3_600_000;
+        state
+            .acp_event_store
+            .record_at(
+                id,
+                1,
+                &Event::Stopped {
+                    reason: "rate_limited".into(),
+                },
+                stale_ms,
+            )
+            .unwrap();
+        let _lease = state.acp_supervisor.test_hold_starting(id);
+        assert!(state.acp_supervisor.is_running(id).await);
+
+        reap_idle_workers(&state).await;
+
+        assert_eq!(
+            state.acp_supervisor.worker_state(id).await,
+            crate::daemon::AcpWorkerState::Resuming
+        );
+        let instances = state.instances.read().await;
+        let row = instances.iter().find(|i| i.id == id).unwrap();
+        assert!(!row.is_idle_dormant());
     }
 
     /// Case 0 replays the real occurrence: an agent-initiated turn after the
