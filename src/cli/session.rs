@@ -3066,14 +3066,14 @@ mod restart_args_tests {
         let first = "01a053b6-c470-78de-9d8f-bc00ef05332a";
         supervise_attach_capture(&mut inst, |live| {
             assert!(
-                live.session_id_poller_is_running(),
+                live.capture_poller.is_running(),
                 "capture must be supervised before the blocking attach call"
             );
             crate::session::publish_host_pi_transcript(&live.id, first, home.path());
             Ok(())
         })
         .unwrap();
-        assert!(inst.session_id_poller.is_none());
+        assert!(inst.capture_poller.handle().is_none());
         assert_eq!(
             storage.load().unwrap()[0].agent_session_id.as_deref(),
             Some(first)
@@ -3087,7 +3087,7 @@ mod restart_args_tests {
 
         assert_eq!(result.unwrap_err().to_string(), "fake attach failure");
         assert!(
-            inst.session_id_poller.is_none(),
+            inst.capture_poller.handle().is_none(),
             "an immediate nested attach return must not orphan its poller"
         );
         assert_eq!(

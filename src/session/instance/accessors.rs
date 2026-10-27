@@ -101,9 +101,7 @@ impl Instance {
             identity_publisher_launched: false,
             pi_session_path: None,
             last_error: None,
-            session_id_poller: None,
-            poller_repair: Default::default(),
-            session_id_poller_retry_after: None,
+            capture_poller: Default::default(),
             retroactive_capture_excludes: HashSet::new(),
             pane_dead_observed: false,
             agent_pane: PaneObservation::default(),
@@ -1388,6 +1386,7 @@ mod tests {
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         });
         sandboxed.agent_session_binding = Some(legacy());

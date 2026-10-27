@@ -7,6 +7,7 @@ import type {
   CreationTrustFingerprint,
   GroupInfo,
 } from "../../lib/types";
+import { setAgentNames } from "../../lib/agentDisplayName";
 import {
   fetchAgents,
   fetchGroups,
@@ -284,7 +285,10 @@ export function SessionWizard({
   useEffect(() => {
     const generations = defaultsGeneration;
     const switches = profileSwitchRef;
-    fetchAgents().then((a) => dispatch({ type: "SET_AGENTS", agents: a }));
+    fetchAgents().then((a) => {
+      setAgentNames(a);
+      dispatch({ type: "SET_AGENTS", agents: a });
+    });
     fetchDockerStatus().then((d) => dispatch({ type: "SET_DOCKER", available: d.available }));
     fetchProfiles()
       .then((profiles) => dispatch({ type: "SET_PROFILES", profiles }))
