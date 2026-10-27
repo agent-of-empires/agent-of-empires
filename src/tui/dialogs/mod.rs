@@ -12,6 +12,7 @@ mod changelog;
 mod cheats;
 mod command_palette;
 mod confirm;
+mod connections;
 mod context_menu;
 mod custom_instruction;
 mod delete_options;
@@ -46,6 +47,7 @@ pub use command_palette::{
     builtin_commands, CommandPaletteDialog, PaletteAction, PaletteCommand, PaletteGroup,
 };
 pub use confirm::ConfirmDialog;
+pub use connections::{ConnectionsView, DaemonAttention, WebState};
 pub use context_menu::{ContextMenuAction, ContextMenuDialog};
 pub use custom_instruction::CustomInstructionDialog;
 pub use delete_options::{DeleteDialogConfig, DeleteOptions, UnifiedDeleteDialog};
@@ -66,7 +68,7 @@ pub use rename::{RenameData, RenameDialog, RenameMode};
 pub use repo_trust::{RepoTrustAction, RepoTrustDialog};
 pub use restart::{RestartData, RestartDialog};
 pub use send_message::SendMessageDialog;
-pub use serve::{ServeAction, ServeLaunchRequest, ServeView};
+pub use serve::{served_via, ServeAction, ServeLaunchRequest, ServeView};
 pub use skills_manager::SkillsManagerDialog;
 pub use snooze_duration::SnoozeDurationDialog;
 pub use telemetry_consent::TelemetryConsentDialog;

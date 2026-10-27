@@ -143,7 +143,7 @@ fn test_archive_then_unarchive_cycle() {
     h.spawn_tui();
     // The native pane preparation refuses an unhealthy runtime, so wait for the
     // subscription to report readiness before driving panes.
-    h.wait_for("Runtime ready");
+    h.wait_for_runtime_ready();
     h.wait_for_ready();
     h.wait_for("Archivo");
     h.wait_for("Neighbor");
@@ -176,7 +176,7 @@ fn test_archive_then_unarchive_cycle() {
         "archived preview should point at z to unarchive\n{parked}"
     );
 
-    h.wait_for("Runtime ready");
+    h.wait_for_runtime_ready();
     h.send_keys("z");
     h.wait_for_absent("is parked", Duration::from_secs(5));
     // The unarchive is a daemon mutation now, so the row rises when the applied
@@ -498,7 +498,7 @@ fn test_tui_bulk_archive_group_tears_down_all_tmux_off_thread() {
     h.spawn_tui();
     // The native pane preparation refuses an unhealthy runtime, so wait for the
     // subscription to report readiness before driving panes.
-    h.wait_for("Runtime ready");
+    h.wait_for_runtime_ready();
     h.wait_for_ready();
     // "name (count)" proves the group loaded with all three members.
     h.wait_for("bulkarch (3)");

@@ -3857,8 +3857,14 @@
       "id": "story.sidebar-keyboard-row-navigation",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/sidebar-keyboard-navigation.spec.ts"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/SessionRow.tsx"]
+      "specs": ["tests/sidebar-keyboard-navigation.spec.ts", "src/components/__tests__/SidebarGroupHeader.test.tsx"],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/components/sidebar/SidebarGroupHeader.tsx",
+        "web/src/components/sidebar/GroupLists.tsx",
+        "web/src/components/sidebar/keyboardNav.ts"
+      ]
     },
     {
       "id": "story.sidebar-plan-progress",

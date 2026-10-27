@@ -27,7 +27,7 @@ aoe serve --open                # Open the URL in the default browser when ready
 aoe serve --remote --read-only  # Monitor without terminal input
 ```
 
-From the TUI, press `R` (`Ctrl+R` with strict hotkeys), shown as `R Web` in the shortcut bar, to start a background server on your network or over a tunnel. While it runs, the entry reads `R ● Web` in green.
+From the TUI, press `R` (`Ctrl+R` with strict hotkeys), shown as `R Web` in the shortcut bar, to open Connections, then Enter on **Web dashboard** to start a background server on your network or over a tunnel. While it runs, the entry reads `R ● Web` in green. When the Daemon needs attention, the entry shows that instead, in red for a problem (`R ● Runtime outcome unknown`) or dim for a limit (`R ● Unavailable`), and Connections lists the Daemon with what it means. If the Daemon goes offline, Connections replaces the home screen, with `r` to reconnect.
 
 The Daemon prints a URL carrying an auth token. Open it in a browser; the token becomes a cookie on first visit.
 

@@ -983,15 +983,15 @@ impl HomeView {
             self.preview_outer_area = Rect::default();
             self.divider_col = None;
             self.main_area_width = 0;
-            let connecting =
-                self.sidebar_source == crate::tui::session_feed::SidebarSource::Connecting;
-            let message = if connecting {
-                "Connecting to runtime…\n\nq: Quit"
-            } else {
-                self.runtime_failure_message
-                    .as_deref()
-                    .unwrap_or("Runtime unavailable\n\nr: Reconnect / start local runtime\nq: Quit")
-            };
+            if self.sidebar_source == crate::tui::session_feed::SidebarSource::Disconnected {
+                frame.render_widget(Clear, area);
+                crate::tui::dialogs::ConnectionsView::offline(
+                    self.runtime_failure_reason.as_deref(),
+                )
+                .render(frame, area, theme);
+                return;
+            }
+            let message = "Connecting to runtime…\n\nq: Quit";
             frame.render_widget(
                 Paragraph::new(message)
                     .style(Style::default().fg(theme.dimmed))
@@ -1236,6 +1236,14 @@ impl HomeView {
             telemetry_consent_dialog,
             tips_dialog,
         );
+        if let Some(view) = &self.connections_view {
+            let web = self.connections_web_state(Some(view.web()));
+            let daemon = self.daemon_attention();
+            if let Some(view) = &mut self.connections_view {
+                view.refresh(daemon, web);
+            }
+        }
+        render_dialogs!(connections_view);
         if self.snooze_duration_dialog.is_none() {
             render_dialogs!(info_dialog);
         }
@@ -4309,49 +4317,6 @@ impl HomeView {
         // Shortcut groups carry a priority, optional key action, and display spans.
         let mut groups: Vec<(u8, Option<KeyEvent>, Vec<Span<'static>>)> = Vec::new();
 
-        use crate::tui::session_feed::SidebarSource;
-        let (runtime_label, runtime_color) = match self.sidebar_source {
-            _ if self.session_feed.namespace_indeterminate()
-                || !self.pending_indeterminate_queue.is_empty()
-                || self
-                    .pending_creation
-                    .as_ref()
-                    .is_some_and(|pending| pending.outcome_unknown) =>
-            {
-                ("Runtime outcome unknown", theme.error)
-            }
-            SidebarSource::Connecting => ("Connecting runtime", theme.dimmed),
-            SidebarSource::Disconnected => ("Runtime disconnected", theme.error),
-            SidebarSource::Daemon if self.session_feed.cityhall_mode() => {
-                ("City Hall client", theme.dimmed)
-            }
-            SidebarSource::Daemon
-                if self.session_feed.any_pending()
-                    || self.pending_namespace_intent.is_some()
-                    || self.pending_creation.is_some() =>
-            {
-                ("Runtime applying", theme.dimmed)
-            }
-            SidebarSource::Daemon if self.session_feed.native_interaction_available() => {
-                ("Runtime ready", theme.running)
-            }
-            SidebarSource::Daemon if self.session_feed.mutations_available() => {
-                ("Native unavailable", theme.dimmed)
-            }
-            SidebarSource::Daemon => ("Runtime read-only", theme.dimmed),
-        };
-        let runtime_status = Span::styled(
-            format!(" \u{25CF}{runtime_label}"),
-            Style::default().fg(runtime_color).bold(),
-        );
-        let runtime_width = runtime_status.width();
-        let runtime_rect = Rect {
-            x: area.x + area.width.saturating_sub(runtime_width as u16),
-            y: area.y,
-            width: area.width.min(runtime_width as u16),
-            height: 1,
-        };
-
         // Other-TUI indicator, shown when more than one `aoe` TUI is alive: two TUIs
         // watching the same sessions clash over pane sizes (tmux reflows to the smallest
         // client). Recomputed on a throttle in the app loop, not per frame.
@@ -4497,11 +4462,14 @@ impl HomeView {
         groups.push((4, click, mk_key(&key)));
         let (click, key) = bound(ActionId::Diff);
         groups.push((4, click, mk(&key, "Diff")));
+        // The R entry carries one state: a Daemon problem or limit, else the Web dashboard.
         let mut serving_status = None;
-        if !super::input::web_plugin_disabled() {
+        let attention = self.daemon_attention();
+        if attention.is_some() || !super::input::web_plugin_disabled() {
             let (click, key) = bound(ActionId::Serve);
-            let (priority, spans) = web_footer_entry(&key, self.serve_running, theme);
-            serving_status = self.serve_running.then_some(groups.len());
+            let (priority, spans) =
+                runtime_footer_entry(attention, &key, self.serve_running, theme);
+            serving_status = (priority == 0).then_some(groups.len());
             groups.push((priority, click, spans));
         }
         let (click, key) = bound(ActionId::OpenCommandPalette);
@@ -4534,9 +4502,7 @@ impl HomeView {
             .map(|(_, _, g)| g.iter().map(|s| s.width()).sum::<usize>())
             .collect();
         let compact_badge_width = unicode_width::UnicodeWidthStr::width("\u{1f4a1}");
-        let avail = (area.width as usize)
-            .saturating_sub(1)
-            .saturating_sub(runtime_width);
+        let avail = (area.width as usize).saturating_sub(1);
 
         let mut order: Vec<usize> = (0..groups.len()).collect();
         // The running server status packs before other priority-0 groups, so it is the last to drop.
@@ -4625,13 +4591,9 @@ impl HomeView {
         let status = Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.selection));
         frame.render_widget(status, area);
 
-        frame.render_widget(
-            Paragraph::new(Line::from(runtime_status)).style(Style::default().bg(theme.selection)),
-            runtime_rect,
-        );
         if let Some(line) = badge_line {
             let rect = Rect {
-                x: runtime_rect.x.saturating_sub(badge_width),
+                x: area.right().saturating_sub(badge_width),
                 y: area.y,
                 width: badge_width,
                 height: 1,
@@ -4696,11 +4658,29 @@ pub(super) fn live_pane_origin(
     )
 }
 
-/// The dashboard entry is a hint until serving, then outranks the other shortcuts.
-/// A build without the dashboard bundle serves the API only, so it never says "Web".
-fn web_footer_entry(key: &str, running: bool, theme: &Theme) -> (u8, Vec<Span<'static>>) {
+/// The footer's R entry: the Daemon's problem (red) or limit (dim) when it has one, else
+/// the Web dashboard's status or hint ("API" in a build without the dashboard bundle). A
+/// state is priority 0 and the hint 1, so a state is the last thing dropped at narrow widths.
+fn runtime_footer_entry(
+    attention: Option<crate::tui::dialogs::DaemonAttention>,
+    key: &str,
+    running: bool,
+    theme: &Theme,
+) -> (u8, Vec<Span<'static>>) {
     let what = if cfg!(feature = "web") { "Web" } else { "API" };
     let key = Span::styled(format!("{key} "), Style::default().fg(theme.accent).bold());
+    if let Some(attention) = attention {
+        let color = if attention.is_problem() {
+            theme.error
+        } else {
+            theme.dimmed
+        };
+        let status = Span::styled(
+            format!("\u{25CF} {}", attention.footer_label()),
+            Style::default().fg(color).bold(),
+        );
+        return (0, vec![key, status]);
+    }
     if running {
         let status = Span::styled(
             format!("\u{25CF} {what}"),
@@ -4719,22 +4699,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn web_footer_entry_hints_until_served_then_shows_a_status_that_outranks_hints() {
+    fn the_r_entry_shows_one_state_a_daemon_problem_first_then_a_limit_then_web() {
+        use crate::tui::dialogs::DaemonAttention as A;
         let theme = crate::tui::styles::load_theme("empire");
         let what = if cfg!(feature = "web") { "Web" } else { "API" };
-        for (running, strict, priority, text) in [
-            (false, false, 1, format!("R {what}")),
-            (false, true, 1, format!("^R {what}")),
-            (true, false, 0, format!("R \u{25CF} {what}")),
-            (true, true, 0, format!("^R \u{25CF} {what}")),
-        ] {
+        // (Daemon attention, Web served, strict, priority, text, label colour)
+        let cases = [
+            (None, false, false, 1, format!("R {what}"), theme.dimmed),
+            (None, false, true, 1, format!("^R {what}"), theme.dimmed),
+            (
+                None,
+                true,
+                false,
+                0,
+                format!("R \u{25CF} {what}"),
+                theme.running,
+            ),
+            (
+                None,
+                true,
+                true,
+                0,
+                format!("^R \u{25CF} {what}"),
+                theme.running,
+            ),
+            // A problem is red and replaces even a running dashboard's status. An offline
+            // Daemon never reaches the footer: Connections takes over the home screen.
+            (
+                Some(A::OutcomeUnknown),
+                true,
+                false,
+                0,
+                "R \u{25CF} Runtime outcome unknown".into(),
+                theme.error,
+            ),
+            // A limit stays visible but dim, so a refused key isn't a mystery.
+            (
+                Some(A::ReadOnly),
+                true,
+                false,
+                0,
+                "R \u{25CF} Unavailable".into(),
+                theme.dimmed,
+            ),
+            (
+                Some(A::NativeUnavailable),
+                false,
+                true,
+                0,
+                "^R \u{25CF} Native unavailable".into(),
+                theme.dimmed,
+            ),
+        ];
+        for (attention, running, strict, priority, text, color) in cases {
             let key = if strict { "^R" } else { "R" };
-            let (p, spans) = web_footer_entry(key, running, &theme);
+            let (p, spans) = runtime_footer_entry(attention, key, running, &theme);
             let rendered: String = spans.iter().map(|s| s.content.as_ref()).collect();
             assert_eq!((p, rendered.as_str()), (priority, text.as_str()));
-            let label_fg = spans.last().and_then(|s| s.style.fg);
-            let expected = if running { theme.running } else { theme.dimmed };
-            assert_eq!(label_fg, Some(expected), "running={running}");
+            assert_eq!(spans.last().and_then(|s| s.style.fg), Some(color), "{text}");
         }
     }
 

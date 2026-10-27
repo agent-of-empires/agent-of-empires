@@ -122,7 +122,7 @@ fn test_creating_stub_appears_during_hook_execution() {
     h.spawn_tui();
 
     h.wait_for(" aoe ");
-    h.wait_for("Runtime ready");
+    h.wait_for_runtime_ready();
 
     // Open new session dialog and fill in the path.
     h.send_keys("n");
@@ -149,7 +149,7 @@ fn test_creating_stub_cancelled_with_ctrl_c() {
     h.spawn_tui();
 
     h.wait_for(" aoe ");
-    h.wait_for("Runtime ready");
+    h.wait_for_runtime_ready();
 
     // Create a session with a slow hook.
     h.send_keys("n");
@@ -179,7 +179,7 @@ fn test_creating_blocks_second_session_creation() {
     h.spawn_tui();
 
     h.wait_for(" aoe ");
-    h.wait_for("Runtime ready");
+    h.wait_for_runtime_ready();
 
     // Start creating a session.
     h.send_keys("n");
@@ -214,7 +214,7 @@ fn test_quit_during_creation_shows_confirm() {
     h.spawn_tui();
 
     h.wait_for(" aoe ");
-    h.wait_for("Runtime ready");
+    h.wait_for_runtime_ready();
 
     // Start creating a session.
     h.send_keys("n");
@@ -281,7 +281,7 @@ async fn test_quit_creation_waits_for_cancellation_admission_before_exit() {
     );
     let project = h.project_path();
     h.spawn_tui();
-    h.wait_for("Runtime ready");
+    h.wait_for_runtime_ready();
     let endpoint = DaemonEndpoint::local_unix(app_dir_in(h.home_path()).join("daemon/api.sock"));
     let mut connection = RuntimeConnection::connect(&endpoint, None).await.unwrap();
     h.send_keys("n");
@@ -395,7 +395,7 @@ fn test_new_session_enters_live_mode_when_configured() {
     h.spawn_tui();
 
     h.wait_for(" aoe ");
-    h.wait_for("Runtime ready");
+    h.wait_for_runtime_ready();
 
     h.send_keys("n");
     h.wait_for("Title");
@@ -464,7 +464,7 @@ fn test_a_typed_title_names_the_agent_session() {
     let project = h.project_path();
     h.spawn_tui();
     h.wait_for(" aoe ");
-    h.wait_for("Runtime ready");
+    h.wait_for_runtime_ready();
 
     let title = "O'Brien's plan";
     h.send_keys("n");

@@ -20,7 +20,7 @@ fn app_file(name: &str) -> Option<PathBuf> {
     crate::session::get_app_dir().ok().map(|dir| dir.join(name))
 }
 
-fn read_app_file(name: &str) -> Option<String> {
+pub(super) fn read_app_file(name: &str) -> Option<String> {
     let raw = std::fs::read_to_string(app_file(name)?).ok()?;
     let trimmed = raw.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
