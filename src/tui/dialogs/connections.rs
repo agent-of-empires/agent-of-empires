@@ -169,10 +169,12 @@ impl ConnectionsView {
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         const NAME: usize = 18;
+        // A row is marker, dot, space and the padded name before its status; details align under it.
+        const INDENT: usize = NAME + 3;
         // Narrow terminals shrink the dialog, so the details wrap to what's really there.
         let width = area.width.min(76);
         let inner_width = width.saturating_sub(4) as usize;
-        let detail_width = inner_width.saturating_sub(NAME + 2);
+        let detail_width = inner_width.saturating_sub(INDENT);
         let dim = Style::default().fg(theme.dimmed);
         let key = Style::default().fg(theme.accent).bold();
 
@@ -269,7 +271,7 @@ impl ConnectionsView {
                 line = line.style(Style::default().bg(theme.selection));
             }
             lines.push(line);
-            let indent = " ".repeat(NAME + 3);
+            let indent = " ".repeat(INDENT);
             for detail in details {
                 lines.push(Line::from(Span::styled(format!("{indent}{detail}"), dim)));
             }
@@ -407,6 +409,14 @@ mod tests {
                 assert!(!text.contains(needle), "{needle:?} present\n{text}");
             }
         }
+
+        // A detail line that fills its width still fits under the indent: its last cell survives.
+        let full_line = format!("{}Q", "x".repeat(51));
+        let text = screen(&mut ConnectionsView::offline(Some(&full_line)));
+        assert!(
+            text.contains('Q'),
+            "the full-width line lost its last cell\n{text}"
+        );
 
         // A narrow terminal shrinks the dialog and wraps its details rather than cutting them.
         let text = screen_at(&mut offline(), 50);
