@@ -207,8 +207,7 @@ impl Instance {
     /// Run `new_tool` in terminal view with a fresh conversation after a
     /// structured view agent switch.
     pub(crate) fn rebind_terminal_tool_fresh(&mut self, new_tool: &str) {
-        self.stop_poller();
-        self.session_id_poller = None;
+        self.capture_poller.clear();
         self.adopt_tool(new_tool);
         self.command.clear();
         self.extra_args.clear();
