@@ -1222,10 +1222,10 @@ impl PathsInUse {
     pub(crate) fn covers(&self, root: &Path) -> bool {
         match self {
             Self::Known(paths) => {
-                let root = canonicalize_or_raw(root);
-                paths
-                    .iter()
-                    .any(|path| canonicalize_or_raw(path).starts_with(&root))
+                let canonical_root = canonicalize_or_raw(root);
+                paths.iter().any(|path| {
+                    path.starts_with(root) || canonicalize_or_raw(path).starts_with(&canonical_root)
+                })
             }
             Self::Unknown(_) => true,
         }

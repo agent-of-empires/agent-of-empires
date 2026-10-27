@@ -1155,6 +1155,35 @@ mod tests {
     /// when a store holds a row that cannot be decoded and so might be a sharer.
     #[test]
     #[serial_test::serial]
+    fn shared_worktree_guard_keeps_a_lexical_match_whose_path_resolves_elsewhere() {
+        if !git_available() {
+            return;
+        }
+        let (tmp, mut inst) = real_worktree_instance();
+        let _home = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("home"));
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = PathBuf::from(&inst.project_path).join("link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let sharer = Instance::new("sharer", link.to_str().unwrap());
+        crate::session::Storage::new_unwatched("other")
+            .unwrap()
+            .update(|instances, _groups| {
+                instances.push(sharer);
+                Ok(())
+            })
+            .unwrap();
+        inst.trash();
+
+        let out = relocate_worktree_to_trash(&mut inst);
+        assert!(
+            matches!(out, RelocateOutcome::Skipped),
+            "expected the relocation to be skipped, got {out:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn shared_worktree_guard_sees_symlinked_paths_and_undecodable_rows() {
         if !git_available() {
             return;
