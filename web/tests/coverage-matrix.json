@@ -299,6 +299,7 @@
         "src/components/__tests__/MobileTerminalToolbar.test.tsx",
         "src/components/__tests__/ArrowJoystick.test.tsx",
         "src/components/settings/__tests__/MobileKeysSettings.test.tsx",
+        "tests/live-terminal-forward-scrollbar.spec.ts",
         "src/components/live-terminal/ForwardScrollbar.test.tsx",
         "src/components/__tests__/MobileLiveTerminal.scrollbar.test.tsx",
         "src/lib/__tests__/forwardScrollbar.test.ts"
