@@ -441,6 +441,37 @@ describe("StartupErrorScreen", () => {
     expect(getByTestId("startup-error-step-1").getAttribute("data-done")).toBe("true");
   });
 
+  it("a stopped container leaves steps the Web dashboard can't run as they are", async () => {
+    const stopped = { ...sandbox, install_allowed: false, install_blocked: "container_not_running" } as const;
+    const cases: [string, IncompatibleAgentDetail, AgentInstallInfo, string][] = [
+      [
+        "manual-only",
+        incompatible(false, OPENCODE),
+        { ...opencode, ...stopped, container_install_command: null },
+        "Run this inside this Session's container",
+      ],
+      [
+        "protocol",
+        { kind: "unsupported_protocol_version", expected: "V1", received: "V2" },
+        info(stopped),
+        "Install an adapter that speaks ACP protocol V1",
+      ],
+    ];
+    for (const [label, detail, answer, stepOne] of cases) {
+      const { getByTestId, queryByTestId } = await renderScreen(detail, answer);
+      const screen = getByTestId("startup-error-screen");
+      expect(queryByTestId("startup-error-container-down"), label).toBeNull();
+      expect(buttons(screen), label).toEqual(["Check again"]);
+      const titles = stepTitles(getByTestId);
+      expect(titles, label).toEqual([stepOne, "Click Check again"]);
+      expectStepsNameRenderedButtons(screen, titles);
+      if (label === "manual-only") {
+        expect(getByTestId("startup-error-install-command").textContent).toContain(OPENCODE_COMMAND);
+      }
+      cleanup();
+    }
+  });
+
   it("fails again: a version failure after the install says it changed nothing", async () => {
     installAcpAgent.mockResolvedValue(installOk());
     const view = await renderScreen(incompatible(), info({ ...sandbox, ...allowed }));

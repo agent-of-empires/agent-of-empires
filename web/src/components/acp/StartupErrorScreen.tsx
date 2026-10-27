@@ -77,9 +77,11 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
   const observer = info?.install_blocked === "read_only" || info?.install_blocked === "cityhall";
   const webInstall = !observer && "auto_install" in detail && detail.auto_install;
   const allowed = info?.install_allowed === true;
+  // Only the Update steps wait on the container; manual and protocol steps keep their own.
   const containerDown =
-    info?.install_blocked === "container_not_running" ||
-    (containerDownFor === detail && install.errorCode === "container_not_running");
+    webInstall &&
+    (info?.install_blocked === "container_not_running" ||
+      (containerDownFor === detail && install.errorCode === "container_not_running"));
   const busy = respawnState === "retrying" || install.state === "installing";
 
   const updateLabel = sandboxed ? "Update in Sandbox & restart" : "Update & restart";
