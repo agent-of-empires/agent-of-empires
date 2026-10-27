@@ -897,7 +897,8 @@
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/components/__tests__/PushHealthBanner.test.tsx"],
-      "components": ["web/src/components/PushHealthBanner.tsx"]
+      "components": ["web/src/components/PushHealthBanner.tsx"],
+      "notes": "The dismiss test asserts the contrast-safe token classes: text-subtle dismiss, text-primary body, no hover opacity on Re-enable."
     },
     {
       "id": "notifications.status-sounds",
@@ -2712,7 +2713,8 @@
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": ["tests/update-banner.spec.ts", "src/components/__tests__/UpdateBanner.test.tsx"],
-      "components": ["web/src/components/UpdateBanner.tsx"]
+      "components": ["web/src/components/UpdateBanner.tsx"],
+      "notes": "The dismiss test asserts text-subtle, not text-muted or text-secondary, on the dismiss control."
     },
     {
       "id": "connectivity.banner-stack",
@@ -3592,7 +3594,8 @@
         "web/src/components/acp/StructuredView.tsx",
         "web/src/components/acp/StartupErrorBanner.tsx",
         "web/src/components/acp/RecoveryActionRow.tsx"
-      ]
+      ],
+      "notes": "Auth-required startup errors name the agent's own login step: Claude keeps claude /login and ANTHROPIC_API_KEY, Codex gets codex login and OPENAI_API_KEY, other agents get generic sign-in copy with no Claude or Codex commands."
     },
     {
       "id": "acp.startup-error-banner-actions",
@@ -4010,6 +4013,13 @@
       "risk": "low",
       "specs": ["src/components/settings/__tests__/SchemaFieldPatches.test.tsx"],
       "components": ["web/src/components/settings/SchemaSection.tsx"]
+    },
+    {
+      "id": "story.settings-sound-controls",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/settings/__tests__/SchemaFieldPatches.test.tsx"],
+      "components": ["web/src/components/settings/customWidgets.tsx"]
     },
     {
       "id": "story.settings-session-id-poller-threads",

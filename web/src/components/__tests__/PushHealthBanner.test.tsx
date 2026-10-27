@@ -54,7 +54,13 @@ describe("PushHealthBanner", () => {
 
   it("stays dismissed for the same failure but returns for a different one", () => {
     const { rerender } = render(<PushHealthBanner />);
-    fireEvent.click(screen.getByRole("button", { name: "Dismiss notifications notice" }));
+    expect(screen.getByRole("alert").className).toContain("text-text-primary");
+    expect(screen.getByRole("alert").className).not.toContain("text-status-waiting");
+    const dismiss = screen.getByRole("button", { name: "Dismiss notifications notice" });
+    expect(dismiss.className).toContain("text-text-subtle");
+    expect(dismiss.className).not.toMatch(/text-text-(muted|secondary)/);
+    expect(reEnable()!.className).not.toContain("hover:opacity");
+    fireEvent.click(dismiss);
     expect(screen.queryByRole("alert")).toBeNull();
 
     rerender(<PushHealthBanner />);

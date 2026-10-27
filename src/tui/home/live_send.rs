@@ -68,26 +68,36 @@ pub(super) const DEFAULT_LEADER: &str = "C-b";
 /// lowercase under any modifier, so `C-q` and `C-Q` share one canonical form.
 pub(super) fn parse_chord(spec: &str) -> Option<(KeyCode, KeyModifiers)> {
     let trimmed = spec.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    // Split on `-` or `+`; both are common in user-facing key specs.
-    let parts: Vec<&str> = trimmed.split(['-', '+']).collect();
-    if parts.is_empty() {
-        return None;
-    }
+    let (mod_spec, key) = split_chord(trimmed)?;
     let mut modifiers = KeyModifiers::NONE;
-    for piece in &parts[..parts.len().saturating_sub(1)] {
-        match piece.to_ascii_lowercase().as_str() {
-            "c" | "ctrl" | "control" => modifiers |= KeyModifiers::CONTROL,
-            "m" | "alt" | "meta" => modifiers |= KeyModifiers::ALT,
-            "s" | "shift" => modifiers |= KeyModifiers::SHIFT,
-            _ => return None,
+    if !mod_spec.is_empty() {
+        for piece in mod_spec.split(['-', '+']).map(str::trim) {
+            match piece.to_ascii_lowercase().as_str() {
+                "c" | "ctrl" | "control" => modifiers |= KeyModifiers::CONTROL,
+                "m" | "alt" | "meta" => modifiers |= KeyModifiers::ALT,
+                "s" | "shift" => modifiers |= KeyModifiers::SHIFT,
+                _ => return None,
+            }
         }
     }
-    let key = *parts.last()?;
+    let key = key.trim();
     let code = parse_key_name(key, modifiers.contains(KeyModifiers::CONTROL))?;
     Some((code, modifiers))
+}
+
+/// Split a chord into its modifier prefix and key. Separators are `-` or `+`, but a trailing
+/// one is the key itself when it opens the spec or follows a separator (`-`, `C--`, `Ctrl+-`).
+fn split_chord(spec: &str) -> Option<(&str, &str)> {
+    let last = spec.chars().next_back()?;
+    if matches!(last, '-' | '+') {
+        let (head, key) = spec.split_at(spec.len() - 1);
+        let head = head.trim_end();
+        if head.is_empty() {
+            return Some(("", key));
+        }
+        return Some((head.strip_suffix(['-', '+'])?, key));
+    }
+    Some(spec.rsplit_once(['-', '+']).unwrap_or(("", spec)))
 }
 
 fn parse_key_name(name: &str, has_ctrl: bool) -> Option<KeyCode> {
@@ -2693,6 +2703,13 @@ mod tests {
             ("X-q", None),  // unknown modifier
             ("C-qq", None), // multi-char key without F-prefix
             ("C-", None),   // missing key
+            // A trailing separator is the literal key; whitespace around tokens is ignored.
+            ("-", Some((KeyCode::Char('-'), KeyModifiers::NONE))),
+            ("C--", Some((KeyCode::Char('-'), ctrl))),
+            ("Ctrl+-", Some((KeyCode::Char('-'), ctrl))),
+            ("Ctrl + J", Some((KeyCode::Char('j'), ctrl))),
+            ("Ctrl+", None),
+            ("Ctrl+K+J", None),
         ];
         for (input, expected) in cases {
             assert_eq!(parse_chord(input), expected, "{input:?}");

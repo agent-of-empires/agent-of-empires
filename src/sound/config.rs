@@ -3,6 +3,19 @@
 use aoe_settings_derive::SettingsSection;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserScope {
+    #[default]
+    All,
+    OtherSessions,
+    HiddenTab,
+}
+
+fn is_default_scope(s: &BrowserScope) -> bool {
+    *s == BrowserScope::All
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
 #[setting_section(name = "sound", category = "Sound")]
 pub struct SoundConfig {
@@ -56,11 +69,71 @@ pub struct SoundConfig {
     #[setting(label = "Play in browser", widget = "toggle")]
     pub browser_enabled: bool,
 
-    /// Playback volume (0.1 = min, 1.0 = normal, 1.5 = max), step 0.1. Ignored
-    /// when aplay is the Linux backend.
+    /// Server playback volume (0.1 = min, 1.0 = normal, 1.5 = max), step 0.1.
+    /// Ignored when aplay is the Linux backend.
     #[serde(default = "default_volume", skip_serializing_if = "is_default_volume")]
-    #[setting(label = "Volume", widget = "custom:sound-volume")]
-    pub volume: f64,
+    #[setting(label = "Server volume", widget = "custom:sound-volume")]
+    pub server_volume: f64,
+
+    /// Browser playback volume, step 0.1. Browsers cap it at 1.0.
+    #[serde(default = "default_volume", skip_serializing_if = "is_default_volume")]
+    #[setting(label = "Browser volume", widget = "custom:sound-volume")]
+    pub browser_volume: f64,
+
+    /// Which sessions sound in the browser: all of them, every session except
+    /// the one open in that tab, or only while the tab is hidden.
+    #[serde(default, skip_serializing_if = "is_default_scope")]
+    #[setting(
+        label = "Browser scope",
+        widget = "select",
+        options = "all:All sessions,other_sessions:Other sessions,hidden_tab:Hidden tab only"
+    )]
+    pub browser_scope: BrowserScope,
+
+    /// Play the start sound on the machine running aoe.
+    #[serde(default = "default_true")]
+    #[setting(label = "Server: Start", widget = "toggle", advanced)]
+    pub server_start_enabled: bool,
+
+    /// Play the running sound on the machine running aoe.
+    #[serde(default = "default_true")]
+    #[setting(label = "Server: Running", widget = "toggle", advanced)]
+    pub server_running_enabled: bool,
+
+    /// Play the waiting sound on the machine running aoe.
+    #[serde(default = "default_true")]
+    #[setting(label = "Server: Waiting", widget = "toggle", advanced)]
+    pub server_waiting_enabled: bool,
+
+    /// Play the idle sound on the machine running aoe.
+    #[serde(default = "default_true")]
+    #[setting(label = "Server: Idle", widget = "toggle", advanced)]
+    pub server_idle_enabled: bool,
+
+    /// Play the error sound on the machine running aoe.
+    #[serde(default = "default_true")]
+    #[setting(label = "Server: Error", widget = "toggle", advanced)]
+    pub server_error_enabled: bool,
+
+    /// Play the approval sound in the web dashboard.
+    #[serde(default = "default_true")]
+    #[setting(label = "Browser: Approval", widget = "toggle", advanced)]
+    pub browser_approval_enabled: bool,
+
+    /// Play the waiting sound in the web dashboard.
+    #[serde(default = "default_true")]
+    #[setting(label = "Browser: Waiting", widget = "toggle", advanced)]
+    pub browser_waiting_enabled: bool,
+
+    /// Play the idle sound in the web dashboard.
+    #[serde(default = "default_true")]
+    #[setting(label = "Browser: Idle", widget = "toggle", advanced)]
+    pub browser_idle_enabled: bool,
+
+    /// Play the error sound in the web dashboard.
+    #[serde(default = "default_true")]
+    #[setting(label = "Browser: Error", widget = "toggle", advanced)]
+    pub browser_error_enabled: bool,
 }
 
 impl Default for SoundConfig {
@@ -75,7 +148,18 @@ impl Default for SoundConfig {
             on_approval: None,
             server_enabled: true,
             browser_enabled: true,
-            volume: default_volume(),
+            server_volume: default_volume(),
+            browser_volume: default_volume(),
+            browser_scope: BrowserScope::default(),
+            server_start_enabled: true,
+            server_running_enabled: true,
+            server_waiting_enabled: true,
+            server_idle_enabled: true,
+            server_error_enabled: true,
+            browser_approval_enabled: true,
+            browser_waiting_enabled: true,
+            browser_idle_enabled: true,
+            browser_error_enabled: true,
         }
     }
 }
@@ -131,7 +215,7 @@ mod tests {
             assert_eq!(config.on_error.as_deref(), on_error, "{toml}");
             assert_eq!(config.on_approval.as_deref(), on_approval, "{toml}");
             // A 0.0 default would mute playback on a fresh install.
-            assert!((config.volume - 1.0).abs() < 1e-9, "{toml}");
+            assert!((config.server_volume - 1.0).abs() < 1e-9, "{toml}");
         }
     }
 
@@ -151,6 +235,25 @@ mod tests {
             assert_eq!(config.server_enabled, server, "{toml}");
             assert_eq!(config.browser_enabled, browser, "{toml}");
         }
+    }
+
+    #[test]
+    fn event_toggles_scope_and_volumes_default_to_today_and_parse() {
+        let config: SoundConfig = toml::from_str("").unwrap();
+        assert!(config.server_start_enabled && config.server_error_enabled);
+        assert!(config.browser_approval_enabled && config.browser_waiting_enabled);
+        assert_eq!(config.browser_scope, BrowserScope::All);
+        assert!((config.browser_volume - 1.0).abs() < 1e-9);
+
+        let config: SoundConfig = toml::from_str(
+            "server_idle_enabled = false\nbrowser_error_enabled = false\nbrowser_scope = \"hidden_tab\"\nserver_volume = 1.4\nbrowser_volume = 0.5",
+        )
+        .unwrap();
+        assert!(!config.server_idle_enabled && config.server_waiting_enabled);
+        assert!(!config.browser_error_enabled && config.browser_idle_enabled);
+        assert_eq!(config.browser_scope, BrowserScope::HiddenTab);
+        assert!((config.server_volume - 1.4).abs() < 1e-9);
+        assert!((config.browser_volume - 0.5).abs() < 1e-9);
     }
 
     #[test]

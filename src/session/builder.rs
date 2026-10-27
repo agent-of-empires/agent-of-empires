@@ -1359,9 +1359,14 @@ pub mod structured {
             return true;
         }
         if !is_bare_command(command) {
-            let checkable =
-                command.contains("${aoe_data_dir}") || std::path::Path::new(command).is_absolute();
-            return !checkable || crate::cli::acp::command_present(command);
+            let path = std::path::Path::new(command);
+            if command.contains("${aoe_data_dir}") || path.is_absolute() {
+                return crate::cli::acp::command_present(command);
+            }
+            // Spawned from the project, so a relative path resolves there; a launch
+            // directory that doesn't exist yet may still gain it.
+            return command.contains("${")
+                || project_path.is_none_or(|cwd| !cwd.is_dir() || cwd.join(path).exists());
         }
         let app_dir = crate::session::get_app_dir().ok();
         if resolve_agent_command(command, app_dir.as_deref()).is_ok() {
@@ -1708,6 +1713,8 @@ mod tests {
                     "fake-present-path",
                     bin.join(&adapter).display().to_string(),
                 ),
+                ("fake-rel-present", format!("agent-bin/{adapter}")),
+                ("fake-rel-missing", "agent-bin/aoe-test-missing".to_string()),
             ] {
                 config.session.agent_acp_cmd.insert(name.into(), cmd);
             }
@@ -1725,6 +1732,7 @@ mod tests {
         };
         let configured = vec![format!("PATH={}", bin.display())];
         let present_wrapper = bin.join(&adapter).display().to_string();
+        let not_created = project.path().join("not-created");
         let missing_text = "is not installed or not on $PATH";
         let missing = Some(missing_text);
         let not_capable = Some("is not ACP-capable");
@@ -1847,6 +1855,41 @@ mod tests {
                 label: "a before_session hook may install an absolute command",
                 tool: "fake-path",
                 before_session_hook: true,
+                ..base()
+            },
+            Case {
+                label: "relative command, present in the project",
+                tool: "fake-rel-present",
+                ..base()
+            },
+            Case {
+                label: "relative command, missing from an existing project",
+                tool: "fake-rel-missing",
+                expected: missing,
+                ..base()
+            },
+            Case {
+                label: "relative command, launch dir not created yet",
+                tool: "fake-rel-missing",
+                project: None,
+                ..base()
+            },
+            Case {
+                label: "relative command, project dir absent on disk",
+                tool: "fake-rel-missing",
+                project: Some(&not_created),
+                ..base()
+            },
+            Case {
+                label: "a before_session hook may install a relative command",
+                tool: "fake-rel-missing",
+                before_session_hook: true,
+                ..base()
+            },
+            Case {
+                label: "an on_create hook may install a relative command",
+                tool: "fake-rel-missing",
+                preparation_hooks: true,
                 ..base()
             },
             Case {

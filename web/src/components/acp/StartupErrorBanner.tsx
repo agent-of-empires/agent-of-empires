@@ -11,13 +11,29 @@ function Code({ children }: { children: React.ReactNode }) {
 }
 
 /** Copy for the failures a reinstall won't fix, keyed off the message text. */
-function specificRemediation(message: string): React.ReactNode {
+function specificRemediation(message: string, agent: string | undefined, name: string): React.ReactNode {
   if (/authentic|login|api[_ -]?key/i.test(message)) {
+    if (agent === "claude" || agent === "claude-code") {
+      return (
+        <>
+          The adapter is installed but has no Claude credentials. Either set <Code>ANTHROPIC_API_KEY</Code> in the env
+          that runs <Code>aoe serve</Code>, or run <Code>claude /login</Code> in a terminal to write credentials to{" "}
+          <Code>~/.claude</Code>, then restart aoe.
+        </>
+      );
+    }
+    if (agent === "codex") {
+      return (
+        <>
+          The adapter is installed but has no Codex credentials. Either set <Code>OPENAI_API_KEY</Code> in the env that
+          runs <Code>aoe serve</Code>, or run <Code>codex login</Code> on the host, then restart aoe.
+        </>
+      );
+    }
     return (
       <>
-        The adapter is installed but has no Claude credentials. Either set <Code>ANTHROPIC_API_KEY</Code> in the env
-        that runs <Code>aoe serve</Code>, or run <Code>claude /login</Code> in a terminal to write credentials to{" "}
-        <Code>~/.claude</Code>, then restart aoe.
+        The adapter is installed but {name} isn't signed in. Sign in to {name} or set its API key in the env that runs{" "}
+        <Code>aoe serve</Code>, then restart aoe.
       </>
     );
   }
@@ -149,7 +165,7 @@ export function StartupErrorBanner({
   }, [sessionId, infoRequest]);
 
   const name = info?.display_name ?? AGENT_IN_MESSAGE.exec(message)?.[1] ?? "The agent";
-  const specific = specificRemediation(message);
+  const specific = specificRemediation(message, info?.agent ?? AGENT_IN_MESSAGE.exec(message)?.[1], name);
   const canInstall = !specific && info?.install_allowed === true && info.npm_installable;
   const busy = retryState === "retrying" || install.state === "installing";
 

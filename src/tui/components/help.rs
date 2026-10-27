@@ -92,11 +92,9 @@ fn shortcuts(strict: bool, live_on_enter: bool) -> Vec<(&'static str, Vec<(Strin
     views.push(("< >".to_string(), "Resize list panel".to_string()));
     other.extend(owned([
         ("n", "Next match (after search)"),
-        ("Ctrl+x", "Dismiss update bar (this session)"),
         ("Shift+drag", "Select text in preview"),
         ("Drag", "Select + copy preview (live mode)"),
         ("Click link", "Open underlined preview link or URL"),
-        ("Ctrl+K", "Command palette"),
         ("\u{1f4a1}", "Tips (badge, or Ctrl+K \u{2192} \"tips\")"),
     ]));
 

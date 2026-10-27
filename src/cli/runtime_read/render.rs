@@ -1049,6 +1049,381 @@ mod tests {
     }
 
     #[test]
+    fn show_preserves_parent_children_and_orphan_relationships() {
+        let parent = session("parent", WireStatus::Idle);
+        let mut child = session("child", WireStatus::Idle);
+        child.parent_session_id = Some("parent".into());
+        let mut orphan = session("orphan", WireStatus::Idle);
+        orphan.parent_session_id = Some("gone".into());
+        let value = snapshot(vec![parent, child, orphan]);
+        for (id, expected) in [
+            ("parent", "  Children:\n    child (child)\n"),
+            ("child", "  Parent:  parent (parent)\n"),
+            ("orphan", "  Parent:  gone\n"),
+        ] {
+            let shown = render_show(
+                &ShowArgs {
+                    identifier: Some(id.into()),
+                    json: false,
+                },
+                &value,
+                &source(),
+            )
+            .unwrap();
+            assert!(shown.stdout.ends_with(expected), "{}", shown.stdout);
+        }
+    }
+
+    mod instance_projection_tests {
+        use super::*;
+        use crate::cli::list::{table_title, WorktreeJson};
+        use crate::session::Instance;
+
+        fn session_json(inst: &Instance, profile: &str, systemd_active: bool) -> SessionJson {
+            let mut wire = SessionRead::from_instance(inst);
+            wire.profile = "main".into();
+            let listed = super::session_json(&wire, profile, systemd_active).unwrap();
+            let value = snapshot(vec![wire]);
+            let shown = render_show(
+                &ShowArgs {
+                    identifier: Some(inst.id.clone()),
+                    json: true,
+                },
+                &value,
+                &source(),
+            )
+            .unwrap();
+            let shown: serde_json::Value = serde_json::from_str(&shown.stdout).unwrap();
+            let listed_value = serde_json::to_value(&listed).unwrap();
+            for key in [
+                "state",
+                "trashed_at",
+                "archived_at",
+                "snoozed_until",
+                "pinned_at",
+                "parent_session_id",
+            ] {
+                assert_eq!(shown.get(key), listed_value.get(key), "{key}");
+            }
+            listed
+        }
+
+        fn nest_children<'a>(instances: &[&'a Instance]) -> Vec<(&'a Instance, usize)> {
+            list::nest_order(
+                instances,
+                |inst| inst.id.as_str(),
+                |inst| inst.parent_session_id.as_deref(),
+            )
+            .into_iter()
+            .map(|(index, depth)| (instances[index], depth))
+            .collect()
+        }
+        /// The CLI, runtime wire and REST rows share one derivation, so they agree
+        /// on the instant of every shared timestamp and on the worktree facts.
+        #[test]
+        #[serial_test::serial]
+        fn projections_agree_on_shared_facts() {
+            use crate::cli::runtime_read::dto::SessionRead;
+            use crate::daemon::SessionResponse;
+            use crate::session::{WorkspaceInfo, WorkspaceRepo, WorktreeInfo};
+
+            let _app = crate::session::test_support::isolate_app_dir();
+            let now = chrono::Utc::now();
+            let instant = |value: &str| chrono::DateTime::parse_from_rfc3339(value).unwrap();
+            let cases: [(&str, fn(&mut Instance)); 5] = [
+                ("live", |_| {}),
+                ("archived", |i| i.archived_at = Some(chrono::Utc::now())),
+                ("trashed", |i| i.trash()),
+                ("snoozed", |i| {
+                    i.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::minutes(5))
+                }),
+                ("expired snooze", |i| {
+                    i.snoozed_until = Some(chrono::Utc::now() - chrono::Duration::minutes(5))
+                }),
+            ];
+            for (label, mutate) in cases {
+                let mut inst = Instance::new("t", "/repo");
+                inst.pinned_at = Some(now);
+                inst.worktree_info = Some(WorktreeInfo {
+                    branch: "feat".into(),
+                    main_repo_path: "/main".into(),
+                    managed_by_aoe: true,
+                    created_at: now,
+                    base_branch: Some("base".into()),
+                });
+                inst.workspace_info = Some(WorkspaceInfo {
+                    branch: "feat".into(),
+                    workspace_dir: "/ws".into(),
+                    created_at: now,
+                    cleanup_on_delete: true,
+                    repos: vec![WorkspaceRepo {
+                        name: "a".into(),
+                        source_path: "/a".into(),
+                        branch: "feat".into(),
+                        worktree_path: "/ws/a".into(),
+                        main_repo_path: "/a".into(),
+                        managed_by_aoe: true,
+                        branch_preexisting: false,
+                        base_branch: None,
+                        base_branch_override: None,
+                    }],
+                });
+                mutate(&mut inst);
+
+                let cli =
+                    serde_json::to_value(session_json(&inst, &inst.source_profile, false)).unwrap();
+                let wire = SessionRead::from_instance(&inst);
+                let rest = SessionResponse::from_instance(&inst, false);
+
+                assert_eq!(wire.state.as_str(), cli["state"], "{label}");
+                let cli_time = |key: &str| cli[key].as_str().map(instant);
+                let wire_time = |v: &Option<String>| v.as_deref().map(instant);
+                let rest_time = |v: &Option<String>| v.as_deref().map(instant);
+                assert_eq!(
+                    cli_time("snoozed_until"),
+                    wire_time(&wire.active_snoozed_until),
+                    "{label}"
+                );
+                assert_eq!(
+                    cli_time("snoozed_until"),
+                    rest_time(&rest.snoozed_until),
+                    "{label}"
+                );
+                assert_eq!(
+                    cli_time("archived_at"),
+                    wire_time(&wire.archived_at),
+                    "{label}"
+                );
+                assert_eq!(
+                    cli_time("archived_at"),
+                    rest_time(&rest.archived_at),
+                    "{label}"
+                );
+                assert_eq!(
+                    cli_time("trashed_at"),
+                    wire_time(&wire.trashed_at),
+                    "{label}"
+                );
+                assert_eq!(
+                    cli_time("trashed_at"),
+                    rest_time(&rest.trashed_at),
+                    "{label}"
+                );
+                assert_eq!(cli_time("pinned_at"), wire_time(&wire.pinned_at), "{label}");
+                assert_eq!(cli_time("pinned_at"), rest_time(&rest.pinned_at), "{label}");
+                assert_eq!(cli["worktree"]["branch"], "feat", "{label}");
+                assert_eq!(wire.worktree.as_ref().unwrap().branch, "feat", "{label}");
+                assert_eq!(rest.branch.as_deref(), Some("feat"), "{label}");
+                assert_eq!(rest.base_branch.as_deref(), Some("base"), "{label}");
+                assert!(
+                    wire.has_managed_worktree && rest.has_managed_worktree,
+                    "{label}"
+                );
+                assert_eq!(cli["workspace_repos"][0]["name"], "a", "{label}");
+                assert_eq!(wire.workspace_repos[0].name, "a", "{label}");
+                assert_eq!(rest.workspace_repos[0].name, "a", "{label}");
+            }
+        }
+
+        /// An optional field the row has no value for is left out, as every other
+        /// optional field in the struct is. A `null` here would make a consumer
+        /// carry a branch that does not exist.
+        #[test]
+        fn a_worktree_without_a_base_branch_emits_no_key() {
+            let row = |base_branch| WorktreeJson {
+                branch: "feature".into(),
+                main_repo_path: "/repo".into(),
+                managed_by_aoe: true,
+                base_branch,
+            };
+            let keys = |value: Option<String>| {
+                let text = serde_json::to_string(&row(value)).expect("encodes");
+                serde_json::from_str::<serde_json::Value>(&text).expect("is JSON")
+            };
+            assert!(
+                keys(None).get("base_branch").is_none(),
+                "an absent base branch is omitted, not null"
+            );
+            assert_eq!(
+                keys(Some("main".into()))["base_branch"],
+                serde_json::json!("main")
+            );
+        }
+        /// #3472: `aoe add -P` children render under their parent in the table.
+        #[test]
+        fn nest_children_lists_each_child_under_its_listed_parent() {
+            let row = |title: &str, parent: Option<&str>| {
+                let mut inst = Instance::new(title, "/repo");
+                inst.parent_session_id = parent.map(str::to_string);
+                inst
+            };
+            let root = row("root", None);
+            let child = row("child", Some(&root.id));
+            let grandchild = row("grandchild", Some(&child.id));
+            let orphan = row("orphan", Some("not-listed"));
+            let other = row("other", None);
+            let mut loop_a = row("loop-a", None);
+            let loop_b = row("loop-b", Some(&loop_a.id));
+            loop_a.parent_session_id = Some(loop_b.id.clone());
+
+            let listed = [
+                &grandchild,
+                &root,
+                &orphan,
+                &child,
+                &other,
+                &loop_a,
+                &loop_b,
+            ];
+            let titles: Vec<String> = nest_children(&listed)
+                .into_iter()
+                .map(|(inst, depth)| table_title(&inst.title, depth))
+                .collect();
+            assert_eq!(
+                titles,
+                [
+                    "root",
+                    "└ child",
+                    "  └ grandchild",
+                    "orphan",
+                    "other",
+                    "loop-a",
+                    "└ loop-b",
+                ]
+            );
+
+            assert_eq!(
+                session_json(&child, "p", false)
+                    .parent_session_id
+                    .as_deref(),
+                Some(root.id.as_str())
+            );
+        }
+        #[test]
+        fn session_json_reports_state_and_only_the_timestamps_that_apply() {
+            let plain = Instance::new("z", "/repo");
+            let json = session_json(&plain, "p", false);
+            assert_eq!(json.state, "live");
+            let serialized = serde_json::to_string(&json).unwrap();
+            assert!(!serialized.contains("trashed_at"));
+            assert!(!serialized.contains("archived_at"));
+            assert!(serialized.contains("\"state\":\"live\""));
+
+            let mut archived = Instance::new("z", "/repo");
+            archived.archive();
+            let json = session_json(&archived, "p", false);
+            assert_eq!(json.state, "archived");
+            assert!(json.archived_at.is_some());
+            assert!(json.trashed_at.is_none());
+
+            let mut trashed = Instance::new("z", "/repo");
+            trashed.trash();
+            let json = session_json(&trashed, "p", false);
+            assert_eq!(json.state, "trashed");
+            assert!(json.trashed_at.is_some());
+            assert!(json.archived_at.is_none());
+        }
+        #[test]
+        fn session_json_mirrors_the_api_snooze_and_pin_keys() {
+            let now = chrono::Utc::now();
+            let future = now + chrono::Duration::minutes(15);
+            let past = now - chrono::Duration::minutes(15);
+            let row = |f: &dyn Fn(&mut Instance)| {
+                let mut inst = Instance::new("z", "/repo");
+                f(&mut inst);
+                inst
+            };
+            let check = |label: &str, f: &dyn Fn(&mut Instance), snooze: bool, pin: bool, state| {
+                let value = serde_json::to_value(session_json(&row(f), "p", false)).unwrap();
+                let seen = (
+                    value.get("snoozed_until").is_some(),
+                    value.get("pinned_at").is_some(),
+                    value["state"].as_str(),
+                );
+                assert_eq!(seen, (snooze, pin, Some(state)), "{label}: {value}");
+            };
+
+            check("plain row", &|_| {}, false, false, "live");
+            check(
+                "active snooze",
+                &|i| i.snoozed_until = Some(future),
+                true,
+                false,
+                "live",
+            );
+            check(
+                "expired snooze",
+                &|i| i.snoozed_until = Some(past),
+                false,
+                false,
+                "live",
+            );
+            check("pinned", &|i| i.pinned_at = Some(now), false, true, "live");
+            check(
+                "snoozed and archived",
+                &|i| {
+                    i.archived_at = Some(now);
+                    i.snoozed_until = Some(future);
+                },
+                true,
+                false,
+                "archived",
+            );
+            check(
+                "pinned and snoozed",
+                &|i| {
+                    i.pinned_at = Some(now);
+                    i.snoozed_until = Some(future);
+                },
+                true,
+                true,
+                "live",
+            );
+            check(
+                "trashed and snoozed",
+                &|i| {
+                    i.snooze(30);
+                    i.trash();
+                },
+                true,
+                false,
+                "trashed",
+            );
+            check(
+                "trashed and pinned",
+                &|i| {
+                    i.pin();
+                    i.trash();
+                },
+                false,
+                true,
+                "trashed",
+            );
+            check(
+                "pinned and archived",
+                &|i| {
+                    i.archived_at = Some(now);
+                    i.pinned_at = Some(now);
+                },
+                false,
+                true,
+                "archived",
+            );
+
+            let active = serde_json::to_value(session_json(
+                &row(&|i| i.snoozed_until = Some(future)),
+                "p",
+                false,
+            ))
+            .unwrap();
+            assert_eq!(
+                active["snoozed_until"],
+                serde_json::to_value(future).unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn human_projections_strip_controls_without_changing_json_values() {
         use clap::Parser;
 

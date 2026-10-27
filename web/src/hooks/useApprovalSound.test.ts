@@ -42,7 +42,7 @@ describe("useApprovalSound", () => {
     vi.useFakeTimers();
     audioInstances = [];
     playImpl = () => Promise.resolve();
-    fetchSettings.mockReset().mockResolvedValue({ sound: { enabled: true, volume: 1.0, on_approval: "ding" } });
+    fetchSettings.mockReset().mockResolvedValue({ sound: { enabled: true, browser_volume: 1.0, on_approval: "ding" } });
     fetchSoundBlob.mockReset().mockResolvedValue(new Blob(["audio"], { type: "audio/wav" }));
     vi.stubGlobal("Audio", FakeAudio);
     vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:fake-url");
@@ -120,7 +120,7 @@ describe("useApprovalSound", () => {
   });
 
   it.each([1.5, undefined])("clamps volume %s into the 0..1 audio range", async (volume) => {
-    fetchSettings.mockResolvedValue({ sound: { enabled: true, on_approval: "ding", volume } });
+    fetchSettings.mockResolvedValue({ sound: { enabled: true, on_approval: "ding", browser_volume: volume } });
     await walk(1);
     expect(audioInstances[0]!.volume).toBe(1);
   });

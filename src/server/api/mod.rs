@@ -16,6 +16,7 @@ pub(crate) mod plugin_settings;
 pub mod plugins;
 mod projects;
 mod queue;
+mod sandbox_image;
 pub(crate) mod sessions;
 mod skills;
 pub(crate) mod system;
@@ -53,6 +54,7 @@ pub use plugins::{
     set_plugin_enabled, start_plugin_install, start_plugin_uninstall,
 };
 pub use projects::{create_project, delete_project, list_projects, update_project};
+pub use sandbox_image::{sandbox_image_dismiss, sandbox_image_pull, sandbox_image_status};
 pub use sessions::{
     abandon_purge, attach_session_project, cancel_creation, create_session,
     create_session_progress, delete_session, delete_workspace, ensure_container_terminal,
@@ -161,11 +163,12 @@ pub(super) fn bare_not_found() -> axum::response::Response {
 pub(crate) fn start_blocked_response(
     blocked: crate::session::StartBlocked,
 ) -> axum::response::Response {
-    api_error(
-        axum::http::StatusCode::CONFLICT,
-        blocked.code(),
-        blocked.to_string(),
-    )
+    use crate::daemon::ApiErrorCode;
+    let code = match blocked {
+        crate::session::StartBlocked::Archived => ApiErrorCode::SessionArchived,
+        crate::session::StartBlocked::Trashed => ApiErrorCode::SessionTrashed,
+    };
+    api_error_with_code_header(code, blocked.to_string())
 }
 
 pub(crate) fn api_error(
@@ -425,6 +428,8 @@ mod tests {
             (Method::PATCH, "/api/groups/collapse"),
             (Method::POST, "/api/reorder"),
             (Method::DELETE, "/api/workspaces"),
+            (Method::POST, "/api/sandbox/image-pull"),
+            (Method::POST, "/api/sandbox/image-dismiss"),
         ] {
             let mut request = Request::builder()
                 .method(method.clone())

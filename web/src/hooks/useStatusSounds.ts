@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
 import { useLatestRef } from "./useLatestRef";
 import type { SessionResponse, SessionStatus } from "../lib/types";
 import { approvalChimedRecently, playSoundFor } from "../lib/soundPlayer";
@@ -8,23 +8,39 @@ import { nextStatusSoundState, soundDueFor, type StatusSoundEvent, type StatusSo
 const COALESCE_MS = 500;
 
 /** Plays the waiting, idle and error sounds for every session, from each session list refresh. */
-export function useStatusSounds(sessions: readonly SessionResponse[]): {
+export function useStatusSounds(
+  sessions: readonly SessionResponse[],
+  activeSessionId: string | null,
+): {
   onSoundDue: (id: string, event: StatusSoundEvent) => void;
   cancelCue: (id: string) => void;
 } {
   const stateRef = useRef<StatusSoundState | null>(null);
   const sessionsRef = useLatestRef(sessions);
-  const lastPlayedRef = useRef(new Map<StatusSoundEvent, number>());
+  const activeRef = useRef(activeSessionId);
+  // The sessions behind one coalesced sound, kept so the browser scope can still play it if any is eligible.
+  const burstRef = useRef(new Map<StatusSoundEvent, { at: number; ids: string[] }>());
+
+  useLayoutEffect(() => {
+    activeRef.current = activeSessionId;
+  }, [activeSessionId]);
   // Cues rejected against a list that had not caught up yet, with the status it still showed; the server will
   // not resend them. A cue lives until the list moves past that status.
   const pendingRef = useRef(new Map<string, { event: StatusSoundEvent; stale: SessionStatus }>());
 
   const playOnce = useCallback((id: string, event: StatusSoundEvent, now: number) => {
     if (event === "waiting" && approvalChimedRecently(id, now)) return;
-    const last = lastPlayedRef.current.get(event);
-    if (last !== undefined && now - last < COALESCE_MS) return;
-    lastPlayedRef.current.set(event, now);
-    void playSoundFor(event);
+    const burst = burstRef.current.get(event);
+    if (burst && now - burst.at < COALESCE_MS) {
+      burst.ids.push(id);
+      return;
+    }
+    const next = { at: now, ids: [id] };
+    burstRef.current.set(event, next);
+    void playSoundFor(event, { sessionIds: next.ids, activeSessionId: () => activeRef.current }).then((played) => {
+      // A sound the scope dropped must not swallow the next cue's window.
+      if (!played && burstRef.current.get(event) === next) burstRef.current.delete(event);
+    });
   }, []);
 
   const replayPending = useCallback(

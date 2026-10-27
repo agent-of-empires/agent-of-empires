@@ -44,6 +44,7 @@ environment = ["ANTHROPIC_API_KEY"]
 |--------|---------|-------------|
 | `enabled_by_default` | `false` | Auto-enable the sandbox for new sessions. Overridable per project. |
 | `default_image` | `aoe-sandbox:latest` | Image to run |
+| `allow_image_pull` | `true` | Let the web dashboard pull a newer sandbox image on the host, as the daemon user. Off, the dashboard shows the pull command to run instead. Global only, and the dashboard can't turn it on; pulling is always blocked in read-only and CityHall mode |
 | `container_runtime` | `docker` | `docker`, `podman`, or `apple_container`. Global only; a profile or repo override is ignored |
 | `auto_cleanup` | `true` | Remove the container when the session is deleted |
 | `cpu_limit` / `memory_limit` | (none) | Per-container limits, e.g. `"4"` and `"8g"` |
