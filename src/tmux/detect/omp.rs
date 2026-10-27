@@ -813,7 +813,7 @@ impl<'a> Surface<'a> {
                 if dialog_footer(lines, composer).is_some()
                     || history_footer(lines, composer).is_some()
                 {
-                    mask_composer(lines, composer, None);
+                    lines[composer.start..=composer.end].fill("│ │");
                 }
                 before = composer.start;
             }

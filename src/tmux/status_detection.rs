@@ -2742,9 +2742,12 @@ Final prose line.\n";
         }
 
         let old_ask = "╭─ Ask ─────────╮\n│ ❯ Yes │\n│   No │\n│ Enter select · n note · Esc cancel │\n╰───────────────╯";
+        let clipped_ask =
+            "│   Yes │\n│ ❯ No │\n│ Enter select · n note · Esc cancel │\n╰───────────────╯";
         for (prefix, title, expected) in [
             ("", "", None),
             (old_ask, "", None),
+            (clipped_ask, "", None),
             ("\n  Esc Waiting\n", "", None),
             ("", "π ⠋ Task", Some(Status::Running)),
             (
@@ -2761,13 +2764,16 @@ Final prose line.\n";
                     .unwrap();
             assert_eq!(detection.status, expected, "{prefix}: {title}");
         }
-        let covered = format!("{old_ask}\n{empty}");
-        assert_eq!(
-            crate::tmux::detect::detect("omp", &covered, &Observation::new("", None, false))
-                .unwrap()
-                .status,
-            Some(Status::Idle),
-        );
+        for prior in [old_ask, clipped_ask] {
+            let covered = format!("{prior}\n{empty}");
+            assert_eq!(
+                crate::tmux::detect::detect("omp", &covered, &Observation::new("", None, false))
+                    .unwrap()
+                    .status,
+                Some(Status::Idle),
+                "{prior}"
+            );
+        }
 
         for pane in [
             OMP_HISTORY_SEARCH.replace("History", "Saved prompts"),
