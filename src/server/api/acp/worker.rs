@@ -2722,11 +2722,11 @@ mod tests {
             switch_acp_agent(
                 State(state.clone()),
                 Path(id.clone()),
-                Json(crate::acp::protocol::SwitchAgentRequest {
+                Ok(Json(crate::acp::protocol::SwitchAgentRequest {
                     target: "codex".to_string(),
                     model: None,
                     reason: None,
-                }),
+                })),
             )
             .await
             .into_response()
