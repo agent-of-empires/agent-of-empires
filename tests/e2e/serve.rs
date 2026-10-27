@@ -1055,8 +1055,9 @@ async fn native_creation_progress_reports_phases_to_the_local_stream() {
     }
     let release = ReleaseHook(tempfile::tempdir_in(h.home_path()).unwrap());
     let command = format!(
-        ": > {gate:?}/started; echo building dependency graph; while [ -d {gate:?} ] && [ ! -f {gate:?}/release ]; do sleep 0.05; done; if [ -d {gate:?} ]; then : > {gate:?}/finished; fi",
-        gate = release.0.path()
+        ": > {gate:?}/started; echo building dependency graph; i=0; while [ -d {gate:?} ] && [ ! -f {gate:?}/release ] && [ \"$i\" -lt {max_polls} ]; do i=$((i+1)); sleep 0.05; done; if [ -d {gate:?} ]; then : > {gate:?}/finished; test -f {gate:?}/release; fi",
+        gate = release.0.path(),
+        max_polls = (PHASE_TIMEOUT * 6).as_millis() / 50
     );
     let mut config = std::fs::read_to_string(&config_path).unwrap();
     config.push_str(&format!(
