@@ -663,6 +663,10 @@ impl ServeLaunch {
         args.port = requested.port;
         args.host = requested.host;
         args.remote = requested.remote;
+        if !args.remote {
+            args.tunnel_name = None;
+            args.tunnel_url = None;
+        }
         args.no_tailscale = requested.no_tailscale;
         args.passphrase = requested.passphrase;
         args
@@ -2514,13 +2518,15 @@ mod tests {
             assert!(args.dangerously_allow_plaintext_remote);
             assert_eq!(args.allowed_host, recorded.allowed_host);
             assert_eq!(args.allowed_origin, recorded.allowed_origin);
-            assert_eq!(args.tunnel_name, recorded.tunnel_name);
-            assert_eq!(args.tunnel_url, recorded.tunnel_url);
             assert_eq!(args.auth, Some(AuthMode::Token));
             assert_eq!(args.port, Some(8080));
         }
         assert!(!local.remote && local.host == "0.0.0.0");
         assert!(tunnel.remote && tunnel.host == "127.0.0.1");
+        // clap requires `--remote` for the tunnel flags, so a Local restart must not replay them.
+        assert_eq!((&local.tunnel_name, &local.tunnel_url), (&None, &None));
+        assert_eq!(tunnel.tunnel_name, recorded.tunnel_name);
+        assert_eq!(tunnel.tunnel_url, recorded.tunnel_url);
 
         let mut core = sample_launch();
         core.core_only = true;
