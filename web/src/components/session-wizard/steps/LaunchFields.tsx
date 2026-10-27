@@ -36,10 +36,21 @@ export function LabeledInput({
   );
 }
 
-export function EnvVarList({ values, onChange }: { values: string[]; onChange: (v: string[]) => void }) {
+export function EnvVarList({
+  values,
+  onChange,
+  label = "Environment variables",
+  hint,
+}: {
+  values: string[];
+  onChange: (v: string[]) => void;
+  label?: string;
+  hint?: string;
+}) {
   return (
     <div>
-      <label className="block text-sm text-text-dim mb-1.5">Environment variables</label>
+      <label className="block text-sm text-text-dim mb-1.5">{label}</label>
+      {hint && <p className="text-xs text-text-dim mb-1.5">{hint}</p>}
       {values.map((env, i) => (
         <div key={i} className="flex gap-2 mb-1">
           <input

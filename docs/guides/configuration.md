@@ -460,7 +460,7 @@ Scope note: `before_session` applies to the **agent** launch, matching the stati
 The command's environment carries:
 
 - **Lifecycle variables:** `AOE_SESSION_ID`, `AOE_SESSION_TITLE`, `AOE_PROJECT_PATH`, `AOE_PROFILE`, `AOE_TOOL`, `AOE_GROUP_PATH`, `AOE_SESSION_BRANCH` for worktrees, and `AOE_REPO_SLUG` when the origin remote parses as `owner/repo`. Structured `before_session` receives the available subset: ID, profile, tool and project path.
-- **Sandbox input** (`before_start` only): the session's environment, or its effective profile/global `sandbox.environment`. Set per-session values in the new-session dialog. Repo config cannot supply this host-hook input. `aoe add --sandbox --hook-env KEY=VALUE` (repeatable) adds hook-only input that wins a same-key entry and never enters the container; a value the container needs must be printed by the hook as `KEY=VALUE`.
+- **Sandbox input** (`before_start` only): the session's environment, or its effective profile/global `sandbox.environment`. Set per-session values in the new-session dialog. Repo config cannot supply this host-hook input. `aoe add --sandbox --hook-env KEY=VALUE` (repeatable), or the web wizard's Host hook environment list, adds hook-only input that wins a same-key entry and never enters the container; a value the container needs must be printed by the hook as `KEY=VALUE`.
 
 `host_hooks` is **global/profile only**: it is never honored from a repo's `.agent-of-empires/config.toml`, because a checked-out repository must not be able to run host commands. Declare it in your global or profile `config.toml`.
 

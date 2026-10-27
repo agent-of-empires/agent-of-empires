@@ -32,6 +32,7 @@ export interface WizardData {
   sandboxEnabled: boolean;
   sandboxImage: string;
   extraEnv: string[];
+  hookEnv: string[];
   extraRepoPaths: string[];
   /** Per extra repo base branch, keyed by path; outranks `baseBranch`. */
   repoBases: Record<string, string>;
@@ -120,6 +121,7 @@ export const initialData: WizardData = {
   sandboxEnabled: false,
   sandboxImage: "",
   extraEnv: [],
+  hookEnv: [],
   extraRepoPaths: [],
   repoBases: {},
   profileDirty: false,

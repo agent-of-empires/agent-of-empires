@@ -395,6 +395,8 @@ export interface CreateSessionRequest {
   extra_args?: string;
   sandbox_image?: string;
   extra_env?: string[];
+  /** Host-only env for `host_hooks.before_start`; sandbox only, never enters the container. */
+  hook_env?: string[];
   extra_repo_paths?: string[];
   /** Per-repo base (`repo` is a directory name or path); outranks `base_branch`. */
   repo_bases?: { repo: string; base_branch: string }[];
