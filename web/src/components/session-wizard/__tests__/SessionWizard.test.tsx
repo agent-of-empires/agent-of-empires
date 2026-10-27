@@ -1086,6 +1086,42 @@ describe("SessionWizard Yolo mode", () => {
     await waitFor(() => expect(yoloRow()).toContain("skips permission prompts"));
     expect(yolo().getAttribute("aria-checked")).toBe("true");
   });
+
+  const AGENTS = [agent("claude"), agent("pi", { always_yolo: true, acp_capable: false })];
+  const launchButton = () => screen.getByText(/Launch session/).closest("button") as HTMLButtonElement;
+
+  it("waits for the agent list before promising prompts or launching", async () => {
+    let answer: (agents: typeof AGENTS) => void = () => {};
+    vi.mocked(fetchAgents).mockReturnValue(new Promise((resolve) => (answer = resolve)));
+    vi.mocked(fetchSettings).mockResolvedValueOnce({ session: { yolo_mode_default: false }, sandbox: {} } as never);
+    renderWizard({ path: "/tmp/proj", tool: "pi" });
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
+    // Let the profile defaults settle, which alone used to enable Launch.
+    await act(async () => {});
+    expect(yoloRow()).toContain("checking the agent…");
+    expect(yoloRow()).not.toContain("asks before running commands");
+    expect(launchButton().disabled).toBe(true);
+
+    await act(async () => answer(AGENTS));
+    expect(yoloRow()).toContain("always on for pi");
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload()).toMatchObject({ tool: "pi", yolo_mode: true });
+  });
+
+  it("retries a failed agent list, keeping Launch off until it loads", async () => {
+    vi.mocked(fetchAgents).mockResolvedValueOnce(null).mockResolvedValue(AGENTS);
+    renderWizard({ path: "/tmp/proj", tool: "pi" });
+    await screen.findByText(/Couldn't load the agent list/);
+    expect(yoloRow()).toContain("checking the agent…");
+    expect(launchButton().disabled).toBe(true);
+    await waitFor(() => expect(yoloRow()).toContain("always on for pi"), { timeout: 3000 });
+    expect(fetchAgents).toHaveBeenCalledTimes(2);
+    expect(screen.queryByText(/Couldn't load the agent list/)).toBeNull();
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload()).toMatchObject({ tool: "pi", yolo_mode: true });
+  });
 });
 
 describe("SessionWizard Container runtime", () => {

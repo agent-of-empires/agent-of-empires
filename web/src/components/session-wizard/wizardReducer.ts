@@ -61,6 +61,8 @@ export interface WizardState {
   isSubmitting: boolean;
   error: string | null;
   agents: AgentInfo[];
+  /** Until "ready", which agents always run in Yolo mode is unknown. */
+  agentsStatus: "loading" | "ready" | "failed";
   groups: GroupInfo[];
   /** Which profile `groups` was fetched for; any other profile sees no Groups. */
   groupsFor: string | null;
@@ -79,6 +81,7 @@ export type Action =
   | { type: "SUBMIT_SUCCESS" }
   | { type: "SUBMIT_CANCEL" }
   | { type: "SET_AGENTS"; agents: AgentInfo[] }
+  | { type: "AGENTS_FAILED" }
   | { type: "SET_GROUPS"; groups: GroupInfo[]; groupsFor: string }
   | { type: "SET_PROFILES"; profiles: ProfileInfo[] }
   | { type: "SET_DOCKER"; available: boolean; runtimeName: string | null }
@@ -246,7 +249,9 @@ export function reducer(state: WizardState, action: Action): WizardState {
     case "SUBMIT_CANCEL":
       return { ...state, isSubmitting: false, error: null };
     case "SET_AGENTS":
-      return { ...state, agents: action.agents };
+      return { ...state, agents: action.agents, agentsStatus: "ready" };
+    case "AGENTS_FAILED":
+      return { ...state, agentsStatus: "failed" };
     case "SET_GROUPS":
       return { ...state, groups: action.groups, groupsFor: action.groupsFor };
     case "SET_PROFILES":

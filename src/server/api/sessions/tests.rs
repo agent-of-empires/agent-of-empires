@@ -883,6 +883,56 @@ async fn create_receipts_include_published_rows_and_idempotent_retries() -> anyh
 
 #[tokio::test]
 #[serial_test::serial]
+async fn an_always_yolo_agent_records_yolo_mode_whatever_the_request_says() -> anyhow::Result<()> {
+    if !crate::tmux::is_tmux_available() {
+        return Ok(());
+    }
+    let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })?;
+    let project = tempfile::tempdir()?;
+    let state = crate::server::test_support::build_test_app_state(Vec::new());
+    let storage = Storage::new("always-yolo", state.file_watch.clone())?;
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+    let mut panes = Vec::new();
+    for (tool, expected) in [("pi", true), ("claude", false)] {
+        let body = serde_json::from_value(serde_json::json!({
+            "title": format!("yolo {tool}"), "path": project.path(),
+            "tool": tool, "command_override": "sleep 120",
+            "profile": "always-yolo", "yolo_mode": false,
+        }))?;
+        let response = create_session(
+            State(state.clone()),
+            axum::extract::Query(create::CreateSessionQuery { wait: None }),
+            None,
+            None,
+            Ok(Json(body)),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        for instance in storage.load()? {
+            panes.push(crate::tmux::test_helpers::TmuxTestSession::from_name(
+                crate::tmux::Session::generate_name(&instance.id, &instance.title),
+            ));
+        }
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{tool}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let row: SessionResponse = serde_json::from_slice(&bytes)?;
+        assert_eq!(row.yolo_mode, expected, "{tool}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn canonical_fork_refusals_do_not_create_sessions() -> anyhow::Result<()> {
     async fn request(state: Arc<AppState>, body: serde_json::Value) -> axum::response::Response {
         create_session(

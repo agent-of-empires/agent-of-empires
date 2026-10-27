@@ -128,6 +128,8 @@ const NETWORK_RETRIES = 3;
 const MAX_RETRY_DELAY_MS = 30_000;
 const UNKNOWN_OUTCOME_ERROR =
   "Lost connection while creating. The session may still be created; Launch retries the same request.";
+const AGENTS_UNAVAILABLE_ERROR = "Couldn't load the agent list, so Yolo mode can't be shown yet. Retrying…";
+
 const REGISTRY_UNRESOLVED_ERROR =
   "Could not load this project's settings, so its sandbox and worktree defaults are unknown. Select the project again to retry.";
 
@@ -192,6 +194,7 @@ export function SessionWizard({
     isSubmitting: false,
     error: null,
     agents: [],
+    agentsStatus: "loading",
     groups: [],
     groupsFor: null,
     profiles: [],
@@ -283,9 +286,25 @@ export function SessionWizard({
   }, [state.data.profile, groupsKey]);
 
   useEffect(() => {
+    let alive = true;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    const load = (attempt: number) =>
+      void fetchAgents().then((agents) => {
+        if (!alive) return;
+        if (agents) return dispatch({ type: "SET_AGENTS", agents });
+        dispatch({ type: "AGENTS_FAILED" });
+        retry = setTimeout(() => load(attempt + 1), Math.min(1000 * 2 ** attempt, 15000));
+      });
+    load(0);
+    return () => {
+      alive = false;
+      clearTimeout(retry);
+    };
+  }, []);
+
+  useEffect(() => {
     const generations = defaultsGeneration;
     const switches = profileSwitchRef;
-    fetchAgents().then((a) => dispatch({ type: "SET_AGENTS", agents: a }));
     fetchDockerStatus().then((d) =>
       dispatch({ type: "SET_DOCKER", available: d.available, runtimeName: d.runtime_name ?? null }),
     );
@@ -854,11 +873,13 @@ export function SessionWizard({
           onChange={(v) => handleChange("yoloMode", v)}
           disabled={alwaysYolo}
           summary={
-            alwaysYolo
-              ? `always on for ${d.tool}`
-              : d.yoloMode
-                ? "skips permission prompts"
-                : "asks before running commands"
+            state.agentsStatus !== "ready"
+              ? "checking the agent…"
+              : alwaysYolo
+                ? `always on for ${d.tool}`
+                : d.yoloMode
+                  ? "skips permission prompts"
+                  : "asks before running commands"
           }
         />
         <SwitchRow
@@ -957,12 +978,17 @@ export function SessionWizard({
               error={
                 state.error ??
                 (projectUnresolved ? REGISTRY_UNRESOLVED_ERROR : null) ??
+                (state.agentsStatus === "failed" ? AGENTS_UNAVAILABLE_ERROR : null) ??
                 (unknownOutcome ? UNKNOWN_OUTCOME_ERROR : null)
               }
               onSubmit={handleSubmit}
               nameOnly={nameOnly}
               defaultsReady={
-                defaultsReady && !profileSwitching && !projectUnresolved && !(d.sandboxEnabled && !state.dockerChecked)
+                defaultsReady &&
+                state.agentsStatus === "ready" &&
+                !profileSwitching &&
+                !projectUnresolved &&
+                !(d.sandboxEnabled && !state.dockerChecked)
               }
               onBackground={creating && onCreatedInBackground ? handleBackground : undefined}
             />

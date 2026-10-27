@@ -1143,7 +1143,7 @@
         "web/src/components/session-wizard/steps/SandboxPanel.tsx",
         "web/src/components/session-wizard/steps/LaunchFields.tsx"
       ],
-      "notes": "The Yolo mode row says what each value does and is locked on for an Agent whose /api/agents row has always_yolo, which the create then sends; the unavailable Sandbox names the configured Container runtime from /api/docker/status."
+      "notes": "The Yolo mode row says what each value does and is locked on for an Agent whose /api/agents row has always_yolo, which the create then sends; until /api/agents answers (retried on failure) the row promises neither value and Launch waits; the unavailable Sandbox names the configured Container runtime from /api/docker/status."
     },
     {
       "id": "wizard.create-progress",

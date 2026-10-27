@@ -1899,8 +1899,9 @@ export async function signOutAllDevices(): Promise<boolean> {
 
 // --- Wizard APIs ---
 
-export async function fetchAgents(): Promise<AgentInfo[]> {
-  return (await fetchJson<AgentInfo[]>("/api/agents")) ?? [];
+/** Null when the request failed, so callers can tell "no agents" from "unknown". */
+export async function fetchAgents(): Promise<AgentInfo[] | null> {
+  return fetchJson<AgentInfo[]>("/api/agents");
 }
 
 export async function fetchProfiles(): Promise<ProfileInfo[]> {

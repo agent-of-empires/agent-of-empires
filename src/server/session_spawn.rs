@@ -150,7 +150,8 @@ pub(crate) async fn spawn_structured_session(
             fork_seed,
             progress,
         } = spec;
-
+        // The agent skips permission prompts whatever the client asked, so record that.
+        let yolo_mode = yolo_mode || crate::agents::is_always_yolo(&tool);
 
         let sandbox_image = sandbox_image.unwrap_or_else(|| {
             if config.sandbox.default_image.is_empty() {

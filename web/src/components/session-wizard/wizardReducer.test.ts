@@ -8,6 +8,7 @@ function makeState(data: Partial<WizardData> = {}): WizardState {
     isSubmitting: false,
     error: null,
     agents: [],
+    agentsStatus: "ready",
     groups: [],
     groupsFor: null,
     profiles: [],
