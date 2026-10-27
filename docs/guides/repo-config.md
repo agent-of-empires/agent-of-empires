@@ -4,9 +4,7 @@ A repo can carry `.agent-of-empires/config.toml` so team members share project d
 
 The [hook trust system](#hook-trust-system) requires each developer to approve commands before they run.
 
-## Configuration Sections
-
-### Hooks
+## Hooks
 
 ```toml
 [hooks]
@@ -20,7 +18,7 @@ on_destroy = ["docker-compose down"]
 
 Native starts release their API locks while pre-launch hooks run, so hooks can call the daemon. The session keeps its lifecycle reservation: a competing start or stop returns a conflict rather than taking ownership. The launcher revalidates that reservation after the hook, before spawning the agent.
 
-**`on_destroy`** runs when a session is deleted, before worktree and sandbox cleanup. This lets teardown commands access resources that are still available (e.g. running containers). Failures are logged as warnings but never prevent deletion. Use this for cleanup like stopping Docker services or removing temporary resources.
+- **`on_destroy`** runs before worktree and sandbox cleanup, while their resources remain available. Failures warn without preventing deletion.
 For a host-side equivalent that always runs outside the container, see [`host_hooks.before_destroy`](configuration.md#host-hooks).
 
 Hooks run inside the container for a sandboxed session and in your host shell otherwise, so a path can resolve in one mode and not the other. An absolute host path fails in the container unless `sandbox.extra_volumes` mounts it, and a repo cannot set that key. Guard optional scripts on their presence only, so a real failure still aborts creation:
@@ -38,7 +36,7 @@ Lifecycle hooks receive `AOE_SESSION_ID`, `AOE_SESSION_TITLE`, `AOE_PROJECT_PATH
 
 ```toml
 [hooks]
-on_create = ["port \"$AOE_SESSION_TITLE\""]
+on_create  = ["port \"$AOE_SESSION_TITLE\""]
 on_destroy = ["port rm \"$AOE_SESSION_TITLE\""]
 ```
 
@@ -73,8 +71,7 @@ volume_ignores = ["node_modules", ".next"]
 auto_cleanup = true
 ```
 
-
-## Hook Trust System
+## Hook trust system
 
 AoE prompts before running repo hooks and stores trust decisions globally, shared across profiles. Changed commands require approval again. The same gate covers [project-local MCP servers](mcp-servers.md#project-local-servers-need-repo-trust).
 
