@@ -87,7 +87,7 @@ export function ProjectsSection({
         ))}
       {expanded && visible.length === 0 && !compact && (
         <p className="px-3 py-2 text-[12px] text-text-dim">
-          {query ? "No matching projects." : "No registered projects. Add one to keep a repo handy without a session."}
+          {query ? "No matching projects." : "No registered Projects. Add one to keep a repo handy without a session."}
         </p>
       )}
     </div>

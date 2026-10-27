@@ -145,7 +145,7 @@ describe("ProjectsSection", () => {
     expect(screen.getByText("No matching projects.")).toBeTruthy();
     cleanup();
     renderSection({ projects: [] });
-    expect(screen.getByText(/No registered projects/)).toBeTruthy();
+    expect(screen.getByText(/No registered Projects\./)).toBeTruthy();
     cleanup();
     renderSection({ projects: [], readOnly: true });
     expect(screen.queryByTestId("sidebar-projects-section")).toBeNull();
