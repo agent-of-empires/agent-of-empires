@@ -184,9 +184,38 @@ describe("SandboxImageBanner", () => {
     const calls = fetchSandboxImageStatus.mock.calls.length;
     await pollAfter(2000);
     expect(fetchSandboxImageStatus.mock.calls.length).toBe(calls + 1);
+    // Also once a status has shown the pull running and a later request fails.
+    fetchSandboxImageStatus.mockResolvedValue(status({ pull: { state: "running" } }));
+    await pollAfter(2000);
+    fetchSandboxImageStatus.mockResolvedValue({ error: "http_500" });
+    await pollAfter(2000);
+    const afterFailure = fetchSandboxImageStatus.mock.calls.length;
+    await pollAfter(2000);
+    expect(fetchSandboxImageStatus.mock.calls.length).toBe(afterFailure + 1);
     fetchSandboxImageStatus.mockResolvedValue(status({ state: "current", pull: { state: "done" } } as never));
     await pollAfter(2000);
     expect(banner()?.getAttribute("aria-label")).toBe("Sandbox image updated");
+  });
+
+  it("follows the Daemon's pull when the Update now reply is lost", async () => {
+    await mount(status());
+    // A network failure: no reply, so no refusal message either.
+    pullSandboxImage.mockResolvedValueOnce({ ok: false });
+    fetchSandboxImageStatus.mockResolvedValue(status({ pull: { state: "running" } }));
+    fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+    await pollAfter(0);
+    expect(banner()?.getAttribute("aria-label")).toBe("Downloading sandbox image");
+    fetchSandboxImageStatus.mockResolvedValue(status({ state: "current", pull: { state: "done" } } as never));
+    await pollAfter(2000);
+    expect(banner()?.getAttribute("aria-label")).toBe("Sandbox image updated");
+  });
+
+  it("hides an earlier available update once a check fails", async () => {
+    await mount(status());
+    expect(banner()).not.toBeNull();
+    fetchSandboxImageStatus.mockResolvedValue({ ...status(), state: "check_failed", error: "registry timed out" });
+    await pollAfter(60 * 60_000);
+    expect(banner()).toBeNull();
   });
 
   it("keeps text at text contrast on the tints, with the state colour on the dot", async () => {

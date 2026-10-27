@@ -43,14 +43,20 @@ export function useSandboxImageBanner(): SandboxImageBannerView | null {
       const seq = ++latest;
       const s = await fetchSandboxImageStatus();
       if (cancelled || seq !== latest) return;
-      const refused = s && "error" in s ? s.error : null;
+      // A status always has `state`; a failed check carries an `error` too, so `error` alone
+      // doesn't mark a refusal.
+      const answer = s && "state" in s ? s : null;
+      const refused = s && !("state" in s) ? s.error : null;
       setConfigUnreadable(refused === "config_unreadable");
-      const answer = s && !("error" in s) ? s : null;
       if (answer) {
         setStatus(answer);
-        if (answer.pull.state === "running") setWatchedPull(true);
+        if (answer.pull.state === "running") {
+          setWatchedPull(true);
+          // The Daemon is pulling after all, e.g. the "Update now" reply was lost on the way.
+          setRefusal(null);
+        }
+        expectingPull.current = answer.pull.state === "running";
       }
-      if (answer) expectingPull.current = false;
       if (timer) clearTimeout(timer);
       const pulling = answer ? answer.pull.state === "running" : expectingPull.current;
       timer = setTimeout(poll, pulling ? PULL_POLL_MS : POLL_MINUTES * 60_000);
