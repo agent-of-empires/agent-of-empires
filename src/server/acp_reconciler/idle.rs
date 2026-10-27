@@ -199,7 +199,7 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
     let now_ms = chrono::Utc::now().timestamp_millis();
     for (id, profile, idle_secs, lease) in live {
         // A resume is activity: its prompt is recorded only after the worker is ready.
-        let last_ms = latest.get(&id).map(|&ms| ms.max(lease.admitted_at_ms()));
+        let last_ms = latest.get(&id).map(|&ms| ms.max(lease.idle_baseline_ms()));
         if !should_auto_stop(now_ms, last_ms, idle_secs, false) {
             continue;
         }
@@ -292,11 +292,16 @@ mod tests {
         #[derive(Debug)]
         enum Worker {
             Starting,
-            Running { admitted_secs_ago: i64 },
+            /// Admitted an hour ago, installed just now.
+            SlowStart,
+            Running {
+                admitted_secs_ago: i64,
+            },
         }
         // (worker, reaped)
         let cases = [
             (Worker::Starting, false),
+            (Worker::SlowStart, false),
             (
                 Worker::Running {
                     admitted_secs_ago: 0,
@@ -334,10 +339,16 @@ mod tests {
             let sup = &state.acp_supervisor;
             let (_hold, before) = match worker {
                 Worker::Starting => (Some(sup.test_hold_starting(id)), Resuming),
+                Worker::SlowStart => {
+                    let lease = sup.test_hold_starting(id);
+                    lease.test_backdate_idle_baseline(Utc::now().timestamp_millis() - 3_600_000);
+                    sup.test_finish_starting(&lease);
+                    (None, Running)
+                }
                 Worker::Running { admitted_secs_ago } => {
                     sup.test_insert_worker(id).await;
                     let lease = sup.running_lease(id).unwrap();
-                    lease.test_backdate_admission(
+                    lease.test_backdate_idle_baseline(
                         Utc::now().timestamp_millis() - admitted_secs_ago * 1000,
                     );
                     (None, Running)

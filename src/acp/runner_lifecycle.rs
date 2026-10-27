@@ -151,8 +151,9 @@ struct Construction {
     retire_previous: std::sync::atomic::AtomicBool,
     spawn_attestor:
         Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<bool>>>>,
-    /// Wall-clock ms; atomic only so tests can backdate it.
-    admitted_at_ms: std::sync::atomic::AtomicI64,
+    /// Wall-clock ms of admission, refreshed on install so a slow start
+    /// does not read as idle; atomic only so tests can backdate it.
+    idle_baseline_ms: std::sync::atomic::AtomicI64,
 }
 
 impl Default for Construction {
@@ -173,7 +174,7 @@ impl Default for Construction {
             previous_runner: Mutex::default(),
             retire_previous: std::sync::atomic::AtomicBool::new(false),
             spawn_attestor: Mutex::default(),
-            admitted_at_ms: std::sync::atomic::AtomicI64::new(
+            idle_baseline_ms: std::sync::atomic::AtomicI64::new(
                 chrono::Utc::now().timestamp_millis(),
             ),
         }
@@ -205,17 +206,17 @@ pub(crate) struct AdapterRetirementRoute {
 }
 
 impl Lease {
-    /// When this epoch's start was admitted, in ms since the Unix epoch.
-    pub(crate) fn admitted_at_ms(&self) -> i64 {
+    /// When this epoch was admitted or last became running, in ms since the Unix epoch.
+    pub(crate) fn idle_baseline_ms(&self) -> i64 {
         self.construction
-            .admitted_at_ms
+            .idle_baseline_ms
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(test)]
-    pub(crate) fn test_backdate_admission(&self, ms: i64) {
+    pub(crate) fn test_backdate_idle_baseline(&self, ms: i64) {
         self.construction
-            .admitted_at_ms
+            .idle_baseline_ms
             .store(ms, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -940,6 +941,10 @@ impl LifecycleTable {
         }
         lease.claim_runner_ownership();
         entry.phase = Phase::Running { identity };
+        lease.construction.idle_baseline_ms.store(
+            chrono::Utc::now().timestamp_millis(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if let Some(identity) = identity {
             self.note_generation(&lease.session_id, identity.generation);
         }

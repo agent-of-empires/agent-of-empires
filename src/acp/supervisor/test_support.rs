@@ -51,6 +51,13 @@ impl<S: BroadcastSink> Supervisor<S> {
             .expect("admit")
     }
 
+    /// Finish a start `test_hold_starting` left open, as installation does.
+    pub(crate) fn test_finish_starting(&self, lease: &Lease) {
+        lock_recover(&self.lifecycle)
+            .install(lease, None)
+            .expect("install");
+    }
+
     /// End a teardown `test_hold_stopping` left open.
     pub(crate) fn test_settle_stopping(&self, lease: &Lease) {
         lock_recover(&self.lifecycle).settle(lease, Settlement::Proven);
