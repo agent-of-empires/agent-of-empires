@@ -1151,6 +1151,46 @@ mod tests {
         assert!(PathBuf::from(&original).exists());
     }
 
+    /// A shared worktree stays put when the other session's path is spelled through a symlink, or
+    /// when a store holds a row that cannot be decoded and so might be a sharer.
+    #[test]
+    #[serial_test::serial]
+    fn shared_worktree_guard_sees_symlinked_paths_and_undecodable_rows() {
+        if !git_available() {
+            return;
+        }
+        for undecodable in [false, true] {
+            let (tmp, mut inst) = real_worktree_instance();
+            let _home = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("home"));
+            let store = crate::session::Storage::new_unwatched("other").unwrap();
+            if undecodable {
+                store.update(|_, _| Ok(())).unwrap();
+                let mut rows: Vec<serde_json::Value> =
+                    serde_json::from_slice(&std::fs::read(store.sessions_path()).unwrap()).unwrap();
+                rows.push(serde_json::json!({ "not": "a session" }));
+                std::fs::write(store.sessions_path(), serde_json::to_vec(&rows).unwrap()).unwrap();
+            } else {
+                let alias = tmp.path().join("alias");
+                std::os::unix::fs::symlink(tmp.path().join("wt"), &alias).unwrap();
+                let sharer = Instance::new("sharer", alias.join("feature").to_str().unwrap());
+                store
+                    .update(|instances, _groups| {
+                        instances.push(sharer);
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            inst.trash();
+
+            let out = relocate_worktree_to_trash(&mut inst);
+            assert!(
+                matches!(out, RelocateOutcome::Skipped),
+                "undecodable={undecodable}: expected the relocation to be skipped, got {out:?}"
+            );
+            assert!(inst.pre_trash_project_path.is_none());
+        }
+    }
+
     /// Upgrade path for #3215: a row relocated by an earlier version. The purge
     /// now preserves the checkout, so leaving it in the holding area would
     /// orphan it once the row is cleared. Reconciliation moves it back.

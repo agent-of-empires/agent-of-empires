@@ -2190,6 +2190,20 @@ impl Storage {
         Ok(bundle)
     }
 
+    /// Read every session row without taking the storage flock, failing on any
+    /// row that cannot be decoded instead of skipping it.
+    pub(crate) fn load_instances_complete(&self) -> Result<Vec<Instance>> {
+        let opened;
+        let files = match self.files.as_deref() {
+            Some(files) => files,
+            None => {
+                opened = ProfileFiles::open(&self.sessions_path, ProfileRootPolicy::Canonical)?;
+                &opened
+            }
+        };
+        self.load_instances(ReadPolicy::Complete(files))
+    }
+
     pub(crate) fn verify_bound_profile(&self) -> Result<()> {
         self.files
             .as_deref()
