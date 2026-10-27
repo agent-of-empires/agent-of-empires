@@ -45,6 +45,7 @@ import {
   type PendingCreate,
 } from "../../lib/pendingCreates";
 import { hasFinePointer } from "../../lib/platform";
+import { useServerDown } from "../../lib/connectionState";
 import { ProjectStep } from "./steps/ProjectStep";
 import { ExtraReposPicker } from "./steps/ExtraReposPicker";
 import { AgentPanel } from "./steps/AgentPanel";
@@ -58,7 +59,7 @@ import { CreateProgressView } from "./CreateProgressView";
 import { FieldRow, NavRow, PanelHeader, ROW_INPUT, RowGroup, SwitchRow } from "./WizardRows";
 import { LaunchFooter } from "./LaunchFooter";
 import { initialData, reducer, type WizardData } from "./wizardReducer";
-import { buildCreateRequest } from "./createRequest";
+import { buildCreateRequest, launchEligible } from "./createRequest";
 import { commandMapsFromSettings, EMPTY_COMMAND_MAPS, type CommandMaps } from "./commandMaps";
 import { profileDefaults, type ProfileDefaults } from "./profileDefaults";
 
@@ -227,6 +228,7 @@ export function SessionWizard({
   // A Retry found the Container runtime still down after a sandbox_unavailable failure.
   const [runtimeDown, setRuntimeDown] = useState(false);
   const [rechecking, setRechecking] = useState(false);
+  const offline = useServerDown();
   const [progress, setProgress] = useState<CreateProgress | null>(null);
   const [progressKey, setProgressKey] = useState<string | null>(null);
   const [showProgress, setShowProgress] = useState(false);
@@ -751,6 +753,8 @@ export function SessionWizard({
         if (unmountedRef.current) return;
         setRechecking(false);
         dispatch({ type: "SET_DOCKER", available: status.available, runtimeName: status.runtime_name ?? null });
+        // Launch may be blocked now, or an edit made this closure's form stale; Retry stays offered.
+        if (!canResendRef.current || dataRef.current !== state.data) return;
         if (status.available) await handleSubmit({}, true);
         else setRuntimeDown(true);
         return;
@@ -780,6 +784,19 @@ export function SessionWizard({
   const failed = state.failure && failureView(state.failure, { sandboxEnabled: d.sandboxEnabled, runtimeDown });
   // A scratch session has no project whose overrides could be unknown.
   const projectUnresolved = registryUnresolved && !d.scratch && !d.importAcpSessionId;
+  // Only the Yolo row needs the agent list, and a name-only form has none.
+  const formReady =
+    defaultsReady && (nameOnly || state.agentsStatus === "ready") && !profileSwitching && !projectUnresolved;
+  const canResend = launchEligible(d, { ready: formReady, offline, nameOnly });
+  const canResendRef = useRef(canResend);
+  useEffect(() => {
+    canResendRef.current = canResend;
+  }, [canResend]);
+  const resendBlocked = (action: FailureAction) => {
+    if (action === "change_image" || action === "choose_project") return false;
+    // Retry checks the runtime itself, and Launch without Sandbox doesn't need it.
+    return !canResend || (action === "try_again" && d.sandboxEnabled && !state.dockerChecked);
+  };
   const selectedAgent = state.agents.find((a) => a.name === d.tool);
   const acpCapable = isAcpEligible(d.tool, selectedAgent);
   const isHostOnly = selectedAgent?.host_only ?? false;
@@ -1073,6 +1090,7 @@ export function SessionWizard({
                     output={progress?.output ?? []}
                     onAction={(action) => void handleFailureAction(action)}
                     busy={rechecking}
+                    blocked={resendBlocked}
                   />
                 )
               }
@@ -1084,14 +1102,7 @@ export function SessionWizard({
               }
               onSubmit={() => void handleSubmit()}
               nameOnly={nameOnly}
-              defaultsReady={
-                defaultsReady &&
-                // Only the Yolo row needs the agent list, and a name-only form has none.
-                (nameOnly || state.agentsStatus === "ready") &&
-                !profileSwitching &&
-                !projectUnresolved &&
-                !(d.sandboxEnabled && !state.dockerChecked)
-              }
+              defaultsReady={formReady && !(d.sandboxEnabled && !state.dockerChecked)}
               onBackground={creating && onCreatedInBackground ? handleBackground : undefined}
             />
           </div>
