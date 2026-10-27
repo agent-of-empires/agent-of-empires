@@ -2689,10 +2689,7 @@ Final prose line.\n";
             for preset in ["unicode", "ascii", "nerd"] {
                 let pane = match preset {
                     "ascii" => history
-                        .replace('╭', "+")
-                        .replace('╮', "+")
-                        .replace('╰', "+")
-                        .replace('╯', "+")
+                        .replace(['╭', '╮', '╰', '╯'], "+")
                         .replace('─', "-")
                         .replace('│', "|")
                         .replace('❯', ">")
