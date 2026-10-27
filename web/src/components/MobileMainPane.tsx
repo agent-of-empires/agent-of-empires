@@ -17,6 +17,8 @@ import type { RepoBase, RichDiffFile, SessionResponse } from "../lib/types";
 import type { useDiffComments } from "../hooks/useDiffComments";
 import type { WebSettings } from "../hooks/useWebSettings";
 import type { FileRef } from "../lib/fileRef";
+import type { ServerAbout } from "../lib/api";
+import { autoResumeSettingsHref } from "../lib/autoResumeSettingsHref";
 
 const StructuredView = lazy(() => import("./acp/StructuredView").then((m) => ({ default: m.StructuredView })));
 
@@ -57,8 +59,8 @@ interface Props {
   onOpenSendDialog: () => void;
   onCloseSendDialog: () => void;
   onClearSelectedFile: () => void;
-  /** The server refuses settings edits, so nothing links to Settings. */
-  settingsReadOnly: boolean;
+  /** Decides whether the usage-limit banner links to Settings. */
+  serverAbout: ServerAbout | null;
 }
 
 function layerClass(active: boolean): string {
@@ -101,7 +103,7 @@ export function MobileMainPane({
   onOpenSendDialog,
   onCloseSendDialog,
   onClearSelectedFile,
-  settingsReadOnly,
+  serverAbout,
 }: Props) {
   const activePluginPane = isPluginPaneId(view) ? (pluginPanes.find((p) => p.id === view) ?? null) : null;
   const viewLabel =
@@ -146,11 +148,7 @@ export function MobileMainPane({
                     sessionId={session.id}
                     acpWorkerState={session.acp_worker_state ?? "absent"}
                     rateLimitAutoResume={session.rate_limit_auto_resume}
-                    settingsHref={
-                      settingsReadOnly
-                        ? null
-                        : `/settings/structured-view?profile=${encodeURIComponent(session.profile)}`
-                    }
+                    settingsHref={autoResumeSettingsHref(session.profile, serverAbout)}
                     tool={session.tool}
                     acpAgent={session.acp_agent ?? null}
                     startedBefore={hasStartedBefore(session)}

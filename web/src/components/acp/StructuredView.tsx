@@ -395,17 +395,15 @@ function ComposerDock({
   const { state, status } = ctx;
   return (
     <>
-      {state.rateLimit && (
-        <UsageLimitSection
-          sessionId={sessionId}
-          agent={state.agent ?? acpAgent}
-          rateLimit={state.rateLimit}
-          autoResume={view.rateLimitAutoResume}
-          retriesExhausted={state.rateLimitRetriesExhausted}
-          settingsHref={view.settingsHref ?? null}
-          onPrefill={(text) => setPrimerPrefill({ id: `rate-limit-recovery-${Date.now()}`, text })}
-        />
-      )}
+      <UsageLimitSection
+        sessionId={sessionId}
+        agent={state.agent ?? acpAgent}
+        rateLimit={state.rateLimit}
+        autoResume={view.rateLimitAutoResume}
+        retriesExhausted={state.rateLimitRetriesExhausted}
+        settingsHref={view.settingsHref ?? null}
+        onPrefill={(text) => setPrimerPrefill({ id: `rate-limit-recovery-${Date.now()}`, text })}
+      />
 
       <QueuedPromptsStrip
         queued={state.queuedPrompts}

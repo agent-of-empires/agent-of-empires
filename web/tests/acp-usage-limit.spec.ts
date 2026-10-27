@@ -41,7 +41,7 @@ test.describe("at 375px", () => {
     await expect(banner).toContainText(/Resets .+ · in about 2h/);
     await expect(banner.getByRole("link", { name: "Turn on" })).toHaveAttribute(
       "href",
-      "/settings/structured-view?profile=default",
+      "/settings/structured-view?profile=default&field=acp.rate_limit_auto_resume",
     );
     const switchAgent = banner.getByRole("button", { name: "Switch Agent" });
     await expect(switchAgent).toBeInViewport();
@@ -61,4 +61,46 @@ test.describe("at 375px", () => {
     await expect(dialog.getByText("current · limit reached")).toBeVisible();
     await expect(dialog.getByRole("button", { name: "Continue in Codex" })).toBeVisible();
   });
+});
+
+test("Turn on opens the Session profile's auto-resume row and highlights it", async ({ page }) => {
+  const mock = await mockAcpSession(page, {
+    title: "story-usage-limit-setting",
+    rateLimitAutoResume: false,
+    reducedState: {
+      rate_limit: { status: "limited", resets_at: null, kind: "usage" },
+    },
+  });
+  await page.route("**/api/agents", (r) => r.fulfill({ json: [agent("claude")] }));
+  await page.route(
+    (url) => url.pathname === "/api/settings/schema",
+    (r) =>
+      r.fulfill({
+        json: [
+          {
+            section: "acp",
+            field: "rate_limit_auto_resume",
+            label: "Auto-resume after rate limit",
+            category: "acp",
+            description: "",
+            widget: { kind: "toggle" },
+            advanced: false,
+            profile_overridable: true,
+            validation: { rule: "none" },
+            web_write: { policy: "allow" },
+          },
+        ],
+      }),
+  );
+  await page.route(
+    (url) => url.pathname === "/api/settings" || /^\/api\/profiles\/[^/]+\/settings$/.test(url.pathname),
+    (r) => r.fulfill({ json: { acp: { rate_limit_auto_resume: false } } }),
+  );
+  await openStructuredSession(page, mock);
+
+  await page.getByTestId("usage-limit-banner").getByRole("link", { name: "Turn on" }).click();
+  await expect(page).toHaveURL(/\/settings\/structured-view\?profile=default&field=acp\.rate_limit_auto_resume$/);
+  const row = page.locator('[data-settings-field="acp.rate_limit_auto_resume"]');
+  await expect(row).toBeVisible();
+  await expect(row).toHaveClass(/animate-settings-highlight/);
 });

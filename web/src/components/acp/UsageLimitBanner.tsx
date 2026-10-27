@@ -30,6 +30,7 @@ export function UsageLimitBanner({
   resumeError,
   onResume,
   onSwitchAgent,
+  switchListFailed = false,
   settingsHref,
 }: {
   agent: string | null;
@@ -42,6 +43,8 @@ export function UsageLimitBanner({
   onResume: () => void;
   /** Omitted when no other installed Agent could take over. */
   onSwitchAgent?: () => void;
+  /** Why the Agents to switch to couldn't be listed. */
+  switchListFailed?: boolean;
   /** Where the auto-resume toggle lives; null where Settings can't be edited. */
   settingsHref: string | null;
 }) {
@@ -81,7 +84,7 @@ export function UsageLimitBanner({
                   )}`
               : own
                 ? `${name ?? "The Agent"} said: ${own}`
-                : "The Agent didn't say when the limit resets."}
+                : "No reset time was reported."}
           </p>
           {retriesExhausted ? (
             <p className="mt-1 text-xs text-text-secondary">
@@ -140,6 +143,11 @@ export function UsageLimitBanner({
           </button>
         </div>
       </div>
+      {switchListFailed && (
+        <p className="mt-2 text-xs text-status-error-text">
+          Couldn't list the other Agents, so Switch Agent isn't offered. Reload to try again.
+        </p>
+      )}
       {resumeState === "ok" && <p className="mt-2 text-xs text-text-dim">New events should start streaming shortly.</p>}
       {resumeState === "failed" && resumeError && (
         <p className="mt-2 text-xs text-status-error-text">Resume failed: {resumeError}</p>
@@ -148,30 +156,34 @@ export function UsageLimitBanner({
   );
 }
 
-/** Other Agents a limited Session could continue in; empty until loaded. */
-function useSwitchTargets(current: string | null): string[] {
+/** Other Agents a limited Session could continue in; empty until loaded, and read only while `limited`. */
+function useSwitchTargets(current: string | null, limited: boolean): { targets: string[]; listFailed: boolean } {
   const [targets, setTargets] = useState<string[]>([]);
+  const [listFailed, setListFailed] = useState(false);
   useEffect(() => {
+    if (!limited) return;
     let cancelled = false;
-    fetchAgents()
-      .then((agents) => {
-        if (cancelled) return;
-        setTargets(
-          agents
-            .filter((a) => a.acp_capable && a.installed && a.acp_installed && a.acp_allowed !== false)
-            .map((a) => a.name)
-            .filter((name) => name !== current),
-        );
-      })
-      .catch(() => {});
+    void fetchAgents().then((agents) => {
+      if (cancelled) return;
+      // The server always lists its builtins, so an empty list is a failed request.
+      setListFailed(agents.length === 0);
+      setTargets(
+        agents
+          .filter((a) => a.acp_capable && a.installed && a.acp_installed && a.acp_allowed !== false)
+          .map((a) => a.name)
+          .filter((name) => name !== current),
+      );
+    });
     return () => {
       cancelled = true;
     };
-  }, [current]);
-  return targets;
+  }, [current, limited]);
+  return { targets, listFailed };
 }
 
-/** The usage-limit banner wired to resume and to the Agent handoff. */
+/** The usage-limit banner wired to resume and to the Agent handoff. Mounted whether or not
+ *  the Session is limited: a handoff clears the limit before its recap arrives, and its
+ *  modal must stay until it settles. */
 export function UsageLimitSection({
   sessionId,
   agent,
@@ -183,35 +195,39 @@ export function UsageLimitSection({
 }: {
   sessionId: string;
   agent: string | null;
-  rateLimit: NonNullable<AcpState["rateLimit"]>;
+  rateLimit: AcpState["rateLimit"];
   autoResume: boolean | undefined;
   retriesExhausted: boolean;
   settingsHref: string | null;
   onPrefill: (text: string) => void;
 }) {
   // A limit with no reported reset still needs a key to scope resume status by.
-  const resume = useRespawnSession(sessionId, rateLimit.resets_at ?? "unknown");
-  const targets = useSwitchTargets(agent);
-  const [switching, setSwitching] = useState(false);
+  const resume = useRespawnSession(sessionId, rateLimit?.resets_at ?? "unknown");
+  const { targets, listFailed } = useSwitchTargets(agent, rateLimit !== null);
+  // Taken when the modal opens, so the switch's own Agent change doesn't reload it mid-handoff.
+  const [handoff, setHandoff] = useState<{ from: string | null; eligible: string[] } | null>(null);
   return (
     <>
-      <UsageLimitBanner
-        agent={agent}
-        rateLimit={rateLimit}
-        autoResume={autoResume}
-        retriesExhausted={retriesExhausted}
-        resumeState={resume.state}
-        resumeError={resume.error}
-        onResume={() => void resume.respawn()}
-        onSwitchAgent={targets.length > 0 ? () => setSwitching(true) : undefined}
-        settingsHref={settingsHref}
-      />
+      {rateLimit && (
+        <UsageLimitBanner
+          agent={agent}
+          rateLimit={rateLimit}
+          autoResume={autoResume}
+          retriesExhausted={retriesExhausted}
+          resumeState={resume.state}
+          resumeError={resume.error}
+          onResume={() => void resume.respawn()}
+          onSwitchAgent={targets.length > 0 ? () => setHandoff({ from: agent, eligible: targets }) : undefined}
+          switchListFailed={listFailed}
+          settingsHref={settingsHref}
+        />
+      )}
       <SwitchAgentModal
-        open={switching}
+        open={handoff !== null}
         sessionId={sessionId}
-        currentAgent={agent}
-        eligible={targets}
-        onClose={() => setSwitching(false)}
+        currentAgent={handoff?.from ?? agent}
+        eligible={handoff?.eligible ?? targets}
+        onClose={() => setHandoff(null)}
         onPrefill={onPrefill}
         trigger="rate_limit"
       />

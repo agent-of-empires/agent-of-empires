@@ -14,7 +14,7 @@ vi.mock("../../lib/api", () => ({
   fetchContextPrimer: vi.fn(),
 }));
 
-import { fetchAcpAgents, fetchAgents } from "../../lib/api";
+import { fetchAcpAgents, fetchAgents, fetchContextPrimer, switchAcpAgent } from "../../lib/api";
 
 const NOW = new Date("2026-10-22T10:00:00Z");
 const IN_2H = "2026-10-22T12:00:00Z";
@@ -92,7 +92,7 @@ describe("UsageLimitBanner", () => {
     [
       "no reported reset",
       { rateLimit: { status: PARIS, resets_at: null, kind: "usage" } },
-      ["The Agent didn't say when the limit resets."],
+      ["No reset time was reported."],
       [/weekly limit|Otherwise/],
       "Try again",
     ],
@@ -120,7 +120,7 @@ describe("UsageLimitBanner", () => {
     [
       "a non-Claude Agent reporting only a fingerprint",
       { agent: "codex", rateLimit: { status: '{"errorKind":"rate_limit"}', resets_at: null, kind: "usage" } },
-      ["The Agent didn't say when the limit resets."],
+      ["No reset time was reported."],
       [/errorKind/],
       "Try again",
     ],
@@ -186,21 +186,92 @@ const agent = (name: string, overrides: Partial<AgentInfo> = {}): AgentInfo => (
 });
 
 describe("UsageLimitSection", () => {
-  function mountSection() {
-    render(
+  const LIMITED = { status: "limited", resets_at: null, kind: "usage" };
+  function mountSection(onPrefill = vi.fn()) {
+    const section = (agent: string, rateLimit: typeof LIMITED | null) => (
       <MemoryRouter>
         <UsageLimitSection
           sessionId="s-1"
-          agent="claude"
-          rateLimit={{ status: "limited", resets_at: null, kind: "usage" }}
+          agent={agent}
+          rateLimit={rateLimit}
           autoResume
           retriesExhausted={false}
           settingsHref={null}
-          onPrefill={vi.fn()}
+          onPrefill={onPrefill}
         />
-      </MemoryRouter>,
+      </MemoryRouter>
     );
+    const view = render(section("claude", LIMITED));
+    // What the switch itself does: a new Agent, and a Stopped that clears the limit.
+    const switched = () => view.rerender(section("codex", null));
+    return { onPrefill, switched };
   }
+
+  it.each([
+    ["its recap arrives", true],
+    ["its recap request fails", false],
+  ])("keeps the handoff modal after the switch clears the limit, until %s", async (_label, recapArrives) => {
+    vi.mocked(fetchAgents).mockResolvedValue([agent("claude"), agent("codex")]);
+    vi.mocked(fetchAcpAgents).mockResolvedValue(
+      ["claude", "codex"].map((name) => ({ name, description: name, command: name })),
+    );
+    vi.mocked(switchAcpAgent).mockResolvedValue({
+      session_id: "s-1",
+      agent: "codex",
+      before_seq: 41,
+      switch_seq: 42,
+      status: "switched",
+    });
+    let settle!: (ok: boolean) => void;
+    vi.mocked(fetchContextPrimer).mockReturnValue(
+      new Promise((resolve, reject) => {
+        settle = (ok) =>
+          ok
+            ? resolve({
+                primer: "user: hi",
+                included_event_count: 1,
+                included_turn_count: 1,
+                truncated: false,
+                max_chars: 4_000,
+                unprocessed_prompt: "",
+              })
+            : reject(new Error("primer unavailable"));
+      }),
+    );
+    const { onPrefill, switched } = mountSection();
+    fireEvent.click(await screen.findByRole("button", { name: "Switch Agent" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Continue in Codex" }));
+    await waitFor(() => expect(fetchContextPrimer).toHaveBeenCalled());
+
+    switched();
+    await act(async () => {});
+    expect(screen.queryByTestId("usage-limit-banner")).toBeNull();
+    expect(screen.getByRole("dialog").textContent).toContain("Switching...");
+    // Still the handoff it started: from Claude, to Codex.
+    const picks = Array.from(document.querySelectorAll<HTMLInputElement>("input[name=acp-agent-target]"));
+    expect(picks.map((r) => [r.value, r.checked])).toEqual([
+      ["claude", false],
+      ["codex", true],
+    ]);
+    expect(screen.getByText("current · limit reached").closest("label")?.textContent).toContain("Claude");
+
+    await act(async () => settle(recapArrives));
+    if (recapArrives) {
+      expect(onPrefill).toHaveBeenCalledWith(expect.stringContaining("user: hi"));
+      expect(screen.queryByRole("dialog")).toBeNull();
+    } else {
+      expect(onPrefill).not.toHaveBeenCalled();
+      expect(screen.getByRole("alert").textContent).toContain("primer unavailable");
+    }
+  });
+
+  it("says why Switch Agent is missing when the Agent list fails", async () => {
+    // fetchAgents resolves an empty list, never rejects, when /api/agents fails.
+    vi.mocked(fetchAgents).mockResolvedValue([]);
+    mountSection();
+    expect(await screen.findByText(/Couldn't list the other Agents, so Switch Agent isn't offered/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Switch Agent" })).toBeNull();
+  });
 
   it("offers only installed, allowed Agents other than the limited one", async () => {
     vi.mocked(fetchAgents).mockResolvedValue([
