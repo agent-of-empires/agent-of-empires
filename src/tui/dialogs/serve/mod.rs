@@ -908,7 +908,6 @@ impl ServeView {
             KeyCode::Char('g' | 'G') if mode == ServeMode::Tunnel => {
                 if confirmed == Some(PendingConfirm::NewPassphrase) {
                     let new_pp = generate_passphrase();
-                    save_passphrase_to_disk(&new_pp);
                     self.pending_passphrase = new_pp.clone();
                     self.restart(mode, transport, Some(new_pp));
                 } else {
@@ -1302,6 +1301,45 @@ mod tests {
                 "{key}"
             );
         }
+    }
+
+    /// A refused or failed restart leaves the old daemon running, so the saved passphrase must
+    /// stay the one that daemon accepts until `ServeLaunchRequest::run` succeeds.
+    #[test]
+    #[serial_test::serial]
+    fn new_passphrase_is_saved_only_after_the_restart_succeeds() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        save_passphrase_to_disk("running daemon phrase");
+        let mut view = ServeView {
+            state: ServeViewState::Active {
+                mode: ServeMode::Tunnel,
+                transport: Some(TunnelTransport::Cloudflare),
+                urls: vec![],
+                url_index: 0,
+                passphrase: Some("running daemon phrase".to_string()),
+                opened_at: Instant::now(),
+                log_offset: 0,
+            },
+            pending_passphrase: String::new(),
+            pending_confirm: None,
+            show_help: false,
+            mouse: RefCell::default(),
+            copied: None,
+            running_persists: None,
+            restart_probe: RestartProbe::default(),
+            pending_launch: None,
+            launch_in_flight: false,
+            stop_requested: false,
+            probes: Probes::new(|_| false),
+        };
+        let key = KeyEvent::from(KeyCode::Char('G'));
+        view.handle_key(key);
+        assert!(matches!(view.handle_key(key), ServeAction::Launch(_)));
+        assert_ne!(view.pending_passphrase, "running daemon phrase");
+        assert_eq!(
+            recall_passphrase().as_deref(),
+            Some("running daemon phrase")
+        );
     }
 
     #[test]
