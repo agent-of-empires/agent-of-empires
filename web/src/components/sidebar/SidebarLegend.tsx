@@ -9,6 +9,7 @@ import { STATUS_DOT_CLASS } from "../../lib/session";
 import { TOOLBAR_BUTTON, TOOLBAR_TINT } from "./styles";
 
 const REDUCED_MOTION = "(prefers-reduced-motion: reduce)";
+const INTERACTIVE = 'a[href], button, input, select, textarea, [contenteditable], [tabindex]:not([tabindex="-1"])';
 
 function subscribeReducedMotion(onChange: () => void) {
   const query = window.matchMedia?.(REDUCED_MOTION);
@@ -59,18 +60,27 @@ export function SidebarLegend() {
     closeMenu();
     buttonRef.current?.focus();
   };
-  // An outside click closes the popover without `close`, after focus has moved: back to "?" when
-  // the click landed on nothing focusable, left alone when a control took it.
+  // An outside click closes the popover without `close`: back to "?" when the click landed on
+  // nothing focusable, left alone when it was a control. Safari doesn't focus a clicked button, so
+  // the pointer's target decides, not only where focus went.
   const wasOpen = useRef(false);
+  const pressedControl = useRef(false);
   useEffect(() => {
     if (menu) {
       wasOpen.current = true;
-      return;
+      pressedControl.current = false;
+      const onPointerDown = (e: PointerEvent) => {
+        pressedControl.current = !!(e.target as Element | null)?.closest?.(INTERACTIVE);
+      };
+      document.addEventListener("pointerdown", onPointerDown, true);
+      return () => document.removeEventListener("pointerdown", onPointerDown, true);
     }
     if (!wasOpen.current) return;
     wasOpen.current = false;
     const active = document.activeElement;
-    if (!active || active === document.body) buttonRef.current?.focus({ preventScroll: true });
+    if ((!active || active === document.body) && !pressedControl.current) {
+      buttonRef.current?.focus({ preventScroll: true });
+    }
   }, [menu]);
   const toggle = () => {
     if (menu) return close();

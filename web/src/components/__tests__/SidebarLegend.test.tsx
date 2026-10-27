@@ -79,4 +79,38 @@ describe("SidebarLegend", () => {
       vi.useRealTimers();
     }
   });
+
+  it("returns focus to ? after a click on blank space, not after a click on a control that took no focus", () => {
+    vi.useFakeTimers();
+    stubReducedMotion(true);
+    render(
+      <>
+        <button type="button">Other control</button>
+        <p>Blank space</p>
+        <SidebarLegend />
+      </>,
+    );
+    const toggle = screen.getByRole("button", { name: "What do these symbols mean?" });
+    const open = () => {
+      fireEvent.click(toggle);
+      // The outside-click listener attaches a frame after opening.
+      act(() => vi.advanceTimersByTime(50));
+      expect(screen.getByTestId("sidebar-legend")).toBeTruthy();
+    };
+    // (where the outside click lands, focus back on "?")
+    const cases: [string, boolean][] = [
+      // Like Safari, jsdom doesn't focus a clicked button, so focus is on <body> either way.
+      ["Other control", false],
+      ["Blank space", true],
+    ];
+    for (const [target, refocused] of cases) {
+      open();
+      act(() => (document.activeElement as HTMLElement | null)?.blur());
+      const el = screen.getByText(target);
+      fireEvent.pointerDown(el);
+      fireEvent.click(el);
+      expect(screen.queryByTestId("sidebar-legend"), target).toBeNull();
+      expect(document.activeElement === toggle, target).toBe(refocused);
+    }
+  });
 });
