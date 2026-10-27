@@ -16,7 +16,7 @@ use crate::daemon::{
     CreateProjectBody, ProfileSnapshot, ProjectResponse, ReloadFailureCode, RuntimeHealth,
 };
 use crate::server::auth::{handler_elevated, AuthenticatedSession};
-use crate::server::principal::Principal;
+use crate::server::principal::{authorize, Capability, Principal};
 use crate::session::config::settings_schema::validate_project_plugin_setting;
 use crate::session::projects::{self, ProjectPatch, RegistryError};
 use crate::session::{Project, ProjectScope};
@@ -390,7 +390,7 @@ pub async fn create_project(
     let elevated = handler_elevated(
         &state,
         session.as_deref(),
-        loopback.as_deref().is_some_and(Principal::is_local_peer),
+        authorize(loopback.as_deref(), Capability::SkipElevation),
     )
     .await;
     if !elevated && !plugin_settings.values().all(BTreeMap::is_empty) {
@@ -439,7 +439,7 @@ pub async fn delete_project(
     let elevated = handler_elevated(
         &state,
         session.as_deref(),
-        loopback.as_deref().is_some_and(Principal::is_local_peer),
+        authorize(loopback.as_deref(), Capability::SkipElevation),
     )
     .await;
     commit_project(
@@ -655,7 +655,7 @@ pub async fn update_project(
         && !handler_elevated(
             &state,
             session.as_deref(),
-            loopback.as_deref().is_some_and(Principal::is_local_peer),
+            authorize(loopback.as_deref(), Capability::SkipElevation),
         )
         .await
     {

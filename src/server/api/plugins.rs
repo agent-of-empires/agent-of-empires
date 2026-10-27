@@ -20,7 +20,7 @@ use super::{api_error, AppState};
 use crate::plugin;
 use crate::plugin::install::OperationLog;
 use crate::server::auth::{handler_elevated, AuthenticatedSession};
-use crate::server::principal::Principal;
+use crate::server::principal::{authorize, Capability, Principal};
 
 const CAP_COMPOSER_READ: &str = "composer.read";
 const CAP_SESSION_READ: &str = "session.read";
@@ -38,7 +38,7 @@ async fn mutation_gate(
     if let Some(resp) = super::cityhall_block(state) {
         return Err(resp);
     }
-    if !handler_elevated(state, session, local.is_some_and(Principal::is_local_peer)).await {
+    if !handler_elevated(state, session, authorize(local, Capability::SkipElevation)).await {
         return Err(super::api_error_with_code_header(
             crate::daemon::ApiErrorCode::ElevationRequired,
             "Re-enter the passphrase to continue",

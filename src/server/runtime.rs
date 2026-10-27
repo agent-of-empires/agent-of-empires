@@ -16,7 +16,10 @@ use tokio::{
 };
 use tracing::Instrument;
 
-use super::{principal::Principal, AppState};
+use super::{
+    principal::{authorize, Capability, Principal},
+    AppState,
+};
 use crate::daemon::{
     CreationProgress, RuntimeCapabilities, RuntimeContents, RuntimeCursor, RuntimeFrame,
     RuntimeHealth, RuntimeInfo, RuntimeSnapshot, RUNTIME_PROTOCOL_VERSION,
@@ -378,9 +381,11 @@ impl NativeRuntime {
             .iter()
             .map(|profile| profile.name.clone())
             .collect();
-        let local_owner = matches!(local, Some(Principal::LocalPeer { .. }));
+        let local_owner = local.is_some_and(Principal::is_local_peer);
+        let owner_detail = authorize(local, Capability::OwnerDiagnostics);
         let mut interaction_capabilities = snapshot.contents.capabilities.clone();
-        interaction_capabilities.native_interaction &= local_owner;
+        interaction_capabilities.native_interaction &=
+            authorize(local, Capability::NativeInteraction);
         RuntimeInfo {
             protocol_version: RUNTIME_PROTOCOL_VERSION,
             epoch: self.epoch.clone(),
@@ -392,7 +397,7 @@ impl NativeRuntime {
             cityhall_mode: state.cityhall_mode,
             health: snapshot.contents.health.clone(),
             interaction_capabilities,
-            owner_diagnostics: if local_owner && snapshot.contents.health != RuntimeHealth::Healthy
+            owner_diagnostics: if owner_detail && snapshot.contents.health != RuntimeHealth::Healthy
             {
                 state
                     .canonical_diagnostics
@@ -402,7 +407,7 @@ impl NativeRuntime {
             } else {
                 Vec::new()
             },
-            owner_instance_id: if local_owner {
+            owner_instance_id: if owner_detail {
                 std::env::var("AOE_SERVE_INSTANCE_ID").ok()
             } else {
                 None
@@ -569,7 +574,7 @@ async fn send_creation_progress(
 /// authorized as the local owner may receive it. A loopback TCP bearer client
 /// is deliberately excluded: it is the same machine, not the same identity.
 fn creation_progress_granted(local: Option<&Principal>) -> bool {
-    matches!(local, Some(Principal::LocalPeer { .. }))
+    authorize(local, Capability::CreationProgress)
 }
 
 async fn follow_runtime(mut socket: WebSocket, state: Arc<AppState>, local: Option<Principal>) {

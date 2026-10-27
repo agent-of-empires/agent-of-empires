@@ -662,9 +662,9 @@ pub async fn create_session(
     local: Option<axum::Extension<crate::server::principal::Principal>>,
     body: Result<Json<CreateSessionBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    let local_owner = matches!(
+    let local_owner = crate::server::principal::authorize(
         local.as_deref(),
-        Some(crate::server::principal::Principal::LocalPeer { .. })
+        crate::server::principal::Capability::CreateHookDetail,
     );
     if state.read_only {
         return crate::server::api::read_only_response();

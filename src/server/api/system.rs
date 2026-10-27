@@ -17,7 +17,7 @@ use super::validate_profile_name;
 use super::AppState;
 use crate::server::auth::AuthenticatedTokenHash;
 use crate::server::auth::{handler_elevated, AuthenticatedSession};
-use crate::server::principal::Principal;
+use crate::server::principal::{authorize, Capability, Principal};
 use crate::session::config::settings_schema::{
     clear_path, rewrite_plugin_sections, runtime_schema, strip_local_only, validate_patch,
     validate_patch_with, PatchRejection, Scope,
@@ -554,7 +554,7 @@ async fn save_settings_patch(
     let elevated = handler_elevated(
         &state,
         session.as_deref(),
-        loopback.as_deref().is_some_and(Principal::is_local_peer),
+        authorize(loopback.as_deref(), Capability::SkipElevation),
     )
     .await;
     if !is_empty_patch(&machine) && !elevated {
@@ -2589,7 +2589,7 @@ pub async fn update_profile_settings(
     let elevated = handler_elevated(
         &state,
         session.as_deref(),
-        loopback.as_deref().is_some_and(Principal::is_local_peer),
+        authorize(loopback.as_deref(), Capability::SkipElevation),
     )
     .await;
 

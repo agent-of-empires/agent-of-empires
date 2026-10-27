@@ -178,7 +178,10 @@ impl CreateProgressRegistry {
             .get(key)
             .filter(|p| {
                 p.visibility == CreateProgressVisibility::WebReadable
-                    || matches!(local, Some(super::principal::Principal::LocalPeer { .. }))
+                    || super::principal::authorize(
+                        local,
+                        super::principal::Capability::CreationProgress,
+                    )
             })
             .map(|p| p.snapshot())
     }
