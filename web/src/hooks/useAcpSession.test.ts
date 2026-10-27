@@ -180,6 +180,33 @@ describe("reconnect (#1130)", () => {
     expect(result.current.replayedWhileDown).toBe(false);
   });
 
+  it("flags history replayed forward onto already loaded history", async () => {
+    const prompt = (seq: number) => ({
+      session_id: "sess-replay-loaded",
+      seq,
+      event: { UserPromptSent: { text: `p${seq}` } },
+    });
+    const row = { id: "user-seq-6", kind: "user_prompt", at: "t", text: "p6" };
+    calls = installAcpFakes(({ url }) => {
+      if (!url.includes("/acp/replay")) return undefined;
+      if (new URL(url, "http://x").searchParams.has("since")) {
+        return json({ frames: [], rows: [], lost: false, highest_seq: 20, next_cursor: 20, has_more: false });
+      }
+      return json({ frames: [prompt(6)], rows: [row], lost: false, highest_seq: 10, next_cursor: 6, has_more: false });
+    });
+    FakeWebSocket.closeFiresOnClose = true;
+    const { result } = render("sess-replay-loaded");
+    await flushAsync();
+    sockets[0]!.open();
+    expect(result.current).toMatchObject({ replayedWhileDown: false, state: { oldestSeq: 6 } });
+
+    sockets[0]!.drop();
+    await act(() => vi.advanceTimersByTimeAsync(acpRetryDelayMs(1)));
+    await flushAsync();
+    expect(sockets).toHaveLength(2);
+    expect(result.current).toMatchObject({ reconnecting: true, replayedWhileDown: true });
+  });
+
   it("does not flag a replay that brought nothing new", async () => {
     const { result } = render("sess-replay-empty");
     await flushAsync();

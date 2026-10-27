@@ -251,7 +251,7 @@ export function useAcpConnection(
       }, delayMs);
     };
 
-    const startReplay = (): { done: Promise<void>; abort: () => void } => {
+    const startReplay = (): { done: Promise<number | null>; abort: () => void } => {
       replayAbortRef.current?.abort();
       const controller = new AbortController();
       replayAbortRef.current = controller;
@@ -315,18 +315,18 @@ export function useAcpConnection(
         const seqBeforeReplay = lastSeqRef.current;
         const replay = startReplay();
         let replayTimer: ReturnType<typeof setTimeout> | undefined;
-        await Promise.race([
+        const replayedTo = await Promise.race([
           replay.done,
-          new Promise<void>((resolve) => {
+          new Promise<null>((resolve) => {
             replayTimer = setTimeout(() => {
               replay.abort();
-              resolve();
+              resolve(null);
             }, ACP_DIAL_TIMEOUT_MS);
           }),
         ]);
         clearTimeout(replayTimer);
         if (!isCurrentDial()) return;
-        if (lastSeqRef.current > seqBeforeReplay) setReplayedWhileDown(true);
+        if (replayedTo !== null && replayedTo > seqBeforeReplay) setReplayedWhileDown(true);
         const protocol = window.location.protocol === "https:" ? "wss" : "ws";
         const url = `${protocol}://${window.location.host}/sessions/${encodeURIComponent(sessionId)}/acp/ws?since=${lastSeqRef.current}`;
         const ws = new WebSocket(url, acpSocketProtocols());

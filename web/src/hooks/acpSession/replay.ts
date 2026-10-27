@@ -41,7 +41,8 @@ const readRows = async (res: Response): Promise<TranscriptRow[]> =>
  * (`oldestSeq` 0) recovers its transcript from the tail, then folds frames forward from its own cursor; the
  * tail is published only once that catch-up succeeds, so a failed one cannot leave a tail the socket snapshot
  * would append older rows after.
- * Errors are swallowed; a later lagged notice retries.
+ * Resolves to the sequence the replay reached, or null when it failed or was cut short. Errors are swallowed;
+ * a later lagged notice retries.
  * Aborting `signal` cancels the requests and stops every later state write, so a stale snapshot cannot land
  * over newer socket content.
  */
@@ -52,10 +53,13 @@ export async function fetchReplay(
   dispatch: Dispatch,
   setHasMoreOlder: (value: boolean) => void,
   signal: AbortSignal,
-): Promise<void> {
+): Promise<number | null> {
   try {
-    if (lastSeq.current === 0) await fetchTail(sid, lastSeq, null, dispatch, setHasMoreOlder, signal);
-    else if (oldestSeq === 0) {
+    if (lastSeq.current === 0) {
+      await fetchTail(sid, lastSeq, null, dispatch, setHasMoreOlder, signal);
+      return lastSeq.current;
+    }
+    if (oldestSeq === 0) {
       // Cached control state is cursor-aware and must see each frame once, from its own cursor. Forward rows
       // from that cursor would append older turns after the recovered tail, so rows resume exactly at the tail's end.
       const from = lastSeq.current;
@@ -65,9 +69,12 @@ export async function fetchReplay(
         return reached;
       };
       await fetchTail(sid, lastSeq, catchUp, dispatch, setHasMoreOlder, signal);
-    } else await fetchForward(sid, lastSeq.current, dispatch, signal);
+      return lastSeq.current;
+    }
+    return await fetchForward(sid, lastSeq.current, dispatch, signal);
   } catch {
     // Best effort.
+    return null;
   }
 }
 
