@@ -1144,57 +1144,253 @@ pub mod structured {
             || crate::acp::inherited_acp_base(tool, &config.session.agent_detect_as).is_some()
     }
 
-    /// Pre-create validation for an explicit structured-view choice from the
-    /// new-session wizard, run BEFORE any worktree / scratch / container is
-    /// provisioned so a refusal can't orphan resources (same ordering as the
-    /// CLI's precondition). Returns a user-facing message on refusal.
-    ///
-    /// The adapter-on-PATH check only runs when the user has no command
-    /// override for the tool: an override swaps the binary the spawn will
-    /// actually exec (see #1910), and second-guessing it here could refuse a
-    /// working setup. With an override, a genuinely missing adapter surfaces
-    /// as the structured view's startup-error banner instead.
+    /// Why a structured-view choice is refused before anything is provisioned.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum StructuredChoiceError {
+        NotCapable(String),
+        AdapterMissing(String),
+    }
+
+    impl std::fmt::Display for StructuredChoiceError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::NotCapable(msg) | Self::AdapterMissing(msg) => f.write_str(msg),
+            }
+        }
+    }
+
+    /// The session a structured-view choice is checked for.
+    pub struct StructuredChoice<'a> {
+        pub tool: &'a str,
+        /// An explicit ACP agent overriding `tool`, as the web create's `agent_name`.
+        pub agent_name: Option<&'a str>,
+        /// The session's own command, as the web create's `command_override`;
+        /// empty uses the configured one.
+        pub command_override: &'a str,
+        pub sandboxed: bool,
+        /// Where the session launches, or `None` while that directory doesn't exist yet
+        /// (a worktree, scratch or multi-repo session checked before provisioning).
+        pub project_path: Option<&'a std::path::Path>,
+        /// Whether a preparation hook runs before launch, or awaits the user's trust decision,
+        /// and so may install the adapter; see [`preparation_hooks_apply`]. Asked only when the
+        /// adapter can't be found, so a normal create skips the repository trust read.
+        pub preparation_hooks: &'a dyn Fn() -> bool,
+    }
+
+    /// Whether an `on_create` or `on_launch` hook will run before a create in `project_path`
+    /// launches, or is waiting on the user's trust decision. `profile_hooks` must be the
+    /// profile's own, without the repository's, which count only under `trust_hooks` (the
+    /// create's decision; `Some(false)` skips them).
+    pub fn preparation_hooks_apply(
+        profile_hooks: &crate::session::HooksConfig,
+        project_path: &std::path::Path,
+        scratch: bool,
+        trust_hooks: Option<bool>,
+    ) -> bool {
+        use crate::session::config::repo_config::{check_repo_trust, TrustSurface};
+        let prepares = |hooks: &crate::session::HooksConfig| {
+            !hooks.on_create.is_empty() || !hooks.on_launch.is_empty()
+        };
+        if prepares(profile_hooks) {
+            return true;
+        }
+        if scratch {
+            return false;
+        }
+        match check_repo_trust(project_path).map(|trust| trust.hooks) {
+            Ok(TrustSurface::Trusted(hooks)) => prepares(&hooks),
+            Ok(TrustSurface::NeedsTrust { config: hooks, .. }) => {
+                trust_hooks != Some(false) && prepares(&hooks)
+            }
+            _ => false,
+        }
+    }
+
+    /// Pre-create validation for an explicit structured-view choice, run BEFORE any worktree,
+    /// scratch or container is provisioned so a refusal can't orphan resources. A sandboxed
+    /// session is not checked: its adapter runs inside the container, which bundles it.
     pub fn validate_structured_choice(
-        tool: &str,
-        command_override: &str,
+        choice: &StructuredChoice<'_>,
         config: &crate::session::Config,
-    ) -> Result<(), String> {
-        if !tool_acp_capable(tool, config) {
-            return Err(format!(
-                "tool `{tool}` is not ACP-capable: it has no agent registry entry and no \
+    ) -> Result<(), StructuredChoiceError> {
+        validate_structured_choice_with(
+            choice,
+            config,
+            &crate::session::environment::resolve_host_environment_pairs(&config.environment),
+            std::env::var_os("PATH").as_deref(),
+        )
+    }
+
+    /// `host_environment` is `config.environment` resolved, passed in so a caller checking
+    /// several agents resolves it once.
+    pub(super) fn validate_structured_choice_with(
+        choice: &StructuredChoice<'_>,
+        config: &crate::session::Config,
+        host_environment: &[(String, String)],
+        inherited_path: Option<&std::ffi::OsStr>,
+    ) -> Result<(), StructuredChoiceError> {
+        let agent = choice
+            .agent_name
+            .filter(|name| !name.is_empty())
+            .unwrap_or(choice.tool);
+        if !tool_acp_capable(agent, config) {
+            return Err(StructuredChoiceError::NotCapable(format!(
+                "tool `{agent}` is not ACP-capable: it has no agent registry entry and no \
                  [session.agent_acp_cmd] command. Run `aoe acp doctor` to see configured \
                  agents, or turn Structured off for a terminal session."
-            ));
+            )));
         }
-        if !command_override.trim().is_empty() {
+        if choice.sandboxed {
             return Ok(());
         }
         let registry = crate::acp::agent_registry::AgentRegistry::with_defaults();
-        let spec = match registry.get(tool) {
-            Some(spec) => spec.clone(),
-            None => match config.session.agent_acp_cmd.get(tool) {
-                Some(cmd) => crate::acp::AgentSpec::from_acp_cmd(tool, cmd)
-                    .map_err(|e| format!("invalid [session.agent_acp_cmd] for `{tool}`: {e}"))?,
+        let (mut spec, spec_from_registry) = match registry.get(agent) {
+            Some(spec) => (spec.clone(), true),
+            None => match config.session.agent_acp_cmd.get(agent) {
+                Some(cmd) => (
+                    crate::acp::AgentSpec::from_acp_cmd(agent, cmd).map_err(|e| {
+                        StructuredChoiceError::NotCapable(format!(
+                            "invalid [session.agent_acp_cmd] for `{agent}`: {e}"
+                        ))
+                    })?,
+                    false,
+                ),
                 // A custom agent that inherits a registry-backed base runs the
-                // base agent's adapter, so the on-PATH check targets that.
-                None => match crate::acp::inherited_acp_base(tool, &config.session.agent_detect_as)
-                    .and_then(|base| registry.get(&base).cloned())
-                {
-                    Some(spec) => spec,
-                    None => unreachable!("tool_acp_capable implies a resolvable spec"),
-                },
+                // base agent's adapter, so the check targets that.
+                None => {
+                    match crate::acp::inherited_acp_base(agent, &config.session.agent_detect_as)
+                        .and_then(|base| registry.get(&base).cloned())
+                    {
+                        Some(spec) => (spec, true),
+                        None => unreachable!("tool_acp_capable implies a resolvable spec"),
+                    }
+                }
             },
         };
-        if !crate::cli::acp::command_present(&spec.command) {
-            let hint = crate::acp::install_hints::install_hint_for(&spec.command)
-                .unwrap_or("install via your package manager and retry");
-            return Err(format!(
-                "ACP adapter `{}` is not installed or not on $PATH. Install: {hint}. \
-                 Or run `aoe acp doctor --fix`, or turn Structured off for a terminal session.",
-                spec.command
-            ));
+        // The spawn runs the session's command in place of an adapter that is the
+        // agent's own CLI, so check what it will launch.
+        let command = match choice.command_override.trim() {
+            "" => config.session.resolve_tool_command(choice.tool),
+            command => command.to_string(),
+        };
+        if let Some(ovr) =
+            crate::server::acp_reconciler::command_override_for_spawn(choice.tool, &command)
+        {
+            crate::acp::supervisor::apply_agent_command_override(
+                agent,
+                spec_from_registry,
+                &ovr,
+                &mut spec,
+            )
+            .map_err(|e| {
+                StructuredChoiceError::NotCapable(format!("invalid command for `{agent}`: {e}"))
+            })?;
         }
-        Ok(())
+        if adapter_reachable_with(
+            &spec.command,
+            choice.project_path,
+            config,
+            host_environment,
+            inherited_path,
+        ) || (choice.preparation_hooks)()
+        {
+            return Ok(());
+        }
+        let hint = crate::acp::install_hints::install_hint_for(&spec.command)
+            .unwrap_or("install via your package manager and retry");
+        Err(StructuredChoiceError::AdapterMissing(format!(
+            "ACP adapter `{}` is not installed or not on $PATH. Install: {hint}. \
+             Or run `aoe acp doctor --fix`, or turn Structured off for a terminal session.",
+            spec.command
+        )))
+    }
+
+    /// Whether `agent` is ACP-capable and its adapter passes the create check, for the agent
+    /// list. There is no project to search from, so relative PATH entries pass.
+    pub fn adapter_installed(
+        agent: &str,
+        config: &crate::session::Config,
+        host_environment: &[(String, String)],
+    ) -> bool {
+        let choice = StructuredChoice {
+            tool: agent,
+            agent_name: None,
+            command_override: "",
+            sandboxed: false,
+            project_path: None,
+            preparation_hooks: &|| false,
+        };
+        validate_structured_choice_with(
+            &choice,
+            config,
+            host_environment,
+            std::env::var_os("PATH").as_deref(),
+        )
+        .is_ok()
+    }
+
+    /// Whether the adapter can launch, judged as the runner does: the daemon's lookup, or the
+    /// configured PATH searched from the session's directory. Given the benefit of the doubt
+    /// when that can't be known yet: any `before_session` hook may install it or set PATH at
+    /// spawn, and a relative PATH entry resolves in a directory that hooks may still fill.
+    pub fn adapter_reachable(
+        command: &str,
+        project_path: Option<&std::path::Path>,
+        config: &crate::session::Config,
+    ) -> bool {
+        adapter_reachable_with(
+            command,
+            project_path,
+            config,
+            &crate::session::environment::resolve_host_environment_pairs(&config.environment),
+            std::env::var_os("PATH").as_deref(),
+        )
+    }
+
+    fn adapter_reachable_with(
+        command: &str,
+        project_path: Option<&std::path::Path>,
+        config: &crate::session::Config,
+        host_environment: &[(String, String)],
+        inherited_path: Option<&std::ffi::OsStr>,
+    ) -> bool {
+        use crate::acp::acp_client::{is_bare_command, on_agent_path, resolve_agent_command};
+        if !config.host_hooks.before_session.is_empty() {
+            return true;
+        }
+        if !is_bare_command(command) {
+            let path = std::path::Path::new(command);
+            if command.contains("${aoe_data_dir}") || path.is_absolute() {
+                return crate::cli::acp::command_present(command);
+            }
+            // Spawned from the project, so a relative path resolves there; a launch
+            // directory that doesn't exist yet may still gain it.
+            return command.contains("${")
+                || project_path.is_none_or(|cwd| !cwd.is_dir() || cwd.join(path).exists());
+        }
+        let app_dir = crate::session::get_app_dir().ok();
+        if resolve_agent_command(command, app_dir.as_deref()).is_ok() {
+            return true;
+        }
+        match project_path {
+            Some(cwd) => on_agent_path(command, cwd, host_environment, inherited_path),
+            None => {
+                let agent_path = host_environment
+                    .iter()
+                    .rev()
+                    .find(|(key, _)| key == "PATH")
+                    .map(|(_, path)| std::ffi::OsString::from(path))
+                    .or_else(|| inherited_path.map(std::ffi::OsStr::to_os_string));
+                agent_path
+                    .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.is_relative()))
+                    || on_agent_path(
+                        command,
+                        std::path::Path::new("/"),
+                        host_environment,
+                        inherited_path,
+                    )
+            }
+        }
     }
 
     /// Apply a validated structured-view choice to a freshly-built instance:
@@ -1489,6 +1685,403 @@ pub(crate) fn branch_name_from_title(title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pre-create refusal follows the runner's lookup, so it never
+    /// refuses an adapter the spawn would find.
+    #[test]
+    #[serial_test::serial]
+    fn validate_structured_choice_cases() {
+        use std::os::unix::fs::PermissionsExt;
+        use structured::{StructuredChoice, StructuredChoiceError};
+        let _home = crate::session::test_support::isolate_app_dir();
+        let adapter = format!("aoe-test-adapter-{}", std::process::id());
+        let project = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        // Only a PATH entry for `agent-bin` finds the adapter; as a relative
+        // entry it resolves from the project, not the daemon's cwd.
+        let bin = project.path().join("agent-bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::write(bin.join(&adapter), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(bin.join(&adapter), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let config = |environment: &[String], hooks: bool, configured_command: Option<&str>| {
+            let mut config = crate::session::Config::default();
+            for (name, cmd) in [
+                ("fake", adapter.clone()),
+                ("fake-path", "/nonexistent/aoe-test-adapter".to_string()),
+                (
+                    "fake-present-path",
+                    bin.join(&adapter).display().to_string(),
+                ),
+                ("fake-rel-present", format!("agent-bin/{adapter}")),
+                ("fake-rel-missing", "agent-bin/aoe-test-missing".to_string()),
+            ] {
+                config.session.agent_acp_cmd.insert(name.into(), cmd);
+            }
+            config.environment = environment.to_vec();
+            if let Some(command) = configured_command {
+                config
+                    .session
+                    .agent_command_override
+                    .insert("gemini".into(), command.into());
+            }
+            if hooks {
+                config.host_hooks.before_session = vec!["true".into()];
+            }
+            config
+        };
+        let configured = vec![format!("PATH={}", bin.display())];
+        let present_wrapper = bin.join(&adapter).display().to_string();
+        let not_created = project.path().join("not-created");
+        let missing_text = "is not installed or not on $PATH";
+        let missing = Some(missing_text);
+        let not_capable = Some("is not ACP-capable");
+        struct Case<'a> {
+            label: &'a str,
+            tool: &'a str,
+            agent_name: Option<&'a str>,
+            command_override: &'a str,
+            sandboxed: bool,
+            /// `None`: a worktree, scratch or multi-repo session checked before it exists.
+            project: Option<&'a std::path::Path>,
+            environment: Vec<String>,
+            /// `agent_command_override` for gemini.
+            configured_command: Option<&'a str>,
+            before_session_hook: bool,
+            /// An `on_create` or `on_launch` hook runs before launch
+            /// (see `preparation_hooks_apply`).
+            preparation_hooks: bool,
+            inherited_path: Option<&'a str>,
+            /// `None` passes; otherwise a substring of the refusal.
+            expected: Option<&'a str>,
+        }
+        let base = || Case {
+            label: "",
+            tool: "fake",
+            agent_name: None,
+            command_override: "",
+            sandboxed: false,
+            project: Some(project.path()),
+            environment: Vec::new(),
+            configured_command: None,
+            before_session_hook: false,
+            preparation_hooks: false,
+            inherited_path: None,
+            expected: None,
+        };
+        let cases = [
+            Case {
+                label: "found nowhere",
+                expected: missing,
+                ..base()
+            },
+            Case {
+                label: "on the configured PATH",
+                environment: configured.clone(),
+                ..base()
+            },
+            Case {
+                label: "relative inherited entry, from the project",
+                inherited_path: Some("agent-bin"),
+                ..base()
+            },
+            Case {
+                label: "relative inherited entry, from another directory",
+                project: Some(elsewhere.path()),
+                inherited_path: Some("agent-bin"),
+                expected: missing,
+                ..base()
+            },
+            Case {
+                label: "a session command doesn't replace a custom agent's ACP command",
+                command_override: "my-wrapper acp",
+                expected: missing,
+                ..base()
+            },
+            Case {
+                label: "a session command replaces an adapter that is the agent's own CLI",
+                tool: "gemini",
+                command_override: &present_wrapper,
+                ..base()
+            },
+            Case {
+                label: "the replacing session command is checked too",
+                tool: "gemini",
+                command_override: "/nonexistent/aoe-test-gemini-wrapper",
+                expected: missing,
+                ..base()
+            },
+            Case {
+                label: "a configured command override replaces it the same way",
+                tool: "gemini",
+                configured_command: Some(&present_wrapper),
+                ..base()
+            },
+            Case {
+                label: "sandboxed skips the check",
+                sandboxed: true,
+                ..base()
+            },
+            Case {
+                label: "a before_session hook may set PATH",
+                before_session_hook: true,
+                ..base()
+            },
+            Case {
+                label: "an on_create hook may install the adapter",
+                preparation_hooks: true,
+                ..base()
+            },
+            Case {
+                label: "agent_name overrides the tool",
+                tool: "claude",
+                agent_name: Some("fake"),
+                expected: missing,
+                ..base()
+            },
+            Case {
+                label: "not ACP-capable",
+                tool: "aoe-test-not-acp",
+                expected: not_capable,
+                ..base()
+            },
+            Case {
+                label: "absolute command, missing",
+                tool: "fake-path",
+                expected: missing,
+                ..base()
+            },
+            Case {
+                label: "a before_session hook may install an absolute command",
+                tool: "fake-path",
+                before_session_hook: true,
+                ..base()
+            },
+            Case {
+                label: "relative command, present in the project",
+                tool: "fake-rel-present",
+                ..base()
+            },
+            Case {
+                label: "relative command, missing from an existing project",
+                tool: "fake-rel-missing",
+                expected: missing,
+                ..base()
+            },
+            Case {
+                label: "relative command, launch dir not created yet",
+                tool: "fake-rel-missing",
+                project: None,
+                ..base()
+            },
+            Case {
+                label: "relative command, project dir absent on disk",
+                tool: "fake-rel-missing",
+                project: Some(&not_created),
+                ..base()
+            },
+            Case {
+                label: "a before_session hook may install a relative command",
+                tool: "fake-rel-missing",
+                before_session_hook: true,
+                ..base()
+            },
+            Case {
+                label: "an on_create hook may install a relative command",
+                tool: "fake-rel-missing",
+                preparation_hooks: true,
+                ..base()
+            },
+            Case {
+                label: "absolute command, present",
+                tool: "fake-present-path",
+                ..base()
+            },
+            Case {
+                label: "a configured PATH replaces the inherited one, as at spawn",
+                environment: vec![format!("PATH={}", elsewhere.path().display())],
+                inherited_path: Some("agent-bin"),
+                expected: missing,
+                ..base()
+            },
+            Case {
+                label: "launch dir not created yet: a relative entry may resolve there",
+                project: None,
+                inherited_path: Some("agent-bin"),
+                ..base()
+            },
+            Case {
+                label: "launch dir not created yet: absolute entries are still searched",
+                project: None,
+                environment: configured.clone(),
+                ..base()
+            },
+            Case {
+                label: "launch dir not created yet: absolute entries without the adapter",
+                project: None,
+                environment: vec![format!("PATH={}", elsewhere.path().display())],
+                expected: missing,
+                ..base()
+            },
+        ];
+        for case in cases {
+            let label = case.label;
+            let asked = std::cell::Cell::new(false);
+            let config = config(
+                &case.environment,
+                case.before_session_hook,
+                case.configured_command,
+            );
+            let choice = StructuredChoice {
+                tool: case.tool,
+                agent_name: case.agent_name,
+                command_override: case.command_override,
+                sandboxed: case.sandboxed,
+                project_path: case.project,
+                preparation_hooks: &|| {
+                    asked.set(true);
+                    case.preparation_hooks
+                },
+            };
+            let got = structured::validate_structured_choice_with(
+                &choice,
+                &config,
+                &crate::session::environment::resolve_host_environment_pairs(&config.environment),
+                case.inherited_path.map(std::ffi::OsStr::new),
+            );
+            match (got, case.expected) {
+                (Ok(()), None) => {}
+                (Err(StructuredChoiceError::AdapterMissing(msg)), Some(want))
+                    if want == missing_text =>
+                {
+                    assert!(msg.contains(want), "{label}: {msg}");
+                }
+                (Err(StructuredChoiceError::NotCapable(msg)), Some(want)) => {
+                    assert!(msg.contains(want), "{label}: {msg}");
+                }
+                (got, expected) => panic!("{label}: got {got:?}, expected {expected:?}"),
+            }
+            // Hooks are asked about only when the adapter isn't otherwise found.
+            if case.expected.is_none() && !case.preparation_hooks {
+                assert!(
+                    !asked.get(),
+                    "{label}: asked about hooks for a reachable adapter"
+                );
+            }
+        }
+    }
+
+    /// Repository hooks count only while their trust isn't declined, and never for scratch.
+    #[test]
+    #[serial_test::serial]
+    fn preparation_hooks_apply_cases() {
+        use crate::session::config::repo_config::{compute_hooks_hash, trust_repo};
+        use crate::session::HooksConfig;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let on_launch = HooksConfig {
+            on_launch: vec!["npm install".into()],
+            ..Default::default()
+        };
+        let on_create = HooksConfig {
+            on_create: vec!["npm install".into()],
+            ..Default::default()
+        };
+        let repo_with_on_launch = || {
+            let repo = tempfile::tempdir().unwrap();
+            let dir = repo.path().join(".agent-of-empires");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("config.toml"),
+                "[hooks]\non_launch = [\"npm install\"]\n",
+            )
+            .unwrap();
+            repo
+        };
+        let plain = tempfile::tempdir().unwrap();
+        let untrusted = repo_with_on_launch();
+        let trusted = repo_with_on_launch();
+        trust_repo(trusted.path(), Some(&compute_hooks_hash(&on_launch)), None).unwrap();
+        let none = HooksConfig::default();
+        struct Case<'a> {
+            label: &'static str,
+            profile: &'a HooksConfig,
+            project: &'a std::path::Path,
+            scratch: bool,
+            trust_hooks: Option<bool>,
+            want: bool,
+        }
+        let cases = [
+            Case {
+                label: "profile on_launch",
+                profile: &on_launch,
+                project: plain.path(),
+                scratch: false,
+                trust_hooks: None,
+                want: true,
+            },
+            Case {
+                label: "profile on_create",
+                profile: &on_create,
+                project: plain.path(),
+                scratch: false,
+                trust_hooks: None,
+                want: true,
+            },
+            Case {
+                label: "no hooks",
+                profile: &none,
+                project: plain.path(),
+                scratch: false,
+                trust_hooks: None,
+                want: false,
+            },
+            Case {
+                label: "repo on_launch awaiting trust",
+                profile: &none,
+                project: untrusted.path(),
+                scratch: false,
+                trust_hooks: None,
+                want: true,
+            },
+            Case {
+                label: "repo on_launch, trust declined",
+                profile: &none,
+                project: untrusted.path(),
+                scratch: false,
+                trust_hooks: Some(false),
+                want: false,
+            },
+            Case {
+                label: "repo on_launch, scratch",
+                profile: &none,
+                project: untrusted.path(),
+                scratch: true,
+                trust_hooks: None,
+                want: false,
+            },
+            Case {
+                label: "repo on_launch trusted",
+                profile: &none,
+                project: trusted.path(),
+                scratch: false,
+                trust_hooks: Some(false),
+                want: true,
+            },
+        ];
+        for case in cases {
+            assert_eq!(
+                structured::preparation_hooks_apply(
+                    case.profile,
+                    case.project,
+                    case.scratch,
+                    case.trust_hooks,
+                ),
+                case.want,
+                "{}",
+                case.label
+            );
+        }
+    }
 
     fn roman_for_test(n: u32) -> String {
         let mut remaining = n;

@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import type { CreateProgress, CreateSessionRequest, SessionResponse, CreationTrustFingerprint } from "../../lib/types";
+import type {
+  CreateProgress,
+  CreateSessionRequest,
+  SessionResponse,
+  CreationTrustFingerprint,
+  GroupInfo,
+} from "../../lib/types";
 import {
   fetchAgents,
   fetchGroups,
@@ -43,6 +49,7 @@ import { AgentPanel } from "./steps/AgentPanel";
 import { WorktreePanel } from "./steps/WorktreePanel";
 import { SandboxPanel } from "./steps/SandboxPanel";
 import { ProfilePresetPicker } from "./steps/ProfilePresetPicker";
+import { GroupCombobox } from "./steps/GroupCombobox";
 import { CreateProgressView } from "./CreateProgressView";
 import { FieldRow, NavRow, PanelHeader, ROW_INPUT, RowGroup, SwitchRow } from "./WizardRows";
 import { LaunchFooter } from "./LaunchFooter";
@@ -169,6 +176,8 @@ interface Props {
   nameOnly?: boolean;
 }
 
+const NO_GROUPS: GroupInfo[] = [];
+
 export function SessionWizard({
   onClose,
   onCreated,
@@ -184,6 +193,7 @@ export function SessionWizard({
     error: null,
     agents: [],
     groups: [],
+    groupsFor: null,
     profiles: [],
     dockerAvailable: false,
     dockerChecked: false,
@@ -258,11 +268,23 @@ export function SessionWizard({
     };
   }, [servedProfile, prefill?.profile, onRetryServedProfile]);
 
+  // Groups are per profile, so the list follows the selected one, or the served one, which can
+  // change while the Daemon runs. A list is shown only for the profile it was fetched for.
+  const groupsKey = state.data.profile || `served:${servedProfile ?? ""}`;
+  useEffect(() => {
+    let alive = true;
+    void fetchGroups(state.data.profile || undefined).then((groups) => {
+      if (alive) dispatch({ type: "SET_GROUPS", groups, groupsFor: groupsKey });
+    });
+    return () => {
+      alive = false;
+    };
+  }, [state.data.profile, groupsKey]);
+
   useEffect(() => {
     const generations = defaultsGeneration;
     const switches = profileSwitchRef;
     fetchAgents().then((a) => dispatch({ type: "SET_AGENTS", agents: a }));
-    fetchGroups().then((g) => dispatch({ type: "SET_GROUPS", groups: g }));
     fetchDockerStatus().then((d) => dispatch({ type: "SET_DOCKER", available: d.available }));
     fetchProfiles()
       .then((profiles) => dispatch({ type: "SET_PROFILES", profiles }))
@@ -843,20 +865,12 @@ export function SessionWizard({
           onConfigure={!sandboxBlocked && d.sandboxEnabled ? openPanel("sandbox") : undefined}
         />
         <FieldRow label="Group" htmlFor="wizard-group">
-          <input
+          <GroupCombobox
             id="wizard-group"
-            type="text"
             value={d.group}
-            onChange={(e) => handleChange("group", e.target.value)}
-            placeholder="Optional"
-            list="wizard-groups"
-            className={ROW_INPUT}
+            onChange={(v) => handleChange("group", v)}
+            groups={state.groupsFor === groupsKey ? state.groups : NO_GROUPS}
           />
-          <datalist id="wizard-groups">
-            {state.groups.map((g) => (
-              <option key={g.path} value={g.path} />
-            ))}
-          </datalist>
         </FieldRow>
       </RowGroup>
     </div>
@@ -886,7 +900,7 @@ export function SessionWizard({
             &times;
           </button>
         </div>
-        <div className="flex-1 overflow-y-auto px-4 md:px-5 py-4">
+        <div data-wizard-scroll className="flex-1 overflow-y-auto px-4 md:px-5 py-4">
           {!nameOnly && !state.data.profile && !servedProfile && (
             <div
               role="alert"

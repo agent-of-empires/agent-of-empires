@@ -84,10 +84,15 @@ pub(crate) async fn login(
         "passphrase": passphrase,
         "device_binding_secret": binding_secret,
     });
-    let res = client.post(url).json(&body).send().await?;
+    // A token-plus-passphrase daemon gates the login route on the bearer too.
+    let mut request = client.post(url).json(&body);
+    if let Some(token) = endpoint.bearer_token() {
+        request = request.bearer_auth(token);
+    }
+    let res = request.send().await?;
     let status = res.status();
     if !status.is_success() {
-        return Err(map_auth_error(status));
+        return Err(map_auth_error(status, res.headers()));
     }
     let cookie = extract_session_cookie(res.headers()).ok_or(HttpError::Unauthorized)?;
     let session = PassphraseSession {
@@ -99,15 +104,10 @@ pub(crate) async fn login(
     Ok(session)
 }
 
-/// Authentication response bodies can reflect credentials, including transformed values.
-fn map_auth_error(status: StatusCode) -> HttpError {
-    match status {
-        StatusCode::UNAUTHORIZED => HttpError::Unauthorized,
-        _ => HttpError::Server {
-            status,
-            body: String::new(),
-        },
-    }
+/// Authentication response bodies can reflect credentials, so only the status and the
+/// validated error-code header are read.
+fn map_auth_error(status: StatusCode, headers: &HeaderMap) -> HttpError {
+    super::http::classify_status(status, headers, None, false)
 }
 
 /// Confirm the passphrase again against `POST /api/login/elevate`, extending
@@ -136,7 +136,7 @@ pub(super) async fn elevate(
     if status.is_success() {
         return Ok(());
     }
-    Err(map_auth_error(status))
+    Err(map_auth_error(status, res.headers()))
 }
 
 fn login_client(url: impl reqwest::IntoUrl) -> Result<(reqwest::Client, reqwest::Url), HttpError> {
@@ -471,16 +471,41 @@ mod tests {
         assert!(cache_dir.join(DEVICE_BINDING_FILENAME).exists());
     }
 
+    /// 401 maps from the status alone; a coded 403 keeps its code only when exactly one
+    /// known value agrees with the status. The body is never an input.
     #[test]
-    fn map_auth_error_distinguishes_unauthorized_from_generic() {
-        assert!(matches!(
-            map_auth_error(StatusCode::UNAUTHORIZED),
-            HttpError::Unauthorized
-        ));
-        assert!(matches!(
-            map_auth_error(StatusCode::TOO_MANY_REQUESTS),
-            HttpError::Server { status, .. } if status == StatusCode::TOO_MANY_REQUESTS
-        ));
+    fn map_auth_error_classifies_from_the_status_and_one_valid_code() {
+        let headers = |values: &[&str]| {
+            let mut map = HeaderMap::new();
+            for value in values {
+                map.append("aoe-error-code", value.parse().unwrap());
+            }
+            map
+        };
+        let forbidden = StatusCode::FORBIDDEN;
+        for (status, values, want) in [
+            (StatusCode::UNAUTHORIZED, &["read_only"][..], "unauthorized"),
+            (forbidden, &["read_only"], "read_only"),
+            (
+                forbidden,
+                &["access_policy_denied"],
+                "code:access_policy_denied",
+            ),
+            (forbidden, &[], "status"),
+            (forbidden, &["not_a_code"], "status"),
+            (forbidden, &["access_policy_denied", "read_only"], "status"),
+            (StatusCode::CONFLICT, &["access_policy_denied"], "status"),
+            (StatusCode::TOO_MANY_REQUESTS, &[], "status"),
+        ] {
+            let got = match map_auth_error(status, &headers(values)) {
+                HttpError::Unauthorized => "unauthorized".to_string(),
+                HttpError::ReadOnly => "read_only".to_string(),
+                HttpError::Server { body, .. } if !body.is_empty() => format!("code:{body}"),
+                HttpError::Server { .. } => "status".to_string(),
+                other => panic!("{status} {values:?}: {other:?}"),
+            };
+            assert_eq!(got, want, "{status} {values:?}");
+        }
     }
 
     #[tokio::test]
@@ -563,6 +588,8 @@ pub(crate) mod test_daemon {
             let router = Router::new()
                 .route("/api/login", post(login))
                 .route("/api/sessions", get(list))
+                .route("/api/runtime", get(profile_metadata))
+                .route("/api/profiles", get(profile_metadata))
                 .route("/api/sessions/{id}/acp/config-option", post(config_option))
                 .with_state(inner.clone());
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -648,6 +675,56 @@ pub(crate) mod test_daemon {
         }
         inner.config_options.push((id, cookie, binding, body));
         StatusCode::ACCEPTED
+    }
+
+    async fn profile_metadata(
+        State(inner): State<Arc<Mutex<Inner>>>,
+        uri: axum::http::Uri,
+        headers: HeaderMap,
+    ) -> impl IntoResponse {
+        let header = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        let authorized = match (
+            &inner.lock().unwrap().valid,
+            header("cookie"),
+            header("x-aoe-device-binding"),
+        ) {
+            (Some((c, b)), Some(cookie), Some(binding)) => *c == cookie && *b == binding,
+            _ => false,
+        };
+        if !authorized {
+            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({})));
+        }
+        let body = if uri.path() == "/api/profiles" {
+            serde_json::json!([
+                {"name": "default", "is_default": true},
+                {"name": "work", "is_default": false},
+            ])
+        } else {
+            serde_json::to_value(crate::daemon::RuntimeInfo {
+                owner_diagnostics: Vec::new(),
+                owner_instance_id: None,
+                protocol_version: crate::daemon::RUNTIME_PROTOCOL_VERSION,
+                epoch: "epoch".into(),
+                namespace: "ns".into(),
+                tmux_socket: None,
+                local_owner: false,
+                profiles: vec!["default".into(), "work".into()],
+                read_only: false,
+                cityhall_mode: false,
+                health: crate::daemon::RuntimeHealth::Healthy,
+                interaction_capabilities: crate::daemon::RuntimeCapabilities {
+                    mutations: true,
+                    native_interaction: true,
+                },
+            })
+            .unwrap()
+        };
+        (StatusCode::OK, Json(body))
     }
 
     async fn list(State(inner): State<Arc<Mutex<Inner>>>, headers: HeaderMap) -> impl IntoResponse {

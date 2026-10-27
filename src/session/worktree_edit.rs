@@ -292,6 +292,8 @@ pub struct WorktreeEditOutcome {
     /// `Some(new_branch)` when the branch was renamed; assign to
     /// `worktree_info.branch`. `None` means the branch was left untouched.
     pub new_branch: Option<String>,
+    /// Set when the directory moved but git is degraded there; says how to repair it.
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -378,31 +380,42 @@ pub fn edit_worktree_workdir(
         renamed_branch = true;
     }
 
+    let mut warning = None;
     if path_changes {
-        if let Err(e) = git.move_worktree(req.current_path, &new_path) {
-            if renamed_branch {
-                if let Err(rollback) = git.rename_branch(&new_branch, &req.worktree_info.branch) {
-                    tracing::error!(
-                        target: "git.worktree",
-                        new = %new_branch,
-                        old = %req.worktree_info.branch,
-                        "worktree edit: branch-rename rollback failed after move error: {rollback}"
-                    );
-                    // The repo is now on `new_branch` with the directory still at its old path.
-                    return Err(WorktreeEditError::RollbackFailed {
-                        move_err: e.to_string(),
-                        rollback_err: rollback.to_string(),
-                        branch: new_branch.clone(),
-                    });
+        match git.move_worktree(req.current_path, &new_path) {
+            Ok(moved) => {
+                warning = moved.into_warning();
+                if let Some(warning) = &warning {
+                    tracing::warn!(target: "git.worktree", to = %new_path.display(), "worktree edit left git degraded: {warning}");
                 }
             }
-            return Err(e.into());
+            Err(e) => {
+                if renamed_branch {
+                    if let Err(rollback) = git.rename_branch(&new_branch, &req.worktree_info.branch)
+                    {
+                        tracing::error!(
+                            target: "git.worktree",
+                            new = %new_branch,
+                            old = %req.worktree_info.branch,
+                            "worktree edit: branch-rename rollback failed after move error: {rollback}"
+                        );
+                        // The repo is now on `new_branch` with the directory still at its old path.
+                        return Err(WorktreeEditError::RollbackFailed {
+                            move_err: e.to_string(),
+                            rollback_err: rollback.to_string(),
+                            branch: new_branch.clone(),
+                        });
+                    }
+                }
+                return Err(e.into());
+            }
         }
     }
 
     Ok(WorktreeEditOutcome {
         new_path,
         new_branch: renamed_branch.then_some(new_branch),
+        warning,
     })
 }
 
@@ -658,5 +671,57 @@ mod tests {
                 "{new_name:?}"
             );
         }
+    }
+
+    /// A degraded move must reach the caller as `warning` while the new path
+    /// is still reported.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn edit_workdir_surfaces_a_degraded_move_warning() {
+        use crate::git::test_support::repo_with_nested_submodules;
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: root ignores directory permissions");
+            return;
+        }
+        let home_dir = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home_dir.path());
+
+        let dirs = repo_with_nested_submodules("feature", Path::new(".claude"));
+        let repo_path = dirs[0].path().to_path_buf();
+        let git = GitWorktree::new(repo_path.clone())
+            .unwrap()
+            .allow_submodule_file_transport();
+        let parent = tempfile::TempDir::new().unwrap();
+        let from = parent.path().join("source");
+        git.create_worktree("feature", &from, false, None).unwrap();
+
+        let gitdir = std::fs::read_to_string(from.join(".claude/.git")).unwrap();
+        let gitdir = from
+            .join(".claude")
+            .join(gitdir.trim().strip_prefix("gitdir: ").unwrap())
+            .canonicalize()
+            .unwrap();
+        std::fs::set_permissions(&gitdir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let info = wt_info("feature", repo_path.to_str().unwrap(), true);
+        let result = edit_worktree_workdir(WorktreeEditRequest {
+            worktree_info: &info,
+            current_path: &from,
+            new_name: "renamed",
+            rename_branch: false,
+        });
+        std::fs::set_permissions(&gitdir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let outcome = result.unwrap();
+        assert_eq!(outcome.new_path, parent.path().join("renamed"));
+        assert!(outcome.new_path.is_dir());
+        let warning = outcome.warning.expect("degraded move must carry a warning");
+        assert!(
+            warning.contains("git submodule update --init --recursive"),
+            "{warning}"
+        );
     }
 }

@@ -197,7 +197,7 @@ pub async fn spawn_acp(
         launch_admission: Some(crate::acp::supervisor::LaunchAdmission {
             store: native,
             generation: instance.lifecycle_generation,
-            namespace: None,
+            namespace: Some(state.profile_namespace.clone()),
         }),
         additional_dirs: req.additional_dirs,
         provider_env: req
@@ -309,6 +309,19 @@ pub async fn restart_acp(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
+    let work = state.runtime.work.clone();
+    match work
+        .run("server.acp.restart", async move {
+            restart_acp_inner(state, id, req).await
+        })
+        .await
+    {
+        Ok(response) => response,
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpRequest) -> Response {
     let Some(restart) = state.acp_supervisor.try_begin_restart(&id).await else {
         return (
             StatusCode::CONFLICT,
@@ -605,15 +618,15 @@ pub async fn shutdown_acp(
             if !persisted.is_structured() {
                 return not_structured_response();
             }
+            let _namespace = state.profile_namespace.read().await;
+            if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
             let stop_request = state
                 .acp_supervisor
                 .begin_stop_request(&id, "user_stopped", None, false)
                 .await;
             let cancelled_target = stop_request.cancelled_target();
-            let _namespace = state.profile_namespace.read().await;
-            if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
-            }
             state.acp_supervisor.cancel_restart_request(&id).await;
             let Some(_submission) = state
                 .session_service
@@ -784,6 +797,7 @@ async fn persist_agent_switch(
             instance.import_pending = None;
             instance.acp_effort = None;
             instance.agent_model = model.clone();
+            instance.terminal_rebind_pending = true;
             Ok(())
         })?;
         Ok(exclusion)
@@ -917,6 +931,9 @@ pub async fn switch_acp_agent(
             .await
         {
             Ok(exclusion) => exclusion,
+            Err(error) if is_store_write_failure(&error) => {
+                return persist_failure_response(&state, &id, "agent switch", &error).await;
+            }
             Err(error) => return launch_error_response("agent switch completion", &error),
         };
     state
@@ -1122,7 +1139,12 @@ pub async fn switch_acp_provider(
     let exclusion =
         match persist_provider_switch(native.clone(), &instance, &provider, exclusion).await {
             Ok(exclusion) => exclusion,
-            Err(error) => return launch_error_response("persisting the provider switch", &error),
+            Err(error) => {
+                if is_store_write_failure(&error) {
+                    state.acp_supervisor.request_respawn(&id);
+                }
+                return launch_error_response("persisting the provider switch", &error);
+            }
         };
     drop(native);
 
@@ -2063,6 +2085,32 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn unhealthy_shutdown_does_not_cancel_a_pending_spawn() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut instance =
+            crate::session::Instance::new("unhealthy-stop", "/tmp/aoe-unhealthy-stop");
+        instance.view = crate::session::View::Structured;
+        instance.source_profile = "default".into();
+        let id = instance.id.clone();
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            "default",
+            vec![instance.clone()],
+        );
+        let state = crate::server::test_support::build_test_app_state(vec![instance]);
+        let pending = state.acp_supervisor.begin_spawn_request(&id).unwrap();
+        *state.canonical_health.write().await = crate::daemon::RuntimeHealth::Degraded {
+            code: crate::daemon::ReloadFailureCode::Metadata,
+            profiles: Vec::new(),
+        };
+        let response = shutdown_acp(State(Arc::clone(&state)), Path(id))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!pending.cancellation().is_cancelled());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn shutdown_cancels_a_pre_admission_spawn_before_the_launcher() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2324,6 +2372,76 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn restart_survives_request_cancellation_after_worker_retirement() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut instance =
+            crate::session::Instance::new("restart-disconnect", "/tmp/aoe-restart-disconnect");
+        instance.view = crate::session::View::Structured;
+        instance.agent_name = Some("claude".into());
+        instance.source_profile = "default".into();
+        let id = instance.id.clone();
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            "default",
+            vec![instance.clone()],
+        );
+        let state = crate::server::test_support::build_test_app_state_with_launcher(
+            vec![instance],
+            crate::server::test_support::succeeding_launcher(),
+        );
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        state.acp_supervisor.test_insert_worker(&id).await;
+        let lock = state.instance_lock(&id).await;
+        let guard = lock.lock().await;
+        let request = {
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            tokio::spawn(async move {
+                restart_acp(
+                    State(state),
+                    Path(id),
+                    Ok(Json(SpawnAcpRequest {
+                        agent: None,
+                        model: None,
+                        additional_dirs: Vec::new(),
+                        provider_env: Vec::new(),
+                    })),
+                )
+                .await
+                .into_response()
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while state.acp_supervisor.worker_state(&id).await
+                != crate::daemon::AcpWorkerState::Absent
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("old worker retires");
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        drop(guard);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while state.acp_supervisor.worker_state(&id).await
+                != crate::daemon::AcpWorkerState::Running
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement runs after request cancellation");
+        assert_eq!(
+            shutdown_acp(State(Arc::clone(&state)), Path(id))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn selectors_wait_for_a_provider_switch_before_choosing_the_worker() {
         use super::super::config::{
             acp_set_config_option, acp_set_mode, SetConfigOptionRequest, SetModeRequest,
@@ -2501,6 +2619,7 @@ mod tests {
             );
             assert_eq!(stored.acp_session_id, None);
             assert_eq!(stored.acp_effort, None);
+            assert!(stored.terminal_rebind_pending);
 
             let memory = state.instances.read().await;
             let live = memory.iter().find(|i| i.id == id).expect("instance");
@@ -2575,6 +2694,107 @@ mod tests {
                 (Some(expected.0), Some(expected.1))
             );
         }
+    }
+
+    /// The target spawns, then the stored write fails on a valid row: the
+    /// caller gets the 500, the new worker is stopped, nothing announces a
+    /// switch, and neither store moves. Once storage recovers the retry lands.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_failed_agent_switch_write_stops_the_target_and_a_retry_recovers() {
+        use crate::server::test_support as support;
+        let profile = "default";
+        let _tmp = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let mut inst = crate::session::Instance::new("claude", project.path().to_str().unwrap());
+        inst.view = crate::session::View::Structured;
+        inst.status = crate::session::Status::Idle;
+        inst.source_profile = profile.to_string();
+        inst.agent_name = Some("claude".to_string());
+        inst.acp_effort = Some("high".to_string());
+        let id = inst.id.clone();
+        support::seed_instances_on_disk_for_test(profile, vec![inst.clone()]);
+        let state =
+            support::build_test_app_state_with_launcher(vec![inst], support::succeeding_launcher());
+        support::refresh_canonical_metadata_for_test(&state).await;
+        state.acp_supervisor.test_insert_worker(&id).await;
+        let switch = || async {
+            switch_acp_agent(
+                State(state.clone()),
+                Path(id.clone()),
+                Json(crate::acp::protocol::SwitchAgentRequest {
+                    target: "codex".to_string(),
+                    model: None,
+                    reason: None,
+                }),
+            )
+            .await
+            .into_response()
+        };
+        let switched = || {
+            state
+                .acp_event_store
+                .replay_from(&id, 0)
+                .iter()
+                .filter(|(_, event)| {
+                    matches!(event, crate::acp::state::Event::AgentSwitched { .. })
+                })
+                .count()
+        };
+
+        let failure = support::fail_session_writes_for_test(profile);
+        let resp = switch().await;
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(
+            body.contains("persist_failed") && body.contains("agent switch"),
+            "{body}"
+        );
+        assert_eq!(
+            state.acp_supervisor.worker_state(&id).await,
+            crate::daemon::AcpWorkerState::Absent,
+            "the target worker is stopped"
+        );
+        assert_eq!(switched(), 0);
+        assert_eq!(
+            state
+                .telemetry_structured
+                .agent_switches
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        let memory = state.instances.read().await;
+        assert_eq!(memory[0].agent_name.as_deref(), Some("claude"));
+        assert_eq!(memory[0].acp_effort.as_deref(), Some("high"));
+        drop(memory);
+        let stored = support::load_instances_from_disk_for_test(profile);
+        assert_eq!(stored[0].agent_name.as_deref(), Some("claude"));
+        assert_eq!(stored[0].acp_effort.as_deref(), Some("high"));
+
+        drop(failure);
+        // The failed commit left the store degraded until the next reload.
+        support::accept_runtime_read_cache_for_test(&state).await;
+        let resp = switch().await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(switched(), 1);
+        assert_eq!(
+            state
+                .telemetry_structured
+                .agent_switches
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        let stored = support::load_instances_from_disk_for_test(profile);
+        assert_eq!(stored[0].agent_name.as_deref(), Some("codex"));
+        assert_eq!(stored[0].acp_effort, None);
+        assert_eq!(
+            state.instances.read().await[0].agent_name.as_deref(),
+            Some("codex")
+        );
     }
 
     /// The pick reaches both stores, and the model resets to the provider's

@@ -2,19 +2,7 @@ import { useEffect, useState } from "react";
 import type { SessionStatus } from "../lib/types";
 import { isFreshIdle } from "../lib/session";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
-
-/** Animated spinner frames from rattles (https://github.com/vyfor/rattles) */
-const RATTLES: Record<string, { frames: string[]; interval: number }> = {
-  dots: {
-    frames: ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
-    interval: 220,
-  },
-  orbit: { frames: ["⠃", "⠉", "⠘", "⠰", "⢠", "⣀", "⡄", "⠆"], interval: 400 },
-  breathe: {
-    frames: ["⠀", "⠂", "⠌", "⡑", "⢕", "⢝", "⣫", "⣟", "⣿", "⣟", "⣫", "⢝", "⢕", "⡑", "⠌", "⠂", "⠀"],
-    interval: 180,
-  },
-};
+import { RATTLES } from "../lib/rattles";
 
 /** Which statuses get animated spinners vs static glyphs */
 const STATUS_RATTLE: Partial<Record<SessionStatus, keyof typeof RATTLES>> = {
@@ -41,7 +29,7 @@ const STATIC_GLYPH: Record<SessionStatus, string> = {
 const DORMANT_GLYPH = "⠶";
 
 /** Slowed-down `breathe` rattle for a freshly-stopped Idle session. */
-const FRESH_IDLE_RATTLE = { frames: RATTLES.breathe!.frames, interval: 280 };
+const FRESH_IDLE_RATTLE = { frames: RATTLES.breathe.frames, interval: 280 };
 
 /** Animated status glyph that cycles through rattles frames. */
 export function StatusGlyph({

@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useRef, useState } from "react";
 import { Folder } from "lucide-react";
 import { archivableWorkspaces, type SidebarGroup } from "../../lib/sidebarGroups";
 import { SCRATCH_GROUP_ID } from "../../hooks/useRepoGroups";
@@ -38,21 +38,6 @@ interface Props {
   dragHandle?: DragHandleProps;
 }
 
-/** Swallows clicks while the header is dragged and for 250ms after, so a reorder cannot also toggle or create. */
-function useDragClickSuppression(isDragging: boolean) {
-  const until = useRef(0);
-  useEffect(() => {
-    if (isDragging) until.current = Number.POSITIVE_INFINITY;
-    else if (until.current > Date.now()) until.current = Date.now() + 250;
-  }, [isDragging]);
-  return (e: React.MouseEvent) => {
-    if (until.current > Date.now()) {
-      e.preventDefault();
-      e.stopPropagation();
-    }
-  };
-}
-
 export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props) {
   const { group, hasActiveChild, onClick, onNewSession, offline, dragHandle } = props;
   const pluginAttention = usePluginAttention();
@@ -70,7 +55,6 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
   const renameRef = useRef<HTMLInputElement>(null);
   const { menu, menuRef, openMenu, closeMenu } = useContextMenu<{ x: number; y: number }>();
   const compact = useSidebarCompact();
-  const suppressClickAfterDrag = useDragClickSuppression(dragHandle?.isDragging ?? false);
 
   const dotClass = STATUS_DOT_CLASS[group.status === "active" ? "Running" : "Idle"] ?? "bg-status-idle";
   const rowClass = `${group.color ? "" : "hover:bg-surface-800/50"} ${hasActiveChild ? "border-l-2 border-session-active" : ""}`;
@@ -145,7 +129,6 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
               }
             : undefined
         }
-        onClickCapture={suppressClickAfterDrag}
         className={`group flex items-center gap-2 ${compact ? "px-2" : "px-3"} py-2 transition-colors duration-75 text-text-secondary focus:outline-none focus:ring-2 focus:ring-brand-600 ${rowClass}`}
         style={headerStyle}
         // The whole row activates the drag; `attributes` would collide with the menu's role and tabIndex.

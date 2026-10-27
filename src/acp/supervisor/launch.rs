@@ -137,13 +137,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                     *request_id == claim.request_id && !token.is_cancelled()
                 })
         });
-        if restart_in_progress && !restart_authorized {
-            if restart.is_some_and(|claim| claim.session_id == session_id && claim.is_cancelled()) {
-                return Err(SupervisorError::SpawnCancelled(session_id.to_string()));
-            }
-            return Err(SupervisorError::RestartInProgress(session_id.to_string()));
-        }
-        if restart.is_some() && !restart_authorized {
+        if (restart_in_progress || restart.is_some()) && !restart_authorized {
             if restart.is_some_and(|claim| claim.session_id == session_id && claim.is_cancelled()) {
                 return Err(SupervisorError::SpawnCancelled(session_id.to_string()));
             }
@@ -1133,6 +1127,15 @@ fn admission_error(error: anyhow::Error, session_id: &str) -> SupervisorError {
     } else {
         SupervisorError::Acp(AcpError::Spawn(format!("launch admission: {error:#}")))
     }
+}
+
+/// Admit a launch with no captured admission, such as a crash respawn, against the row as stored now.
+pub(super) async fn admit_stored_row(
+    profile: Option<&str>,
+    session_id: &str,
+) -> Result<(), SupervisorError> {
+    let (admission, _) = capture_durable_launch(profile, session_id, None, false).await?;
+    admit_durable_launch(admission.as_ref(), session_id).await
 }
 
 /// Check the same authority and generation before hooks, after hooks and after handshake.
@@ -2910,7 +2913,7 @@ time.sleep(60)
             )));
             assert!(events.iter().any(|(_, event)| matches!(
                 event,
-                Event::AgentMessageChunk { text } if text == "original producer completed"
+                Event::AgentMessageChunk { text, .. } if text == "original producer completed"
             )));
             let stops: Vec<_> = events
                 .iter()

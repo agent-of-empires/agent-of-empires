@@ -53,7 +53,12 @@ fn is_holding_path(path: &Path, session_id: &str) -> bool {
 pub enum RelocateOutcome {
     /// The worktree was moved into the holding area and `project_path` was
     /// repointed; `pre_trash_project_path` now holds the original location.
-    Relocated { from: PathBuf, to: PathBuf },
+    /// `warning` is set when git is left degraded at the new path.
+    Relocated {
+        from: PathBuf,
+        to: PathBuf,
+        warning: Option<String>,
+    },
     /// Nothing to do: not a managed single-repo worktree, or already
     /// relocated. `project_path` is untouched.
     Skipped,
@@ -67,7 +72,12 @@ pub enum RelocateOutcome {
 #[derive(Debug)]
 pub enum RestoreOutcome {
     /// The worktree was moved back to its pre-trash location.
-    Restored { from: PathBuf, to: PathBuf },
+    /// `warning` is set when git is left degraded at the original path.
+    Restored {
+        from: PathBuf,
+        to: PathBuf,
+        warning: Option<String>,
+    },
     /// No relocation had happened (plain/non-managed session, or a row trashed
     /// before relocation existed), so there is nothing to move. The caller
     /// still clears `trashed_at`.
@@ -229,11 +239,14 @@ pub fn relocate_worktree_to_trash(inst: &mut Instance) -> RelocateOutcome {
             };
         }
     }
-    if let Err(e) = git.move_worktree(&current, &target) {
-        return RelocateOutcome::Failed {
-            reason: format!("git worktree move: {e}"),
-        };
-    }
+    let warning = match git.move_worktree(&current, &target) {
+        Ok(moved) => moved.into_warning(),
+        Err(e) => {
+            return RelocateOutcome::Failed {
+                reason: format!("git worktree move: {e}"),
+            }
+        }
+    };
 
     discard_sandbox_container_after_move(&inst.id, is_sandboxed(inst));
     inst.pre_trash_project_path = Some(inst.project_path.clone());
@@ -245,9 +258,13 @@ pub fn relocate_worktree_to_trash(inst: &mut Instance) -> RelocateOutcome {
         to = %target.display(),
         "relocated trashed worktree into holding area"
     );
+    if let Some(warning) = &warning {
+        tracing::warn!(target: "session.trash", session = %inst.id, "relocated worktree is degraded: {warning}");
+    }
     RelocateOutcome::Relocated {
         from: current,
         to: target,
+        warning,
     }
 }
 
@@ -389,7 +406,8 @@ pub fn perform_trash(request: &TrashRequest) -> TrashResult {
         relocation,
         relocate_warning: match outcome {
             RelocateOutcome::Failed { reason } => Some(reason),
-            RelocateOutcome::Relocated { .. } | RelocateOutcome::Skipped => None,
+            RelocateOutcome::Relocated { warning, .. } => warning,
+            RelocateOutcome::Skipped => None,
         },
     }
 }
@@ -456,11 +474,14 @@ pub fn restore_worktree_location(inst: &mut Instance) -> RestoreOutcome {
             }
         }
     };
-    if let Err(e) = git.move_worktree(&current, &original) {
-        return RestoreOutcome::Failed {
-            reason: format!("git worktree move: {e}"),
-        };
-    }
+    let warning = match git.move_worktree(&current, &original) {
+        Ok(moved) => moved.into_warning(),
+        Err(e) => {
+            return RestoreOutcome::Failed {
+                reason: format!("git worktree move: {e}"),
+            }
+        }
+    };
     discard_sandbox_container_after_move(&inst.id, is_sandboxed(inst));
     inst.project_path = original.to_string_lossy().into_owned();
     inst.pre_trash_project_path = None;
@@ -471,9 +492,13 @@ pub fn restore_worktree_location(inst: &mut Instance) -> RestoreOutcome {
         to = %original.display(),
         "restored worktree from holding area"
     );
+    if let Some(warning) = &warning {
+        tracing::warn!(target: "session.trash", session = %inst.id, "restored worktree is degraded: {warning}");
+    }
     RestoreOutcome::Restored {
         from: current,
         to: original,
+        warning,
     }
 }
 

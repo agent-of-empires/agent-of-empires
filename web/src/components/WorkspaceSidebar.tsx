@@ -22,7 +22,7 @@ import { useSidebarTriage } from "../hooks/useSidebarTriage";
 import { ProjectsSection } from "./ProjectsSection";
 import { FoldChevron, PlusIcon, StrokeIcon } from "./icons";
 import { usePersistedFlag } from "./usePersistedFlag";
-import { useSuppressClickAfterDrag } from "./sidebar/dnd";
+import { newDragClickGuard, useSuppressClickAfterDrag, type DragClickGuard } from "./sidebar/dnd";
 import {
   filterFlat,
   filterNested,
@@ -80,6 +80,7 @@ interface Props {
   onEmptyTrash?: (workspaces: Workspace[]) => void;
   onStopSession?: (sessionId: string) => void;
   onStartSession?: (sessionId: string) => void;
+  onRestartForUpdate?: (sessionId: string) => void;
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
   readOnly?: boolean;
   /** False in CityHall client mode, which hides project management. */
@@ -115,8 +116,8 @@ export function WorkspaceSidebar(props: Props) {
     pluginSortActive ||
     facets.activeFacets.length > 0 ||
     groups.some((g) => !g.capabilities.reorder);
-  const dragSuppressRef = useRef<number>(0);
-  useSuppressClickAfterDrag(dragSuppressRef);
+  const dragClickGuard = useRef<DragClickGuard>(newDragClickGuard());
+  useSuppressClickAfterDrag(dragClickGuard);
 
   const [filterOpen, setFilterOpen] = useState(false);
   const [filterQuery, setFilterQuery] = useState("");
@@ -188,6 +189,7 @@ export function WorkspaceSidebar(props: Props) {
       onDelete: props.onDeleteSession,
       onStop: props.onStopSession,
       onStart: props.onStartSession,
+      onRestartForUpdate: props.onRestartForUpdate,
       onSwitchView: props.onSwitchView,
       readOnly,
       optimistic: triage.optimisticFor(v.workspace.id),
@@ -314,7 +316,7 @@ export function WorkspaceSidebar(props: Props) {
               onToggleGroup={props.onToggleGroup}
               onReorderGroups={props.onReorderGroups}
               onReorderWorkspaces={props.onReorderWorkspaces}
-              dragSuppressRef={dragSuppressRef}
+              dragClickGuard={dragClickGuard}
             />
           )}
 

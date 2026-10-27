@@ -3,7 +3,7 @@
 use tracing::{info, warn};
 
 use super::errors::AcpError;
-use super::resolve_command::{resolve_agent_command, Unresolved};
+use super::resolve_command::{on_agent_path, resolve_agent_command, Unresolved};
 use super::session_sandbox::{build_sandbox_docker_argv, SessionSandbox};
 use super::spawn::{
     apply_claude_store_route, apply_env_filter, host_environment_denyreason, prepend_path_dirs,
@@ -124,9 +124,7 @@ fn append_to_log(path: &std::path::Path) -> std::process::Stdio {
 /// A Worker started for a bare adapter name that resolved nowhere can only exit
 /// before its Hello, which loses the cause (#4576). `unresolved` is `None` when
 /// the name resolved or a sandbox resolves it inside its container; paths and
-/// `${placeholder}` commands resolve elsewhere. The adapter searches the last
-/// `PATH` in `agent_environment`, else the inherited one, from its cwd, so
-/// relative entries resolve against the project.
+/// `${placeholder}` commands resolve elsewhere.
 fn refuse_unresolved_adapter(
     config: &SpawnConfig,
     unresolved: Option<&Unresolved>,
@@ -136,15 +134,12 @@ fn refuse_unresolved_adapter(
     let Some(reason) = unresolved.filter(|reason| **reason != Unresolved::NotBare) else {
         return Ok(());
     };
-    let path = agent_environment
-        .iter()
-        .rev()
-        .find(|(key, _)| key == "PATH")
-        .map(|(_, path)| std::ffi::OsStr::new(path))
-        .or(inherited_path);
-    if path
-        .is_some_and(|path| which::which_in(&config.spec.command, Some(path), &config.cwd).is_ok())
-    {
+    if on_agent_path(
+        &config.spec.command,
+        &config.cwd,
+        agent_environment,
+        inherited_path,
+    ) {
         return Ok(());
     }
     Err(AcpError::unresolved_adapter_spawn_error(
@@ -152,6 +147,20 @@ fn refuse_unresolved_adapter(
         config,
         reason,
     ))
+}
+
+/// `current_exe()` keeps returning the original path after the binary is
+/// unlinked, so the spawn would otherwise fail with a bare ENOENT.
+fn ensure_runner_exe(exe: &std::path::Path) -> Result<(), AcpError> {
+    // A stat failure is not proof of removal; spawn reports the real error.
+    if exe.try_exists().unwrap_or(true) {
+        return Ok(());
+    }
+    Err(AcpError::Spawn(format!(
+        "aoe binary `{}` no longer exists; the running `aoe serve` was started from a \
+         build that was removed. Rebuild or reinstall aoe and restart `aoe serve`",
+        exe.display()
+    )))
 }
 
 /// The runner owns the agent subprocess and outlives the daemon; its Child is
@@ -164,6 +173,7 @@ pub(super) async fn spawn_runner_detached(
 ) -> Result<(u32, Option<crate::session::ExecutionBinding>), AcpError> {
     let current_exe =
         std::env::current_exe().map_err(|e| AcpError::Spawn(format!("current_exe: {e}")))?;
+    ensure_runner_exe(&current_exe)?;
     let log_path = crate::process::worker_registry::log_path_for(&session_id)
         .map_err(|e| AcpError::Spawn(format!("log path: {e}")))?;
     if let Some(parent) = log_path.parent() {
@@ -490,7 +500,10 @@ pub(super) async fn spawn_runner_detached(
         }
         let mut child = cmd
             .spawn()
-            .map_err(|error| AcpError::Spawn(format!("spawn runner: {error}")))?;
+            .map_err(|error| match ensure_runner_exe(&current_exe) {
+                Err(missing) if error.kind() == std::io::ErrorKind::NotFound => missing,
+                _ => AcpError::Spawn(format!("spawn runner: {error}")),
+            })?;
         let pid = child
             .id()
             .ok_or_else(|| AcpError::Spawn("runner exited before it could be identified".into()))?;
@@ -529,6 +542,21 @@ mod tests {
     const XDG: &str = "XDG_RUNTIME_DIR";
     const BUS: &str = "DBUS_SESSION_BUS_ADDRESS";
     const ENV: &str = "/usr/bin/env";
+
+    #[test]
+    fn missing_runner_exe_names_path_and_remedy() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("aoe");
+        let Err(AcpError::Spawn(message)) = ensure_runner_exe(&gone) else {
+            panic!("missing exe must fail with AcpError::Spawn");
+        };
+        assert!(message.contains(&gone.display().to_string()), "{message}");
+        assert!(message.contains("restart `aoe serve`"), "{message}");
+
+        assert!(ensure_runner_exe(&std::env::current_exe().unwrap()).is_ok());
+        // A stat error other than absence must not claim the build was removed.
+        assert!(ensure_runner_exe(std::path::Path::new("a\0b")).is_ok());
+    }
 
     fn prefix() -> ScopePrefix {
         ScopePrefix {

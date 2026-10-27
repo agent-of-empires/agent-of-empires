@@ -75,11 +75,11 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
           Adapter compatibility check failed
         </div>
         <h2 className="mt-2 text-lg font-semibold text-text-primary">{heading}</h2>
-        <p className="mt-3 text-sm text-text-secondary">{summary}</p>
+        <p className="mt-3 text-sm text-text-subtle">{summary}</p>
 
         {showHostCommand && (
           <div className="mt-4">
-            <div className="text-[11px] font-medium uppercase tracking-wide text-text-dim">
+            <div className="text-[11px] font-medium uppercase tracking-wide text-text-subtle">
               Run this, then restart the agent
             </div>
             <pre
@@ -93,23 +93,23 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
 
         {isSandboxed && installCommand && (
           <div className="mt-4" data-testid="startup-error-sandbox-note">
-            <div className="text-[11px] font-medium uppercase tracking-wide text-text-dim">
+            <div className="text-[11px] font-medium uppercase tracking-wide text-text-subtle">
               This session runs in a sandbox
             </div>
             {autoInstallable ? (
-              <p className="mt-1 text-sm text-text-secondary">
+              <p className="mt-1 text-sm text-text-subtle">
                 The adapter lives inside the container, so a host{" "}
                 <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">npm install</code> would not reach
-                it. Use <span className="font-medium text-text-secondary">Update &amp; restart</span> below to install
-                the adapter <span className="font-medium text-text-secondary">inside the container</span> and reload the
+                it. Use <span className="font-medium text-text-subtle">Update &amp; restart</span> below to install the
+                adapter <span className="font-medium text-text-subtle">inside the container</span> and reload the
                 session.
               </p>
             ) : (
               <>
-                <p className="mt-1 text-sm text-text-secondary">
+                <p className="mt-1 text-sm text-text-subtle">
                   The adapter lives inside the container, so installing it on the host would not reach it.
                 </p>
-                <div className="mt-3 text-[11px] font-medium uppercase tracking-wide text-text-dim">
+                <div className="mt-3 text-[11px] font-medium uppercase tracking-wide text-text-subtle">
                   Run this inside the container, then press Restart agent
                 </div>
                 <pre
@@ -120,7 +120,7 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
                 </pre>
               </>
             )}
-            <p className="mt-2 text-xs text-text-dim">
+            <p className="mt-2 text-xs text-text-subtle">
               This updates the running container only. To keep new sessions from hitting this, refresh the sandbox
               image: the aoe TUI shows a "sandbox image update available" banner that pulls the right image with your
               configured container runtime.
@@ -139,7 +139,7 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
         </div>
 
         {autoInstallable && !allowInstall && (
-          <div className="mt-2 text-xs text-text-dim" data-testid="startup-error-enable-hint">
+          <div className="mt-2 text-xs text-text-subtle" data-testid="startup-error-enable-hint">
             One-click install is off. Enable{" "}
             <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">acp.allow_agent_install</code> in the{" "}
             <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">aoe</code> TUI settings (Advanced) to
@@ -160,9 +160,9 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
           <div className="mt-2 text-xs text-status-error">Restart failed: {respawnError}</div>
         )}
 
-        <div className="mt-4 text-xs text-text-dim">
+        <div className="mt-4 text-xs text-text-subtle">
           The session is paused until the adapter satisfies the required version. After installing, use{" "}
-          <span className="font-medium text-text-secondary">Restart agent</span> above (no full restart of{" "}
+          <span className="font-medium text-text-subtle">Restart agent</span> above (no full restart of{" "}
           <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">aoe serve</code> needed) and the check
           re-runs at the next ACP <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">initialize</code>{" "}
           handshake.
@@ -240,10 +240,10 @@ function DetailRows({ detail }: { detail: IncompatibleAgentDetail }) {
       break;
   }
   return (
-    <dl className="mt-4 grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 font-mono text-[11px] text-text-secondary">
+    <dl className="mt-4 grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 font-mono text-[11px] text-text-subtle">
       {rows.map(([label, value]) => (
         <div key={label} className="contents">
-          <dt className="font-medium text-text-dim">{label}</dt>
+          <dt className="font-medium text-text-subtle">{label}</dt>
           <dd className="break-all">{value}</dd>
         </div>
       ))}

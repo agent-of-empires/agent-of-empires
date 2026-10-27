@@ -423,19 +423,7 @@ fn slice_line_columns(line: &ratatui::text::Line, from: u16, to_excl: u16, width
     crate::tui::components::text::line_columns(line, width).slice(from, to_excl.min(width))
 }
 
-/// `Alt+Up` / `Alt+Down`: the direction they walk the list, or `None` for any other key.
-fn jump_delta_for(key: &KeyEvent) -> Option<isize> {
-    // The bound chord is Alt alone. Ctrl+Alt+arrow is not one of ours, so inside live send it
-    // stays with the pane instead of breaking the relay.
-    if !key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::CONTROL) {
-        return None;
-    }
-    match key.code {
-        KeyCode::Up => Some(-1),
-        KeyCode::Down => Some(1),
-        _ => None,
-    }
-}
+const PAGE_STEP: u16 = 10;
 
 impl HomeView {
     pub fn is_diff_open(&self) -> bool {
@@ -687,7 +675,7 @@ impl HomeView {
             return;
         }
         match self.drag_state {
-            Some(DragKind::ListDivider) => {
+            Some(DragKind::ListDivider | DragKind::StackedListDivider) => {
                 self.handle_drag_end();
             }
             Some(DragKind::PreviewSelect) => {
@@ -698,11 +686,13 @@ impl HomeView {
         self.sidebar_position = position;
     }
 
-    /// Hit the preview border shared with the list, on either side.
-    /// Stacked and takeover views clear `divider_col`; modals block drags.
+    /// Hit the shared list/preview border. Overlays block resizing.
     pub fn hit_divider(&self, col: u16, row: u16) -> bool {
-        if self.has_dialog() {
+        if self.has_non_live_send_overlay() {
             return false;
+        }
+        if let Some(div_row) = self.divider_row {
+            return row == div_row && col >= self.list_area.x && col < self.list_area.right();
         }
         let Some(div_col) = self.divider_col else {
             return false;
@@ -725,7 +715,11 @@ impl HomeView {
     /// mobile clients where Shift-bypass does nothing.
     pub fn handle_drag_start(&mut self, col: u16, row: u16) -> bool {
         if self.hit_divider(col, row) {
-            self.drag_state = Some(DragKind::ListDivider);
+            self.drag_state = Some(if self.divider_row.is_some() {
+                DragKind::StackedListDivider
+            } else {
+                DragKind::ListDivider
+            });
             return true;
         }
         // Modals that aren't live-send sit over the preview, so a click inside
@@ -751,15 +745,12 @@ impl HomeView {
         false
     }
 
-    /// Resize the list within the preview's minimum width, or update a
-    /// text selection within the preview's content bounds.
+    /// Resize the list while reserving preview space, or update a text selection.
     ///
     /// True when state changed, so the caller redraws. Nothing persists per tick: the
     /// divider saves on release and the preview-select path emits OSC 52 on release.
     pub fn handle_drag_move(&mut self, col: u16, row: u16) -> bool {
-        // Settings scrollbar grab: map the live row to a scroll offset. Handled before the
-        // cancel-on-overlay logic below, which keys off `has_dialog()` (true while settings
-        // is open) and would tear the drag down on the first move.
+        // The settings scrollbar belongs to the overlay itself.
         if matches!(self.drag_state, Some(DragKind::SettingsScrollbar)) {
             if let Some(view) = &mut self.settings_view {
                 return view.scrollbar_drag_to_row(row);
@@ -769,28 +760,16 @@ impl HomeView {
             self.drag_state = None;
             return false;
         }
-        // A dialog opened mid-drag must not keep updating the sidebar invisibly under the
-        // modal, so end the drag here and persist whatever width was reached, mirroring
-        // `handle_drag_end`.
-        //
-        // `has_dialog()` is true during live-send, which is exactly when preview
-        // drag-select is meant to work, so live mode is exempt; a real modal opening
-        // mid-select still kills the drag and drops the selection so it cannot finalize
-        // behind the overlay.
+        // Live mode keeps the separator interactive; real overlays end the gesture.
         let drag_is_preview = matches!(self.drag_state, Some(DragKind::PreviewSelect));
-        let cancel_drag = if drag_is_preview {
-            self.has_non_live_send_overlay()
-        } else {
-            self.has_dialog()
-        };
-        if cancel_drag && self.drag_state.is_some() {
-            self.drag_state = None;
+        if self.has_non_live_send_overlay() && self.drag_state.is_some() {
             if drag_is_preview {
+                self.drag_state = None;
                 self.preview_selection = None;
                 self.preview_copy_pending = false;
                 self.preview_copy_text = None;
             } else {
-                self.save_list_width();
+                self.handle_drag_end();
             }
             return false;
         }
@@ -816,6 +795,21 @@ impl HomeView {
                     return false;
                 }
                 self.list_width = clamped;
+                true
+            }
+            Some(DragKind::StackedListDivider) => {
+                if self.divider_row.is_none() {
+                    self.handle_drag_end();
+                    return false;
+                }
+                let proposed = row.saturating_sub(self.list_area.y);
+                let height = responsive::stacked_list_height(self.main_area_height, Some(proposed));
+                if responsive::stacked_list_height(self.main_area_height, self.list_height)
+                    == height
+                {
+                    return false;
+                }
+                self.list_height = Some(height);
                 true
             }
             Some(DragKind::PreviewSelect) => {
@@ -948,10 +942,7 @@ impl HomeView {
         true
     }
 
-    /// End any active drag: the divider persists its final `list_width` to config, and a
-    /// preview selection is marked `finalized` so the renderer keeps the highlight until
-    /// dismissed. The clipboard copy is the caller's job (see `app.rs`), keeping this
-    /// method free of side effects beyond state.
+    /// Persist the final list size or finalize a preview selection for the caller to copy.
     ///
     /// True when a drag was in progress, so an `Up(Left)` that wasn't part of one causes
     /// no redraw.
@@ -966,6 +957,9 @@ impl HomeView {
         match state {
             DragKind::ListDivider => {
                 self.save_list_width();
+            }
+            DragKind::StackedListDivider => {
+                self.save_list_height();
             }
             DragKind::PreviewSelect => {
                 // A bare click collapses anchor == extent; treat it as no selection so a
@@ -1909,10 +1903,11 @@ impl HomeView {
         if self.live_send.is_some() && !self.has_non_live_send_overlay() {
             // The jump keys are the one exception: they mean "take me to another session",
             // which is only answerable from the list, so they leave the relay first.
-            if let Some(delta) = jump_delta_for(&key) {
+            if let Some(id @ (ActionId::JumpPrevFinished | ActionId::JumpNextFinished)) =
+                self.live_send_action(&key)
+            {
                 self.exit_live_send_if_active();
-                self.jump_to_adjacent_finished(delta);
-                return None;
+                return self.run_action(id, None);
             }
             return self.handle_live_send_key(key);
         }
@@ -2683,15 +2678,6 @@ impl HomeView {
             return None;
         }
 
-        // Ctrl+K opens the command palette in any hotkey mode, activated before strict
-        // normalization so the binding stays discoverable on every keymap.
-        if matches!(key.code, KeyCode::Char('k') | KeyCode::Char('K'))
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-        {
-            self.open_command_palette();
-            return None;
-        }
-
         // Strict-mode relocation happens inside dispatch_action_key through the shared
         // bindings registry, so no key rewriting happens here.
         self.dispatch_action_key(key, update_info)
@@ -2743,12 +2729,7 @@ impl HomeView {
         }
 
         // Registry-driven action keys.
-        let ctx = bindings::Ctx {
-            view_mode: self.view_mode.clone(),
-            sort_order: self.sort_order,
-            has_search: !self.search_matches.is_empty(),
-            project_group_selected: self.project_group_at_cursor().is_some(),
-        };
+        let ctx = self.bindings_ctx(false);
         match bindings::resolve_action(&key, self.strict_hotkeys, &ctx) {
             Some(bindings::ResolvedAction::Core(id)) => return self.run_action(id, update_info),
             Some(bindings::ResolvedAction::Plugin(action)) => {
@@ -3096,6 +3077,15 @@ impl HomeView {
             ActionId::Fork => self.open_fork_from_selection(),
             ActionId::EmptyTrash => self.prompt_empty_trash(),
             ActionId::AutoName => return self.auto_name_selected(),
+            ActionId::OpenCommandPalette => self.open_command_palette(),
+            ActionId::PreviewScrollUp => {
+                self.preview_scroll_offset = self.preview_scroll_offset.saturating_add(PAGE_STEP)
+            }
+            ActionId::PreviewScrollDown => {
+                self.preview_scroll_offset = self.preview_scroll_offset.saturating_sub(PAGE_STEP)
+            }
+            // `App` handles the chord before the home view sees it.
+            ActionId::DismissUpdateBanner => {}
         }
         None
     }
@@ -3811,6 +3801,30 @@ impl HomeView {
                 }
             }
         }
+    }
+
+    fn bindings_ctx(&self, live_send: bool) -> bindings::Ctx {
+        bindings::Ctx {
+            view_mode: self.view_mode.clone(),
+            sort_order: self.sort_order,
+            has_search: !self.search_matches.is_empty(),
+            project_group_selected: self.project_group_at_cursor().is_some(),
+            live_send,
+        }
+    }
+
+    /// The jump and preview-scroll actions live-send takes from the agent; every other
+    /// registry chord relays to the pane.
+    fn live_send_action(&self, key: &KeyEvent) -> Option<ActionId> {
+        bindings::resolve(key, self.strict_hotkeys, &self.bindings_ctx(true)).filter(|id| {
+            matches!(
+                id,
+                ActionId::JumpPrevFinished
+                    | ActionId::JumpNextFinished
+                    | ActionId::PreviewScrollUp
+                    | ActionId::PreviewScrollDown
+            )
+        })
     }
 
     fn open_command_palette(&mut self) {
@@ -4888,14 +4902,23 @@ impl HomeView {
                     super::Item::Session { id, .. } => self.session_switch_view_target(id),
                     super::Item::Group { .. } => None,
                 };
-                ContextMenuDialog::for_session(
+                let update_restart = match &self.flat_items[idx] {
+                    super::Item::Session { id, .. } => self.update_restart_offered(id),
+                    super::Item::Group { .. } => false,
+                };
+                let menu = ContextMenuDialog::for_session(
                     anchor,
                     is_archived,
                     snooze,
                     unread,
                     can_fork,
                     switch_view,
-                )
+                );
+                if update_restart {
+                    menu.with_restart_for_update()
+                } else {
+                    menu
+                }
             });
             return true;
         }
@@ -4991,6 +5014,15 @@ impl HomeView {
             ContextMenuAction::NewFromSelection => self.open_new_from_selection(),
             ContextMenuAction::Fork => self.open_fork_from_selection(),
             ContextMenuAction::SwitchView => self.prompt_switch_view_for_selected(),
+            ContextMenuAction::RestartForUpdate => {
+                if let Err(e) = self.restart_selected_for_update() {
+                    tracing::warn!("restart_selected_for_update failed: {}", e);
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Restart Failed",
+                        &format!("Could not restart session: {e}"),
+                    ));
+                }
+            }
             ContextMenuAction::OpenSortPicker => self.show_sort_picker(),
             ContextMenuAction::AddProject => self.open_add_project_for_selected(),
             ContextMenuAction::OpenGroupPicker => self.show_group_picker(),
@@ -6254,24 +6286,10 @@ impl HomeView {
         // the terminal-emulator convention where shift+page works on the outer scrollback.
         // Bare PageUp/PageDown still goes to the agent so agents that page their own UI
         // keep working.
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
-        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-        if shift && !ctrl && !alt {
-            const PAGE_STEP: u16 = 10;
-            match key.code {
-                KeyCode::PageUp => {
-                    self.preview_scroll_offset =
-                        self.preview_scroll_offset.saturating_add(PAGE_STEP);
-                    return None;
-                }
-                KeyCode::PageDown => {
-                    self.preview_scroll_offset =
-                        self.preview_scroll_offset.saturating_sub(PAGE_STEP);
-                    return None;
-                }
-                _ => {}
-            }
+        if let Some(id @ (ActionId::PreviewScrollUp | ActionId::PreviewScrollDown)) =
+            self.live_send_action(&key)
+        {
+            return self.run_action(id, None);
         }
 
         // The exit chord is checked before drift: exiting is always safe, and a user

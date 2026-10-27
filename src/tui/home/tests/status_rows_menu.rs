@@ -171,12 +171,12 @@ fn update_bar_renders_status_toast_without_update_info() {
          Full buffer:\n{out}"
     );
     assert!(
-        out.contains("[Ctrl+x] dismiss"),
+        out.contains("[Ctrl+X] dismiss"),
         "expected the dismiss hint alongside the toast.\nFull buffer:\n{out}"
     );
 }
 
-/// The sandbox-image banner renders with its `[u] pull` / `[Ctrl+x] dismiss` hints in the lowest
+/// The sandbox-image banner renders with its `[u] pull` / `[Ctrl+X] dismiss` hints in the lowest
 /// slot of `render_update_bar`, and an app update wins the shared row over it so the `u` and
 /// Ctrl+x keys stay unambiguous.
 #[test]
@@ -221,7 +221,7 @@ fn update_bar_renders_sandbox_image_banner() {
             "expected the sandbox image banner to render.\nFull buffer:\n{out}"
         );
         assert!(
-            out.contains("[u] pull") && out.contains("[Ctrl+x] dismiss"),
+            out.contains("[u] pull") && out.contains("[Ctrl+X] dismiss"),
             "expected the pull/dismiss hints alongside the image banner.\nFull buffer:\n{out}"
         );
     }
@@ -571,6 +571,43 @@ async fn trash_admission_does_not_locally_write_before_daemon_completion() {
         .find(|row| row.id == id)
         .unwrap()
         .is_trashed());
+}
+
+/// A daemon trash whose worktree move landed degraded reaches the TUI runtime dialog.
+#[tokio::test]
+#[serial]
+async fn trash_relocation_warning_reaches_the_dialog() {
+    let mut env = create_test_env_with_sessions(2);
+    let state = native_state(&["test"]).await;
+    apply_published(&mut env.view, &state).await;
+    let id = env.view.instance_at(0).id.clone();
+    let mut respond = env.view.session_feed.request_driver_for_test();
+    env.view.trash_session_by_id(&id);
+    let (status, headers, value) = request_with_headers(
+        &state,
+        "POST",
+        &format!("/api/sessions/{id}/trash"),
+        serde_json::json!({"kill_pane":true}),
+    )
+    .await;
+    assert!(status.is_success(), "{status}: {value}");
+    let mut outcome: crate::daemon::TrashOutcome =
+        serde_json::from_value(value["outcome"].clone()).unwrap();
+    outcome.relocation = crate::daemon::TrashRelocationOutcome::Relocated {
+        warning: Some("submodule x is not repointed".to_string()),
+    };
+    let receipt = crate::daemon::MutationReceipt {
+        cursor: super::pickers_groups_sort::receipt_cursor(&headers),
+        outcome,
+    };
+    assert!(respond(Ok(
+        crate::tui::session_feed::SessionCommandOutcome::Trashed(receipt)
+    ))
+    .is_some());
+    env.view.apply_session_feed();
+    apply_published(&mut env.view, &state).await;
+    let dialog = env.view.info_dialog.as_ref().expect("runtime dialog");
+    assert!(dialog.message().contains("submodule x is not repointed"));
 }
 
 /// Trashing reserves a durable lifecycle generation before queueing teardown.

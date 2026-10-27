@@ -346,6 +346,9 @@ pub struct RestartSessionBody {
     #[serde(default)]
     pub discard_sandbox_container: bool,
     pub wake_message: Option<String>,
+    /// Refuse, under the lifecycle locks, a session that is no longer Idle.
+    #[serde(default)]
+    pub only_if_idle: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -491,8 +494,14 @@ pub struct TrashOutcome {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum TrashRelocationOutcome {
     Skipped,
-    Relocated,
-    Failed { reason: String },
+    /// `warning` is set when git is left degraded at the new path.
+    Relocated {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
+    },
+    Failed {
+        reason: String,
+    },
 }
 
 fn default_kill_pane() -> bool {
@@ -805,7 +814,11 @@ pub struct PendingApproval {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum RestoreOutcome {
-    Restored,
+    /// `warning` is set when git is left degraded at the original path.
+    Restored {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
+    },
     AlreadyRestored,
 }
 
@@ -1036,6 +1049,9 @@ pub struct SessionResponse {
     pub acp_worker_state: AcpWorkerState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acp_worker_start: Option<AcpWorkerStart>,
+    /// The agent binary was replaced after launch and a restart is safe to offer now.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub update_restart: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_approvals: Vec<PendingApproval>,
     /// The provider rate limit this session is parked on, read from the

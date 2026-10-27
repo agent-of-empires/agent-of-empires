@@ -669,7 +669,10 @@ mod tests {
         enable_auto_resume(true);
         let long_ago = Utc::now() - chrono::Duration::hours(1);
         let events = [
-            Event::AgentMessageChunk { text: "x".into() },
+            Event::AgentMessageChunk {
+                text: "x".into(),
+                message_id: None,
+            },
             Event::RateLimit {
                 info: crate::acp::state::RateLimitInfo {
                     status: "limited".into(),

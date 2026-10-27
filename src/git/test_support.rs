@@ -133,3 +133,83 @@ fn run_git_ignores_inherited_repository_context() {
     );
     assert_eq!(observed[1].trim(), "target");
 }
+
+/// `main -> .claude -> .claude/nested`, each served from a bare `file://`
+/// clone, with `branch` on the main repo's HEAD. Two levels, since the
+/// moved pointers sit at different depths.
+pub(crate) fn repo_with_nested_submodules(branch: &str, outer_path: &Path) -> Vec<TempDir> {
+    fn commit_all(dir: &Path, message: &str) {
+        run_git(dir, &["add", "-A"]);
+        run_git(
+            dir,
+            &[
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@e",
+                "commit",
+                "-qm",
+                message,
+            ],
+        );
+    }
+    fn seed(name: &str) -> TempDir {
+        let dir = TempDir::new().unwrap();
+        run_git(dir.path(), &["init", "-q", "."]);
+        std::fs::write(dir.path().join(format!("{name}.md")), format!("{name}\n")).unwrap();
+        commit_all(dir.path(), "init");
+        dir
+    }
+    fn bare_url(src: &Path, dirs: &mut Vec<TempDir>) -> String {
+        let parent = TempDir::new().unwrap();
+        let bare = parent.path().join("repo.git");
+        run_git(
+            parent.path(),
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                src.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+        );
+        dirs.push(parent);
+        format!("file://{}", bare.display())
+    }
+    fn add_submodule(repo: &Path, url: &str, path: &Path) {
+        let output = std::process::Command::new("git")
+            .current_dir(repo)
+            .args([
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                "--name",
+                "fixture",
+            ])
+            .arg(url)
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git submodule add failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        commit_all(repo, "add submodule");
+    }
+
+    let mut dirs = Vec::new();
+    let inner = seed("inner");
+    let inner_url = bare_url(inner.path(), &mut dirs);
+    let mid = seed("mid");
+    add_submodule(mid.path(), &inner_url, Path::new("nested"));
+    let mid_url = bare_url(mid.path(), &mut dirs);
+    let repo = seed("README");
+    add_submodule(repo.path(), &mid_url, outer_path);
+    run_git(repo.path(), &["branch", branch]);
+    dirs.insert(0, repo);
+    dirs.extend([inner, mid]);
+    dirs
+}

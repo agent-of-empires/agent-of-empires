@@ -322,6 +322,32 @@ describe("AskUserQuestionCard rendering", () => {
     submit();
     expect(onResolve).toHaveBeenCalledWith({ action: "accept", answers: { question_0: "Red" } });
   });
+
+  it.each(["single_select", "multi_select"] as const)(
+    "shows a preview toggle only for %s options that carry one",
+    (kind) => {
+      const onResolve = renderCard([
+        q({
+          field_key: "question_0",
+          kind,
+          title: "Pick",
+          options: [
+            { value: "Red", label: "Red", preview: "draft reply" },
+            { value: "Blue", label: "Blue", preview: null },
+          ],
+        }),
+      ]);
+      expect(screen.getAllByText("Preview")).toHaveLength(1);
+      expect(screen.getByText("draft reply")).toBeTruthy();
+      fireEvent.click(screen.getByText("Preview"));
+      fireEvent.click(screen.getAllByRole(kind === "multi_select" ? "checkbox" : "radio")[0]!);
+      submit();
+      expect(onResolve).toHaveBeenCalledWith({
+        action: "accept",
+        answers: { question_0: kind === "multi_select" ? ["Red"] : "Red" },
+      });
+    },
+  );
 });
 
 describe("ElicitationAnswerCard", () => {

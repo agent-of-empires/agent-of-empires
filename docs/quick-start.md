@@ -32,6 +32,12 @@ Press `n` and fill in the path to your project (or leave `.`), or run `aoe add /
 
 Press `t` to toggle between the structured view and the paired shell terminal, where you can run builds and git commands without interrupting the agent.
 
+Drag the border between the session list and preview to resize the list. In terminals
+narrower than 80 columns, the list moves above the preview: drag their horizontal border
+up or down to change its height, including in live mode. Width and height are remembered
+separately across restarts. A shorter window temporarily limits the height to leave room
+for the preview; enlarging it restores your chosen height.
+
 ## Projects and groups
 
 A **project** is a saved directory path you register once so you can start sessions from it without retyping. Registering is only a convenience: `n` and `aoe add <path>` work on any path. Add one with `aoe project add /path/to/repo`, or press `p` in the TUI and then `a`. Once a project exists, `b` starts a session from it. See [Multi-repo workspaces](guides/multi-repo-workspaces.md#the-project-registry).

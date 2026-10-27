@@ -11,13 +11,14 @@ use tracing::{debug, info, warn};
 
 use super::agents::log_wrapper_substitution;
 use super::launch::{
-    apply_claude_store_pin, await_resume_to_completion, before_session_env, overlay_env,
-    publish_rejection, refresh_spawn_model_effort, resolve_mcp_servers,
+    admit_stored_row, apply_claude_store_pin, await_resume_to_completion, before_session_env,
+    overlay_env, publish_rejection, refresh_spawn_model_effort, resolve_mcp_servers,
 };
 use super::teardown::{settle_sweeping_if_owed, tear_down_runner, wait_for_exit};
 use super::{
-    lock_recover, next_seq, BroadcastSink, Launcher, PendingContextReset, SeqMap, SharedSet,
-    Supervisor, WorkerKind, Workers, MAX_RESPAWNS_IN_WINDOW, RESPAWN_BACKOFF, RESTART_WINDOW,
+    lock_recover, next_seq, BroadcastSink, Launcher, PendingContextReset, ResumeReservation,
+    SeqMap, SharedSet, Supervisor, SupervisorError, WorkerKind, Workers, MAX_RESPAWNS_IN_WINDOW,
+    RESPAWN_BACKOFF, RESTART_WINDOW,
 };
 use crate::acp::acp_client::{AcpError, SpawnConfig};
 use crate::acp::runner_lifecycle::{
@@ -567,7 +568,9 @@ impl<S: BroadcastSink> Drain<S> {
         )
         .await
         .is_ok();
-        if !refreshed {
+        self.refuse_if_dismissed(&config).await;
+        let cancelled = lock_recover(&self.lifecycle).cancel_requested(&respawn_lease);
+        if !refreshed || cancelled.is_some() {
             if lock_recover(&self.lifecycle).convert_to_stopping(&respawn_lease) {
                 self.finish_cancelled(&respawn_lease, previous).await;
             }
@@ -582,6 +585,7 @@ impl<S: BroadcastSink> Drain<S> {
         let mut client = match launched {
             Ok(client) => client,
             Err(e) => {
+                self.refuse_if_dismissed(&config).await;
                 self.fail_launch(&respawn_lease, previous, &config, e).await;
                 return None;
             }
@@ -594,6 +598,7 @@ impl<S: BroadcastSink> Drain<S> {
             );
             let client = Arc::new(client);
             respawn_lease.retirement().record_client(&client, false);
+            self.refuse_if_dismissed(&config).await;
             self.fail_launch(
                 &respawn_lease,
                 previous,
@@ -606,6 +611,7 @@ impl<S: BroadcastSink> Drain<S> {
         let client = Arc::new(client);
         respawn_lease.retirement().record_client(&client, false);
         if !respawn_lease.attest_runner().await {
+            self.refuse_if_dismissed(&config).await;
             self.fail_launch(
                 &respawn_lease,
                 previous,
@@ -632,6 +638,7 @@ impl<S: BroadcastSink> Drain<S> {
                 .unwrap_or_else(|| RunnerIdentity::unattested(pid, respawn_lease.epoch()))
         });
 
+        self.refuse_if_dismissed(&config).await;
         let refused = {
             let mut guard = self.workers.lock().await;
             if worker_registry::stop_requested(session_id) {
@@ -779,6 +786,27 @@ impl<S: BroadcastSink> Drain<S> {
             "MCP re-resolution on respawn failed",
         )
         .await;
+    }
+
+    /// Route an archived, trashed or purged row through the stop path, so the cancellation retires
+    /// the replacement and the runner it replaces.
+    async fn refuse_if_dismissed(&self, config: &SpawnConfig) {
+        let refusal =
+            match admit_stored_row(config.source_profile.as_deref(), &self.session_id).await {
+                Ok(()) => return,
+                Err(SupervisorError::Blocked(blocked)) => blocked.code(),
+                Err(SupervisorError::SessionGone(_)) => "session_gone",
+                Err(error) => {
+                    warn!(
+                        target: "acp.supervisor",
+                        session = %self.session_id,
+                        error = %error,
+                        "durable admission check failed on respawn; continuing without it"
+                    );
+                    return;
+                }
+            };
+        lock_recover(&self.lifecycle).begin_stop(&self.session_id, refusal, false);
     }
 
     /// Report a failed relaunch and retire whatever runner this epoch left.
@@ -1837,6 +1865,286 @@ mod tests {
         assert!(control.releases().is_empty(), "{:?}", control.releases());
         assert_eq!(
             sup.worker_state("s-respawn-kept").await,
+            AcpWorkerState::Absent
+        );
+    }
+
+    fn seed_row(id: &str) -> (crate::session::Storage, String) {
+        let mut inst = crate::session::Instance::new(id, "/tmp");
+        inst.id = id.into();
+        let storage = crate::session::Storage::new_unwatched(&inst.source_profile).unwrap();
+        let profile = inst.source_profile.clone();
+        storage
+            .update(|rows, _| {
+                *rows = vec![inst];
+                Ok(())
+            })
+            .unwrap();
+        (storage, profile)
+    }
+
+    /// A crash respawn after an archive or a purge launches no replacement.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_respawn_for_a_dismissed_row_launches_nothing() {
+        type Dismiss = fn(&mut Vec<crate::session::Instance>);
+        let cases: [(&str, &str, Dismiss); 2] = [
+            ("s-archived", "session_archived", |rows| rows[0].archive()),
+            ("s-purged", "session_gone", |rows| rows.clear()),
+        ];
+        for (id, reason, dismiss) in cases {
+            let _home = isolate_home();
+            let control =
+                Arc::new(crate::acp::runner_lifecycle::test_support::FakeProcessControl::default());
+            control.alive(4242);
+            let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let launcher: Launcher = {
+                let launches = Arc::clone(&launches);
+                Arc::new(move |_: SpawnConfig, _: AcpSessionId| {
+                    launches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Box::pin(async { Err(AcpError::Spawn("must not launch".into())) })
+                })
+            };
+            let sink = VecSink::new();
+            let sup = Arc::new(
+                Supervisor::new(sink.clone())
+                    .with_process_control(control.clone())
+                    .with_launcher(launcher),
+            );
+            let (storage, profile) = seed_row(id);
+            storage
+                .update(|rows, _| {
+                    dismiss(rows);
+                    Ok(())
+                })
+                .unwrap();
+            save_attested_test_record(id, 4242, 0);
+            let socket = worker_registry::socket_path_for(id).unwrap();
+            let mut config = runner_config(socket);
+            config.source_profile = Some(profile);
+            let lease = sup
+                .test_install_runner(id, config, Some(attested_test_identity(4242, 0)))
+                .await;
+            let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
+            let drain = sup.start_drain_task(id.into(), lease, inbound_rx, None);
+            drop(inbound_tx);
+
+            tokio::time::timeout(Duration::from_secs(5), drain)
+                .await
+                .expect("drain task must finish")
+                .unwrap();
+            assert_eq!(
+                launches.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{id}"
+            );
+            assert_eq!(stopped_reasons(&sink, id), [reason.to_string()], "{id}");
+            assert_eq!(sup.worker_state(id).await, AcpWorkerState::Absent, "{id}");
+        }
+    }
+
+    /// An archive or trash that lands while the `before_session` hook runs reaches no launcher.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_respawn_dismissed_during_the_hook_launches_nothing() {
+        type Dismiss = fn(&mut Vec<crate::session::Instance>);
+        let cases: [(&str, &str, Dismiss); 2] = [
+            ("s-hook-archived", "session_archived", |rows| {
+                rows[0].archive()
+            }),
+            ("s-hook-trashed", "session_trashed", |rows| rows[0].trash()),
+        ];
+        for (id, reason, dismiss) in cases {
+            let (_home, temp) = isolate_home();
+            let entered = temp.path().join("hook-entered");
+            let release = temp.path().join("hook-release");
+            let app_dir = crate::session::get_app_dir().unwrap();
+            std::fs::create_dir_all(&app_dir).unwrap();
+            std::fs::write(
+                app_dir.join("config.toml"),
+                format!(
+                    "[host_hooks]\nbefore_session = \"touch {entered}; while [ ! -e {release} ]; do sleep 0.02; done\"\n",
+                    entered = entered.display(),
+                    release = release.display(),
+                ),
+            )
+            .unwrap();
+            let control =
+                Arc::new(crate::acp::runner_lifecycle::test_support::FakeProcessControl::default());
+            control.alive(4242);
+            let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let launcher: Launcher = {
+                let launches = Arc::clone(&launches);
+                Arc::new(move |_: SpawnConfig, _: AcpSessionId| {
+                    launches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Box::pin(async { Err(AcpError::Spawn("must not launch".into())) })
+                })
+            };
+            let sink = VecSink::new();
+            let sup = Arc::new(
+                Supervisor::new(sink.clone())
+                    .with_process_control(control.clone())
+                    .with_launcher(launcher),
+            );
+            let (storage, profile) = seed_row(id);
+            save_attested_test_record(id, 4242, 0);
+            let socket = worker_registry::socket_path_for(id).unwrap();
+            let mut config = runner_config(socket);
+            config.source_profile = Some(profile);
+            let lease = sup
+                .test_install_runner(id, config, Some(attested_test_identity(4242, 0)))
+                .await;
+            let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
+            let drain = sup.start_drain_task(id.into(), lease, inbound_rx, None);
+            drop(inbound_tx);
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !entered.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("hook must start");
+            storage
+                .update(|rows, _| {
+                    dismiss(rows);
+                    Ok(())
+                })
+                .unwrap();
+            std::fs::write(&release, "").unwrap();
+
+            tokio::time::timeout(Duration::from_secs(5), drain)
+                .await
+                .expect("drain task must finish")
+                .unwrap();
+            assert_eq!(
+                launches.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{id}"
+            );
+            assert_eq!(stopped_reasons(&sink, id), [reason.to_string()], "{id}");
+            assert_eq!(sup.worker_state(id).await, AcpWorkerState::Absent, "{id}");
+            assert!(storage.load().unwrap()[0].ensure_startable().is_err());
+        }
+    }
+
+    /// A trash that lands during the respawn handshake retires the replacement uninstalled.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_respawn_trashed_during_the_handshake_retires_the_replacement() {
+        let _home = isolate_home();
+        let control =
+            Arc::new(crate::acp::runner_lifecycle::test_support::FakeProcessControl::default());
+        control.alive(4242).alive(4343);
+        let gate = Gate::default();
+        let sink = VecSink::new();
+        let sup = Arc::new(
+            Supervisor::new(sink.clone())
+                .with_process_control(control.clone())
+                .with_launcher(gated_launcher(&gate, 4343)),
+        );
+        let (storage, profile) = seed_row("s-trashed");
+        save_attested_test_record("s-trashed", 4242, 0);
+        let socket = worker_registry::socket_path_for("s-trashed").unwrap();
+        let mut config = runner_config(socket);
+        config.source_profile = Some(profile);
+        let lease = sup
+            .test_install_runner("s-trashed", config, Some(attested_test_identity(4242, 0)))
+            .await;
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
+        let drain = sup.start_drain_task("s-trashed".into(), lease, inbound_rx, None);
+        drop(inbound_tx);
+
+        gate.entered.notified().await;
+        storage
+            .update(|rows, _| {
+                rows[0].trash();
+                Ok(())
+            })
+            .unwrap();
+        gate.open.notify_one();
+        control.terminated().await;
+        control.exit(4343);
+
+        tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .expect("drain task must finish")
+            .unwrap();
+        assert!(control.signals().iter().any(|(pid, _)| *pid == 4343));
+        assert_eq!(
+            stopped_reasons(&sink, "s-trashed"),
+            ["session_trashed".to_string()]
+        );
+        assert_eq!(sup.worker_state("s-trashed").await, AcpWorkerState::Absent);
+        assert!(storage.load().unwrap()[0].ensure_startable().is_err());
+    }
+
+    /// A trash that lands before the launcher fails reports the dismissal and retires the
+    /// predecessor, not a launch error.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_failed_respawn_after_a_trash_reports_the_dismissal() {
+        let _home = isolate_home();
+        let control =
+            Arc::new(crate::acp::runner_lifecycle::test_support::FakeProcessControl::default());
+        control.alive(4242);
+        let gate = Gate::default();
+        let launcher: Launcher = {
+            let entered = Arc::clone(&gate.entered);
+            let open = Arc::clone(&gate.open);
+            Arc::new(move |_: SpawnConfig, _: AcpSessionId| {
+                let entered = Arc::clone(&entered);
+                let open = Arc::clone(&open);
+                Box::pin(async move {
+                    entered.notify_one();
+                    open.notified().await;
+                    Err(AcpError::Spawn("dial deadline".into()))
+                })
+            })
+        };
+        let sink = VecSink::new();
+        let sup = Arc::new(
+            Supervisor::new(sink.clone())
+                .with_process_control(control.clone())
+                .with_launcher(launcher),
+        );
+        let (storage, profile) = seed_row("s-trash-failed");
+        save_attested_test_record("s-trash-failed", 4242, 0);
+        let socket = worker_registry::socket_path_for("s-trash-failed").unwrap();
+        let mut config = runner_config(socket);
+        config.source_profile = Some(profile);
+        let lease = sup
+            .test_install_runner(
+                "s-trash-failed",
+                config,
+                Some(attested_test_identity(4242, 0)),
+            )
+            .await;
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
+        let drain = sup.start_drain_task("s-trash-failed".into(), lease, inbound_rx, None);
+        drop(inbound_tx);
+
+        gate.entered.notified().await;
+        storage
+            .update(|rows, _| {
+                rows[0].trash();
+                Ok(())
+            })
+            .unwrap();
+        gate.open.notify_one();
+        control.terminated().await;
+        control.exit(4242);
+
+        tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .expect("drain task must finish")
+            .unwrap();
+        assert_eq!(
+            stopped_reasons(&sink, "s-trash-failed"),
+            ["session_trashed".to_string()]
+        );
+        assert_eq!(
+            sup.worker_state("s-trash-failed").await,
             AcpWorkerState::Absent
         );
     }

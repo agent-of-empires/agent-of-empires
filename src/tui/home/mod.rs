@@ -76,27 +76,11 @@ pub(super) use self::watchers::{
 };
 use self::watchers::{RELOAD_FAILED_TITLE, WATCHER_WARNING_TITLE};
 
-/// Kinds of in-progress mouse drags. Today only the list/preview divider
-/// is draggable; the enum keeps future drag targets (diff split, group
-/// reorder) from churning the `Option<...>` shape on `HomeView`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DragKind {
-    /// Resizing the side-by-side list/preview divider. `start_col` is the
-    /// column where the user pressed; `start_width` is the requested
-    /// `list_width` at that moment. The new requested width is
-    /// `start_width + (current_col - start_col)`, clamped on apply.
     ListDivider,
-    /// Drag-selecting text inside the preview pane. Available whenever
-    /// the pane is on screen (in or out of live-send mode). The anchor
-    /// cell is where the user pressed; `preview_selection` on
-    /// `HomeView` carries the live extent and is what the renderer
-    /// reads. We keep the kind here (with no payload beyond a marker)
-    /// so `handle_drag_move` / `handle_drag_end` can dispatch by
-    /// variant without re-checking `live_send`.
+    StackedListDivider,
     PreviewSelect,
-    /// Grab-dragging the Settings fields-panel scrollbar. The live row is
-    /// mapped to a scroll offset on each move (`scrollbar_drag_to_row`);
-    /// there's no payload because the settings view owns the offset.
     SettingsScrollbar,
 }
 
@@ -789,20 +773,12 @@ pub struct HomeView {
     pub(super) diff_view: Option<DiffView>,
 
     pub(super) list_width: u16,
+    pub(super) list_height: Option<u16>,
 
-    /// Visible column of the list/preview divider in side-by-side mode,
-    /// `None` in stacked layout or while the diff view is open. Set in
-    /// `render()` after the layout split; read by mouse handlers to
-    /// hit-test divider clicks and clamp drag updates.
     pub(super) divider_col: Option<u16>,
-    /// Width of the main horizontal area (list + preview) captured at the
-    /// last render. Used as the clamp ceiling when a divider drag updates
-    /// `list_width`, so the new width can't push the preview below
-    /// `PREVIEW_MIN_WIDTH`.
+    pub(super) divider_row: Option<u16>,
     pub(super) main_area_width: u16,
-    /// Active mouse-drag state, `None` when no button is held. Set on
-    /// `Down(Left)` over a draggable target (the list/preview divider
-    /// today), updated on each `Drag(Left)`, cleared on `Up(Left)`.
+    pub(super) main_area_height: u16,
     pub(super) drag_state: Option<DragKind>,
 
     /// The SGR base button code (0/1/2) of a mouse press currently being
