@@ -460,19 +460,14 @@ impl<S: BroadcastSink> Supervisor<S> {
             .await
     }
 
-    /// Stop a worker reclaimed for inactivity.
-    pub async fn shutdown_idle(&self, session_id: &str) -> Result<(), SupervisorError> {
-        self.shutdown_with_reason(session_id, "idle_auto_stop", false, None, None)
-            .await
-    }
-
-    /// `shutdown_idle`, only while `observed` is still the running epoch.
-    pub(crate) async fn shutdown_idle_observed(
+    /// Stop a worker reclaimed for inactivity; with `observed`, only while
+    /// that epoch is still the running one.
+    pub(crate) async fn shutdown_idle(
         &self,
         session_id: &str,
-        observed: &Lease,
+        observed: Option<&Lease>,
     ) -> Result<(), SupervisorError> {
-        self.shutdown_with_reason(session_id, "idle_auto_stop", false, None, Some(observed))
+        self.shutdown_with_reason(session_id, "idle_auto_stop", false, None, observed)
             .await
     }
 

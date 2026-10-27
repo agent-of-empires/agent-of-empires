@@ -222,11 +222,7 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
             tracing::warn!(target: "acp.supervisor", session = %id, "idle-reap persist failed; leaving worker alive");
             continue;
         }
-        match state
-            .acp_supervisor
-            .shutdown_idle_observed(&id, &lease)
-            .await
-        {
+        match state.acp_supervisor.shutdown_idle(&id, Some(&lease)).await {
             Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {
                 tracing::info!(target: "acp.supervisor", session = %id, idle_secs, "auto-stopped idle structured view worker");
             }
@@ -377,7 +373,7 @@ mod tests {
         let observed = sup.running_lease(id).unwrap();
         sup.test_respawn_worker(id).await;
         assert!(matches!(
-            sup.shutdown_idle_observed(id, &observed).await,
+            sup.shutdown_idle(id, Some(&observed)).await,
             Err(crate::acp::supervisor::SupervisorError::Superseded(_))
         ));
         assert_eq!(sup.worker_state(id).await, Running);
