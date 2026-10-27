@@ -252,7 +252,7 @@ claude-personal = "claude"
 claude-personal = "~/.claude-personal"
 ```
 
-Host structured sessions export the entry as the agent's config-dir variable (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `OPENCODE_CONFIG_DIR`, `PI_CODING_AGENT_DIR`), the same as terminal sessions, so the wrapper does not need to. To use another account, log in once with that variable set (for example `CLAUDE_CONFIG_DIR=~/.claude-personal claude login`) and name the directory here.
+Host structured sessions export the entry as the agent's config-dir variable (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `OPENCODE_CONFIG_DIR`, `PI_CODING_AGENT_DIR`), the same as terminal sessions, so the wrapper does not need to. To use another account, log in once with that variable set (for example `CLAUDE_CONFIG_DIR=~/.claude-personal claude auth login`) and name the directory here.
 
 The value is a host path. Host sessions use the directory itself. Each
 sandboxed session uses a separate `sandbox-v2/<instance-id>` child that AoE
