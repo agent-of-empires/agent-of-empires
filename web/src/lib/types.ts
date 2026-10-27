@@ -289,6 +289,8 @@ export interface Workspace {
 
 export interface AgentInfo {
   name: string;
+  /** How copy names the agent; the registry id for custom agents. */
+  display_name: string;
   kind: "builtin" | "custom";
   binary: string;
   host_only: boolean;
