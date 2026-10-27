@@ -189,6 +189,21 @@ describe("SidebarGroupHeader", () => {
     }
   });
 
+  it("returns focus to the header when a rename ends with Enter or Escape", async () => {
+    for (const key of ["Enter", "Escape"]) {
+      renderHeader();
+      fireEvent.contextMenu(screen.getByTestId("sidebar-group-header"));
+      fireEvent.click(screen.getByTestId("sidebar-group-context-menu-rename"));
+      const input = screen.getByTestId("sidebar-group-rename-input");
+      input.focus();
+      fireEvent.keyDown(input, { key });
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      const button = screen.getByTestId("sidebar-group-header").querySelector("button[aria-expanded]");
+      expect(document.activeElement, key).toBe(button);
+      cleanup();
+    }
+  });
+
   it("marks the header draggable only with a drag handle", () => {
     const { rerender } = renderHeader({ dragHandle: dragHandle() });
     expect(screen.getByTestId("sidebar-group-header").getAttribute("data-draggable")).toBe("true");

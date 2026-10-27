@@ -70,6 +70,9 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
     setRenaming(false);
     props.onUpdateAppearance(group.id, { alias: renameValue.trim() || null });
   };
+  // Enter and Escape unmount the focused input; send focus back to the header button once
+  // it renders again. A blur (Tab, a click) keeps its own destination.
+  const refocusHeader = () => requestAnimationFrame(() => buttonRef.current?.focus());
 
   if (renaming) {
     return (
@@ -87,8 +90,14 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
           onChange={(e) => setRenameValue(e.target.value)}
           onBlur={commitRename}
           onKeyDown={(e) => {
-            if (e.key === "Enter") commitRename();
-            if (e.key === "Escape") setRenaming(false);
+            if (e.key === "Enter") {
+              commitRename();
+              refocusHeader();
+            }
+            if (e.key === "Escape") {
+              setRenaming(false);
+              refocusHeader();
+            }
           }}
           data-testid="sidebar-group-rename-input"
           className="min-w-0 flex-1 rounded border border-brand-600 bg-surface-900 px-2 py-1 text-[13px] md:text-[14px] font-mono text-text-primary focus:outline-none"
