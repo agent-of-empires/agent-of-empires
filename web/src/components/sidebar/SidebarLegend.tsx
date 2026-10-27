@@ -86,7 +86,7 @@ export function SidebarLegend() {
           menu={menu}
           menuRef={menuRef}
           testId="sidebar-legend"
-          minWidth="w-[340px] max-w-[calc(100vw-16px)]"
+          minWidth="w-[340px] max-w-[calc(100vw-16px)] max-md:max-w-none"
           sheetOnMobile
           label="What the sidebar symbols mean"
           heading={<span className="text-xs font-medium uppercase tracking-wide text-text-subtle">Symbols</span>}

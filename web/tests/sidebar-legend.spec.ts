@@ -96,7 +96,8 @@ test.describe("sidebar legend on a phone", () => {
     await expect(legend).toBeVisible();
     await expect(legend).toHaveAttribute("role", "dialog");
     const box = await legend.boundingBox();
-    expect(box && Math.round(box.y + box.height)).toBe(812);
+    // Docked full width at the bottom, like the row menu's sheet.
+    expect(box && [Math.round(box.width), Math.round(box.y + box.height)]).toEqual([375, 812]);
 
     await page.touchscreen.tap(187, 40);
     await expect(legend).toBeHidden();
