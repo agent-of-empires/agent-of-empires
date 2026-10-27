@@ -2780,6 +2780,7 @@ mod tests {
             custom_instruction: None,
             container_workdir: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             provider: None,
         });
         let legacy_bytes = serde_json::to_vec(&vec![legacy]).unwrap();

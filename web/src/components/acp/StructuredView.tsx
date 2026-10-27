@@ -11,7 +11,7 @@ import { useRespawnSession } from "../../hooks/useRespawnSession";
 import { useWebSettings } from "../../hooks/useWebSettings";
 import { lastClearIndex } from "../../lib/acpHistoryWindow";
 import { visibleSessionNotices } from "../../lib/acpTypes";
-import { agentDisplayName } from "../../lib/agentDisplayName";
+import { useAgentDisplayNames } from "../../lib/agentDisplayName";
 import { isNewSessionStarting } from "./startupWait";
 import { AgentProfileProvider } from "../../lib/agentProfileContext";
 import { conversationFontSizeRem } from "../../lib/conversationFontSize";
@@ -165,9 +165,8 @@ function AcpChrome({
 }: ChromeProps) {
   const { sessionId, acpWorkerState, acpAgent } = view;
   const { state, status } = ctx;
-  const startingAgent = isNewSessionStarting(state, ctx, acpWorkerState)
-    ? agentDisplayName(state.agent ?? acpAgent)
-    : null;
+  const agentName = useAgentDisplayNames();
+  const startingAgent = isNewSessionStarting(state, ctx, acpWorkerState) ? agentName(state.agent ?? acpAgent) : null;
   // Neither can start until restored or unarchived, so nothing here may send (#4116).
   const readOnly = !!view.trashedAt || !!view.archivedAt;
   // Rows before the latest `/clear` divider are the hidden history.

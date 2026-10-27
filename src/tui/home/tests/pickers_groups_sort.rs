@@ -764,6 +764,7 @@ fn test_group_has_managed_worktrees_and_containers() {
         extra_env: None,
         custom_instruction: None,
         before_start_env: Vec::new(),
+        before_start_hook_env: Vec::new(),
         container_workdir: None,
     });
 
