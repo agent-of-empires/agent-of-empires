@@ -48,6 +48,17 @@ pub fn ensure_unique(
     Ok(())
 }
 
+/// [`ensure_unique`] for a title-only change.
+pub fn ensure_unique_title(
+    rows: &[Instance],
+    session: &Instance,
+    title: &str,
+) -> Result<(), RenameRefusal> {
+    let mut after = session.clone();
+    after.title = title.to_owned();
+    ensure_unique(rows, session, &after)
+}
+
 /// What an edit does to the worktree on disk.
 #[derive(Clone, Copy)]
 pub struct WorktreeChange {
