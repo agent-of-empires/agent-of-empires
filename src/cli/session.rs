@@ -598,12 +598,14 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let mut inst = fresh.context("restored session disappeared after claim")?;
     inst.source_profile = storage.profile().to_owned();
 
-    if let crate::session::trash::RestoreOutcome::Failed { reason } =
-        crate::session::trash::restore_worktree_location(&mut inst)
-    {
-        release_restore_reservation(&storage, &restore_id, restore_generation);
-        anyhow::bail!("Cannot restore worktree: {reason}");
-    }
+    let warning = match crate::session::trash::restore_worktree_location(&mut inst) {
+        crate::session::trash::RestoreOutcome::Failed { reason } => {
+            release_restore_reservation(&storage, &restore_id, restore_generation);
+            anyhow::bail!("Cannot restore worktree: {reason}");
+        }
+        crate::session::trash::RestoreOutcome::Restored { warning, .. } => warning,
+        crate::session::trash::RestoreOutcome::NoChange => None,
+    };
     let restored_path = inst.project_path.clone();
     let restored_pre = inst.pre_trash_project_path.clone();
 
@@ -627,6 +629,9 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         }
     }
     println!("Restored: {}", inst.title);
+    if let Some(warning) = warning {
+        eprintln!("Warning: {warning}");
+    }
     Ok(())
 }
 
@@ -2061,6 +2066,9 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
                         is_sandboxed,
                     );
                 }
+                if let Some(warning) = &outcome.warning {
+                    eprintln!("Warning: {warning}");
+                }
                 new_path = Some(outcome.new_path.to_string_lossy().to_string());
                 new_branch = outcome.new_branch;
             }
@@ -2774,6 +2782,9 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     }
     let new_path = outcome.new_path.to_string_lossy().to_string();
     let new_branch = outcome.new_branch.clone();
+    if let Some(warning) = &outcome.warning {
+        eprintln!("Warning: {warning}");
+    }
 
     storage
         .update(|instances, _groups| {

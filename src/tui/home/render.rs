@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use rattles::presets::prelude as spinners;
 
+use super::bindings::ActionId;
 use super::{
     get_indent, live_send, DragKind, HomeView, TerminalMode, ViewMode, ICON_ARCHIVED_SECTION,
     ICON_COLLAPSED, ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED, ICON_FAVORITE,
@@ -2033,8 +2034,13 @@ impl HomeView {
         let terminal_badge = (self.view_mode == ViewMode::Structured
             && self.paired_terminal_running_for_display(inst))
         .then(|| format!(" {ICON_TERMINAL}"));
-        let badge_width =
-            badge_text.map_or(0, |s| s.len()) + terminal_badge.as_ref().map_or(0, |s| s.len());
+        // Paint must not fork tmux, so this skips the resume gate the menu applies.
+        let update_badge = (!inst.is_structured()
+            && crate::session::update_restart::binary_updated(inst))
+        .then_some(" [update]");
+        let badge_width = badge_text.map_or(0, |s| s.len())
+            + terminal_badge.as_ref().map_or(0, |s| s.len())
+            + update_badge.map_or(0, |s| s.len());
         let age = if self.show_activity_age {
             row_age(inst, in_attention)
         } else {
@@ -2079,6 +2085,17 @@ impl HomeView {
 
         if let Some(badge) = terminal_badge {
             let badge_style = Style::default().fg(theme.terminal_active);
+            line_spans.push(Span::styled(
+                badge,
+                if is_selected {
+                    selected_row_style(badge_style, theme)
+                } else {
+                    badge_style
+                },
+            ));
+        }
+        if let Some(badge) = update_badge {
+            let badge_style = Style::default().fg(theme.waiting);
             line_spans.push(Span::styled(
                 badge,
                 if is_selected {
@@ -4277,13 +4294,17 @@ impl HomeView {
         let mk_key =
             |key: &str| -> Vec<Span<'static>> { vec![Span::styled(key.to_string(), key_style)] };
 
-        // Key a footer button synthesizes on click. The registry matches the bare keycode
-        // (Shift implied by an uppercase char, Ctrl by the flag), so a plain char and a
-        // Ctrl char cover every footer chord.
+        // Key a footer button synthesizes on click, for the few entries outside the registry.
         let kc = |c: char| Some(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
-        let kctrl = |c: char| Some(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
         let kenter = Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let ktab = Some(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        // Click key and compact label (`^G`) for an action's chord in the active mode.
+        let bound = |id: ActionId| {
+            (
+                super::bindings::key_event(id, strict),
+                super::bindings::label(id, strict).replace("Ctrl+", "^"),
+            )
+        };
 
         // Shortcut groups carry a priority, optional key action, and display spans.
         let mut groups: Vec<(u8, Option<KeyEvent>, Vec<Span<'static>>)> = Vec::new();
@@ -4350,11 +4371,11 @@ impl HomeView {
         // `m` after selecting a runnable session drains it into the compose dialog.
         if let Some(buf) = &self.pending_paste {
             if !buf.is_empty() {
-                let key = if strict { "M" } else { "m" };
+                let (click, key) = bound(ActionId::SendMessage);
                 let desc = format!("send {} buffered", buf.chars().count());
-                let mut spans = mk(key, &desc);
+                let mut spans = mk(&key, &desc);
                 spans[1] = Span::styled(desc, Style::default().fg(theme.running).bold());
-                groups.push((0, kc(if strict { 'M' } else { 'm' }), spans));
+                groups.push((0, click, spans));
             }
         }
 
@@ -4394,32 +4415,25 @@ impl HomeView {
             groups.push((2, ktab, mk("⇥ ", tab_action_text)));
         }
 
-        groups.push((
-            2,
-            kc(if strict { 'T' } else { 't' }),
-            mk(if strict { "T" } else { "t" }, "View"),
-        ));
+        let (click, key) = bound(ActionId::ToggleView);
+        groups.push((2, click, mk(&key, "View")));
         if matches!(self.view_mode, ViewMode::Tool(_)) {
-            groups.push((1, kc(';'), mk(";", "Back")));
+            let (click, key) = bound(ActionId::ToolPicker);
+            groups.push((1, click, mk(&key, "Back")));
         } else if self.has_tool_targets() {
-            groups.push((2, kc(';'), mk(";", "Tools")));
+            let (click, key) = bound(ActionId::ToolPicker);
+            groups.push((2, click, mk(&key, "Tools")));
         }
-        groups.push((
-            3,
-            if strict { kctrl('g') } else { kc('g') },
-            mk(if strict { "^G" } else { "g" }, "Group"),
-        ));
+        let (click, key) = bound(ActionId::GroupBy);
+        groups.push((3, click, mk(&key, "Group")));
 
         // c: container/host toggle hint for sandboxed sessions in Terminal view
         if self.view_mode == ViewMode::Terminal {
             if let Some(id) = &self.selected_session {
                 if let Some(inst) = self.get_instance(id) {
                     if inst.is_sandboxed() {
-                        groups.push((
-                            4,
-                            kc(if strict { 'C' } else { 'c' }),
-                            mk(if strict { "C" } else { "c" }, "Mode"),
-                        ));
+                        let (click, key) = bound(ActionId::ToggleContainer);
+                        groups.push((4, click, mk(&key, "Mode")));
                     }
                 }
             }
@@ -4429,55 +4443,41 @@ impl HomeView {
         // `n` for cycling, advertise Shift+N (which still creates, #3038). Strict mode
         // already uses `N`.
         let new_uses_shift = committed_search && !strict;
-        groups.push((
-            1,
-            kc(if strict || new_uses_shift { 'N' } else { 'n' }),
-            mk(if strict || new_uses_shift { "N" } else { "n" }, "New"),
-        ));
+        let (click, key) = if new_uses_shift {
+            (kc('N'), "N".to_string())
+        } else {
+            bound(ActionId::NewSession)
+        };
+        groups.push((1, click, mk(&key, "New")));
 
         // Priority 1 is the core daily workflow (new, message, the web dashboard), which
         // survives the greedy pack at ~80 cols; del stays at p3 and can drop first.
         if self.selected_session.is_some() {
-            groups.push((
-                1,
-                kc(if strict { 'M' } else { 'm' }),
-                mk(if strict { "M" } else { "m" }, "Msg"),
-            ));
+            let (click, key) = bound(ActionId::SendMessage);
+            groups.push((1, click, mk(&key, "Msg")));
         }
         if !self.flat_items.is_empty() {
-            groups.push((
-                3,
-                kc(if strict { 'D' } else { 'd' }),
-                mk(if strict { "D" } else { "d" }, "Del"),
-            ));
+            let (click, key) = bound(ActionId::Delete);
+            groups.push((3, click, mk(&key, "Del")));
         }
         // Archive / Snooze render only in Attention sort: they shape the Attention queue
         // and do nothing visible elsewhere, so they would just take footer space.
         let in_attention = self.sort_order == SortOrder::Attention;
         if in_attention {
             if !self.flat_items.is_empty() {
-                groups.push((
-                    1,
-                    kc(if strict { 'Z' } else { 'z' }),
-                    mk(if strict { "Z" } else { "z" }, "Archive"),
-                ));
+                let (click, key) = bound(ActionId::ToggleArchive);
+                groups.push((1, click, mk(&key, "Archive")));
             }
             if self.selected_session.is_some() {
-                groups.push((
-                    1,
-                    kc(if strict { 'H' } else { 'h' }),
-                    mk(if strict { "H" } else { "h" }, "Snooze"),
-                ));
+                let (click, key) = bound(ActionId::ToggleSnooze);
+                groups.push((1, click, mk(&key, "Snooze")));
             }
         }
         // Fav follows the key's own gate (`Context::FavoritesUsable`), so the footer
         // advertises it wherever `f` actually does something.
         if self.selected_session.is_some() && (in_attention || crate::session::favorites_first()) {
-            groups.push((
-                2,
-                kc(if strict { 'F' } else { 'f' }),
-                mk(if strict { "F" } else { "f" }, "Fav"),
-            ));
+            let (click, key) = bound(ActionId::ToggleFavorite);
+            groups.push((2, click, mk(&key, "Fav")));
         }
 
         // Committed-search cue: `n` cycles matches and `Esc` clears (#3038). The `[i/N]`
@@ -4493,20 +4493,21 @@ impl HomeView {
             groups.push((0, kc('n'), hint));
         }
 
-        groups.push((4, kc('/'), mk_key("/")));
-        groups.push((
-            4,
-            if strict { kctrl('d') } else { kc('D') },
-            mk(if strict { "^D" } else { "D" }, "Diff"),
-        ));
+        let (click, key) = bound(ActionId::SearchStart);
+        groups.push((4, click, mk_key(&key)));
+        let (click, key) = bound(ActionId::Diff);
+        groups.push((4, click, mk(&key, "Diff")));
         let mut serving_status = None;
         if !super::input::web_plugin_disabled() {
-            let (priority, spans) = web_footer_entry(self.serve_running, strict, theme);
+            let (click, key) = bound(ActionId::Serve);
+            let (priority, spans) = web_footer_entry(&key, self.serve_running, theme);
             serving_status = self.serve_running.then_some(groups.len());
-            groups.push((priority, if strict { kctrl('r') } else { kc('R') }, spans));
+            groups.push((priority, click, spans));
         }
-        groups.push((1, kctrl('k'), mk("^K", "Cmds")));
-        groups.push((0, kc('?'), mk_key("?")));
+        let (click, key) = bound(ActionId::OpenCommandPalette);
+        groups.push((1, click, mk(&key, "Cmds")));
+        let (click, key) = bound(ActionId::Help);
+        groups.push((0, click, mk_key(&key)));
 
         let badge_bg = if self.tips_badge_hovered {
             theme.session_selection
@@ -4653,24 +4654,25 @@ impl HomeView {
         image_update: Option<&ImageUpdate>,
     ) {
         let update_style = Style::default().fg(theme.waiting).bold();
-        // The Update key is `u` (`Ctrl+u` in strict mode); pull the label from
-        // the binding registry so this hint can't drift from the dispatcher.
-        let update_key =
-            super::bindings::label(super::bindings::ActionId::Update, self.strict_hotkeys);
+        // Pull the keys from the binding registry so these hints can't drift from the
+        // dispatcher.
+        let update_key = super::bindings::label(ActionId::Update, self.strict_hotkeys);
+        let dismiss_key =
+            super::bindings::label(ActionId::DismissUpdateBanner, self.strict_hotkeys);
         // Precedence: transient status, app update, then sandbox-image update. Only one
         // banner shows at a time so its keys are unambiguous; a lower-priority banner
         // surfaces once the ones above clear.
         let text = if let Some(s) = status {
-            format!(" {s}  [Ctrl+x] dismiss")
+            format!(" {s}  [{dismiss_key}] dismiss")
         } else if let Some(info) = info {
             // Reassure users (#2220) that updating never tears down running sessions.
             // Kept after the keys so the action hints stay visible on narrow terminals.
             format!(
-                " update available {} → {}  [{update_key}] update  [Ctrl+x] dismiss  ·  running sessions stay safe",
+                " update available {} → {}  [{update_key}] update  [{dismiss_key}] dismiss  ·  running sessions stay safe",
                 info.current_version, info.latest_version
             )
         } else if image_update.is_some() {
-            format!(" sandbox image update available  [{update_key}] pull  [Ctrl+x] dismiss")
+            format!(" sandbox image update available  [u] pull  [{dismiss_key}] dismiss")
         } else {
             return;
         };
@@ -4696,12 +4698,9 @@ pub(super) fn live_pane_origin(
 
 /// The dashboard entry is a hint until serving, then outranks the other shortcuts.
 /// A build without the dashboard bundle serves the API only, so it never says "Web".
-fn web_footer_entry(running: bool, strict: bool, theme: &Theme) -> (u8, Vec<Span<'static>>) {
+fn web_footer_entry(key: &str, running: bool, theme: &Theme) -> (u8, Vec<Span<'static>>) {
     let what = if cfg!(feature = "web") { "Web" } else { "API" };
-    let key = Span::styled(
-        if strict { "^R " } else { "R " },
-        Style::default().fg(theme.accent).bold(),
-    );
+    let key = Span::styled(format!("{key} "), Style::default().fg(theme.accent).bold());
     if running {
         let status = Span::styled(
             format!("\u{25CF} {what}"),
@@ -4729,7 +4728,8 @@ mod tests {
             (true, false, 0, format!("R \u{25CF} {what}")),
             (true, true, 0, format!("^R \u{25CF} {what}")),
         ] {
-            let (p, spans) = web_footer_entry(running, strict, &theme);
+            let key = if strict { "^R" } else { "R" };
+            let (p, spans) = web_footer_entry(key, running, &theme);
             let rendered: String = spans.iter().map(|s| s.content.as_ref()).collect();
             assert_eq!((p, rendered.as_str()), (priority, text.as_str()));
             let label_fg = spans.last().and_then(|s| s.style.fg);

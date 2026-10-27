@@ -16,6 +16,7 @@ pub(crate) mod plugin_settings;
 pub mod plugins;
 mod projects;
 mod queue;
+mod sandbox_image;
 pub(crate) mod sessions;
 mod skills;
 pub(crate) mod system;
@@ -53,16 +54,17 @@ pub use plugins::{
     set_plugin_enabled, start_plugin_install, start_plugin_uninstall,
 };
 pub use projects::{create_project, delete_project, list_projects, update_project};
+pub use sandbox_image::{sandbox_image_dismiss, sandbox_image_pull, sandbox_image_status};
 pub use sessions::{
     abandon_purge, attach_session_project, cancel_creation, create_session,
     create_session_progress, delete_session, delete_workspace, ensure_container_terminal,
     ensure_session, ensure_terminal, ensure_tool, force_smart_rename, get_recent_projects,
     kill_terminal, list_sessions, paste_image, preview_volume_ignores_globs, read_output,
-    rename_session, restart_session, restore_session, review_creation_trust, search_sessions,
-    send_message, serve_session_artifact, session_diff_file, session_diff_file_raw,
-    session_diff_files, session_file, session_file_raw, set_worktree_name, start_session,
-    stop_auxiliary, stop_session, summarize_session, touch_session_access, trash_session,
-    update_session_archive, update_session_color, update_session_diff_base,
+    rename_session, restart_for_update, restart_session, restore_session, review_creation_trust,
+    search_sessions, send_message, serve_session_artifact, session_diff_file,
+    session_diff_file_raw, session_diff_files, session_file, session_file_raw, set_worktree_name,
+    start_session, stop_auxiliary, stop_session, summarize_session, touch_session_access,
+    trash_session, update_session_archive, update_session_color, update_session_diff_base,
     update_session_favorite, update_session_group, update_session_notifications,
     update_session_pin, update_session_snooze, update_session_unread, update_workspace_ordering,
     OutputQuery, SendMessageRequest,
@@ -161,11 +163,12 @@ pub(super) fn bare_not_found() -> axum::response::Response {
 pub(crate) fn start_blocked_response(
     blocked: crate::session::StartBlocked,
 ) -> axum::response::Response {
-    api_error(
-        axum::http::StatusCode::CONFLICT,
-        blocked.code(),
-        blocked.to_string(),
-    )
+    use crate::daemon::ApiErrorCode;
+    let code = match blocked {
+        crate::session::StartBlocked::Archived => ApiErrorCode::SessionArchived,
+        crate::session::StartBlocked::Trashed => ApiErrorCode::SessionTrashed,
+    };
+    api_error_with_code_header(code, blocked.to_string())
 }
 
 pub(crate) fn api_error(
@@ -425,6 +428,8 @@ mod tests {
             (Method::PATCH, "/api/groups/collapse"),
             (Method::POST, "/api/reorder"),
             (Method::DELETE, "/api/workspaces"),
+            (Method::POST, "/api/sandbox/image-pull"),
+            (Method::POST, "/api/sandbox/image-dismiss"),
         ] {
             let mut request = Request::builder()
                 .method(method.clone())

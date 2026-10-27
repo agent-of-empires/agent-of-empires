@@ -175,6 +175,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             post(api::restart_session).layer(read_only.clone()),
         )
         .route(
+            "/api/sessions/{id}/restart-for-update",
+            post(api::restart_for_update).layer(read_only.clone()),
+        )
+        .route(
             "/api/sessions/{id}/terminal",
             post(api::ensure_terminal).delete(api::kill_terminal),
         )
@@ -232,6 +236,12 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             patch(api::update_project).delete(api::delete_project),
         )
         .route("/api/docker/status", get(api::docker_status))
+        .route("/api/sandbox/image-status", get(api::sandbox_image_status))
+        .route("/api/sandbox/image-pull", post(api::sandbox_image_pull))
+        .route(
+            "/api/sandbox/image-dismiss",
+            post(api::sandbox_image_dismiss),
+        )
         .route("/api/system/health", get(api::system_health))
         .route("/api/system/logs", get(api::get_logs))
         // Settings + themes

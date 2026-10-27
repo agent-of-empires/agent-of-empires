@@ -111,7 +111,7 @@ fn test_sound(name: &str) -> Result<()> {
     }
 
     let volume = crate::session::Config::load()
-        .map(|c| c.sound.volume)
+        .map(|c| c.sound.server_volume)
         .unwrap_or(1.0);
 
     print!("🔊 Playing '{}' at volume {:.1}... ", name, volume);

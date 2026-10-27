@@ -1530,7 +1530,7 @@ async fn daemon_trash_restore_purge_preserves_collisions_and_allows_retry() {
         .unwrap();
     assert!(matches!(
         moved.outcome.relocation,
-        agent_of_empires::daemon::TrashRelocationOutcome::Relocated
+        agent_of_empires::daemon::TrashRelocationOutcome::Relocated { warning: None }
     ));
     let moved: RuntimeSnapshot = client
         .get("http://localhost/api/runtime/snapshot")
