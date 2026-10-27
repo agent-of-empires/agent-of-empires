@@ -262,6 +262,47 @@ describe("SandboxImageBanner", () => {
     expect(banner()?.getAttribute("aria-label")).toBe("Sandbox image updated");
   });
 
+  it("doesn't let a poll sent before Update now overwrite the pull it asked for", async () => {
+    // (the older poll's pull state): done would claim success for the new request, idle would
+    // bring the offer back, failed would report the old failure.
+    const older: SandboxImageStatus["pull"][] = [
+      { state: "done" },
+      { state: "idle" },
+      { state: "failed", error: "old failure" },
+    ];
+    for (const pull of older) {
+      const { unmount } = await mount(status());
+      // A poll leaves before the click and its answer is held.
+      let answerOld: (value: SandboxImageStatus) => void = () => {};
+      fetchSandboxImageStatus.mockImplementationOnce(() => new Promise((resolve) => (answerOld = resolve)));
+      await act(async () => {
+        document.dispatchEvent(new Event("visibilitychange"));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      // Update now, with its reply held too.
+      let reply: (value: { ok: boolean; message?: string }) => void = () => {};
+      pullSandboxImage.mockImplementationOnce(() => new Promise((resolve) => (reply = resolve)));
+      fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+      fetchSandboxImageStatus.mockResolvedValue(status({ pull: { state: "running" } }));
+      await act(async () => {
+        answerOld(status({ pull }));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(banner()?.getAttribute("aria-label"), pull.state).toBe("Downloading sandbox image");
+      const calls = fetchSandboxImageStatus.mock.calls.length;
+      await pollAfter(2000);
+      expect(fetchSandboxImageStatus.mock.calls.length, `${pull.state}: polls fast`).toBe(calls + 1);
+      // The confirmed pull's own outcome then shows at once.
+      fetchSandboxImageStatus.mockResolvedValue(status({ state: "current", pull: { state: "done" } } as never));
+      await act(async () => {
+        reply({ ok: true });
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(banner()?.getAttribute("aria-label"), pull.state).toBe("Sandbox image updated");
+      unmount();
+    }
+  });
+
   it("hides an earlier available update once a check fails", async () => {
     await mount(status());
     expect(banner()).not.toBeNull();
