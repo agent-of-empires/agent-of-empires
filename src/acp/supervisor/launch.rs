@@ -1084,10 +1084,16 @@ pub(super) fn apply_declared_config_dir(
         "pi" => "PI_CODING_AGENT_DIR",
         _ => return None,
     };
-    let home =
-        crate::session::environment::resolve_host_environment_value(&cfg.environment, "HOME")
-            .map(std::path::PathBuf::from)
-            .or_else(dirs::home_dir)?;
+    let home = environment
+        .iter()
+        .rev()
+        .find(|(name, value)| name == "HOME" && !value.is_empty())
+        .map(|(_, value)| value.clone())
+        .or_else(|| {
+            crate::session::environment::resolve_host_environment_value(&cfg.environment, "HOME")
+        })
+        .map(std::path::PathBuf::from)
+        .or_else(dirs::home_dir)?;
     let dir = cfg.session.agent_config_dir_for(tool, &home)?;
     overlay_env(
         environment,
@@ -1346,6 +1352,20 @@ mod tests {
         for (cfg, tool, agent, env, claude_dir) in cases {
             assert_eq!(run(&cfg, tool, agent), (env, claude_dir), "{tool}");
         }
+
+        // `~` expands against the worker's effective HOME, not the configured one.
+        let mut cfg = cfg(&[("claude", "~/.claude-work")]);
+        cfg.environment = vec!["HOME=/home/operator".into()];
+        let mut env = vec![pair("HOME", "/srv/account")];
+        let claude_dir = apply_declared_config_dir(&mut env, &cfg, "claude", "claude");
+        assert_eq!(claude_dir, Some(PathBuf::from("/srv/account/.claude-work")));
+        assert_eq!(
+            env,
+            vec![
+                pair("HOME", "/srv/account"),
+                pair("CLAUDE_CONFIG_DIR", "/srv/account/.claude-work"),
+            ]
+        );
     }
 
     #[tokio::test]
