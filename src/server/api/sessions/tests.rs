@@ -10081,9 +10081,9 @@ async fn empty_trash_purges_one_profiles_trash_and_reports_busy_rows() -> anyhow
 
     let response = empty_trash(
         State(state.clone()),
-        Json(crate::daemon::EmptyTrashBody {
+        Ok(Json(crate::daemon::EmptyTrashBody {
             profile: profile.into(),
-        }),
+        })),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -10128,9 +10128,9 @@ async fn empty_trash_refuses_an_unknown_profile() {
     let state = crate::server::test_support::build_test_app_state(Vec::new());
     let response = empty_trash(
         State(state),
-        Json(crate::daemon::EmptyTrashBody {
+        Ok(Json(crate::daemon::EmptyTrashBody {
             profile: "no-such-profile".into(),
-        }),
+        })),
     )
     .await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);

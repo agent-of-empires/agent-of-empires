@@ -843,8 +843,15 @@ pub async fn delete_session(
 /// consent to each row's own trash lifecycle, so a client snapshot is never trusted.
 pub async fn empty_trash(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<crate::daemon::EmptyTrashBody>,
+    body: Result<Json<crate::daemon::EmptyTrashBody>, axum::extract::rejection::JsonRejection>,
 ) -> axum::response::Response {
+    if state.read_only {
+        return crate::server::api::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
+    };
     match tokio::spawn(empty_trash_owned(state, body.profile)).await {
         Ok(response) => response,
         Err(error) => {

@@ -407,7 +407,12 @@ mod tests {
         (
             "sessions/delete.rs",
             include_str!("sessions/delete.rs"),
-            &["abandon_purge", "delete_session", "delete_workspace"],
+            &[
+                "abandon_purge",
+                "delete_session",
+                "delete_workspace",
+                "empty_trash",
+            ],
         ),
         (
             "sessions/rename.rs",
