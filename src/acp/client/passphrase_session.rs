@@ -588,6 +588,8 @@ pub(crate) mod test_daemon {
             let router = Router::new()
                 .route("/api/login", post(login))
                 .route("/api/sessions", get(list))
+                .route("/api/runtime", get(profile_metadata))
+                .route("/api/profiles", get(profile_metadata))
                 .route("/api/sessions/{id}/acp/config-option", post(config_option))
                 .with_state(inner.clone());
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -673,6 +675,56 @@ pub(crate) mod test_daemon {
         }
         inner.config_options.push((id, cookie, binding, body));
         StatusCode::ACCEPTED
+    }
+
+    async fn profile_metadata(
+        State(inner): State<Arc<Mutex<Inner>>>,
+        uri: axum::http::Uri,
+        headers: HeaderMap,
+    ) -> impl IntoResponse {
+        let header = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        let authorized = match (
+            &inner.lock().unwrap().valid,
+            header("cookie"),
+            header("x-aoe-device-binding"),
+        ) {
+            (Some((c, b)), Some(cookie), Some(binding)) => *c == cookie && *b == binding,
+            _ => false,
+        };
+        if !authorized {
+            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({})));
+        }
+        let body = if uri.path() == "/api/profiles" {
+            serde_json::json!([
+                {"name": "default", "is_default": true},
+                {"name": "work", "is_default": false},
+            ])
+        } else {
+            serde_json::to_value(crate::daemon::RuntimeInfo {
+                owner_diagnostics: Vec::new(),
+                owner_instance_id: None,
+                protocol_version: crate::daemon::RUNTIME_PROTOCOL_VERSION,
+                epoch: "epoch".into(),
+                namespace: "ns".into(),
+                tmux_socket: None,
+                local_owner: false,
+                profiles: vec!["default".into(), "work".into()],
+                read_only: false,
+                cityhall_mode: false,
+                health: crate::daemon::RuntimeHealth::Healthy,
+                interaction_capabilities: crate::daemon::RuntimeCapabilities {
+                    mutations: true,
+                    native_interaction: true,
+                },
+            })
+            .unwrap()
+        };
+        (StatusCode::OK, Json(body))
     }
 
     async fn list(State(inner): State<Arc<Mutex<Inner>>>, headers: HeaderMap) -> impl IntoResponse {

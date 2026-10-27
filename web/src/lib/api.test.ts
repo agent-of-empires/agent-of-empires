@@ -1291,6 +1291,16 @@ describe("login", () => {
 });
 
 describe("session mutation messages", () => {
+  it.each([
+    ["trashSession", () => api.trashSession("s1"), { relocation: { status: "relocated", warning: "w" } }],
+    ["restoreSession", () => api.restoreSession("s1"), { status: "restored", warning: "w" }],
+  ])("%s folds a degraded move warning into warnings", async (_name, call, outcome) => {
+    fetchSpy.mockResolvedValueOnce(json({ ...session, outcome }));
+    expect((await call())?.warnings).toEqual(["w"]);
+    fetchSpy.mockResolvedValueOnce(json({ ...session, outcome: { status: "restored" } }));
+    expect((await call())?.warnings).toBeUndefined();
+  });
+
   it("renameSession keeps only string warnings", async () => {
     fetchSpy.mockResolvedValueOnce(runtimeJson({ ...session, outcome: { warnings: ["kept", 3, null] } }));
     expect(await api.renameSession("s1", "T")).toEqual({ ok: true, session, cursor, warnings: ["kept"] });

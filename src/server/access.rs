@@ -454,6 +454,8 @@ pub(super) const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
 /// Mutating routes deliberately unavailable in CityHall.
 #[cfg(test)]
 pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
+    ("POST", "/api/sandbox/image-pull"),
+    ("POST", "/api/sandbox/image-dismiss"),
     ("POST", "/api/sessions/creation-trust"),
     ("POST", "/api/sessions/{id}/restart"),
     ("POST", "/api/sessions/{id}/tools/ensure"),

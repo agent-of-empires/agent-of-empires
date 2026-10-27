@@ -241,6 +241,15 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             patch(api::update_project).delete(api::delete_project),
         )
         .route("/api/docker/status", get(api::docker_status))
+        .route("/api/sandbox/image-status", get(api::sandbox_image_status))
+        .route(
+            "/api/sandbox/image-pull",
+            post(api::sandbox_image_pull).layer(read_only.clone()),
+        )
+        .route(
+            "/api/sandbox/image-dismiss",
+            post(api::sandbox_image_dismiss).layer(read_only.clone()),
+        )
         .route("/api/system/health", get(api::system_health))
         .route("/api/system/logs", get(api::get_logs))
         // Settings + themes

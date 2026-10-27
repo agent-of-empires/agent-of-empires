@@ -18,6 +18,10 @@ to configure their private network namespace. The
 [web-e2e CI leg](../.github/workflows/tests.yml) requires this coverage with
 `AOE_REQUIRE_LOCAL_NETWORK_TESTS=1`; unavailable confinement fails the job.
 
+The core-rest CI leg requires real systemd scope cancellation coverage with
+`AOE_REQUIRE_SCOPED_TESTS=1`. Local runs may skip the scoped case when no usable
+user manager exists; unscoped cancellation still runs.
+
 The binary is `target/{profile}/aoe`. Web commands and test selection live in `web/AGENTS.md`.
 
 When adding a mutating REST route, classify it in the CityHall allow or deny table in `src/server/access.rs`. Audit its handler or declare an exact, justified exemption in `src/server/api/mod.rs`.

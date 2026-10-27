@@ -95,7 +95,7 @@ export interface SessionResponse {
   /** Claude's fullscreen renderer is on, so mobile skips copy-mode scrollback workarounds. */
   claude_fullscreen: boolean;
   workspace_repos: WorkspaceRepoSummary[];
-  /** Only on the create-session response. */
+  /** Non-fatal notes: on create, rename, trash and restore responses. */
   warnings?: string[];
   plan_summary?: PlanSummary;
   /** When the agent's pending `ScheduleWakeup` fires. */

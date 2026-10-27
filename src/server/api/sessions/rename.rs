@@ -319,6 +319,8 @@ async fn edit_session(
     }
     let effect_applied = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let effect_flag = effect_applied.clone();
+    let move_warning = Arc::new(std::sync::Mutex::new(None::<String>));
+    let move_warning_slot = move_warning.clone();
     let old_title = before.title.clone();
     let new_title = after.title.clone();
     let structured = before.is_structured();
@@ -351,6 +353,7 @@ async fn edit_session(
             );
             match result {
                 Ok(result) => {
+                    *move_warning_slot.lock().expect("move warning slot") = result.warning.clone();
                     effect_flag.store(
                         result.new_path != std::path::Path::new(&before.project_path)
                             || result.new_branch.as_deref().is_some_and(|branch| {
@@ -477,6 +480,7 @@ async fn edit_session(
         }
     };
     let mut warnings = Vec::new();
+    warnings.extend(move_warning.lock().expect("move warning slot").take());
     if old_title != new_title && !structured {
         let rekey_id = id.to_owned();
         match tokio::task::spawn_blocking(move || crate::tmux::rekey_session(&rekey_id, &old_title, &new_title)).await {

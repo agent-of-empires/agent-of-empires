@@ -664,8 +664,11 @@ pub async fn trash_session(
         Ok(crate::session::trash::RelocateOutcome::Skipped) => {
             crate::daemon::TrashRelocationOutcome::Skipped
         }
-        Ok(crate::session::trash::RelocateOutcome::Relocated { .. }) => {
-            crate::daemon::TrashRelocationOutcome::Relocated
+        Ok(crate::session::trash::RelocateOutcome::Relocated { warning, .. }) => {
+            if let Some(warning) = &warning {
+                tracing::warn!(target: "http.api.sessions", session = %id, %warning, "trashed worktree is degraded");
+            }
+            crate::daemon::TrashRelocationOutcome::Relocated { warning }
         }
         Err(error) => {
             if let Some(response) = lifecycle_rejection(&state, &error) {
@@ -779,9 +782,8 @@ pub async fn restore_session(
             };
             instance.source_profile = profile;
             instance.file_watch = Some(worker_state.file_watch.clone());
-            if let crate::session::trash::RestoreOutcome::Failed { reason } =
-                crate::session::trash::restore_worktree_location(&mut instance)
-            {
+            let warning = match crate::session::trash::restore_worktree_location(&mut instance) {
+                crate::session::trash::RestoreOutcome::Failed { reason } => {
                 store.update(|rows, _| {
                     let row = rows
                         .iter_mut()
@@ -796,7 +798,10 @@ pub async fn restore_session(
                     Ok(())
                 })?;
                 return Err(WorktreeFailure(reason).into());
-            }
+                }
+                crate::session::trash::RestoreOutcome::Restored { warning, .. } => warning,
+                crate::session::trash::RestoreOutcome::NoChange => None,
+            };
             store.update(|rows, _| {
                 match crate::session::claim::finalize_restore_commit(
                     rows,
@@ -814,7 +819,10 @@ pub async fn restore_session(
                     }
                 }
             })?;
-            Ok(crate::daemon::RestoreOutcome::Restored)
+            if let Some(warning) = &warning {
+                tracing::warn!(target: "http.api.sessions", session = %worker_id, %warning, "restored worktree is degraded");
+            }
+            Ok(crate::daemon::RestoreOutcome::Restored { warning })
         })
         .await
         .map_err(anyhow::Error::from)

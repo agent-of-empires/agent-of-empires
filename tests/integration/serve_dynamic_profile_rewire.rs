@@ -545,6 +545,10 @@ fn scope_available(runtime: &std::path::Path, slice: &str) -> bool {
             let _ = manager_command("systemctl", runtime, true)
                 .args(["--user", "stop", slice])
                 .output();
+            assert!(
+                std::env::var_os("AOE_REQUIRE_SCOPED_TESTS").is_none(),
+                "Required scoped cancellation coverage unavailable: {result:?}"
+            );
             false
         }
     }
