@@ -275,6 +275,38 @@ fn local_network_unavailable(reason: &str) -> bool {
 
 #[test]
 #[parallel]
+fn cli_read_daemon_stops_when_its_harness_drops() {
+    use fs2::FileExt;
+
+    for unwind in [false, true] {
+        let mut lifetime = None;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let h = TuiTestHarness::new_in_tmp("cli_read_cleanup");
+            h.run_cli_ok(&["list", "--json"]);
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(app_dir_in(h.home_path()).join("daemon/lifetime.lock"))
+                .unwrap();
+            assert_eq!(
+                lock.try_lock_exclusive().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            lifetime = Some(lock);
+            if unwind {
+                panic!("exercise harness cleanup during unwinding");
+            }
+        }));
+        assert_eq!(result.is_err(), unwind);
+        lifetime
+            .expect("read must have started a daemon")
+            .try_lock_exclusive()
+            .expect("daemon retained lifetime ownership after harness teardown");
+    }
+}
+
+#[test]
+#[parallel]
 fn tui_disconnect_hides_sessions_and_explicit_reconnect_restores_them() {
     require_tmux!();
     let mut h = TuiTestHarness::new_in_tmp("offline_reconnect");

@@ -14,6 +14,8 @@
 //! Modules behind `#[cfg(debug_assertions)]` use test hooks and helpers that
 //! only debug builds compile, so release test builds (the Nix checks) skip them.
 
+#[cfg(all(unix, debug_assertions))]
+mod cli_read_daemon;
 #[cfg(all(target_os = "linux", debug_assertions))]
 mod cli_read_parity;
 #[cfg(debug_assertions)]

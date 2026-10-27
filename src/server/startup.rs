@@ -170,6 +170,7 @@ pub(crate) struct ServerConfig<'a> {
     pub host: &'a str,
     pub port: u16,
     pub core_only: bool,
+    pub read_acquisition: bool,
     /// Auth mode the operator asked for. Carried whole rather than
     /// flattened to a "no token" bool so `start_server` can tell
     /// `--auth=passphrase` (token off, passphrase wall on) apart from
@@ -282,6 +283,7 @@ pub(crate) async fn start_server(
         host,
         port,
         core_only,
+        read_acquisition,
         auth_mode,
         read_only,
         remote,
@@ -313,7 +315,15 @@ pub(crate) async fn start_server(
 
     let ownership_repair = if !read_only && std::env::var_os("AOE_CITYHALL_MODE").is_none() {
         if crate::session::list_profiles().is_ok_and(|profiles| profiles.is_empty()) {
-            crate::session::Storage::new(profile, file_watch.clone())?;
+            let stale_default = read_acquisition && core_only && {
+                let configured_default =
+                    crate::session::config::Config::load_or_warn().default_profile;
+                !configured_default.is_empty()
+                    && (profile.is_empty() || profile == configured_default)
+            };
+            if !stale_default {
+                crate::session::Storage::new(profile, file_watch.clone())?;
+            }
         }
         super::startup_recovery::repair_startup_profile_ownership(&file_watch)
     } else {
@@ -1459,7 +1469,7 @@ mod tests {
     #[serial_test::serial]
     async fn a_successor_waits_for_a_retained_reader_then_serves_the_cached_row() {
         use crate::cli::definition::Cli;
-        use crate::cli::runtime_read::{attempt, classify, ReadRequestSource, ScopedRead};
+        use crate::cli::runtime_read::{attempt, classify, ReadRequestSource};
         use crate::server::runtime_uds::{LOCK_FILE, POSTBIND_FILE, PREBIND_FILE, SOCKET_FILE};
         use clap::Parser;
         use std::fs::OpenOptions;
@@ -1527,7 +1537,8 @@ mod tests {
         )
         .await
         .expect("a retained reader must not stall local discovery");
-        assert!(matches!(local, ScopedRead::NoLocalPublication(None)));
+        assert_eq!(local.exit, 2);
+        assert_eq!(local.stdout, None);
         drop(owner_probe);
         drop(reader);
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -1538,12 +1549,7 @@ mod tests {
         .await
         .expect("the successor publishes after the retained reader leaves");
 
-        let outcome = match attempt(classify(cli.command.as_ref()).unwrap(), &source).await {
-            ScopedRead::Answered(outcome) => outcome,
-            ScopedRead::NoLocalPublication(_) => {
-                panic!("the waiting successor must serve, not fall back")
-            }
-        };
+        let outcome = attempt(classify(cli.command.as_ref()).unwrap(), &source).await;
         assert_eq!(outcome.exit, 0, "{:?}", outcome.stderr);
         let value: serde_json::Value = serde_json::from_str(&outcome.stdout.unwrap()).unwrap();
         assert_eq!(value["id"], "successor-read");
