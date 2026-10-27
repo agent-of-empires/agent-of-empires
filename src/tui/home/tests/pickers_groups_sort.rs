@@ -2341,8 +2341,11 @@ fn test_strict_mode_ctrl_d_r_p_reach_secondary_actions() {
         env.view.rename_dialog.is_none(),
         "Ctrl+R in strict mode must NOT open the rename dialog (it targets serve)"
     );
-    env.view.info_dialog = None;
-    env.view.serve_view = None;
+    assert!(
+        env.view.connections_view.is_some(),
+        "Ctrl+R opens Connections"
+    );
+    env.view.connections_view = None;
 
     // P follows the same relocation rule as D/R/T/N, so in strict mode Shift+P opens
     // projects and Ctrl+P opens profiles.

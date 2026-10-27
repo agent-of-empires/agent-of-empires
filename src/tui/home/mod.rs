@@ -350,6 +350,7 @@ pub struct HomeView {
     pub(super) skills_manager_dialog: Option<crate::tui::dialogs::SkillsManagerDialog>,
     pub(super) command_palette: Option<CommandPaletteDialog>,
     pub(super) serve_view: Option<ServeView>,
+    pub(super) connections_view: Option<super::dialogs::ConnectionsView>,
     pub(super) pending_dashboard_launch: Option<super::dialogs::ServeLaunchRequest>,
     pub(super) update_confirm_dialog: Option<UpdateConfirmDialog>,
     /// One-time opt-in popup for users who finished the walkthrough before
@@ -583,7 +584,8 @@ pub struct HomeView {
 
     // Canonical subscription and native command lane.
     pub(super) sidebar_source: super::session_feed::SidebarSource,
-    runtime_failure_message: Option<String>,
+    /// Why the Daemon couldn't be reached, shown on the offline takeover.
+    runtime_failure_reason: Option<String>,
     pub(super) session_feed: super::session_feed::SessionFeed,
     pending_namespace_intent: Option<NamespaceIntent>,
     namespace_unknown_message: Option<String>,

@@ -723,9 +723,10 @@ impl Instance {
             })
             .cloned();
         let unresolved = "ACP does not prove a native conversation store; bind its current ID with aoe session set-session-id SESSION ID --store /absolute/claude-store before switching to terminal";
+        let persisted = self.persisted_observed_store(&sid);
         let resolved = match asserted {
             Some(asserted) => Ok(Some(asserted)),
-            None => worker.map_or(Ok(None), |worker| {
+            None => worker.or(persisted).map_or(Ok(None), |worker| {
                 self.resolved_handoff_binding(&sid, worker)
             }),
         };
@@ -806,6 +807,60 @@ impl Instance {
             attested |= super::execution::attest_observed_default_store(binding, Some(observed));
         }
         attested
+    }
+
+    /// Persist the store a worker observed for the ACP id it was just assigned,
+    /// so a dormant session can still prove it at the next terminal switch.
+    pub(crate) fn record_observed_acp_store(
+        &mut self,
+        sid: &str,
+        observed: Option<&ExecutionBinding>,
+    ) -> bool {
+        let Some(observed) = observed.filter(|o| o.agent == "claude" && o.filesystem == "host")
+        else {
+            return false;
+        };
+        if self.is_sandboxed()
+            || self.agent_session_binding.as_ref().is_some_and(|binding| {
+                binding.session_id == sid
+                    && (binding.provenance != ConversationProvenance::Observed
+                        || binding.execution.as_ref().is_some_and(|known| {
+                            known.stores == observed.stores && known.cwd == observed.cwd
+                        }))
+            })
+        {
+            return false;
+        }
+        self.agent_session_binding = Some(ConversationBinding {
+            session_id: sid.to_owned(),
+            execution: Some(observed.clone()),
+            provenance: ConversationProvenance::Observed,
+            transcript_path: None,
+        });
+        true
+    }
+
+    /// The persisted observed store for `sid`, only while its transcript still exists.
+    fn persisted_observed_store(&self, sid: &str) -> Option<&ExecutionBinding> {
+        let execution = self
+            .agent_session_binding
+            .as_ref()
+            .filter(|binding| {
+                binding.session_id == sid && binding.provenance == ConversationProvenance::Observed
+            })?
+            .execution
+            .as_ref()?;
+        let [store] = execution.stores.as_slice() else {
+            return None;
+        };
+        store
+            .join("projects")
+            .join(crate::session::capture::encode_claude_project_path(
+                &execution.cwd.to_string_lossy(),
+            ))
+            .join(format!("{sid}.jsonl"))
+            .is_file()
+            .then_some(execution)
     }
 
     fn resolved_handoff_binding(
@@ -1282,6 +1337,44 @@ mod tests {
                 .map(std::path::PathBuf::as_path),
             Some(path_identity(&session_home.join(".claude")).as_path())
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn handoff_uses_the_persisted_observed_store_only_while_its_transcript_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _config_dir = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "claude",
+            "#!/bin/sh\nexit 0\n",
+        );
+        let mut inst = Instance::new("claude-dormant", "/tmp");
+        inst.view = View::Structured;
+        inst.acp_session_id = Some("sid-abc".to_string());
+        let worker = inst.resolve_native_execution(None).unwrap().binding;
+        assert!(inst.record_observed_acp_store("sid-abc", Some(&worker)));
+        assert!(!inst.record_observed_acp_store("sid-abc", Some(&worker)));
+        let moved = ExecutionBinding {
+            stores: vec![temp.path().join("other-store")],
+            ..worker.clone()
+        };
+        assert!(inst.record_observed_acp_store("sid-abc", Some(&moved)));
+        assert!(inst.record_observed_acp_store("sid-abc", Some(&worker)));
+
+        assert!(inst.terminal_keep_context_state(None).is_err());
+
+        let transcript_dir = worker.stores[0].join("projects").join(
+            crate::session::capture::encode_claude_project_path(&worker.cwd.to_string_lossy()),
+        );
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        std::fs::write(transcript_dir.join("sid-abc.jsonl"), "").unwrap();
+        let planned = inst.terminal_keep_context_state(None).unwrap();
+        assert_eq!(planned.session_id.as_deref(), Some("sid-abc"));
+
+        inst.acp_session_id = Some("sid-new".to_string());
+        assert!(inst.terminal_keep_context_state(None).is_err());
     }
 
     #[test]
