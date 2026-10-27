@@ -45,8 +45,7 @@ pub(super) struct Shared {
     /// Set between a successful `session/load` and the first prompt, while
     /// the adapter replays history the event store already holds.
     pub(super) suppress_history_replay: AtomicBool,
-    /// Epoch-ms of the last inbound notification, for the resume-idle
-    /// watchdog.
+    /// Epoch-ms of foreground lifecycle activity, for resume-idle recovery.
     pub(super) last_event_at: AtomicI64,
     /// A lifecycle-bearing notification arrived after attach. Ambient
     /// updates do not prove turn progress.
@@ -231,7 +230,6 @@ impl Shared {
         mut notification: SessionNotification,
         local_prompt_signals: bool,
     ) {
-        self.last_event_at.store(now_ms(), Ordering::Relaxed);
         let suppressing = self.suppress_history_replay.load(Ordering::Relaxed);
         // Drop the adapter's leaked restatement before anything sees it
         // (#2281). Replayed history resets rather than feeds the deduper.
@@ -284,6 +282,7 @@ impl Shared {
             .is_some_and(|signal| !matches!(signal, LifecycleSignal::TaskSnapshotCompleted { .. }))
             || wakeup.is_some()
         {
+            self.last_event_at.store(now_ms(), Ordering::Relaxed);
             self.first_event_after_attach.store(true, Ordering::Relaxed);
         }
         let prompt_active = self.prompt_in_flight.load(Ordering::Relaxed);
@@ -476,6 +475,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn omp_task_activity_clocks_require_explicit_blocking_work() {
+        for (blocking_active, replay) in [
+            (None, false),
+            (Some(false), false),
+            (Some(true), false),
+            (Some(true), true),
+        ] {
+            for status in ["in_progress", "completed"] {
+                let (event_tx, mut event_rx) = mpsc::channel(32);
+                let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(32);
+                let shared = Shared::new(
+                    event_tx,
+                    "test".into(),
+                    &OMP,
+                    lifecycle_tx,
+                    Arc::new(TerminalClaim::new()),
+                    Arc::new(AtomicBool::new(false)),
+                    None,
+                    Arc::new(SessionIngress::new(Some(SessionId::from("native")))),
+                    None,
+                    None,
+                );
+                shared.last_event_at.store(123, Ordering::Relaxed);
+                shared
+                    .suppress_history_replay
+                    .store(replay, Ordering::Relaxed);
+                let mut frame = json!({
+                    "sessionId": "native",
+                    "update": {
+                        "sessionUpdate": "tool_call_update", "toolCallId": "mixed",
+                        "status": status, "_meta": {"omp": {"taskLifecycle": "progress"}},
+                        "rawOutput": {"details": {
+                            "async": {"type": "task"}, "progress": [
+                                {"id": "Child", "agent": "task", "status": "running",
+                                 "recentOutput": ["Background preview"]},
+                                {"id": "Blocking", "agent": "task", "status": "running"}
+                            ]
+                        }}
+                    }
+                });
+                if let Some(active) = blocking_active {
+                    frame["update"]["rawOutput"]["details"]["blockingActive"] = json!(active);
+                }
+                shared
+                    .handle_notification(serde_json::from_value(frame).unwrap(), false)
+                    .await;
+                let foreground = blocking_active == Some(true) && !replay;
+                assert_eq!(
+                    shared.last_event_at.load(Ordering::Relaxed) != 123,
+                    foreground
+                );
+                assert_eq!(
+                    shared.first_event_after_attach.load(Ordering::Relaxed),
+                    foreground
+                );
+                assert_eq!(shared.between_prompt.work_state().tool_calls, foreground);
+                let mut child_updated = false;
+                while let Ok(event) = event_rx.try_recv() {
+                    child_updated |= matches!(event, Event::BackgroundAgentProgress {
+                        agent_id, last_text: Some(text), ..
+                    } if agent_id == "Child" && text == "Background preview");
+                }
+                assert_eq!(child_updated, !replay);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn omp_tasks_resume_preserves_terminal_siblings_and_settles_unresolved() {
         use crate::acp::state::{AcpState, BackgroundAgentStatus};
 
@@ -649,10 +716,12 @@ mod tests {
             None,
             None,
         );
+        shared.last_event_at.store(123, Ordering::Relaxed);
         shared
             .handle_notification(task_notification("completed", "running"), true)
             .await;
         assert!(!shared.first_event_after_attach.load(Ordering::Relaxed));
+        assert_eq!(shared.last_event_at.load(Ordering::Relaxed), 123);
         assert!(!shared.between_prompt.work_state().tool_calls);
         assert_eq!(shared.between_prompt.take_idle_fire(i64::MAX), None);
         assert!(lifecycle_rx.try_recv().is_err());
@@ -671,6 +740,7 @@ mod tests {
             LifecycleSignal::ToolStarted { id, .. } if id == "batch"
         ));
         assert!(shared.first_event_after_attach.load(Ordering::Relaxed));
+        let foreground_at = shared.last_event_at.load(Ordering::Relaxed);
         for status in ["pending", "in_progress"] {
             shared
                 .handle_notification(task_notification(status, "running"), true)
@@ -689,6 +759,7 @@ mod tests {
         .unwrap();
         shared.handle_notification(rolling, true).await;
         assert!(lifecycle_rx.try_recv().is_err());
+        assert_eq!(shared.last_event_at.load(Ordering::Relaxed), foreground_at);
         shared
             .handle_notification(task_notification("completed", "completed"), true)
             .await;
@@ -697,6 +768,7 @@ mod tests {
         assert!(
             matches!(terminal.signal, LifecycleSignal::TaskSnapshotCompleted { id } if id == "batch")
         );
+        assert_eq!(shared.last_event_at.load(Ordering::Relaxed), foreground_at);
     }
 
     #[tokio::test]

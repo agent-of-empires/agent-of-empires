@@ -215,6 +215,133 @@ async fn attach_in_flight_disarms_after_first_inbound_notification() {
     );
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn adopted_task_snapshots_distinguish_detached_from_blocking_activity() {
+    if let Err(reason) = shim_ready() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+
+    let _env = crate::common::EnvGuard::from_pairs(&[
+        ("AOE_RESUME_IDLE_GRACE_MS", "800"),
+        ("AOE_RESUME_IDLE_CHECK_INTERVAL_MS", "50"),
+    ]);
+
+    for (mode, session) in [
+        ("detached", "midturn-detached-snapshots"),
+        ("mixed", "midturn-mixed-snapshots"),
+    ] {
+        let release_dir = tempfile::tempdir().expect("task snapshot release directory");
+        let release = release_dir.path().join("release");
+        let session_id = "test-acp-session-id";
+        let (socket_path, _runner) = spawn_runner_with_shim(
+            session,
+            &[
+                ("SHIM_PRESEED_SESSION_ID", session_id.to_string()),
+                ("SHIM_RESUME_TASK_SNAPSHOTS", mode.to_string()),
+                (
+                    "SHIM_RESUME_TASK_RELEASE_FILE",
+                    release.display().to_string(),
+                ),
+            ],
+        )
+        .await;
+        let mut client = AcpClient::attach(
+            socket_path,
+            std::env::temp_dir(),
+            vec![],
+            session_id.into(),
+            true,
+            AcpSessionId(session.into()),
+            None,
+            "claude".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("attach adopted task stream");
+
+        std::fs::write(&release, b"release").expect("release snapshots after attachment");
+        let mut detached_output = None;
+        let mut blocking_output = None;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match client.next_event().await.expect("adopted stream open") {
+                    Event::BackgroundAgentProgress {
+                        agent_id,
+                        last_text: Some(text),
+                        ..
+                    } => match agent_id.as_str() {
+                        "old-detached-child" => detached_output = Some(text),
+                        "blocking-sibling" => blocking_output = Some(text),
+                        _ => {}
+                    },
+                    Event::Stopped { reason } => {
+                        panic!("{mode}: stopped before task row updates: {reason}")
+                    }
+                    _ => {}
+                }
+                if detached_output.as_deref() == Some("detached output 1")
+                    && (mode == "detached"
+                        || blocking_output.as_deref() == Some("foreground output 1"))
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("received changing task rows from the released snapshot stream");
+
+        if mode == "detached" {
+            // The shim keeps sending every 100ms, below the 800ms grace.
+            let stopped =
+                drain_for_stopped_reason(&mut client, Instant::now() + Duration::from_secs(3))
+                    .await;
+            assert_eq!(
+                stopped.as_deref(),
+                Some("reattach_idle"),
+                "detached child progress must not keep an adopted foreground turn alive"
+            );
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if let Event::BackgroundAgentProgress {
+                        agent_id,
+                        last_text: Some(text),
+                        ..
+                    } = client
+                        .next_event()
+                        .await
+                        .expect("snapshot stream remains open")
+                    {
+                        if agent_id == "old-detached-child"
+                            && Some(text.as_str()) != detached_output.as_deref()
+                        {
+                            break;
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("detached updates continue beyond the timeout observation");
+        } else {
+            // Both snapshots have ACP completed status but blockingActive=true.
+            // The shim now goes silent, retaining the full negative window.
+            let stopped =
+                drain_for_stopped_reason(&mut client, Instant::now() + Duration::from_millis(1600))
+                    .await;
+            assert!(
+                stopped.is_none(),
+                "blocking sibling must protect the adopted turn beyond grace: {stopped:?}"
+            );
+        }
+        let _ = client.shutdown().await;
+    }
+}
+
 async fn read_typed_control(
     stream: &mut tokio::net::UnixStream,
 ) -> agent_of_empires::acp::control_protocol::ControlBody {

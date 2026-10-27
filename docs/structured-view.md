@@ -108,7 +108,7 @@ The background-agent panel consumes structured omp task details, not rendered to
 
 After a daemon restart, tracking identities retained outside event history prevent completed siblings from launching or completing again; unresolved tasks continue tracking only when the runner confirms the same native conversation. Changing that conversation clears the tracking identities. Upgrading cannot recover identities already removed by earlier history cleanup. The last-tool preview uses the current tool when present, otherwise the newest `recentTools` entry.
 
-Background task progress does not count as foreground prompt activity. The panel does not offer Stop for omp tasks because its ACP adapter does not expose background-task cancellation; cancelling the parent prompt does not stop those detached tasks.
+Detached background task progress does not count as foreground prompt activity or postpone recovery of an orphaned resumed turn. Mixed task batches still count as foreground work while blocking siblings are active. The panel does not offer Stop for omp tasks because its ACP adapter does not expose background-task cancellation; cancelling the parent prompt does not stop those detached tasks.
 
 Live progress and completion after the parent prompt ends require the native `omp acp` adapter to forward task updates for the session's lifetime. AoE support alone does not guarantee those source updates: that bridge must be deployed in the installed omp adapter. See the [task update contract](development/internals/structured-view.md#omp-async-task-updates).
 

@@ -251,7 +251,7 @@ pub(super) fn silent_orphan_check_interval() -> Duration {
         })
 }
 
-/// Excludes replay; explicitly marked spawning ends close already-tracked calls.
+/// Excludes replay and detached progress; spawning ends close tracked calls.
 pub(super) fn classify_watchdog_notification_signals(
     update: &SessionUpdate,
     restored_title: Option<&str>,
@@ -278,12 +278,27 @@ pub(super) fn classify_watchdog_notification_signals(
             .and_then(|meta| meta.get("taskLifecycle"))
             .and_then(|value| value.as_str())
             == Some("completed");
-        return (
-            terminal.then(|| LifecycleSignal::TaskSnapshotCompleted {
+        let lifecycle = if terminal {
+            Some(LifecycleSignal::TaskSnapshotCompleted {
                 id: update.tool_call_id.0.to_string(),
-            }),
-            None,
-        );
+            })
+        } else if update
+            .fields
+            .raw_output
+            .as_ref()
+            .and_then(|output| output.pointer("/details/blockingActive"))
+            .and_then(|active| active.as_bool())
+            == Some(true)
+        {
+            // ACP status describes async children, not the blocking siblings.
+            Some(LifecycleSignal::ToolStarted {
+                id: update.tool_call_id.0.to_string(),
+                is_background_task: false,
+            })
+        } else {
+            None
+        };
+        return (lifecycle, None);
     }
     (
         classify_lifecycle_signal(update),
@@ -677,6 +692,39 @@ mod tests {
                 marker == Some("completed")
             );
         }
+    }
+
+    #[test]
+    fn omp_blocking_snapshot_adopts_foreground_until_spawning_end() {
+        let t0 = Instant::now();
+        let wall = chrono::Utc::now();
+        let mut watchdog = SilentOrphanWatchdog::default();
+        let progress = serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "tool_call_update", "toolCallId": "mixed", "status": "completed",
+            "_meta": {"omp": {"taskLifecycle": "progress"}},
+            "rawOutput": {"details": {
+                "async": {"type": "task", "state": "completed"}, "blockingActive": true
+            }}
+        }))
+        .unwrap();
+        let (lifecycle, wakeup) =
+            classify_watchdog_notification_signals(&progress, None, &agent_profiles::OMP, false);
+        assert!(wakeup.is_none());
+        assert!(matches!(lifecycle, Some(L::ToolStarted { .. })));
+        watchdog.apply_signal(lifecycle.unwrap(), t0, wall, CFG);
+        assert_eq!(watchdog.last_progress_at, Some(t0));
+        assert!(!watchdog.should_fire(t0 + CFG.base_grace, CFG));
+
+        let (terminal, _) = classify_watchdog_notification_signals(
+            &task_snapshot("mixed", "completed"),
+            None,
+            &agent_profiles::OMP,
+            false,
+        );
+        watchdog.apply_signal(terminal.unwrap(), t0 + CFG.base_grace, wall, CFG);
+        assert_eq!(watchdog.tool_calls_in_flight_len(), 0);
+        assert_eq!(watchdog.last_progress_at, Some(t0));
+        assert!(watchdog.should_fire(t0 + CFG.base_grace, CFG));
     }
 
     #[test]

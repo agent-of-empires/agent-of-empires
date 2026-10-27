@@ -99,6 +99,54 @@ function emitUnsolicitedNotifIfRequested(client) {
   );
 }
 
+// SHIM_RESUME_TASK_SNAPSHOTS=detached|mixed emits only adopted task snapshots.
+// The release file ensures the final attachment receives the first snapshot.
+async function emitResumeTaskSnapshotsIfRequested(client) {
+  const mode = process.env.SHIM_RESUME_TASK_SNAPSHOTS;
+  const sessionId = process.env.SHIM_PRESEED_SESSION_ID;
+  const release = process.env.SHIM_RESUME_TASK_RELEASE_FILE;
+  if (!mode || !sessionId || !release) return;
+  await waitForFile(release);
+  const blockingActive = mode === "mixed";
+  for (let sequence = 0; ; sequence++) {
+    const progress = [
+      {
+        id: "old-detached-child",
+        agent: "scout",
+        status: blockingActive ? "completed" : "running",
+        recentOutput: [`detached output ${sequence}`],
+      },
+    ];
+    if (blockingActive) {
+      progress.push({
+        id: "blocking-sibling",
+        agent: "worker",
+        status: "running",
+        recentOutput: [`foreground output ${sequence}`],
+      });
+    }
+    await client.notify("session/update", {
+      sessionId,
+      update: {
+        sessionUpdate: "tool_call_update",
+        toolCallId: "adopted-task-batch",
+        status: blockingActive ? "completed" : "in_progress",
+        _meta: { omp: { taskLifecycle: "progress" } },
+        rawOutput: {
+          details: {
+            async: { type: "task", jobId: "old-detached-child" },
+            blockingActive,
+            progress,
+          },
+        },
+      },
+    });
+    // Blocking proof must survive silence; detached traffic never stops.
+    if (blockingActive && sequence === 1) return;
+    await sleep(100);
+  }
+}
+
 function handleInitialize(params) {
   // SHIM_LOAD_SESSION=1 advertises loadSession.
   const agentCapabilities = { loadSession: process.env.SHIM_LOAD_SESSION === "1" };
@@ -509,7 +557,10 @@ async function bootstrap() {
     .onRequest("session/set_config_option", ({ params }) => handleSetConfigOption(params))
     .onRequest("session/prompt", ({ params, client }) => handlePrompt(params, client))
     .onNotification("session/cancel", () => handleCancel())
-    .onConnect((connection) => emitUnsolicitedNotifIfRequested(connection.client));
+    .onConnect((connection) => {
+      emitUnsolicitedNotifIfRequested(connection.client);
+      emitResumeTaskSnapshotsIfRequested(connection.client).catch(() => {});
+    });
   if (process.env.SHIM_DELETE_CAPABILITY === "1") {
     app.onRequest("session/delete", ({ params }) => handleDeleteSession(params));
   }
