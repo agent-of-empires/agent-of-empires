@@ -47,7 +47,15 @@ fn rename_targets(path: &Path) -> Result<()> {
             }
         }
     }
-    std::fs::write(path, out.join(",")).with_context(|| format!("writing {}", path.display()))?;
+    // Replace atomically so a failed write leaves the old filter for the retry.
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, out.join(",")).with_context(|| format!("writing {}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
     info!(target: "migrations.v052", "Renamed cockpit log targets to acp in {}", path.display());
     Ok(())
 }
