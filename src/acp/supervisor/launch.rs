@@ -1093,7 +1093,8 @@ pub(super) fn apply_declared_config_dir(
             crate::session::environment::resolve_host_environment_value(&cfg.environment, "HOME")
         })
         .map(std::path::PathBuf::from)
-        .or_else(dirs::home_dir)?;
+        .or_else(dirs::home_dir)
+        .filter(|home| home.is_absolute())?;
     let dir = cfg.session.agent_config_dir_for(tool, &home)?;
     overlay_env(
         environment,
@@ -1352,6 +1353,15 @@ mod tests {
         for (cfg, tool, agent, env, claude_dir) in cases {
             assert_eq!(run(&cfg, tool, agent), (env, claude_dir), "{tool}");
         }
+
+        // A relative effective HOME would resolve differently per process: no export.
+        let mut env = vec![pair("HOME", "account")];
+        let relative_home = cfg(&[("claude", "~/.claude-work")]);
+        assert_eq!(
+            apply_declared_config_dir(&mut env, &relative_home, "claude", "claude"),
+            None
+        );
+        assert_eq!(env, vec![pair("HOME", "account")]);
 
         // `~` expands against the worker's effective HOME, not the configured one.
         let mut cfg = cfg(&[("claude", "~/.claude-work")]);
