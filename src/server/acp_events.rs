@@ -481,9 +481,10 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             let profile_for_save = profile.clone();
             let acp_change_for_save = acp_change.clone();
             let file_watch = state.file_watch.clone();
-            let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
                 let storage = crate::session::Storage::new(&profile_for_save, file_watch)?;
                 storage.update(|all, _groups| {
+                    let found = all.iter().any(|i| i.id == session_id_for_save);
                     if let Some(inst) = all.iter_mut().find(|i| i.id == session_id_for_save) {
                         inst.attest_launch_default_store(observed_for_save.as_ref());
                         apply_acp_session_change(
@@ -497,20 +498,23 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                             inst.record_observed_acp_store(new_id, observed_for_save.as_ref());
                         }
                     }
-                    Ok(())
-                })?;
-                Ok(())
+                    Ok(found)
+                })
             })
             .await;
             match save_result {
-                Ok(Ok(())) => {
+                Ok(Ok(row_saved)) => {
                     // The saved row is the durable one; the mirror may only
                     // attest what has actually been written, never a marker the
                     // next reload would drop.
                     let mut instances = state.instances.write().await;
                     if let Some(inst) = instances.iter_mut().find(|i| i.id == frame.session_id) {
                         inst.attest_launch_default_store(observed_mirror.as_ref());
-                        if let Some(AcpSessionChange::Assigned(new_id)) = acp_change.as_ref() {
+                        // A row that moved out of this profile was not written, and
+                        // the next reload would drop what the mirror recorded.
+                        if let (true, Some(AcpSessionChange::Assigned(new_id))) =
+                            (row_saved, acp_change.as_ref())
+                        {
                             inst.record_observed_acp_store(new_id, observed_mirror.as_ref());
                         }
                     }

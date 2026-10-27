@@ -823,10 +823,13 @@ impl Instance {
             return false;
         };
         if self.is_sandboxed()
-            || self
-                .agent_session_binding
-                .as_ref()
-                .is_some_and(|binding| binding.session_id == sid)
+            || self.agent_session_binding.as_ref().is_some_and(|binding| {
+                binding.session_id == sid
+                    && (binding.provenance != ConversationProvenance::Observed
+                        || binding.execution.as_ref().is_some_and(|known| {
+                            known.stores == observed.stores && known.cwd == observed.cwd
+                        }))
+            })
         {
             return false;
         }
@@ -1355,6 +1358,12 @@ mod tests {
         let worker = inst.resolve_native_execution(None).unwrap().binding;
         assert!(inst.record_observed_acp_store("sid-abc", Some(&worker)));
         assert!(!inst.record_observed_acp_store("sid-abc", Some(&worker)));
+        let moved = ExecutionBinding {
+            stores: vec![temp.path().join("other-store")],
+            ..worker.clone()
+        };
+        assert!(inst.record_observed_acp_store("sid-abc", Some(&moved)));
+        assert!(inst.record_observed_acp_store("sid-abc", Some(&worker)));
 
         assert!(inst.terminal_keep_context_state(None).is_err());
 
