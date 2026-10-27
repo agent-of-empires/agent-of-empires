@@ -63,8 +63,11 @@ export function SidebarLegend() {
     if (menu) return close();
     const rect = buttonRef.current?.getBoundingClientRect();
     openMenu({ x: rect?.left ?? 0, y: (rect?.bottom ?? 0) + 4 });
-    // The popover isn't modal, so it takes focus itself; Escape then reaches it.
-    requestAnimationFrame(() => bodyRef.current?.focus({ preventScroll: true }));
+    // The popover isn't modal, so it takes focus itself; Escape then reaches it. The phone sheet is
+    // modal and has already focused its close button, where its Tab trap starts; leave that be.
+    requestAnimationFrame(() => {
+      if (!menuRef.current?.contains(document.activeElement)) bodyRef.current?.focus({ preventScroll: true });
+    });
   };
 
   return (

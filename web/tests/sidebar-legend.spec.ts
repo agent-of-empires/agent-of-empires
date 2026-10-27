@@ -98,6 +98,14 @@ test.describe("sidebar legend on a phone", () => {
     const box = await legend.boundingBox();
     // Docked full width at the bottom, like the row menu's sheet.
     expect(box && [Math.round(box.width), Math.round(box.y + box.height)]).toEqual([375, 812]);
+    // Focus stays inside the modal sheet: its close button, and Tab either way wraps back to it.
+    const closeButton = legend.getByRole("button", { name: /close/i });
+    await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
+    await expect(closeButton).toBeFocused();
+    for (const key of ["Tab", "Shift+Tab"]) {
+      await page.keyboard.press(key);
+      await expect(closeButton, key).toBeFocused();
+    }
 
     await page.touchscreen.tap(187, 40);
     await expect(legend).toBeHidden();
