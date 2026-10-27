@@ -1021,10 +1021,11 @@ async fn native_creation_progress_reports_phases_to_the_local_stream() {
     use agent_of_empires::{
         acp::client::DaemonEndpoint,
         daemon::{
-            CreateSessionBody, CreationPhase, CreationProgress, DaemonClient, RuntimeConnection,
-            RuntimeEvent,
+            ApiErrorCode, CreateSessionBody, CreationPhase, CreationProgress, DaemonClient,
+            RuntimeConnection, RuntimeEvent, RUNTIME_EPOCH_HEADER,
         },
     };
+    const PHASE_TIMEOUT: Duration = Duration::from_secs(20);
     require_tmux!();
     let mut h = TuiTestHarness::new_in_tmp("native_creation_progress");
     h.set_env("AGENT_OF_EMPIRES_PROFILE", "default");
@@ -1034,16 +1035,28 @@ async fn native_creation_progress_reports_phases_to_the_local_stream() {
     std::fs::write(&agent, "#!/bin/sh\nexec sleep 120\n").unwrap();
     let app = crate::harness::app_dir_in(h.home_path());
     let config_path = app.join("config.toml");
-    struct ReleaseHook(std::path::PathBuf);
+    struct ReleaseHook(tempfile::TempDir);
     impl Drop for ReleaseHook {
         fn drop(&mut self) {
-            let _ = std::fs::write(&self.0, []);
+            let gate = self.0.path();
+            if std::fs::write(gate.join("release"), []).is_err() || !gate.join("started").exists() {
+                return;
+            }
+            let finished = gate.join("finished");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !finished.exists() {
+                if Instant::now() >= deadline {
+                    eprintln!("creation hook did not acknowledge release before cleanup");
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
     }
-    let release = ReleaseHook(h.home_path().join("hook-release"));
+    let release = ReleaseHook(tempfile::tempdir_in(h.home_path()).unwrap());
     let command = format!(
-        "echo building dependency graph; while [ ! -f {release:?} ]; do sleep 0.05; done",
-        release = release.0
+        ": > {gate:?}/started; echo building dependency graph; while [ -d {gate:?} ] && [ ! -f {gate:?}/release ]; do sleep 0.05; done; if [ -d {gate:?} ]; then : > {gate:?}/finished; fi",
+        gate = release.0.path()
     );
     let mut config = std::fs::read_to_string(&config_path).unwrap();
     config.push_str(&format!(
@@ -1064,6 +1077,12 @@ async fn native_creation_progress_reports_phases_to_the_local_stream() {
     let socket = app.join("daemon/api.sock");
     let sdk = DaemonClient::new_unix(&socket).unwrap();
     let epoch = sdk.runtime_info().await.unwrap().epoch;
+    let http = reqwest::Client::builder()
+        .unix_socket(socket.clone())
+        .no_proxy()
+        .timeout(PHASE_TIMEOUT * 5)
+        .build()
+        .unwrap();
     let endpoint = DaemonEndpoint::local_unix(socket);
     let mut connection = RuntimeConnection::connect(&endpoint, None).await.unwrap();
     assert!(
@@ -1080,27 +1099,35 @@ async fn native_creation_progress_reports_phases_to_the_local_stream() {
         connection: &mut RuntimeConnection,
         ready: impl Fn(&CreationProgress) -> bool,
     ) -> CreationProgress {
-        loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(20), connection.next_event())
-                .await
-                .expect("creation progress arrived")
-                .expect("runtime stream stayed connected")
-            {
-                RuntimeEvent::Progress(progress) => {
-                    if let Some(entry) = progress.iter().find(|entry| ready(entry)) {
-                        return entry.clone();
+        tokio::time::timeout(PHASE_TIMEOUT, async {
+            loop {
+                match connection
+                    .next_event()
+                    .await
+                    .expect("runtime stream stayed connected")
+                {
+                    RuntimeEvent::Progress(progress) => {
+                        if let Some(entry) = progress.iter().find(|entry| ready(entry)) {
+                            return entry.clone();
+                        }
                     }
+                    RuntimeEvent::Snapshot(_) | RuntimeEvent::OwnerDiagnostics(_) => {}
                 }
-                RuntimeEvent::Snapshot(_) | RuntimeEvent::OwnerDiagnostics(_) => {}
             }
-        }
+        })
+        .await
+        .expect("creation progress arrived")
     }
 
-    let creator = sdk.clone();
     let create_epoch = epoch.clone();
-    let create = tokio::spawn(async move { creator.create_session(&body, &create_epoch).await });
-    // The phase change publishes before the command starts, so wait for the
-    // frame that actually names the hook and its output.
+    let create = tokio::spawn(async move {
+        http.post("http://localhost/api/sessions")
+            .header(RUNTIME_EPOCH_HEADER, create_epoch)
+            .json(&body)
+            .send()
+            .await
+    });
+    // Wait for the hook's command and output, not just its phase.
     let observed = read_progress(&mut connection, |entry| {
         entry.phase == CreationPhase::CreateHooks
             && !entry.cancelled
@@ -1121,7 +1148,7 @@ async fn native_creation_progress_reports_phases_to_the_local_stream() {
         "progress must carry the hook's first line, got: {:?}",
         observed.output
     );
-    tokio::time::timeout(Duration::from_secs(20), async {
+    tokio::time::timeout(PHASE_TIMEOUT, async {
         while !connection
             .snapshot()
             .contents
@@ -1155,22 +1182,31 @@ async fn native_creation_progress_reports_phases_to_the_local_stream() {
         observed.session_id, pending.id,
         "the pending cancellation must name the creation it fences"
     );
-    std::fs::write(&release.0, "continue").unwrap();
-    let cancelled = create.await.unwrap();
-    assert!(
-        cancelled.is_err(),
-        "a cancelled creation must not report success"
+    std::fs::write(release.0.path().join("release"), "continue").unwrap();
+    let cancelled = create
+        .await
+        .unwrap()
+        .expect("creation returned an HTTP response");
+    assert_eq!(
+        ApiErrorCode::from_headers(cancelled.status(), cancelled.headers(), false),
+        Some(ApiErrorCode::CreationCancelled),
+        "expected a cancellation response, got {}",
+        cancelled.status()
     );
-    loop {
-        match tokio::time::timeout(std::time::Duration::from_secs(20), connection.next_event())
-            .await
-            .expect("progress cleared")
-            .expect("runtime stream stayed connected")
-        {
-            RuntimeEvent::Progress(progress) if progress.is_empty() => break,
-            _ => {}
+    tokio::time::timeout(PHASE_TIMEOUT, async {
+        loop {
+            match connection
+                .next_event()
+                .await
+                .expect("runtime stream stayed connected")
+            {
+                RuntimeEvent::Progress(progress) if progress.is_empty() => break,
+                _ => {}
+            }
         }
-    }
+    })
+    .await
+    .expect("progress cleared");
     assert!(connection.creation_progress().is_empty());
     let rows = sdk.list_sessions(None).await.unwrap().sessions;
     assert!(

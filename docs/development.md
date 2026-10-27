@@ -26,7 +26,9 @@ cancellation still runs.
 Creation-progress events are advisory and publish independently of session
 snapshots. Tests that need a published session must wait for its ID in the
 canonical snapshot. Hold in-flight fixture gates until explicit release, with
-cleanup that also releases them on failure.
+cleanup that waits for release acknowledgment and lets a late hook exit when
+its gate directory disappears. Keep request deadlines longer than the bounded
+scenario and assert the expected API error code, not merely any error.
 
 The binary is `target/{profile}/aoe`. Web commands and test selection live in `web/AGENTS.md`.
 
