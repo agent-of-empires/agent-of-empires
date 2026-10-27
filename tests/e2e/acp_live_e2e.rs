@@ -668,7 +668,7 @@ fn wizard_created_structured_session_opens_structured_view() {
     let project = h.project_path();
 
     h.spawn_tui();
-    h.wait_for("Runtime ready");
+    h.wait_for_runtime_ready();
     h.send_keys("n");
     h.wait_for(" New Session ");
     h.send_keys("C-u");

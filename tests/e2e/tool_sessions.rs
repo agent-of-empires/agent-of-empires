@@ -317,7 +317,7 @@ hotkey = "Alt+t"
 
     h.spawn_tui();
     h.wait_for("RoundtripSession");
-    h.wait_for("Runtime ready");
+    h.wait_for_runtime_ready();
 
     // Press the configured hotkey (Alt+t). tmux's send-keys grammar
     // names Alt-modified keys as `M-<key>`.
@@ -996,7 +996,7 @@ fn native_attach_has_one_input_reader_and_survives_peer_delete_on_detach() {
         let id = h.add_session(&[project.to_str().unwrap(), "-t", "ExactAttachTarget"]);
         h.run_cli_ok(&["session", "start", &id]);
         h.spawn_tui();
-        h.wait_for("Runtime ready");
+        h.wait_for_runtime_ready();
         h.send_keys("/");
         h.type_text("ExactAttachTarget");
         h.send_keys("Enter");
@@ -1100,7 +1100,7 @@ fn native_attach_has_one_input_reader_and_survives_peer_delete_on_detach() {
         h.send_keys_unfenced("C-b");
         h.send_keys_unfenced("d");
         h.wait_for_terminal_resume(resume);
-        h.wait_for("Runtime ready");
+        h.wait_for_runtime_ready();
         if kind == "agent" {
             // The harness uses a 100x30 compact viewport: two preview borders
             // and one footer leave 27 content rows. Pane-border-status consumes

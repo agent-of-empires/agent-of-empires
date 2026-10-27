@@ -342,8 +342,10 @@ fn tui_restart_failure_retains_predecessor_credential_for_rotation_and_removal()
             std::fs::write(app.join("serve.mode"), "tunnel").unwrap();
         }
         h.spawn_tui();
-        h.wait_for("Runtime ready");
+        h.wait_for_runtime_ready();
         h.send_keys("R");
+        h.wait_for("Connections");
+        h.send_keys("Enter");
         h.wait_for(if rotate { "tunnel" } else { "local" });
         let key = if rotate { "g" } else { "r" };
         h.send_keys(key);

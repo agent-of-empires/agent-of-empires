@@ -946,18 +946,20 @@ pub static BINDINGS: &[Binding] = &[
         help: Some(HelpMeta {
             section: HelpSection::Other,
             desc: if cfg!(feature = "web") {
-                "Web dashboard (browser / phone)"
+                "Connections: Web dashboard (browser / phone)"
             } else {
-                "Remote API access (LAN / Tunnel)"
+                "Connections: API server (LAN / Tunnel)"
             },
         }),
         palette: Some(PaletteMeta {
             title: if cfg!(feature = "web") {
-                "Open web dashboard (browser / phone)"
+                "Open Connections: Web dashboard (browser / phone)"
             } else {
-                "Open remote API access (LAN / Tunnel)"
+                "Open Connections: API server (LAN / Tunnel)"
             },
             keywords: &[
+                "connections",
+                "daemon",
                 "serve",
                 "web",
                 "dashboard",

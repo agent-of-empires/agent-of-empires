@@ -297,13 +297,13 @@ fn tui_disconnect_hides_sessions_and_explicit_reconnect_restores_them() {
         "{}",
         String::from_utf8_lossy(&stopped.stderr)
     );
-    h.wait_for("Runtime unavailable");
+    h.wait_for("Not responding");
     assert!(!h.capture_screen().contains("offline-visible-session"));
     h.send_keys("n");
-    assert!(h.capture_screen().contains("Runtime unavailable"));
+    assert!(h.capture_screen().contains("Not responding"));
     h.send_keys("r");
     h.wait_for_timeout("offline-visible-session", Duration::from_secs(30));
-    assert!(!h.capture_screen().contains("Runtime unavailable"));
+    assert!(!h.capture_screen().contains("Not responding"));
 }
 
 #[cfg(unix)]
@@ -2142,10 +2142,10 @@ async fn daemon_terminal_commands_apply_dimensions_archive_and_abandon_policy() 
     );
 }
 
-/// Pressing `R` from the home screen opens the serve ModePicker,
-/// which must render both cards (Local + Internet) and surface the
-/// transport-picker-deferred hint on the Tunnel card ("Pick transport
-/// on next screen.").
+/// `R` opens Connections, and Enter on its Web dashboard row opens the
+/// serve ModePicker, which must render both cards (Local + Internet) and
+/// surface the transport-picker-deferred hint on the Tunnel card ("Pick
+/// transport on next screen.").
 #[test]
 #[parallel]
 fn tui_serve_dialog_opens_to_mode_picker() {
@@ -2156,6 +2156,8 @@ fn tui_serve_dialog_opens_to_mode_picker() {
 
     h.wait_for(" aoe ");
     h.send_keys("R");
+    h.wait_for("Connections");
+    h.send_keys("Enter");
 
     h.wait_for("How should this be reachable?");
     h.assert_screen_contains("Local network");
@@ -2179,6 +2181,8 @@ fn tui_serve_dialog_escape_returns_home() {
 
     h.wait_for(" aoe ");
     h.send_keys("R");
+    h.wait_for("Connections");
+    h.send_keys("Enter");
     h.wait_for("How should this be reachable?");
 
     h.send_keys("Escape");
@@ -2200,9 +2204,9 @@ fn tui_footer_web_entry_tracks_core_to_web_promotion() {
     assert!(!h.capture_screen().contains(&format!("R \u{25CF} {what}")));
 
     h.start_daemon();
-    h.wait_for("Runtime unavailable");
+    h.wait_for("Not responding");
     h.send_keys("r");
-    h.wait_for_absent("Runtime unavailable", Duration::from_secs(10));
+    h.wait_for_absent("Not responding", Duration::from_secs(10));
     h.wait_for(&format!("R \u{25CF} {what}"));
 }
 
@@ -2840,6 +2844,8 @@ fn tui_local_restart_preserves_the_env_passphrase_gate() {
     h.wait_for_ready();
 
     h.send_keys("R");
+    h.wait_for("Connections");
+    h.send_keys("Enter");
     h.wait_for("How should this be reachable?");
     h.send_keys("L");
     let (port, token) = wait_for_local_dashboard(&h);
@@ -2879,6 +2885,8 @@ fn tui_local_restart_preserves_the_gate_without_the_env_variable() {
     h.wait_for_ready();
 
     h.send_keys("R");
+    h.wait_for("Connections");
+    h.send_keys("Enter");
     h.wait_for("How should this be reachable?");
     h.send_keys("L");
     let (port, token) = wait_for_local_dashboard(&h);
@@ -2899,6 +2907,8 @@ fn tui_local_restart_preserves_the_gate_without_the_env_variable() {
     h.spawn_tui();
     h.wait_for_ready();
     h.send_keys("R");
+    h.wait_for("Connections");
+    h.send_keys("Enter");
     h.wait_for("R: restart");
 
     let successor = restart_local_from_tui(&h);

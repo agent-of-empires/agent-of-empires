@@ -195,7 +195,7 @@ schemars = { version = "1", features = ["chrono04"] }
 # Unix-only: O_NOFOLLOW for capability-safe filesystem operations.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-nix = { version = "0.31", features = ["signal", "process", "net", "fs", "resource", "dir", "user", "poll"] }
+nix = { version = "0.31", features = ["signal", "process", "net", "fs", "resource", "dir", "user", "poll", "hostname"] }
 
 [features]
 # The daemon (REST/WS API, auth, Web Push, ACP, structured view) is core: a
