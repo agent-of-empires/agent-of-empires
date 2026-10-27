@@ -164,7 +164,21 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
     );
   }
   await page.route("**/api/agents", (r) =>
-    r.fulfill({ json: [{ name: "claude", kind: "builtin", display_name: "Claude Code" }] }),
+    r.fulfill({
+      json: [
+        {
+          name: "claude",
+          display_name: "Claude Code",
+          kind: "builtin",
+          binary: "claude",
+          host_only: false,
+          installed: true,
+          install_hint: "",
+          acp_capable: true,
+          acp_installed: true,
+        },
+      ],
+    }),
   );
   await page.route("**/api/about", (r) => r.fulfill({ json: opts.about ?? {} }));
   await page.route("**/api/telemetry/seen", (r) => {
