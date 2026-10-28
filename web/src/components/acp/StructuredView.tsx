@@ -372,6 +372,7 @@ function AcpChrome({
               collapsed={composerCollapsed}
               onToggleCollapsed={() => setComposerCollapsed((v) => !v)}
               startingAgent={startingAgent}
+              agent={agentName(state.agent ?? acpAgent)}
             />
           )}
         </div>
@@ -391,6 +392,7 @@ function ComposerDock({
   collapsed,
   onToggleCollapsed,
   startingAgent,
+  agent,
 }: {
   view: Props;
   ctx: AcpContext;
@@ -401,6 +403,8 @@ function ComposerDock({
   onToggleCollapsed: () => void;
   /** Set while a new Session starts, as for the startup line. */
   startingAgent: string | null;
+  /** The Session's Agent by display name. */
+  agent: string;
 }) {
   const { sessionId, acpWorkerState, acpAgent, acpProvider } = view;
   const { state, status } = ctx;
@@ -418,6 +422,7 @@ function ComposerDock({
           status !== "open" || acpWorkerState !== "running" || state.workerStopped || state.workerRestarting
         }
         waitingFor={startingAgent}
+        agent={agent}
       />
 
       <RejectedPromptsStrip

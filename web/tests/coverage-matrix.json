@@ -3539,6 +3539,14 @@
       "notes": "#4475: notice_timeout_secs is capped at 2147483 so its millisecond delay fits a browser setTimeout, and PromptStrips clamps the delay for older configs above the cap. SessionNoticesStrip.test.tsx covers the boundary: a timeout past the timer limit does not dismiss at once and fires only after the clamped delay."
     },
     {
+      "id": "acp.queued-strip-tooltip",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": ["tests/acp-queued-tooltip.spec.ts", "src/components/acp/QueuedPromptsStrip.test.tsx"],
+      "components": ["web/src/components/acp/PromptStrips.tsx", "web/src/components/acp/StructuredView.tsx"],
+      "reason": "The queued-messages header is a keyboard-reachable Tooltip trigger, not a title, and says the Daemon holds the queue; a strip with an unconfirmed row says it isn't sent yet."
+    },
+    {
       "id": "acp.queue-send-now",
       "kind": "vitest",
       "risk": "medium",
