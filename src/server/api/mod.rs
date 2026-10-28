@@ -502,6 +502,7 @@ mod tests {
             "system.rs",
             include_str!("system.rs"),
             &[
+                "apply_cityhall_bundle",
                 "create_profile",
                 "default_profile",
                 "delete_profile",
@@ -560,6 +561,7 @@ mod tests {
             &[
                 "post_telemetry_seen",
                 "post_telemetry_structured_interaction",
+                "reset_telemetry_id",
                 "set_telemetry_consent",
             ],
         ),
