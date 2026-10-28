@@ -688,6 +688,11 @@ async fn empty_trash(profile: &str) -> Result<()> {
         parts.push(format!("{restored_after_teardown} restored mid-purge"));
     }
     println!("Emptied trash: {} (profile '{profile}').", parts.join(", "));
+    for failure in &outcome.failures {
+        if failure.code == GroupSessionFailureCode::PurgeFailed {
+            eprintln!("  Kept for retry: {} ({})", failure.id, failure.message);
+        }
+    }
     if busy > 0 {
         for failure in &outcome.failures {
             if failure.code == GroupSessionFailureCode::LifecycleBusy {
