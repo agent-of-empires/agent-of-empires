@@ -308,7 +308,9 @@ pub(crate) fn resolve_repo_base_selectors(
 /// per-project layer of `resolve_repo_base_branch` for the launch repo and any
 /// extra repos when building a session.
 pub(crate) fn project_base_branches(profile: &str) -> std::collections::HashMap<String, String> {
-    crate::session::projects::load_merged(profile)
+    use crate::session::projects::{load_global, load_profile};
+    let (global, scoped) = load_global()
+        .and_then(|g| Ok((g, load_profile(profile)?)))
         .unwrap_or_else(|e| {
             // Don't fork worktrees from the wrong base in silence: if the registry can't be read,
             // log it so the missing per-project defaults are explainable instead of mysterious.
@@ -317,18 +319,34 @@ pub(crate) fn project_base_branches(profile: &str) -> std::collections::HashMap<
                 "Failed to load project registry for base-branch defaults; \
                  repos fall back to the global default: {e}"
             );
-            Vec::new()
-        })
-        .into_iter()
-        .filter_map(|p| {
-            let base = p.default_base_branch?;
-            let base = base.trim().to_string();
-            if base.is_empty() {
-                None
-            } else {
-                Some((project_root_key(&p.path), base))
+            Default::default()
+        });
+    merge_base_branches(global, scoped)
+}
+
+/// Per-scope defaults keyed by repo root, profile over global. Within a scope, a registration at
+/// the root itself wins over a linked worktree that collapses to the same root.
+fn merge_base_branches(
+    global: Vec<crate::session::projects::Project>,
+    scoped: Vec<crate::session::projects::Project>,
+) -> std::collections::HashMap<String, String> {
+    let by_root = |projects: Vec<crate::session::projects::Project>| {
+        let mut map = std::collections::HashMap::<String, Option<String>>::new();
+        for p in projects {
+            let key = project_root_key(&p.path);
+            let is_root = crate::session::projects::canonical_key(&p.path) == key;
+            if is_root || !map.contains_key(&key) {
+                let base = p.default_base_branch.map(|b| b.trim().to_string());
+                map.insert(key, base.filter(|b| !b.is_empty()));
             }
-        })
+        }
+        map
+    };
+    let mut merged = by_root(global);
+    merged.extend(by_root(scoped));
+    merged
+        .into_iter()
+        .filter_map(|(k, base)| Some((k, base?)))
         .collect()
 }
 
@@ -2575,6 +2593,38 @@ mod tests {
                 "{}",
                 start.display()
             );
+        }
+    }
+
+    #[test]
+    fn merge_base_branches_prefers_profile_and_root_over_aliases() {
+        use crate::session::projects::{Project, ProjectScope};
+        let (parent, _tip) = init_repo_with_branch("repo", "release");
+        let root = parent.path().join("repo");
+        let wt = parent.path().join("repo-wt");
+        GitWorktree::new(root.clone())
+            .unwrap()
+            .create_worktree("wt-branch", &wt, true, None)
+            .unwrap();
+        let proj = |path: &std::path::Path, base: &str, scope| {
+            let mut p = Project::new("p", path.to_string_lossy(), scope);
+            p.default_base_branch = Some(base.to_string());
+            p
+        };
+        let key = project_root_key(&root.to_string_lossy());
+        let g = ProjectScope::Global;
+        let pr = ProjectScope::Profile;
+
+        // Profile root default beats a global worktree alias, in either insertion order.
+        for global in [
+            vec![proj(&root, "main", g), proj(&wt, "release", g)],
+            vec![proj(&wt, "release", g), proj(&root, "main", g)],
+        ] {
+            let bases = merge_base_branches(global.clone(), vec![proj(&root, "develop", pr)]);
+            assert_eq!(bases.get(&key).map(String::as_str), Some("develop"));
+            // Without a profile entry, the global root wins over the alias.
+            let bases = merge_base_branches(global, vec![]);
+            assert_eq!(bases.get(&key).map(String::as_str), Some("main"));
         }
     }
 
