@@ -1,6 +1,7 @@
-import type { Page } from "@playwright/test";
+import type { Locator, Page } from "@playwright/test";
 import { test, expect } from "./helpers/mockedTest";
 import { devices } from "@playwright/test";
+import { copiedBy } from "./helpers/clipboard";
 import { agentMessageChunk, mockAcpSession, openStructuredSession, stopped } from "./helpers/acpMock";
 
 const WIDE = `| ${Array.from({ length: 24 }, (_, i) => `column-${i}`).join(" | ")} |`;
@@ -32,28 +33,55 @@ async function openTables(page: Page) {
 }
 
 const tableButton = (page: Page, i: number) => page.locator(".acp-table-block").nth(i).getByRole("button");
+/** The reveal class sits on the row around the button, not on the button. */
+const rowOf = (button: Locator) => button.locator("xpath=ancestor::div[contains(@class, 'acp-copy-reveal')][1]");
 
 test.describe("pointer device", () => {
   test.use({ permissions: ["clipboard-read", "clipboard-write"] });
 
-  test("button appears on hover, copies the table without its container prefix, and confirms", async ({ page }) => {
+  test("button appears on hover below the table, copies it without its container prefix, and confirms", async ({
+    page,
+  }) => {
     await openTables(page);
     const quoted = tableButton(page, 0);
     const listed = tableButton(page, 1);
 
-    await expect(quoted).toHaveCSS("opacity", "0");
+    await expect(rowOf(quoted)).toHaveCSS("opacity", "0");
     await page.locator(".acp-table-block").nth(0).hover();
-    await expect(quoted).toHaveCSS("opacity", "1");
+    await expect(rowOf(quoted)).toHaveCSS("opacity", "1");
 
-    await quoted.click();
+    // Below the table box, so it covers no cell.
+    const table = (await page.locator(".acp-table-wrap").nth(0).boundingBox())!;
+    const button = (await quoted.boundingBox())!;
+    expect(button.y).toBeGreaterThanOrEqual(table.y + table.height);
+
+    expect(await copiedBy(page, () => quoted.click())).toBe("| name | count |\n|:-----|------:|\n| alpha | 1 |");
     await expect(page.getByRole("button", { name: "Copied" })).toBeVisible();
-    expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(
-      "| name | count |\n|:-----|------:|\n| alpha | 1 |",
-    );
 
     await page.locator(".acp-table-block").nth(1).hover();
-    await listed.click();
-    expect(await page.evaluate(() => navigator.clipboard.readText())).toBe("| a | b |\n|---|---|\n| 1 | 2 |");
+    expect(await copiedBy(page, () => listed.click())).toBe("| a | b |\n|---|---|\n| 1 | 2 |");
+  });
+
+  test("keyboard focus reveals the row", async ({ page }) => {
+    await openTables(page);
+    const button = tableButton(page, 0);
+    await expect(rowOf(button)).toHaveCSS("opacity", "0");
+    await page.keyboard.press("Tab");
+    await button.focus();
+    await expect(button).toBeFocused();
+    await expect(rowOf(button)).toHaveCSS("opacity", "1");
+  });
+
+  test("the row hides again once the pointer leaves, even though the clicked button keeps focus", async ({ page }) => {
+    await openTables(page);
+    const button = tableButton(page, 0);
+    await page.locator(".acp-table-block").nth(0).hover();
+    await button.click();
+    await expect(page.getByRole("button", { name: "Copied" })).toBeVisible();
+
+    await page.mouse.move(0, 0);
+    await expect(button).toBeFocused();
+    await expect(rowOf(button)).toHaveCSS("opacity", "0");
   });
 
   test("button stays in place while a wide table scrolls", async ({ page }) => {
@@ -83,15 +111,12 @@ test.describe("touch device", () => {
   test("button is visible without hover and copies on tap", async ({ page }) => {
     await openTables(page);
     const button = tableButton(page, 0);
-    await expect(button).toHaveCSS("opacity", "1");
+    await expect(rowOf(button)).toHaveCSS("opacity", "1");
     const bounds = await button.boundingBox();
     expect(bounds).not.toBeNull();
     expect(bounds!.width).toBeGreaterThanOrEqual(32);
     expect(bounds!.height).toBeGreaterThanOrEqual(32);
-    await button.tap();
+    expect(await copiedBy(page, () => button.tap())).toBe("| name | count |\n|:-----|------:|\n| alpha | 1 |");
     await expect(page.getByRole("button", { name: "Copied" })).toBeVisible();
-    expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(
-      "| name | count |\n|:-----|------:|\n| alpha | 1 |",
-    );
   });
 });

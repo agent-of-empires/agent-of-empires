@@ -147,6 +147,7 @@ impl From<NewSessionData> for crate::session::builder::InstanceParams {
             sandbox_image: data.sandbox_image,
             yolo_mode: data.yolo_mode,
             extra_env: data.extra_env,
+            before_start_hook_env: Vec::new(),
             extra_args: data.extra_args,
             command_override: data.command_override,
             extra_repo_paths: data.extra_repo_paths,

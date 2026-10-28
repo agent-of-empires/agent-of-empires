@@ -497,11 +497,7 @@ impl ScopePrefix {
 /// (one attempt, 5 s at most), so call it from `spawn_blocking` in async code.
 pub(crate) fn scope_prefix_for(session_id: &str, profile: &str) -> Option<ScopePrefix> {
     let cap = capability()?;
-    let profile = if profile.is_empty() {
-        crate::session::config::effective_profile("")
-    } else {
-        profile.to_string()
-    };
+    let profile = resolved_profile(profile);
     let namespace = scope_namespace().ok()?;
     let unit = unit_name(session_id, now_ms(), &namespace);
     let mut argv = vec![cap.systemd_run.to_string_lossy().into_owned()];
@@ -515,6 +511,77 @@ pub(crate) fn scope_prefix_for(session_id: &str, profile: &str) -> Option<ScopeP
         argv,
         env_bin: cap.env_bin.to_string_lossy().into_owned(),
     })
+}
+
+/// An empty profile means the effective one.
+fn resolved_profile(profile: &str) -> String {
+    if profile.is_empty() {
+        crate::session::config::effective_profile("")
+    } else {
+        profile.to_string()
+    }
+}
+
+/// The slice `scope_prefix_for` puts a session of `profile` in, or `None`
+/// when scopes are unavailable. Blocking on the first call.
+pub(crate) fn slice_for(profile: &str) -> Option<String> {
+    let cap = capability()?;
+    Some(resolve_slice(
+        &cap.cfg.slice_template,
+        &resolved_profile(profile),
+    ))
+}
+
+/// Whether session scopes are available. Blocking on the first call, like
+/// `scope_prefix_for`.
+pub(crate) fn scopes_available() -> bool {
+    capability().is_some()
+}
+
+fn container_scope_words(
+    systemd_run: &str,
+    env_bin: &str,
+    slice: &str,
+    container: &str,
+    start_ms: u64,
+    unique: &str,
+) -> Vec<String> {
+    let mut words = vec![systemd_run.to_string()];
+    words.extend(
+        [
+            "--user",
+            "--scope",
+            "--quiet",
+            "--collect",
+            "--no-ask-password",
+            "--expand-environment=no",
+        ]
+        .map(String::from),
+    );
+    words.push(format!("--slice={slice}"));
+    words.push(format!(
+        "--unit=aoe-container-{}-{start_ms}-{unique}.scope",
+        escape(container)
+    ));
+    words.push(format!("--description=aoe container {container}"));
+    words.extend(["--", env_bin, "-u", INJECTED_VAR].map(String::from));
+    words
+}
+
+/// The words to put in front of a container runtime command so that the
+/// helpers it forks (pasta) stay in `slice` instead of the caller's cgroup,
+/// or `None` when scopes are unavailable. Blocking on the first call, like
+/// `scope_prefix_for`.
+pub(crate) fn container_scope_prefix(slice: &str, container: &str) -> Option<Vec<String>> {
+    let cap = capability()?;
+    Some(container_scope_words(
+        &cap.systemd_run.to_string_lossy(),
+        &cap.env_bin.to_string_lossy(),
+        slice,
+        container,
+        now_ms(),
+        &uuid::Uuid::new_v4().to_string(),
+    ))
 }
 
 /// Retire only frozen owned units, including scopes created before configuration was disabled.
@@ -1053,6 +1120,36 @@ esac
         let flag = AtomicBool::new(false);
         let fired = (0..5).filter(|_| first_time(&flag)).count();
         assert_eq!(fired, 1);
+    }
+
+    #[test]
+    fn container_scope_words_shape() {
+        assert_eq!(
+            container_scope_words(
+                "/usr/bin/systemd-run",
+                "/usr/bin/env",
+                "background-aoe-main.slice",
+                "aoe-sandbox-ab12",
+                7,
+                "u1"
+            ),
+            [
+                "/usr/bin/systemd-run",
+                "--user",
+                "--scope",
+                "--quiet",
+                "--collect",
+                "--no-ask-password",
+                "--expand-environment=no",
+                "--slice=background-aoe-main.slice",
+                "--unit=aoe-container-aoe_2dsandbox_2dab12-7-u1.scope",
+                "--description=aoe container aoe-sandbox-ab12",
+                "--",
+                "/usr/bin/env",
+                "-u",
+                "INVOCATION_ID",
+            ]
+        );
     }
 
     #[test]

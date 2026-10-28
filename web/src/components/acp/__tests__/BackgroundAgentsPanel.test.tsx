@@ -3,6 +3,9 @@ import { fireEvent, render } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { BackgroundAgent } from "../../../lib/acpTypes";
+import { writeClipboard } from "../../../lib/clipboard";
+
+vi.mock("../../../lib/clipboard", () => ({ writeClipboard: vi.fn().mockResolvedValue(true) }));
 
 // The panel reads the live list from the useAcpSession store; mock it so
 // the test drives the rendering purely from a fixed agent list.
@@ -131,5 +134,20 @@ describe("BackgroundAgentsPanel", () => {
     // Closes on the X button.
     fireEvent.click(getByRole("button", { name: /close/i }));
     expect(() => getByText("the complete final result text")).toThrow();
+  });
+});
+
+describe("BackgroundAgentsPanel copy", () => {
+  it("copies the full prompt and result of an expanded agent", () => {
+    const prompt = "line one\nline two\nline three\nline four\nline five\nline six";
+    agentsMock.mockReturnValue([
+      agent({ status: "completed", endedAt: new Date().toISOString(), prompt, result: "done" }),
+    ]);
+    const { getByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    fireEvent.click(getByRole("button", { name: /Map backend lifecycle/ }));
+    fireEvent.click(getByRole("button", { name: "Copy prompt" }));
+    expect(writeClipboard).toHaveBeenLastCalledWith(prompt);
+    fireEvent.click(getByRole("button", { name: "Copy result" }));
+    expect(writeClipboard).toHaveBeenLastCalledWith("done");
   });
 });

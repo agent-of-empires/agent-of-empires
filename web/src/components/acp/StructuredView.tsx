@@ -236,6 +236,7 @@ function AcpChrome({
               rateLimitAutoResume={view.rateLimitAutoResume}
               rateLimitRetriesExhausted={state.rateLimitRetriesExhausted}
               hasEverOpened={ctx.hasEverOpened}
+              replayedWhileDown={ctx.replayedWhileDown}
               reconnecting={ctx.reconnecting}
               retryCount={ctx.retryCount}
               retryCountdown={ctx.retryCountdown}
