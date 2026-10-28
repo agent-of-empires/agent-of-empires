@@ -32,7 +32,7 @@ export function PushHealthBanner({ hidden = false }: { hidden?: boolean }) {
     <div
       role="alert"
       aria-label="Notifications stopped"
-      className="bg-status-waiting/10 border-b border-status-waiting/30 px-4 py-2 flex items-center justify-center gap-3 text-xs font-mono text-status-waiting animate-fade-in"
+      className="bg-status-waiting/10 border-b border-status-waiting/30 px-4 py-2 flex items-center justify-center gap-3 text-xs font-mono text-text-primary animate-fade-in"
     >
       <span className="w-1.5 h-1.5 rounded-full bg-status-waiting shrink-0" />
       {health === "permission-denied" ? (
@@ -45,7 +45,7 @@ export function PushHealthBanner({ hidden = false }: { hidden?: boolean }) {
             type="button"
             onClick={() => void enable()}
             disabled={busy}
-            className="underline hover:opacity-80 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+            className="underline hover:no-underline cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {busy ? "Enabling..." : "Re-enable"}
           </button>
@@ -58,7 +58,7 @@ export function PushHealthBanner({ hidden = false }: { hidden?: boolean }) {
           setDismissed(health);
         }}
         aria-label="Dismiss notifications notice"
-        className="ml-2 text-text-muted hover:text-text-secondary cursor-pointer text-base leading-none px-1"
+        className="ml-2 text-text-subtle hover:text-text-primary cursor-pointer text-base leading-none px-1"
       >
         &times;
       </button>

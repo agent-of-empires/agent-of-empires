@@ -136,6 +136,52 @@ impl HomeView {
             .connect(self.active_profile.clone().unwrap_or_default());
     }
 
+    /// The Daemon state the footer's R entry and the Connections hub surface. None while
+    /// it is healthy, connecting, applying a change, or serving a City Hall client.
+    pub(in crate::tui) fn daemon_attention(&self) -> Option<crate::tui::dialogs::DaemonAttention> {
+        use crate::tui::dialogs::DaemonAttention;
+        use crate::tui::session_feed::SidebarSource;
+        if self.session_feed.namespace_indeterminate()
+            || !self.pending_indeterminate_queue.is_empty()
+            || self
+                .pending_creation
+                .as_ref()
+                .is_some_and(|pending| pending.outcome_unknown)
+        {
+            return Some(DaemonAttention::OutcomeUnknown);
+        }
+        match self.sidebar_source {
+            SidebarSource::Connecting => None,
+            SidebarSource::Disconnected => Some(DaemonAttention::Offline),
+            SidebarSource::Daemon
+                if self.session_feed.cityhall_mode()
+                    || self.session_feed.any_pending()
+                    || self.pending_namespace_intent.is_some()
+                    || self.pending_creation.is_some()
+                    || self.session_feed.native_interaction_available() =>
+            {
+                None
+            }
+            SidebarSource::Daemon if self.session_feed.mutations_available() => {
+                Some(DaemonAttention::NativeUnavailable)
+            }
+            SidebarSource::Daemon => Some(DaemonAttention::ReadOnly),
+        }
+    }
+
+    /// What the footer used to call "Runtime ready": connected, nothing applying, and native
+    /// interaction granted. The footer no longer says so, so e2e tests read it from a file.
+    #[cfg(feature = "e2e-tests")]
+    pub(in crate::tui) fn runtime_settled(&self) -> bool {
+        self.sidebar_source == crate::tui::session_feed::SidebarSource::Daemon
+            && self.daemon_attention().is_none()
+            && !self.session_feed.cityhall_mode()
+            && !self.session_feed.any_pending()
+            && self.pending_namespace_intent.is_none()
+            && self.pending_creation.is_none()
+            && self.session_feed.native_interaction_available()
+    }
+
     /// Record where daemon-owned sidebar state comes from, logging the
     /// transition so a sidebar stuck on stale structured status is
     /// diagnosable from the log alone. `reason` says why the daemon is not
@@ -147,26 +193,15 @@ impl HomeView {
     ) -> bool {
         use crate::tui::session_feed::SidebarSource;
 
-        let reason = (source == SidebarSource::Disconnected).then(|| {
-            reason
-                .filter(|reason| !reason.is_empty())
-                .unwrap_or("The daemon could not be reached.")
-        });
-        let cached_reason = self
-            .runtime_failure_message
-            .as_deref()
-            .and_then(|message| message.strip_prefix("Runtime unavailable\n\n"))
-            .and_then(|message| {
-                message.strip_suffix("\n\nr: Reconnect / start local runtime\nq: Quit")
-            });
-        if self.sidebar_source == source && reason == cached_reason {
+        // The offline takeover already says the Daemon isn't responding; only a real
+        // reason adds a line.
+        let reason = (source == SidebarSource::Disconnected)
+            .then(|| reason.filter(|reason| !reason.is_empty()))
+            .flatten();
+        if self.sidebar_source == source && reason == self.runtime_failure_reason.as_deref() {
             return false;
         }
-        self.runtime_failure_message = reason.map(|reason| {
-            format!(
-                "Runtime unavailable\n\n{reason}\n\nr: Reconnect / start local runtime\nq: Quit"
-            )
-        });
+        self.runtime_failure_reason = reason.map(str::to_owned);
         self.sidebar_source = source;
         if source == SidebarSource::Daemon {
             self.project_registry_authoritative = true;

@@ -355,6 +355,7 @@ mod tests {
             custom_instruction: None,
             container_workdir: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
         });
         assert!(gates_needed_by_instances(&[sandboxed.clone()]).is_empty());
 

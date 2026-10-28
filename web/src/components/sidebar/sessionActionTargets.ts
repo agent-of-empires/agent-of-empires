@@ -6,6 +6,7 @@ export type SessionAction =
   | "stop"
   | "start"
   | "restartUpdate"
+  | "recreateContainer"
   | "fork"
   | "switchAgent"
   | "switchView"
@@ -19,9 +20,11 @@ const ELIGIBLE: Record<SessionAction, (s: SessionResponse, archived: boolean) =>
   // Archived and trashed sessions must be unarchived or restored before they start (#4116).
   start: (s, archived) => s.status === "Stopped" && !archived && !s.trashed_at,
   restartUpdate: (s) => !!s.update_restart,
+  recreateContainer: (s, archived) =>
+    s.is_sandboxed && !archived && !s.trashed_at && !["Creating", "Deleting"].includes(s.status),
   fork: (s) => isStructured(s) && !!s.acp_session_id && !!s.acp_can_fork,
   switchAgent: isStructured,
-  switchView: (s) => isStructured(s) || !!s.acp_capable,
+  switchView: (s) => isStructured(s) || (!!s.acp_capable && !s.structured_view_off),
   autoName: isStructured,
   summarize: isStructured,
 };
@@ -38,6 +41,7 @@ export function resolveActionTargets(sessions: SessionResponse[], optimistic: Op
     stop: targets("stop"),
     start: targets("start"),
     restartUpdate: targets("restartUpdate"),
+    recreateContainer: targets("recreateContainer"),
     fork: targets("fork"),
     switchAgent: targets("switchAgent"),
     switchView: targets("switchView"),

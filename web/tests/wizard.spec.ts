@@ -49,8 +49,8 @@ test.describe("essentials", () => {
     await expect(group).toHaveValue("backend");
   });
 
-  test("default_new_session_view = terminal selects Terminal view and creates a terminal (#3517)", async ({ page }) => {
-    const created = await startWizard(page, { settings: { acp: { default_new_session_view: "terminal" } } });
+  test("structured_view = terminal selects Terminal view and creates a terminal (#3517)", async ({ page }) => {
+    const created = await startWizard(page, { settings: { acp: { structured_view: "terminal" } } });
     await expect(wizard(page).getByRole("radio", { name: "Structured view" })).toHaveAttribute("aria-checked", "false");
     await launch(page);
     await expect.poll(() => created[0]?.view).toBe("terminal");

@@ -24,14 +24,13 @@ mod pane;
 pub mod passkeys;
 pub(crate) mod peer;
 pub mod plugin_status;
+pub mod principal;
 pub mod push;
 pub mod push_send;
 pub mod rate_limit;
 pub(crate) mod reload;
 pub(crate) mod router;
 pub(crate) mod runtime;
-#[cfg(target_os = "linux")]
-pub(crate) mod runtime_uds;
 pub(crate) mod runtime_ws;
 mod secure_store;
 pub(crate) mod serve_snapshot;
@@ -59,7 +58,6 @@ pub mod tunnel;
 /// `crate::server::` so existing supervisor/WS call sites keep resolving without churn.
 pub use crate::acp::protocol::AcpBroadcastFrame;
 pub(crate) use access::{is_untrusted_ip_literal, is_wildcard_bind, norm_host};
-pub(crate) use acp_events::derive_acp_status;
 #[cfg(feature = "web")]
 pub use assets::web_build_id;
 

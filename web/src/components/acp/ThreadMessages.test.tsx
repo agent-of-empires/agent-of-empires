@@ -332,10 +332,9 @@ describe("AssistantMessage tool output media", () => {
       ],
       false,
     );
-    const { container } = render(<Harness messages={messages} />);
-    const header = container.querySelector("button");
-    expect(header).not.toBeNull();
-    fireEvent.click(header!);
+    const { container, getByRole } = render(<Harness messages={messages} />);
+    // The card's own header, not the first button of the thread (the prompt has a copy button).
+    fireEvent.click(getByRole("button", { name: /out\.sh/ }));
     expect(container.querySelector('[data-testid="string-diff"]')).not.toBeNull();
   });
 
@@ -361,9 +360,10 @@ describe("AssistantMessage tool output media", () => {
       ],
       false,
     );
-    const { container } = render(<Harness messages={messages} />);
+    const { container, queryByRole } = render(<Harness messages={messages} />);
     expect(container.textContent).toContain("/tmp/x");
-    expect(container.querySelector("button")).toBeNull();
+    // No diff to show, so the card has no expandable header.
+    expect(queryByRole("button", { name: /\/tmp\/x/ })).toBeNull();
   });
 
   it.each([
@@ -434,5 +434,142 @@ describe("AssistantMessage tool output media", () => {
     expect(screen.getByTestId("image-lightbox").querySelector("img")?.getAttribute("src")).toBe(
       "data:image/png;base64,AAAA",
     );
+  });
+});
+
+describe("AssistantMessage copy buttons", () => {
+  const at = "2026-05-12T00:00:00Z";
+  const prompt: ActivityRow = { id: "u1", kind: "user_prompt", text: "go", at };
+  const reply = (id: string, text: string): ActivityRow => ({ id, kind: "message", text, at });
+  const read: ActivityRow[] = [
+    {
+      id: "start-t1",
+      kind: "tool_start",
+      text: "Read",
+      at,
+      toolCallId: "t1",
+      tool: { id: "t1", name: "Read", kind: "read", args_preview: '{"path":"a.rs"}', started_at: at },
+    },
+    { id: "done-t1", kind: "tool_complete", text: "fn a() {}", at, toolCallId: "t1" },
+  ];
+  const thread = (rows: ActivityRow[], busy = false) => activityToThreadMessages([prompt, ...rows], busy);
+
+  beforeEach(() => {
+    vi.mocked(writeClipboard).mockClear();
+  });
+
+  it("copies each text part's own markdown from its inner button", () => {
+    const { getAllByRole, getByRole } = render(
+      <Harness messages={thread([reply("m1", "**one**"), ...read, reply("m2", "two")])} />,
+    );
+    const buttons = getAllByRole("button", { name: "Copy text as markdown" });
+    expect(buttons).toHaveLength(2);
+    fireEvent.click(buttons[0]!);
+    expect(writeClipboard).toHaveBeenLastCalledWith("**one**");
+    fireEvent.click(buttons[1]!);
+    expect(writeClipboard).toHaveBeenLastCalledWith("two");
+    // The last part has no row of its own: its button sits in the message footer.
+    expect(buttons[0]!.closest(".group")!.querySelectorAll(".acp-copy-reveal")).toHaveLength(2);
+    const footer = buttons[1]!.closest(".acp-copy-reveal");
+    expect(footer?.contains(getByRole("button", { name: "Copy message as markdown" }))).toBe(true);
+  });
+
+  it("copies a write's carried diff with its tool call, though its text result is empty", () => {
+    const path = "/tmp/out.sh";
+    const messages = activityToThreadMessages(
+      [
+        prompt,
+        {
+          id: "start-w1",
+          kind: "tool_start",
+          text: `Write ${path}`,
+          at,
+          toolCallId: "w1",
+          tool: {
+            id: "w1",
+            name: `Write ${path}`,
+            kind: "edit",
+            args_preview: JSON.stringify({ file_path: path }),
+            started_at: at,
+            diffs: [{ path, old_text: null, new_text: "echo hi\n", created_at: at }],
+          },
+        },
+        { id: "done-w1", kind: "tool_complete", text: "", at, toolCallId: "w1" },
+      ],
+      false,
+    );
+    const { getByRole } = render(<Harness messages={messages} />);
+    fireEvent.click(getByRole("button", { name: "More copy options" }));
+    fireEvent.click(getByRole("menuitem", { name: "Copy with tool calls" }));
+    const copied = vi.mocked(writeClipboard).mock.lastCall?.[0] ?? "";
+    expect(copied).toContain(`**Write ${path}**`);
+    expect(copied).toContain(`\`\`\`diff\n--- /dev/null\n+++ ${path}\n`);
+    expect(copied).toContain("\n+echo hi\n");
+    expect(copied).not.toContain("_aoe_diffs");
+  });
+
+  it("copies the text parts from the outer button, and tool calls too from its menu", () => {
+    const { getByRole } = render(<Harness messages={thread([reply("m1", "before"), ...read, reply("m2", "after")])} />);
+    fireEvent.click(getByRole("button", { name: "Copy message as markdown" }));
+    expect(writeClipboard).toHaveBeenLastCalledWith("before\n\nafter");
+
+    fireEvent.click(getByRole("button", { name: "More copy options" }));
+    fireEvent.click(getByRole("menuitem", { name: "Copy with tool calls" }));
+    const full = vi.mocked(writeClipboard).mock.lastCall?.[0] ?? "";
+    expect(full.startsWith("before\n\n")).toBe(true);
+    expect(full.endsWith("\n\nafter")).toBe(true);
+    expect(full).toContain("**Read**");
+    expect(full).toContain('"path": "a.rs"');
+    expect(full).toContain("fn a() {}");
+  });
+
+  it("offers one button and no menu for a lone text part, since the two would copy the same thing", () => {
+    const { getByRole, queryByRole } = render(<Harness messages={thread([reply("m1", "plain")])} />);
+    expect(getByRole("button", { name: "Copy message as markdown" })).toBeTruthy();
+    expect(queryByRole("button", { name: "More copy options" })).toBeNull();
+    expect(queryByRole("button", { name: "Copy text as markdown" })).toBeNull();
+  });
+
+  it("copies what has arrived while the message runs, per part once a tool call ends the first", () => {
+    const { getByRole, getAllByRole, queryByRole, rerender } = render(
+      <Harness messages={thread([reply("m1", "half")], true)} />,
+    );
+    expect(queryByRole("button", { name: "Copy text as markdown" })).toBeNull();
+    fireEvent.click(getByRole("button", { name: "Copy message as markdown" }));
+    expect(writeClipboard).toHaveBeenLastCalledWith("half");
+
+    rerender(<Harness messages={thread([reply("m1", "half"), ...read, reply("m2", "more")], true)} />);
+    const inner = getAllByRole("button", { name: "Copy text as markdown" });
+    expect(inner).toHaveLength(2);
+    fireEvent.click(inner[1]!);
+    expect(writeClipboard).toHaveBeenLastCalledWith("more");
+  });
+
+  it("copies the text of a prompt that also carries an attachment, from under the shared bubble", () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, blob: async () => new Blob(["x"]) }));
+    const { getByRole, getByTestId } = render(
+      <Harness
+        messages={[
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "look at **this**" },
+              { type: "image", image: "/api/sessions/s1/acp/attachments/att1" },
+            ],
+          },
+        ]}
+      />,
+    );
+    expect(getByTestId("user-message-bubble")).toBeTruthy();
+    fireEvent.click(getByRole("button", { name: "Copy prompt" }));
+    expect(writeClipboard).toHaveBeenLastCalledWith("look at **this**");
+  });
+
+  it("copies a user prompt's raw markdown from the footer under its bubble", () => {
+    const { getByRole } = render(
+      <Harness messages={[{ role: "user", content: [{ type: "text", text: "do **this**\nand that" }] }]} />,
+    );
+    fireEvent.click(getByRole("button", { name: "Copy prompt" }));
+    expect(writeClipboard).toHaveBeenLastCalledWith("do **this**\nand that");
   });
 });

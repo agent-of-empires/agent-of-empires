@@ -326,6 +326,7 @@ pub async fn acp_replay(
                 seq,
                 event: Arc::new(event),
                 worker_generation: None,
+                sidebar_status: None,
             })
             .collect();
         (frames, None)

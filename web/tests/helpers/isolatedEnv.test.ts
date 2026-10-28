@@ -34,6 +34,7 @@ const NON_SUFFIX_HOST_STATE: Record<string, string> = {
   AOE_DASHBOARD_URL: "https://host.invalid/dashboard",
   AOE_NO_AUTOSTART: "1",
   AOE_E2E_INPUT_BARRIER: `${HOST}/input-barrier`,
+  AOE_E2E_RUNTIME_STATE: `${HOST}/runtime-state`,
   AOE_E2E_PARTIAL_FRAME_FILE: `${HOST}/partial-frame`,
   AOE_E2E_PROMPT_COMPLETED_FILE: `${HOST}/prompt-completed`,
   AOE_E2E_STORAGE_LOCK_CONTENDED: `${HOST}/lock-contended`,

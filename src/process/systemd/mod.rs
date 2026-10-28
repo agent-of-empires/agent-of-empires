@@ -497,11 +497,7 @@ impl ScopePrefix {
 /// (one attempt, 5 s at most), so call it from `spawn_blocking` in async code.
 pub(crate) fn scope_prefix_for(session_id: &str, profile: &str) -> Option<ScopePrefix> {
     let cap = capability()?;
-    let profile = if profile.is_empty() {
-        crate::session::config::effective_profile("")
-    } else {
-        profile.to_string()
-    };
+    let profile = resolved_profile(profile);
     let namespace = scope_namespace().ok()?;
     let unit = unit_name(session_id, now_ms(), &namespace);
     let mut argv = vec![cap.systemd_run.to_string_lossy().into_owned()];
@@ -515,6 +511,77 @@ pub(crate) fn scope_prefix_for(session_id: &str, profile: &str) -> Option<ScopeP
         argv,
         env_bin: cap.env_bin.to_string_lossy().into_owned(),
     })
+}
+
+/// An empty profile means the effective one.
+fn resolved_profile(profile: &str) -> String {
+    if profile.is_empty() {
+        crate::session::config::effective_profile("")
+    } else {
+        profile.to_string()
+    }
+}
+
+/// The slice `scope_prefix_for` puts a session of `profile` in, or `None`
+/// when scopes are unavailable. Blocking on the first call.
+pub(crate) fn slice_for(profile: &str) -> Option<String> {
+    let cap = capability()?;
+    Some(resolve_slice(
+        &cap.cfg.slice_template,
+        &resolved_profile(profile),
+    ))
+}
+
+/// Whether session scopes are available. Blocking on the first call, like
+/// `scope_prefix_for`.
+pub(crate) fn scopes_available() -> bool {
+    capability().is_some()
+}
+
+fn container_scope_words(
+    systemd_run: &str,
+    env_bin: &str,
+    slice: &str,
+    container: &str,
+    start_ms: u64,
+    unique: &str,
+) -> Vec<String> {
+    let mut words = vec![systemd_run.to_string()];
+    words.extend(
+        [
+            "--user",
+            "--scope",
+            "--quiet",
+            "--collect",
+            "--no-ask-password",
+            "--expand-environment=no",
+        ]
+        .map(String::from),
+    );
+    words.push(format!("--slice={slice}"));
+    words.push(format!(
+        "--unit=aoe-container-{}-{start_ms}-{unique}.scope",
+        escape(container)
+    ));
+    words.push(format!("--description=aoe container {container}"));
+    words.extend(["--", env_bin, "-u", INJECTED_VAR].map(String::from));
+    words
+}
+
+/// The words to put in front of a container runtime command so that the
+/// helpers it forks (pasta) stay in `slice` instead of the caller's cgroup,
+/// or `None` when scopes are unavailable. Blocking on the first call, like
+/// `scope_prefix_for`.
+pub(crate) fn container_scope_prefix(slice: &str, container: &str) -> Option<Vec<String>> {
+    let cap = capability()?;
+    Some(container_scope_words(
+        &cap.systemd_run.to_string_lossy(),
+        &cap.env_bin.to_string_lossy(),
+        slice,
+        container,
+        now_ms(),
+        &uuid::Uuid::new_v4().to_string(),
+    ))
 }
 
 /// Retire only frozen owned units, including scopes created before configuration was disabled.
@@ -588,9 +655,6 @@ pub(crate) fn legacy_unknown_scope_absent(
     );
     #[cfg(target_os = "linux")]
     {
-        if !user_manager_runtime_present() {
-            return Ok(true);
-        }
         super::linux::legacy_scope_inventory_clear(&format!("{}-", escaped_id(session_id)), known)
     }
     #[cfg(target_os = "macos")]
@@ -604,23 +668,10 @@ pub(crate) fn legacy_unknown_scope_absent(
     }
 }
 
-/// Without a user manager's runtime sockets, `systemd-run --user` never
-/// created a scope, so earlier releases left none to retire.
-#[cfg(target_os = "linux")]
-fn user_manager_runtime_present() -> bool {
-    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", nix::unistd::geteuid().as_raw())));
-    user_manager_reachable(Some(&runtime_dir), None)
-}
-
 /// Units named as releases before scope custody named this session's scopes.
 fn legacy_scope_units(session_id: &str) -> anyhow::Result<Vec<String>> {
     #[cfg(target_os = "linux")]
     {
-        if !user_manager_runtime_present() {
-            return Ok(Vec::new());
-        }
         let prefix = format!("{}-", escaped_id(session_id));
         Ok(super::linux::legacy_scope_unit_names(&prefix)?
             .into_iter()
@@ -712,6 +763,32 @@ pub(crate) fn retire_scope(
     );
     anyhow::ensure!(proven_empty, "captured scope is not empty after stop");
     Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod legacy_runtime_fixture {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static ROOT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) struct Installed(Option<PathBuf>);
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            ROOT.with(|root| *root.borrow_mut() = self.0.take());
+        }
+    }
+
+    pub(crate) fn install(root: &Path) -> Installed {
+        Installed(ROOT.with(|slot| slot.replace(Some(root.to_owned()))))
+    }
+
+    pub(crate) fn root() -> Option<PathBuf> {
+        ROOT.with(|root| root.borrow().clone())
+    }
 }
 
 /// Observes this thread's `release` calls, so tests can check when one runs.
@@ -1043,6 +1120,36 @@ esac
         let flag = AtomicBool::new(false);
         let fired = (0..5).filter(|_| first_time(&flag)).count();
         assert_eq!(fired, 1);
+    }
+
+    #[test]
+    fn container_scope_words_shape() {
+        assert_eq!(
+            container_scope_words(
+                "/usr/bin/systemd-run",
+                "/usr/bin/env",
+                "background-aoe-main.slice",
+                "aoe-sandbox-ab12",
+                7,
+                "u1"
+            ),
+            [
+                "/usr/bin/systemd-run",
+                "--user",
+                "--scope",
+                "--quiet",
+                "--collect",
+                "--no-ask-password",
+                "--expand-environment=no",
+                "--slice=background-aoe-main.slice",
+                "--unit=aoe-container-aoe_2dsandbox_2dab12-7-u1.scope",
+                "--description=aoe container aoe-sandbox-ab12",
+                "--",
+                "/usr/bin/env",
+                "-u",
+                "INVOCATION_ID",
+            ]
+        );
     }
 
     #[test]

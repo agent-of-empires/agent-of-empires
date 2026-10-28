@@ -104,7 +104,7 @@ Capabilities depend on channels the adapter advertises; unavailable mode, slash-
 
 ## Quickstart
 
-In the web dashboard, create a session and choose an ACP-capable agent; **Structured** defaults on. The CLI and TUI default to terminal view unless configured otherwise. In the TUI, enable the offered **Structured** field; from the CLI:
+In the web dashboard or TUI, create a session and choose an ACP-capable agent; **Structured** defaults on. Set `acp.structured_view` to `terminal` to preselect terminal view, or `off` to hide the option. The CLI defaults to terminal view; opt in with:
 
 ```bash
 aoe acp doctor
@@ -137,8 +137,8 @@ It exits 1 if Node is missing, 2 if some agents are unreachable, else 0. Pass `-
 
 ## Choosing the view per session
 
-- **Web wizard:** defaults to the structured view (set [`acp.default_new_session_view`](guides/configuration.md) to change it); pick **Terminal** in the **View** row to get the terminal view.
-- **CLI / TUI:** default to the terminal view. From the CLI, opt in with `--structured-view` or `--agent`; in the TUI new-session dialog, toggle the **Structured** field (shown for ACP-capable tools).
+- **Web wizard and TUI dialog:** default to the structured view; set [`acp.structured_view`](guides/configuration.md) to `terminal` to preselect the terminal, or `off` to hide the option. Pick **Terminal** in the wizard's **View** row, or turn off the **Structured** field in the TUI (shown for ACP-capable tools), to get the terminal view.
+- **CLI:** defaults to the terminal view; opt in with `--structured-view` or `--agent`.
 - Either way, an existing active session can switch views: the web sidebar's right-click menu (**Switch to terminal** / **Switch to structured view**) or the TUI's right-click context menu (requires a healthy runtime; archived, trashed, and still-creating rows are excluded until they leave that state). Both surfaces confirm first. The worktree, open files, and commits are always preserved. For a **claude** session, the conversation is kept in both directions only when AoE can resolve a shared native store. A terminal switch whose store cannot be resolved, or which the structured worker does not share, is refused with HTTP 409 and `set-session-id --store` recovery guidance. Every other agent starts fresh on the target surface.
 
 If the agent cannot resume a prior conversation, the transcript reports a context reset before assigning a fresh conversation. Recorded terminal context and an explicitly selected conversation count as prior context. Reattaching to the same live conversation does not add a reset.
@@ -200,7 +200,7 @@ The remote picker uses bearer authentication only. Credentials require HTTPS out
 
 With no explicit remote or TCP endpoint, native clients use the local owner-verified Unix API and need neither credential variable. The kernel peer identity authorizes the connection, including when the dashboard runs with `--behind-proxy`. This is a same-OS-user trust boundary, not daemon-instance authentication; namespace and tmux checks establish runtime consistency. See the [native transport trust model](api.md#authentication).
 
-For runtime reads and ACP requests to a daemon running `--auth=passphrase`, use `AOE_DAEMON_PASSPHRASE` instead of a bearer token. These clients share the `/api/login` handshake, device binding, and persisted session cache. Login secrets never follow redirects; loopback login bypasses environment proxies. ACP TCP discovery can also read the saved `serve.passphrase` file. A revoked cached session triggers a fresh login; failed authentication never substitutes local rows. TCP loopback callers remain a separate authentication path; behind a proxy, the passphrase wall applies to them too.
+For runtime reads and ACP requests to a daemon running `--auth=passphrase`, use `AOE_DAEMON_PASSPHRASE` instead of a bearer token. These clients share the `/api/login` handshake, device binding, and persisted session cache. Login secrets never follow redirects; loopback login bypasses environment proxies. ACP TCP discovery can also read the saved `serve.passphrase` file. A revoked cached session triggers a fresh login; failed authentication never substitutes local rows. TCP loopback clients must authenticate and step up for sensitive writes, with or without a proxy. See [dashboard authentication](guides/web-dashboard.md#authentication).
 
 ## Headless CLI verbs
 

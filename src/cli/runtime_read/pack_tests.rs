@@ -238,7 +238,6 @@ async fn all_recorded_exchanges_preserve_the_cli_answers() {
             4,
             Some("unauthorized"),
         ),
-        ("uds-list-nominal", &["aoe", "list"], 0, None),
         (
             "http-loopback-default-missing",
             &["aoe", "status"],
@@ -247,10 +246,6 @@ async fn all_recorded_exchanges_preserve_the_cli_answers() {
         ),
     ];
     for &(name, argv, exit, code) in cases {
-        #[cfg(not(target_os = "linux"))]
-        if name == "uds-list-nominal" {
-            continue;
-        }
         let fixture = pack::fixture(name);
         let cli = Cli::try_parse_from(argv).expect("recorded argv");
         let command = super::classify(cli.command.as_ref()).expect("scoped read");
@@ -271,19 +266,6 @@ async fn all_recorded_exchanges_preserve_the_cli_answers() {
         } else {
             let frames = pack::application_frames(fixture.wire);
             let expected = super::ExpectedPeer::Remote;
-            #[cfg(target_os = "linux")]
-            let expected = if name == "uds-list-nominal" {
-                let hello = parse_hello(frames[0].as_bytes()).unwrap();
-                super::ExpectedPeer::Local(super::uds::UdsIdentity {
-                    namespace: hello.namespace,
-                    prebind_instance_id: hello.prebind_instance_id,
-                    runtime_instance_id: hello.runtime_instance_id,
-                    runtime_epoch: hello.runtime_epoch,
-                    owner_uid: 501,
-                })
-            } else {
-                expected
-            };
             let (client, peer) = tokio::io::duplex(64 * 1024);
             let server = tokio::spawn(async move {
                 let mut socket =

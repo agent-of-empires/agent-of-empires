@@ -1446,6 +1446,25 @@ fn cli_add_effort_is_stored_and_refusals_provision_nothing() {
     }
 }
 
+/// An explicit `--agent` whose relative adapter is missing is refused after the scratch dir
+/// is provisioned, so the refusal must remove it.
+#[test]
+#[parallel]
+fn cli_add_missing_relative_adapter_leaves_no_scratch_dir() {
+    let h = TuiTestHarness::new("cli_add_missing_adapter");
+    h.append_config("[session.agent_acp_cmd]\nfake = \"./missing-acp\"");
+
+    let stderr = h.run_cli_err(&["add", "--scratch", "-t", "Refused", "--agent", "fake"]);
+    assert!(stderr.contains("is not installed"), "{stderr}");
+
+    let scratch_root = app_dir_in(h.home_path()).join("scratch");
+    assert_eq!(
+        std::fs::read_dir(&scratch_root).map_or(0, Iterator::count),
+        0,
+        "the refused add left its scratch dir behind"
+    );
+}
+
 /// #1051: `aoe ps --json` is fail-soft on an empty profile with no tmux
 /// server: an empty array and exit 0, never a failed substrate probe.
 #[test]
@@ -1520,10 +1539,6 @@ fn cli_send_waits_for_slow_boot_before_typing() {
     });
 }
 
-/// #3350 and #3415: the lifecycle state a scripted consumer reads from
-/// `aoe list --json` and `aoe session show --json`. Snooze keeps a row live,
-/// trashed outranks archived, `archived_at` survives the trash, and an empty
-/// filtered listing is still `[]` rather than the human line.
 #[test]
 #[parallel]
 fn cli_list_and_show_expose_lifecycle_state() {
@@ -1531,6 +1546,17 @@ fn cli_list_and_show_expose_lifecycle_state() {
     let project = h.project_path();
     h.run_cli_ok(&["add", project.to_str().unwrap(), "-t", "State Probe"]);
     let show = |h: &TuiTestHarness| json_out(h, &["session", "show", "State Probe", "--json"]);
+    // #4467: local writes return before Daemon adoption.
+    let adopted = |args: &[&str], ready: fn(&Value) -> bool| {
+        wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
+            let value = json_out(&h, args);
+            if ready(&value) {
+                Ok(value)
+            } else {
+                Err(format!("Daemon has not adopted {args:?}: {value}"))
+            }
+        })
+    };
 
     let live = json_out(&h, &["list", "--json", "--state=live"]);
     assert_eq!(live[0]["state"], "live");
@@ -1542,19 +1568,30 @@ fn cli_list_and_show_expose_lifecycle_state() {
     assert!(shown.get("pinned_at").is_none());
 
     h.run_cli_ok(&["session", "snooze", "State Probe", "--minutes", "5"]);
-    let snoozed = json_out(&h, &["list", "--json"]);
+    let snoozed = adopted(&["list", "--json"], |rows| {
+        rows[0]["title"] == "State Probe"
+            && rows[0]["state"] == "live"
+            && rows[0]["snoozed_until"].is_string()
+    });
     assert_eq!(snoozed[0]["state"], "live");
     assert!(snoozed[0]["snoozed_until"].is_string());
-    assert!(show(&h)["snoozed_until"].is_string());
+    let snoozed = adopted(&["session", "show", "State Probe", "--json"], |row| {
+        row["snoozed_until"].is_string()
+    });
+    assert!(snoozed["snoozed_until"].is_string());
 
     h.run_cli_ok(&["session", "archive", "State Probe"]);
-    let archived = show(&h);
+    let archived = adopted(&["session", "show", "State Probe", "--json"], |row| {
+        row["state"] == "archived" && row["archived_at"].is_string()
+    });
     assert_eq!(archived["state"], "archived");
     assert!(archived["archived_at"].is_string());
     assert!(archived.get("trashed_at").is_none());
 
     h.run_cli_ok(&["rm", "State Probe"]);
-    let trashed = show(&h);
+    let trashed = adopted(&["session", "show", "State Probe", "--json"], |row| {
+        row["state"] == "trashed" && row["trashed_at"].is_string() && row["archived_at"].is_string()
+    });
     assert_eq!(
         trashed["state"], "trashed",
         "trashed outranks archived, and archived_at survives the trash"
