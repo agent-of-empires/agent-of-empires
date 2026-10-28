@@ -94,12 +94,13 @@ pub(crate) use instance::{
 pub use instance::{
     is_valid_session_color, AuxiliaryObservation, AuxiliaryTarget, ConversationBinding,
     ConversationProvenance, DetectionState, EnsureReadyError, EnsureReadyOutcome, ExecutionBinding,
-    ExecutionLocation, Instance, LaunchSidOutcome, LegacyToolAdoption, LegacyToolIdentity,
-    LegacyToolObservation, LifecycleOperation, LifecycleReservation, LifecycleReservationError,
-    ManagedResumeCause, PaneObservation, PanePresence, PendingInitialTurn, PluginCreateIdempotency,
-    PollerStart, SandboxInfo, SessionBucket, SessionGone, StartBlocked, StartOutcome, Status,
-    TerminalInfo, TmuxServerIdentity, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
-    SESSION_COLORS, TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR,
+    ExecutionLocation, Instance, LaunchIndeterminateCause, LaunchSidOutcome, LegacyToolAdoption,
+    LegacyToolIdentity, LegacyToolObservation, LifecycleOperation, LifecycleReservation,
+    LifecycleReservationError, ManagedResumeCause, PaneObservation, PanePresence,
+    PendingInitialTurn, PluginCreateIdempotency, PollerStart, SandboxInfo, SessionBucket,
+    SessionGone, StartBlocked, StartOutcome, Status, TerminalInfo, TmuxServerIdentity, View,
+    WorkspaceInfo, WorkspaceRepo, WorktreeInfo, SESSION_COLORS, TMUX_SERVER_UNREACHABLE_ERROR,
+    TMUX_SESSION_GONE_ERROR,
 };
 pub(crate) use instance::{
     ConversationState, LaunchReservation, ManagedResumeRefused, ResumeAttemptPolicy,

@@ -533,6 +533,14 @@ structured sessions). The receipt cursor is carried in `aoe-runtime-epoch` and
 attach only after applying a snapshot at or beyond that receipt in the same
 epoch, with matching lifecycle generation, profile, and live terminal identity.
 
+A terminal resume or fresh-pinned readiness probe can return HTTP `409` with
+`aoe-error-code: launch_indeterminate` and a finite `cause`: `command_timed_out`,
+`observation_failed`, `stabilization_expired`, or `ownership_unproven`. This is
+not a ready target or a confirmed Agent exit. The response retains a mutation
+receipt when launch state was committed; no wake message or pending send is
+delivered. See [Native Session Resume](guides/session-resume.md#pinning-or-resetting-a-conversation)
+for preservation and inspection guidance.
+
 ## POST /api/sessions/{id}/send
 
 Type a message into the agent and press Enter, the same way the TUI's

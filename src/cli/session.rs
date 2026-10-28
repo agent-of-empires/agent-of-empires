@@ -1214,7 +1214,12 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
             let title = inst.title.clone();
             let res = tokio::task::spawn_blocking(move || {
                 let result = inst.restart_with_size(size);
-                if result.is_ok() {
+                if matches!(
+                    result,
+                    Ok(StartOutcome::Fresh
+                        | StartOutcome::Resumed
+                        | StartOutcome::FreshAfterFailedResume { .. })
+                ) {
                     let file_watch = crate::file_watch::FileWatchService::noop();
                     crate::session::sync::capture_launched_session_id_blocking(
                         &mut inst,
@@ -1252,7 +1257,9 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
             }
         }
         let id = inst_opt.as_ref().map(|i| i.id.clone()).unwrap_or_default();
-        if let Some(inst) = inst_opt {
+        if let Some(inst) =
+            inst_opt.filter(|_| !matches!(&result, Ok(StartOutcome::Indeterminate { .. })))
+        {
             restarted.push(inst);
         }
         match result {
@@ -1260,6 +1267,9 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
                 title,
                 format!("resume failed for sid {sid}; preserved for explicit retry"),
             )),
+            Ok(StartOutcome::Indeterminate { cause }) => {
+                failed.push((title, cause.message().to_owned()))
+            }
             Ok(StartOutcome::FreshAfterFailedResume { sid }) => {
                 fresh_after_failed_resume.push((title.clone(), sid));
                 succeeded.push((id, title));
@@ -1390,6 +1400,9 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         false,
         crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting,
     )?;
+    if let StartOutcome::Indeterminate { cause } = outcome {
+        bail!("{}", cause.message());
+    }
     let title = working.title.clone();
     let session_id = working.id.clone();
     let tool = working.tool.clone();
@@ -1399,7 +1412,14 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         .unwrap_or_else(|_| "wake up: pick up what you were doing".to_string());
 
     let mut wake_succeeded = false;
-    if !wake_msg.is_empty() && !matches!(outcome, StartOutcome::ResumeFailed { .. }) {
+    if !wake_msg.is_empty()
+        && matches!(
+            outcome,
+            StartOutcome::Fresh
+                | StartOutcome::Resumed
+                | StartOutcome::FreshAfterFailedResume { .. }
+        )
+    {
         let tmux_session = crate::tmux::Session::new(&session_id, &title)?;
         tmux_session.wait_until_ready(
             std::time::Duration::from_secs(5),
@@ -1450,6 +1470,7 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         StartOutcome::ResumeFailed { sid } => {
             bail!("Resume failed for sid {sid}; preserved for explicit retry");
         }
+        StartOutcome::Indeterminate { cause } => bail!("{}", cause.message()),
         StartOutcome::FreshAfterFailedResume { sid } => {
             println!(
                 "Restarted session: {} (started fresh after a prior resume failed for sid {}; the old conversation remains in the agent's history)",
