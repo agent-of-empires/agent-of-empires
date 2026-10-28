@@ -2541,6 +2541,11 @@ export async function summarizeSession(id: string): Promise<{ ok: boolean; messa
   }
 }
 
+/** Restarts a sandboxed session on a new container from the current local image. */
+export async function recreateSessionContainer(id: string): Promise<{ ok: boolean; message?: string }> {
+  return okWithMessage(`/api/sessions/${encodeURIComponent(id)}/recreate-container`, { method: "POST" });
+}
+
 /** The server re-checks eligibility; a 409 means the session got busy or is no longer out of date. */
 export async function restartSessionForUpdate(id: string): Promise<{ ok: boolean; message?: string }> {
   try {

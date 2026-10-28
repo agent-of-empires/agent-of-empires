@@ -27,6 +27,9 @@ pub enum GitError {
     #[error("Git clone failed: {0}")]
     CloneFailed(String),
 
+    #[error("Invalid worktree path template: {0}")]
+    InvalidTemplate(String),
+
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
 }

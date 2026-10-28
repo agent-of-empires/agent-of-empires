@@ -764,6 +764,7 @@ pub async fn create_session(
         body.command_override = String::new();
         body.extra_args = String::new();
         body.extra_env = Vec::new();
+        body.hook_env = Vec::new();
         body.yolo_mode = false;
         body.worktree_enabled = false;
         body.worktree_branch = None;
@@ -830,6 +831,14 @@ pub async fn create_session(
             StatusCode::BAD_REQUEST,
             "validation_failed",
             "Cannot combine scratch with path",
+        );
+    }
+
+    if !body.hook_env.is_empty() && !body.sandbox {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "hook_env requires sandbox; host_hooks.before_start only runs for sandboxed sessions",
         );
     }
 
@@ -1151,6 +1160,7 @@ pub async fn create_session(
         sandbox_image: body.sandbox_image,
         yolo_mode: body.yolo_mode,
         extra_env: body.extra_env,
+        before_start_hook_env: body.hook_env,
         extra_args: body.extra_args,
         command_override: body.command_override,
         extra_repo_paths: body.extra_repo_paths,
@@ -1386,6 +1396,7 @@ pub(super) fn public_create_session_error(e: &anyhow::Error) -> String {
             GitError::WorktreeAlreadyExists(_)
             | GitError::BranchAlreadyCheckedOut(_)
             | GitError::BranchNotFound(_)
+            | GitError::InvalidTemplate(_)
             | GitError::NotAGitRepo => return git_err.to_string(),
             // Raw command output / libgit2 / IO: not safe to expose.
             GitError::WorktreeCommandFailed(_)
