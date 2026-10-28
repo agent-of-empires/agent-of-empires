@@ -180,7 +180,9 @@ fn build_custom_agent_infos(
     entries
 }
 
-pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentInfo>> {
+pub async fn list_agents(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<AgentInfo>>, axum::response::Response> {
     let _namespace = state.profile_namespace.read().await;
     let profile = state.served_profile().to_string();
     let result = tokio::task::spawn_blocking(move || {
@@ -236,11 +238,16 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
         agents
     })
     .await
-    .unwrap_or_else(|e| {
+    // An empty list would read as "no agents", so the client retries instead.
+    .map_err(|e| {
         tracing::error!("list_agents task failed: {e}");
-        Vec::new()
-    });
-    Json(result)
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "Couldn't list the agents.",
+        )
+    })?;
+    Ok(Json(result))
 }
 
 // --- Settings ---
@@ -3482,7 +3489,9 @@ mod tests {
         })
         .unwrap();
         let state = crate::server::test_support::build_test_app_state(Vec::new());
-        let Json(agents) = list_agents(State(state)).await;
+        let Ok(Json(agents)) = list_agents(State(state)).await else {
+            panic!("list_agents failed");
+        };
         for (name, installed) in [("on-path", true), ("missing", false), ("terminal", false)] {
             let agent = agents.iter().find(|a| a.name == name).unwrap();
             assert_eq!(agent.acp_installed, installed, "{name}");
