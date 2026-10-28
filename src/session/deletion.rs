@@ -35,6 +35,34 @@ pub struct DeletionRequest {
     pub keep_scratch: bool,
 }
 
+/// What the caller asked to keep or remove; the daemon fills the rest from config.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct CleanupIntent {
+    #[serde(default)]
+    pub delete_worktree: bool,
+    #[serde(default)]
+    pub delete_branch: bool,
+    #[serde(default)]
+    pub keep_container: bool,
+}
+
+impl CleanupIntent {
+    /// Returns `(delete_worktree, delete_branch, delete_sandbox)`.
+    fn resolve(
+        &self,
+        config: &crate::session::config::Config,
+        managed: bool,
+        sandboxed: bool,
+    ) -> (bool, bool, bool) {
+        let delete_worktree = self.delete_worktree && managed;
+        let delete_branch = managed
+            && (self.delete_branch
+                || (delete_worktree && config.worktree.delete_branch_on_cleanup));
+        let delete_sandbox = sandboxed && !self.keep_container && config.sandbox.auto_cleanup;
+        (delete_worktree, delete_branch, delete_sandbox)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeletionDisposition {
     Removed,
@@ -454,15 +482,8 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
     }
     /// Resolve defaults after reservation from the complete authoritative snapshot.
     pub(crate) fn resolve_cleanup_defaults(mut self) -> Result<Self> {
+        let config = self.effective_cleanup_config()?;
         let instance = &self.request().instance;
-        let config = self.store().configuration(Some(&instance.source_profile))?;
-        let mut config = match repo_config::load_repo_config(
-            &repo_config::repo_config_source_path(Path::new(&instance.project_path)),
-        )? {
-            Some(repo) => repo_config::merge_repo_config(config, &repo),
-            None => config,
-        };
-        crate::session::config::profile_config::apply_cityhall_overrides(&mut config);
         let managed = instance.has_managed_worktree_or_workspace();
         let sandboxed = instance
             .sandbox_info
@@ -474,6 +495,37 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
         request.delete_sandbox = config.sandbox.auto_cleanup && sandboxed;
         // force_delete and keep_scratch are explicit request policy, not config defaults.
         Ok(self)
+    }
+
+    /// Resolve cleanup from the reserved row's effective config, honoring the caller's explicit intent.
+    pub(crate) fn resolve_cleanup_intent(mut self, intent: &CleanupIntent) -> Result<Self> {
+        let config = self.effective_cleanup_config()?;
+        let instance = &self.request().instance;
+        let managed = instance.has_managed_worktree_or_workspace();
+        let sandboxed = instance
+            .sandbox_info
+            .as_ref()
+            .is_some_and(|sandbox| sandbox.enabled);
+        let (delete_worktree, delete_branch, delete_sandbox) =
+            intent.resolve(&config, managed, sandboxed);
+        let request = self.request.as_mut().expect("active purge request");
+        request.delete_worktree = delete_worktree;
+        request.delete_branch = delete_branch;
+        request.delete_sandbox = delete_sandbox;
+        Ok(self)
+    }
+
+    fn effective_cleanup_config(&self) -> Result<crate::session::config::Config> {
+        let instance = &self.request().instance;
+        let config = self.store().configuration(Some(&instance.source_profile))?;
+        let mut config = match repo_config::load_repo_config(
+            &repo_config::repo_config_source_path(Path::new(&instance.project_path)),
+        )? {
+            Some(repo) => repo_config::merge_repo_config(config, &repo),
+            None => config,
+        };
+        crate::session::config::profile_config::apply_cityhall_overrides(&mut config);
+        Ok(config)
     }
 
     pub(crate) fn with_additional_protection(mut self, protection: CleanupProtection) -> Self {
@@ -2168,6 +2220,9 @@ fn run_destroy_hooks(instance: &Instance, detach: bool, config: &crate::session:
 
 const BEFORE_DESTROY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Client wait for a purge RPC: several `before_destroy` hooks plus teardown.
+pub const PURGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// Host-side on every session kind, so it never targets the container.
 fn run_before_destroy_hooks(instance: &Instance, detach: bool, commands: &[String]) {
     if commands.is_empty() {
@@ -2255,6 +2310,46 @@ fn run_on_destroy_hooks(instance: &Instance, detach: bool, configured_hooks: &[S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_intent_honors_repo_sandbox_retention_over_profile_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_dir = dir.path().join(".agent-of-empires");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::fs::write(
+            repo_dir.join("config.toml"),
+            "[sandbox]\nauto_cleanup = false\n",
+        )
+        .unwrap();
+
+        let mut profile = crate::session::config::Config::default();
+        profile.sandbox.auto_cleanup = true;
+        profile.worktree.delete_branch_on_cleanup = true;
+        let repo = repo_config::load_repo_config(&repo_config::repo_config_source_path(dir.path()))
+            .unwrap()
+            .unwrap();
+        let effective = repo_config::merge_repo_config(profile.clone(), &repo);
+
+        let intent = CleanupIntent::default();
+        assert_eq!(intent.resolve(&profile, true, true), (false, false, true));
+        assert_eq!(
+            intent.resolve(&effective, true, true),
+            (false, false, false)
+        );
+
+        // --delete-worktree pulls the branch in via config; --keep-container wins over it.
+        let intent = CleanupIntent {
+            delete_worktree: true,
+            keep_container: true,
+            ..Default::default()
+        };
+        assert_eq!(intent.resolve(&profile, true, true), (true, true, false));
+        // Nothing to delete without a managed worktree or an enabled sandbox.
+        assert_eq!(
+            intent.resolve(&profile, false, false),
+            (false, false, false)
+        );
+    }
 
     fn create_test_instance() -> Instance {
         Instance::new("Test Session", "/tmp/test-project")

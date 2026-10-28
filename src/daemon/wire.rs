@@ -505,6 +505,10 @@ pub enum TrashRelocationOutcome {
     Failed {
         reason: String,
     },
+    /// The session is trashed but its tmux sessions may still be running.
+    TeardownFailed {
+        reason: String,
+    },
 }
 
 fn default_kill_pane() -> bool {
@@ -537,6 +541,9 @@ pub struct DeleteSessionBody {
     /// Resolve resource cleanup policy on the daemon from the reserved row.
     #[serde(default)]
     pub use_cleanup_defaults: bool,
+    /// Resolve cleanup on the daemon from the reserved row, keeping this caller intent.
+    #[serde(default)]
+    pub cleanup_intent: Option<crate::session::deletion::CleanupIntent>,
     /// Consent is bound to the trash lifecycle selected by the client.
     #[serde(default)]
     pub expected_trashed_at: Option<chrono::DateTime<chrono::Utc>>,

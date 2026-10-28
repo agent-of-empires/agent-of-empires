@@ -1391,6 +1391,8 @@ last_seen_version = "{}"
             .env_remove("AGENT_OF_EMPIRES_DEBUG")
             .env_remove("AOE_LOG_LEVEL")
             .env_remove("AOE_NO_AUTOSTART")
+            .env_remove("AOE_DAEMON_URL")
+            .env_remove("AOE_DAEMON_TOKEN")
             .envs(self.extra_env.iter().map(|(key, value)| (key, value)));
         for key in &self.extra_env_remove {
             command.env_remove(key);
