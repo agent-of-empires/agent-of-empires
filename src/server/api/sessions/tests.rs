@@ -10257,3 +10257,88 @@ async fn empty_trash_batch_survives_the_client_disconnecting() -> anyhow::Result
     .await?;
     Ok(())
 }
+
+/// A row restored, edited and retrashed while an earlier row purges is kept with its edits.
+#[tokio::test]
+async fn empty_trash_keeps_a_row_retrashed_after_selection() -> anyhow::Result<()> {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let root = crate::session::get_app_dir()?;
+    crate::session::purge_owners::initialize(&root)?;
+    crate::tmux::tool_retirement::initialize(&root)?;
+    let profile = "empty-trash-retrash";
+    let project = tempfile::tempdir()?;
+    let row = |id: &str| {
+        let mut row = Instance::new(id, project.path().to_str().unwrap());
+        row.id = id.into();
+        row.source_profile = profile.into();
+        row.trash();
+        row
+    };
+    let (first, second) = (row("a-first"), row("b-second"));
+    crate::server::test_support::seed_instances_on_disk_for_test(
+        profile,
+        vec![first.clone(), second.clone()],
+    );
+    let state =
+        crate::server::test_support::build_test_app_state(vec![first.clone(), second.clone()]);
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+
+    let submission = state.session_service.prompt_submission(&first.id).await;
+    let mut claims = state.session_service.watch_submission_claims();
+    let request = tokio::spawn(empty_trash(
+        State(state.clone()),
+        Ok(Json(crate::daemon::EmptyTrashBody {
+            profile: profile.into(),
+        })),
+    ));
+    let claimed = tokio::time::timeout(std::time::Duration::from_secs(10), claims.recv())
+        .await?
+        .expect("claim channel open");
+    assert_eq!(claimed, first.id, "the handler is parked on the first row");
+    let mut retrashed = second.clone();
+    retrashed.untrash();
+    retrashed.title = "edited while the batch ran".into();
+    retrashed.lifecycle_generation += 1;
+    retrashed.trash();
+    crate::server::test_support::seed_instances_on_disk_for_test(
+        profile,
+        vec![first.clone(), retrashed.clone()],
+    );
+    *state
+        .instances
+        .write()
+        .await
+        .iter_mut()
+        .find(|row| row.id == second.id)
+        .unwrap() = retrashed.clone();
+    drop(submission);
+
+    let response = tokio::time::timeout(std::time::Duration::from_secs(10), request).await??;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let outcomes: Vec<_> = body["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| (s["id"].as_str().unwrap(), s["status"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        outcomes,
+        [(first.id.as_str(), "deleted"), (second.id.as_str(), "kept")],
+        "{body}"
+    );
+    assert!(body["failures"].as_array().unwrap().is_empty(), "{body}");
+    let kept = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|row| row.id == second.id)
+        .cloned()
+        .expect("the retrashed row survives");
+    assert_eq!(kept.title, "edited while the batch ran");
+    assert!(kept.is_trashed());
+    Ok(())
+}

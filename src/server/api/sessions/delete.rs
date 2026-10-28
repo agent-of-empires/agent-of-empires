@@ -891,20 +891,29 @@ async fn empty_trash_owned(state: Arc<AppState>, profile: String) -> axum::respo
             "Profile not found",
         );
     }
-    let mut ids: Vec<String> = state
+    // Consent is captured per row here, so a row restored and retrashed while an
+    // earlier row purges is kept instead of purged under its new trash lifecycle.
+    let mut selected: Vec<_> = state
         .instances
         .read()
         .await
         .iter()
         .filter(|row| row.is_trashed() && row.source_profile == profile)
-        .map(|row| row.id.clone())
+        .map(|row| {
+            (
+                row.id.clone(),
+                row.trashed_at,
+                row.trash_lifecycle_id.clone(),
+                row.lifecycle_generation,
+            )
+        })
         .collect();
-    ids.sort_unstable();
+    selected.sort_unstable_by(|left, right| left.0.cmp(&right.0));
     let mut outcome = EmptyTrashOutcome {
         sessions: Vec::new(),
         failures: Vec::new(),
     };
-    for id in ids {
+    for (id, expected_trashed_at, expected_trash_lifecycle_id, expected_generation) in selected {
         let Some(_submission) = state
             .session_service
             .prompt_submission_for_session(&id)
@@ -927,9 +936,9 @@ async fn empty_trash_owned(state: Arc<AppState>, profile: String) -> axum::respo
         let body = DeleteSessionBody {
             force_delete: true,
             expected_trash: true,
-            expected_trashed_at: instance.trashed_at,
-            expected_trash_lifecycle_id: instance.trash_lifecycle_id.clone(),
-            expected_generation: Some(instance.lifecycle_generation),
+            expected_trashed_at,
+            expected_trash_lifecycle_id,
+            expected_generation: Some(expected_generation),
             use_cleanup_defaults: true,
             ..Default::default()
         };
