@@ -17,7 +17,13 @@ export function SandboxPanel({
         onChange={(v) => onChange("sandboxImage", v)}
         placeholder="ghcr.io/agent-of-empires/aoe-sandbox:latest"
       />
-      <EnvVarList values={data.extraEnv} onChange={(v) => onChange("extraEnv", v)} />
+      <EnvVarList label="Container environment" values={data.extraEnv} onChange={(v) => onChange("extraEnv", v)} />
+      <EnvVarList
+        label="Host hook environment"
+        hint="Visible to host_hooks.before_start only; never passed into the container."
+        values={data.hookEnv}
+        onChange={(v) => onChange("hookEnv", v)}
+      />
     </div>
   );
 }

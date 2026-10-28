@@ -6,6 +6,7 @@ import { Bot, ChevronDown, Maximize2, Square, X } from "lucide-react";
 
 import { useBackgroundAgents } from "../../hooks/useAcpSession";
 import type { BackgroundAgent, BackgroundAgentStatus, BackgroundAgentTool } from "../../lib/acpTypes";
+import { CopyMarkdownButton } from "./CopyMarkdownButton";
 
 export function BackgroundAgentsPanel({ sessionId }: { sessionId: string | null }) {
   const agents = useBackgroundAgents(sessionId);
@@ -125,8 +126,8 @@ function AgentRow({ agent }: { agent: BackgroundAgent }) {
           {agent.warning && <Field label="warning" value={agent.warning} tone="warn" />}
           <Field label="model" value={agent.model || "unknown"} mono />
           {agent.tools.length > 0 && <ToolList tools={agent.tools} />}
-          <Field label="prompt" value={agent.prompt || "(none)"} clamp />
-          {agent.result && <Field label="result" value={agent.result} clamp />}
+          <Field label="prompt" value={agent.prompt || "(none)"} clamp copy={!!agent.prompt} />
+          {agent.result && <Field label="result" value={agent.result} clamp copy />}
         </div>
       )}
       {modal && <AgentDetailModal agent={agent} onClose={() => setModal(false)} />}
@@ -174,8 +175,8 @@ function AgentDetailModal({ agent, onClose }: { agent: BackgroundAgent; onClose:
           {agent.warning && <Field label="warning" value={agent.warning} tone="warn" />}
           <Field label="model" value={agent.model || "unknown"} mono />
           {agent.tools.length > 0 && <ToolList tools={agent.tools} />}
-          <Field label="prompt" value={agent.prompt || "(none)"} />
-          {agent.result && <Field label="result" value={agent.result} />}
+          <Field label="prompt" value={agent.prompt || "(none)"} copy={!!agent.prompt} />
+          {agent.result && <Field label="result" value={agent.result} copy />}
         </div>
       </div>
     </div>
@@ -213,6 +214,7 @@ function Field({
   mono,
   tone,
   clamp,
+  copy,
 }: {
   label: string;
   value: string;
@@ -220,10 +222,15 @@ function Field({
   tone?: "warn";
   /** Clamp long text in the narrow panel; the details modal shows it in full. */
   clamp?: boolean;
+  /** Offer a copy of the full value, which a clamp does not shorten. */
+  copy?: boolean;
 }) {
   return (
     <div className="flex flex-col gap-0.5">
-      <span className="text-[10px] uppercase tracking-wider text-text-dim">{label}</span>
+      <div className="flex items-center justify-between">
+        <span className="text-[10px] uppercase tracking-wider text-text-dim">{label}</span>
+        {copy && <CopyMarkdownButton compact source={value} label={`Copy ${label}`} />}
+      </div>
       <span
         className={[
           "whitespace-pre-wrap break-words",

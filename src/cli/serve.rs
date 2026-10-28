@@ -177,13 +177,13 @@ pub struct ServeArgs {
     #[arg(long)]
     pub open: bool,
 
-    /// Internal marker: this invocation is the detached child spawned by
-    /// `--daemon`. Set automatically by `start_daemon()`; never pass by hand.
-    /// Tells `main.rs` to classify the process as `ServeDaemonChild` so the
-    /// sink resolver routes tracing to the configured log file (its
-    /// stdout/stderr are detached). Hidden from `--help`.
+    /// Internal marker for a detached child; selects daemon logging.
     #[arg(long, hide = true)]
     pub daemon_child: bool,
+
+    /// Preserve missing defaults only during automatic read acquisition.
+    #[arg(long, hide = true, requires_all = ["daemon_child", "core_only"])]
+    pub read_acquisition: bool,
 
     /// Restart the running managed daemon with its recorded policy.
     /// Missing credentials are rejected before stopping it.
@@ -642,11 +642,35 @@ impl ServeLaunch {
             passphrase,
             open: false,
             daemon_child: false,
+            read_acquisition: false,
             restart: false,
             rollback: false,
             allowed_host: self.allowed_host.clone(),
             allowed_origin: self.allowed_origin.clone(),
         }
+    }
+}
+
+impl ServeLaunch {
+    /// Replay the recorded launch, taking only what the TUI restart controls
+    /// (bind, exposure, port, dashboard enablement, passphrase) from `requested`,
+    /// so recorded policy such as `--read-only` and the allowlists survives.
+    fn overlay_tui_args(&self, requested: ServeArgs) -> ServeArgs {
+        let mut args = self.to_serve_args(None);
+        if self.core_only {
+            args.auth = requested.auth;
+        }
+        args.core_only = requested.core_only;
+        args.port = requested.port;
+        args.host = requested.host;
+        args.remote = requested.remote;
+        if !args.remote {
+            args.tunnel_name = None;
+            args.tunnel_url = None;
+        }
+        args.no_tailscale = requested.no_tailscale;
+        args.passphrase = requested.passphrase;
+        args
     }
 }
 
@@ -811,6 +835,13 @@ impl LaunchProfileUpdates {
 /// is both false and hides the `aoe serve --restart` that does work for it.
 fn launch_authorizes(launch: &ServeLaunch, pid: u32, instance_is_live: bool) -> bool {
     launch.pid == pid && !launch_contradicts(launch, pid, instance_is_live)
+}
+
+/// The launch settings of the daemon running as `pid`, when `serve.launch` belongs to it.
+pub(crate) fn running_launch(pid: u32) -> Option<ServeLaunch> {
+    read_serve_launch()
+        .ok()
+        .filter(|launch| launch_authorizes(launch, pid, instance_is_live(launch, pid)))
 }
 
 pub(crate) fn serve_launch_matches(pid: u32) -> bool {
@@ -1180,6 +1211,18 @@ pub fn daemon_pid() -> Option<u32> {
     }
 }
 
+/// The verified daemon's recorded launch, which a TUI restart replays.
+pub(crate) fn recorded_launch() -> Option<ServeLaunch> {
+    managed_launch(daemon_pid()?).ok()
+}
+
+/// Whether the verified daemon already runs `passphrase`.
+pub(crate) fn daemon_runs_passphrase(passphrase: &str) -> bool {
+    recorded_launch()
+        .and_then(|launch| recall_serve_passphrase(&launch).ok().flatten())
+        .is_some_and(|running| running == passphrase)
+}
+
 /// Returns a verified daemon only when it exposes the web dashboard.
 pub(crate) fn web_daemon_pid() -> Option<u32> {
     let pid = daemon_pid()?;
@@ -1358,6 +1401,7 @@ pub async fn run(profile: &str, mut args: ServeArgs, startup: Option<ServeStartu
         crate::server::ServerConfig {
             profile,
             core_only: args.core_only,
+            read_acquisition: args.read_acquisition,
             host: &host,
             port: args.resolved_port(),
             auth_mode,
@@ -1500,8 +1544,9 @@ async fn fetch_cityhall_bundle(url: &str, token: &str) -> Result<String> {
     Ok(daemon::decode_text(response).await?)
 }
 
+/// `None` selects read acquisition; `Some` preserves native profile admission.
 pub(crate) async fn ensure_local_daemon(
-    profile: &str,
+    native_profile: Option<&str>,
     allow_start: bool,
 ) -> Result<(crate::acp::client::DaemonEndpoint, Option<u32>)> {
     use clap::Parser;
@@ -1525,13 +1570,24 @@ pub(crate) async fn ensure_local_daemon(
             allow_start,
             "Local daemon autostart is disabled; start one with `aoe serve --core-only --daemon`"
         );
-        let resolved_profile = crate::session::config::effective_profile(profile);
+        let resolved_profile = if let Some(profile) = native_profile {
+            crate::session::config::effective_profile(profile)
+        } else {
+            let default = crate::session::config::resolve_default_profile();
+            let profiles = crate::session::list_profiles()?;
+            if profiles.iter().any(|profile| profile == &default) {
+                default
+            } else {
+                profiles.into_iter().next().unwrap_or(default)
+            }
+        };
         let profile = resolved_profile.as_str();
         crate::session::require_known_profile(profile)?;
         let cli = crate::cli::Cli::try_parse_from(["aoe", "serve", "--core-only", "--daemon"])?;
-        let Some(crate::cli::Commands::Serve(args)) = cli.command else {
+        let Some(crate::cli::Commands::Serve(mut args)) = cli.command else {
             unreachable!()
         };
+        args.read_acquisition = native_profile.is_none();
         start_daemon(profile, &args, &transaction, false).await?;
         daemon_pid()
     } else {
@@ -1540,10 +1596,20 @@ pub(crate) async fn ensure_local_daemon(
     let endpoint = crate::acp::client::DaemonEndpoint::local_unix(
         crate::daemon::transport::local_socket_path()?,
     );
-    endpoint
-        .daemon_client()?
-        .local_runtime_ready((!profile.is_empty()).then_some(profile))
-        .await?;
+    let client = endpoint.daemon_client()?;
+    if let Some(profile) = native_profile {
+        client
+            .local_runtime_ready((!profile.is_empty()).then_some(profile))
+            .await?;
+    } else {
+        let pid = existing
+            .or(started)
+            .context("Local daemon has no verified owner after startup")?;
+        anyhow::ensure!(
+            client.local_daemon_ready(pid).await?,
+            "Local daemon runtime identity or protocol is incompatible"
+        );
+    }
     Ok((endpoint, started))
 }
 pub(crate) async fn start_dashboard_for_tui(
@@ -1620,6 +1686,9 @@ async fn start_daemon(
     cmd.env_remove("AOE_CITYHALL_MODE")
         .env_remove("AOE_SERVE_PASSPHRASE");
     cmd.args(["serve", "--daemon-child"]);
+    if args.read_acquisition {
+        cmd.arg("--read-acquisition");
+    }
     if args.core_only {
         cmd.arg("--core-only");
     } else {
@@ -1777,8 +1846,6 @@ async fn start_daemon(
     let client = endpoint.daemon_client()?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
     let ready = tokio::time::timeout_at(deadline, async {
-        #[cfg(target_os = "linux")]
-        let mut require_local_read = None;
         loop {
             if let Some(status) = child.try_wait()? {
                 anyhow::bail!("Daemon exited before readiness: {status}");
@@ -1792,27 +1859,6 @@ async fn start_daemon(
                 && crate::process::process_birth_identity(pid)
                     .is_ok_and(|current| current.as_ref() == Some(&birth))
             {
-                #[cfg(target_os = "linux")]
-                {
-                    use crate::cli::runtime_read::uds::{self, TrustedPathError};
-                    let required = *require_local_read.get_or_insert_with(|| {
-                        !args.cityhall
-                            && match uds::existing_app_namespace() {
-                                Ok(_) | Err(TrustedPathError::Missing) => true,
-                                Err(TrustedPathError::Invalid | TrustedPathError::Refused(_)) => {
-                                    false
-                                }
-                            }
-                    });
-                    if required
-                        && !uds::connect(deadline)
-                            .await
-                            .is_ok_and(|connection| connection.owned_by(pid))
-                    {
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                        continue;
-                    }
-                }
                 return Ok::<(), anyhow::Error>(());
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1882,7 +1928,10 @@ pub(crate) async fn restart_daemon_with_receipt(
 
     let launch = managed_launch(pid)?;
     let predecessor_passphrase = recall_serve_passphrase(&launch)?;
-    let mut args = override_args.unwrap_or_else(|| launch.to_serve_args(None));
+    let mut args = match override_args {
+        Some(requested) => launch.overlay_tui_args(requested),
+        None => launch.to_serve_args(None),
+    };
     args.passphrase = resolve_launch_passphrase(
         args.passphrase.take(),
         Some(predecessor_passphrase.as_deref()),
@@ -2447,6 +2496,56 @@ mod tests {
             allowed_origin: vec!["https://aoe.example.com:8443".to_string()],
             additional_fields: serde_json::Map::new(),
         }
+    }
+
+    #[test]
+    fn tui_restart_overlay_keeps_recorded_policy() {
+        use clap::Parser;
+        let tui_args = |argv: &[&str]| {
+            let parsed = crate::cli::Cli::try_parse_from(argv).unwrap();
+            let Some(crate::cli::Commands::Serve(args)) = parsed.command else {
+                unreachable!();
+            };
+            args
+        };
+        let mut recorded = sample_launch();
+        recorded.auth_mode = AuthMode::Token;
+        let local = recorded.overlay_tui_args(tui_args(&[
+            "aoe", "serve", "--daemon", "--port", "8080", "--host", "0.0.0.0",
+        ]));
+        let tunnel = recorded.overlay_tui_args(tui_args(&[
+            "aoe",
+            "serve",
+            "--daemon",
+            "--port",
+            "8080",
+            "--remote",
+            "--host",
+            "127.0.0.1",
+            "--no-tailscale",
+        ]));
+        for args in [&local, &tunnel] {
+            assert!(args.read_only && args.behind_proxy && args.cityhall);
+            assert!(args.dangerously_allow_plaintext_remote);
+            assert_eq!(args.allowed_host, recorded.allowed_host);
+            assert_eq!(args.allowed_origin, recorded.allowed_origin);
+            assert_eq!(args.auth, Some(AuthMode::Token));
+            assert_eq!(args.port, Some(8080));
+        }
+        assert!(!local.remote && local.host == "0.0.0.0");
+        assert!(tunnel.remote && tunnel.host == "127.0.0.1");
+        // clap requires `--remote` for the tunnel flags, so a Local restart must not replay them.
+        assert_eq!((&local.tunnel_name, &local.tunnel_url), (&None, &None));
+        assert_eq!(tunnel.tunnel_name, recorded.tunnel_name);
+        assert_eq!(tunnel.tunnel_url, recorded.tunnel_url);
+
+        let mut core = sample_launch();
+        core.core_only = true;
+        let dashboard = core.overlay_tui_args(tui_args(&[
+            "aoe", "serve", "--daemon", "--port", "8080", "--host", "0.0.0.0",
+        ]));
+        assert!(!dashboard.core_only);
+        assert_eq!((dashboard.port, dashboard.auth), (Some(8080), None));
     }
 
     #[test]

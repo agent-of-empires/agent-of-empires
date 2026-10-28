@@ -11,7 +11,7 @@ use crate::containers::DockerContainer;
 use crate::git::cleanup::{remove_managed_worktree, WorktreeCleanupOptions};
 use crate::git::GitWorktree;
 use crate::session::config::repo_config;
-use crate::session::path_identity::CleanupProtection;
+use crate::session::path_identity::{canonicalize_or_raw, CleanupProtection};
 use crate::session::storage::StorageFlock;
 use crate::session::{
     Instance, LifecycleOperation, LifecycleReservationError, SessionStore, Storage,
@@ -33,6 +33,34 @@ pub struct DeletionRequest {
     /// info level and surfaced in the deletion result's messages. Has no
     /// effect on non-scratch sessions.
     pub keep_scratch: bool,
+}
+
+/// What the caller asked to keep or remove; the daemon fills the rest from config.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct CleanupIntent {
+    #[serde(default)]
+    pub delete_worktree: bool,
+    #[serde(default)]
+    pub delete_branch: bool,
+    #[serde(default)]
+    pub keep_container: bool,
+}
+
+impl CleanupIntent {
+    /// Returns `(delete_worktree, delete_branch, delete_sandbox)`.
+    fn resolve(
+        &self,
+        config: &crate::session::config::Config,
+        managed: bool,
+        sandboxed: bool,
+    ) -> (bool, bool, bool) {
+        let delete_worktree = self.delete_worktree && managed;
+        let delete_branch = managed
+            && (self.delete_branch
+                || (delete_worktree && config.worktree.delete_branch_on_cleanup));
+        let delete_sandbox = sandboxed && !self.keep_container && config.sandbox.auto_cleanup;
+        (delete_worktree, delete_branch, delete_sandbox)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -454,15 +482,8 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
     }
     /// Resolve defaults after reservation from the complete authoritative snapshot.
     pub(crate) fn resolve_cleanup_defaults(mut self) -> Result<Self> {
+        let config = self.effective_cleanup_config()?;
         let instance = &self.request().instance;
-        let config = self.store().configuration(Some(&instance.source_profile))?;
-        let mut config = match repo_config::load_repo_config(
-            &repo_config::repo_config_source_path(Path::new(&instance.project_path)),
-        )? {
-            Some(repo) => repo_config::merge_repo_config(config, &repo),
-            None => config,
-        };
-        crate::session::config::profile_config::apply_cityhall_overrides(&mut config);
         let managed = instance.has_managed_worktree_or_workspace();
         let sandboxed = instance
             .sandbox_info
@@ -474,6 +495,37 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
         request.delete_sandbox = config.sandbox.auto_cleanup && sandboxed;
         // force_delete and keep_scratch are explicit request policy, not config defaults.
         Ok(self)
+    }
+
+    /// Resolve cleanup from the reserved row's effective config, honoring the caller's explicit intent.
+    pub(crate) fn resolve_cleanup_intent(mut self, intent: &CleanupIntent) -> Result<Self> {
+        let config = self.effective_cleanup_config()?;
+        let instance = &self.request().instance;
+        let managed = instance.has_managed_worktree_or_workspace();
+        let sandboxed = instance
+            .sandbox_info
+            .as_ref()
+            .is_some_and(|sandbox| sandbox.enabled);
+        let (delete_worktree, delete_branch, delete_sandbox) =
+            intent.resolve(&config, managed, sandboxed);
+        let request = self.request.as_mut().expect("active purge request");
+        request.delete_worktree = delete_worktree;
+        request.delete_branch = delete_branch;
+        request.delete_sandbox = delete_sandbox;
+        Ok(self)
+    }
+
+    fn effective_cleanup_config(&self) -> Result<crate::session::config::Config> {
+        let instance = &self.request().instance;
+        let config = self.store().configuration(Some(&instance.source_profile))?;
+        let mut config = match repo_config::load_repo_config(
+            &repo_config::repo_config_source_path(Path::new(&instance.project_path)),
+        )? {
+            Some(repo) => repo_config::merge_repo_config(config, &repo),
+            None => config,
+        };
+        crate::session::config::profile_config::apply_cityhall_overrides(&mut config);
+        Ok(config)
     }
 
     pub(crate) fn with_additional_protection(mut self, protection: CleanupProtection) -> Self {
@@ -1221,7 +1273,12 @@ pub(crate) enum PathsInUse {
 impl PathsInUse {
     pub(crate) fn covers(&self, root: &Path) -> bool {
         match self {
-            Self::Known(paths) => paths.iter().any(|path| path.starts_with(root)),
+            Self::Known(paths) => {
+                let canonical_root = canonicalize_or_raw(root);
+                paths.iter().any(|path| {
+                    path.starts_with(root) || canonicalize_or_raw(path).starts_with(&canonical_root)
+                })
+            }
             Self::Unknown(_) => true,
         }
     }
@@ -1257,7 +1314,7 @@ fn all_profile_storages() -> std::result::Result<(Vec<String>, Vec<Storage>), St
 fn scan_paths_in_use(storages: &[Storage], except_ids: &[&str]) -> PathsInUse {
     let mut paths = Vec::new();
     for storage in storages {
-        match storage.load() {
+        match storage.load_instances_complete() {
             Ok(instances) => paths.extend(other_sessions_paths(&instances, except_ids)),
             Err(error) => {
                 return PathsInUse::Unknown(format!(
@@ -1569,7 +1626,11 @@ fn stage_teardown_worktrees(
                     .any(|owner| owner.references_path(Path::new(&workspace.workspace_dir)))
             });
 
-    let preclean = if request.delete_worktree && is_sandboxed && root_cleanup_allowed {
+    let preclean = if request.delete_worktree
+        && is_sandboxed
+        && request.instance.has_managed_worktree_or_workspace()
+        && root_cleanup_allowed
+    {
         tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "sandbox_worktree_preclean", "perform_deletion: stage");
         Some(crate::git::cleanup::cleanup_sandbox_worktree(
             &request.instance,
@@ -2163,6 +2224,9 @@ fn run_destroy_hooks(instance: &Instance, detach: bool, config: &crate::session:
 
 const BEFORE_DESTROY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Client wait for a purge RPC: several `before_destroy` hooks plus teardown.
+pub const PURGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// Host-side on every session kind, so it never targets the container.
 fn run_before_destroy_hooks(instance: &Instance, detach: bool, commands: &[String]) {
     if commands.is_empty() {
@@ -2250,6 +2314,46 @@ fn run_on_destroy_hooks(instance: &Instance, detach: bool, configured_hooks: &[S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_intent_honors_repo_sandbox_retention_over_profile_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_dir = dir.path().join(".agent-of-empires");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::fs::write(
+            repo_dir.join("config.toml"),
+            "[sandbox]\nauto_cleanup = false\n",
+        )
+        .unwrap();
+
+        let mut profile = crate::session::config::Config::default();
+        profile.sandbox.auto_cleanup = true;
+        profile.worktree.delete_branch_on_cleanup = true;
+        let repo = repo_config::load_repo_config(&repo_config::repo_config_source_path(dir.path()))
+            .unwrap()
+            .unwrap();
+        let effective = repo_config::merge_repo_config(profile.clone(), &repo);
+
+        let intent = CleanupIntent::default();
+        assert_eq!(intent.resolve(&profile, true, true), (false, false, true));
+        assert_eq!(
+            intent.resolve(&effective, true, true),
+            (false, false, false)
+        );
+
+        // --delete-worktree pulls the branch in via config; --keep-container wins over it.
+        let intent = CleanupIntent {
+            delete_worktree: true,
+            keep_container: true,
+            ..Default::default()
+        };
+        assert_eq!(intent.resolve(&profile, true, true), (true, true, false));
+        // Nothing to delete without a managed worktree or an enabled sandbox.
+        assert_eq!(
+            intent.resolve(&profile, false, false),
+            (false, false, false)
+        );
+    }
 
     fn create_test_instance() -> Instance {
         Instance::new("Test Session", "/tmp/test-project")
@@ -2396,24 +2500,58 @@ mod tests {
             bin.display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let runtime = tempfile::tempdir().unwrap();
-        std::fs::create_dir(runtime.path().join("systemd")).unwrap();
-        std::fs::write(runtime.path().join("systemd/private"), "").unwrap();
+        let alternate = tempfile::tempdir().unwrap();
         let _path = crate::session::test_support::EnvGuard::unset(&["DBUS_SESSION_BUS_ADDRESS"])
-            .and_set("PATH", path.as_str());
-        // A legacy row is resolvable only without a user manager that could own its scopes.
-        for (legacy_unknown, manager) in [(false, true), (true, true), (true, false)] {
-            let _manager = crate::session::test_support::EnvGuard::set(&[(
-                "XDG_RUNTIME_DIR",
-                if manager {
-                    runtime.path().to_str().unwrap()
-                } else {
-                    home.path().to_str().unwrap()
-                },
-            )]);
+            .and_set("PATH", path.as_str())
+            .and_set("XDG_RUNTIME_DIR", alternate.path());
+        for (legacy_unknown, manager, known_unscoped, kernel_state) in [
+            (false, true, false, "unused"),
+            (true, true, false, "unused"),
+            (true, false, false, "empty"),
+            (false, true, true, "unused"),
+            (true, false, false, "populated"),
+            (true, false, false, "missing-events"),
+        ] {
+            #[cfg(target_os = "linux")]
+            let canonical = tempfile::tempdir().unwrap();
+            #[cfg(target_os = "linux")]
+            let _canonical =
+                crate::process::systemd::legacy_runtime_fixture::install(canonical.path());
+            #[cfg(target_os = "linux")]
+            let _listener = if manager {
+                let runtime = canonical
+                    .path()
+                    .join("user")
+                    .join(nix::unistd::geteuid().as_raw().to_string());
+                std::fs::create_dir_all(runtime.join("systemd")).unwrap();
+                Some(
+                    std::os::unix::net::UnixListener::bind(runtime.join("systemd/private"))
+                        .unwrap(),
+                )
+            } else {
+                let runtime = canonical
+                    .path()
+                    .join("user")
+                    .join(nix::unistd::geteuid().as_raw().to_string());
+                std::fs::create_dir_all(runtime).unwrap();
+                std::fs::create_dir(canonical.path().join("cgroups")).unwrap();
+                std::fs::write(canonical.path().join("cgroups/cgroup.controllers"), "").unwrap();
+                None
+            };
             let profile = "terminal-scope-refusal";
             let storage = Storage::new_unwatched(profile).unwrap();
             let mut row = Instance::new("owned terminal", home.path().to_str().unwrap());
+            #[cfg(target_os = "linux")]
+            if matches!(kernel_state, "populated" | "missing-events") {
+                let scope = canonical.path().join("cgroups/other.service").join(format!(
+                    "aoe-session-{}-1700000000000.scope",
+                    row.id.replace('-', "_2d")
+                ));
+                std::fs::create_dir_all(&scope).unwrap();
+                if kernel_state == "populated" {
+                    std::fs::write(scope.join("cgroup.events"), "populated 1\n").unwrap();
+                }
+            }
             row.source_profile = profile.into();
             row.scratch = true;
             let scratch = crate::session::scratch::provision_scratch_dir(&row.id).unwrap();
@@ -2421,6 +2559,8 @@ mod tests {
             std::fs::write(scratch.join("payload"), b"owned checkout contents").unwrap();
             row.terminal_scopes = if legacy_unknown {
                 None
+            } else if known_unscoped {
+                Some(vec![])
             } else {
                 Some(vec![
                     crate::process::worker_registry::ScopeOwnership::Owned {
@@ -2443,8 +2583,10 @@ mod tests {
                 panic!("the selected row must reserve before runtime scope proof");
             };
             let result = transaction.run_hooks().unwrap().complete();
-            // Without a Linux scope backend a legacy row has nothing left to prove.
-            if legacy_unknown && (!manager || !cfg!(target_os = "linux")) {
+            if known_unscoped
+                || (legacy_unknown
+                    && (!cfg!(target_os = "linux") || (!manager && kernel_state == "empty")))
+            {
                 assert!(result.success, "{:?}", result.errors);
                 assert!(!scratch.exists());
                 assert!(storage
@@ -4364,6 +4506,7 @@ mod tests {
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         });
 
@@ -4583,6 +4726,7 @@ mod tests {
                 extra_env: None,
                 custom_instruction: None,
                 before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
                 container_workdir: None,
             });
             DeletionRequest {
@@ -4971,18 +5115,8 @@ mod tests {
             // absent container. A nonexistent name alone is insufficient:
             // an unavailable runtime fails teardown and correctly prevents
             // worktree cleanup.
-            let mut instance = Instance::new("Test", "/tmp/aoe-deletion-test-nonexistent");
-            instance.sandbox_info = Some(SandboxInfo {
-                provider: None,
-                enabled: true,
-                container_id: None,
-                image: "alpine".to_string(),
-                container_name: "aoe-sandbox-doesnotexist".to_string(),
-                extra_env: None,
-                custom_instruction: None,
-                before_start_env: Vec::new(),
-                container_workdir: None,
-            });
+            let (_tmp, _main_repo, _worktree_path, instance) =
+                build_sandboxed_worktree("feature/ordering");
             let request = DeletionRequest {
                 session_id: instance.id.clone(),
                 instance,
@@ -5988,6 +6122,7 @@ mod tests {
                 extra_env: None,
                 custom_instruction: None,
                 before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
                 container_workdir: None,
             });
 
@@ -6152,6 +6287,42 @@ mod tests {
                 "unsandboxed deletion must not emit sandbox preclean stage: stages={:?}",
                 stages
             );
+        }
+
+        /// A sandboxed session without a managed worktree must never get the
+        /// in-container `find -delete`: its workdir is the user's project dir
+        /// (#5023), whatever `delete_worktree` says.
+        #[test]
+        fn sandboxed_without_managed_worktree_skips_preclean() {
+            let _app_guard = crate::session::test_support::isolate_app_dir();
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
+            let (_tmp, _main_repo, worktree_path, mut instance) =
+                build_sandboxed_worktree("feature/plain-sandbox");
+            instance.worktree_info = None;
+            std::fs::write(worktree_path.join("sentinel"), "keep").unwrap();
+
+            let request = DeletionRequest {
+                session_id: instance.id.clone(),
+                instance,
+                delete_worktree: true,
+                delete_branch: false,
+                delete_sandbox: false,
+                force_delete: true,
+                detach_hooks: true,
+                keep_scratch: false,
+            };
+
+            let stages = run_with_capture(|| {
+                let result = perform_deletion(&request);
+                assert!(result.success, "{:?}", result.errors);
+            });
+            assert!(
+                !stages.iter().any(|s| s == "sandbox_worktree_preclean"),
+                "preclean must not run without a managed worktree: stages={:?}",
+                stages
+            );
+            assert!(worktree_path.join("sentinel").exists());
         }
 
         /// A stray file under an otherwise aoe-owned workspace keeps the dir

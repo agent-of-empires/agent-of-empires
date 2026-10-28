@@ -58,6 +58,11 @@ describe("SystemNotices", () => {
       /Structured view disconnected\. Reconnecting \(1\/7\)/,
     ],
     [
+      "a retry while replay still delivers events",
+      { status: "closed", reconnecting: true, retryCount: 2, hasEverOpened: true, replayedWhileDown: true },
+      /Live updates unavailable, showing history fetched over HTTP\. Reconnecting \(2\/7\)/,
+    ],
+    [
       "a reconnect",
       { status: "connecting", hasEverOpened: true, newSessionStarting: true },
       /Reconnecting to structured view/,
@@ -75,7 +80,7 @@ describe("SystemNotices", () => {
 
   it.each([false, true])("offers recovery after retry exhaustion (previously connected: %s)", (hasEverOpened) => {
     const props = noticeProps({ status: "closed", hasEverOpened, retryCount: 7 });
-    const starting = isNewSessionStarting(emptyAcpState(), props, "resuming");
+    const starting = isNewSessionStarting(emptyAcpState(), props, "resuming", false);
     const { getByRole, queryByText } = render(<SystemNotices {...props} newSessionStarting={starting} />);
     expect(starting).toBe(false);
     expect(

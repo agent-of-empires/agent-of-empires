@@ -127,10 +127,12 @@ impl GitWorktree {
         }
         let bare_repo_path = repo.path().to_path_buf();
         let parent_dir = bare_repo_path.parent().ok_or(GitError::NotAGitRepo)?;
-        // A `.git` file (`gitdir: ./.bare`) marks the parent as the project
-        // root. `is_file`, because tools such as opencode create stray `.git/`
-        // directories wherever they run.
-        if parent_dir.join(".git").is_file() {
+        // A bare repo named `.git`, or a `.git` file (`gitdir: ./.bare`) beside
+        // it, marks the parent as the project root. `is_file`, because tools
+        // such as opencode create stray `.git/` directories wherever they run.
+        if bare_repo_path.file_name() == Some(OsStr::new(".git"))
+            || parent_dir.join(".git").is_file()
+        {
             return Ok(parent_dir.to_path_buf());
         }
         Ok(bare_repo_path)
@@ -381,6 +383,24 @@ mod tests {
         dir
     }
 
+    /// Bare repo stored directly as `<tmp>/.git` with a `main` worktree.
+    fn dot_git_bare_layout() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        let bare = dir.path().join(".git");
+        let repo = git2::Repository::init_bare(&bare).unwrap();
+        crate::git::test_support::commit(&repo, Some("HEAD"), &[], &[], None);
+        run_git(
+            &bare,
+            &[
+                "worktree",
+                "add",
+                dir.path().join("main").to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        dir
+    }
+
     /// `fe/foo.git` bare repo with a `fe/master` worktree on `main`.
     fn sibling_bare_layout() -> (TempDir, PathBuf, PathBuf) {
         let dir = TempDir::new().unwrap();
@@ -436,9 +456,10 @@ mod tests {
         GitWorktree::convert_git_file_to_relative(&linked_main).unwrap();
         let (_sibling, sibling_bare, sibling_wt) = sibling_bare_layout();
         let (_spurious, spurious_bare) = bare_under_spurious_git_dir();
+        let dot_git = dot_git_bare_layout();
 
         let canonical = |p: &Path| p.canonicalize().unwrap();
-        let cases: [(&str, PathBuf, PathBuf, bool); 7] = [
+        let cases: [(&str, PathBuf, PathBuf, bool); 9] = [
             (
                 "regular",
                 regular.path().to_path_buf(),
@@ -455,6 +476,18 @@ mod tests {
                 "linked bare worktree",
                 linked_main.clone(),
                 canonical(linked.path()),
+                true,
+            ),
+            (
+                "dot-git bare root",
+                dot_git.path().to_path_buf(),
+                canonical(dot_git.path()),
+                true,
+            ),
+            (
+                "dot-git bare worktree",
+                dot_git.path().join("main"),
+                canonical(dot_git.path()),
                 true,
             ),
             (

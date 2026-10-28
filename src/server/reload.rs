@@ -2,6 +2,7 @@
 //! already holds in memory.
 
 use crate::file_watch::FileWatchService;
+use crate::session::Handoff;
 use crate::session::Instance;
 use crate::session::Status;
 use crate::session::Storage;
@@ -624,62 +625,21 @@ pub(crate) async fn adopt_committed_profiles<const N: usize>(
     Ok(())
 }
 
-/// What a runtime merge may carry of `prior`'s poller: a poller serves one agent
-/// on one execution, and the repair window it paces was armed for the same, so
-/// both are carried only while the fresh row still runs what the prior row ran.
-/// A poller the fresh row cannot use is stopped here rather than handed over,
-/// because its thread keeps reading the launch the row is giving up.
-///
-/// Both decisions are read off `prior` before any inherit consumes it, since
-/// that inherit moves the prior row's own poller state in whatever these say.
-struct PollerHandoff {
-    keeps_poller: bool,
-    keeps_repair: bool,
-}
-
-impl PollerHandoff {
-    fn decide(prior: &Instance, fresh: &Instance) -> Self {
-        Self {
-            keeps_poller: prior.poller_serves(&fresh.tool, fresh.active_execution.as_ref()),
-            keeps_repair: fresh.runs(&prior.tool, prior.active_execution.as_ref()),
-        }
-    }
-
-    /// Stop the poller the fresh row cannot use, before the hand-off moves it.
-    fn stop_unservable(&self, prior: &Instance) {
-        if !self.keeps_poller {
-            prior.stop_poller();
-        }
-    }
-
-    /// Drop whatever the inherit moved in that the fresh row cannot use.
-    fn settle(self, fresh: &mut Instance) {
-        if !self.keeps_poller {
-            fresh.session_id_poller = None;
-        }
-        if !self.keeps_repair {
-            fresh.poller_repair = Default::default();
-            fresh.session_id_poller_retry_after = None;
-        }
-    }
-}
-
 /// Keep process state without replacing the committed lifecycle or identity.
 ///
-/// The poller guards live in [`PollerHandoff`], shared with the status-poll
+/// The poller guards live in [`Handoff`], shared with the status-poll
 /// branch of [`merge_loaded_rows`]: both hand a prior row's launch-owned process
 /// state to the fresh row, so both must decide the same way whether that row
 /// still runs what the prior one ran.
 pub(super) fn merge_runtime_fields(prior: Instance, fresh: &mut Instance) {
-    let handoff = PollerHandoff::decide(&prior, fresh);
-    handoff.stop_unservable(&prior);
+    let handoff = Handoff::decide(&prior.capture_poller, prior.held(), fresh.held());
     // `plugin_revival_pending` is `#[serde(skip)]`, so every fresh disk load
     // defaults it; dropping it here would stop counting a plugin revival that is
     // still waking toward its per-plugin cap.
     let plugin_revival_pending = prior.plugin_revival_pending;
     fresh.last_error_check = prior.last_error_check;
     fresh.inherit_runtime(prior, fresh.status == Status::Error);
-    handoff.settle(fresh);
+    handoff.settle(&mut fresh.capture_poller);
     fresh.plugin_revival_pending = plugin_revival_pending;
 }
 
@@ -687,17 +647,16 @@ pub(super) fn merge_runtime_fields(prior: Instance, fresh: &mut Instance) {
 /// status, panes and detection this tick's tmux scrape already decided, and so
 /// must keep them: [`merge_runtime_fields`] would carry the prior row's
 /// observations back over the fresh ones. The poller guards are the same
-/// [`PollerHandoff`] the full merge applies, because the poller and its repair
+/// [`Handoff`] the full merge applies, because the poller and its repair
 /// window are launch-owned whatever decided the status, and `plugin_revival_pending`
 /// is `#[serde(skip)]` like the poller, so a fresh disk load defaults it.
 fn merge_process_runtime_fields(prior: Instance, fresh: &mut Instance) {
-    let handoff = PollerHandoff::decide(&prior, fresh);
-    handoff.stop_unservable(&prior);
+    let handoff = Handoff::decide(&prior.capture_poller, prior.held(), fresh.held());
     // `#[serde(skip)]` like the poller, so a fresh disk load defaults it and a
     // revival slower than one tick would stop counting toward its plugin cap.
     let plugin_revival_pending = prior.plugin_revival_pending;
     fresh.inherit_process_runtime(prior);
-    handoff.settle(fresh);
+    handoff.settle(&mut fresh.capture_poller);
     fresh.plugin_revival_pending = plugin_revival_pending;
 }
 
@@ -2531,6 +2490,7 @@ mod tests {
                 extra_env: None,
                 custom_instruction: None,
                 before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
                 container_workdir: None,
             });
             let mut prev = std::collections::HashMap::from([(row.id.clone(), status)]);
@@ -3053,7 +3013,7 @@ mod tests {
             Some(vec![reloaded.tmux_session().unwrap().name().to_string()]),
             None,
         );
-        reloaded.repair_session_id_poller_if_needed(&snapshot);
+        reloaded.reconcile_capture_poller(&snapshot);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             crate::session::sync::drain_and_persist_session_ids(
@@ -3067,7 +3027,7 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        reloaded.stop_poller();
+        reloaded.capture_poller.stop();
         let stored = storage.load().unwrap().remove(0);
         assert_eq!(stored.agent_session_id.as_deref(), Some(sid.as_str()));
         assert_eq!(
@@ -3110,20 +3070,20 @@ mod tests {
             // What the repair walk leaves behind on a row with no poller: a re-probe ladder and a
             // store-retry deadline.
             let mut prior = Instance::new("poller-less", "/tmp/poller-less");
-            prior.poller_repair.reprobe(now);
+            prior.capture_poller.repair_mut().reprobe(now);
             let deadline = now + std::time::Duration::from_secs(30);
-            prior.session_id_poller_retry_after = Some(deadline);
-            assert!(prior.session_id_poller.is_none());
+            prior.capture_poller.set_retry_after(Some(deadline));
+            assert!(prior.capture_poller.handle().is_none());
 
             let merged = merge(prior, Instance::new("poller-less", "/tmp/poller-less"));
 
             assert_eq!(
-                merged.poller_repair.current_reprobe_delay(),
+                merged.capture_poller.repair().current_reprobe_delay(),
                 Some(std::time::Duration::from_secs(5)),
                 "the row keeps its window, or it re-resolves every tick"
             );
             assert_eq!(
-                merged.session_id_poller_retry_after,
+                merged.capture_poller.retry_after(),
                 Some(deadline),
                 "and so does its store-retry deadline"
             );
@@ -3132,20 +3092,24 @@ mod tests {
             // armed for the old one and paces nothing this row can still use.
             let mut prior = Instance::new("replaced", "/tmp/replaced");
             prior.active_execution = execution("launch-1");
-            prior.poller_repair.reprobe(now);
+            prior.capture_poller.repair_mut().reprobe(now);
             let deadline = now + std::time::Duration::from_secs(30);
-            prior.session_id_poller_retry_after = Some(deadline);
+            prior.capture_poller.set_retry_after(Some(deadline));
             let mut fresh = Instance::new("replaced", "/tmp/replaced");
             fresh.active_execution = execution("launch-2");
 
             let merged = merge(prior, fresh);
 
             assert!(
-                merged.poller_repair.due(std::time::Instant::now()),
+                merged
+                    .capture_poller
+                    .repair()
+                    .due(std::time::Instant::now()),
                 "a window armed for the superseded execution does not hold the new one back"
             );
             assert_eq!(
-                merged.session_id_poller_retry_after, None,
+                merged.capture_poller.retry_after(),
+                None,
                 "and neither does the deadline that went with it"
             );
         }
@@ -3174,7 +3138,7 @@ mod tests {
             crate::session::poller::PollerSpawn::Spawned
         );
         let poller = std::sync::Arc::new(std::sync::Mutex::new(poller));
-        prior.session_id_poller = Some(poller.clone());
+        prior.capture_poller.set_handle(Some(poller.clone()));
         prior.plugin_revival_pending = true;
         assert!(
             prior.active_execution.is_none(),
@@ -3197,10 +3161,10 @@ mod tests {
 
         assert_eq!(merged.tool, "codex");
         assert!(
-            merged.session_id_poller.is_none(),
+            merged.capture_poller.handle().is_none(),
             "the previous agent's watcher does not follow the row to a new one"
         );
-        // `Instance::session_id_poller` holds a `std::sync::Mutex`, so this reads the guard
+        // `Instance::capture_poller` holds a `std::sync::Mutex`, so this reads the guard
         // through `matches!` rather than unwrapping a poisoning error the type can raise.
         assert!(
             matches!(poller.lock(), Ok(poller) if !poller.is_running()),
@@ -3229,24 +3193,26 @@ mod tests {
         });
         for merge in mergers {
             let mut prior = Instance::new("poller-less", "/tmp/poller-less");
-            prior.poller_repair.reprobe(now);
+            prior.capture_poller.repair_mut().reprobe(now);
             let deadline = now + std::time::Duration::from_secs(30);
-            prior.session_id_poller_retry_after = Some(deadline);
+            prior.capture_poller.set_retry_after(Some(deadline));
 
             let merged = merge(prior, Instance::new("poller-less", "/tmp/poller-less"));
 
             assert_eq!(
-                merged.poller_repair.current_reprobe_delay(),
+                merged.capture_poller.repair().current_reprobe_delay(),
                 Some(std::time::Duration::from_secs(5)),
                 "the row keeps its window, or it re-resolves every tick"
             );
-            assert_eq!(merged.session_id_poller_retry_after, Some(deadline));
+            assert_eq!(merged.capture_poller.retry_after(), Some(deadline));
 
             // The same row, another agent: the window paces the previous agent's capture.
             let mut prior = Instance::new("other-agent", "/tmp/other-agent");
             prior.tool = "claude".to_string();
-            prior.poller_repair.reprobe(now);
-            prior.session_id_poller_retry_after = Some(now + std::time::Duration::from_secs(30));
+            prior.capture_poller.repair_mut().reprobe(now);
+            prior
+                .capture_poller
+                .set_retry_after(Some(now + std::time::Duration::from_secs(30)));
             let mut fresh = Instance::new("other-agent", "/tmp/other-agent");
             fresh.tool = "codex".to_string();
 
@@ -3254,11 +3220,15 @@ mod tests {
 
             assert_eq!(merged.tool, "codex");
             assert!(
-                merged.poller_repair.due(std::time::Instant::now()),
+                merged
+                    .capture_poller
+                    .repair()
+                    .due(std::time::Instant::now()),
                 "a window armed for the previous agent does not hold this one back"
             );
             assert_eq!(
-                merged.session_id_poller_retry_after, None,
+                merged.capture_poller.retry_after(),
+                None,
                 "and neither does the deadline that went with it"
             );
         }
@@ -3347,7 +3317,7 @@ mod tests {
                 assert_eq!(row.unknown_since, Some(unknown));
                 assert_eq!(row.detection.pending, Some(Status::Idle));
                 assert_eq!(row.last_accessed_at, Some(accessed));
-                assert!(row.session_id_poller.is_none());
+                assert!(row.capture_poller.handle().is_none());
             }
             let replacement = tempfile::tempdir().unwrap();
             assert_ne!(identity(outside.path()), identity(replacement.path()));

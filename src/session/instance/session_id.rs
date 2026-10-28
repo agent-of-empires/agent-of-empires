@@ -511,7 +511,7 @@ impl Instance {
         now: std::time::Instant,
     ) -> bool {
         self.needs_session_id_backfill()
-            && self.poller_repair.due(now)
+            && self.capture_poller.repair().due(now)
             && !self.has_live_agent_pane_in(live)
     }
 
@@ -543,10 +543,10 @@ impl Instance {
         }
         // Only a released, applied CAS fills the previously missing id.
         if self.agent_session_id.is_some() {
-            self.poller_repair.reset();
+            self.capture_poller.reset_repair();
             true
         } else {
-            self.poller_repair.reprobe(std::time::Instant::now());
+            self.capture_poller.reprobe(std::time::Instant::now());
             false
         }
     }
@@ -1819,7 +1819,7 @@ work-opencode = "opencode"
                     persisted[0].agent_session_id.as_deref(),
                     (published && !rejected).then_some(SID)
                 );
-                assert!(rows[0].session_id_poller.is_none());
+                assert!(rows[0].capture_poller.handle().is_none());
                 assert!(persisted[0].lifecycle_reservation.is_none());
                 if !published || rejected {
                     assert_eq!(std::fs::read(&registry).unwrap(), before);
@@ -2148,7 +2148,7 @@ work-opencode = "opencode"
         assert_eq!(cmd, "gemini");
         inst.capture_started_at = Some(std::time::SystemTime::now());
         inst.maybe_start_poller_since();
-        assert!(inst.session_id_poller.is_none());
+        assert!(inst.capture_poller.handle().is_none());
     }
 
     /// A command's own session selector skips AoE injection, and conflicts with AoE state.

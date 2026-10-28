@@ -1,4 +1,5 @@
 import type { ElicitationAnswer } from "../../lib/acpTypes";
+import { CopyMarkdownButton } from "./CopyMarkdownButton";
 
 interface Props {
   answers: ElicitationAnswer[];
@@ -19,6 +20,13 @@ export function ElicitationAnswerCard({ answers }: Props) {
         <span className="rounded bg-brand-600/15 px-1.5 py-0.5 font-mono text-brand-300">answer</span>
         <span>
           {answers.length} answer{answers.length === 1 ? "" : "s"}
+        </span>
+        <span className="ml-auto">
+          <CopyMarkdownButton
+            compact
+            source={answers.map((a) => `**${a.question}**\n${a.answer}`).join("\n\n")}
+            label="Copy answers"
+          />
         </span>
       </div>
       <ul className="flex flex-col gap-2">

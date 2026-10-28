@@ -2710,6 +2710,7 @@ mod tests {
             custom_instruction: None,
             container_workdir: Some("/workspace/project".into()),
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
         });
         let config = inst.build_container_config_for_test().unwrap();
         let _transport = super::super::test_helpers::install_container_transport(
@@ -3724,6 +3725,7 @@ mod tests {
             custom_instruction: None,
             container_workdir: Some("/workspace/project".into()),
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
         });
         let config = inst.build_container_config_for_test().unwrap();
         let _transport = super::super::test_helpers::install_container_transport(

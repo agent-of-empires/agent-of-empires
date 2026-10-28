@@ -271,6 +271,7 @@ export async function seedSettings(
     persistentTerminals?: boolean;
     mobileToolbarKeys?: string[];
     showArrowJoystick?: boolean;
+    showForwardScrollbar?: boolean;
   },
 ) {
   await page.evaluate((settings) => {

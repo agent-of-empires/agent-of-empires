@@ -27,6 +27,10 @@ export interface AcpSessionMockOptions {
   startingAgent?: string;
   /** Overrides the reported `acp_worker_state`. */
   workerState?: "absent" | "resuming" | "running" | "stopping";
+  /** The Session's `acp_session_id`, set once its Agent session exists. */
+  acpSessionId?: string;
+  /** An import whose history hasn't loaded yet; its `acp_session_id` is set from creation. */
+  importPending?: boolean;
 }
 
 export interface AcpSessionMock {
@@ -163,6 +167,23 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
       }),
     );
   }
+  await page.route("**/api/agents", (r) =>
+    r.fulfill({
+      json: [
+        {
+          name: "claude",
+          display_name: "Claude Code",
+          kind: "builtin",
+          binary: "claude",
+          host_only: false,
+          installed: true,
+          install_hint: "",
+          acp_capable: true,
+          acp_installed: true,
+        },
+      ],
+    }),
+  );
   await page.route("**/api/about", (r) => r.fulfill({ json: opts.about ?? {} }));
   await page.route("**/api/telemetry/seen", (r) => {
     const body = r.request().postData();
@@ -205,6 +226,8 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
               opts.workerState ??
               (opts.trashedAt || opts.archivedAt ? "stopped" : opts.workerStarting ? "resuming" : "running"),
             ...(opts.workerStarting ? { acp_agent: opts.startingAgent ?? "claude" } : {}),
+            ...(opts.acpSessionId ? { acp_session_id: opts.acpSessionId } : {}),
+            ...(opts.importPending ? { import_pending: true } : {}),
             claude_fullscreen: false,
           },
         ],

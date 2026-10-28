@@ -716,8 +716,7 @@ impl Instance {
 
         // A takeover can replace the pane without changing the agent or the execution, and a poller
         // for either would then be watching the pane this launch is replacing.
-        self.stop_poller();
-        self.session_id_poller = None;
+        self.capture_poller.clear();
         if !self.is_sandboxed() {
             self.install_agent_status_hooks(self.status_agent());
         }
@@ -1141,7 +1140,7 @@ impl Instance {
 
         // A launch re-evaluates the row, so its schedule goes. Clearing the working copy is not
         // enough: the live row keeps its own until the relaunch merge sees the stamp below.
-        self.poller_repair.reset();
+        self.capture_poller.reset_repair();
         self.maybe_start_poller_since_in(CaptureStorage::Scoped(storage))?;
 
         self.status = Status::Starting;

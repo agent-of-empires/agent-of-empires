@@ -20,6 +20,7 @@ export function useForwardInput({
   mouseSgrRef,
   pointerCell,
   inputPaneMiddleRow,
+  inputPaneMiddleCol,
   forwardWheel,
   forwardButton,
   inputRef,
@@ -32,6 +33,7 @@ export function useForwardInput({
   mouseSgrRef: RefObject<boolean>;
   pointerCell: (clientX: number, clientY: number) => Cell;
   inputPaneMiddleRow: () => number;
+  inputPaneMiddleCol: () => number;
   forwardWheel: (up: boolean, sgr: boolean, col: number, row: number) => void;
   forwardButton: (
     baseButton: number,
@@ -79,6 +81,20 @@ export function useForwardInput({
       });
     },
     [lineH, notchPacer, pointerCell, forwardWheel, forwardModeRef, mouseSgrRef, inputPaneMiddleRow],
+  );
+  // The scrollbar sits outside the pane, so it reports at the pane's centre like an app-neutral wheel.
+  // Negative scrolls up.
+  const scrollNotches = useCallback(
+    (notches: number) => {
+      if (notches === 0) return;
+      notchPacer.enqueue(notches, (up, count) => {
+        if (!forwardModeRef.current) return;
+        const col = inputPaneMiddleCol();
+        const row = inputPaneMiddleRow();
+        for (let i = 0; i < count; i++) forwardWheel(up, mouseSgrRef.current, col, row);
+      });
+    },
+    [notchPacer, forwardWheel, forwardModeRef, mouseSgrRef, inputPaneMiddleCol, inputPaneMiddleRow],
   );
   useEffect(() => cancelTouchWheelQueue, [cancelTouchWheelQueue]);
   // A frame after a forwarded notch acknowledges it, releasing the next burst.
@@ -187,6 +203,7 @@ export function useForwardInput({
     wheelAccumRef,
     onWheel,
     enqueueTouchWheelDelta,
+    scrollNotches,
     cancelTouchWheelQueue,
     startMomentum,
     stopMomentum,

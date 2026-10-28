@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { AgentProfileProvider } from "../../lib/agentProfileContext";
@@ -30,6 +30,7 @@ function renderWithProfile(
     sendNowInterrupts?: boolean;
     pendingResume?: boolean;
     waitingFor?: string | null;
+    agent?: string;
   } = {},
 ) {
   return render(
@@ -44,12 +45,34 @@ function renderWithProfile(
         sendNowInterrupts={opts.sendNowInterrupts ?? false}
         pendingResume={opts.pendingResume ?? false}
         waitingFor={opts.waitingFor}
+        agent={opts.agent ?? "Claude Code"}
       />
     </AgentProfileProvider>,
   );
 }
 
 describe("QueuedPromptsStrip", () => {
+  it.each<[string, QueuedPrompt[], string]>([
+    // The Daemon holds confirmed rows, so they send with no tab open.
+    ["Daemon-held rows", [mk("a", "hello")], "Sends when Codex is free, even if you close this tab."],
+    // An unconfirmed row lives only in this browser until it reaches the Daemon.
+    [
+      "a strip with a pending row",
+      [mk("a", "hello"), { ...mk("b", "later"), pending: true }],
+      "A message isn't sent yet. This browser sends it when you're back online or reopen this chat.",
+    ],
+  ])("explains %s in a tooltip that opens on keyboard focus", (_label, queued, tip) => {
+    renderWithProfile("codex", queued, { agent: "Codex" });
+    const header = screen.getByTestId("queued-strip-header");
+    expect(header.hasAttribute("title")).toBe(false);
+    expect(screen.queryByRole("tooltip")).toBeNull();
+    act(() => header.focus());
+    expect(document.activeElement).toBe(header);
+    const tooltip = screen.getByRole("tooltip");
+    expect(tooltip.textContent).toBe(tip);
+    expect(tooltip.textContent).not.toMatch(/tab stays open|other devices|Three closed chats/);
+  });
+
   it.each<[string, boolean, string | null, string]>([
     ["a new Session names the Agent it waits for", true, "Claude Code", "Pending until Claude Code is ready (1)"],
     ["a resumed Session waits to resume", true, null, "Pending until session resumes (1)"],
