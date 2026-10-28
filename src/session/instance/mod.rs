@@ -84,7 +84,9 @@ pub use resume::ManagedResumeCause;
 pub(crate) use resume::{
     LaunchReservation, ManagedResumeRefused, ResumeAttemptPolicy, ResumeLaunchOptions,
 };
-pub(crate) use sid_persist::{persist_session_to_storage, SidPersistOutcome, SidWrite};
+pub(crate) use sid_persist::{
+    persist_session_to_storage, CaptureCommit, SidPersistOutcome, SidWrite,
+};
 pub use start::{LaunchSidOutcome, StartOutcome};
 pub(crate) use status::PassiveStatusPatch;
 pub use status::{Status, TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR};

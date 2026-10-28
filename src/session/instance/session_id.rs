@@ -469,10 +469,10 @@ impl Instance {
             .try_retroactive_capture_in(CaptureStorage::Profiles(&file_watch))
             .ok()
             .flatten();
-        let applied = captured.as_ref().is_some_and(|captured| {
-            self.resume_probe_failed_sid.as_deref() != Some(captured.sid.as_str())
-                && persist_session_to_storage(profile, &self.id, captured, &expected, &file_watch)
-                    == SidWrite::Applied
+        let commit = captured.as_ref().and_then(|captured| {
+            (self.resume_probe_failed_sid.as_deref() != Some(captured.sid.as_str())).then(|| {
+                persist_session_to_storage(profile, &self.id, captured, &expected, &file_watch)
+            })
         });
         let released = storage.update(|instances, _groups| {
             let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
@@ -491,11 +491,11 @@ impl Instance {
         }
         self.lifecycle_generation = generation;
         self.lifecycle_reservation = None;
-        if applied {
+        if let Some(commit) = commit.filter(|commit| commit.outcome == SidWrite::Applied) {
             if let Some(observation) = captured {
                 self.apply_conversation_observation(&observation);
             }
-            self.resume_probe_failed_sid = None;
+            self.resume_probe_failed_sid = commit.failed_sid;
             tracing::info!(
                 target: "session.store",
                 instance = %self.id,
