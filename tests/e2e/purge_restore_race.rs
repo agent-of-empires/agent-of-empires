@@ -119,8 +119,16 @@ fn purge_refused_while_restore_reservation_present_then_removes_row() {
     inject_reservation(&h, "RacePurge", "restore");
 
     let stderr = h.run_cli_err(&["rm", "--purge", "RacePurge"]);
+    // Stale consent or a fresh Restore reservation: both refuse before teardown,
+    // depending on whether the daemon reload published the injected generation.
     assert!(
-        stderr.contains("Selected trash lifecycle changed before purge"),
+        [
+            "Selected trash lifecycle changed before purge",
+            "busy with another operation",
+            "lifecycle_busy",
+        ]
+        .iter()
+        .any(|message| stderr.contains(message)),
         "unexpected stderr:\n{stderr}"
     );
     // The row must survive with the peer's Restore claim intact.
