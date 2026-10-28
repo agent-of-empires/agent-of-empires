@@ -2220,6 +2220,9 @@ fn run_destroy_hooks(instance: &Instance, detach: bool, config: &crate::session:
 
 const BEFORE_DESTROY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Client wait for a purge RPC: several `before_destroy` hooks plus teardown.
+pub const PURGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// Host-side on every session kind, so it never targets the container.
 fn run_before_destroy_hooks(instance: &Instance, detach: bool, commands: &[String]) {
     if commands.is_empty() {
