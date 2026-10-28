@@ -978,14 +978,15 @@ export function SessionWizard({
               error={
                 state.error ??
                 (projectUnresolved ? REGISTRY_UNRESOLVED_ERROR : null) ??
-                (state.agentsStatus === "failed" ? AGENTS_UNAVAILABLE_ERROR : null) ??
+                (!nameOnly && state.agentsStatus === "failed" ? AGENTS_UNAVAILABLE_ERROR : null) ??
                 (unknownOutcome ? UNKNOWN_OUTCOME_ERROR : null)
               }
               onSubmit={handleSubmit}
               nameOnly={nameOnly}
               defaultsReady={
                 defaultsReady &&
-                state.agentsStatus === "ready" &&
+                // Only the Yolo row needs the agent list, and a name-only form has none.
+                (nameOnly || state.agentsStatus === "ready") &&
                 !profileSwitching &&
                 !projectUnresolved &&
                 !(d.sandboxEnabled && !state.dockerChecked)

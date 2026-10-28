@@ -1825,7 +1825,7 @@ mod tests {
     #[test]
     fn always_yolo_follows_each_agents_declaration() {
         for agent in AGENTS {
-            let declared = matches!(agent.yolo, Some(YoloMode::AlwaysYolo));
+            let declared = agent.yolo.as_ref().is_some_and(YoloMode::always_on);
             assert_eq!(is_always_yolo(agent.name), declared, "{}", agent.name);
         }
         for name in ["pi", "settl", "prime-agent"] {

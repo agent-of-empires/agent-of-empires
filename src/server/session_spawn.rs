@@ -150,8 +150,6 @@ pub(crate) async fn spawn_structured_session(
             fork_seed,
             progress,
         } = spec;
-        // The agent skips permission prompts whatever the client asked, so record that.
-        let yolo_mode = yolo_mode || crate::agents::is_always_yolo(&tool);
 
         let sandbox_image = sandbox_image.unwrap_or_else(|| {
             if config.sandbox.default_image.is_empty() {
@@ -409,6 +407,19 @@ pub(crate) async fn spawn_structured_session(
                 }
             }
 
+            // An always-Yolo agent skips permission prompts whatever the client asked, so record
+            // that for the agent this session actually runs.
+            let runs = if instance.is_structured() {
+                agent_key.as_str()
+            } else {
+                instance.tool.as_str()
+            };
+            instance.yolo_mode |= crate::acp::runs_always_yolo(
+                runs,
+                &resolved_config.session.agent_acp_cmd,
+                &resolved_config.session.agent_detect_as,
+            );
+
             if !instance.is_structured() {
                 agent_effort = None;
                 // Terminal sessions keep only an explicitly requested model,
@@ -504,6 +515,7 @@ pub(crate) async fn spawn_structured_session(
                     _ => return Err(crate::session::LifecycleReservationError::Superseded.into()),
                 }
                 row.view = instance.view;
+                row.yolo_mode = instance.yolo_mode;
                 row.agent_model = instance.agent_model.clone();
                 row.acp_effort = instance.acp_effort.clone();
                 row.fork_pending = instance.fork_pending.clone();

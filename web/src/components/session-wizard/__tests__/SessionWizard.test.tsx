@@ -68,6 +68,8 @@ const INSTRUCTION_KEY = "aoe-new-session-last-instruction";
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // clearAllMocks keeps queued answers, and a test can leave some unread.
+  vi.mocked(fetchAgents).mockReset().mockResolvedValue([]);
   localStorage.clear();
   createSession.mockResolvedValue({ ok: true, session: { id: "s1" } });
   reviewCreationTrust.mockResolvedValue({
@@ -1122,6 +1124,18 @@ describe("SessionWizard Yolo mode", () => {
     await launch();
     await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
     expect(payload()).toMatchObject({ tool: "pi", yolo_mode: true });
+  });
+
+  it("launches a name-only form without the agent list", async () => {
+    // The retry never answers, so the list stays failed.
+    vi.mocked(fetchAgents)
+      .mockResolvedValueOnce(null)
+      .mockReturnValueOnce(new Promise(() => {}));
+    render(<SessionWizard servedProfile="default" onClose={vi.fn()} onCreated={vi.fn()} nameOnly />);
+    await waitFor(() => expect(fetchAgents).toHaveBeenCalled());
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(screen.queryByText(/Couldn't load the agent list/)).toBeNull();
   });
 });
 

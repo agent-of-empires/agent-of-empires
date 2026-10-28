@@ -146,27 +146,30 @@ fn build_custom_agent_infos(
                 && !command.trim().is_empty()
                 && crate::agents::get_agent(name).is_none()
         })
-        .map(|(name, _command)| AgentInfo {
-            lifecycle: crate::agents::AgentLifecycle::Active,
-            kind: "custom".to_string(),
-            name: name.clone(),
-            binary: name.clone(),
-            host_only: false,
-            always_yolo: false,
-            installed: true,
-            install_hint: "Configured custom agent".to_string(),
-            oneshot_capable: false,
-            acp_capable: agent_acp_cmd
+        .map(|(name, _command)| {
+            let own_adapter = agent_acp_cmd
                 .get(name)
-                .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(name, cmd).is_ok())
-                || crate::acp::inherited_acp_base(name, agent_detect_as).is_some(),
-            acp_allowed: policy.allows(name),
-            // Set by `list_agents`, which holds the config the probe needs.
-            acp_installed: false,
-            // Custom agents' command values are deliberately never
-            // serialized here; they can hold hostnames or secrets.
-            acp_command: None,
-            acp_args: Vec::new(),
+                .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(name, cmd).is_ok());
+            let base = crate::acp::inherited_acp_base(name, agent_detect_as);
+            AgentInfo {
+                lifecycle: crate::agents::AgentLifecycle::Active,
+                kind: "custom".to_string(),
+                name: name.clone(),
+                binary: name.clone(),
+                host_only: false,
+                always_yolo: crate::acp::runs_always_yolo(name, agent_acp_cmd, agent_detect_as),
+                installed: true,
+                install_hint: "Configured custom agent".to_string(),
+                oneshot_capable: false,
+                acp_capable: own_adapter || base.is_some(),
+                acp_allowed: policy.allows(name),
+                // Set by `list_agents`, which holds the config the probe needs.
+                acp_installed: false,
+                // Custom agents' command values are deliberately never
+                // serialized here; they can hold hostnames or secrets.
+                acp_command: None,
+                acp_args: Vec::new(),
+            }
         })
         .collect();
     entries.sort_by(|left, right| left.name.cmp(&right.name));
@@ -3355,6 +3358,23 @@ mod tests {
             !cursor.acp_capable,
             "wrapper inheriting a terminal-only base stays tmux-only"
         );
+    }
+
+    #[test]
+    fn a_custom_agent_is_always_yolo_only_when_it_runs_an_always_yolo_base() {
+        let custom = custom_agents(&[
+            ("my-pi", "pi --profile work"),
+            ("own-pi", "pi"),
+            ("my-claude", "claude"),
+        ]);
+        let detect_as =
+            custom_agents(&[("my-pi", "pi"), ("own-pi", "pi"), ("my-claude", "claude")]);
+        let acp = custom_agents(&[("own-pi", "own-pi-acp")]);
+        let entries = build_custom_agent_infos(&custom, &acp, &detect_as, &unrestricted());
+        for (name, expected) in [("my-pi", true), ("own-pi", false), ("my-claude", false)] {
+            let entry = entries.iter().find(|e| e.name == name).unwrap();
+            assert_eq!(entry.always_yolo, expected, "{name}");
+        }
     }
 
     /// The wizard names the runtime that isn't running, so it's reported

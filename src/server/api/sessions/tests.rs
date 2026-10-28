@@ -891,19 +891,47 @@ async fn an_always_yolo_agent_records_yolo_mode_whatever_the_request_says() -> a
     crate::session::config::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
     })?;
+    let adapters = crate::session::test_support::stub_claude_adapter_on_agent_path();
+    crate::session::test_support::write_stub_adapter(adapters.path(), "pi-acp");
+    crate::session::config::update_config(|config| {
+        config
+            .session
+            .custom_agents
+            .insert("my-pi".into(), "pi".into());
+        config
+            .session
+            .agent_detect_as
+            .insert("my-pi".into(), "pi".into());
+    })?;
     let project = tempfile::tempdir()?;
-    let state = crate::server::test_support::build_test_app_state(Vec::new());
+    let (launcher, _launches) = crate::server::test_support::counting_failing_launcher();
+    let state =
+        crate::server::test_support::build_test_app_state_with_launcher(Vec::new(), launcher);
     let storage = Storage::new("always-yolo", state.file_watch.clone())?;
     *state.canonical_metadata.write().await =
         crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
     let mut panes = Vec::new();
     let mut guarded = std::collections::HashSet::new();
-    for (tool, expected) in [("pi", true), ("claude", false)] {
-        let body = serde_json::from_value(serde_json::json!({
+    // A structured session runs the agent `agent_name` picks, not `tool`.
+    let terminal = serde_json::json!({ "command_override": "sleep 120" });
+    let structured = |agent: &str| serde_json::json!({ "view": "structured", "agent_name": agent });
+    for (tool, extra, expected) in [
+        ("pi", terminal.clone(), true),
+        ("claude", terminal, false),
+        ("pi", structured("claude"), false),
+        ("claude", structured("pi"), true),
+        // A custom agent without its own adapter runs the base it inherits.
+        ("claude", structured("my-pi"), true),
+    ] {
+        let label = format!("{tool} {extra}");
+        let mut body = serde_json::json!({
             "title": format!("yolo {tool}"), "path": project.path(),
-            "tool": tool, "command_override": "sleep 120",
-            "profile": "always-yolo", "yolo_mode": false,
-        }))?;
+            "tool": tool, "profile": "always-yolo", "yolo_mode": false,
+        });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let body = serde_json::from_value(body)?;
         let response = create_session(
             State(state.clone()),
             axum::extract::Query(create::CreateSessionQuery { wait: None }),
@@ -926,11 +954,11 @@ async fn an_always_yolo_agent_records_yolo_mode_whatever_the_request_says() -> a
         assert_eq!(
             status,
             StatusCode::CREATED,
-            "{tool}: {}",
+            "{label}: {}",
             String::from_utf8_lossy(&bytes)
         );
         let row: SessionResponse = serde_json::from_slice(&bytes)?;
-        assert_eq!(row.yolo_mode, expected, "{tool}");
+        assert_eq!(row.yolo_mode, expected, "{label}");
     }
     Ok(())
 }
