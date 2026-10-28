@@ -74,6 +74,8 @@ pub struct InstanceParams {
     /// Additional environment entries for the container.
     /// `KEY` = pass through from host, `KEY=VALUE` = set explicitly.
     pub extra_env: Vec<String>,
+    /// Host-only env for `host_hooks.before_start`; never enters the container.
+    pub before_start_hook_env: Vec<String>,
     /// Extra arguments to append after the agent binary
     pub extra_args: String,
     /// Command override for the agent binary (replaces the default binary)
@@ -925,6 +927,11 @@ pub(crate) fn plan_instance(
             &params.extra_env
         };
         warnings.extend(crate::session::validate_env_entries(effective_env));
+        warnings.extend(
+            crate::session::validate_env_entries(&params.before_start_hook_env)
+                .into_iter()
+                .map(|w| w.replace("empty in the container", "skipped by the host hook")),
+        );
 
         instance.sandbox_info = Some(SandboxInfo {
             enabled: true,
@@ -938,6 +945,7 @@ pub(crate) fn plan_instance(
             },
             custom_instruction: config.sandbox.custom_instruction.clone(),
             before_start_env: Vec::new(),
+            before_start_hook_env: params.before_start_hook_env.clone(),
             provider: None,
             container_workdir: None,
         });
@@ -2835,6 +2843,7 @@ mod tests {
             sandbox_image: "ubuntu:latest".to_string(),
             yolo_mode: false,
             extra_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: Vec::new(),
@@ -2842,6 +2851,30 @@ mod tests {
             scratch: false,
             fork_seed: None,
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_instance_keeps_hook_env_off_the_container_env() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
+        let runtime = containers::get_container_runtime();
+        if !runtime.is_available() || !runtime.is_daemon_running() {
+            return;
+        }
+        let project = tempfile::tempdir().unwrap();
+        let mut params = custom_agent_params(project.path(), "claude");
+        params.sandbox = true;
+        params.extra_env = vec!["A=1".into()];
+        params.before_start_hook_env = vec!["TOKEN".into(), "H=2".into()];
+
+        let sandbox = build_instance(params, &[], &[], "default")
+            .unwrap()
+            .instance
+            .sandbox_info
+            .unwrap();
+        assert_eq!(sandbox.before_start_hook_env, ["TOKEN", "H=2"]);
+        assert_eq!(sandbox.extra_env, Some(vec!["A=1".to_string()]));
     }
 
     #[test]
@@ -3080,6 +3113,7 @@ mod tests {
             sandbox_image: String::new(),
             yolo_mode: false,
             extra_env: vec![],
+            before_start_hook_env: vec![],
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: vec![],
@@ -3152,6 +3186,7 @@ mod tests {
             sandbox_image: String::new(),
             yolo_mode: false,
             extra_env: vec![],
+            before_start_hook_env: vec![],
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: vec![],

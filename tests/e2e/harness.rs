@@ -214,7 +214,8 @@ pub fn wait_for_port(port: u16, timeout: Duration) -> bool {
     false
 }
 
-/// Retry `Err` until `Ok` or timeout. Probe panics abort polling.
+/// Retry `Err` until `Ok`; at the deadline, panic with the last error.
+/// Probe panics abort polling immediately.
 pub fn wait_until<T>(
     timeout: Duration,
     interval: Duration,
@@ -445,6 +446,9 @@ impl TuiTestHarness {
         let config_content = format!(
             r#"[updates]
 update_check_mode = "off"
+
+[acp]
+structured_view = "off"
 
 {SYSTEMD_OFF}
 [app_state]
@@ -789,7 +793,14 @@ last_seen_version = "{}"
     /// Build the shell command string to run inside the tmux session.
     /// When recording, wraps the command with `asciinema rec`.
     fn build_tmux_command(&mut self, args: &[&str]) -> String {
-        let mut aoe_cmd = self.binary_path.display().to_string();
+        let runtime_state = self.home_dir.path().join("runtime-state");
+        // A respawned TUI must not read as ready before its first draw.
+        let _ = std::fs::remove_file(&runtime_state);
+        let mut aoe_cmd = format!(
+            "env AOE_E2E_RUNTIME_STATE={} {}",
+            shell_words::quote(runtime_state.to_str().expect("runtime state path")),
+            self.binary_path.display()
+        );
         if self.input_barrier {
             let path = self.home_dir.path().join("input-barrier");
             aoe_cmd = format!(
@@ -1286,6 +1297,24 @@ last_seen_version = "{}"
     /// the many fast, steady-state waits that follow.
     pub fn wait_for_ready(&self) {
         self.wait_for_timeout(" aoe ", Duration::from_secs(30));
+    }
+
+    /// Wait until the runtime is connected, has applied every change this TUI sent, and grants
+    /// native interaction (what the footer once called "Runtime ready"). The TUI reports it in
+    /// `AOE_E2E_RUNTIME_STATE`, which every TUI this harness spawns writes.
+    pub fn wait_for_runtime_ready(&self) {
+        let path = self.home_dir.path().join("runtime-state");
+        let timeout = Duration::from_secs(10);
+        let start = Instant::now();
+        while std::fs::read_to_string(&path).ok().as_deref() != Some("ready") {
+            if start.elapsed() > timeout {
+                panic!(
+                    "Timed out waiting for the runtime after {timeout:?}.\n\n--- Screen capture ---\n{}\n--- End screen capture ---",
+                    self.capture_screen()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     /// Like `wait_for` but with a custom timeout.

@@ -5,6 +5,7 @@ import {
   ChevronRight,
   CircleDot,
   CircleStop,
+  Container,
   FolderPen,
   FolderPlus,
   Folders,
@@ -97,6 +98,7 @@ export interface SingleRowActions {
   stop: (sessionId: string) => void;
   start: (sessionId: string) => void;
   restartUpdate: (sessionId: string) => void;
+  recreateContainer: (sessionId: string) => void;
   notify: (preset: NotifyPreset) => void;
   color: (color: string | null) => void;
   pin: () => void;
@@ -223,6 +225,13 @@ export function SingleRowMenuItems({
                 label: "Switch agent",
                 testId: "sidebar-context-menu-switch-agent",
                 glyph: icon(ArrowLeftRight),
+                indent: true,
+              })}
+            {write &&
+              item("recreateContainer", {
+                label: "Recreate container",
+                testId: "sidebar-context-menu-recreate-container",
+                glyph: icon(Container),
                 indent: true,
               })}
             {write &&

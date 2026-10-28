@@ -628,7 +628,7 @@ fn before_session_mints_environment_for_structured_worker() {
     }
 }
 
-/// Seeded config plus the wizard's Structured toggle, over a daemon.
+/// Seeded config with the structured view offered, over a daemon.
 fn structured_tui_harness(name: &str) -> TuiTestHarness {
     let script = r#"{
   "turns": [
@@ -648,7 +648,10 @@ fn structured_tui_harness(name: &str) -> TuiTestHarness {
     let seeded = std::fs::read_to_string(&config_path).expect("read seeded config");
     std::fs::write(
         &config_path,
-        format!("{seeded}\n[acp]\noffer_structured_in_new_session = true\n"),
+        seeded.replace(
+            "structured_view = \"off\"",
+            "structured_view = \"structured\"",
+        ),
     )
     .expect("write config");
     init_git_repo(&h.project_path());
@@ -668,7 +671,7 @@ fn wizard_created_structured_session_opens_structured_view() {
     let project = h.project_path();
 
     h.spawn_tui();
-    h.wait_for("Runtime ready");
+    h.wait_for_runtime_ready();
     h.send_keys("n");
     h.wait_for(" New Session ");
     h.send_keys("C-u");
@@ -683,8 +686,6 @@ fn wizard_created_structured_session_opens_structured_view() {
     {
         h.send_keys("Tab");
     }
-    h.assert_screen_contains("[ ] Structured view");
-    h.send_keys("Space");
     h.assert_screen_contains("[x] Structured view");
     h.send_keys("Enter");
 

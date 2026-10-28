@@ -9,7 +9,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
+import { writeClipboard } from "../../../lib/clipboard";
 import { StartupErrorScreen } from "../StartupErrorScreen";
+
+vi.mock("../../../lib/clipboard", () => ({ writeClipboard: vi.fn().mockResolvedValue(true) }));
 
 const fetchSettings = vi.fn();
 const installAcpAgent = vi.fn();
@@ -300,5 +303,13 @@ describe("StartupErrorScreen", () => {
       expect(installAcpAgent).toHaveBeenCalledWith("s1");
       await waitFor(spawnCall);
     });
+  });
+});
+
+describe("StartupErrorScreen copy", () => {
+  it("copies the install command", () => {
+    const { getByRole } = render(<StartupErrorScreen detail={incompatible()} sessionId="s1" />);
+    fireEvent.click(getByRole("button", { name: "Copy command" }));
+    expect(writeClipboard).toHaveBeenCalledWith("npm install -g @agentclientprotocol/claude-agent-acp@latest");
   });
 });
