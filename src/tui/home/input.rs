@@ -3757,7 +3757,7 @@ impl HomeView {
         }
     }
 
-    fn open_serve(&mut self) {
+    pub(crate) fn open_serve(&mut self) {
         if web_plugin_disabled() {
             self.info_dialog = Some(InfoDialog::new(
                 "Web dashboard disabled",

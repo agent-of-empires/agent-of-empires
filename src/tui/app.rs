@@ -742,14 +742,8 @@ impl App {
                                     e2e_render_ack(false)?;
                                     continue;
                                 }
-                                match (key.code, key.modifiers) {
-                                    (KeyCode::Char('q'), KeyModifiers::NONE)
-                                    | (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
-                                    (KeyCode::Char('r'), KeyModifiers::NONE)
-                                        if self.home.sidebar_source == crate::tui::session_feed::SidebarSource::Disconnected => {
-                                        self.home.connect_runtime();
-                                    }
-                                    _ => {}
+                                if self.handle_runtime_gate_key(key) {
+                                    break;
                                 }
                             }
                             Some(Ok(Event::Resize(_, _))) => {}
@@ -2634,9 +2628,8 @@ impl App {
                     } else {
                         "API server"
                     };
-                    self.home.flash_status(format!(
-                        "{what} didn't start. Press R, then Enter, for details."
-                    ));
+                    self.home
+                        .flash_status(format!("{what} didn't start. Press Enter for details."));
                 }
                 self.home.set_sidebar_source(
                     crate::tui::session_feed::SidebarSource::Disconnected,
@@ -2646,6 +2639,28 @@ impl App {
         }
         self.start_dashboard_stop_if_ready();
         true
+    }
+
+    /// Keys while the runtime isn't the Daemon and no Web dashboard view is open: the offline
+    /// takeover or the "Connecting" screen. Returns true to quit.
+    fn handle_runtime_gate_key(&mut self, key: KeyEvent) -> bool {
+        use crate::tui::session_feed::SidebarSource;
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('q'), KeyModifiers::NONE)
+            | (KeyCode::Char('c'), KeyModifiers::CONTROL) => return true,
+            (KeyCode::Char('r'), KeyModifiers::NONE)
+                if self.home.sidebar_source == SidebarSource::Disconnected =>
+            {
+                self.home.connect_runtime();
+            }
+            // A dashboard start hidden with Esc keeps the runtime off the Daemon, so this screen is
+            // the only way back to it: still starting, or why it didn't.
+            (KeyCode::Enter, KeyModifiers::NONE) if self.home.dashboard_launch.is_some() => {
+                self.home.open_serve();
+            }
+            _ => {}
+        }
+        false
     }
 
     fn request_dashboard_stop(&mut self) {
@@ -4384,24 +4399,13 @@ mod tests {
             crate::file_watch::FileWatchService::noop(),
         )
         .unwrap();
-        // R opens Connections; Enter on its Web dashboard row opens the view.
-        let open = |app: &mut App| {
-            app.home
-                .handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT), None);
-            assert!(app.home.connections_view.is_some(), "R opens Connections");
-            // Down reaches the Web dashboard row whether or not a Daemon row is above it.
-            app.home.handle_key(KeyEvent::from(KeyCode::Down), None);
-            app.home.handle_key(KeyEvent::from(KeyCode::Enter), None);
-            assert!(app.home.connections_view.is_none());
-        };
-        let hub = |app: &mut App| {
-            let view = app
-                .home
-                .connections_view
-                .as_mut()
-                .expect("Connections open");
+        use crate::tui::session_feed::SidebarSource;
+        let enter = KeyEvent::from(KeyCode::Enter);
+        // The whole home screen as the user sees it, including a takeover.
+        let home = |app: &mut App| {
             test_render::text(&test_render::draw(110, 40, |frame, theme| {
-                view.render(frame, frame.area(), theme)
+                app.home
+                    .render(frame, frame.area(), theme, None, None, None)
             }))
         };
         let screen = |app: &App| {
@@ -4418,9 +4422,13 @@ mod tests {
             app.home.dashboard_launch = Some(DashboardLaunch::tunnel_for_test(started));
             let (settle, launch) = tokio::sync::oneshot::channel();
             app.dashboard_launch = Some(launch);
+            // As start_dashboard_launch leaves it: off the Daemon, behind the runtime gate.
+            app.home.set_sidebar_source(SidebarSource::Connecting, None);
+            assert!(home(&mut app).contains("Enter: back to the Web dashboard start"));
 
-            // Reopened mid-launch, it counts from the launch and leaves the bound to the App.
-            open(&mut app);
+            // Reopened mid-launch through the gate, it counts from the launch and leaves the bound
+            // to the App.
+            assert!(!app.handle_runtime_gate_key(enter));
             assert!(elapsed.is_match(&screen(&app)), "{}", screen(&app));
             assert!(app.home.serve_view.as_mut().is_some_and(|v| !v.tick()));
             if !view_open {
@@ -4433,20 +4441,19 @@ mod tests {
             assert!(app.poll_dashboard_launch());
             let flash = app.home.status_flash_text().unwrap_or_default().to_owned();
             assert_eq!(
-                flash.ends_with("didn't start. Press R, then Enter, for details."),
+                flash.ends_with("didn't start. Press Enter for details."),
                 flashed,
                 "{view_open}: {flash:?}"
             );
             if !view_open {
-                // The hub says it didn't start, on the row Enter opens.
-                app.home
-                    .handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT), None);
+                // The offline takeover says it didn't start, and Enter, through the gate, shows why.
+                assert_eq!(app.home.sidebar_source, SidebarSource::Disconnected);
+                let takeover = home(&mut app);
                 assert!(
-                    hub(&mut app).contains("Didn't start \u{00B7} Enter shows why"),
-                    "{}",
-                    hub(&mut app)
+                    takeover.contains("Didn't start \u{00B7} Enter shows why"),
+                    "{takeover}"
                 );
-                app.home.handle_key(KeyEvent::from(KeyCode::Enter), None);
+                assert!(!app.handle_runtime_gate_key(enter));
             }
             assert!(
                 screen(&app).contains("Dashboard start failed."),

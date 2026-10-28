@@ -112,11 +112,17 @@ impl ConnectionsView {
         view
     }
 
-    /// The home screen's takeover while the Daemon can't be reached.
-    pub fn offline(reason: Option<&str>) -> Self {
+    /// The home screen's takeover while the Daemon can't be reached. `launch_failed`: a Web
+    /// dashboard start hidden with Esc failed, and Enter shows why.
+    pub fn offline(reason: Option<&str>, launch_failed: bool) -> Self {
+        let web = if launch_failed {
+            WebState::Failed
+        } else {
+            WebState::NeedsDaemon
+        };
         Self {
             reason: reason.map(str::to_owned),
-            ..Self::new(Some(DaemonAttention::Offline), WebState::NeedsDaemon)
+            ..Self::new(Some(DaemonAttention::Offline), web)
         }
     }
 
@@ -304,7 +310,13 @@ impl ConnectionsView {
             }
         }
         lines.push(Line::raw(""));
-        let hints: Vec<(&str, &str)> = if self.offline_takeover() {
+        let hints: Vec<(&str, &str)> = if self.offline_takeover() && self.web == WebState::Failed {
+            vec![
+                ("r", " reconnect  "),
+                ("Enter", " why it didn't start  "),
+                ("q", " quit"),
+            ]
+        } else if self.offline_takeover() {
             vec![("r", " reconnect  "), ("q", " quit")]
         } else if self.rows().len() > 1 {
             vec![
@@ -373,9 +385,9 @@ mod tests {
         } else {
             "API server"
         };
-        let offline = || ConnectionsView::offline(Some("connection refused"));
+        let offline = || ConnectionsView::offline(Some("connection refused"), false);
         // (view, text shown, text absent)
-        let cases: [(ConnectionsView, &[&str], &[&str]); 7] = [
+        let cases: [(ConnectionsView, &[&str], &[&str]); 8] = [
             // Healthy: no Daemon row and one row, so no move hint.
             (
                 ConnectionsView::new(None, WebState::Off),
@@ -401,6 +413,16 @@ mod tests {
                 ConnectionsView::new(None, WebState::Disabled),
                 &["aoe.web plugin is disabled"],
                 &[],
+            ),
+            // The takeover after a hidden start failed: its row and how to see why.
+            (
+                ConnectionsView::offline(Some("connection refused"), true),
+                &[
+                    "Didn't start \u{00B7} Enter shows why",
+                    "why it didn't start",
+                    "reconnect",
+                ],
+                &["Needs the Daemon"],
             ),
             (
                 ConnectionsView::new(None, WebState::Failed),
@@ -434,7 +456,10 @@ mod tests {
 
         // A detail one cell wider than the space under the indent wraps its last cell, not cuts it.
         let fill = "x".repeat(51);
-        let text = screen(&mut ConnectionsView::offline(Some(&format!("{fill}Q"))));
+        let text = screen(&mut ConnectionsView::offline(
+            Some(&format!("{fill}Q")),
+            false,
+        ));
         let lines: Vec<&str> = text.lines().collect();
         let at = lines
             .iter()
