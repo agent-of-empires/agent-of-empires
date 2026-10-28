@@ -6,6 +6,7 @@ export const NAV_ITEM = "data-sidebar-nav-item";
 export const ROWS = "data-sidebar-rows";
 
 const SIDEBAR = '[role="navigation"][aria-label="Sessions sidebar"]';
+const GROUP_HEADER = '[data-testid="sidebar-group-header"]';
 
 /** A valid HTML id for the element wrapping `key`'s rows; group keys are paths and may hold spaces. */
 export function rowsId(key: string): string {
@@ -62,26 +63,41 @@ export function onSidebarArrowKey(e: KeyboardEvent<HTMLElement>): void {
 }
 
 /**
- * Once `header` leaves the sidebar (its Group emptied, as after Archive all), move focus to the next
- * Group header, or the previous one at the end, unless focus has gone somewhere since.
+ * Once `header` leaves the sidebar (its Group emptied, as after Archive all), move focus to the nearest
+ * Group header still there: the next ones first, then the previous ones nearest first. Nothing moves if
+ * focus left the header before then.
  */
 export function refocusNearbyWhenRemoved(header: HTMLElement, timeoutMs = 10_000): void {
   const sidebar = header.closest<HTMLElement>(SIDEBAR);
   if (!sidebar) return;
-  const headers = navItems(sidebar).filter((el) => el.hasAttribute("aria-expanded"));
+  // Group headers only: the Snoozed & archived toggle is a header for the arrow keys, not a Group.
+  const headers = navItems(sidebar).filter((el) => el.closest(GROUP_HEADER));
   const at = headers.indexOf(header);
   const rows = document.getElementById(header.getAttribute("aria-controls") ?? "");
-  const next = headers.slice(at + 1).find((el) => !rows?.contains(el));
-  const neighbours = [next, headers[at - 1]].filter((el): el is HTMLElement => !!el);
-  const observer = new MutationObserver(() => {
-    if (header.isConnected) return;
+  // A parent can go with its last subgroup, so every candidate is kept and checked when it's time.
+  const candidates = [...headers.slice(at + 1).filter((el) => !rows?.contains(el)), ...headers.slice(0, at).reverse()];
+  let left = false;
+  // Focus leaving while the header is still mounted (a click elsewhere, even on nothing) means the
+  // user moved on. Chrome also fires focusout as a focused node is removed, before it's detached,
+  // so the check waits a task: by then a removed header is gone and a deserted one is still there.
+  const onFocusOut = () =>
+    setTimeout(() => {
+      if (header.isConnected) left = true;
+    }, 0);
+  header.addEventListener("focusout", onFocusOut);
+  const stop = () => {
     observer.disconnect();
     clearTimeout(timer);
+    header.removeEventListener("focusout", onFocusOut);
+  };
+  const observer = new MutationObserver(() => {
+    if (header.isConnected) return;
+    stop();
     const active = document.activeElement;
-    if (active && active !== document.body) return;
-    neighbours.find((el) => el.isConnected)?.focus();
+    if (left || (active && active !== document.body)) return;
+    candidates.find((el) => el.isConnected)?.focus();
   });
   observer.observe(sidebar, { childList: true, subtree: true });
-  // Read only from the observer's callback, which can't run before this line.
-  const timer = setTimeout(() => observer.disconnect(), timeoutMs);
+  // Read only from the observer's callback and `stop`, which can't run before this line.
+  const timer = setTimeout(stop, timeoutMs);
 }

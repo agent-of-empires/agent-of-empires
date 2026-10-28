@@ -194,8 +194,9 @@ for (const axis of ["repo+group", "org"] as const) {
 }
 
 test("the Snoozed & archived toggle is a header for the arrow keys", async ({ page }) => {
+  // The live session's Group is named like the section, so a shared rows id would send Right into it.
   const sessions: MockSessionInput[] = [
-    { id: "s-live", title: "live", project_path: "/tmp/repo-a", branch: "a/live" },
+    { id: "s-live", title: "live", project_path: "/tmp/repo-a", branch: "a/live", group: "snoozed-and-archived" },
     {
       id: "s-old",
       title: "old",
@@ -207,6 +208,7 @@ test("the Snoozed & archived toggle is a header for the arrow keys", async ({ pa
   await installSidebarMocks(page, { sessions });
   await page.setViewportSize({ width: 1280, height: 720 });
   await page.goto("/");
+  await showAxis(page, "group");
 
   const press = async (key: string, focused: Locator) => {
     await page.keyboard.press(key);
@@ -229,34 +231,79 @@ test("the Snoozed & archived toggle is a header for the arrow keys", async ({ pa
   await expect(toggle).toHaveAttribute("aria-expanded", "false");
 });
 
-test("Archive all that empties a Group moves focus to the next header", async ({ page }) => {
+test.describe("Archive all that empties a Group", () => {
   // `fields` is merged into each list response, so an archive shows up on the next refresh.
-  const sessions: MockSessionInput[] = [
-    { id: "s-a", title: "a-only", project_path: "/tmp/repo-a", branch: "a/only", fields: {} },
-    { id: "s-b", title: "b-only", project_path: "/tmp/repo-b", branch: "b/only", fields: {} },
-  ];
-  await installSidebarMocks(page, { sessions });
-  await page.route("**/api/sessions/*/archive", async (r) => {
-    const id = new URL(r.request().url()).pathname.split("/")[3];
-    const archived_at = new Date().toISOString();
-    Object.assign(sessions.find((s) => s.id === id)?.fields ?? {}, { archived_at });
-    await r.fulfill({ json: { id, archived_at } });
+  // `hold` keeps an archive reply back until released.
+  async function setup(page: Page, sessions: MockSessionInput[], hold?: Promise<void>) {
+    await installSidebarMocks(page, { sessions });
+    await page.route("**/api/sessions/*/archive", async (r) => {
+      const id = new URL(r.request().url()).pathname.split("/")[3];
+      await hold;
+      const archived_at = new Date().toISOString();
+      Object.assign(sessions.find((s) => s.id === id)?.fields ?? {}, { archived_at });
+      await r.fulfill({ json: { id, archived_at } });
+    });
+    page.on("dialog", (dialog) => void dialog.accept());
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto("/");
+  }
+  const header = (page: Page, path: string) =>
+    page.locator(`[data-testid="sidebar-group-header"][data-group-id="${path}"] button[aria-expanded]`).first();
+  async function archiveAll(page: Page, from: Locator, sessionId: string) {
+    await from.focus();
+    await page.keyboard.press("Shift+F10");
+    const item = page.getByTestId("sidebar-group-context-menu-archive-all");
+    await expect(item).toBeVisible();
+    // The menu focuses its first item a frame after opening; wait for that, or it takes focus back.
+    await expect(page.getByTestId("sidebar-group-context-menu").getByRole("button").first()).toBeFocused();
+    await item.focus();
+    await Promise.all([page.waitForRequest(`**/api/sessions/${sessionId}/archive`), page.keyboard.press("Enter")]);
+  }
+  const one = (id: string, repo: string, fields: Record<string, unknown> = {}): MockSessionInput => ({
+    id,
+    title: `${repo}-only`,
+    project_path: `/tmp/${repo}`,
+    branch: `${repo}/only`,
+    fields,
   });
-  page.on("dialog", (dialog) => void dialog.accept());
-  await page.setViewportSize({ width: 1280, height: 720 });
-  await page.goto("/");
 
-  const header = (path: string) =>
-    page.locator(`[data-testid="sidebar-group-header"][data-group-id="${path}"] button[aria-expanded]`);
-  await header("/tmp/repo-a").focus();
-  await page.keyboard.press("Shift+F10");
-  const archiveAll = page.getByTestId("sidebar-group-context-menu-archive-all");
-  await expect(archiveAll).toBeVisible();
-  // The menu focuses its first item a frame after opening; wait for that, or it takes focus back.
-  await expect(page.getByTestId("sidebar-group-context-menu").getByRole("button").first()).toBeFocused();
-  await archiveAll.focus();
-  await Promise.all([page.waitForRequest("**/api/sessions/s-a/archive"), page.keyboard.press("Enter")]);
+  test("moves focus to the next Group header, then from the last Group to the previous one", async ({ page }) => {
+    await setup(page, [one("s-a", "repo-a"), one("s-b", "repo-b"), one("s-c", "repo-c")]);
+    await archiveAll(page, header(page, "/tmp/repo-a"), "s-a");
+    await expect(header(page, "/tmp/repo-a")).toHaveCount(0);
+    await expect(header(page, "/tmp/repo-b")).toBeFocused();
+    // Snoozed & archived now exists below the last Group; it isn't a Group, so focus goes up instead.
+    await expect(page.getByTestId("sidebar-sunk-toggle")).toBeVisible();
+    await archiveAll(page, header(page, "/tmp/repo-c"), "s-c");
+    await expect(header(page, "/tmp/repo-c")).toHaveCount(0);
+    await expect(header(page, "/tmp/repo-b")).toBeFocused();
+  });
 
-  await expect(header("/tmp/repo-a")).toHaveCount(0);
-  await expect(header("/tmp/repo-b")).toBeFocused();
+  test("goes past a parent header that leaves with its last subgroup", async ({ page }) => {
+    await setup(page, [
+      { ...one("s-w", "repo-w"), group: "g-w" },
+      { ...one("s-x", "repo-x"), group: "g-x" },
+    ]);
+    await showAxis(page, "repo+group");
+    const parentX = header(page, "/tmp/repo-x");
+    const childX = page.locator(`[id="${await parentX.getAttribute("aria-controls")}"] button[aria-expanded]`).first();
+    const parentW = header(page, "/tmp/repo-w");
+    const childW = page.locator(`[id="${await parentW.getAttribute("aria-controls")}"] button[aria-expanded]`).first();
+    await archiveAll(page, childX, "s-x");
+    // repo-x's header goes with its only subgroup; focus lands on the nearest Group header above.
+    await expect(parentX).toHaveCount(0);
+    await expect(childW).toBeFocused();
+  });
+
+  test("leaves focus alone when it moved before the Group emptied", async ({ page }) => {
+    let release: () => void = () => {};
+    const hold = new Promise<void>((resolve) => (release = resolve));
+    await setup(page, [one("s-a", "repo-a"), one("s-b", "repo-b")], hold);
+    await archiveAll(page, header(page, "/tmp/repo-a"), "s-a");
+    // A click on nothing focusable moves focus to the page while the archive is still out.
+    await page.mouse.click(900, 650);
+    release();
+    await expect(header(page, "/tmp/repo-a")).toHaveCount(0);
+    await expect(header(page, "/tmp/repo-b")).not.toBeFocused();
+  });
 });

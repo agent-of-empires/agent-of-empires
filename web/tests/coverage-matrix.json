@@ -3968,7 +3968,8 @@
         "web/src/components/sidebar/SidebarGroupHeader.tsx",
         "web/src/components/sidebar/GroupLists.tsx",
         "web/src/components/sidebar/keyboardNav.ts"
-      ]
+      ],
+      "notes": "Arrow keys over headers and rows on every axis, including nested and org lists; Left on a collapsed nested header goes to its parent; the Snoozed & archived toggle is a header for its rows; Archive all that empties a Group moves focus to the nearest remaining Group header, never the toggle, and not after focus moved elsewhere."
     },
     {
       "id": "story.sidebar-plan-progress",

@@ -22,7 +22,7 @@ import { useSidebarTriage } from "../hooks/useSidebarTriage";
 import { ProjectsSection } from "./ProjectsSection";
 import { FoldChevron, PlusIcon, StrokeIcon } from "./icons";
 import { usePersistedFlag } from "./usePersistedFlag";
-import { NAV_ITEM, ROWS, onSidebarArrowKey, rowsId } from "./sidebar/keyboardNav";
+import { NAV_ITEM, ROWS, onSidebarArrowKey } from "./sidebar/keyboardNav";
 import { newDragClickGuard, useSuppressClickAfterDrag, type DragClickGuard } from "./sidebar/dnd";
 import {
   filterFlat,
@@ -41,8 +41,9 @@ import { useFacetFilter } from "./sidebar/useFacetFilter";
 import { useSidebarSelection } from "./sidebar/useSidebarSelection";
 import { useSidebarWidth } from "./sidebar/useSidebarWidth";
 
-/** Rows of the "Snoozed & archived" section; not a path, so no Group key can collide with it. */
-const SUNK_ROWS = rowsId("snoozed-and-archived");
+/** Rows of the "Snoozed & archived" section. Outside `rowsId`'s "sidebar-rows-" namespace, so no Group,
+ *  whatever its name, can share it. */
+const SUNK_ROWS = "sidebar-sunk-rows";
 
 interface Props {
   observedById: Record<string, RuntimeCursor>;
