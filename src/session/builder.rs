@@ -335,9 +335,15 @@ fn merge_base_branches(
         for p in projects {
             let key = project_root_key(&p.path);
             let is_root = crate::session::projects::canonical_key(&p.path) == key;
+            let base = p
+                .default_base_branch
+                .map(|b| b.trim().to_string())
+                .filter(|b| !b.is_empty());
+            if base.is_none() && !is_root {
+                continue;
+            }
             if is_root || !map.contains_key(&key) {
-                let base = p.default_base_branch.map(|b| b.trim().to_string());
-                map.insert(key, base.filter(|b| !b.is_empty()));
+                map.insert(key, base);
             }
         }
         map
@@ -2608,7 +2614,7 @@ mod tests {
             .unwrap();
         let proj = |path: &std::path::Path, base: &str, scope| {
             let mut p = Project::new("p", path.to_string_lossy(), scope);
-            p.default_base_branch = Some(base.to_string());
+            p.default_base_branch = Some(base.to_string()).filter(|b| !b.is_empty());
             p
         };
         let key = project_root_key(&root.to_string_lossy());
@@ -2626,6 +2632,12 @@ mod tests {
             let bases = merge_base_branches(global, vec![]);
             assert_eq!(bases.get(&key).map(String::as_str), Some("main"));
         }
+
+        // An unset worktree alias never replaces or hides a configured base.
+        let bases = merge_base_branches(vec![proj(&root, "release", g)], vec![proj(&wt, "", pr)]);
+        assert_eq!(bases.get(&key).map(String::as_str), Some("release"));
+        let bases = merge_base_branches(vec![proj(&wt, "", g), proj(&wt, "release", g)], vec![]);
+        assert_eq!(bases.get(&key).map(String::as_str), Some("release"));
     }
 
     /// Create a repo with `main` plus a second branch holding a distinct
