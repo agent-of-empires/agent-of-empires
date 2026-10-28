@@ -1574,7 +1574,11 @@ fn stage_teardown_worktrees(
                     .any(|owner| owner.references_path(Path::new(&workspace.workspace_dir)))
             });
 
-    let preclean = if request.delete_worktree && is_sandboxed && root_cleanup_allowed {
+    let preclean = if request.delete_worktree
+        && is_sandboxed
+        && request.instance.has_managed_worktree_or_workspace()
+        && root_cleanup_allowed
+    {
         tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "sandbox_worktree_preclean", "perform_deletion: stage");
         Some(crate::git::cleanup::cleanup_sandbox_worktree(
             &request.instance,
@@ -5016,19 +5020,8 @@ mod tests {
             // absent container. A nonexistent name alone is insufficient:
             // an unavailable runtime fails teardown and correctly prevents
             // worktree cleanup.
-            let mut instance = Instance::new("Test", "/tmp/aoe-deletion-test-nonexistent");
-            instance.sandbox_info = Some(SandboxInfo {
-                provider: None,
-                enabled: true,
-                container_id: None,
-                image: "alpine".to_string(),
-                container_name: "aoe-sandbox-doesnotexist".to_string(),
-                extra_env: None,
-                custom_instruction: None,
-                before_start_env: Vec::new(),
-                before_start_hook_env: Vec::new(),
-                container_workdir: None,
-            });
+            let (_tmp, _main_repo, _worktree_path, instance) =
+                build_sandboxed_worktree("feature/ordering");
             let request = DeletionRequest {
                 session_id: instance.id.clone(),
                 instance,
@@ -6199,6 +6192,41 @@ mod tests {
                 "unsandboxed deletion must not emit sandbox preclean stage: stages={:?}",
                 stages
             );
+        }
+
+        /// A sandboxed session without a managed worktree must never get the
+        /// in-container `find -delete`: its workdir is the user's project dir
+        /// (#5023), whatever `delete_worktree` says.
+        #[test]
+        fn sandboxed_without_managed_worktree_skips_preclean() {
+            let _app_guard = crate::session::test_support::isolate_app_dir();
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
+            let (_tmp, _main_repo, worktree_path, mut instance) =
+                build_sandboxed_worktree("feature/plain-sandbox");
+            instance.worktree_info = None;
+            std::fs::write(worktree_path.join("sentinel"), "keep").unwrap();
+
+            let request = DeletionRequest {
+                session_id: instance.id.clone(),
+                instance,
+                delete_worktree: true,
+                delete_branch: false,
+                delete_sandbox: false,
+                force_delete: true,
+                detach_hooks: true,
+                keep_scratch: false,
+            };
+
+            let stages = run_with_capture(|| {
+                let _ = perform_deletion(&request);
+            });
+            assert!(
+                !stages.iter().any(|s| s == "sandbox_worktree_preclean"),
+                "preclean must not run without a managed worktree: stages={:?}",
+                stages
+            );
+            assert!(worktree_path.join("sentinel").exists());
         }
 
         /// A stray file under an otherwise aoe-owned workspace keeps the dir
