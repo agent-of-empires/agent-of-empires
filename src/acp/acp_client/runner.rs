@@ -176,7 +176,7 @@ pub(super) async fn spawn_runner_detached(
         std::env::current_exe().map_err(|e| AcpError::Spawn(format!("current_exe: {e}")))?;
     ensure_runner_exe(&current_exe)?;
     let log_path = crate::process::worker_registry::log_path_for(&session_id)
-        .map_err(|e| AcpError::Spawn(format!("log path: {e}")))?;
+        .map_err(|e| AcpError::Spawn(format!("log path: {e:#}")))?;
     if let Some(parent) = log_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }

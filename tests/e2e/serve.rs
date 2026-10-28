@@ -1021,10 +1021,11 @@ async fn native_creation_progress_reports_phases_to_the_local_stream() {
     use agent_of_empires::{
         acp::client::DaemonEndpoint,
         daemon::{
-            CreateSessionBody, CreationPhase, CreationProgress, DaemonClient, RuntimeConnection,
-            RuntimeEvent,
+            ApiErrorCode, CreateSessionBody, CreationPhase, CreationProgress, DaemonClient,
+            RuntimeConnection, RuntimeEvent, RUNTIME_EPOCH_HEADER,
         },
     };
+    const PHASE_TIMEOUT: Duration = Duration::from_secs(20);
     require_tmux!();
     let mut h = TuiTestHarness::new_in_tmp("native_creation_progress");
     h.set_env("AGENT_OF_EMPIRES_PROFILE", "default");
@@ -1034,11 +1035,29 @@ async fn native_creation_progress_reports_phases_to_the_local_stream() {
     std::fs::write(&agent, "#!/bin/sh\nexec sleep 120\n").unwrap();
     let app = crate::harness::app_dir_in(h.home_path());
     let config_path = app.join("config.toml");
-    let release = h.home_path().join("hook-release");
-    // One line then block: the first output line must reach the stream even
-    // though the hook never finishes on its own.
+    struct ReleaseHook(tempfile::TempDir);
+    impl Drop for ReleaseHook {
+        fn drop(&mut self) {
+            let gate = self.0.path();
+            if std::fs::write(gate.join("release"), []).is_err() || !gate.join("started").exists() {
+                return;
+            }
+            let finished = gate.join("finished");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !finished.exists() {
+                if Instant::now() >= deadline {
+                    eprintln!("creation hook did not acknowledge release before cleanup");
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+    let release = ReleaseHook(tempfile::tempdir_in(h.home_path()).unwrap());
     let command = format!(
-        "echo building dependency graph; i=0; while [ ! -f {release:?} ] && [ \"$i\" -lt 400 ]; do i=$((i+1)); sleep 0.05; done"
+        ": > {gate:?}/started; echo building dependency graph; i=0; while [ -d {gate:?} ] && [ ! -f {gate:?}/release ] && [ \"$i\" -lt {max_polls} ]; do i=$((i+1)); sleep 0.05; done; if [ -d {gate:?} ]; then : > {gate:?}/finished; test -f {gate:?}/release; fi",
+        gate = release.0.path(),
+        max_polls = (PHASE_TIMEOUT * 6).as_millis() / 50
     );
     let mut config = std::fs::read_to_string(&config_path).unwrap();
     config.push_str(&format!(
@@ -1059,6 +1078,12 @@ async fn native_creation_progress_reports_phases_to_the_local_stream() {
     let socket = app.join("daemon/api.sock");
     let sdk = DaemonClient::new_unix(&socket).unwrap();
     let epoch = sdk.runtime_info().await.unwrap().epoch;
+    let http = reqwest::Client::builder()
+        .unix_socket(socket.clone())
+        .no_proxy()
+        .timeout(PHASE_TIMEOUT * 5)
+        .build()
+        .unwrap();
     let endpoint = DaemonEndpoint::local_unix(socket);
     let mut connection = RuntimeConnection::connect(&endpoint, None).await.unwrap();
     assert!(
@@ -1075,27 +1100,35 @@ async fn native_creation_progress_reports_phases_to_the_local_stream() {
         connection: &mut RuntimeConnection,
         ready: impl Fn(&CreationProgress) -> bool,
     ) -> CreationProgress {
-        loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(20), connection.next_event())
-                .await
-                .expect("creation progress arrived")
-                .expect("runtime stream stayed connected")
-            {
-                RuntimeEvent::Progress(progress) => {
-                    if let Some(entry) = progress.iter().find(|entry| ready(entry)) {
-                        return entry.clone();
+        tokio::time::timeout(PHASE_TIMEOUT, async {
+            loop {
+                match connection
+                    .next_event()
+                    .await
+                    .expect("runtime stream stayed connected")
+                {
+                    RuntimeEvent::Progress(progress) => {
+                        if let Some(entry) = progress.iter().find(|entry| ready(entry)) {
+                            return entry.clone();
+                        }
                     }
+                    RuntimeEvent::Snapshot(_) | RuntimeEvent::OwnerDiagnostics(_) => {}
                 }
-                RuntimeEvent::Snapshot(_) | RuntimeEvent::OwnerDiagnostics(_) => {}
             }
-        }
+        })
+        .await
+        .expect("creation progress arrived")
     }
 
-    let creator = sdk.clone();
     let create_epoch = epoch.clone();
-    let create = tokio::spawn(async move { creator.create_session(&body, &create_epoch).await });
-    // The phase change publishes before the command starts, so wait for the
-    // frame that actually names the hook and its output.
+    let create = tokio::spawn(async move {
+        http.post("http://localhost/api/sessions")
+            .header(RUNTIME_EPOCH_HEADER, create_epoch)
+            .json(&body)
+            .send()
+            .await
+    });
+    // Wait for the hook's command and output, not just its phase.
     let observed = read_progress(&mut connection, |entry| {
         entry.phase == CreationPhase::CreateHooks
             && !entry.cancelled
@@ -1116,14 +1149,31 @@ async fn native_creation_progress_reports_phases_to_the_local_stream() {
         "progress must carry the hook's first line, got: {:?}",
         observed.output
     );
+    tokio::time::timeout(PHASE_TIMEOUT, async {
+        while !connection
+            .snapshot()
+            .contents
+            .sessions
+            .iter()
+            .any(|row| row.id == observed.session_id)
+        {
+            connection
+                .next_snapshot()
+                .await
+                .expect("runtime stream stayed connected");
+        }
+    })
+    .await
+    .expect("the reservation reached the canonical snapshot");
     let pending = sdk
         .list_sessions(None)
         .await
         .unwrap()
         .sessions
         .into_iter()
-        .find(|row| row.title == "progress")
+        .find(|row| row.id == observed.session_id)
         .expect("the reservation is published while provisioning");
+    assert_eq!(pending.title, "progress");
     assert!(
         sdk.cancel_creation(&pending.id, &epoch).await.is_ok(),
         "a pending creation accepts cancellation"
@@ -1133,22 +1183,31 @@ async fn native_creation_progress_reports_phases_to_the_local_stream() {
         observed.session_id, pending.id,
         "the pending cancellation must name the creation it fences"
     );
-    std::fs::write(&release, "continue").unwrap();
-    let cancelled = create.await.unwrap();
-    assert!(
-        cancelled.is_err(),
-        "a cancelled creation must not report success"
+    std::fs::write(release.0.path().join("release"), "continue").unwrap();
+    let cancelled = create
+        .await
+        .unwrap()
+        .expect("creation returned an HTTP response");
+    assert_eq!(
+        ApiErrorCode::from_headers(cancelled.status(), cancelled.headers(), false),
+        Some(ApiErrorCode::CreationCancelled),
+        "expected a cancellation response, got {}",
+        cancelled.status()
     );
-    loop {
-        match tokio::time::timeout(std::time::Duration::from_secs(20), connection.next_event())
-            .await
-            .expect("progress cleared")
-            .expect("runtime stream stayed connected")
-        {
-            RuntimeEvent::Progress(progress) if progress.is_empty() => break,
-            _ => {}
+    tokio::time::timeout(PHASE_TIMEOUT, async {
+        loop {
+            match connection
+                .next_event()
+                .await
+                .expect("runtime stream stayed connected")
+            {
+                RuntimeEvent::Progress(progress) if progress.is_empty() => break,
+                _ => {}
+            }
         }
-    }
+    })
+    .await
+    .expect("progress cleared");
     assert!(connection.creation_progress().is_empty());
     let rows = sdk.list_sessions(None).await.unwrap().sessions;
     assert!(
@@ -3937,6 +3996,21 @@ fn cli_serve_daemon_profile_reaches_the_served_layer() {
     }
 }
 
+/// Replace the live Daemon's worker directory with a file. The Daemon may
+/// recreate the directory between the delete and the write, so retry until
+/// the file holds; a file cannot be recreated as a directory.
+fn block_workers_dir(workers: &std::path::Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let _ = std::fs::remove_dir_all(workers);
+        if std::fs::write(workers, "not a directory").is_ok() && workers.is_file() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "could not block {workers:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// A running Daemon stays administrable when pending migrations would fail.
 #[test]
 #[parallel]
@@ -3949,8 +4023,7 @@ fn cli_serve_controls_skip_migrations_and_lock() {
     let version = app.join(".schema_version");
     std::fs::write(&version, "39").unwrap();
     let workers = app.join("acp-workers");
-    std::fs::remove_dir_all(&workers).unwrap();
-    std::fs::write(&workers, "not a directory").unwrap();
+    block_workers_dir(&workers);
 
     for flag in ["--status", "--stop"] {
         h.run_cli(&["serve", flag]);
@@ -3975,8 +4048,7 @@ fn cli_serve_restart_reports_replacement_startup_failure() {
     let app = app_dir_in(h.home_path());
     std::fs::write(app.join(".schema_version"), "39").unwrap();
     let workers = app.join("acp-workers");
-    let _ = std::fs::remove_dir_all(&workers);
-    std::fs::write(&workers, "not a directory").unwrap();
+    block_workers_dir(&workers);
 
     h.run_cli_err(&["serve", "--restart"]);
     h.run_cli_err(&["serve", "--status"]);

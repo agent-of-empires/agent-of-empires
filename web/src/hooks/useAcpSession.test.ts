@@ -162,6 +162,110 @@ describe("reconnect (#1130)", () => {
     expect(result.current).toMatchObject({ reconnecting: false, retryCount: 0, status: "connecting" });
   });
 
+  const replayedPrompt = (sid: string, seq: number) => ({
+    frame: { session_id: sid, seq, event: { UserPromptSent: { text: `p${seq}` } } },
+    row: { id: `user-seq-${seq}`, kind: "user_prompt", at: "t", text: `p${seq}` },
+  });
+
+  it("flags history arriving over replay while the socket is down, until a socket opens", async () => {
+    const { frame, row } = replayedPrompt("sess-replay-down", 7);
+    calls = installAcpFakes(({ url }) =>
+      url.includes("/acp/replay")
+        ? json({ frames: [frame], rows: [row], lost: false, highest_seq: 7, next_cursor: 7 })
+        : undefined,
+    );
+    FakeWebSocket.closeFiresOnClose = true;
+    const { result } = render("sess-replay-down");
+    await flushAsync();
+    sockets[0]!.drop();
+    expect(result.current).toMatchObject({ reconnecting: true, replayedWhileDown: true });
+
+    await act(() => vi.advanceTimersByTimeAsync(acpRetryDelayMs(1)));
+    await flushAsync();
+    sockets[1]!.open();
+    expect(result.current.replayedWhileDown).toBe(false);
+  });
+
+  // A page that landed stays on screen whatever happens to the later pages.
+  it.each<[string, () => Response | Promise<Response>]>([
+    ["completes", () => json({ frames: [], rows: [], lost: false, highest_seq: 30, next_cursor: 30 })],
+    ["fails", () => new Response("boom", { status: 500 })],
+    ["hangs until the dial timeout", () => new Promise<Response>(() => {})],
+  ])("flags history replayed forward onto loaded history when the second page %s", async (label, secondPage) => {
+    const sid = "sess-replay-loaded";
+    const first = replayedPrompt(sid, 6);
+    const forward = replayedPrompt(sid, 11);
+    let secondPageRequests = 0;
+    calls = installAcpFakes(({ url }) => {
+      if (!url.includes("/acp/replay")) return undefined;
+      const since = new URL(url, "http://x").searchParams.get("since");
+      if (since === null) {
+        return json({ frames: [first.frame], rows: [first.row], lost: false, highest_seq: 10, next_cursor: 6 });
+      }
+      if (Number(since) > 10) {
+        secondPageRequests += 1;
+        return secondPage();
+      }
+      return json({
+        frames: [forward.frame],
+        rows: [forward.row],
+        lost: false,
+        highest_seq: 30,
+        next_cursor: 11,
+        has_more: true,
+      });
+    });
+    FakeWebSocket.closeFiresOnClose = true;
+    const { result } = render(sid);
+    await flushAsync();
+    sockets[0]!.open();
+    expect(result.current).toMatchObject({ replayedWhileDown: false, state: { oldestSeq: 6 } });
+
+    sockets[0]!.drop();
+    await act(() => vi.advanceTimersByTimeAsync(acpRetryDelayMs(1)));
+    // The first page commits only once the replay has gone on to ask for the second.
+    await act(() => vi.waitFor(() => expect(secondPageRequests).toBeGreaterThan(0)));
+    await flushAsync();
+    expect(result.current.state.activity.map((r) => r.id)).toContain(forward.row.id);
+    if (label.startsWith("hangs")) {
+      expect(sockets).toHaveLength(1);
+      expect(result.current.replayedWhileDown).toBe(false);
+      await act(() => vi.advanceTimersByTimeAsync(ACP_DIAL_TIMEOUT_MS));
+      await flushAsync();
+    }
+    expect(sockets).toHaveLength(2);
+    expect(result.current).toMatchObject({ reconnecting: true, replayedWhileDown: true });
+  });
+
+  it("does not flag a reconnect whose replay only repeats the overlap window", async () => {
+    const sid = "sess-replay-overlap";
+    const known = replayedPrompt(sid, 6);
+    calls = installAcpFakes(({ url }) => {
+      if (!url.includes("/acp/replay")) return undefined;
+      const since = new URL(url, "http://x").searchParams.get("since");
+      // The forward request re-reads an overlap window, so the page repeats a frame already held.
+      const next = since === null ? { next_cursor: 6 } : { next_cursor: 10 };
+      return json({ frames: [known.frame], rows: [known.row], lost: false, highest_seq: 6, ...next });
+    });
+    FakeWebSocket.closeFiresOnClose = true;
+    const { result } = render(sid);
+    await flushAsync();
+    sockets[0]!.open();
+    sockets[0]!.drop();
+    await act(() => vi.advanceTimersByTimeAsync(acpRetryDelayMs(1)));
+    await flushAsync();
+    expect(sockets).toHaveLength(2);
+    expect(calls.some((c) => new URL(c.url, "http://x").searchParams.has("since"))).toBe(true);
+    expect(result.current).toMatchObject({ reconnecting: true, replayedWhileDown: false });
+  });
+
+  it("does not flag a replay that brought nothing new", async () => {
+    const { result } = render("sess-replay-empty");
+    await flushAsync();
+    sockets[0]!.drop();
+    expect(result.current).toMatchObject({ reconnecting: true, replayedWhileDown: false });
+  });
+
   it("dials without an elevation preflight", async () => {
     render("sess-no-preflight");
     await flushAsync();

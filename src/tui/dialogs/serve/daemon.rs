@@ -202,22 +202,36 @@ fn saved_port_in(dir: &Path) -> Option<u16> {
         .filter(|port| *port >= 49152)
 }
 
-/// Whether the next start mints a new access token, which the Devices' `aoe_token` cookies
-/// don't match. `load_or_generate_token` reuses `serve.token` only while it is under 24 hours
-/// old, and only remote serving refreshes it while running. The hour's margin covers a help
-/// overlay left open.
-pub(super) fn token_renews() -> bool {
-    crate::session::get_app_dir()
-        .ok()
-        .is_none_or(|dir| token_renews_in(&dir))
+/// Whether the next start reuses `serve.token`. `load_or_generate_token` keeps it only while it
+/// is under 24 hours old, and only remote serving refreshes it while running.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum TokenWindow {
+    #[default]
+    Reused,
+    /// Within an hour of expiry, so a help overlay left open may be stale by the restart.
+    Boundary,
+    /// The next start mints a new token, which the Devices' `aoe_token` cookies don't match.
+    Renews,
 }
 
-fn token_renews_in(dir: &Path) -> bool {
-    const REUSED_UNDER: std::time::Duration = std::time::Duration::from_secs(23 * 60 * 60);
-    std::fs::metadata(dir.join("serve.token"))
+pub(super) fn token_window() -> TokenWindow {
+    crate::session::get_app_dir()
+        .ok()
+        .map_or(TokenWindow::Renews, |dir| token_window_in(&dir))
+}
+
+fn token_window_in(dir: &Path) -> TokenWindow {
+    const HOUR: u64 = 60 * 60;
+    let age = std::fs::metadata(dir.join("serve.token"))
         .and_then(|meta| meta.modified())
         .ok()
-        .is_none_or(|modified| modified.elapsed().unwrap_or_default() >= REUSED_UNDER)
+        .map(|modified| modified.elapsed().unwrap_or_default());
+    match age {
+        None => TokenWindow::Renews,
+        Some(age) if age.as_secs() >= 24 * HOUR => TokenWindow::Renews,
+        Some(age) if age.as_secs() >= 23 * HOUR => TokenWindow::Boundary,
+        Some(_) => TokenWindow::Reused,
+    }
 }
 
 fn log_file_size_opt() -> Option<u64> {
@@ -361,13 +375,17 @@ mod tests {
     }
 
     #[test]
-    fn token_renews_once_the_reuse_window_has_passed() {
-        let hours = |h: u64| std::time::Duration::from_secs(h * 60 * 60);
-        for (age, renews) in [
-            (None, true),
-            (Some(hours(1)), false),
-            (Some(hours(23)), true),
-            (Some(hours(25)), true),
+    fn token_window_follows_the_reuse_age() {
+        use TokenWindow::{Boundary, Renews, Reused};
+        let minutes = |m: u64| std::time::Duration::from_secs(m * 60);
+        for (age, window) in [
+            (None, Renews),
+            (Some(minutes(60)), Reused),
+            (Some(minutes(23 * 60 - 1)), Reused),
+            (Some(minutes(23 * 60)), Boundary),
+            (Some(minutes(24 * 60 - 1)), Boundary),
+            (Some(minutes(24 * 60)), Renews),
+            (Some(minutes(25 * 60)), Renews),
         ] {
             let tmp = tempfile::tempdir().unwrap();
             if let Some(age) = age {
@@ -380,7 +398,7 @@ mod tests {
                     .set_modified(std::time::SystemTime::now() - age)
                     .unwrap();
             }
-            assert_eq!(token_renews_in(tmp.path()), renews, "{age:?}");
+            assert_eq!(token_window_in(tmp.path()), window, "{age:?}");
         }
     }
 

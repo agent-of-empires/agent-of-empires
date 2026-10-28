@@ -24,14 +24,13 @@ mod pane;
 pub mod passkeys;
 pub(crate) mod peer;
 pub mod plugin_status;
+pub mod principal;
 pub mod push;
 pub mod push_send;
 pub mod rate_limit;
 pub(crate) mod reload;
 pub(crate) mod router;
 pub(crate) mod runtime;
-#[cfg(target_os = "linux")]
-pub(crate) mod runtime_uds;
 pub(crate) mod runtime_ws;
 mod secure_store;
 pub(crate) mod serve_snapshot;

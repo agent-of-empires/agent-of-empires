@@ -159,6 +159,22 @@ export function TerminalSettings() {
           </div>
         </div>
 
+        <label className="flex items-center justify-between gap-3 cursor-pointer">
+          <div>
+            <div className="text-[13px] text-text-secondary">Scrollbar for full-screen apps</div>
+            <p className="text-[11px] text-text-muted mt-1">
+              Show scroll arrows and a drag handle beside agents that use the whole screen and take mouse input. Uses a
+              few terminal columns; hidden on touch devices.
+            </p>
+          </div>
+          <input
+            type="checkbox"
+            checked={settings.showForwardScrollbar}
+            onChange={(e) => update({ showForwardScrollbar: e.target.checked })}
+            className="accent-brand-600 w-4 h-4 shrink-0"
+          />
+        </label>
+
         <MobileKeysSettings />
       </div>
     </div>

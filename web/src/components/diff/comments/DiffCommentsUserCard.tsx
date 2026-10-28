@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { CopyMarkdownButton } from "../../acp/CopyMarkdownButton";
 import { CommentMarkdown } from "./CommentMarkdown";
-import { compareComments, type DiffCommentsCardPayload } from "./buildPrompt";
+import { buildDiffCommentsPrompt, compareComments, type DiffCommentsCardPayload } from "./buildPrompt";
 import type { DiffComment } from "./types";
 import { highlightSnippet } from "../../../lib/snippetHighlighter";
 import { useShikiTheme } from "../../../hooks/useShikiTheme";
@@ -13,12 +14,20 @@ interface Props {
 export function DiffCommentsUserCard({ payload }: Props) {
   const { intro, outro, isMultiRepo, comments } = payload;
   const sorted = [...comments].sort(compareComments);
+  // Rebuilt from the payload; it is the text the agent received.
+  const sentPrompt = useMemo(
+    () => buildDiffCommentsPrompt(comments, intro, outro, { isMultiRepo }).assembledMarkdown,
+    [comments, intro, outro, isMultiRepo],
+  );
   return (
     <div className="w-full max-w-3xl rounded-2xl rounded-br-sm border border-surface-700 bg-surface-800/70 px-4 py-3 text-sm">
       <div className="mb-2 flex items-center gap-2 text-[11px] uppercase tracking-wider text-text-dim">
         <span className="rounded bg-brand-600/15 px-1.5 py-0.5 font-mono text-brand-300">diff review</span>
         <span>
           {comments.length} comment{comments.length === 1 ? "" : "s"}
+        </span>
+        <span className="ml-auto">
+          <CopyMarkdownButton compact source={sentPrompt} label="Copy prompt" />
         </span>
       </div>
       {intro && (
