@@ -3,6 +3,7 @@ import { FileDown, Image as ImageIcon, Link as LinkIcon, Music } from "lucide-re
 
 import type { ToolOutputBlock } from "../../lib/acpTypes";
 import { ExpandableImage } from "./artifactMedia";
+import { CopyRow } from "./CopyRow";
 import { SAFE_LINK_SCHEMES, SAFE_MEDIA_SCHEMES, safeUri } from "./ToolCardChrome";
 
 /** Structured completion payload rendered under any tool card, or with `bare`
@@ -37,7 +38,11 @@ function MediaPlaceholder({ icon, label }: { icon: ReactNode; label: string }) {
 }
 
 function TextPre({ text }: { text: string }) {
-  return <pre className="whitespace-pre-wrap break-words font-mono text-xs text-text-secondary">{text}</pre>;
+  return (
+    <CopyRow source={text} label="Copy text">
+      <pre className="whitespace-pre-wrap break-words font-mono text-xs text-text-secondary">{text}</pre>
+    </CopyRow>
+  );
 }
 
 function LinkRow({ icon, label, ...anchor }: { icon: ReactNode; label: string } & React.ComponentProps<"a">) {

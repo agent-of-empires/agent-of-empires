@@ -31,6 +31,7 @@ fn aoe(home: &Path, tmux_socket: &Path, profile: &str, args: &[&str]) -> String 
         .env("AGENT_OF_EMPIRES_PROFILE", profile)
         .env_remove("AOE_DAEMON_URL")
         .env_remove("AOE_DAEMON_TOKEN")
+        .env_remove("AOE_NO_AUTOSTART")
         .args(args)
         .output()
         .expect("the aoe binary runs");
@@ -64,6 +65,25 @@ fn registered(home: &Path, profile: Option<&str>) -> Vec<Value> {
     }
 }
 
+struct DaemonCleanup {
+    home: PathBuf,
+    socket: PathBuf,
+}
+
+impl Drop for DaemonCleanup {
+    fn drop(&mut self) {
+        let _ = Command::new(env!("CARGO_BIN_EXE_aoe"))
+            .current_dir(&self.home)
+            .env("HOME", &self.home)
+            .env("XDG_CONFIG_HOME", self.home.join(".config"))
+            .env("XDG_DATA_HOME", self.home.join(".local/share"))
+            .env("AOE_TMUX_SOCKET", &self.socket)
+            .env_remove("AOE_DAEMON_URL")
+            .args(["serve", "--stop"])
+            .output();
+    }
+}
+
 /// An empty profile variable writes to main and reads the configured default.
 /// The registry identifies the profile chosen by each operation.
 #[test]
@@ -72,10 +92,16 @@ fn an_empty_profile_variable_writes_where_it_wrote_before_and_reads_as_the_defau
     let home = setup_temp_home();
     let home = home.path().to_path_buf();
     let socket = tmux_socket();
+    let _daemon = DaemonCleanup {
+        home: home.clone(),
+        socket: socket.clone(),
+    };
 
     create_profile("main").expect("main");
     create_profile("other").expect("other");
     set_default_profile("main").expect("default");
+    agent_of_empires::session::config::update_config(|config| config.systemd.enabled = false)
+        .expect("disable scopes in the existing configuration");
 
     // A row registered in `other`, so the control below proves the row is
     // there at all when that profile is named.

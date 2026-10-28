@@ -16,11 +16,14 @@ teams; each auto-assigns one reviewer. Paths no area claims, such as
 
 ## Merging
 
-A PR merges with green CI and one approval from a maintainer other than its
-author. The author or the approver squash-merges it. No PR needs @njbrake by
-default.
+A PR merges with green CI and a code-owner approval: one approval, from someone
+other than its author, from each team [CODEOWNERS](.github/CODEOWNERS) assigns
+to a path the PR changes. The `main` ruleset enforces this by requiring
+code-owner review. The author or the approver squash-merges it. No PR needs
+@njbrake by default.
 
-Protected and release paths also need an approval from their team.
+Protected and release paths are owned by the `protected` and `release` teams, so
+changes there need those teams' approval.
 
 ## Reviewing
 
@@ -30,7 +33,7 @@ Protected and release paths also need an approval from their team.
 - If you cannot get to a PR, re-request another team member instead of
   letting it sit.
 - The same reviewer sees a PR through to merge.
-- A PR spanning areas gets one reviewer, plus only the protected or release
-  approvals it requires.
+- A PR spanning areas gets one lead reviewer. Owners of the
+  other areas it touches approve their paths only.
 
 Review with the [rubric](CONTRIBUTING.md#review-rubric).

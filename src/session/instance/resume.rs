@@ -487,14 +487,14 @@ impl Instance {
                 tracing::info!(
                     target: "containers.runtime",
                     session = %self.id,
-                    "removed sandbox container built for the previous tool; it will be recreated on start"
+                    "removed sandbox container; it will be recreated on start"
                 );
                 Ok(())
             }
             crate::containers::Teardown::AlreadyGone => Ok(()),
             crate::containers::Teardown::Failed(e) => anyhow::bail!(
-                "failed to remove sandbox container {} built for the previous tool; remove it \
-                 before restarting, or the new tool reuses its config: {e}",
+                "failed to remove sandbox container {}; remove it before restarting, or the \
+                 restart reuses it: {e}",
                 container.name
             ),
         }
@@ -546,8 +546,7 @@ impl Instance {
         if matches!(probe, Ok(ProbeResult::Alive)) {
             return Ok(());
         }
-        self.stop_poller();
-        self.session_id_poller = None;
+        self.capture_poller.clear();
         probe?;
         let detail = self.dead_pane_detail();
         anyhow::bail!("agent exited immediately when pinned to session id {sid}{detail}")
@@ -616,8 +615,7 @@ impl Instance {
         let probe = match self.probe_settle(RESUME_PROBE_MAX, RESUME_PROBE_POLL) {
             Ok(probe) => probe,
             Err(error) => {
-                self.stop_poller();
-                self.session_id_poller = None;
+                self.capture_poller.clear();
                 return Err(error);
             }
         };
@@ -632,8 +630,7 @@ impl Instance {
             stale_sid,
             self.id,
         );
-        self.stop_poller();
-        self.session_id_poller = None;
+        self.capture_poller.clear();
         self.resume_probe_failed_sid = Some(stale_sid.clone());
         self.mark_resume_probe_failed(storage, &stale_sid)?;
         let killed = self.kill_clean_locked();

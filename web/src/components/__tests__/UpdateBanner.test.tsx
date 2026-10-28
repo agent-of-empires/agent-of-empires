@@ -208,7 +208,10 @@ describe("UpdateBanner", () => {
     const { container } = render(<Banner />);
 
     await screen.findByRole("status", { name: /^Update available/ });
-    fireEvent.click(screen.getByLabelText("Dismiss update notice"));
+    const dismiss = screen.getByLabelText("Dismiss update notice");
+    expect(dismiss.className).toContain("text-text-subtle");
+    expect(dismiss.className).not.toMatch(/text-text-(muted|secondary)/);
+    fireEvent.click(dismiss);
 
     expect(dismissUpdate).toHaveBeenCalledTimes(1);
     expect(dismissUpdate).toHaveBeenCalledWith("1.1.0");

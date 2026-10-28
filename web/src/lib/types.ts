@@ -92,6 +92,8 @@ export interface SessionResponse {
   acp_can_fork?: boolean;
   /** The agent binary was replaced after launch and a restart is safe to offer now. */
   update_restart?: boolean;
+  /** `acp.structured_view = off` for this session: a terminal session cannot switch to structured. */
+  structured_view_off?: boolean;
   /** Claude's fullscreen renderer is on, so mobile skips copy-mode scrollback workarounds. */
   claude_fullscreen: boolean;
   workspace_repos: WorkspaceRepoSummary[];
@@ -289,6 +291,8 @@ export interface Workspace {
 
 export interface AgentInfo {
   name: string;
+  /** How copy names the agent; the registry id for custom agents. */
+  display_name: string;
   kind: "builtin" | "custom";
   binary: string;
   host_only: boolean;
@@ -393,6 +397,8 @@ export interface CreateSessionRequest {
   extra_args?: string;
   sandbox_image?: string;
   extra_env?: string[];
+  /** Host-only env for `host_hooks.before_start`; sandbox only, never enters the container. */
+  hook_env?: string[];
   extra_repo_paths?: string[];
   /** Per-repo base (`repo` is a directory name or path); outranks `base_branch`. */
   repo_bases?: { repo: string; base_branch: string }[];

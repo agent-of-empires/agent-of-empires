@@ -807,6 +807,7 @@ fn restart_help(effect: RestartEffect) -> String {
         LinkChange::Replaced if effect.passphrase => "new link, sign in again".to_string(),
         LinkChange::Replaced => "new link".to_string(),
         LinkChange::Moved => format!("new link; {logins}"),
+        LinkChange::Same if effect.may_change => format!("link may change; {logins}"),
         LinkChange::Same => logins.to_string(),
     };
     format!("Restart the Daemon ({what}; agents keep running)")
@@ -1200,10 +1201,11 @@ mod tests {
 
     #[test]
     fn restart_and_passphrase_copy_say_what_happens_to_devices() {
-        use super::super::RestartProbe;
+        use super::super::{RestartProbe, TokenWindow};
         use PendingConfirm::{NewPassphrase as G, Restart as R};
         use ServeMode::{Local, Tunnel};
         let lan = "http://192.168.1.42:8080/?token=t";
+        let loopback = "http://127.0.0.1:8080/?token=t";
         let funnel = "https://host.tailnet.ts.net/?token=t";
         let named = "https://aoe.example.com/?token=t";
         let quick = "https://a-b-c.trycloudflare.com/?token=t";
@@ -1243,7 +1245,12 @@ mod tests {
                     "localhost".to_string(),
                 ],
                 local_passphrase,
-                local_token_renews: renews,
+                local_token: if renews {
+                    TokenWindow::Renews
+                } else {
+                    TokenWindow::Reused
+                },
+                named_host: None,
             };
         let tunnel = |on_funnel, persists| probe(on_funnel, None, true, false, persists, false);
         // (mode, url, next start, running daemon's persist_sessions (None = reattached), key
@@ -1258,6 +1265,18 @@ mod tests {
                 None,
                 R,
                 stays.clone(),
+            ),
+            // In the token's last hour the confirm is exact, but a standing help screen can't be.
+            (
+                Local,
+                lan,
+                RestartProbe {
+                    local_token: TokenWindow::Boundary,
+                    ..probe(false, Some(8080), true, false, false, false)
+                },
+                None,
+                R,
+                (format!("{kept}."), format!("link may change; {kept}")),
             ),
             // A CLI-started Local daemon on another port, or no saved port, moves the link.
             (
@@ -1295,6 +1314,23 @@ mod tests {
                 on,
                 R,
                 moved.clone(),
+            ),
+            // The restart binds 0.0.0.0, so a loopback link survives with its LAN host gone.
+            (
+                Local,
+                loopback,
+                probe(false, Some(8080), false, false, true, false),
+                on,
+                R,
+                stays.clone(),
+            ),
+            (
+                Local,
+                loopback,
+                probe(false, Some(51234), false, false, true, false),
+                on,
+                R,
+                local_moved.clone(),
             ),
             // A Local daemon behind AOE_SERVE_PASSPHRASE has LAN Devices sign in, so the same
             // host and port keep them only when the sign-ins persist.
@@ -1370,6 +1406,29 @@ mod tests {
             // spawn_daemon never re-creates a named tunnel, whether or not Funnel replaces it.
             (Tunnel, named, tunnel(false, true), on, R, moved.clone()),
             (Tunnel, named, tunnel(true, true), on, R, moved.clone()),
+            // A recorded named tunnel is replayed, so its link stays whatever Funnel does.
+            (
+                Tunnel,
+                named,
+                RestartProbe {
+                    named_host: Some("aoe.example.com".to_string()),
+                    ..tunnel(false, true)
+                },
+                on,
+                R,
+                stays.clone(),
+            ),
+            (
+                Tunnel,
+                quick,
+                RestartProbe {
+                    named_host: Some("aoe.example.com".to_string()),
+                    ..tunnel(true, true)
+                },
+                on,
+                R,
+                moved.clone(),
+            ),
             (Tunnel, quick, tunnel(false, true), on, R, moved.clone()),
             (
                 Tunnel,

@@ -42,7 +42,7 @@ use tokio_tungstenite::WebSocketStream;
 use tracing::debug;
 
 use super::discovery::DaemonEndpoint;
-use super::passphrase_session::{self, PassphraseSessionCache};
+use super::passphrase_session::{self, Credential, PassphraseSessionCache};
 use crate::acp::protocol::AcpBroadcastFrame;
 use crate::acp::state::AcpState;
 use crate::acp::transcript::{TranscriptDelta, TranscriptRow};
@@ -191,12 +191,10 @@ async fn connect_session(
     query: &str,
 ) -> Result<NativeSocket, WsError> {
     let cache = PassphraseSessionCache::default();
-    let had_cached_session = cache.get(endpoint).is_some();
+    let may_retry = passphrase_session::may_retry_with_login(endpoint, &cache);
     let headers = session_headers(endpoint, &cache, false).await?;
-    let bearer_only =
-        !had_cached_session && endpoint.bearer_token().is_some() && can_login(endpoint);
     match websocket::connect_with_headers(endpoint, path, Some(query), &headers).await {
-        Err(error) if (had_cached_session || bearer_only) && is_unauthorized(&error) => {
+        Err(error) if may_retry && is_unauthorized(&error) => {
             cache.invalidate(endpoint);
             let headers = session_headers(endpoint, &cache, true).await?;
             websocket::connect_with_headers(endpoint, path, Some(query), &headers).await
@@ -205,22 +203,14 @@ async fn connect_session(
     }
 }
 
-/// A passphrase can be used: never over a Unix socket, whose peer owner authorizes the
-/// connection, and never without one resolving (`--auth=none`).
-fn can_login(endpoint: &DaemonEndpoint) -> bool {
-    endpoint.unix_path().is_none() && endpoint.resolved_passphrase().is_some()
-}
-
 /// The passphrase-login headers this upgrade must carry, or none when the endpoint needs
-/// none. A cached session wins, then a bearer token (which already rides the
-/// `Authorization` header), then a fresh login; `force_session` skips the bearer.
+/// none: a bearer token already rides the `Authorization` header.
 async fn session_headers(
     endpoint: &DaemonEndpoint,
     cache: &PassphraseSessionCache,
     force_session: bool,
 ) -> Result<Vec<(HeaderName, HeaderValue)>, WsError> {
-    if !can_login(endpoint)
-        || (endpoint.bearer_token().is_some() && !force_session && cache.get(endpoint).is_none())
+    if passphrase_session::select_credential(endpoint, cache, force_session) != Credential::Session
     {
         return Ok(Vec::new());
     }

@@ -355,7 +355,10 @@ impl Instance {
         if !recreate {
             self.ensure_before_start_env(true, &launch_config, &mut scoped_hook)?;
         }
-        let config = self.build_container_config(&launch_config)?;
+        let mut config = self.build_container_config(&launch_config)?;
+        // The profile `spawn_prepared_launch` gives `scope_prefix_for`, so the
+        // container lands in its session's slice.
+        config.cgroup_parent = crate::process::systemd::slice_for(store.storage().profile());
         // Still the workdir the *previous* container was created with; the pin below
         // is what moves it forward.
         let stranded = container_config::stranded_named_ignore_volumes(
@@ -737,6 +740,7 @@ mod tests {
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         });
 
@@ -766,6 +770,7 @@ mod tests {
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: Some("/workspace/Thymeline-worktrees/groceries".to_string()),
         });
 
@@ -858,6 +863,7 @@ claude-personal = "~/.claude-global"
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         });
         for (case, declared_agent, entries, expected) in cases {
@@ -1039,6 +1045,7 @@ claude-personal = "~/.claude-global"
                 extra_env: None,
                 custom_instruction: None,
                 before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
                 container_workdir: None,
             });
             instance.sandbox_store_generation =
@@ -1124,6 +1131,7 @@ claude-personal = "~/.claude-global"
                 extra_env: None,
                 custom_instruction: None,
                 before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
                 container_workdir: None,
             });
             assert_eq!(
@@ -1229,6 +1237,7 @@ claude-personal = "~/.claude-global"
                 extra_env: None,
                 custom_instruction: None,
                 before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
                 container_workdir: None,
             });
             let id = instance.id.clone();

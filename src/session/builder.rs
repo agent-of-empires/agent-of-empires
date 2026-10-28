@@ -74,6 +74,8 @@ pub struct InstanceParams {
     /// Additional environment entries for the container.
     /// `KEY` = pass through from host, `KEY=VALUE` = set explicitly.
     pub extra_env: Vec<String>,
+    /// Host-only env for `host_hooks.before_start`; never enters the container.
+    pub before_start_hook_env: Vec<String>,
     /// Extra arguments to append after the agent binary
     pub extra_args: String,
     /// Command override for the agent binary (replaces the default binary)
@@ -925,6 +927,11 @@ pub(crate) fn plan_instance(
             &params.extra_env
         };
         warnings.extend(crate::session::validate_env_entries(effective_env));
+        warnings.extend(
+            crate::session::validate_env_entries(&params.before_start_hook_env)
+                .into_iter()
+                .map(|w| w.replace("empty in the container", "skipped by the host hook")),
+        );
 
         instance.sandbox_info = Some(SandboxInfo {
             enabled: true,
@@ -938,6 +945,7 @@ pub(crate) fn plan_instance(
             },
             custom_instruction: config.sandbox.custom_instruction.clone(),
             before_start_env: Vec::new(),
+            before_start_hook_env: params.before_start_hook_env.clone(),
             provider: None,
             container_workdir: None,
         });
@@ -1359,9 +1367,14 @@ pub mod structured {
             return true;
         }
         if !is_bare_command(command) {
-            let checkable =
-                command.contains("${aoe_data_dir}") || std::path::Path::new(command).is_absolute();
-            return !checkable || crate::cli::acp::command_present(command);
+            let path = std::path::Path::new(command);
+            if command.contains("${aoe_data_dir}") || path.is_absolute() {
+                return crate::cli::acp::command_present(command);
+            }
+            // Spawned from the project, so a relative path resolves there; a launch
+            // directory that doesn't exist yet may still gain it.
+            return command.contains("${")
+                || project_path.is_none_or(|cwd| !cwd.is_dir() || cwd.join(path).exists());
         }
         let app_dir = crate::session::get_app_dir().ok();
         if resolve_agent_command(command, app_dir.as_deref()).is_ok() {
@@ -1708,6 +1721,8 @@ mod tests {
                     "fake-present-path",
                     bin.join(&adapter).display().to_string(),
                 ),
+                ("fake-rel-present", format!("agent-bin/{adapter}")),
+                ("fake-rel-missing", "agent-bin/aoe-test-missing".to_string()),
             ] {
                 config.session.agent_acp_cmd.insert(name.into(), cmd);
             }
@@ -1725,6 +1740,7 @@ mod tests {
         };
         let configured = vec![format!("PATH={}", bin.display())];
         let present_wrapper = bin.join(&adapter).display().to_string();
+        let not_created = project.path().join("not-created");
         let missing_text = "is not installed or not on $PATH";
         let missing = Some(missing_text);
         let not_capable = Some("is not ACP-capable");
@@ -1847,6 +1863,41 @@ mod tests {
                 label: "a before_session hook may install an absolute command",
                 tool: "fake-path",
                 before_session_hook: true,
+                ..base()
+            },
+            Case {
+                label: "relative command, present in the project",
+                tool: "fake-rel-present",
+                ..base()
+            },
+            Case {
+                label: "relative command, missing from an existing project",
+                tool: "fake-rel-missing",
+                expected: missing,
+                ..base()
+            },
+            Case {
+                label: "relative command, launch dir not created yet",
+                tool: "fake-rel-missing",
+                project: None,
+                ..base()
+            },
+            Case {
+                label: "relative command, project dir absent on disk",
+                tool: "fake-rel-missing",
+                project: Some(&not_created),
+                ..base()
+            },
+            Case {
+                label: "a before_session hook may install a relative command",
+                tool: "fake-rel-missing",
+                before_session_hook: true,
+                ..base()
+            },
+            Case {
+                label: "an on_create hook may install a relative command",
+                tool: "fake-rel-missing",
+                preparation_hooks: true,
                 ..base()
             },
             Case {
@@ -2792,6 +2843,7 @@ mod tests {
             sandbox_image: "ubuntu:latest".to_string(),
             yolo_mode: false,
             extra_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: Vec::new(),
@@ -2799,6 +2851,30 @@ mod tests {
             scratch: false,
             fork_seed: None,
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_instance_keeps_hook_env_off_the_container_env() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
+        let runtime = containers::get_container_runtime();
+        if !runtime.is_available() || !runtime.is_daemon_running() {
+            return;
+        }
+        let project = tempfile::tempdir().unwrap();
+        let mut params = custom_agent_params(project.path(), "claude");
+        params.sandbox = true;
+        params.extra_env = vec!["A=1".into()];
+        params.before_start_hook_env = vec!["TOKEN".into(), "H=2".into()];
+
+        let sandbox = build_instance(params, &[], &[], "default")
+            .unwrap()
+            .instance
+            .sandbox_info
+            .unwrap();
+        assert_eq!(sandbox.before_start_hook_env, ["TOKEN", "H=2"]);
+        assert_eq!(sandbox.extra_env, Some(vec!["A=1".to_string()]));
     }
 
     #[test]
@@ -3037,6 +3113,7 @@ mod tests {
             sandbox_image: String::new(),
             yolo_mode: false,
             extra_env: vec![],
+            before_start_hook_env: vec![],
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: vec![],
@@ -3109,6 +3186,7 @@ mod tests {
             sandbox_image: String::new(),
             yolo_mode: false,
             extra_env: vec![],
+            before_start_hook_env: vec![],
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: vec![],

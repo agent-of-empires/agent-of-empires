@@ -122,7 +122,7 @@ export function UpdateBanner({ status, onDismiss }: { status: UpdateStatus; onDi
         type="button"
         onClick={onDismiss}
         aria-label="Dismiss update notice"
-        className="flex h-8 w-8 shrink-0 items-center justify-center text-text-muted hover:text-text-secondary cursor-pointer text-base leading-none"
+        className="flex h-8 w-8 shrink-0 items-center justify-center text-text-subtle hover:text-text-primary cursor-pointer text-base leading-none"
       >
         &times;
       </button>

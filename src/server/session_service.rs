@@ -1618,6 +1618,32 @@ impl SessionService {
         })
     }
 
+    /// The sidebar status right after `seq`, rebuilt from the durable log. For
+    /// a frame published while the control cache was cold, so no status rode
+    /// with it; exact for whatever the journal's retention still holds.
+    pub(crate) async fn sidebar_status_at(
+        &self,
+        id: &str,
+        seq: u64,
+    ) -> Option<crate::session::Status> {
+        use crate::acp::state::{AcpSessionId, AcpState, AgentName};
+        let store = Arc::clone(&self.acp_event_store);
+        let sid = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut state =
+                AcpState::new(AcpSessionId(sid.clone()), AgentName(String::new()), None);
+            let mut folded = false;
+            for (at, event) in store.replay_before(&sid, seq.saturating_add(1)) {
+                let _ = state.apply_event(at, event);
+                folded = true;
+            }
+            folded.then(|| state.sidebar_status())
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// Drain the leading batch of a session's server-owned queue into the live
     /// worker once the current turn has ended. Mirrors
     /// `drain_pending_initial_turn`'s single-owner `pending_drains` claim +
@@ -2474,6 +2500,7 @@ mod tests {
             sandbox_image: None,
             yolo_mode: false,
             extra_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: Vec::new(),
