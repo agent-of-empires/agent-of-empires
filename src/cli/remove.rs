@@ -76,15 +76,7 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         let receipt = daemon
             .trash_session(id, &TrashSessionBody::default(), &info.epoch)
             .await?;
-        match receipt.outcome.relocation {
-            TrashRelocationOutcome::Relocated {
-                warning: Some(warning),
-            } => eprintln!("  Warning: {warning}"),
-            TrashRelocationOutcome::Failed { reason } => {
-                eprintln!("  Note: left worktree in place ({reason}).")
-            }
-            _ => {}
-        }
+        trash_result(receipt.outcome.relocation, title)?;
         println!("  Moved session to trash: {title} (from profile '{profile}')");
         println!(
             "  Restore with `aoe session restore {id}`, or delete permanently with `aoe rm --purge {id}`."
@@ -133,6 +125,23 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         println!("Container preserved (--keep-container)");
     }
     println!("  Removed session: {title} (from profile '{profile}')");
+    Ok(())
+}
+
+/// Teardown failure is an error; worktree relocation problems only warn.
+fn trash_result(relocation: TrashRelocationOutcome, title: &str) -> Result<()> {
+    match relocation {
+        TrashRelocationOutcome::TeardownFailed { reason } => anyhow::bail!(
+            "Session {title} trashed, but resources retained because tmux teardown failed: {reason}"
+        ),
+        TrashRelocationOutcome::Relocated {
+            warning: Some(warning),
+        } => eprintln!("  Warning: {warning}"),
+        TrashRelocationOutcome::Failed { reason } => {
+            eprintln!("  Note: left worktree in place ({reason}).")
+        }
+        TrashRelocationOutcome::Relocated { warning: None } | TrashRelocationOutcome::Skipped => {}
+    }
     Ok(())
 }
 
@@ -209,6 +218,39 @@ mod tests {
         assert!(intent.delete_worktree && intent.keep_container && !intent.delete_branch);
         assert!(b.force_delete);
         assert!(!b.delete_worktree && !b.delete_branch && !b.delete_sandbox);
+    }
+
+    #[test]
+    fn trash_result_fails_only_on_teardown_failure() {
+        let outcomes = [
+            (TrashRelocationOutcome::Skipped, false),
+            (TrashRelocationOutcome::Relocated { warning: None }, false),
+            (
+                TrashRelocationOutcome::Relocated {
+                    warning: Some("git degraded".into()),
+                },
+                false,
+            ),
+            (
+                TrashRelocationOutcome::Failed {
+                    reason: "busy".into(),
+                },
+                false,
+            ),
+            (
+                TrashRelocationOutcome::TeardownFailed {
+                    reason: "tmux gone".into(),
+                },
+                true,
+            ),
+        ];
+        for (outcome, fails) in outcomes {
+            let result = trash_result(outcome, "t");
+            assert_eq!(result.is_err(), fails);
+            if let Err(error) = result {
+                assert!(error.to_string().contains("tmux gone"));
+            }
+        }
     }
 
     #[test]

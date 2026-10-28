@@ -654,17 +654,21 @@ pub async fn trash_session(
                 Ok(())
             }
         })?;
-        Ok(outcome)
+        Ok((outcome, stopped.err().map(|error| error.to_string())))
     }).await.map_err(anyhow::Error::from).and_then(|result| result);
     let relocation = match result {
-        Ok(crate::session::trash::RelocateOutcome::Failed { reason }) => {
+        Ok((_, Some(reason))) => {
+            tracing::warn!(target: "http.api.sessions", session = %id, %reason, "trash tmux teardown failed");
+            crate::daemon::TrashRelocationOutcome::TeardownFailed { reason }
+        }
+        Ok((crate::session::trash::RelocateOutcome::Failed { reason }, None)) => {
             tracing::warn!(target: "http.api.sessions", session = %id, %reason, "trash worktree relocation skipped");
             crate::daemon::TrashRelocationOutcome::Failed { reason }
         }
-        Ok(crate::session::trash::RelocateOutcome::Skipped) => {
+        Ok((crate::session::trash::RelocateOutcome::Skipped, None)) => {
             crate::daemon::TrashRelocationOutcome::Skipped
         }
-        Ok(crate::session::trash::RelocateOutcome::Relocated { warning, .. }) => {
+        Ok((crate::session::trash::RelocateOutcome::Relocated { warning, .. }, None)) => {
             if let Some(warning) = &warning {
                 tracing::warn!(target: "http.api.sessions", session = %id, %warning, "trashed worktree is degraded");
             }

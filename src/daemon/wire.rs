@@ -502,6 +502,10 @@ pub enum TrashRelocationOutcome {
     Failed {
         reason: String,
     },
+    /// The session is trashed but its tmux sessions may still be running.
+    TeardownFailed {
+        reason: String,
+    },
 }
 
 fn default_kill_pane() -> bool {
