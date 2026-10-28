@@ -4,7 +4,7 @@ import type { WizardData } from "./wizardReducer";
 /** The create payload for the wizard state. Scratch omits every worktree field
  *  (the server rejects scratch plus a worktree branch); the server re-validates
  *  structured view capability. */
-export function buildCreateRequest(d: WizardData, acpCapable: boolean, alwaysYolo = false): CreateSessionRequest {
+export function buildCreateRequest(d: WizardData, acpCapable: boolean): CreateSessionRequest {
   const worktree = !d.scratch && d.useWorktree;
   const newBranch = worktree && !d.attachExisting;
   const structured = acpCapable && d.useStructuredView;
@@ -13,7 +13,7 @@ export function buildCreateRequest(d: WizardData, acpCapable: boolean, alwaysYol
     tool: d.tool,
     title: d.title || undefined,
     group: d.group || undefined,
-    yolo_mode: alwaysYolo || d.yoloMode,
+    yolo_mode: d.yoloMode,
     worktree_enabled: worktree,
     worktree_branch: worktree && d.worktreeBranchDirty && d.worktreeBranch.trim() ? d.worktreeBranch.trim() : undefined,
     create_new_branch: newBranch,

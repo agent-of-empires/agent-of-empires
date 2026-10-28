@@ -638,7 +638,6 @@ export function SessionWizard({
           d.tool,
           state.agents.find((a) => a.name === d.tool),
         ),
-        state.agents.find((a) => a.name === d.tool)?.always_yolo === true,
       ),
       idempotency_key: newIdempotencyKey(),
     };

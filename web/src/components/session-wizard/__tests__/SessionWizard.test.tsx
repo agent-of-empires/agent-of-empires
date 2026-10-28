@@ -1084,7 +1084,7 @@ describe("SessionWizard Yolo mode", () => {
     await waitFor(() => expect(yoloRow()).toContain("always on for pi"));
     await launch();
     await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
-    expect(payload()).toMatchObject({ tool: "pi", yolo_mode: true });
+    expect(payload()).toMatchObject({ tool: "pi", yolo_mode: false });
   });
 
   it("keeps a profile's Yolo mode default for an agent that can turn it off", async () => {
@@ -1153,7 +1153,7 @@ describe("SessionWizard Yolo mode", () => {
     expect(yoloRow()).toContain("always on for pi");
     await launch();
     await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
-    expect(payload()).toMatchObject({ tool: "pi", yolo_mode: true });
+    expect(payload()).toMatchObject({ tool: "pi", yolo_mode: false });
   });
 
   it("retries a failed agent list, keeping Launch off until it loads", async () => {
@@ -1167,7 +1167,7 @@ describe("SessionWizard Yolo mode", () => {
     expect(screen.queryByText(/Couldn't load the agent list/)).toBeNull();
     await launch();
     await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
-    expect(payload()).toMatchObject({ tool: "pi", yolo_mode: true });
+    expect(payload()).toMatchObject({ tool: "pi", yolo_mode: false });
   });
 
   it("launches a name-only form without the agent list", async () => {
