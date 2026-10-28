@@ -1097,6 +1097,7 @@ mod tests {
             .join(&child_plan.session_dir)
             .join(format!("{parent_id}.jsonl"));
         let before = child.conversation_state();
+        let file_watch = crate::file_watch::FileWatchService::noop();
         let invalid_store = tmp.path().join("invalid-parent-store");
         std::fs::create_dir(&invalid_store).unwrap();
         std::fs::write(
@@ -1117,14 +1118,27 @@ mod tests {
                 _ => unreachable!(),
             }
             let original = invalid.conversation_state();
-            assert!(invalid.preflight_resume_launch().is_err(), "{reason}");
+            assert!(
+                invalid
+                    .preflight_resume_launch_in(
+                        CaptureStorage::Profiles(&file_watch),
+                        super::resume::ResumeAttemptPolicy::Allow,
+                    )
+                    .is_err(),
+                "{reason}"
+            );
             assert_eq!(invalid.conversation_state(), original);
             assert!(
                 !target.exists(),
                 "preflight must not copy a parent transcript"
             );
         }
-        child.preflight_resume_launch().unwrap();
+        child
+            .preflight_resume_launch_in(
+                CaptureStorage::Profiles(&file_watch),
+                super::resume::ResumeAttemptPolicy::Allow,
+            )
+            .unwrap();
         assert_eq!(child.conversation_state(), before);
         assert!(!target.exists(), "valid preflight is read-only");
         assert_eq!(std::fs::read(&parent_transcript).unwrap(), parent_bytes);

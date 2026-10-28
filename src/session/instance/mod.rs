@@ -707,9 +707,9 @@ pub struct Instance {
     pub(crate) prior_tool_session_ids: HashMap<String, PriorToolSession>,
 
     /// Durable loop-breaker for ambiguous resume-probe failures. When this
-    /// equals `agent_session_id`, the next default resume cascade starts fresh
-    /// instead of repeating the failed probe. Explicit pins and direct starts
-    /// may retry after shared native-context validation.
+    /// equals `agent_session_id`, startup recovery skips automatic resume so a
+    /// transient pane crash does not repeatedly re-run the same failed probe.
+    /// Explicit user actions can still retry the preserved sid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) resume_probe_failed_sid: Option<String>,
 

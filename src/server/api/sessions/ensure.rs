@@ -347,11 +347,6 @@ pub(super) async fn agent_target_response(
             crate::session::StartOutcome::Resumed => "resumed",
             crate::session::StartOutcome::Fresh => "fresh",
             crate::session::StartOutcome::ResumeFailed { .. } => "resume_failed",
-            crate::session::StartOutcome::FreshAfterFailedResume { sid } => {
-                body["message"] = format!("Started fresh; the prior conversation {sid} remains available in the agent's history.").into();
-                body["prior_session_id"] = sid.into();
-                "fresh_after_failed_resume"
-            }
         }
         .into();
     }

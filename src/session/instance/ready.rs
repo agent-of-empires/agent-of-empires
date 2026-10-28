@@ -135,8 +135,8 @@ impl Instance {
         if !session.exists() {
             // Route fresh starts through the resume probe so a sid loaded
             // from disk that crashes the agent on launch is detected and
-            // preserved on the first failure. The next attempt starts fresh
-            // rather than repeating that resume. Always `Allow`: sends must
+            // preserved with a loop-breaker instead of being retried
+            // automatically. Always `Allow`: Send Message and Live Send must
             // keep trying to preserve agent context regardless of
             // `auto_resume_on_restart`, which only scopes explicit
             // restart/reattach. See #2609.
@@ -146,9 +146,7 @@ impl Instance {
                 StartOutcome::ResumeFailed { sid } => {
                     return Ok(EnsureReadyOutcome::ResumeFailed { sid });
                 }
-                StartOutcome::Resumed
-                | StartOutcome::Fresh
-                | StartOutcome::FreshAfterFailedResume { .. } => {}
+                StartOutcome::Resumed | StartOutcome::Fresh => {}
             }
             self.wait_for_pane_ready(&session);
             return Ok(EnsureReadyOutcome::Started);
@@ -160,9 +158,7 @@ impl Instance {
                 StartOutcome::ResumeFailed { sid } => {
                     return Ok(EnsureReadyOutcome::ResumeFailed { sid });
                 }
-                StartOutcome::Resumed
-                | StartOutcome::Fresh
-                | StartOutcome::FreshAfterFailedResume { .. } => {}
+                StartOutcome::Resumed | StartOutcome::Fresh => {}
             }
             self.wait_for_pane_ready(&session);
             return Ok(EnsureReadyOutcome::Respawned);

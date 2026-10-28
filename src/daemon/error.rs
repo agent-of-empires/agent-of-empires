@@ -150,6 +150,7 @@ fn managed_resume_cause(headers: &HeaderMap) -> ManagedResumeCause {
             b"wrapper_contract_required" => ManagedResumeCause::WrapperContractRequired,
             b"unsupported_managed_arguments" => ManagedResumeCause::UnsupportedManagedArguments,
             b"opencode_schema_unattested" => ManagedResumeCause::OpenCodeSchemaUnattested,
+            b"previous_resume_probe_failed" => ManagedResumeCause::PreviousResumeProbeFailed,
             _ => ManagedResumeCause::ExecutionContextUnattested,
         },
         _ => ManagedResumeCause::ExecutionContextUnattested,
@@ -285,6 +286,7 @@ mod tests {
             ("wrapper_contract_required", WrapperContractRequired),
             ("unsupported_managed_arguments", UnsupportedManagedArguments),
             ("opencode_schema_unattested", OpenCodeSchemaUnattested),
+            ("previous_resume_probe_failed", PreviousResumeProbeFailed),
             ("execution_context_unattested", ExecutionContextUnattested),
             ("secret-token", ExecutionContextUnattested),
             (
