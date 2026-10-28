@@ -487,14 +487,14 @@ impl Instance {
                 tracing::info!(
                     target: "containers.runtime",
                     session = %self.id,
-                    "removed sandbox container built for the previous tool; it will be recreated on start"
+                    "removed sandbox container; it will be recreated on start"
                 );
                 Ok(())
             }
             crate::containers::Teardown::AlreadyGone => Ok(()),
             crate::containers::Teardown::Failed(e) => anyhow::bail!(
-                "failed to remove sandbox container {} built for the previous tool; remove it \
-                 before restarting, or the new tool reuses its config: {e}",
+                "failed to remove sandbox container {}; remove it before restarting, or the \
+                 restart reuses it: {e}",
                 container.name
             ),
         }

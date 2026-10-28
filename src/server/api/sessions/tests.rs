@@ -4335,6 +4335,13 @@ fn public_create_session_error_forwards_whitelisted_git_errors_only() {
         "Branch 'feature/foo' is already in use by another worktree"
     );
 
+    let template: anyhow::Error =
+        GitError::InvalidTemplate("environment variable `X` is unset or empty".to_string()).into();
+    assert_eq!(
+        public_create_session_error(&template),
+        "Invalid worktree path template: environment variable `X` is unset or empty"
+    );
+
     // Whitelisted variants survive an anyhow::Context wrapper too.
     let wrapped = anyhow::Error::from(GitError::BranchNotFound("nope".to_string()))
         .context("while creating worktree");
@@ -9893,4 +9900,135 @@ async fn create_refuses_a_structured_session_without_its_adapter() {
             "{extra}: {body}"
         );
     }
+}
+
+/// Recreate goes through the restart: the container is removed under the launch reservation,
+/// then the relaunch, tmux or the structured Worker's respawn, creates a new one from the local
+/// image. Only a sandboxed, free, writable session gets that far.
+#[tokio::test]
+#[serial_test::serial]
+async fn recreate_container_removes_the_container_before_the_agent_restarts() -> anyhow::Result<()>
+{
+    use std::os::unix::fs::PermissionsExt;
+    let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })?;
+    let bin = tempfile::tempdir()?;
+    let calls = bin.path().join("runtime-calls");
+    // Removal succeeds, the image is local and a container reads as gone, so a relaunch stops
+    // at creating the new container.
+    for binary in ["docker", "podman", "container"] {
+        let script = bin.path().join(binary);
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n\
+                 if [ \"$1\" = rm ]; then exit 0; fi\n\
+                 case \"$*\" in \"image inspect\"*) exit 0;; *inspect*) echo 'Error: No such container (container not found)' >&2; exit 1;; esac\n\
+                 echo 'permission denied' >&2\nexit 1\n",
+                calls.display()
+            ),
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+    }
+    let _path = crate::session::test_support::path_prepended(bin.path());
+    let project = tempfile::tempdir()?;
+
+    // (case, structured, sandboxed, read_only, busy, refusal); no refusal means recreated.
+    let cases = [
+        ("terminal", false, true, false, false, None),
+        ("structured", true, true, false, false, None),
+        (
+            "not sandboxed",
+            false,
+            false,
+            false,
+            false,
+            Some(StatusCode::CONFLICT),
+        ),
+        (
+            "read only",
+            false,
+            true,
+            true,
+            false,
+            Some(StatusCode::FORBIDDEN),
+        ),
+        ("busy", false, true, false, true, Some(StatusCode::CONFLICT)),
+    ];
+    for (case, structured, sandboxed, read_only, busy, refusal) in cases {
+        let _ = std::fs::remove_file(&calls);
+        let mut row = Instance::new(case, project.path().to_str().unwrap());
+        row.source_profile = "default".into();
+        row.tool = "claude".into();
+        row.status = Status::Stopped;
+        if structured {
+            row.view = crate::session::View::Structured;
+            row.agent_name = Some("claude".into());
+            row.mark_idle_dormant();
+        }
+        if sandboxed {
+            row.sandbox_info = Some(crate::session::SandboxInfo {
+                provider: None,
+                enabled: true,
+                container_id: None,
+                image: "ubuntu:latest".to_string(),
+                container_name: "recreate-test".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
+                container_workdir: None,
+            });
+        }
+        if busy {
+            row.try_acquire_lifecycle_reservation(
+                crate::session::LifecycleOperation::Launch,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                chrono::Utc::now(),
+            )?;
+        }
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let container = crate::containers::DockerContainer::from_session_id(&row.id).name;
+        let state = crate::server::test_support::build_test_app_state_impl(
+            vec![row.clone()],
+            Vec::new(),
+            Vec::new(),
+            None,
+            false,
+            |s| s.read_only = read_only,
+            std::convert::identity,
+        );
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+        let response = recreate_container(State(state.clone()), Path(row.id.clone())).await;
+        let code = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 8192).await?;
+        let body = String::from_utf8_lossy(&body);
+        let log = std::fs::read_to_string(&calls).unwrap_or_default();
+        let lines: Vec<&str> = log.lines().collect();
+        let removals: Vec<usize> = (0..lines.len())
+            .filter(|&i| lines[i].starts_with("rm ") && lines[i].ends_with(&container))
+            .collect();
+        let created = lines
+            .iter()
+            .position(|line| line.starts_with("run ") || line.starts_with("create "));
+        match refusal {
+            Some(expected) => {
+                assert_eq!(code, expected, "{case}: {body}");
+                assert!(removals.is_empty() && created.is_none(), "{case}: {log}");
+            }
+            None => {
+                // The fake runtime fails the create, so the relaunch itself fails.
+                assert!(!code.is_success(), "{case}: {code} {body}");
+                assert_eq!(removals.len(), 1, "{case}: {log}");
+                assert!(
+                    created.is_some_and(|at| at > removals[0]),
+                    "{case}: no container was created after the removal:\n{log}"
+                );
+            }
+        }
+    }
+    Ok(())
 }
