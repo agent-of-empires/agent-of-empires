@@ -18,7 +18,22 @@ function mergeSession(session: SessionResponse, previous: SessionResponse): Sess
     ...session,
     rate_limit: session.rate_limit === undefined ? previous.rate_limit : session.rate_limit,
     rate_limit_auto_resume: session.rate_limit_auto_resume ?? previous.rate_limit_auto_resume,
+    // Omitted when false, and mutation responses never resolve it: keep the polled value.
+    structured_view_off: session.structured_view_off ?? previous.structured_view_off,
   };
+}
+
+interface PushedStatus {
+  status: SessionResponse["status"];
+  cursor: RuntimeCursor;
+}
+
+/** A pushed status wins over a row observation of the same epoch only while it is newer than that observation. */
+const outranks = (held: PushedStatus, observed: RuntimeCursor) =>
+  held.cursor.epoch === observed.epoch && held.cursor.revision > observed.revision;
+
+function withPushedStatus(row: SessionResponse, observed: RuntimeCursor, held: PushedStatus | undefined) {
+  return held && outranks(held, observed) ? { ...row, status: held.status } : row;
 }
 
 export function useSessions() {
@@ -31,6 +46,9 @@ export function useSessions() {
   // GET admission is global; only installed rows attest individual mutation receipts.
   const floorGet = useRef<RuntimeCursor | null>(null);
   const abandonedEpochs = useRef(new Set<string>());
+  // Newest pushed status per row. A push is a partial observation: it is compared with each row's own observation,
+  // never with the global floor, and one from an epoch not yet installed waits for a read of that epoch.
+  const pushedRef = useRef(new Map<string, PushedStatus>());
 
   const injectSession = useCallback((session: SessionResponse) => {
     setState((prev) =>
@@ -53,8 +71,15 @@ export function useSessions() {
       if (floor?.epoch === cursor.epoch && cursor.revision < floor.revision) return;
       if (floor && floor.epoch !== cursor.epoch) abandonedEpochs.current.add(floor.epoch);
       floorGet.current = cursor;
+      const pushed = pushedRef.current;
+      const present = new Set(data.sessions.map((s) => s.id));
+      const sessions = data.sessions.map((s) => withPushedStatus(s, cursor, pushed.get(s.id)));
+      for (const [id, held] of pushed) {
+        const waiting = held.cursor.epoch !== cursor.epoch && !abandonedEpochs.current.has(held.cursor.epoch);
+        if (!present.has(id) || !(outranks(held, cursor) || waiting)) pushed.delete(id);
+      }
       setState({
-        sessions: data.sessions,
+        sessions,
         observedById: Object.fromEntries(data.sessions.map((session) => [session.id, cursor])),
         epoch: cursor.epoch,
       });
@@ -107,6 +132,25 @@ export function useSessions() {
     };
   }, [applyResult]);
 
+  // Refetches the authoritative list after the stream (re)connected or lost events.
+  const refresh = useCallback(() => {
+    void fetchSessions().then(applyResult);
+  }, [applyResult]);
+
+  // The server sends a move only after publishing a snapshot that includes it, and stamps it with that cursor.
+  const applyPushedStatus = useCallback((id: string, status: SessionResponse["status"], cursor: RuntimeCursor) => {
+    if (abandonedEpochs.current.has(cursor.epoch)) return;
+    const held = pushedRef.current.get(id);
+    if (held && held.cursor.epoch === cursor.epoch && held.cursor.revision >= cursor.revision) return;
+    pushedRef.current.set(id, { status, cursor });
+    setState((prev) => {
+      if (prev.epoch !== cursor.epoch) return prev;
+      const observed = prev.observedById[id];
+      if (observed?.epoch === cursor.epoch && observed.revision >= cursor.revision) return prev;
+      return { ...prev, sessions: prev.sessions.map((s) => (s.id === id ? { ...s, status } : s)) };
+    });
+  }, []);
+
   const setSessionStatus = useCallback((id: string, status: SessionResponse["status"]) => {
     setState((prev) => ({ ...prev, sessions: prev.sessions.map((s) => (s.id === id ? { ...s, status } : s)) }));
   }, []);
@@ -156,7 +200,11 @@ export function useSessions() {
       // A mutation response cannot resurrect an id absent from the canonical list.
       if (!prev.sessions.some((s) => s.id === session.id)) return prev;
       return {
-        sessions: prev.sessions.map((s) => (s.id === session.id ? mergeSession(session, s) : s)),
+        sessions: prev.sessions.map((s) =>
+          s.id === session.id
+            ? withPushedStatus(mergeSession(session, s), cursor, pushedRef.current.get(session.id))
+            : s,
+        ),
         observedById: { ...prev.observedById, [session.id]: cursor },
         epoch: cursor.epoch,
       };
@@ -177,5 +225,7 @@ export function useSessions() {
     clearDeletingStatus,
     applySession,
     applySessionMutation,
+    refresh,
+    applyPushedStatus,
   };
 }

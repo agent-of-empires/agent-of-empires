@@ -70,7 +70,7 @@ fn stop_twice(h: &TuiTestHarness, stop_key: &str, dialog: &str, pane: &str) {
     h.send_keys(stop_key);
     wait_gone(h, pane);
     // Wait for the applied receipt, not just physical teardown.
-    h.wait_for("Runtime ready");
+    h.wait_for_runtime_ready();
 }
 
 #[tokio::test]
@@ -104,7 +104,7 @@ async fn second_x_confirms_stop_in_terminal_and_agent_views() {
     h.spawn_tui();
     h.wait_for_ready();
     h.wait_for(TITLE);
-    h.wait_for("Runtime ready");
+    h.wait_for_runtime_ready();
 
     h.send_keys("t");
     stop_twice(&h, "x", "Kill Terminal", &terminal);

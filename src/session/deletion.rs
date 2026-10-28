@@ -11,9 +11,11 @@ use crate::containers::DockerContainer;
 use crate::git::cleanup::{remove_managed_worktree, WorktreeCleanupOptions};
 use crate::git::GitWorktree;
 use crate::session::config::repo_config;
-use crate::session::path_identity::CleanupProtection;
+use crate::session::path_identity::{canonicalize_or_raw, CleanupProtection};
 use crate::session::storage::StorageFlock;
-use crate::session::{Instance, LifecycleOperation, SessionStore, Storage};
+use crate::session::{
+    Instance, LifecycleOperation, LifecycleReservationError, SessionStore, Storage,
+};
 #[derive(Clone, Serialize, Deserialize)]
 pub struct DeletionRequest {
     pub session_id: String,
@@ -38,7 +40,10 @@ pub enum DeletionDisposition {
     Removed,
     KeptRestored,
     AlreadyGone,
+    /// Another lifecycle operation holds the session; nothing changed, retry later.
     Busy,
+    /// The selection changed after it was made; re-select before retrying.
+    Superseded,
     Failed,
 }
 
@@ -52,6 +57,8 @@ pub struct DeletionResult {
     pub teardown_started: bool,
     /// Latest durable row when the transaction deliberately kept it.
     pub retained_instance: Option<Instance>,
+    /// Operation that blocked a `Busy` result, as decided by the claim.
+    busy_holder: Option<LifecycleOperation>,
 }
 
 impl DeletionResult {
@@ -69,6 +76,21 @@ impl DeletionResult {
             disposition,
             retained_instance,
             teardown_started: false,
+            busy_holder: None,
+        }
+    }
+
+    /// The reservation error for a `Busy` or `Superseded` result.
+    pub fn conflict(&self) -> Option<LifecycleReservationError> {
+        match self.disposition {
+            DeletionDisposition::Busy => Some(
+                self.busy_holder
+                    .map_or(LifecycleReservationError::Superseded, |holder| {
+                        LifecycleReservationError::Busy(holder)
+                    }),
+            ),
+            DeletionDisposition::Superseded => Some(LifecycleReservationError::Superseded),
+            _ => None,
         }
     }
 }
@@ -278,6 +300,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
         let now = Utc::now();
         let mut reserved = None;
         let mut rejected = None;
+        let mut busy_holder = None;
         store.update(|instances, _groups| {
             if let Some(stored) = instances.iter().find(|instance| instance.id == id) {
                 if let Some(consent) = &consent {
@@ -335,7 +358,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
                     })
                 {
                     rejected = Some((
-                        DeletionDisposition::Busy,
+                        DeletionDisposition::Superseded,
                         "Session selection changed before purge".to_owned(),
                         Some(stored.clone()),
                     ));
@@ -364,6 +387,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
                     return Ok(());
                 }
                 crate::session::claim::PurgeClaimDecision::Busy(holder) => {
+                    busy_holder = Some(holder);
                     let retained = instances.iter().find(|instance| instance.id == id).cloned();
                     rejected = Some((
                         DeletionDisposition::Busy,
@@ -395,12 +419,9 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
         })?;
 
         if let Some((disposition, message, retained_instance)) = rejected {
-            return Ok(Err(Box::new(DeletionResult::rejected(
-                id,
-                disposition,
-                message,
-                retained_instance,
-            ))));
+            let mut result = DeletionResult::rejected(id, disposition, message, retained_instance);
+            result.busy_holder = busy_holder;
+            return Ok(Err(Box::new(result)));
         }
         let (generation, snapshot) =
             reserved.ok_or_else(|| anyhow::anyhow!("purge reservation produced no outcome"))?;
@@ -556,7 +577,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
                 "Session was restored before teardown, so it was not purged",
             ),
             CompletionGate::Superseded => (
-                DeletionDisposition::Busy,
+                DeletionDisposition::Superseded,
                 "Session changed while purge was pending, so it was retained",
             ),
             CompletionGate::Proceed => unreachable!("proceed is not a terminal result"),
@@ -1200,7 +1221,12 @@ pub(crate) enum PathsInUse {
 impl PathsInUse {
     pub(crate) fn covers(&self, root: &Path) -> bool {
         match self {
-            Self::Known(paths) => paths.iter().any(|path| path.starts_with(root)),
+            Self::Known(paths) => {
+                let canonical_root = canonicalize_or_raw(root);
+                paths.iter().any(|path| {
+                    path.starts_with(root) || canonicalize_or_raw(path).starts_with(&canonical_root)
+                })
+            }
             Self::Unknown(_) => true,
         }
     }
@@ -1236,7 +1262,7 @@ fn all_profile_storages() -> std::result::Result<(Vec<String>, Vec<Storage>), St
 fn scan_paths_in_use(storages: &[Storage], except_ids: &[&str]) -> PathsInUse {
     let mut paths = Vec::new();
     for storage in storages {
-        match storage.load() {
+        match storage.load_instances_complete() {
             Ok(instances) => paths.extend(other_sessions_paths(&instances, except_ids)),
             Err(error) => {
                 return PathsInUse::Unknown(format!(
@@ -1431,6 +1457,7 @@ fn perform_deletion_core(
             disposition: DeletionDisposition::Failed,
             teardown_started: true,
             retained_instance: None,
+            busy_holder: None,
         };
     }
 
@@ -1487,6 +1514,7 @@ fn perform_deletion_core(
             errors,
             disposition: DeletionDisposition::Failed,
             retained_instance: None,
+            busy_holder: None,
         };
     }
 
@@ -1504,6 +1532,7 @@ fn perform_deletion_core(
         errors,
         disposition: DeletionDisposition::Failed,
         retained_instance: None,
+        busy_holder: None,
     }
 }
 
@@ -2372,24 +2401,58 @@ mod tests {
             bin.display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let runtime = tempfile::tempdir().unwrap();
-        std::fs::create_dir(runtime.path().join("systemd")).unwrap();
-        std::fs::write(runtime.path().join("systemd/private"), "").unwrap();
+        let alternate = tempfile::tempdir().unwrap();
         let _path = crate::session::test_support::EnvGuard::unset(&["DBUS_SESSION_BUS_ADDRESS"])
-            .and_set("PATH", path.as_str());
-        // A legacy row is resolvable only without a user manager that could own its scopes.
-        for (legacy_unknown, manager) in [(false, true), (true, true), (true, false)] {
-            let _manager = crate::session::test_support::EnvGuard::set(&[(
-                "XDG_RUNTIME_DIR",
-                if manager {
-                    runtime.path().to_str().unwrap()
-                } else {
-                    home.path().to_str().unwrap()
-                },
-            )]);
+            .and_set("PATH", path.as_str())
+            .and_set("XDG_RUNTIME_DIR", alternate.path());
+        for (legacy_unknown, manager, known_unscoped, kernel_state) in [
+            (false, true, false, "unused"),
+            (true, true, false, "unused"),
+            (true, false, false, "empty"),
+            (false, true, true, "unused"),
+            (true, false, false, "populated"),
+            (true, false, false, "missing-events"),
+        ] {
+            #[cfg(target_os = "linux")]
+            let canonical = tempfile::tempdir().unwrap();
+            #[cfg(target_os = "linux")]
+            let _canonical =
+                crate::process::systemd::legacy_runtime_fixture::install(canonical.path());
+            #[cfg(target_os = "linux")]
+            let _listener = if manager {
+                let runtime = canonical
+                    .path()
+                    .join("user")
+                    .join(nix::unistd::geteuid().as_raw().to_string());
+                std::fs::create_dir_all(runtime.join("systemd")).unwrap();
+                Some(
+                    std::os::unix::net::UnixListener::bind(runtime.join("systemd/private"))
+                        .unwrap(),
+                )
+            } else {
+                let runtime = canonical
+                    .path()
+                    .join("user")
+                    .join(nix::unistd::geteuid().as_raw().to_string());
+                std::fs::create_dir_all(runtime).unwrap();
+                std::fs::create_dir(canonical.path().join("cgroups")).unwrap();
+                std::fs::write(canonical.path().join("cgroups/cgroup.controllers"), "").unwrap();
+                None
+            };
             let profile = "terminal-scope-refusal";
             let storage = Storage::new_unwatched(profile).unwrap();
             let mut row = Instance::new("owned terminal", home.path().to_str().unwrap());
+            #[cfg(target_os = "linux")]
+            if matches!(kernel_state, "populated" | "missing-events") {
+                let scope = canonical.path().join("cgroups/other.service").join(format!(
+                    "aoe-session-{}-1700000000000.scope",
+                    row.id.replace('-', "_2d")
+                ));
+                std::fs::create_dir_all(&scope).unwrap();
+                if kernel_state == "populated" {
+                    std::fs::write(scope.join("cgroup.events"), "populated 1\n").unwrap();
+                }
+            }
             row.source_profile = profile.into();
             row.scratch = true;
             let scratch = crate::session::scratch::provision_scratch_dir(&row.id).unwrap();
@@ -2397,6 +2460,8 @@ mod tests {
             std::fs::write(scratch.join("payload"), b"owned checkout contents").unwrap();
             row.terminal_scopes = if legacy_unknown {
                 None
+            } else if known_unscoped {
+                Some(vec![])
             } else {
                 Some(vec![
                     crate::process::worker_registry::ScopeOwnership::Owned {
@@ -2419,8 +2484,10 @@ mod tests {
                 panic!("the selected row must reserve before runtime scope proof");
             };
             let result = transaction.run_hooks().unwrap().complete();
-            // Without a Linux scope backend a legacy row has nothing left to prove.
-            if legacy_unknown && (!manager || !cfg!(target_os = "linux")) {
+            if known_unscoped
+                || (legacy_unknown
+                    && (!cfg!(target_os = "linux") || (!manager && kernel_state == "empty")))
+            {
                 assert!(result.success, "{:?}", result.errors);
                 assert!(!scratch.exists());
                 assert!(storage
@@ -2972,7 +3039,7 @@ mod tests {
                 change, "unchanged",
                 "valid selected generation was rejected after claiming"
             );
-            assert_eq!(result.disposition, DeletionDisposition::Busy);
+            assert_eq!(result.disposition, DeletionDisposition::Superseded);
             assert_eq!(result.teardown_started, change == "group after teardown");
             let retained = storage.load().unwrap();
             assert_eq!(retained.len(), 1);
@@ -3032,13 +3099,145 @@ mod tests {
             Err(result) => result,
             Ok(_) => panic!("purge removed a row whose execution mode changed during hooks"),
         };
-        assert_eq!(result.disposition, DeletionDisposition::Busy);
+        assert_eq!(result.disposition, DeletionDisposition::Superseded);
         assert!(!result.teardown_started);
         let retained = storage.load().unwrap();
         assert_eq!(retained.len(), 1);
         assert!(retained[0].is_structured());
         assert_eq!(retained[0].status, crate::session::Status::Idle);
         assert!(!retained[0].has_fresh_lifecycle_reservation(Utc::now()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn purge_reports_the_holding_operation_as_busy_until_it_is_released() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let root = crate::session::get_app_dir().unwrap();
+        super::super::purge_owners::initialize(&root).unwrap();
+        crate::tmux::tool_retirement::initialize(&root).unwrap();
+        let profile = "purge-busy-holder";
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let mut instance = create_test_instance();
+        instance.source_profile = profile.into();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let generation = storage
+            .update(|rows, _| {
+                Ok(rows[0]
+                    .try_acquire_lifecycle_reservation(
+                        LifecycleOperation::Restore,
+                        Instance::LIFECYCLE_RESERVATION_TTL,
+                        Utc::now(),
+                    )
+                    .unwrap())
+            })
+            .unwrap();
+        let request = || DeletionRequest {
+            session_id: instance.id.clone(),
+            instance: instance.clone(),
+            delete_worktree: false,
+            delete_branch: false,
+            delete_sandbox: false,
+            force_delete: false,
+            detach_hooks: true,
+            keep_scratch: false,
+        };
+
+        let busy = match PurgeTransaction::reserve(
+            Storage::open_unwatched(profile).unwrap(),
+            request(),
+            None,
+        )
+        .unwrap()
+        {
+            Err(result) => result,
+            Ok(_) => panic!("purge reserved a session another operation holds"),
+        };
+        assert_eq!(busy.disposition, DeletionDisposition::Busy);
+        assert_eq!(
+            busy.conflict(),
+            Some(LifecycleReservationError::Busy(LifecycleOperation::Restore))
+        );
+        assert!(!busy.teardown_started);
+        assert_eq!(storage.load().unwrap().len(), 1);
+
+        storage
+            .update(|rows, _| {
+                rows[0].release_lifecycle_reservation_if_owned(
+                    LifecycleOperation::Restore,
+                    generation,
+                );
+                Ok(())
+            })
+            .unwrap();
+        let transaction = match PurgeTransaction::reserve(
+            Storage::open_unwatched(profile).unwrap(),
+            request(),
+            None,
+        )
+        .unwrap()
+        {
+            Ok(transaction) => transaction,
+            Err(_) => panic!("purge stayed refused after the holder released"),
+        };
+        assert_eq!(
+            transaction.complete().disposition,
+            DeletionDisposition::Removed
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn purge_keeps_the_typed_holder_of_a_retained_handoff_without_a_reservation() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let root = crate::session::get_app_dir().unwrap();
+        super::super::purge_owners::initialize(&root).unwrap();
+        crate::tmux::tool_retirement::initialize(&root).unwrap();
+        let profile = "purge-busy-handoff";
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let mut instance = create_test_instance();
+        instance.source_profile = profile.into();
+        instance.terminal_handoff = Some(Box::new(
+            crate::session::test_support::launch_owed_handoff(&instance),
+        ));
+        assert!(instance.lifecycle_reservation.is_none());
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        let busy = match PurgeTransaction::reserve(
+            Storage::open_unwatched(profile).unwrap(),
+            DeletionRequest {
+                session_id: instance.id.clone(),
+                instance,
+                delete_worktree: false,
+                delete_branch: false,
+                delete_sandbox: false,
+                force_delete: false,
+                detach_hooks: true,
+                keep_scratch: false,
+            },
+            None,
+        )
+        .unwrap()
+        {
+            Err(result) => result,
+            Ok(_) => panic!("purge reserved a session with a retained terminal handoff"),
+        };
+        assert_eq!(busy.disposition, DeletionDisposition::Busy);
+        assert_eq!(
+            busy.conflict(),
+            Some(LifecycleReservationError::Busy(LifecycleOperation::Launch))
+        );
+        assert!(!busy.teardown_started);
+        assert_eq!(storage.load().unwrap().len(), 1);
     }
 
     #[test]
@@ -3743,7 +3942,7 @@ mod tests {
         .unwrap();
         match rejected {
             Err(result) => {
-                assert_eq!(result.disposition, DeletionDisposition::Busy)
+                assert_eq!(result.disposition, DeletionDisposition::Superseded)
             }
             Ok(_) => panic!("foreign creation acquired rollback ownership"),
         }
@@ -3891,7 +4090,7 @@ mod tests {
         .unwrap();
         match rejected {
             Err(result) => {
-                assert_eq!(result.disposition, DeletionDisposition::Busy)
+                assert_eq!(result.disposition, DeletionDisposition::Superseded)
             }
             Ok(_) => {
                 panic!("a superseded creation took rollback ownership from generation {foreign}")
@@ -4007,7 +4206,7 @@ mod tests {
             Ok(_) => panic!("superseded purge crossed the irreversible boundary"),
             Err(result) => *result,
         };
-        assert_eq!(result.disposition, DeletionDisposition::Busy);
+        assert_eq!(result.disposition, DeletionDisposition::Superseded);
         assert!(!result.teardown_started);
         let retained = storage.load().unwrap();
         assert_eq!(retained.len(), 1);
@@ -4088,7 +4287,7 @@ mod tests {
             Ok(_) => panic!("a superseded trash lifecycle crossed the irreversible boundary"),
             Err(result) => result,
         };
-        assert_eq!(result.disposition, DeletionDisposition::Busy);
+        assert_eq!(result.disposition, DeletionDisposition::Superseded);
         assert!(!result.teardown_started);
         let retained = storage.load().unwrap().remove(0);
         assert!(!retained.same_trash_lifecycle(&selected));
@@ -4208,6 +4407,7 @@ mod tests {
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         });
 
@@ -4427,6 +4627,7 @@ mod tests {
                 extra_env: None,
                 custom_instruction: None,
                 before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
                 container_workdir: None,
             });
             DeletionRequest {
@@ -4825,6 +5026,7 @@ mod tests {
                 extra_env: None,
                 custom_instruction: None,
                 before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
                 container_workdir: None,
             });
             let request = DeletionRequest {
@@ -5832,6 +6034,7 @@ mod tests {
                 extra_env: None,
                 custom_instruction: None,
                 before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
                 container_workdir: None,
             });
 

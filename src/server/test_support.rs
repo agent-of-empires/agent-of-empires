@@ -136,6 +136,28 @@ pub fn build_test_app_state_configured(
     )
 }
 
+/// A state for ingress tests: optional bearer token and passphrase login, with the
+/// plaintext-remote gate and proxy mode set explicitly.
+pub fn build_test_app_state_ingress(
+    token: Option<String>,
+    passphrase: Option<&str>,
+    proxy_mode: bool,
+    allow_plaintext_remote: bool,
+) -> Arc<AppState> {
+    build_test_app_state_with_policy_configured(
+        Vec::new(),
+        vec!["localhost".to_string()],
+        vec!["http://localhost:8080".to_string()],
+        token,
+        |state| {
+            state.login_manager = Arc::new(login::LoginManager::new(passphrase));
+            state.behind_tunnel = proxy_mode;
+            state.trust_cf_header = proxy_mode;
+            state.allow_plaintext_remote = allow_plaintext_remote;
+        },
+    )
+}
+
 /// Like [`build_test_app_state`] but every worker start goes through
 /// `launcher`, so a test decides how a start ends.
 #[cfg(test)]
@@ -260,6 +282,9 @@ pub(crate) fn build_test_app_state_impl_with_event_store(
         passkey_manager: Arc::new(super::passkeys::PasskeyManager::in_memory()),
         rate_limiter: Arc::new(RateLimiter::new()),
         behind_tunnel: false,
+        trust_cf_header: false,
+        // Handler tests drive requests from arbitrary peers; the 426 gate has its own tests.
+        allow_plaintext_remote: true,
         auth_mode: "none",
         serve_mode: "local",
         allowed_hosts,
@@ -355,7 +380,8 @@ pub fn attach_session_id_update_for_test(inst: &mut Instance, sid: &str) {
         inst.active_execution.clone(),
     );
     poller.inject_test_update(&inst.id, sid);
-    inst.session_id_poller = Some(Arc::new(std::sync::Mutex::new(poller)));
+    inst.capture_poller
+        .set_handle(Some(Arc::new(std::sync::Mutex::new(poller))));
 }
 
 /// The Contract Pack's recording entry point, re-exported because
@@ -371,6 +397,15 @@ pub fn seed_instances_on_disk_for_test(profile: &str, insts: Vec<Instance>) {
             Ok(())
         })
         .expect("seed sessions.json");
+}
+
+/// Make storage for `profile` fail on every write: a plain file where its directory belongs.
+pub fn block_profile_storage_for_test(profile: &str) {
+    let dir = crate::session::get_app_dir()
+        .expect("app dir")
+        .join("profiles");
+    std::fs::create_dir_all(&dir).expect("profiles dir");
+    std::fs::write(dir.join(profile), b"").expect("block profile");
 }
 
 pub fn load_instances_from_disk_for_test(profile: &str) -> Vec<Instance> {
@@ -488,128 +523,6 @@ pub async fn reload_tmux_applied_for_test(
     .expect("Tmux-applied reload did not finish within 30 seconds");
 }
 
-/// A temporary XDG base whose whole ancestor chain satisfies the client's
-/// trusted walk, with the environment bound to it, so a test that publishes or
-/// reads never touches the developer's real app directory. `None` means this
-/// host has no such chain, which every caller treats as a failure.
-#[cfg(all(test, target_os = "linux"))]
-pub(crate) fn trusted_namespace() -> Option<(tempfile::TempDir, RuntimeEnvGuard)> {
-    let mut guard = RuntimeEnvGuard::read_lock();
-    let euid = crate::process::effective_uid();
-    let mut candidates = Vec::new();
-    if let Some(base) = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from) {
-        candidates.push(base);
-    }
-    candidates.push(std::env::temp_dir());
-    if let Some(home) = dirs::home_dir() {
-        candidates.push(home);
-    }
-    for base in candidates {
-        if crate::cli::runtime_read::uds::open_trusted_directory(&base, euid).is_err() {
-            continue;
-        }
-        let Ok(base) = tempfile::tempdir_in(&base) else {
-            continue;
-        };
-        guard.bind(base.path());
-        return Some((base, guard));
-    }
-    None
-}
-
-/// A live local runtime read, in a namespace of the test's own.
-///
-/// The producer resolves the app dir from the environment, so the harness
-/// points `XDG_CONFIG_HOME` at a temporary base first. Bases are tried in
-/// order and the real publisher is the oracle: a base whose ancestor chain the
-/// trusted walk would reject is reported as `app_dir_untrusted` and skipped.
-#[cfg(target_os = "linux")]
-pub struct RuntimeUdsTestServer {
-    /// The temporary base a publication owns, when this harness created it.
-    _namespace: Option<tempfile::TempDir>,
-    app_dir: std::path::PathBuf,
-    _env: RuntimeEnvGuard,
-    listener: tokio::task::JoinHandle<()>,
-}
-
-#[cfg(target_os = "linux")]
-impl RuntimeUdsTestServer {
-    pub fn start(state: Arc<AppState>) -> Result<Self, String> {
-        let mut env = RuntimeEnvGuard::read_lock();
-        let mut bases: Vec<std::path::PathBuf> = Vec::new();
-        if let Some(base) = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from) {
-            bases.push(base);
-        }
-        bases.push(std::env::temp_dir());
-        if let Some(home) = dirs::home_dir() {
-            bases.push(home);
-        }
-        let mut rejected = Vec::new();
-        for base in bases {
-            let namespace = match tempfile::tempdir_in(&base) {
-                Ok(namespace) => namespace,
-                Err(error) => {
-                    rejected.push(format!("{}: {error}", base.display()));
-                    continue;
-                }
-            };
-            env.bind(namespace.path());
-            match super::runtime_uds::try_publish() {
-                Ok(published) => {
-                    let listener = crate::task_util::spawn_supervised(
-                        "runtime.uds.test",
-                        crate::task_util::PanicPolicy::Log,
-                        super::runtime_uds::serve(state, published),
-                    );
-                    return Ok(Self {
-                        app_dir: namespace.path().join(crate::session::APP_DIR_NAME_XDG),
-                        _namespace: Some(namespace),
-                        _env: env,
-                        listener,
-                    });
-                }
-                Err(error) => {
-                    if error.code() != "app_dir_untrusted" {
-                        return Err(error.to_string());
-                    }
-                    rejected.push(format!("{}: {error}", base.display()));
-                }
-            }
-        }
-        Err(format!("no trusted app dir base: {rejected:?}"))
-    }
-
-    /// Publish beneath xdg_base/<APP_DIR_NAME_XDG>, matching client discovery.
-    pub fn start_in(xdg_base: &std::path::Path, state: Arc<AppState>) -> Result<Self, String> {
-        let env = RuntimeEnvGuard::set(xdg_base);
-        let app_dir = xdg_base.join(crate::session::APP_DIR_NAME_XDG);
-        std::fs::create_dir_all(&app_dir).map_err(|error| error.to_string())?;
-        let published = super::runtime_uds::try_publish().map_err(|error| error.to_string())?;
-        let listener = crate::task_util::spawn_supervised(
-            "runtime.uds.test",
-            crate::task_util::PanicPolicy::Log,
-            super::runtime_uds::serve(state, published),
-        );
-        Ok(Self {
-            app_dir,
-            _namespace: None,
-            _env: env,
-            listener,
-        })
-    }
-
-    /// The app dir this publication owns, for assertions on its artifacts.
-    pub fn app_dir(&self) -> std::path::PathBuf {
-        self.app_dir.clone()
-    }
-
-    /// Wait for retraction; retain the returned guards for post-shutdown reads.
-    pub async fn join(self) -> (Option<tempfile::TempDir>, RuntimeEnvGuard) {
-        let _ = self.listener.await;
-        (self._namespace, self._env)
-    }
-}
-
 /// Install a global `before_session` hook that creates `<label>-ready` in `dir` and blocks
 /// until `<label>-release` exists, so a test can commit a peer write inside a launch's hook
 /// window. Returns `(ready, release)`.
@@ -651,6 +564,32 @@ pub(crate) fn counting_failing_launcher() -> (
     (launcher, launches)
 }
 
+/// A launcher that hands back a fake worker that accepts commands, keeping the
+/// event senders alive so the drains never see a close.
+#[cfg(test)]
+pub(crate) fn succeeding_launcher() -> crate::acp::supervisor::Launcher {
+    let senders: Arc<std::sync::Mutex<Vec<tokio::sync::mpsc::Sender<crate::acp::state::Event>>>> =
+        Default::default();
+    Arc::new(move |_config, id| {
+        let senders = Arc::clone(&senders);
+        Box::pin(async move {
+            let (client, tx, _cmds) =
+                crate::acp::acp_client::AcpClient::fake_for_test_cmd_recording(id);
+            senders.lock().unwrap().push(tx);
+            Ok(client)
+        })
+    })
+}
+
+/// Fails every `sessions.json` write while the guard lives, leaving rows loadable.
+/// The failpoint is process-wide, so the test must be serial.
+#[cfg(test)]
+pub(crate) fn fail_session_writes_for_test(profile: &str) -> impl Drop {
+    Storage::new_unwatched(profile)
+        .expect("storage")
+        .fail_writes_for_test()
+}
+
 /// Once the blocking hook signals `ready`, archive the stored rows matching `is_target` under
 /// their lifecycle lock, as `aoe session archive --no-kill` does, then release the hook.
 /// Returns whether the hook ran and a row was archived; the hook is released either way.
@@ -686,9 +625,8 @@ pub(crate) async fn archive_while_hook_waits(
     target.is_some()
 }
 
-#[cfg(test)]
 /// Serve a fixture router through the real owner-authenticated private listener.
-pub(crate) async fn serve_owner_router_for_test(
+pub async fn serve_owner_router_for_test(
     socket: &std::path::Path,
     router: axum::Router,
 ) -> tokio::task::JoinHandle<()> {

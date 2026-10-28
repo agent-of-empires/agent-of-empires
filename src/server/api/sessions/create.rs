@@ -678,13 +678,13 @@ pub(super) async fn wait_until_left_starting(
 pub async fn create_session(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<CreateSessionQuery>,
-    local: Option<axum::Extension<crate::server::auth::LocalAuthorization>>,
+    local: Option<axum::Extension<crate::server::principal::Principal>>,
     request_id: Option<axum::Extension<crate::server::router::RequestId>>,
     body: Result<Json<CreateSessionBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    let local_owner = matches!(
+    let local_owner = crate::server::principal::authorize(
         local.as_deref(),
-        Some(crate::server::auth::LocalAuthorization::UnixOwner(_))
+        crate::server::principal::Capability::CreateHookDetail,
     );
     // The router always sets it; a direct call (tests) still gets a loggable one.
     let reference = request_id.map_or_else(|| uuid::Uuid::new_v4().to_string(), |id| id.0 .0);
@@ -786,6 +786,7 @@ pub async fn create_session(
         body.command_override = String::new();
         body.extra_args = String::new();
         body.extra_env = Vec::new();
+        body.hook_env = Vec::new();
         body.yolo_mode = false;
         body.worktree_enabled = false;
         body.worktree_branch = None;
@@ -852,6 +853,14 @@ pub async fn create_session(
             StatusCode::BAD_REQUEST,
             "validation_failed",
             "Cannot combine scratch with path",
+        );
+    }
+
+    if !body.hook_env.is_empty() && !body.sandbox {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "hook_env requires sandbox; host_hooks.before_start only runs for sandboxed sessions",
         );
     }
 
@@ -1176,6 +1185,7 @@ pub async fn create_session(
         sandbox_image: body.sandbox_image,
         yolo_mode: body.yolo_mode,
         extra_env: body.extra_env,
+        before_start_hook_env: body.hook_env,
         extra_args: body.extra_args,
         command_override: body.command_override,
         extra_repo_paths: body.extra_repo_paths,
@@ -1368,7 +1378,7 @@ pub(super) fn create_failure(
 pub async fn create_session_progress(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
-    local: Option<axum::Extension<crate::server::auth::LocalAuthorization>>,
+    local: Option<axum::Extension<crate::server::principal::Principal>>,
 ) -> impl IntoResponse {
     match state.create_progress.snapshot(&key, local.as_deref()) {
         Some(snapshot) => Json(snapshot).into_response(),
@@ -1489,6 +1499,7 @@ pub(super) fn public_create_session_error(e: &anyhow::Error) -> (&'static str, S
             GitError::WorktreeAlreadyExists(_)
             | GitError::BranchAlreadyCheckedOut(_)
             | GitError::BranchNotFound(_)
+            | GitError::InvalidTemplate(_)
             | GitError::NotAGitRepo => return ("create_failed", git_err.to_string()),
             // Raw command output / libgit2 / IO: not safe to expose.
             GitError::WorktreeCommandFailed(_)

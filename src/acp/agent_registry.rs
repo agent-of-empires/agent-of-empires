@@ -170,9 +170,17 @@ pub fn runs_always_yolo(
 /// "Codex couldn't start".
 pub fn display_name_for(agent: &str) -> Option<&'static str> {
     Some(match agent {
-        "claude" | "claude-code" => "Claude",
+        "claude" | "claude-code" => "Claude Code",
         "opencode" => "OpenCode",
-        "gemini" => "Gemini",
+        "gemini" => "Gemini CLI",
+        "cursor" => "Cursor",
+        "copilot" => "Copilot CLI",
+        "droid" => "Factory Droid",
+        "settl" => "Settl",
+        "hermes" => "Hermes",
+        "kiro" => "Kiro CLI",
+        "qwen" => "Qwen Code",
+        "antigravity" => "Antigravity CLI",
         "codex" => "Codex",
         "vibe" => "Mistral Vibe",
         "pi" => "Pi",
@@ -354,9 +362,12 @@ mod tests {
     }
 
     #[test]
-    fn every_default_agent_has_a_display_name() {
+    fn every_agent_has_a_display_name() {
         for (name, _) in AgentRegistry::with_defaults().list() {
             assert!(display_name_for(name).is_some(), "{name}");
+        }
+        for agent in crate::agents::AGENTS {
+            assert!(display_name_for(agent.name).is_some(), "{}", agent.name);
         }
     }
 

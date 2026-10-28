@@ -46,7 +46,8 @@ pub(super) enum SidebarSection {
     Archived,
 }
 
-/// The `aoe.web` plugin serves the dashboard; with it disabled, `R` explains why instead.
+/// The `aoe.web` plugin serves the dashboard; with it disabled, the Connections row says so
+/// and Enter on it explains why.
 pub(super) fn web_plugin_disabled() -> bool {
     crate::plugin::registry()
         .get("aoe.web")
@@ -423,19 +424,7 @@ fn slice_line_columns(line: &ratatui::text::Line, from: u16, to_excl: u16, width
     crate::tui::components::text::line_columns(line, width).slice(from, to_excl.min(width))
 }
 
-/// `Alt+Up` / `Alt+Down`: the direction they walk the list, or `None` for any other key.
-fn jump_delta_for(key: &KeyEvent) -> Option<isize> {
-    // The bound chord is Alt alone. Ctrl+Alt+arrow is not one of ours, so inside live send it
-    // stays with the pane instead of breaking the relay.
-    if !key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::CONTROL) {
-        return None;
-    }
-    match key.code {
-        KeyCode::Up => Some(-1),
-        KeyCode::Down => Some(1),
-        _ => None,
-    }
-}
+const PAGE_STEP: u16 = 10;
 
 impl HomeView {
     pub fn is_diff_open(&self) -> bool {
@@ -1572,6 +1561,13 @@ impl HomeView {
             }
             return true;
         }
+        if let Some(view) = &mut self.connections_view {
+            if let Some(DialogResult::Submit(())) = view.handle_click(col, row) {
+                self.connections_view = None;
+                self.open_serve();
+            }
+            return true;
+        }
         if let Some(dialog) = &self.update_confirm_dialog {
             if let Some(result) = dialog.handle_click(col, row) {
                 match result {
@@ -1915,10 +1911,11 @@ impl HomeView {
         if self.live_send.is_some() && !self.has_non_live_send_overlay() {
             // The jump keys are the one exception: they mean "take me to another session",
             // which is only answerable from the list, so they leave the relay first.
-            if let Some(delta) = jump_delta_for(&key) {
+            if let Some(id @ (ActionId::JumpPrevFinished | ActionId::JumpNextFinished)) =
+                self.live_send_action(&key)
+            {
                 self.exit_live_send_if_active();
-                self.jump_to_adjacent_finished(delta);
-                return None;
+                return self.run_action(id, None);
             }
             return self.handle_live_send_key(key);
         }
@@ -2107,6 +2104,18 @@ impl HomeView {
                 }
                 return None;
             }
+        }
+
+        if let Some(view) = &mut self.connections_view {
+            match view.handle_key(key) {
+                DialogResult::Continue => {}
+                DialogResult::Cancel => self.connections_view = None,
+                DialogResult::Submit(()) => {
+                    self.connections_view = None;
+                    self.open_serve();
+                }
+            }
+            return None;
         }
 
         // Command palette captures input ahead of the help overlay so its own
@@ -2689,15 +2698,6 @@ impl HomeView {
             return None;
         }
 
-        // Ctrl+K opens the command palette in any hotkey mode, activated before strict
-        // normalization so the binding stays discoverable on every keymap.
-        if matches!(key.code, KeyCode::Char('k') | KeyCode::Char('K'))
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-        {
-            self.open_command_palette();
-            return None;
-        }
-
         // Strict-mode relocation happens inside dispatch_action_key through the shared
         // bindings registry, so no key rewriting happens here.
         self.dispatch_action_key(key, update_info)
@@ -2749,12 +2749,7 @@ impl HomeView {
         }
 
         // Registry-driven action keys.
-        let ctx = bindings::Ctx {
-            view_mode: self.view_mode.clone(),
-            sort_order: self.sort_order,
-            has_search: !self.search_matches.is_empty(),
-            project_group_selected: self.project_group_at_cursor().is_some(),
-        };
+        let ctx = self.bindings_ctx(false);
         match bindings::resolve_action(&key, self.strict_hotkeys, &ctx) {
             Some(bindings::ResolvedAction::Core(id)) => return self.run_action(id, update_info),
             Some(bindings::ResolvedAction::Plugin(action)) => {
@@ -3036,7 +3031,7 @@ impl HomeView {
             ActionId::SetWorktreeName => self.open_worktree_name_for_selected(),
             ActionId::AddProject => self.open_add_project_for_selected(),
             ActionId::Diff => self.open_diff_for_selected(),
-            ActionId::Serve => self.open_serve(),
+            ActionId::Serve => self.open_connections(),
             ActionId::Settings => self.open_settings(),
             ActionId::Profiles => self.show_profile_picker(),
             ActionId::Projects => {
@@ -3102,6 +3097,15 @@ impl HomeView {
             ActionId::Fork => self.open_fork_from_selection(),
             ActionId::EmptyTrash => self.prompt_empty_trash(),
             ActionId::AutoName => return self.auto_name_selected(),
+            ActionId::OpenCommandPalette => self.open_command_palette(),
+            ActionId::PreviewScrollUp => {
+                self.preview_scroll_offset = self.preview_scroll_offset.saturating_add(PAGE_STEP)
+            }
+            ActionId::PreviewScrollDown => {
+                self.preview_scroll_offset = self.preview_scroll_offset.saturating_sub(PAGE_STEP)
+            }
+            // `App` handles the chord before the home view sees it.
+            ActionId::DismissUpdateBanner => {}
         }
         None
     }
@@ -3226,7 +3230,7 @@ impl HomeView {
     /// Whether the session's persisted view can be switched, and which it renders now:
     /// `Some(is_structured)` when the context menu should offer a switch. A structured
     /// session can always go back to a terminal; a terminal one can go structured only
-    /// when its tool is ACP-capable and `offer_structured_in_new_session` is on, the same
+    /// when its tool is ACP-capable and `acp.structured_view` is not `off`, the same
     /// gate as the new-session toggle. Archived, trashed and mid-lifecycle rows are
     /// excluded: their agent is deliberately stopped and the swap would boot a worker
     /// behind the parked state.
@@ -3245,10 +3249,8 @@ impl HomeView {
             &inst.source_profile,
             std::path::Path::new(&inst.project_path),
         );
-        // Switching a terminal session into structured view is gated on the same opt-in
-        // as the new-session toggle; the reverse direction stays available regardless, so
-        // a session can always get out.
-        (config.acp.offer_structured_in_new_session
+        // The reverse direction stays available regardless, so a session can always get out.
+        (config.acp.structured_view.is_offered()
             && crate::session::builder::structured::tool_acp_capable(&inst.tool, &config))
         .then_some(false)
     }
@@ -3726,6 +3728,33 @@ impl HomeView {
         Some(Action::SmartRenameNow(id))
     }
 
+    /// R: the Connections hub. Its Web dashboard row reaches [`Self::open_serve`].
+    fn open_connections(&mut self) {
+        let web = self.connections_web_state(None);
+        self.connections_view = Some(crate::tui::dialogs::ConnectionsView::new(
+            self.daemon_attention(),
+            web,
+        ));
+    }
+
+    /// The hub's Web dashboard row. `known` keeps a transport already read, so a refresh
+    /// reads `serve.mode` only until it names one.
+    pub(super) fn connections_web_state(
+        &self,
+        known: Option<&crate::tui::dialogs::WebState>,
+    ) -> crate::tui::dialogs::WebState {
+        use crate::tui::dialogs::{served_via, WebState};
+        if web_plugin_disabled() {
+            WebState::Disabled
+        } else if !self.serve_running {
+            WebState::Off
+        } else if let Some(WebState::On(Some(via))) = known {
+            WebState::On(Some(via))
+        } else {
+            WebState::On(served_via())
+        }
+    }
+
     fn open_serve(&mut self) {
         if web_plugin_disabled() {
             self.info_dialog = Some(InfoDialog::new(
@@ -3733,7 +3762,7 @@ impl HomeView {
                 "The aoe.web plugin is disabled, so the web dashboard cannot \
                      be served.\n\n\
                      Re-enable it in Settings > Plugins (or run \
-                     `aoe plugin enable aoe.web`), then press R again.",
+                     `aoe plugin enable aoe.web`), then open it again from R.",
             ));
             return;
         }
@@ -3817,6 +3846,30 @@ impl HomeView {
                 }
             }
         }
+    }
+
+    fn bindings_ctx(&self, live_send: bool) -> bindings::Ctx {
+        bindings::Ctx {
+            view_mode: self.view_mode.clone(),
+            sort_order: self.sort_order,
+            has_search: !self.search_matches.is_empty(),
+            project_group_selected: self.project_group_at_cursor().is_some(),
+            live_send,
+        }
+    }
+
+    /// The jump and preview-scroll actions live-send takes from the agent; every other
+    /// registry chord relays to the pane.
+    fn live_send_action(&self, key: &KeyEvent) -> Option<ActionId> {
+        bindings::resolve(key, self.strict_hotkeys, &self.bindings_ctx(true)).filter(|id| {
+            matches!(
+                id,
+                ActionId::JumpPrevFinished
+                    | ActionId::JumpNextFinished
+                    | ActionId::PreviewScrollUp
+                    | ActionId::PreviewScrollDown
+            )
+        })
     }
 
     fn open_command_palette(&mut self) {
@@ -4894,14 +4947,23 @@ impl HomeView {
                     super::Item::Session { id, .. } => self.session_switch_view_target(id),
                     super::Item::Group { .. } => None,
                 };
-                ContextMenuDialog::for_session(
+                let update_restart = match &self.flat_items[idx] {
+                    super::Item::Session { id, .. } => self.update_restart_offered(id),
+                    super::Item::Group { .. } => false,
+                };
+                let menu = ContextMenuDialog::for_session(
                     anchor,
                     is_archived,
                     snooze,
                     unread,
                     can_fork,
                     switch_view,
-                )
+                );
+                if update_restart {
+                    menu.with_restart_for_update()
+                } else {
+                    menu
+                }
             });
             return true;
         }
@@ -4997,6 +5059,15 @@ impl HomeView {
             ContextMenuAction::NewFromSelection => self.open_new_from_selection(),
             ContextMenuAction::Fork => self.open_fork_from_selection(),
             ContextMenuAction::SwitchView => self.prompt_switch_view_for_selected(),
+            ContextMenuAction::RestartForUpdate => {
+                if let Err(e) = self.restart_selected_for_update() {
+                    tracing::warn!("restart_selected_for_update failed: {}", e);
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Restart Failed",
+                        &format!("Could not restart session: {e}"),
+                    ));
+                }
+            }
             ContextMenuAction::OpenSortPicker => self.show_sort_picker(),
             ContextMenuAction::AddProject => self.open_add_project_for_selected(),
             ContextMenuAction::OpenGroupPicker => self.show_group_picker(),
@@ -6260,24 +6331,10 @@ impl HomeView {
         // the terminal-emulator convention where shift+page works on the outer scrollback.
         // Bare PageUp/PageDown still goes to the agent so agents that page their own UI
         // keep working.
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
-        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-        if shift && !ctrl && !alt {
-            const PAGE_STEP: u16 = 10;
-            match key.code {
-                KeyCode::PageUp => {
-                    self.preview_scroll_offset =
-                        self.preview_scroll_offset.saturating_add(PAGE_STEP);
-                    return None;
-                }
-                KeyCode::PageDown => {
-                    self.preview_scroll_offset =
-                        self.preview_scroll_offset.saturating_sub(PAGE_STEP);
-                    return None;
-                }
-                _ => {}
-            }
+        if let Some(id @ (ActionId::PreviewScrollUp | ActionId::PreviewScrollDown)) =
+            self.live_send_action(&key)
+        {
+            return self.run_action(id, None);
         }
 
         // The exit chord is checked before drift: exiting is always safe, and a user

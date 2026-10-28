@@ -99,7 +99,7 @@ impl GitWorktree {
     /// Lets this instance's submodule update use `file://` URLs, which git
     /// blocks by default (CVE-2022-39253).
     #[cfg(test)]
-    fn allow_submodule_file_transport(mut self) -> Self {
+    pub(crate) fn allow_submodule_file_transport(mut self) -> Self {
         self.submodule_config
             .push("protocol.file.allow=always".to_string());
         self

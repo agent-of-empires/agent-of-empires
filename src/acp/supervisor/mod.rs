@@ -86,6 +86,9 @@ pub enum SupervisorError {
     /// The previous runner is not proven dead yet.
     #[error("session {0:?} is still stopping its previous structured view worker")]
     TeardownPending(String),
+    /// The worker a caller observed is no longer the running one.
+    #[error("session {0:?} worker changed before the stop claimed it")]
+    Superseded(String),
     #[error(transparent)]
     Blocked(crate::session::StartBlocked),
     #[error("session {0:?} no longer exists")]
@@ -438,6 +441,13 @@ impl<S: BroadcastSink> Supervisor<S> {
         if let Ok(mut guard) = self.next_seqs.lock() {
             guard.extend(pairs);
         }
+    }
+
+    /// The running epoch, for a caller that must stop only that epoch.
+    pub(crate) fn running_lease(&self, session_id: &str) -> Option<Lease> {
+        lock_recover(&self.lifecycle)
+            .running(session_id)
+            .map(|(lease, _)| lease)
     }
 
     /// Whether this session has a worker up or coming up.

@@ -14,7 +14,7 @@ vi.mock("./api", () => ({
 
 import { clearSoundCache, playSoundFor } from "./soundPlayer";
 
-const ENABLED = { enabled: true, browser_enabled: true, volume: 1 };
+const ENABLED = { enabled: true, browser_enabled: true, browser_volume: 1 };
 
 let played: string[] = [];
 
@@ -51,6 +51,52 @@ describe("playSoundFor", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+  });
+
+  it.each([
+    ["the event is switched off", { browser_idle_enabled: false }, {}, false],
+    ["another event is switched off", { browser_error_enabled: false }, {}, true],
+    [
+      "other_sessions and the session is open",
+      { browser_scope: "other_sessions" },
+      { sessionIds: ["a"], activeSessionId: () => "a" },
+      false,
+    ],
+    [
+      "other_sessions and another session is open",
+      { browser_scope: "other_sessions" },
+      { sessionIds: ["a"], activeSessionId: () => "b" },
+      true,
+    ],
+    [
+      "other_sessions and none is open",
+      { browser_scope: "other_sessions" },
+      { sessionIds: ["a"], activeSessionId: () => null },
+      true,
+    ],
+    ["hidden_tab and the tab is visible", { browser_scope: "hidden_tab" }, {}, false],
+  ])("honors the per-event and scope settings when %s", async (_label, extra, context, plays) => {
+    fetchSettings.mockResolvedValue({ sound: { ...ENABLED, ...extra } });
+    expect(await playSoundFor("idle", context)).toBe(plays);
+  });
+
+  it("plays under hidden_tab only while the tab is hidden, and at the browser volume", async () => {
+    fetchSettings.mockResolvedValue({ sound: { ...ENABLED, browser_scope: "hidden_tab", browser_volume: 0.4 } });
+    const hidden = vi.spyOn(document, "hidden", "get").mockReturnValue(true);
+    const volumes: number[] = [];
+    vi.stubGlobal(
+      "Audio",
+      class extends FakeAudio {
+        play() {
+          volumes.push(this.volume);
+          return super.play();
+        }
+      },
+    );
+    expect(await playSoundFor("idle")).toBe(true);
+    expect(volumes).toEqual([0.4]);
+    hidden.mockReturnValue(false);
+    expect(await playSoundFor("idle")).toBe(false);
   });
 
   it("retries discovery after an empty or failed sound list", async () => {

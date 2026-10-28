@@ -1,6 +1,5 @@
 //! Validate and render a daemon snapshot after a two-frame WebSocket exchange.
-//! Explicit endpoints never fall back. Absent environment-selected endpoints
-//! use the local store with a notice that does not disclose the endpoint URL.
+//! Production reads acquire a local Daemon only after its socket is proven absent.
 
 /// Shared with the producer's contract checks against the real client decoder.
 pub(crate) mod dto;
@@ -10,17 +9,12 @@ pub(crate) mod pack;
 #[cfg(test)]
 mod pack_tests;
 mod render;
-/// Linux descriptor admission shared with the local publisher.
-/// Other platforms use HTTP when selected, otherwise the local store.
-#[cfg(target_os = "linux")]
-pub(crate) mod uds;
 
 use std::time::Duration;
 use tokio::time::Instant;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
-#[cfg(any(target_os = "linux", test))]
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::error::{CapacityError, Error as WsError, ProtocolError};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
@@ -35,8 +29,6 @@ use self::dto::{
 /// endpoint; production callers use [`read_request_source`].
 pub use self::endpoint::ReadRequestSource;
 use self::endpoint::SelectedEndpoint;
-#[cfg(target_os = "linux")]
-use self::uds::UdsIdentity;
 use super::group::GroupListArgs;
 use super::list::ListArgs;
 use super::project::ProjectListArgs;
@@ -48,9 +40,6 @@ use super::{Cli, Commands};
 use crate::server::runtime_ws::CONNECTION_BUDGET;
 const CLOSE_BUDGET: Duration = Duration::from_millis(200);
 pub(crate) const APPLICATION_LIMIT: usize = 16 * 1024 * 1024;
-/// An environment endpoint was unusable or unreachable before any peer answered.
-pub(crate) const LOCAL_STORE_NOTICE: &str =
-    "notice: AOE_DAEMON_URL did not produce a daemon answer, so this answer is the local store's.\n";
 
 #[derive(Clone, Copy)]
 pub enum ScopedCommand<'a> {
@@ -91,6 +80,7 @@ pub(crate) const EMITTABLE_CODES: &[&str] = &[
     // `parser_error` is clap's, raised before any read begins.
     "parser_error",
     "anchored_alias_unavailable",
+    "cityhall_mode",
     "close_timeout",
     "connection_closed",
     "default_missing",
@@ -126,14 +116,25 @@ pub fn read_sentence(code: &str) -> String {
     if code == "protocol_mismatch" {
         return "daemon read: protocol_mismatch\nClient and daemon protocol versions differ. Restart the target daemon on its host with `aoe serve --restart` (or its service manager); update that host's aoe installation if needed.\n".into();
     }
+    if code == "cityhall_mode" {
+        return "daemon read: cityhall_mode\nCityHall mode disables runtime CLI reads on this Daemon. This is a mode restriction, not an authentication failure. Check the deployment mode with its administrator; retrying authentication will not enable these reads.\n".into();
+    }
+    if matches!(code, "peer_identity" | "marker_identity") {
+        return format!("daemon read: {code}\nThe Daemon identity could not be verified. Check the expected Daemon, app/build namespace and CLI/Daemon versions. For local connections, inspect socket and publication ownership through the Daemon's manager. Do not remove publication artifacts or start another Daemon while ownership is uncertain.\n");
+    }
+    if matches!(
+        code,
+        "publisher_absent" | "establishment_timeout" | "marker_missing" | "unavailable"
+    ) {
+        return format!("daemon read: {code}\nReconnect to the selected daemon and retry. Check --daemon-url or AOE_DAEMON_URL; local storage is never used as a fallback.\n");
+    }
     format!("daemon read: {code}\n")
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiscoveryBoundary {
     Refused,
     LocalAbsent,
-    HttpUnreached,
 }
 
 #[derive(Debug)]
@@ -161,18 +162,11 @@ impl ReadFailure {
         failure
     }
 
-    fn before_http_peer(mut self) -> Self {
-        self.boundary = DiscoveryBoundary::HttpUnreached;
-        self.attempt_close = false;
-        self
-    }
-
     pub(crate) fn post_no_close(code: &'static str) -> Self {
         Self::refusal(code, 4, false)
     }
 
     /// Pre-admission diagnosis; it does not authorize a connection.
-    #[cfg(target_os = "linux")]
     pub(crate) fn pre_exact(code: &'static str, message: impl Into<String>) -> Self {
         let mut failure = Self::refusal(code, 2, false);
         failure.exact = Some(message.into());
@@ -208,7 +202,7 @@ impl ReadFailure {
         Self::refuse(RENDERER_INTERNAL, exit, message)
     }
 
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(test)]
     pub(crate) fn code(&self) -> &str {
         self.code
     }
@@ -239,17 +233,59 @@ pub fn read_request_source(cli: &Cli) -> ReadRequestSource {
     endpoint::read_request_source(cli)
 }
 
-/// What a scoped read found: either the daemon's answer, or the fact that no
-/// daemon publishes a local read here, which leaves the command to the caller.
-pub enum ScopedRead {
-    /// Final CLI projection or refusal from a served exchange; no local handler runs.
-    Answered(ReadOutcome),
-    /// Run the local handler; notice is present only for an absent environment endpoint.
-    NoLocalPublication(Option<&'static str>),
+/// Read an already published endpoint without acquiring or starting a Daemon.
+pub async fn attempt(command: ScopedCommand<'_>, source: &ReadRequestSource) -> ReadOutcome {
+    finish(execute_inner(command, source).await, source).await
 }
 
-pub async fn attempt(command: ScopedCommand<'_>, source: &ReadRequestSource) -> ScopedRead {
-    match execute_inner(command, source).await {
+/// Acquire a local Daemon only after definitive absence, then read it once.
+pub async fn run(command: ScopedCommand<'_>, source: &ReadRequestSource) -> ReadOutcome {
+    let result = execute_inner(command, source).await;
+    let result = match result {
+        Err(error)
+            if error.boundary == DiscoveryBoundary::LocalAbsent
+                && source.explicit_url.is_none()
+                && !source.env_url_is_set() =>
+        {
+            acquire_local_read(command, source).await
+        }
+        result => result,
+    };
+    finish(result, source).await
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn acquire_local_read(
+    command: ScopedCommand<'_>,
+    source: &ReadRequestSource,
+) -> Result<render::Projection, ReadFailure> {
+    crate::acp::client::daemon_manager::require_local_read_daemon()
+        .await
+        .map_err(|error| {
+            ReadFailure::pre_exact(
+                "unavailable",
+                format!("daemon read: unavailable\n{error}\n"),
+            )
+        })?;
+    execute_inner(command, source).await
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+async fn acquire_local_read(
+    _command: ScopedCommand<'_>,
+    _source: &ReadRequestSource,
+) -> Result<render::Projection, ReadFailure> {
+    Err(ReadFailure::pre_exact(
+        "unavailable",
+        "daemon read: unavailable\nThis client has no local Daemon backend. Set --daemon-url <url> or AOE_DAEMON_URL to an existing daemon and configure its authentication.\n",
+    ))
+}
+
+async fn finish(
+    result: Result<render::Projection, ReadFailure>,
+    source: &ReadRequestSource,
+) -> ReadOutcome {
+    match result {
         Ok(projection) => {
             let notice = if projection.session_table {
                 crate::update::update_notice().await
@@ -264,28 +300,32 @@ pub async fn attempt(command: ScopedCommand<'_>, source: &ReadRequestSource) -> 
                 (diagnostics, None) => diagnostics,
                 (None, notice) => notice,
             };
-            ScopedRead::Answered(ReadOutcome {
+            ReadOutcome {
                 stdout: Some(projection.stdout),
                 stderr,
                 exit: projection.exit,
-            })
+            }
         }
-        Err(error) if absent_local_publication(&error, source) => {
-            ScopedRead::NoLocalPublication(source.env_url_is_set().then_some(LOCAL_STORE_NOTICE))
+        Err(mut error) => {
+            if error.exact.is_none()
+                && source.explicit_url.is_none()
+                && !source.env_url_is_set()
+                && matches!(
+                    error.code,
+                    "publisher_absent" | "establishment_timeout" | "marker_missing" | "unavailable"
+                )
+            {
+                error.exact = Some(format!(
+                    "daemon read: {}\nThe local Daemon's runtime read is unavailable. \
+                     Check its mode, CLI/Daemon versions and publication diagnostics. \
+                     CityHall mode disables runtime reads. When appropriate, restart the local \
+                     Daemon through its service manager or `aoe serve --restart`, then retry. \
+                     Local storage is never used as a fallback.\n",
+                    error.code
+                ));
+            }
+            error.into()
         }
-        Err(error) => ScopedRead::Answered(error.into()),
-    }
-}
-
-/// Explicit endpoints never fall back. Environment endpoints do so only before a peer is reached.
-fn absent_local_publication(error: &ReadFailure, source: &ReadRequestSource) -> bool {
-    if source.explicit_url.is_some() {
-        return false;
-    }
-    match error.boundary {
-        DiscoveryBoundary::LocalAbsent => !source.env_url_is_set(),
-        DiscoveryBoundary::HttpUnreached => source.env_url_is_set(),
-        DiscoveryBoundary::Refused => false,
     }
 }
 
@@ -293,36 +333,18 @@ async fn execute_inner(
     command: ScopedCommand<'_>,
     source: &ReadRequestSource,
 ) -> Result<render::Projection, ReadFailure> {
-    let endpoint = endpoint::select_endpoint(source).map_err(ReadFailure::before_http_peer)?;
+    let endpoint = endpoint::select_endpoint(source)?;
     let establishment_deadline = Instant::now() + CONNECTION_BUDGET;
     match endpoint {
         SelectedEndpoint::Local => {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             {
-                let connection = uds::connect(establishment_deadline).await?;
-                let request = "ws://localhost/api/runtime/read/ws"
-                    .into_client_request()
-                    .map_err(|_| ReadFailure::post("unavailable"))?;
-                let exchange = connection.upgrade(request).await?;
-                let uds::UdsExchange {
-                    stream,
-                    identity,
-                    home,
-                    deadline,
-                    _admission,
-                } = exchange;
-                exchange_stream(
-                    stream,
-                    deadline,
-                    ExpectedPeer::Local(identity),
-                    Some(home.as_path()),
-                    command,
-                    source,
-                )
-                .await
+                let _ = establishment_deadline;
+                let path = crate::daemon::transport::local_socket_path()
+                    .map_err(|_| ReadFailure::pre("unavailable"))?;
+                execute_local_api(command, source, &path).await
             }
-            // No local publisher on this platform.
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             {
                 let _ = establishment_deadline;
                 Err(ReadFailure::local_absence())
@@ -330,7 +352,7 @@ async fn execute_inner(
         }
         SelectedEndpoint::Http { request } => {
             let local_home = loopback_home(&request);
-            // Environment discovery is optional; an explicit endpoint keeps the full budget.
+            // Preserve the environment target's shorter establishment budget.
             let connect_deadline = if source.explicit_url.is_none() {
                 establishment_deadline.min(Instant::now() + Duration::from_secs(1))
             } else {
@@ -338,8 +360,8 @@ async fn execute_inner(
             };
             let stream = tokio::time::timeout_at(connect_deadline, connect_http(request.uri()))
                 .await
-                .map_err(|_| ReadFailure::pre("establishment_timeout").before_http_peer())?
-                .map_err(|_| ReadFailure::post("publisher_absent").before_http_peer())?;
+                .map_err(|_| ReadFailure::pre("establishment_timeout"))?
+                .map_err(|_| ReadFailure::post("publisher_absent"))?;
             let stream = upgrade_http(*request, stream, source, establishment_deadline).await?;
             exchange_stream(
                 stream,
@@ -352,6 +374,45 @@ async fn execute_inner(
             .await
         }
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn execute_local_api(
+    command: ScopedCommand<'_>,
+    source: &ReadRequestSource,
+    path: &std::path::Path,
+) -> Result<render::Projection, ReadFailure> {
+    let deadline = Instant::now() + CONNECTION_BUDGET;
+    let stream = tokio::time::timeout_at(deadline, async {
+        let stream =
+            crate::daemon::transport::connect_unix(path)
+                .await
+                .map_err(|error| match error {
+                    crate::daemon::DaemonClientError::PeerIdentity => {
+                        ReadFailure::pre("peer_identity")
+                    }
+                    _ => ReadFailure::local_absence(),
+                })?;
+        let request = "ws://localhost/api/runtime/read/ws"
+            .into_client_request()
+            .map_err(|_| ReadFailure::pre("invalid_endpoint"))?;
+        tokio_tungstenite::client_async_with_config(request, stream, Some(websocket_config()))
+            .await
+            .map(|(stream, _)| stream)
+            .map_err(map_upgrade_error)
+    })
+    .await
+    .map_err(|_| ReadFailure::pre("establishment_timeout"))??;
+    let home = dirs::home_dir();
+    exchange_stream(
+        stream,
+        deadline,
+        ExpectedPeer::ApiUnix,
+        home.as_deref(),
+        command,
+        source,
+    )
+    .await
 }
 
 async fn connect_http(
@@ -385,9 +446,8 @@ async fn upgrade_http(
     let peer = stream
         .peer_addr()
         .map_err(|_| ReadFailure::post("unavailable"))?;
-    let auth = if !request.headers().contains_key("Authorization")
-        && std::env::var_os("AOE_DAEMON_PASSPHRASE").is_some()
-    {
+    let had_bearer = request.headers().contains_key("Authorization");
+    let auth = if std::env::var_os("AOE_DAEMON_PASSPHRASE").is_some() {
         let uri = request.uri();
         let path = uri
             .path()
@@ -403,7 +463,13 @@ async fn upgrade_http(
             // Login uses the connected loopback address, never a second localhost lookup.
             format!("http://{peer}{path}")
         };
-        let endpoint = DaemonEndpoint::new(base, None, Source::Env);
+        let bearer = request
+            .headers()
+            .get("Authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .map(str::to_string);
+        let endpoint = DaemonEndpoint::new(base, bearer, Source::Env);
         endpoint
             .resolved_passphrase()
             .is_some()
@@ -411,6 +477,9 @@ async fn upgrade_http(
     } else {
         None
     };
+    // A bearer goes first. A 401 on it falls back to one passphrase login, which then
+    // replaces the bearer, the same order the HTTP client uses.
+    let mut login_now = !had_bearer;
     let mut refreshed = false;
     loop {
         let mut had_cached_session = false;
@@ -418,29 +487,33 @@ async fn upgrade_http(
             let session = match cache.get(endpoint) {
                 Some(session) => {
                     had_cached_session = true;
-                    session
+                    Some(session)
                 }
-                None => {
+                None if login_now => Some(
                     tokio::time::timeout_at(deadline, passphrase_session::login(endpoint, cache))
                         .await
                         .map_err(|_| ReadFailure::post("unavailable"))?
-                        .map_err(map_login_error)?
-                }
+                        .map_err(map_login_error)?,
+                ),
+                None => None,
             };
-            request.headers_mut().insert(
-                "Cookie",
-                session
-                    .cookie
-                    .parse()
-                    .map_err(|_| ReadFailure::post("unauthorized"))?,
-            );
-            request.headers_mut().insert(
-                "X-Aoe-Device-Binding",
-                session
-                    .binding_secret
-                    .parse()
-                    .map_err(|_| ReadFailure::post("unauthorized"))?,
-            );
+            if let Some(session) = session {
+                request.headers_mut().remove("Authorization");
+                request.headers_mut().insert(
+                    "Cookie",
+                    session
+                        .cookie
+                        .parse()
+                        .map_err(|_| ReadFailure::post("unauthorized"))?,
+                );
+                request.headers_mut().insert(
+                    "X-Aoe-Device-Binding",
+                    session
+                        .binding_secret
+                        .parse()
+                        .map_err(|_| ReadFailure::post("unauthorized"))?,
+                );
+            }
         }
         let result = tokio::time::timeout_at(
             deadline,
@@ -456,11 +529,16 @@ async fn upgrade_http(
         match result {
             Ok((stream, _)) => return Ok(stream),
             Err(WsError::Http(response))
-                if response.status().as_u16() == 401 && had_cached_session && !refreshed =>
+                if response.status().as_u16() == 401
+                    && auth.is_some()
+                    && ((had_cached_session && !refreshed) || !login_now) =>
             {
-                let (endpoint, cache) = auth.as_ref().expect("cached passphrase session");
-                cache.invalidate(endpoint);
-                refreshed = true;
+                let (endpoint, cache) = auth.as_ref().expect("passphrase auth");
+                if had_cached_session {
+                    cache.invalidate(endpoint);
+                    refreshed = true;
+                }
+                login_now = true;
                 request = match endpoint::select_endpoint(source)? {
                     SelectedEndpoint::Http { request } => *request,
                     SelectedEndpoint::Local => unreachable!("captured HTTP source"),
@@ -524,8 +602,8 @@ fn websocket_config() -> WebSocketConfig {
 #[derive(Debug)]
 enum ExpectedPeer {
     Remote,
-    #[cfg(target_os = "linux")]
-    Local(UdsIdentity),
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    ApiUnix,
 }
 
 async fn exchange_stream<S>(
@@ -561,6 +639,10 @@ async fn exchange_inner<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let server_closes = matches!(&expected, ExpectedPeer::ApiUnix);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let server_closes = false;
     let hello_text = match read_application(&mut stream).await {
         Ok(text) => text,
         Err(error) => return Err(error),
@@ -575,20 +657,6 @@ where
     if let Err(code) = validate_hello(&hello) {
         return Err(ReadFailure::post_no_close(code));
     }
-    // The local transport proves the peer it reached is the publisher whose
-    // markers it admitted; a named endpoint has no such claim to check.
-    #[cfg(target_os = "linux")]
-    if let ExpectedPeer::Local(identity) = &expected {
-        if hello.namespace != identity.namespace
-            || hello.prebind_instance_id != identity.prebind_instance_id
-            || hello.runtime_instance_id != identity.runtime_instance_id
-            || hello.runtime_epoch != identity.runtime_epoch
-            || hello.owner.uid != Some(identity.owner_uid)
-        {
-            return Err(ReadFailure::post_no_close("peer_identity"));
-        }
-    }
-
     let snapshot_text = match read_application(&mut stream).await {
         Ok(text) => text,
         Err(error) => return Err(error),
@@ -600,23 +668,31 @@ where
                 &mut stream,
                 deadline,
                 Err(ReadFailure::post("schema_invalid")),
+                server_closes,
             )
             .await
         }
     };
     if let Err(code) = validate_snapshot(&snapshot) {
-        return finish_with_close(&mut stream, deadline, Err(ReadFailure::post(code))).await;
+        return finish_with_close(
+            &mut stream,
+            deadline,
+            Err(ReadFailure::post(code)),
+            server_closes,
+        )
+        .await;
     }
-    let local_uid = match &expected {
-        ExpectedPeer::Remote => None,
-        #[cfg(target_os = "linux")]
-        ExpectedPeer::Local(identity) => Some(identity.owner_uid),
-    };
-    if let Err(code) = validate_cross_message(&hello, &snapshot, local_uid) {
-        return finish_with_close(&mut stream, deadline, Err(ReadFailure::post(code))).await;
+    if let Err(code) = validate_cross_message(&hello, &snapshot, None) {
+        return finish_with_close(
+            &mut stream,
+            deadline,
+            Err(ReadFailure::post(code)),
+            server_closes,
+        )
+        .await;
     }
     let projection = render::evaluate(&command, &snapshot, source, local_home);
-    finish_with_close(&mut stream, deadline, projection).await
+    finish_with_close(&mut stream, deadline, projection, server_closes).await
 }
 
 async fn read_application<S>(
@@ -675,6 +751,7 @@ async fn finish_with_close<S>(
     stream: &mut tokio_tungstenite::WebSocketStream<S>,
     deadline: Instant,
     result: Result<render::Projection, ReadFailure>,
+    server_closes: bool,
 ) -> Result<render::Projection, ReadFailure>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -682,11 +759,37 @@ where
     if result.as_ref().is_err_and(|error| !error.attempt_close) {
         return result;
     }
-    match (result, close_local(stream, deadline).await) {
+    let closed = if server_closes {
+        close_from_server(stream, deadline).await
+    } else {
+        close_local(stream, deadline).await
+    };
+    match (result, closed) {
         (Err(error), _) => Err(error),
         (Ok(projection), Ok(())) => Ok(projection),
         (Ok(_), Err(close)) => Err(close),
     }
+}
+
+async fn close_from_server<S>(
+    stream: &mut tokio_tungstenite::WebSocketStream<S>,
+    deadline: Instant,
+) -> Result<(), ReadFailure>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let budget = CLOSE_BUDGET.min(deadline.saturating_duration_since(Instant::now()));
+    tokio::time::timeout(budget, async {
+        loop {
+            match stream.next().await {
+                Some(Ok(Message::Close(_))) => return Ok(()),
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                _ => return Err(ReadFailure::post("close_timeout")),
+            }
+        }
+    })
+    .await
+    .map_err(|_| ReadFailure::post("close_timeout"))?
 }
 
 async fn close_local<S>(
@@ -713,6 +816,8 @@ where
 }
 
 fn map_upgrade_error(error: WsError) -> ReadFailure {
+    use crate::daemon::ApiErrorCode;
+
     match error {
         WsError::Http(response) if response.status().as_u16() == 404 => {
             let mut failure = ReadFailure::post("server_error");
@@ -720,6 +825,12 @@ fn map_upgrade_error(error: WsError) -> ReadFailure {
                 "daemon read: server_error\nThe runtime-read route was not found. Check the selected URL and proxy routing. If the daemon predates this CLI, update it and restart it on its host with `aoe serve --restart` (or its service manager).\n".into(),
             );
             failure
+        }
+        WsError::Http(response)
+            if ApiErrorCode::from_headers(response.status(), response.headers(), false)
+                == Some(ApiErrorCode::CityhallMode) =>
+        {
+            ReadFailure::post("cityhall_mode")
         }
         WsError::Http(response) => map_http_status(response.status().as_u16()),
         _ => ReadFailure::post("unavailable"),
@@ -731,6 +842,45 @@ mod tests {
     use super::*;
     use clap::Parser;
     use std::ffi::OsString;
+
+    #[tokio::test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[serial_test::serial]
+    async fn local_api_reads_keep_unix_transport_and_remote_wire_shape() {
+        use crate::server::test_support::{
+            accept_runtime_read_cache_for_test, build_router_for_test,
+            build_test_app_state_with_policy, seed_instances_on_disk_for_test,
+            serve_owner_router_for_test,
+        };
+        let home = tempfile::TempDir::new_in("/tmp").unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        let mut row = crate::session::Instance::new("API UDS only", "/repo");
+        row.id = "api-uds-row".into();
+        row.source_profile = "main".into();
+        seed_instances_on_disk_for_test("main", vec![row.clone()]);
+        let state =
+            build_test_app_state_with_policy(vec![row], vec!["localhost".into()], Vec::new(), None);
+        accept_runtime_read_cache_for_test(&state).await;
+        let path = crate::daemon::transport::local_socket_path().unwrap();
+        let server = serve_owner_router_for_test(&path, build_router_for_test(state.clone())).await;
+        let source = ReadRequestSource {
+            explicit_url: None,
+            env_url: None,
+            token: None,
+            explicit_profile: Some("main".into()),
+            env_profile: None,
+        };
+        let cli = Cli::parse_from(["aoe", "list", "--json"]);
+        let projection = execute_local_api(classify(cli.command.as_ref()).unwrap(), &source, &path)
+            .await
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_str(&projection.stdout).unwrap();
+        assert_eq!(rows[0]["id"], "api-uds-row");
+        assert_eq!(rows[0]["title"], "API UDS only");
+        state.shutdown.cancel();
+        server.abort();
+        let _ = server.await;
+    }
 
     // Localhost is pinned; other TLS names do not establish local provenance.
     #[test]
@@ -756,90 +906,6 @@ mod tests {
                 .expect("the uri parses");
             assert_eq!(loopback_home(&request).is_some(), expected, "{url}");
         }
-    }
-
-    /// Empty or blank environment endpoints preserve local takeover.
-    #[test]
-    fn an_empty_environment_url_still_takes_over_from_the_local_store() {
-        let missing = ReadFailure::local_absence();
-        let cases: [(&str, Option<OsString>); 3] = [
-            ("absent", None),
-            ("empty", Some(OsString::from(""))),
-            ("whitespace", Some(OsString::from("   "))),
-        ];
-        for (label, env_url) in cases {
-            let source = ReadRequestSource {
-                explicit_url: None,
-                env_url,
-                token: None,
-                explicit_profile: None,
-                env_profile: None,
-            };
-            assert!(
-                absent_local_publication(&missing, &source),
-                "{label} must answer from the local store"
-            );
-        }
-        let named = ReadRequestSource {
-            explicit_url: None,
-            env_url: Some(OsString::from("https://example.test")),
-            token: None,
-            explicit_profile: None,
-            env_profile: None,
-        };
-        assert!(
-            !absent_local_publication(&missing, &named),
-            "a named endpoint is the daemon's answer to keep"
-        );
-        assert!(
-            !absent_local_publication(
-                &ReadFailure::pre("marker_invalid"),
-                &ReadRequestSource {
-                    explicit_url: None,
-                    env_url: None,
-                    token: None,
-                    explicit_profile: None,
-                    env_profile: None,
-                }
-            ),
-            "only an absent publication is a take-over"
-        );
-    }
-
-    /// An absent environment-selected peer falls back with an endpoint notice.
-    #[tokio::test]
-    async fn a_variable_naming_an_endpoint_that_did_not_answer_says_the_store_answered() {
-        let unused = tokio::net::TcpSocket::new_v4().unwrap();
-        unused.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let absent = format!("http://{}", unused.local_addr().unwrap());
-        let source = |explicit_url: Option<&str>| ReadRequestSource {
-            explicit_url: explicit_url.map(str::to_string),
-            env_url: Some(OsString::from(&absent)),
-            token: Some(OsString::from("t")),
-            explicit_profile: None,
-            env_profile: None,
-        };
-        let cli = Cli::try_parse_from(["aoe", "list"]).expect("the argv parses");
-        let command = classify(cli.command.as_ref()).expect("`aoe list` is scoped");
-
-        let read = attempt(command, &source(None)).await;
-        let ScopedRead::NoLocalPublication(notice) = read else {
-            panic!("an endpoint that is not there must not be answered by a daemon");
-        };
-        assert!(
-            notice.is_some(),
-            "an environment fallback must be disclosed"
-        );
-
-        let flagged = attempt(command, &source(Some(&absent))).await;
-        let ScopedRead::Answered(outcome) = flagged else {
-            panic!("a flag naming an endpoint is a request for a served answer");
-        };
-        assert_ne!(
-            outcome.exit, 0,
-            "an explicit endpoint must refuse, not fall back"
-        );
-        assert!(outcome.stdout.is_none(), "a refusal prints no answer");
     }
 
     /// Connect targets omit the authority brackets around IPv6 literals.
@@ -876,7 +942,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn invalid_environment_config_falls_back_but_explicit_endpoints_refuse() {
+    async fn invalid_environment_and_explicit_config_both_refuse() {
         let cli = Cli::parse_from(["aoe", "list"]);
         for (url, token, phrase) in [
             ("not a URL", None, ""),
@@ -894,16 +960,9 @@ mod tests {
                     explicit_profile: None,
                     env_profile: None,
                 };
-                let result = attempt(classify(cli.command.as_ref()).unwrap(), &source).await;
-                if explicit {
-                    let ScopedRead::Answered(outcome) = result else {
-                        panic!("explicit endpoint must fail closed");
-                    };
-                    assert_eq!(outcome.exit, 2);
-                    assert_eq!(outcome.stdout, None);
-                } else {
-                    assert!(matches!(result, ScopedRead::NoLocalPublication(Some(_))));
-                }
+                let outcome = attempt(classify(cli.command.as_ref()).unwrap(), &source).await;
+                assert_eq!(outcome.exit, 2);
+                assert_eq!(outcome.stdout, None);
             }
         }
     }
@@ -951,32 +1010,41 @@ mod tests {
     /// A close failure cannot replace the refusal that prompted it.
     #[tokio::test]
     async fn a_failed_close_never_replaces_the_failure_that_caused_it() {
-        let mut stream = broken_stream().await;
-        let deadline = Instant::now() + CONNECTION_BUDGET;
-        for code in ["schema_invalid", "profile_missing", "freshness_unavailable"] {
-            let error = finish_with_close(&mut stream, deadline, Err(ReadFailure::post(code)))
+        for server_closes in [false, true] {
+            let mut stream = broken_stream().await;
+            let deadline = Instant::now() + CONNECTION_BUDGET;
+            for code in ["schema_invalid", "profile_missing", "freshness_unavailable"] {
+                let error = finish_with_close(
+                    &mut stream,
+                    deadline,
+                    Err(ReadFailure::post(code)),
+                    server_closes,
+                )
                 .await
                 .expect_err("the read failed");
-            assert_eq!(error.code(), code, "{code} must survive a broken close");
+                assert_eq!(error.code(), code, "{code} must survive a broken close");
+            }
         }
     }
 
     /// An otherwise successful read reports its close failure.
     #[tokio::test]
     async fn a_failed_close_is_the_answer_when_the_read_otherwise_succeeded() {
-        let mut stream = broken_stream().await;
-        let deadline = Instant::now() + CONNECTION_BUDGET;
-        let projection = render::Projection {
-            stdout: "rows\n".into(),
-            session_table: false,
-            stderr: None,
-            exit: 0,
-        };
-        let error = finish_with_close(&mut stream, deadline, Ok(projection))
-            .await
-            .expect_err("a broken close is not a clean finish");
-        assert_eq!(error.code(), "close_timeout");
-        assert_eq!(error.exit, 4);
+        for server_closes in [false, true] {
+            let mut stream = broken_stream().await;
+            let deadline = Instant::now() + CONNECTION_BUDGET;
+            let projection = render::Projection {
+                stdout: "rows\n".into(),
+                session_table: false,
+                stderr: None,
+                exit: 0,
+            };
+            let error = finish_with_close(&mut stream, deadline, Ok(projection), server_closes)
+                .await
+                .expect_err("a broken close is not a clean finish");
+            assert_eq!(error.code(), "close_timeout");
+            assert_eq!(error.exit, 4);
+        }
     }
 
     /// A client-side stream whose peer is gone: every write fails, which is
@@ -1103,11 +1171,7 @@ mod tests {
             if revoke {
                 assert_eq!(state.login_manager.logout_all().await, 1);
             }
-            let ScopedRead::Answered(outcome) =
-                attempt(classify(cli.command.as_ref()).unwrap(), &source).await
-            else {
-                panic!("an authenticated localhost peer must not fall back to disk");
-            };
+            let outcome = attempt(classify(cli.command.as_ref()).unwrap(), &source).await;
             assert_eq!(outcome.exit, 0, "read {index}: {:?}", outcome.stderr);
             let value: serde_json::Value = serde_json::from_str(&outcome.stdout.unwrap()).unwrap();
             assert_eq!(value["id"], "passphrase-read");
@@ -1137,6 +1201,74 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        state.shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// A bearer alone is refused on a token-plus-passphrase daemon, so the read falls back to
+    /// one passphrase login (which carries the bearer) instead of failing.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_bearer_refused_for_a_second_factor_falls_back_to_a_passphrase_login() {
+        use crate::server::test_support;
+        use crate::session::test_support::EnvGuard;
+        let mut _env = test_support::RuntimeEnvGuard::read_lock();
+        let dir = tempfile::tempdir().unwrap();
+        _env.bind(dir.path());
+        let phrase = "runtime read second factor";
+        let token = "a".repeat(64);
+        let _phrase = EnvGuard::set(&[("AOE_DAEMON_PASSPHRASE", phrase)]);
+        crate::session::create_profile("main").unwrap();
+        let mut row = crate::session::Instance::new("second factor evidence", "/repo");
+        row.id = "second-factor-read".into();
+        row.source_profile = "main".into();
+        row.tool = "claude".into();
+        test_support::seed_instances_on_disk_for_test("main", vec![row.clone()]);
+        let state = test_support::build_test_app_state_with_policy_configured(
+            vec![row],
+            vec!["localhost".into(), "127.0.0.1".into()],
+            Vec::new(),
+            Some(token.clone()),
+            |state| {
+                state.login_manager =
+                    std::sync::Arc::new(crate::server::login::LoginManager::new(Some(phrase)));
+            },
+        );
+        test_support::accept_runtime_read_cache_for_test(&state).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app =
+            axum::Router::new().nest("/base", test_support::build_router_for_test(state.clone()));
+        let shutdown = state.shutdown.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown.cancelled_owned())
+            .await
+            .unwrap();
+        });
+        let cli = Cli::parse_from(["aoe", "session", "show", "second-factor-read", "--json"]);
+        let source = ReadRequestSource {
+            explicit_url: None,
+            env_url: Some(format!("http://127.0.0.1:{port}/base/").into()),
+            token: Some(OsString::from(token)),
+            explicit_profile: Some("main".into()),
+            env_profile: None,
+        };
+        let outcome = attempt(classify(cli.command.as_ref()).unwrap(), &source).await;
+        assert_eq!(outcome.exit, 0, "{:?}", outcome.stderr);
+        let value: serde_json::Value = serde_json::from_str(&outcome.stdout.unwrap()).unwrap();
+        assert_eq!(value["id"], "second-factor-read");
+        assert_eq!(
+            state.login_manager.device_snapshot(None).await.len(),
+            1,
+            "exactly one passphrase login"
+        );
         state.shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(5), server)
             .await

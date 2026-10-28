@@ -33,6 +33,7 @@ export const docsNav: NavSection[] = [
       { title: "tmux Status Bar", href: "/guides/tmux-status-bar/", description: "Show live session status in your tmux status bar." },
       { title: "Tool Sessions", href: "/guides/tool-sessions/", description: "Run plain shell or tool sessions alongside your agents." },
       { title: "MCP Servers", href: "/guides/mcp-servers/", description: "Forward configured MCP servers to structured-view agents." },
+      { title: "Controlling AoE over MCP", href: "/guides/mcp-control/", description: "Connect an agent to sessions through the daemon's MCP server." },
       { title: "Session Resume & Forking", href: "/guides/session-resume/", description: "Resume, fork, or import an agent conversation in a session." },
       { title: "Shell Completions", href: "/guides/shell-completions/", description: "Install and refresh tab-completion for the aoe CLI." },
       { title: "Sound Effects", href: "/docs/sounds/", description: "Play sounds when agents need input or finish work." },

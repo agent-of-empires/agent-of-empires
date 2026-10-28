@@ -1532,6 +1532,16 @@ pub(crate) fn registry_lifecycle(name: &str) -> AgentLifecycle {
         .unwrap_or(AgentLifecycle::Active)
 }
 
+/// The built-in terminal tool a structured view agent runs as; `None` for ACP-only agents.
+pub fn terminal_tool_for_acp_agent(agent: &str) -> Option<&'static str> {
+    let tool = if agent == "claude-code" {
+        "claude"
+    } else {
+        agent
+    };
+    get_agent(tool).map(|def| def.name)
+}
+
 /// Only claude qualifies: claude-agent-acp's session id is the id `claude --resume` reads.
 pub fn acp_transcript_cli_resumable(tool: &str, acp_agent: &str) -> bool {
     tool == "claude" && matches!(acp_agent, "claude" | "claude-code")
@@ -1813,6 +1823,21 @@ mod tests {
             "failed-launch\nfresh-launch\nfresh-launch\nfresh-launch\n"
         );
     }
+    #[test]
+    fn terminal_tool_for_acp_agent_maps_only_built_in_terminal_tools() {
+        for (agent, tool) in [
+            ("claude", Some("claude")),
+            ("claude-code", Some("claude")),
+            ("codex", Some("codex")),
+            ("gemini", Some("gemini")),
+            ("opencode", Some("opencode")),
+            ("aoe-agent", None),
+            ("my-custom-acp", None),
+        ] {
+            assert_eq!(terminal_tool_for_acp_agent(agent), tool, "{agent}");
+        }
+    }
+
     #[test]
     fn acp_transcript_cli_resumable_only_for_claude_pairings() {
         assert!(acp_transcript_cli_resumable("claude", "claude"));

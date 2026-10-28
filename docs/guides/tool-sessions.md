@@ -13,10 +13,6 @@ Define tools in global `config.toml` under `[tools.<name>]`; see [File Locations
 command = "lazygit"
 hotkey = "Alt+g"
 
-[tools.yazi]
-command = "yazi"
-hotkey = "Alt+f"
-
 [tools.tig]
 command = "tig --all"     # no hotkey: picker and palette only
 
@@ -48,10 +44,7 @@ Once attached, the tool owns the screen. Use its quit behavior, or detach tmux w
 
 ## Lifecycle and cleanup
 
-Each tool session is tied to one agent session's working directory.
-Switching to a different agent session and pressing the same hotkey
-opens a **separate** tool session against that worktree, with its own
-independent state.
+Each tool session is tied to one agent session's working directory, so the same hotkey on a different session opens a separate tool session with its own state. Tool sessions are killed when their agent session is removed, and the sweep covers tools whose `[tools.*]` entry you have since renamed or deleted. Background tools are not tmux sessions and are not part of that cleanup: if one starts a daemon, its lifecycle is yours to manage.
 
 Creating or recovering a tool uses the current session and configured
 command. Launch is refused while the session is trashed, being created
@@ -75,10 +68,10 @@ means ownership or liveness could not be established; requests never guess an
 owner. An explicit stop may still finish an already-authorized original
 retirement, even when the current pane is absent or ownership is unknown.
 
-While the TUI shows **Runtime applying**, a change to that session is still
-pending. Wait for **Runtime ready** before another change to the same session.
-A pane disappearing does not establish completion: the TUI must receive the
-command acknowledgement and apply its matching runtime snapshot.
+A change to a session stays pending until the TUI receives the command
+acknowledgement and applies its matching runtime snapshot; let it settle before
+another change to the same session. A pane disappearing does not establish
+completion.
 
 If a TUI runtime change loses its acknowledgement, its session stays blocked because the outcome is unknown. Check the current daemon state before choosing **Unlock**; resolution does not replay the lost change. **Keep Blocked** leaves the quarantine intact. Reopen the prompt with `Ctrl+K`, then **Resolve unknown runtime change**, even if the session has disappeared from the list. A failed resolution remains blocked until a healthy, current daemon snapshot has been applied.
 
@@ -121,7 +114,6 @@ error, not an empty inventory.
 
 A dead pane without a leader PID can be removed only with its captured server/socket proof and unchanged owner and immutable tmux target. Missing or unprovable original server evidence stays fail-closed. Older tmux-only pending stop receipts remain retained and refused; they are never discarded or replaced by a new process cohort.
 
-
 Removing a parent session attempts cleanup of every owned tool, including renamed or deleted `[tools.*]` entries. Unsettled original debt remains a cleanup fence, not proof that an absent pane is complete.
 
 Background tools are not tmux sessions and use no managed cleanup path. If a command starts a daemon, that command owns its lifecycle.
@@ -134,7 +126,6 @@ Tools run on the **host** in the agent session's working directory, including fo
 [tools.lazygit]
 command = "docker exec -it my-container lazygit"
 ```
-
 
 ## tmux session naming
 

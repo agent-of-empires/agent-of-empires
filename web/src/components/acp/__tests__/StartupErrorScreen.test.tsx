@@ -9,7 +9,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
+import { writeClipboard } from "../../../lib/clipboard";
 import { StartupErrorScreen } from "../StartupErrorScreen";
+
+vi.mock("../../../lib/clipboard", () => ({ writeClipboard: vi.fn().mockResolvedValue(true) }));
 
 const fetchSettings = vi.fn();
 const installAcpAgent = vi.fn();
@@ -100,6 +103,25 @@ describe("StartupErrorScreen", () => {
       else expect(cmd, detail.kind).toBeNull();
       cleanup();
     }
+  });
+
+  it.each([
+    ["installable and sandboxed", incompatible(true), true, true],
+    ["non-auto-installable and sandboxed", incompatible(false), true, false],
+    ["installable with one-click install off", incompatible(true), false, false],
+    [
+      "not installable",
+      { kind: "unsupported_protocol_version" as const, expected: "V1", received: "V2" },
+      false,
+      false,
+    ],
+  ])("keeps every line on a validated text colour: %s", async (_label, detail, isSandboxed, allowInstall) => {
+    fetchSettings.mockResolvedValue({ acp: { allow_agent_install: allowInstall } });
+    const { getByTestId } = render(<StartupErrorScreen detail={detail} sessionId="s1" isSandboxed={isSandboxed} />);
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
+    const screen = getByTestId("startup-error-screen");
+    expect(screen.querySelectorAll(".text-text-secondary, .text-text-dim")).toHaveLength(0);
+    expect(screen.querySelectorAll(".text-text-subtle").length).toBeGreaterThan(0);
   });
 
   it("Restart agent POSTs to /acp/spawn", async () => {
@@ -276,5 +298,13 @@ describe("StartupErrorScreen", () => {
       expect(installAcpAgent).toHaveBeenCalledWith("s1");
       await waitFor(spawnCall);
     });
+  });
+});
+
+describe("StartupErrorScreen copy", () => {
+  it("copies the install command", () => {
+    const { getByRole } = render(<StartupErrorScreen detail={incompatible()} sessionId="s1" />);
+    fireEvent.click(getByRole("button", { name: "Copy command" }));
+    expect(writeClipboard).toHaveBeenCalledWith("npm install -g @agentclientprotocol/claude-agent-acp@latest");
   });
 });

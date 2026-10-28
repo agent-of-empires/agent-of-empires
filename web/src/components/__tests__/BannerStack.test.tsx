@@ -68,7 +68,8 @@ const NAMES: [RegExp, string][] = [
 ];
 
 function shown(container: HTMLElement): string[] {
-  return Array.from(container.querySelectorAll('[role="alert"], [role="status"]')).map((el) => {
+  // Top-level banners only; a banner's own copy feedback is a status region inside it.
+  return Array.from(container.querySelectorAll(':scope > [role="alert"], :scope > [role="status"]')).map((el) => {
     const text = `${el.getAttribute("aria-label") ?? ""} ${el.textContent ?? ""}`;
     return NAMES.find(([re]) => re.test(text))?.[1] ?? text;
   });

@@ -279,12 +279,10 @@ describe("code block header", () => {
     [undefined, "text"],
   ])("labels language %s and copies the raw source", (language, label) => {
     const Highlighter = override<{ language?: string; code: string }>("SyntaxHighlighter");
-    const writeText = vi.fn().mockResolvedValue(undefined);
-    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
     const { container, getByText } = render(<Highlighter language={language} code="alert('hi')" />);
     expect(container.textContent).toContain(label);
     fireEvent.click(getByText("copy"));
-    expect(writeText).toHaveBeenCalledWith("alert('hi')");
+    expect(writeClipboard).toHaveBeenCalledWith("alert('hi')");
   });
 
   it("keeps the header and the code in one bordered box", () => {

@@ -54,6 +54,7 @@ export function SystemNotices({
   rateLimitAutoResume,
   rateLimitRetriesExhausted,
   hasEverOpened,
+  replayedWhileDown = false,
   reconnecting,
   retryCount,
   retryCountdown,
@@ -72,6 +73,8 @@ export function SystemNotices({
   rateLimitAutoResume?: boolean;
   rateLimitRetriesExhausted: boolean;
   hasEverOpened: boolean;
+  /** Events still arrive over HTTP replay while the socket is down. */
+  replayedWhileDown?: boolean;
   reconnecting: boolean;
   retryCount: number;
   retryCountdown: number;
@@ -90,7 +93,10 @@ export function SystemNotices({
   if (!reconnectRetriesExhausted && !(newSessionStarting && !hasEverOpened)) {
     if (reconnecting && status !== "open") {
       const countdownPart = retryCountdown > 0 ? ` in ${retryCountdown}s` : "";
-      warn(`Structured view disconnected. Reconnecting (${retryCount}/${maxRetries})${countdownPart}…`);
+      const lead = replayedWhileDown
+        ? "Live updates unavailable, showing history fetched over HTTP."
+        : "Structured view disconnected.";
+      warn(`${lead} Reconnecting (${retryCount}/${maxRetries})${countdownPart}…`);
     } else if (status === "connecting") {
       messages.push({
         kind: "info",

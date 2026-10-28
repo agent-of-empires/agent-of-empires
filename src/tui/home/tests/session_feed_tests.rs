@@ -51,7 +51,7 @@ fn daemon_status_moves_a_structured_row_off_idle() {
 #[test]
 #[serial]
 fn daemon_status_carries_the_waiting_state_for_a_pending_approval() {
-    // `derive_acp_status` maps ApprovalRequested/ElicitationRequested to Waiting; the
+    // `AcpState::sidebar_status` maps a pending approval or elicitation to Waiting; the
     // yellow pill exists to spot a session blocked on you from the home list.
     let mut env = create_test_env_empty();
     let id = structured_row(&mut env, Status::Running);
@@ -2741,7 +2741,7 @@ fn diff_save_uses_its_own_receipt_and_surfaces_rejection_or_unknown_in_takeover(
 #[tokio::test]
 #[serial]
 async fn degraded_stream_revokes_grants_and_project_writes_while_owner_http_is_held() {
-    use crate::server::auth::LocalAuthorization;
+    use crate::server::principal::Principal;
     use crate::tui::dialogs::ProjectsDialog;
     use axum::{extract::Extension, routing::get, Router};
     let mut env = create_test_env_with_sessions(1);
@@ -2803,9 +2803,9 @@ async fn degraded_stream_revokes_grants_and_project_writes_while_owner_http_is_h
                 }
             }),
         )
-        .layer(Extension(LocalAuthorization::UnixOwner(
-            nix::unistd::geteuid().as_raw(),
-        )))
+        .layer(Extension(Principal::LocalPeer {
+            uid: nix::unistd::geteuid().as_raw(),
+        }))
         .with_state(state.clone());
     let socket = app.join("daemon/api.sock");
     let server = crate::server::test_support::serve_owner_router_for_test(&socket, router).await;

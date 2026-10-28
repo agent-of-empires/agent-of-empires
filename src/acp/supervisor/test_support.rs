@@ -13,7 +13,7 @@ use crate::acp::acp_client::{AcpClient, SpawnConfig};
 use crate::acp::agent_registry::AgentSpec;
 use crate::acp::approvals::Nonce;
 use crate::acp::event_store::EventStore;
-use crate::acp::runner_lifecycle::{Lease, ProcessControl, RunnerIdentity};
+use crate::acp::runner_lifecycle::{Lease, ProcessControl, RunnerIdentity, Settlement};
 use crate::acp::state::{AcpSessionId, Event};
 use crate::process::worker_registry::{self, WorkerRecord};
 
@@ -40,8 +40,27 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 
     /// Leave the session mid-teardown, where an unproven settlement parks it.
-    pub(crate) fn test_hold_stopping(&self, session_id: &str) {
-        lock_recover(&self.lifecycle).adopt_for_stop(session_id);
+    pub(crate) fn test_hold_stopping(&self, session_id: &str) -> Option<Lease> {
+        lock_recover(&self.lifecycle).adopt_for_stop(session_id)
+    }
+
+    /// Leave the session mid-start, as an explicit resume does before its worker is ready.
+    pub(crate) fn test_hold_starting(&self, session_id: &str) -> Lease {
+        lock_recover(&self.lifecycle)
+            .admit(session_id, ResumeKind::Spawn)
+            .expect("admit")
+    }
+
+    /// Finish a start `test_hold_starting` left open, as installation does.
+    pub(crate) fn test_finish_starting(&self, lease: &Lease) {
+        lock_recover(&self.lifecycle)
+            .install(lease, None)
+            .expect("install");
+    }
+
+    /// End a teardown `test_hold_stopping` left open.
+    pub(crate) fn test_settle_stopping(&self, lease: &Lease) {
+        lock_recover(&self.lifecycle).settle(lease, Settlement::Proven);
     }
 
     /// Reports each session a `wait_for_worker` call starts parking on.

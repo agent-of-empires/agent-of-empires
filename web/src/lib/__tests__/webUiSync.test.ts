@@ -40,10 +40,12 @@ describe("isSyncedKey", () => {
       "aoe-repo-collapsed-/home/me/repo",
       "aoe-group-collapsed-feature",
       "aoe-nested-group-collapsed-x",
+      "aoe-settings-intro-worktree", // folded Settings tab intro
     ]) {
       expect(isSyncedKey(k), k).toBe(true);
     }
     for (const k of [
+      "aoe-local-settings-intro-worktree", // a read-only dashboard's fold stays on the device
       "aoe-sidebar-width",
       "aoe-split-ratio",
       "aoe-right-vsplit",

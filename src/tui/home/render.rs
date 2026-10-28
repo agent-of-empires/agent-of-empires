@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use rattles::presets::prelude as spinners;
 
+use super::bindings::ActionId;
 use super::{
     get_indent, live_send, DragKind, HomeView, TerminalMode, ViewMode, ICON_ARCHIVED_SECTION,
     ICON_COLLAPSED, ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED, ICON_FAVORITE,
@@ -258,18 +259,15 @@ fn preview_frozen(scroll_offset: u16, has_selection: bool) -> bool {
     scroll_offset > 0 || has_selection
 }
 
-/// Grace beyond the shared tmux operation deadline before a preview worker is
-/// considered stalled. A healthy capture may spend the full deadline inside
-/// one logical multi-command sample, so restarting earlier would overlap
-/// legitimate workers and multiply tmux load.
+/// Grace beyond the shared tmux operation deadline before a preview worker counts as
+/// stalled. A healthy capture may spend the full deadline inside one logical sample, so
+/// restarting earlier would overlap legitimate workers and multiply tmux load.
 const WORKER_STALL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Fold one capture-worker cycle observation into a stall verdict.
-///
-/// The worker deduplicates unchanged frames, so publication cannot prove
-/// liveness. Its cycle counter advances before each deadline-bounded sample.
-/// An unchanged counter is tolerated through the operation deadline plus
-/// grace; after that the caller replaces the worker off the tmux hot path.
+/// Fold one capture-worker cycle observation into a stall verdict. The worker dedupes
+/// unchanged frames, so publication cannot prove liveness; its cycle counter advances
+/// before each deadline-bounded sample. An unchanged counter is tolerated through the
+/// deadline plus grace, after which the caller replaces the worker off the tmux hot path.
 fn worker_stalled_step(
     cycles: u64,
     prior: Option<(u64, std::time::Instant)>,
@@ -326,17 +324,11 @@ pub(super) enum PassiveResizeStep {
 /// Debounce for the passive preview sync: resize only once the same geometry has been
 /// wanted on two consecutive refreshes.
 ///
-/// The `EnterLiveSend` / `SendMessage` handlers each draw exactly one frame
-/// with a transient "Reviving session..." toast before doing the slow work.
-/// That toast claims a one-row bottom bar, so the frame's preview output rect
-/// is one row shorter than both the frame before and the frame after. Chasing
-/// it resized the agent's detached pane down and straight back up (43 -> 42 ->
-/// 43 rows ~30ms apart in the repro), and the double SIGWINCH made
-/// bottom-anchored agent UIs visibly jump, worst right as live mode opened.
-/// Requiring two consecutive sightings means one-frame transients never reach
-/// tmux, while real geometry changes (terminal resize, info-header toggle,
-/// persistent update banner) land one refresh later, within the normal poll
-/// cadence.
+/// The `EnterLiveSend` / `SendMessage` handlers each draw one frame with a transient
+/// toast that claims a bottom row, so that frame's output rect is a row shorter than the
+/// frames either side. Chasing it resized the agent's pane down and straight back up
+/// ~30ms later, and the double SIGWINCH made bottom-anchored agent UIs jump. Real
+/// geometry changes land one refresh later, within the normal poll cadence.
 fn passive_resize_step(
     want: &(String, u16, u16),
     synced: Option<&(String, u16, u16)>,
@@ -351,11 +343,9 @@ fn passive_resize_step(
     }
 }
 
-/// What the fleet reconcile should do for one session wanting `(cols, rows)`.
-/// The fleet has its own debounce (the armed fleet geometry in
-/// `reconcile_passive_fleet`), so per session this only dedups: an
-/// already-synced, declined, or already-queued geometry is not re-sent,
-/// anything else is handed to the worker.
+/// What the fleet reconcile should do for one session wanting `(cols, rows)`. The fleet
+/// debounces in `reconcile_passive_fleet`, so this only dedups: an already-synced,
+/// declined or queued geometry is not re-sent.
 #[derive(Debug, PartialEq, Eq)]
 enum FleetPassiveStep {
     Skip,
@@ -375,19 +365,15 @@ fn fleet_passive_step(
     }
 }
 
-/// How long a declined passive resize stays parked before the fleet retries
-/// it. Declines come from a live attach or an active size owner; nothing
-/// announces when those go away, so a bounded retry turns "parked until the
-/// next geometry change" into "recovers within half a minute", at one
-/// guarded worker attempt per declined session per interval.
+/// How long a declined passive resize stays parked before the fleet retries it. Declines
+/// come from a live attach or an active size owner and nothing announces when those go
+/// away, so a bounded retry recovers within half a minute, at one attempt per interval.
 pub(super) const PASSIVE_DECLINE_RETRY: Duration = Duration::from_secs(30);
 
-/// Whether a pane observation contradicts an applied passive resize: taken
-/// after adoption (the shared list-panes snapshot can lag our own resize,
-/// and acting on an older one would re-SIGWINCH a pane that is already
-/// correct) and showing a window size other than the one we applied. True
-/// means another client resized the window and the synced entry must be
-/// dropped so the reconcile re-asserts the pane.
+/// Whether a pane observation contradicts an applied passive resize: taken after adoption
+/// (the shared snapshot can lag our own resize) and showing a size other than the one we
+/// applied. True means another client resized the window, so the synced entry must drop
+/// and the reconcile re-assert the pane.
 fn passive_synced_contradicted(
     synced: &super::PassiveSynced,
     observed: (u16, u16),
@@ -396,9 +382,8 @@ fn passive_synced_contradicted(
     observed_at > synced.adopted_at && observed != (synced.cols, synced.window_rows)
 }
 
-/// Clamp the user's preview scroll offset to what the freshly captured pane
-/// can actually render. Prevents the offset from drifting into "phantom"
-/// territory (M3 from the multi-AI review) when tmux history is shorter than
+/// Clamp the user's preview scroll offset to what the freshly captured pane can render,
+/// so it cannot drift into phantom territory when tmux history is shorter than
 /// `MAX_PREVIEW_SCROLL`.
 ///
 /// `visible_height` is the rendered output-body height the caller already computed
@@ -435,12 +420,9 @@ fn spinner_starting(created_at: &DateTime<Utc>) -> &'static str {
         .current_frame()
 }
 
-/// Slow `breathe` rattle for a freshly-stopped Idle session. Reuses the
-/// same animation as Starting on purpose; differentiation is by color
-/// (Starting uses `theme.dimmed`, fresh-idle uses `theme.fresh_idle`).
-/// The longer interval reads as "gentle reminder" rather than "actively
-/// transitioning". Phase offset uses `idle_entered_at` when available so
-/// sessions that just stopped don't all sync to the same frame.
+/// Slow `breathe` rattle for a freshly-stopped Idle session, the same animation as
+/// Starting but slower and colored `theme.fresh_idle`, so it reads as a gentle reminder.
+/// The phase offset uses `idle_entered_at` so sessions don't all sync to one frame.
 fn spinner_idle_fresh(
     created_at: &DateTime<Utc>,
     idle_entered_at: Option<DateTime<Utc>>,
@@ -563,10 +545,7 @@ fn decorate_row(
     (icon, title_text, style)
 }
 
-/// Append the selected row's `last_error` (in red) to a shelf placeholder's
-/// lines when the daemon's canonical row sits in `Status::Error`; domain
-/// purge/trash failures are also retained in the typed receipt presentation.
-/// without this the calm placeholder swallowed the failure entirely.
+/// Show canonical row errors and typed purge/trash failures on shelf placeholders.
 fn push_shelf_error_lines(
     lines: &mut Vec<Line<'static>>,
     inst: Option<&crate::session::Instance>,
@@ -638,11 +617,10 @@ fn press_hint(theme: &Theme, key: &'static str, tail: &'static str) -> Line<'sta
     ])
 }
 
-/// Per-row tag content plus the mode's max content width. The renderer
-/// right-pads `content` to `max_width` so the bracket span is fixed-width
-/// across rows (`[fb  ]` vs `[def ]`), keeping the activity column from
-/// reflowing as tag widths vary. `compute_row_tag` truncates each variant
-/// to the same cap it carries here, so `rendered()` never truncates.
+/// Per-row tag content plus the mode's max content width. The renderer right-pads
+/// `content` to `max_width` so the bracket span is fixed-width across rows (`[fb  ]` vs
+/// `[def ]`) and the activity column cannot reflow. `compute_row_tag` truncates to the
+/// same cap, so `rendered()` never truncates.
 pub(crate) struct RowTag {
     pub content: String,
     pub max_width: usize,
@@ -761,20 +739,15 @@ fn branch_tag_content(branch: &str, max_width: usize) -> Option<String> {
 
 /// Compact display code for a profile name, for the per-row tag in all-profiles view.
 ///
-/// Hyphen/underscore-delimited names keep a short lead segment (at most
-/// three grapheme clusters) whole and append the first cluster of each
-/// remaining segment, so sibling profiles that share an initial stay
-/// distinguishable at a glance (`gna-main` becomes `gnam`, `bsc-main` and
-/// `bso-main` become `bscm` and `bsom`, `wma-work` becomes `wmaw`); a longer
-/// lead contributes its initial only (`forit-backup` becomes `fb`).
-/// Single-segment names take their first three clusters (`default` becomes
-/// `def`). The code is lowercased and then cut to four terminal cells on a
-/// cluster boundary, measured as a string the way [`RowTag::rendered`]
-/// measures it, so a case expansion (`İ`), a wide glyph (`界`) or an emoji
-/// sequence (`♥️`, `🤝🏽`) never pushes the fixed-width tag past
-/// [`RowTag::max_width`]. The mapping is per-name and deterministic, so two
-/// profiles that collapse to the same code render identically; the full name
-/// still shows in a filtered view's list title and in the New/Restart dialogs.
+/// Delimited names keep a short lead segment (at most three grapheme clusters) whole and
+/// append the first cluster of each remaining segment, so siblings sharing an initial stay
+/// distinguishable (`gna-main` -> `gnam`, `bsc-main` / `bso-main` -> `bscm` / `bsom`); a
+/// longer lead contributes its initial only (`forit-backup` -> `fb`). Single-segment names
+/// take their first three clusters (`default` -> `def`). The code is lowercased and cut to
+/// four cells on a cluster boundary, measured as [`RowTag::rendered`] measures it, so a
+/// case expansion (`İ`), a wide glyph or an emoji sequence cannot push the tag past
+/// [`RowTag::max_width`]. Deterministic per name, so two profiles may share a code; the
+/// full name still shows in the list title and the New/Restart dialogs.
 pub(crate) fn profile_short_code(profile: &str) -> String {
     use unicode_segmentation::UnicodeSegmentation;
     const MAX_CELLS: usize = 4;
@@ -967,7 +940,6 @@ impl HomeView {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
 
-        // Serve view takes over the whole screen
         if let Some(ref serve) = self.serve_view {
             self.divider_col = None;
             self.main_area_width = 0;
@@ -982,15 +954,15 @@ impl HomeView {
             self.preview_outer_area = Rect::default();
             self.divider_col = None;
             self.main_area_width = 0;
-            let connecting =
-                self.sidebar_source == crate::tui::session_feed::SidebarSource::Connecting;
-            let message = if connecting {
-                "Connecting to runtime…\n\nq: Quit"
-            } else {
-                self.runtime_failure_message
-                    .as_deref()
-                    .unwrap_or("Runtime unavailable\n\nr: Reconnect / start local runtime\nq: Quit")
-            };
+            if self.sidebar_source == crate::tui::session_feed::SidebarSource::Disconnected {
+                frame.render_widget(Clear, area);
+                crate::tui::dialogs::ConnectionsView::offline(
+                    self.runtime_failure_reason.as_deref(),
+                )
+                .render(frame, area, theme);
+                return;
+            }
+            let message = "Connecting to runtime…\n\nq: Quit";
             frame.render_widget(
                 Paragraph::new(message)
                     .style(Style::default().fg(theme.dimmed))
@@ -1235,6 +1207,14 @@ impl HomeView {
             telemetry_consent_dialog,
             tips_dialog,
         );
+        if let Some(view) = &self.connections_view {
+            let web = self.connections_web_state(Some(view.web()));
+            let daemon = self.daemon_attention();
+            if let Some(view) = &mut self.connections_view {
+                view.refresh(daemon, web);
+            }
+        }
+        render_dialogs!(connections_view);
         if self.snooze_duration_dialog.is_none() {
             render_dialogs!(info_dialog);
         }
@@ -1261,10 +1241,9 @@ impl HomeView {
     }
 
     /// Dock the diagnostics strip under the session-list column: carve
-    /// `DIAGNOSTICS_STRIP_HEIGHT` rows off the bottom of `column`, render the
-    /// strip there, and return the reduced rect for the list. Returns `column`
-    /// unchanged when the strip is hidden or the column is too short to spare
-    /// the rows, so the list is never starved below one row.
+    /// `DIAGNOSTICS_STRIP_HEIGHT` rows off the bottom of `column`, render there, and return
+    /// the reduced rect. Returns `column` unchanged when the strip is hidden or the column
+    /// cannot spare the rows, so the list is never starved below one row.
     fn diagnostics_dock(&mut self, frame: &mut Frame, column: Rect, theme: &Theme) -> Rect {
         self.diagnostics_area = Rect::default();
         if !self.show_diagnostics || column.height <= DIAGNOSTICS_STRIP_HEIGHT {
@@ -2033,8 +2012,13 @@ impl HomeView {
         let terminal_badge = (self.view_mode == ViewMode::Structured
             && self.paired_terminal_running_for_display(inst))
         .then(|| format!(" {ICON_TERMINAL}"));
-        let badge_width =
-            badge_text.map_or(0, |s| s.len()) + terminal_badge.as_ref().map_or(0, |s| s.len());
+        // Paint must not fork tmux, so this skips the resume gate the menu applies.
+        let update_badge = (!inst.is_structured()
+            && crate::session::update_restart::binary_updated(inst))
+        .then_some(" [update]");
+        let badge_width = badge_text.map_or(0, |s| s.len())
+            + terminal_badge.as_ref().map_or(0, |s| s.len())
+            + update_badge.map_or(0, |s| s.len());
         let age = if self.show_activity_age {
             row_age(inst, in_attention)
         } else {
@@ -2088,6 +2072,17 @@ impl HomeView {
                 },
             ));
         }
+        if let Some(badge) = update_badge {
+            let badge_style = Style::default().fg(theme.waiting);
+            line_spans.push(Span::styled(
+                badge,
+                if is_selected {
+                    selected_row_style(badge_style, theme)
+                } else {
+                    badge_style
+                },
+            ));
+        }
         if let Some(badge) = badge_text {
             let badge_style = Style::default().fg(theme.sandbox);
             line_spans.push(Span::styled(
@@ -2108,20 +2103,13 @@ impl HomeView {
         Line::from(line_spans)
     }
 
-    /// Refresh preview cache if needed (session changed, dimensions changed, or timer expired)
-    // pub(super) so unit tests in `super::tests` can exercise the
-    // cache-preservation behavior added with the kill-switch fix
-    // without standing up a full render pipeline.
     /// Keep the live-send tmux pane sized to the preview's visible output area.
     ///
-    /// No-op unless live-send is currently targeting `target`: without that gate,
-    /// viewing the Agent pane while live-on-Terminal would resize the *terminal*
-    /// pane (the worker is bound to it) to Agent-view dimensions, mis-fitting the
-    /// shell the user is typing into. Deduped against `live_send_last_resize`
-    /// (shared, since only one target is live at a time) so we only fire when the
-    /// user enters live mode or the preview pane is resized (terminal resize,
-    /// divider drag, layout flip). Each `refresh_*_cache_if_needed` calls this
-    /// with its own target so the three copies stay in lockstep.
+    /// No-op unless live-send targets `target`: without the gate, viewing the Agent pane
+    /// while live on Terminal would resize the terminal pane (the worker is bound to it)
+    /// to Agent-view dimensions. Deduped against `live_send_last_resize` (shared, since
+    /// one target is live at a time) so it fires only on live entry or a preview resize.
+    /// Each `refresh_*_cache_if_needed` calls it with its own target.
     fn resize_live_pane_if_target(
         &mut self,
         target: live_send::LiveSendTarget,
@@ -2159,11 +2147,9 @@ impl HomeView {
         }
     }
 
-    /// tmux session name backing the pane the preview currently shows, as a
-    /// function of the selected session and view mode (and, for Terminal,
-    /// the host/container sub-mode). Live-send pins the pane captured at entry,
-    /// independent of storage-driven selection changes. Drives
-    /// `sync_preview_capture_worker`.
+    /// The tmux session name backing the pane the preview shows, from the selection and
+    /// view mode (and, for Terminal, the host/container sub-mode). Live-send pins the
+    /// pane captured at entry. Drives `sync_preview_capture_worker`.
     pub(super) fn displayed_pane_tmux_name(&self) -> Option<String> {
         if let Some(state) = &self.live_send {
             return Some(state.tmux_name.clone());
@@ -2422,10 +2408,9 @@ impl HomeView {
         );
     }
 
-    /// Observe worker progress without relying on changed-frame publication.
-    /// A stalled worker is replaced only after its shared tmux operation
-    /// deadline and grace have elapsed, so a legitimate slow sample is never
-    /// overlapped by another worker.
+    /// Observe worker progress without relying on changed-frame publication. A stalled
+    /// worker is replaced only after its tmux operation deadline and grace, so a slow but
+    /// legitimate sample is never overlapped.
     fn preview_worker_stalled_at(&mut self, now: std::time::Instant) -> bool {
         let Some(worker) = self.preview_capture_worker.as_ref() else {
             self.preview_worker_pulse = None;
@@ -2436,13 +2421,10 @@ impl HomeView {
         self.preview_worker_pulse = observation;
         stalled
     }
-    /// Point the off-thread capture worker at `desired` (the displayed
-    /// pane's tmux session), then retune its cadence to live-send vs. idle.
-    /// One long-lived worker is spawned lazily on first use and retargeted
-    /// in place (no per-switch respawn); an empty target idles it. Cheap and
-    /// idempotent when the target is unchanged, so render calls it every
-    /// frame. This is what keeps the worker tracking whatever the user is
-    /// looking at instead of only the agent during live-send.
+    /// Point the capture worker at `desired` (the displayed pane's tmux session) and
+    /// retune its cadence for live-send vs idle. One long-lived worker is spawned lazily
+    /// and retargeted in place; an empty target idles it. Idempotent and cheap when the
+    /// target is unchanged, so render calls it every frame.
     pub(super) fn sync_preview_capture_worker(&mut self, desired: Option<String>) {
         if desired.is_some() && self.preview_worker_stalled_at(std::time::Instant::now()) {
             self.preview_capture_worker = None;
@@ -2523,15 +2505,11 @@ impl HomeView {
         }
     }
 
-    /// Apply the capture worker's newest frame to `select`'s cache. The
-    /// worker is the ONLY capture source: when it has nothing new (cold
-    /// start, retarget, unchanged pane), the cache keeps its last-good
-    /// content and this returns without writing, so paint never forks a
-    /// capture.
-    ///
-    /// The frame is consumed atomically: content, cursor, line budget, and
-    /// target generation travel together, so a frame can never be split
-    /// across a retarget or budget change.
+    /// Apply the capture worker's newest frame to `select`'s cache. The worker is the
+    /// only capture source: with nothing new (cold start, retarget, unchanged pane) the
+    /// cache keeps its last-good content and this returns without writing, so paint never
+    /// forks a capture. The frame is consumed atomically, so content, cursor, line budget
+    /// and target generation cannot be split across a retarget.
     fn apply_worker_capture(
         &mut self,
         width: u16,
@@ -2629,19 +2607,16 @@ impl HomeView {
             clamp_scroll_to_capture(scroll_offset, captured_lines, self.preview_visible_rows);
     }
 
-    /// Whether the preview holds its captured snapshot instead of following
-    /// live output. Decision lives in the pure [`preview_frozen`] helper so it
-    /// is unit-tested away from a live `HomeView`.
+    /// Whether the preview holds its snapshot instead of following live output; the
+    /// decision lives in [`preview_frozen`] so it is unit-tested without a `HomeView`.
     fn preview_is_frozen(&self) -> bool {
         preview_frozen(self.preview_scroll_offset, self.preview_selection.is_some())
     }
 
-    /// Adopt passive-resize completions into the per-session bookkeeping.
-    /// Applied geometry becomes the synced dedup (and clears the live-send
-    /// dedup when the resize raced live entry, see
-    /// `passive_resize_invalidates_live_geometry`); declined geometry is
-    /// parked so the fleet reconcile stops retrying it until the wanted
-    /// geometry changes.
+    /// Adopt passive-resize completions into the per-session bookkeeping. Applied
+    /// geometry becomes the synced dedup (and clears the live-send dedup when the resize
+    /// raced live entry, see `passive_resize_invalidates_live_geometry`); declined
+    /// geometry is parked until the wanted geometry changes.
     fn adopt_passive_resize_completions(&mut self) {
         for done in crate::tmux::take_passive_resize_dones() {
             self.passive_pane_queued.remove(&done.session_id);
@@ -2678,11 +2653,9 @@ impl HomeView {
         }
     }
 
-    /// Drop synced entries contradicted by a newer pane snapshot: an
-    /// external `tmux attach` or the web live view resized the window after
-    /// we set it, and treating the entry as in-sync would leave the preview
-    /// clipped with no self-recovery. The reconcile then re-asserts the pane
-    /// like any other diff.
+    /// Drop synced entries contradicted by a newer pane snapshot: an external attach or
+    /// the web live view resized the window after we set it, and trusting the entry would
+    /// leave the preview clipped with no self-recovery.
     fn invalidate_externally_resized_panes(&mut self) {
         let stale: Vec<String> = self
             .passive_pane_synced
@@ -2704,30 +2677,21 @@ impl HomeView {
         }
     }
 
-    /// Keep every open session's detached agent pane pre-sized to the preview
-    /// output rect it would be shown at, so selecting a row or entering live
-    /// view lands on an already-correct pane instead of waiting out a resize
-    /// round-trip. `exclude` is the session whose per-frame sync in
-    /// `refresh_preview_cache_if_needed` owns its geometry this frame; the
-    /// live-send session is skipped because its worker owns the pane.
+    /// Keep every open session's detached agent pane pre-sized to the preview rect it
+    /// would be shown at, so selecting a row or entering live view lands on an already
+    /// correct pane. `exclude` is the session whose per-frame sync owns its geometry;
+    /// the live-send session is skipped because its worker owns the pane.
     ///
-    /// The per-session target is fully predictable: `PreviewLayout::compute`
-    /// over the shared preview rect and that instance's own header height,
-    /// the same split the renderer will use when the row is selected. Work
-    /// runs on the passive-resize worker under its atomic detached/no-owner
-    /// guard. Two debounces bound the SIGWINCH cost: resizes fire only when
-    /// the same fleet geometry is wanted on two consecutive refreshes (the
-    /// fleet analogue of `passive_resize_step`'s one-frame-toast rule), and a
-    /// geometry the worker declined is not retried until the wanted fleet
-    /// geometry changes or [`PASSIVE_DECLINE_RETRY`] elapses.
+    /// The per-session target is `PreviewLayout::compute` over the shared preview rect and
+    /// that instance's header height, the same split the renderer uses. Work runs on the
+    /// passive-resize worker under its detached/no-owner guard. Two debounces bound the
+    /// SIGWINCH cost: two consecutive refreshes must want the same fleet geometry, and a
+    /// declined geometry waits for a change or [`PASSIVE_DECLINE_RETRY`].
     ///
-    /// Single-TUI only: with more than one aoe TUI alive, each would treat
-    /// the other's fleet resizes as external (the observed-size invalidation
-    /// below) and re-assert its own geometry, oscillating every open pane at
-    /// snapshot cadence. The presence count already surfaced as the
-    /// "N watching" indicator gates both the fleet pass and the invalidation;
-    /// the selected-session sync stays on, matching the pre-fleet behavior
-    /// those TUIs had.
+    /// Single-TUI only: with two TUIs alive each would read the other's fleet resizes as
+    /// external and re-assert its own, oscillating every pane. The presence count behind
+    /// the "N watching" indicator gates the fleet pass and the invalidation; the
+    /// selected-session sync stays on.
     pub(super) fn reconcile_passive_fleet(
         &mut self,
         inner: Rect,
@@ -2958,16 +2922,10 @@ impl HomeView {
         self.apply_worker_capture(width, height, |s| &mut s.tool_preview_cache);
     }
 
-    /// `captured_lines` from whichever preview cache is currently on screen.
-    /// Both the preview's own scroll indicator and the live-send footer need
-    /// the active view's line count; reading `preview_cache` (the Agent cache)
-    /// unconditionally shows a stale or empty `[offset/max]` in Terminal or
-    /// Tool live mode, where a different cache backs the visible output.
-    /// Record the output pane's text layout for the drag-select handlers.
-    /// `total_lines` is the parsed scrollback length; `first_line` is
-    /// derived from the same `compute_scroll` the renderer feeds to
-    /// `Paragraph::scroll`, so the snapshot agrees cell-for-cell with what
-    /// was painted this frame.
+    /// Record the output pane's text layout for the drag-select handlers. `total_lines`
+    /// is the parsed scrollback length; `first_line` comes from the same `compute_scroll`
+    /// the renderer feeds to `Paragraph::scroll`, so the snapshot agrees cell-for-cell
+    /// with what was painted this frame.
     fn set_preview_text_view(&mut self, pane: Rect, total_lines: usize) {
         let first_line = preview::compute_scroll(
             total_lines,
@@ -2981,11 +2939,9 @@ impl HomeView {
         };
     }
 
-    /// The preview cache backing whatever the pane currently shows,
-    /// resolving the sandbox container-vs-host split for Terminal view.
-    /// Shared by the scroll clamp, the scroll indicator, and the
-    /// drag-select copy so they all read the same content the renderer
-    /// painted.
+    /// The preview cache backing whatever the pane shows, resolving the sandbox
+    /// container-vs-host split for Terminal view. Shared by the scroll clamp, the scroll
+    /// indicator and the drag-select copy so they read what the renderer painted.
     pub(super) fn active_preview_cache(&self) -> &super::PreviewCache {
         match &self.view_mode {
             ViewMode::Structured => &self.preview_cache,
@@ -3616,18 +3572,15 @@ impl HomeView {
         self.paint_preview_selection(frame, theme);
     }
 
-    /// Underline the hyperlink spans on the visible preview rows.
-    ///
-    /// Without this a link whose visible text is not itself a URL is
-    /// indistinguishable from surrounding output: the host terminal never sees
-    /// the OSC 8 (the grid drops it) and has no URL to match on either, so
-    /// nothing marks the text as clickable. The underline is the affordance for
-    /// `preview_link_at`, which opens the target on a plain click.
+    /// Underline the hyperlink spans on the visible preview rows: the host terminal
+    /// never sees the OSC 8 (the grid drops it) and has no URL to match, so without the
+    /// underline a link whose text is not itself a URL is indistinguishable from the
+    /// output around it. It is the affordance for `preview_link_at`.
     pub(super) fn paint_preview_links(&self, buf: &mut Buffer) {
-        // Same guard as `preview_link_at`: an overlay swallows the click, so
-        // underlining behind it would advertise an affordance that does
-        // nothing, and the dialog paints over these cells after this runs,
-        // leaving the backend to wrap the dialog's own text in OSC 8.
+        // Same guards as `preview_link_at`, so an underline always marks a clickable
+        // link: an overlay swallows the click (and paints over these cells, leaving the
+        // backend to wrap its own text in OSC 8), and transcript rows are not the
+        // capture's links.
         if self.has_non_live_send_overlay() {
             return;
         }
@@ -3677,18 +3630,13 @@ impl HomeView {
         }
     }
 
-    /// Where to paint the live-send cursor this frame, or `None` to paint no
-    /// cursor. Maps the agent pane's `(cursor_x, cursor_y)` (counted from the
-    /// top of the visible screen) onto the preview's output rect.
+    /// Where to paint the live-send cursor this frame, mapping the agent pane's
+    /// `(cursor_x, cursor_y)` onto the preview's output rect, or `None` for no cursor.
     ///
-    /// Only fires while live-send is active and the preview is at the live
-    /// tail (`preview_scroll_offset == 0`): over scrolled-back history the
-    /// live cursor would land on the wrong row. The capture worker now
-    /// publishes a cursor for every previewed pane (the wheel forward reads its
-    /// mode flags), so this gates on `live_send` to keep painting confined to
-    /// the driven pane, and on `position_reliable` (false while the pane
-    /// scrolled mid-capture) to avoid painting on a row the cursor no longer
-    /// indexes.
+    /// Only while live-send is active and the preview sits at the live tail
+    /// (`preview_scroll_offset == 0`), since over scrolled-back history the cursor would
+    /// land on the wrong row. The worker publishes a cursor for every previewed pane, so
+    /// this also gates on `position_reliable`, false while the pane scrolled mid-capture.
     fn live_preview_cursor_pos(&self) -> Option<Position> {
         if self.live_send.is_none() || self.preview_scroll_offset != 0 {
             return None;
@@ -3705,17 +3653,11 @@ impl HomeView {
         )
     }
 
-    /// Apply the drag-select highlight to cells inside the preview
-    /// pane. Style is reversed (bg/fg swap) for AA-friendly contrast
-    /// against arbitrary agent output, mirroring how most terminal
-    /// emulators render their own native selections.
-    ///
-    /// Walks the frame buffer rather than re-rendering, so the
-    /// underlying preview pane keeps its existing styles (colored
-    /// diff text, syntax highlighting from the agent); only the
-    /// bg/fg pair swaps. Cells outside the buffer area are skipped
-    /// rather than treated as an error: a terminal resize during a
-    /// drag can leave a stale extent off-screen for one frame.
+    /// Apply the drag-select highlight to cells inside the preview pane, reversing
+    /// bg/fg for contrast against arbitrary agent output like a terminal's own selection.
+    /// Walks the frame buffer rather than re-rendering, so the preview keeps its existing
+    /// styles. Cells outside the buffer are skipped: a resize mid-drag can leave a stale
+    /// extent off-screen for a frame.
     fn paint_preview_selection(&mut self, frame: &mut Frame, theme: &Theme) {
         let Some(sel) = self.preview_selection else {
             return;
@@ -3870,10 +3812,9 @@ impl HomeView {
         }
     }
 
-    /// Calm placeholder shown in the preview pane when the selected session is
-    /// archived. Archiving kills the pane, so the normal capture path would
-    /// render an empty body ("No output available"); this explains the state
-    /// instead and points at `z` to bring the row back to the active list.
+    /// Calm placeholder for an archived session: archiving kills the pane, so the
+    /// capture path would render "No output available". Points at `z` to bring the row
+    /// back.
     fn render_archived_preview(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let inst = self
             .selected_session
@@ -3908,9 +3849,8 @@ impl HomeView {
         );
     }
 
-    /// Shared "Deleting" takeover for the archived/trashed placeholders while
-    /// a permanent delete runs on the deletion worker. No restore/delete
-    /// hints: acting on the row would race the in-flight purge.
+    /// Shared "Deleting" takeover for the archived/trashed placeholders while a
+    /// permanent delete runs. No hints: acting on the row would race the purge.
     fn render_shelf_deleting_preview(
         &self,
         frame: &mut Frame,
@@ -3937,9 +3877,8 @@ impl HomeView {
         );
     }
 
-    /// Calm placeholder shown when the selected session is in the trash. Its
-    /// agent was stopped on trash but its transcript and workspace are kept;
-    /// it can be restored or permanently purged from here.
+    /// Calm placeholder for a trashed session: its agent was stopped but its transcript
+    /// and workspace are kept, so it can be restored or purged from here.
     fn render_trashed_preview(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let inst = self
             .selected_session
@@ -3993,10 +3932,8 @@ impl HomeView {
         );
     }
 
-    /// Calm placeholder shown when the selected session's pane is simply gone
-    /// (the generic gone-error, no diagnostic detail). Replaces the red crash
-    /// error with a "Stopped, enter to start" message; the row's real status
-    /// icon still signals the state in the sidebar.
+    /// Calm placeholder for a pane that is simply gone (the generic gone-error), in
+    /// place of the red crash error; the row's status icon still signals the state.
     fn render_stopped_preview(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         render_placeholder(
             frame,
@@ -4012,10 +3949,9 @@ impl HomeView {
         );
     }
 
-    /// Placeholder shown when the selected session renders as a structured
-    /// view: it has no agent tmux pane to capture (the transcript lives in
-    /// the `aoe serve` daemon), so explain how to open the real view rather
-    /// than leaving the ` Output ` pane silently blank.
+    /// Placeholder for a structured-view session: it has no agent tmux pane to capture
+    /// (the transcript lives in the `aoe serve` daemon), so explain how to open the real
+    /// view instead of leaving ` Output ` blank.
     fn render_structured_preview(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let inst = self
             .selected_session
@@ -4277,59 +4213,20 @@ impl HomeView {
         let mk_key =
             |key: &str| -> Vec<Span<'static>> { vec![Span::styled(key.to_string(), key_style)] };
 
-        // Key a footer button synthesizes on click. The registry matches the bare keycode
-        // (Shift implied by an uppercase char, Ctrl by the flag), so a plain char and a
-        // Ctrl char cover every footer chord.
+        // Key a footer button synthesizes on click, for the few entries outside the registry.
         let kc = |c: char| Some(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
-        let kctrl = |c: char| Some(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
         let kenter = Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let ktab = Some(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        // Click key and compact label (`^G`) for an action's chord in the active mode.
+        let bound = |id: ActionId| {
+            (
+                super::bindings::key_event(id, strict),
+                super::bindings::label(id, strict).replace("Ctrl+", "^"),
+            )
+        };
 
         // Shortcut groups carry a priority, optional key action, and display spans.
         let mut groups: Vec<(u8, Option<KeyEvent>, Vec<Span<'static>>)> = Vec::new();
-
-        use crate::tui::session_feed::SidebarSource;
-        let (runtime_label, runtime_color) = match self.sidebar_source {
-            _ if self.session_feed.namespace_indeterminate()
-                || !self.pending_indeterminate_queue.is_empty()
-                || self
-                    .pending_creation
-                    .as_ref()
-                    .is_some_and(|pending| pending.outcome_unknown) =>
-            {
-                ("Runtime outcome unknown", theme.error)
-            }
-            SidebarSource::Connecting => ("Connecting runtime", theme.dimmed),
-            SidebarSource::Disconnected => ("Runtime disconnected", theme.error),
-            SidebarSource::Daemon if self.session_feed.cityhall_mode() => {
-                ("City Hall client", theme.dimmed)
-            }
-            SidebarSource::Daemon
-                if self.session_feed.any_pending()
-                    || self.pending_namespace_intent.is_some()
-                    || self.pending_creation.is_some() =>
-            {
-                ("Runtime applying", theme.dimmed)
-            }
-            SidebarSource::Daemon if self.session_feed.native_interaction_available() => {
-                ("Runtime ready", theme.running)
-            }
-            SidebarSource::Daemon if self.session_feed.mutations_available() => {
-                ("Native unavailable", theme.dimmed)
-            }
-            SidebarSource::Daemon => ("Runtime read-only", theme.dimmed),
-        };
-        let runtime_status = Span::styled(
-            format!(" \u{25CF}{runtime_label}"),
-            Style::default().fg(runtime_color).bold(),
-        );
-        let runtime_width = runtime_status.width();
-        let runtime_rect = Rect {
-            x: area.x + area.width.saturating_sub(runtime_width as u16),
-            y: area.y,
-            width: area.width.min(runtime_width as u16),
-            height: 1,
-        };
 
         // Other-TUI indicator, shown when more than one `aoe` TUI is alive: two TUIs
         // watching the same sessions clash over pane sizes (tmux reflows to the smallest
@@ -4350,11 +4247,11 @@ impl HomeView {
         // `m` after selecting a runnable session drains it into the compose dialog.
         if let Some(buf) = &self.pending_paste {
             if !buf.is_empty() {
-                let key = if strict { "M" } else { "m" };
+                let (click, key) = bound(ActionId::SendMessage);
                 let desc = format!("send {} buffered", buf.chars().count());
-                let mut spans = mk(key, &desc);
+                let mut spans = mk(&key, &desc);
                 spans[1] = Span::styled(desc, Style::default().fg(theme.running).bold());
-                groups.push((0, kc(if strict { 'M' } else { 'm' }), spans));
+                groups.push((0, click, spans));
             }
         }
 
@@ -4394,32 +4291,25 @@ impl HomeView {
             groups.push((2, ktab, mk("⇥ ", tab_action_text)));
         }
 
-        groups.push((
-            2,
-            kc(if strict { 'T' } else { 't' }),
-            mk(if strict { "T" } else { "t" }, "View"),
-        ));
+        let (click, key) = bound(ActionId::ToggleView);
+        groups.push((2, click, mk(&key, "View")));
         if matches!(self.view_mode, ViewMode::Tool(_)) {
-            groups.push((1, kc(';'), mk(";", "Back")));
+            let (click, key) = bound(ActionId::ToolPicker);
+            groups.push((1, click, mk(&key, "Back")));
         } else if self.has_tool_targets() {
-            groups.push((2, kc(';'), mk(";", "Tools")));
+            let (click, key) = bound(ActionId::ToolPicker);
+            groups.push((2, click, mk(&key, "Tools")));
         }
-        groups.push((
-            3,
-            if strict { kctrl('g') } else { kc('g') },
-            mk(if strict { "^G" } else { "g" }, "Group"),
-        ));
+        let (click, key) = bound(ActionId::GroupBy);
+        groups.push((3, click, mk(&key, "Group")));
 
         // c: container/host toggle hint for sandboxed sessions in Terminal view
         if self.view_mode == ViewMode::Terminal {
             if let Some(id) = &self.selected_session {
                 if let Some(inst) = self.get_instance(id) {
                     if inst.is_sandboxed() {
-                        groups.push((
-                            4,
-                            kc(if strict { 'C' } else { 'c' }),
-                            mk(if strict { "C" } else { "c" }, "Mode"),
-                        ));
+                        let (click, key) = bound(ActionId::ToggleContainer);
+                        groups.push((4, click, mk(&key, "Mode")));
                     }
                 }
             }
@@ -4429,55 +4319,41 @@ impl HomeView {
         // `n` for cycling, advertise Shift+N (which still creates, #3038). Strict mode
         // already uses `N`.
         let new_uses_shift = committed_search && !strict;
-        groups.push((
-            1,
-            kc(if strict || new_uses_shift { 'N' } else { 'n' }),
-            mk(if strict || new_uses_shift { "N" } else { "n" }, "New"),
-        ));
+        let (click, key) = if new_uses_shift {
+            (kc('N'), "N".to_string())
+        } else {
+            bound(ActionId::NewSession)
+        };
+        groups.push((1, click, mk(&key, "New")));
 
         // Priority 1 is the core daily workflow (new, message, the web dashboard), which
         // survives the greedy pack at ~80 cols; del stays at p3 and can drop first.
         if self.selected_session.is_some() {
-            groups.push((
-                1,
-                kc(if strict { 'M' } else { 'm' }),
-                mk(if strict { "M" } else { "m" }, "Msg"),
-            ));
+            let (click, key) = bound(ActionId::SendMessage);
+            groups.push((1, click, mk(&key, "Msg")));
         }
         if !self.flat_items.is_empty() {
-            groups.push((
-                3,
-                kc(if strict { 'D' } else { 'd' }),
-                mk(if strict { "D" } else { "d" }, "Del"),
-            ));
+            let (click, key) = bound(ActionId::Delete);
+            groups.push((3, click, mk(&key, "Del")));
         }
         // Archive / Snooze render only in Attention sort: they shape the Attention queue
         // and do nothing visible elsewhere, so they would just take footer space.
         let in_attention = self.sort_order == SortOrder::Attention;
         if in_attention {
             if !self.flat_items.is_empty() {
-                groups.push((
-                    1,
-                    kc(if strict { 'Z' } else { 'z' }),
-                    mk(if strict { "Z" } else { "z" }, "Archive"),
-                ));
+                let (click, key) = bound(ActionId::ToggleArchive);
+                groups.push((1, click, mk(&key, "Archive")));
             }
             if self.selected_session.is_some() {
-                groups.push((
-                    1,
-                    kc(if strict { 'H' } else { 'h' }),
-                    mk(if strict { "H" } else { "h" }, "Snooze"),
-                ));
+                let (click, key) = bound(ActionId::ToggleSnooze);
+                groups.push((1, click, mk(&key, "Snooze")));
             }
         }
         // Fav follows the key's own gate (`Context::FavoritesUsable`), so the footer
         // advertises it wherever `f` actually does something.
         if self.selected_session.is_some() && (in_attention || crate::session::favorites_first()) {
-            groups.push((
-                2,
-                kc(if strict { 'F' } else { 'f' }),
-                mk(if strict { "F" } else { "f" }, "Fav"),
-            ));
+            let (click, key) = bound(ActionId::ToggleFavorite);
+            groups.push((2, click, mk(&key, "Fav")));
         }
 
         // Committed-search cue: `n` cycles matches and `Esc` clears (#3038). The `[i/N]`
@@ -4493,20 +4369,24 @@ impl HomeView {
             groups.push((0, kc('n'), hint));
         }
 
-        groups.push((4, kc('/'), mk_key("/")));
-        groups.push((
-            4,
-            if strict { kctrl('d') } else { kc('D') },
-            mk(if strict { "^D" } else { "D" }, "Diff"),
-        ));
+        let (click, key) = bound(ActionId::SearchStart);
+        groups.push((4, click, mk_key(&key)));
+        let (click, key) = bound(ActionId::Diff);
+        groups.push((4, click, mk(&key, "Diff")));
+        // The R entry carries one state: a Daemon problem or limit, else the Web dashboard.
         let mut serving_status = None;
-        if !super::input::web_plugin_disabled() {
-            let (priority, spans) = web_footer_entry(self.serve_running, strict, theme);
-            serving_status = self.serve_running.then_some(groups.len());
-            groups.push((priority, if strict { kctrl('r') } else { kc('R') }, spans));
+        let attention = self.daemon_attention();
+        if attention.is_some() || !super::input::web_plugin_disabled() {
+            let (click, key) = bound(ActionId::Serve);
+            let (priority, spans) =
+                runtime_footer_entry(attention, &key, self.serve_running, theme);
+            serving_status = (priority == 0).then_some(groups.len());
+            groups.push((priority, click, spans));
         }
-        groups.push((1, kctrl('k'), mk("^K", "Cmds")));
-        groups.push((0, kc('?'), mk_key("?")));
+        let (click, key) = bound(ActionId::OpenCommandPalette);
+        groups.push((1, click, mk(&key, "Cmds")));
+        let (click, key) = bound(ActionId::Help);
+        groups.push((0, click, mk_key(&key)));
 
         let badge_bg = if self.tips_badge_hovered {
             theme.session_selection
@@ -4533,9 +4413,7 @@ impl HomeView {
             .map(|(_, _, g)| g.iter().map(|s| s.width()).sum::<usize>())
             .collect();
         let compact_badge_width = unicode_width::UnicodeWidthStr::width("\u{1f4a1}");
-        let avail = (area.width as usize)
-            .saturating_sub(1)
-            .saturating_sub(runtime_width);
+        let avail = (area.width as usize).saturating_sub(1);
 
         let mut order: Vec<usize> = (0..groups.len()).collect();
         // The running server status packs before other priority-0 groups, so it is the last to drop.
@@ -4624,13 +4502,9 @@ impl HomeView {
         let status = Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.selection));
         frame.render_widget(status, area);
 
-        frame.render_widget(
-            Paragraph::new(Line::from(runtime_status)).style(Style::default().bg(theme.selection)),
-            runtime_rect,
-        );
         if let Some(line) = badge_line {
             let rect = Rect {
-                x: runtime_rect.x.saturating_sub(badge_width),
+                x: area.right().saturating_sub(badge_width),
                 y: area.y,
                 width: badge_width,
                 height: 1,
@@ -4653,24 +4527,25 @@ impl HomeView {
         image_update: Option<&ImageUpdate>,
     ) {
         let update_style = Style::default().fg(theme.waiting).bold();
-        // The Update key is `u` (`Ctrl+u` in strict mode); pull the label from
-        // the binding registry so this hint can't drift from the dispatcher.
-        let update_key =
-            super::bindings::label(super::bindings::ActionId::Update, self.strict_hotkeys);
+        // Pull the keys from the binding registry so these hints can't drift from the
+        // dispatcher.
+        let update_key = super::bindings::label(ActionId::Update, self.strict_hotkeys);
+        let dismiss_key =
+            super::bindings::label(ActionId::DismissUpdateBanner, self.strict_hotkeys);
         // Precedence: transient status, app update, then sandbox-image update. Only one
         // banner shows at a time so its keys are unambiguous; a lower-priority banner
         // surfaces once the ones above clear.
         let text = if let Some(s) = status {
-            format!(" {s}  [Ctrl+x] dismiss")
+            format!(" {s}  [{dismiss_key}] dismiss")
         } else if let Some(info) = info {
             // Reassure users (#2220) that updating never tears down running sessions.
             // Kept after the keys so the action hints stay visible on narrow terminals.
             format!(
-                " update available {} → {}  [{update_key}] update  [Ctrl+x] dismiss  ·  running sessions stay safe",
+                " update available {} → {}  [{update_key}] update  [{dismiss_key}] dismiss  ·  running sessions stay safe",
                 info.current_version, info.latest_version
             )
         } else if image_update.is_some() {
-            format!(" sandbox image update available  [{update_key}] pull  [Ctrl+x] dismiss")
+            format!(" sandbox image update available  [u] pull  [{dismiss_key}] dismiss")
         } else {
             return;
         };
@@ -4694,14 +4569,29 @@ pub(super) fn live_pane_origin(
     )
 }
 
-/// The dashboard entry is a hint until serving, then outranks the other shortcuts.
-/// A build without the dashboard bundle serves the API only, so it never says "Web".
-fn web_footer_entry(running: bool, strict: bool, theme: &Theme) -> (u8, Vec<Span<'static>>) {
+/// The footer's R entry: the Daemon's problem (red) or limit (dim) when it has one, else
+/// the Web dashboard's status or hint ("API" in a build without the dashboard bundle). A
+/// state is priority 0 and the hint 1, so a state is the last thing dropped at narrow widths.
+fn runtime_footer_entry(
+    attention: Option<crate::tui::dialogs::DaemonAttention>,
+    key: &str,
+    running: bool,
+    theme: &Theme,
+) -> (u8, Vec<Span<'static>>) {
     let what = if cfg!(feature = "web") { "Web" } else { "API" };
-    let key = Span::styled(
-        if strict { "^R " } else { "R " },
-        Style::default().fg(theme.accent).bold(),
-    );
+    let key = Span::styled(format!("{key} "), Style::default().fg(theme.accent).bold());
+    if let Some(attention) = attention {
+        let color = if attention.is_problem() {
+            theme.error
+        } else {
+            theme.dimmed
+        };
+        let status = Span::styled(
+            format!("\u{25CF} {}", attention.footer_label()),
+            Style::default().fg(color).bold(),
+        );
+        return (0, vec![key, status]);
+    }
     if running {
         let status = Span::styled(
             format!("\u{25CF} {what}"),
@@ -4720,21 +4610,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn web_footer_entry_hints_until_served_then_shows_a_status_that_outranks_hints() {
+    fn the_r_entry_shows_one_state_a_daemon_problem_first_then_a_limit_then_web() {
+        use crate::tui::dialogs::DaemonAttention as A;
         let theme = crate::tui::styles::load_theme("empire");
         let what = if cfg!(feature = "web") { "Web" } else { "API" };
-        for (running, strict, priority, text) in [
-            (false, false, 1, format!("R {what}")),
-            (false, true, 1, format!("^R {what}")),
-            (true, false, 0, format!("R \u{25CF} {what}")),
-            (true, true, 0, format!("^R \u{25CF} {what}")),
-        ] {
-            let (p, spans) = web_footer_entry(running, strict, &theme);
+        // (Daemon attention, Web served, strict, priority, text, label colour)
+        let cases = [
+            (None, false, false, 1, format!("R {what}"), theme.dimmed),
+            (None, false, true, 1, format!("^R {what}"), theme.dimmed),
+            (
+                None,
+                true,
+                false,
+                0,
+                format!("R \u{25CF} {what}"),
+                theme.running,
+            ),
+            (
+                None,
+                true,
+                true,
+                0,
+                format!("^R \u{25CF} {what}"),
+                theme.running,
+            ),
+            // A problem is red and replaces even a running dashboard's status. An offline
+            // Daemon never reaches the footer: Connections takes over the home screen.
+            (
+                Some(A::OutcomeUnknown),
+                true,
+                false,
+                0,
+                "R \u{25CF} Runtime outcome unknown".into(),
+                theme.error,
+            ),
+            // A limit stays visible but dim, so a refused key isn't a mystery.
+            (
+                Some(A::ReadOnly),
+                true,
+                false,
+                0,
+                "R \u{25CF} Unavailable".into(),
+                theme.dimmed,
+            ),
+            (
+                Some(A::NativeUnavailable),
+                false,
+                true,
+                0,
+                "^R \u{25CF} Native unavailable".into(),
+                theme.dimmed,
+            ),
+        ];
+        for (attention, running, strict, priority, text, color) in cases {
+            let key = if strict { "^R" } else { "R" };
+            let (p, spans) = runtime_footer_entry(attention, key, running, &theme);
             let rendered: String = spans.iter().map(|s| s.content.as_ref()).collect();
             assert_eq!((p, rendered.as_str()), (priority, text.as_str()));
-            let label_fg = spans.last().and_then(|s| s.style.fg);
-            let expected = if running { theme.running } else { theme.dimmed };
-            assert_eq!(label_fg, Some(expected), "running={running}");
+            assert_eq!(spans.last().and_then(|s| s.style.fg), Some(color), "{text}");
         }
     }
 
@@ -4763,8 +4696,8 @@ mod tests {
     // `preview_visible_rows_equal_output_area_with_info_shown` in `home/tests/keys_and_nav.rs`.
 
     /// A preview worker gets the full shared tmux deadline plus grace before
-    /// replacement. The unchanged observation timestamp must not slide on each
-    /// render, or a stalled worker would remain trusted forever.
+    /// replacement, and the unchanged-observation timestamp must not slide on each render
+    /// or a stalled worker stays trusted forever.
     #[test]
     fn worker_stall_detection_honors_deadline_and_progress() {
         let t0 = std::time::Instant::now();
@@ -5105,11 +5038,10 @@ mod tests {
         }
     }
 
-    /// `UnicodeWidthChar` is not additive across an emoji sequence: `♥` plus
-    /// VS16 measures 1 + 0 per scalar but 2 as a string, and a skin tone
-    /// measures 2 alone but 0 once joined to its base. The cap has to measure
-    /// grapheme-aligned prefixes as a string, the way `RowTag::rendered()`
-    /// does, or the tag over- or under-fills.
+    /// `UnicodeWidthChar` is not additive across an emoji sequence: `♥` plus VS16
+    /// measures 1 + 0 per scalar but 2 as a string, and a skin tone measures 2 alone but 0
+    /// once joined. The cap must measure grapheme-aligned prefixes as a string, the way
+    /// `RowTag::rendered()` does.
     #[test]
     fn profile_short_code_measures_width_across_grapheme_clusters() {
         use unicode_width::UnicodeWidthStr;
@@ -5363,12 +5295,10 @@ mod tests {
         );
     }
 
-    /// The bracketed tag must occupy `max_width + 2` cells **as the renderer
-    /// paints them**: locked `ratatui-core` spends a cell on each halfwidth
-    /// katakana dakuten/handakuten (U+FF9E, U+FF9F) that `UnicodeWidthStr`
-    /// scores at zero, so a string-width metric draws a nine-cell tag for
-    /// `ｶﾞｻﾞﾊﾟ` where the renderer sees six content cells. Asserting through a
-    /// `Buffer` reads back what the renderer actually paints.
+    /// The bracketed tag must occupy `max_width + 2` cells as the renderer paints them:
+    /// locked `ratatui-core` spends a cell on each halfwidth katakana dakuten (U+FF9E,
+    /// U+FF9F) that `UnicodeWidthStr` scores at zero, so a string-width metric draws a
+    /// nine-cell tag for `ｶﾞｻﾞﾊﾟ`. Asserting through a `Buffer` reads back real cells.
     #[test]
     fn row_tag_rendered_fits_the_fixed_width_contract_in_a_buffer() {
         use ratatui::buffer::Buffer;
@@ -5407,9 +5337,8 @@ mod tests {
         );
     }
 
-    /// The repository count is what the workspace tag exists to carry, so the
-    /// branch must be cut in cells to leave room for it rather than filling
-    /// the cap and pushing it off the end.
+    /// The repository count is what the workspace tag exists to carry, so the branch is
+    /// cut in cells to leave room rather than filling the cap and pushing it off.
     #[test]
     fn workspace_branch_row_tag_keeps_the_repository_count() {
         let rendered = workspace_branch_row_tag(&"界".repeat(10), 2)

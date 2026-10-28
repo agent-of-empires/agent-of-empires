@@ -395,6 +395,7 @@ pub(super) const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
     ("PATCH", "/api/sessions/{id}/unread"),
     ("PATCH", "/api/sessions/{id}/worktree-name"),
     ("POST", "/api/sessions/{id}/purge/abandon"),
+    ("POST", "/api/sessions/{id}/restart-for-update"),
     ("POST", "/api/sessions/{id}/restore"),
     ("POST", "/api/sessions/{id}/start"),
     ("POST", "/api/sessions/{id}/stop"),
@@ -449,6 +450,367 @@ pub(super) const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
     ("POST", "/api/logout"),
     ("DELETE", "/api/login/sessions/{id}"),
 ];
+
+/// Mutating routes deliberately unavailable in CityHall.
+#[cfg(test)]
+pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
+    ("POST", "/api/sandbox/image-pull"),
+    ("POST", "/api/sandbox/image-dismiss"),
+    ("POST", "/api/sessions/creation-trust"),
+    ("POST", "/api/sessions/{id}/restart"),
+    ("POST", "/api/sessions/{id}/recreate-container"),
+    ("POST", "/api/sessions/{id}/tools/ensure"),
+    ("POST", "/api/sessions/{id}/auxiliary/stop"),
+    // Terminal surface.
+    ("POST", "/api/sessions/{id}/ensure"),
+    ("POST", "/api/sessions/{id}/send"),
+    ("POST", "/api/sessions/{id}/terminal"),
+    ("DELETE", "/api/sessions/{id}/terminal"),
+    ("POST", "/api/sessions/{id}/container-terminal"),
+    // Git / project / profile management.
+    ("POST", "/api/git/clone"),
+    ("POST", "/api/projects"),
+    // Attaching a repo to a session takes an arbitrary host path, so it is denied for the
+    // same reason `git/clone` and `POST /api/projects` are.
+    ("POST", "/api/sessions/{id}/projects"),
+    ("PATCH", "/api/projects/{name}"),
+    ("DELETE", "/api/projects/{name}"),
+    ("POST", "/api/profiles"),
+    ("DELETE", "/api/profiles/{name}"),
+    ("PATCH", "/api/profiles/{name}/rename"),
+    ("PATCH", "/api/default-profile"),
+    // MCP mutations.
+    ("POST", "/mcp"),
+    ("PUT", "/mcp"),
+    ("PATCH", "/mcp"),
+    ("DELETE", "/mcp"),
+    ("POST", "/api/mcp/servers"),
+    ("PUT", "/api/mcp/servers/{name}"),
+    ("DELETE", "/api/mcp/servers/{name}"),
+    ("POST", "/api/mcp/servers/{name}/drop"),
+    ("POST", "/api/mcp/servers/{name}/keep"),
+    ("POST", "/api/mcp/servers/{name}/resolve"),
+    // Skills mutations.
+    ("POST", "/api/skills"),
+    ("POST", "/api/skills/sync"),
+    ("PUT", "/api/skills/{directory}"),
+    ("DELETE", "/api/skills/{directory}"),
+    ("POST", "/api/skills/{source}/{directory}/adopt"),
+    // Plugin lifecycle.
+    ("POST", "/api/plugins/install"),
+    ("POST", "/api/plugins/install/preview"),
+    ("POST", "/api/plugins/{id}/action"),
+    ("POST", "/api/plugins/{id}/enabled"),
+    ("POST", "/api/plugins/{id}/worker/restart"),
+    ("POST", "/api/plugins/{id}/uninstall"),
+    ("POST", "/api/plugins/{id}/update/apply"),
+    ("POST", "/api/plugins/{id}/update/dismiss"),
+    ("POST", "/api/plugins/commands/{fqid}/invoke"),
+    // ACP agent / worker lifecycle + config.
+    ("DELETE", "/api/sessions/{id}/acp"),
+    ("POST", "/api/sessions/{id}/acp/config-option"),
+    ("POST", "/api/sessions/{id}/acp/disable"),
+    ("POST", "/api/sessions/{id}/acp/enable"),
+    ("POST", "/api/sessions/{id}/acp/install-agent"),
+    ("POST", "/api/sessions/{id}/acp/mode"),
+    ("POST", "/api/sessions/{id}/acp/spawn"),
+    ("POST", "/api/sessions/{id}/acp/switch-agent"),
+    ("POST", "/api/sessions/{id}/acp/switch-provider"),
+    // Global settings / ops / shared workspace ordering.
+    ("PATCH", "/api/settings"),
+    ("PATCH", "/api/log-level"),
+    ("PUT", "/api/workspace-ordering"),
+];
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(super) struct MutatingRoute<'a> {
+    pub method: &'static str,
+    pub path: &'a str,
+    pub handler: &'a str,
+    pub read_only_layer: bool,
+}
+
+#[cfg(test)]
+pub(super) fn router_mutating_handlers() -> Vec<MutatingRoute<'static>> {
+    mutating_routes(include_str!("router.rs"))
+}
+
+#[cfg(test)]
+fn mutating_routes(source: &str) -> Vec<MutatingRoute<'_>> {
+    let file = syn::parse_file(source).expect("router source must be valid Rust");
+    assert!(
+        file.items.iter().any(|item| {
+            matches!(item, syn::Item::Use(item) if RouteAudit::canonical_import(
+                &item.tree, &["axum", "Router"]
+            ))
+        }),
+        "router audit requires the unaliased axum::Router import"
+    );
+    let function = file
+        .items
+        .iter()
+        .find_map(|item| match item {
+            syn::Item::Fn(function) if function.sig.ident == "build_router" => Some(function),
+            _ => None,
+        })
+        .expect("top-level build_router must exist");
+    let imports = function.block.stmts.iter().fold(0, |imports, statement| {
+        if let syn::Stmt::Item(syn::Item::Use(item)) = statement {
+            imports | RouteAudit::routing_import(&item.tree, 0)
+        } else {
+            imports
+        }
+    });
+    assert_eq!(
+        imports,
+        (1u8 << RouteAudit::METHODS.len()) - 1,
+        "router audit requires unaliased Axum method imports"
+    );
+    let mut audit = RouteAudit {
+        source,
+        routes: Vec::new(),
+    };
+    audit.router_block(&function.block);
+    audit.routes
+}
+
+#[cfg(test)]
+struct RouteAudit<'a> {
+    source: &'a str,
+    routes: Vec<MutatingRoute<'a>>,
+}
+
+#[cfg(test)]
+impl<'a> RouteAudit<'a> {
+    const METHODS: [(&'static str, Option<&'static str>); 5] = [
+        ("get", None),
+        ("post", Some("POST")),
+        ("put", Some("PUT")),
+        ("patch", Some("PATCH")),
+        ("delete", Some("DELETE")),
+    ];
+
+    fn text(&self, node: &impl syn::spanned::Spanned) -> &'a str {
+        &self.source[node.span().byte_range()]
+    }
+
+    fn canonical_import(tree: &syn::UseTree, path: &[&str]) -> bool {
+        match tree {
+            syn::UseTree::Group(group) => group
+                .items
+                .iter()
+                .any(|tree| Self::canonical_import(tree, path)),
+            syn::UseTree::Path(item) => path.split_first().is_some_and(|(name, rest)| {
+                item.ident == *name && Self::canonical_import(&item.tree, rest)
+            }),
+            syn::UseTree::Name(item) => path.len() == 1 && item.ident == path[0],
+            _ => false,
+        }
+    }
+
+    fn routing_import(tree: &syn::UseTree, depth: usize) -> u8 {
+        match tree {
+            syn::UseTree::Path(item)
+                if (depth == 0 && item.ident == "axum")
+                    || (depth == 1 && item.ident == "routing") =>
+            {
+                Self::routing_import(&item.tree, depth + 1)
+            }
+            syn::UseTree::Group(group) => group
+                .items
+                .iter()
+                .fold(0, |mask, tree| mask | Self::routing_import(tree, depth)),
+            syn::UseTree::Name(item) if depth == 2 => {
+                let index = Self::METHODS
+                    .iter()
+                    .position(|(name, _)| item.ident == *name)
+                    .expect("unsupported routing import");
+                1 << index
+            }
+            _ => panic!("router audit requires canonical, unaliased Axum method imports"),
+        }
+    }
+
+    fn router_block(&mut self, block: &syn::Block) {
+        for statement in &block.stmts {
+            match statement {
+                syn::Stmt::Local(local) => {
+                    let syn::Pat::Ident(binding) = &local.pat else {
+                        panic!("unsupported router binding: {}", self.text(local));
+                    };
+                    let init = local
+                        .init
+                        .as_ref()
+                        .expect("router binding needs an initializer");
+                    assert!(
+                        init.diverge.is_none(),
+                        "unsupported diverging router binding"
+                    );
+                    if binding.ident == "app" {
+                        self.router_expression(&init.expr);
+                    } else {
+                        assert!(
+                            binding.ident == "read_only",
+                            "unsupported router binding: {}",
+                            self.text(local)
+                        );
+                        assert!(
+                            matches!(&*init.expr, syn::Expr::Call(call)
+                                if self.text(&call.func) == "axum::middleware::from_fn_with_state"
+                                && call.args.len() == 2
+                                && Self::is_clone_of(&call.args[0], "state")
+                                && self.text(&call.args[1]) == "api::read_only_gate"),
+                            "unsupported read-only layer initializer"
+                        );
+                    }
+                }
+                syn::Stmt::Item(syn::Item::Use(item)) => {
+                    Self::routing_import(&item.tree, 0);
+                }
+                syn::Stmt::Expr(expression, None) => self.router_expression(expression),
+                _ => panic!("unsupported router statement: {}", self.text(statement)),
+            }
+        }
+    }
+
+    fn condition(expression: &syn::Expr) -> bool {
+        match expression {
+            syn::Expr::Path(path) => path.path.is_ident("state"),
+            syn::Expr::Field(field) => Self::condition(&field.base),
+            syn::Expr::Paren(paren) => Self::condition(&paren.expr),
+            _ => false,
+        }
+    }
+
+    fn is_clone_of(expression: &syn::Expr, name: &str) -> bool {
+        matches!(expression, syn::Expr::MethodCall(call)
+            if call.method == "clone" && call.args.is_empty()
+            && matches!(&*call.receiver, syn::Expr::Path(path) if path.path.is_ident(name)))
+    }
+
+    fn router_expression(&mut self, expression: &syn::Expr) {
+        match expression {
+            syn::Expr::Path(path) if path.path.is_ident("app") => {}
+            syn::Expr::Call(call)
+                if call.args.is_empty()
+                    && matches!(self.text(&call.func), "Router::new" | "axum::Router::new") => {}
+            syn::Expr::Paren(paren) => self.router_expression(&paren.expr),
+            syn::Expr::Block(block) => self.router_block(&block.block),
+            syn::Expr::If(branch) => {
+                assert!(
+                    Self::condition(&branch.cond),
+                    "unsupported router condition"
+                );
+                self.router_block(&branch.then_branch);
+                let (_, other) = branch
+                    .else_branch
+                    .as_ref()
+                    .expect("router condition needs both branches");
+                self.router_expression(other);
+            }
+            syn::Expr::MethodCall(call) => {
+                self.router_expression(&call.receiver);
+                if call.method == "route" || call.method == "route_service" {
+                    assert_eq!(call.args.len(), 2, "route needs a path and handler");
+                    let path = self.text(&call.args[0]);
+                    let path = path
+                        .strip_prefix('"')
+                        .and_then(|path| path.strip_suffix('"'))
+                        .filter(|path| !path.contains('\\'))
+                        .expect("canonical literal route path");
+                    if call.method == "route_service" {
+                        for method in ["POST", "PUT", "PATCH", "DELETE"] {
+                            self.routes.push(MutatingRoute {
+                                method,
+                                path,
+                                handler: self.text(&call.args[1]),
+                                read_only_layer: false,
+                            });
+                        }
+                    } else {
+                        let start = self.routes.len();
+                        let covered = self.method_router(path, &call.args[1]);
+                        for route in &mut self.routes[start..] {
+                            route.read_only_layer = covered;
+                        }
+                    }
+                } else if call.method == "layer" || call.method == "with_state" {
+                    assert_eq!(call.args.len(), 1, "router modifier needs one argument");
+                } else if call.method == "fallback" {
+                    assert_eq!(call.args.len(), 1, "fallback needs one handler");
+                    let start = self.routes.len();
+                    self.method_router("<fallback>", &call.args[0]);
+                    assert_eq!(
+                        self.routes.len(),
+                        start,
+                        "mutating fallback requires explicit classification support"
+                    );
+                } else {
+                    panic!("unsupported router composition: {}", self.text(expression));
+                }
+            }
+            _ => panic!("unsupported router expression: {}", self.text(expression)),
+        }
+    }
+
+    fn method_router(&mut self, path: &'a str, expression: &syn::Expr) -> bool {
+        let (name, handler, covered) = match expression {
+            syn::Expr::Call(call) => {
+                assert_eq!(call.args.len(), 1, "method builder needs one handler");
+                let name = self.text(&call.func);
+                (
+                    name.strip_prefix("axum::routing::").unwrap_or(name),
+                    &call.args[0],
+                    false,
+                )
+            }
+            syn::Expr::MethodCall(call) => {
+                let covered = self.method_router(path, &call.receiver);
+                assert_eq!(
+                    call.args.len(),
+                    1,
+                    "method router modifier needs one argument"
+                );
+                if call.method == "layer" {
+                    return covered || Self::is_clone_of(&call.args[0], "read_only");
+                }
+                (self.text(&call.method), &call.args[0], covered)
+            }
+            syn::Expr::Paren(paren) => return self.method_router(path, &paren.expr),
+            _ => panic!(
+                "unsupported method router for {path}: {}",
+                self.text(expression)
+            ),
+        };
+        let (_, method) = Self::METHODS
+            .iter()
+            .find(|(supported, _)| *supported == name)
+            .unwrap_or_else(|| panic!("unsupported method builder for {path}: {name}"));
+        assert!(
+            matches!(handler, syn::Expr::Path(_)),
+            "unsupported handler for {path}"
+        );
+        let handler = self.text(handler);
+        assert!(
+            handler
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | ':')),
+            "noncanonical handler for {path}: {handler}"
+        );
+        if let Some(method) = method {
+            self.routes.push(MutatingRoute {
+                method,
+                path,
+                handler,
+                read_only_layer: false,
+            });
+            false
+        } else {
+            covered
+        }
+    }
+}
 
 /// Refuse unlisted mutations in CityHall mode with the canonical 403.
 /// Unmatched routes and omitted prefixes fail closed.
@@ -549,6 +911,210 @@ mod tests {
 
     use crate::server::test_helpers::vecs;
     use crate::server::test_support;
+    fn router_mutating_routes() -> std::collections::BTreeSet<(String, String)> {
+        router_mutating_handlers()
+            .into_iter()
+            .map(|route| (route.method.to_owned(), route.path.to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn mutation_scan_keeps_chained_methods_and_nested_layers() {
+        let routes = mutating_routes(
+            r#"
+            use axum::Router;
+            fn build_router() {
+            use axum::routing::{delete, get, patch, post, put};
+            Router::new()
+            // .route("/comment", post(api::not_a_route))
+            .route /* gap */ ("/first", get(api::read).post(api::write).layer(read_only.clone()))
+            .route(
+                "/second",
+                patch(api::change).delete(api::remove).layer(limit(2)),
+            )
+            .route("/third", post(api::early).layer(read_only.clone()).patch(api::late))
+            .route_service("/service", super::mcp::service(state.clone()))
+            .route(
+                "/spaced",
+                axum::routing::post /* gap */ (api::spaced)
+                    .layer(trace(".route(\"/string\", post(api::not_a_route))")),
+            )
+            }
+        "#,
+        );
+        let observed: Vec<_> = routes
+            .iter()
+            .map(|route| {
+                (
+                    route.method,
+                    route.path,
+                    route.handler,
+                    route.read_only_layer,
+                )
+            })
+            .collect();
+        assert_eq!(
+            observed,
+            vec![
+                ("POST", "/first", "api::write", true),
+                ("PATCH", "/second", "api::change", false),
+                ("DELETE", "/second", "api::remove", false),
+                ("POST", "/third", "api::early", false),
+                ("PATCH", "/third", "api::late", false),
+                (
+                    "POST",
+                    "/service",
+                    "super::mcp::service(state.clone())",
+                    false
+                ),
+                (
+                    "PUT",
+                    "/service",
+                    "super::mcp::service(state.clone())",
+                    false
+                ),
+                (
+                    "PATCH",
+                    "/service",
+                    "super::mcp::service(state.clone())",
+                    false
+                ),
+                (
+                    "DELETE",
+                    "/service",
+                    "super::mcp::service(state.clone())",
+                    false
+                ),
+                ("POST", "/spaced", "api::spaced", false),
+            ]
+        );
+    }
+
+    #[test]
+    fn mutation_scan_rejects_opaque_method_routers() {
+        for builder in [
+            "any(api::write)",
+            "axum::routing::any(api::write)",
+            "on(MethodFilter::POST, api::write)",
+            "axum::routing::on(axum::routing::MethodFilter::POST, api::write)",
+            "get(api::read).on(MethodFilter::POST, api::write)",
+            "post(api::known).any(api::hidden)",
+            "get(api::read).merge(post(api::hidden))",
+            "write_routes",
+            "make_routes()",
+            "make_routes(post(api::hidden))",
+            "routes!()",
+        ] {
+            let source = format!(
+                r#"
+                use axum::Router;
+                fn build_router() {{
+                    use axum::routing::{{delete, get, patch, post, put}};
+                    Router::new().route("/unclassified", {builder})
+                }}
+                "#
+            );
+            assert!(
+                std::panic::catch_unwind(|| mutating_routes(&source)).is_err(),
+                "accepted unaudited method router: {builder}"
+            );
+        }
+    }
+
+    #[test]
+    fn mutation_scan_rejects_opaque_router_composition() {
+        for (imports, router) in [
+            (
+                "delete, get, patch, post, put",
+                "Router::new().route(\"/known\", post(api::write)).merge(other_router)",
+            ),
+            (
+                "delete, get, patch, post, put",
+                "Router::new().nest(\"/hidden\", other_router)",
+            ),
+            (
+                "delete, get, patch, post, put",
+                "Router::new().fallback(post(api::write))",
+            ),
+            (
+                "delete, get, patch, post, put",
+                "make_router().route(\"/hidden\", post(api::write))",
+            ),
+            (
+                "delete, any as get, patch, post, put",
+                "Router::new().route(\"/hidden\", get(api::write))",
+            ),
+            (
+                "delete, get, patch, post, put",
+                "let mut app = Router::new(); let read_only = { app = app.route(\"/hidden\", post(api::write)); axum::middleware::from_fn_with_state(state.clone(), api::read_only_gate) }; app",
+            ),
+        ] {
+            let source = format!(
+                r#"
+                use axum::Router;
+                fn build_router() {{
+                    use axum::routing::{{{imports}}};
+                    {router}
+                }}
+                "#
+            );
+            assert!(
+                std::panic::catch_unwind(|| mutating_routes(&source)).is_err(),
+                "accepted unaudited router: {router}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_mutating_route_is_cityhall_classified() {
+        let routed = router_mutating_routes();
+        assert!(
+            routed.len() > 60,
+            "router scan found only {} mutating routes; parser likely broke",
+            routed.len()
+        );
+        let classified: std::collections::BTreeSet<(String, String)> = CITYHALL_MUTATION_ALLOW
+            .iter()
+            .chain(CITYHALL_MUTATION_DENY.iter())
+            .map(|(m, p)| ((*m).to_string(), (*p).to_string()))
+            .collect();
+
+        assert_eq!(
+            classified.len(),
+            CITYHALL_MUTATION_ALLOW.len() + CITYHALL_MUTATION_DENY.len(),
+            "duplicate CityHall classification"
+        );
+        let mut failures = Vec::new();
+        for route in routed.difference(&classified) {
+            failures.push(format!(
+                "{} {} is a mutating route but is in neither CITYHALL_MUTATION_ALLOW nor \
+                 CITYHALL_MUTATION_DENY. Add it to the allow table if the CityHall client must \
+                 reach it, else to the deny table.",
+                route.0, route.1
+            ));
+        }
+        for entry in classified.difference(&routed) {
+            failures.push(format!(
+                "{} {} is listed in a CityHall table but no router route matches it; remove the \
+                 stale entry (path template or method changed?).",
+                entry.0, entry.1
+            ));
+        }
+        for a in CITYHALL_MUTATION_ALLOW {
+            assert!(
+                !CITYHALL_MUTATION_DENY.contains(a),
+                "{} {} is in both CityHall allow and deny tables",
+                a.0,
+                a.1
+            );
+        }
+        assert!(
+            failures.is_empty(),
+            "CityHall route classification is not exhaustive:\n{}",
+            failures.join("\n")
+        );
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn cityhall_reorder_preserves_native_rows_and_allows_structured_ordering() {

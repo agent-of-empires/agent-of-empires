@@ -1,27 +1,18 @@
 // The only module importing react-joyride; lazy-loaded when a tour first runs.
-// Controlled `stepIndex` is load-bearing: a `settingsTab` anchor exists only after
-// navigating, so each crossing unmounts Joyride, polls for the anchor, then remounts.
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { ACTIONS, Joyride, EVENTS, STATUS, type EventData, type Step } from "react-joyride";
 import { type TourShortcutHint, type TourStep, tourSelector } from "../../lib/tourSteps";
 import { SHORTCUTS_BY_ID, formatTourShortcut } from "../../lib/shortcuts";
 import { TOUR_RUNNER_OPTIONS, TOUR_RUNNER_STYLES } from "./tourRunnerStyles";
-
-export type TourSettingsTab = NonNullable<TourStep["settingsTab"]>;
 
 export interface TourRunnerProps {
   run: boolean;
   steps: TourStep[];
   /** `markSeen` is false for a programmatic stop, true for a user finish, skip, or close. */
   onFinish: (markSeen: boolean) => void;
-  /** Open the given Settings tab, or close Settings when passed null. */
-  onNavigate: (tab: TourSettingsTab | null) => void;
 }
 
 const LOCALE = { skip: "Skip tour", last: "Done", next: "Next", back: "Back" };
-
-// Settings tabs always exist, so a longer wait means a crash or removed tab.
-const ANCHOR_WAIT_MS = 3000;
 
 function StepBody({ body, shortcutHints }: { body: string; shortcutHints?: readonly TourShortcutHint[] }) {
   return (
@@ -47,50 +38,23 @@ function toJoyrideStep(step: TourStep): Step {
     title: step.title,
     content: <StepBody body={step.body} shortcutHints={step.shortcutHints} />,
     placement: "auto",
-    // An in-view anchor whose tab grows async otherwise makes joyride loop on scroll.
-    ...(step.disableScrolling ? { skipScroll: true } : {}),
   };
 }
 
-export default function TourRunner({ run, steps, onFinish, onNavigate }: TourRunnerProps) {
+export default function TourRunner({ run, steps, onFinish }: TourRunnerProps) {
   const joyrideSteps = useMemo(() => steps.map(toJoyrideStep), [steps]);
   const [stepIndex, setStepIndex] = useState(0);
-  // Joyride stays unmounted while the next anchor is pending.
-  const [suspended, setSuspended] = useState(false);
 
   // Joyride can report the end more than once; latch the first.
   const endedRef = useRef(false);
   const end = useCallback(
-    (markSeen: boolean, index: number) => {
+    (markSeen: boolean) => {
       if (endedRef.current) return;
       endedRef.current = true;
-      if (steps[index]?.settingsTab) onNavigate(null);
       onFinish(markSeen);
     },
-    [steps, onNavigate, onFinish],
+    [onFinish],
   );
-
-  useEffect(() => {
-    if (!suspended) return;
-    const step = steps[stepIndex];
-    if (!step) return;
-    const selector = tourSelector(step.anchor);
-    const start = performance.now();
-    let frame = 0;
-    const tick = () => {
-      if (document.querySelector(selector)) {
-        setSuspended(false);
-        return;
-      }
-      if (performance.now() - start > ANCHOR_WAIT_MS) {
-        end(false, stepIndex);
-        return;
-      }
-      frame = requestAnimationFrame(tick);
-    };
-    frame = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(frame);
-  }, [suspended, stepIndex, steps, end]);
 
   const handleEvent = useCallback(
     (data: EventData) => {
@@ -100,34 +64,26 @@ export default function TourRunner({ run, steps, onFinish, onNavigate }: TourRun
       const userDismiss = action === ACTIONS.CLOSE || action === ACTIONS.SKIP;
 
       if (type === EVENTS.TOUR_END || terminalStatus || userDismiss) {
-        end(terminalStatus || userDismiss, index);
+        end(terminalStatus || userDismiss);
         return;
       }
 
       if (type === EVENTS.STEP_AFTER) {
         if (action !== ACTIONS.NEXT && action !== ACTIONS.PREV) return;
         const next = index + (action === ACTIONS.PREV ? -1 : 1);
-        // Remounted Joyrides emit no TOUR_END on the last step, so Done ends here.
+        // Done on the last step ends here rather than relying on a TOUR_END.
         if (next >= steps.length) {
-          end(true, index);
+          end(true);
           return;
         }
-        if (next < 0) return;
-        const nextTab = steps[next]?.settingsTab ?? null;
-        setStepIndex(next);
-        if ((steps[index]?.settingsTab ?? null) !== nextTab) {
-          onNavigate(nextTab);
-          setSuspended(true);
-        }
+        if (next >= 0) setStepIndex(next);
         return;
       }
 
-      if (type === EVENTS.TARGET_NOT_FOUND) end(false, index);
+      if (type === EVENTS.TARGET_NOT_FOUND) end(false);
     },
-    [steps, onNavigate, end],
+    [steps, end],
   );
-
-  if (suspended) return null;
 
   return (
     <Joyride

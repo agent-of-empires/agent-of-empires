@@ -85,8 +85,8 @@ fn park_message(project_path: &str) -> String {
 #[derive(Debug, Clone)]
 enum ResumeOutcome {
     Attached,
-    /// Attachment or retirement is unfinished; retry next tick unless parked.
-    RetryAfterAttachTimeout,
+    /// Attachment, retirement or launch prep lost a race; retry next tick unless parked.
+    Retry,
     /// Spawn finished with or without error; `attempted` stays set so a
     /// permanently failing spawn does not loop.
     SpawnFinished,
@@ -188,12 +188,19 @@ pub async fn reconcile_acp_workers(
 
     // `aoe acp stop|kill|restart` runs out of process; the reaper surfaces it
     // and returns restart ids, which, like respawn requests (#2109), get a clean slate.
-    for id in supervisor
-        .reap_user_stopped()
-        .await
-        .into_iter()
-        .chain(supervisor.take_respawn_requests())
-    {
+    for id in supervisor.reap_user_stopped().await {
+        forget_session_budget(&id, attempted, parked, respawn_history, capacity_deferred);
+    }
+    for id in supervisor.take_respawn_requests() {
+        // A teardown in flight settles later; the request waits for it, or the
+        // loop below would pin the session as attempted.
+        if matches!(
+            supervisor.worker_state(&id).await,
+            AcpWorkerState::Resuming | AcpWorkerState::Stopping
+        ) {
+            supervisor.request_respawn(&id);
+            continue;
+        }
         forget_session_budget(&id, attempted, parked, respawn_history, capacity_deferred);
     }
     // Pre-session startup failures re-arm under the ordinary budget.
@@ -364,7 +371,7 @@ pub async fn reconcile_acp_workers(
 
     while let Some(result) = set.join_next().await {
         match result {
-            Ok((id, ResumeOutcome::RetryAfterAttachTimeout)) => {
+            Ok((id, ResumeOutcome::Retry)) => {
                 if !parked.contains(&id) {
                     attempted.remove(&id);
                 }
@@ -549,7 +556,7 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::test_fixtures::{capacity_startup_errors, test_state, Tick};
+    use super::test_fixtures::{capacity_startup_errors, startup_errors, test_state, Tick};
     use super::*;
 
     #[test]
@@ -815,6 +822,33 @@ mod tests {
         }
     }
 
+    /// A respawn request made while the worker is still mid-teardown is kept
+    /// until it settles; spent early, the tick would pin the session as attempted
+    /// and nothing would bring the worker back.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_respawn_request_waits_out_a_teardown_in_flight() {
+        let id = "s-req";
+        let (_home, state, _project) = test_state(id);
+        let mut tick = Tick::default();
+        tick.run(&state).await;
+        let attempts = startup_errors(&state, id);
+        assert!(tick.attempted.contains(id), "precondition");
+
+        let lease = state.acp_supervisor.test_hold_stopping(id).unwrap();
+        state.acp_supervisor.request_respawn(id);
+        tick.run(&state).await;
+        assert_eq!(startup_errors(&state, id), attempts, "nothing spawns yet");
+
+        state.acp_supervisor.test_settle_stopping(&lease);
+        tick.run(&state).await;
+        assert_eq!(
+            startup_errors(&state, id),
+            attempts + 1,
+            "the kept request respawns the session once the teardown ends"
+        );
+    }
+
     /// Wake-on-drain: a dormant session with a queue must be woken, or its
     /// queue sits behind a worker the resume pass never respawns.
     #[tokio::test]
@@ -840,5 +874,57 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// A launch-prep race (here: memory and disk disagree on the row) must not
+    /// pin the session out of the resume set, or a queued prompt never drains.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn launch_prep_race_does_not_pin_the_session() {
+        let id = "sess-race";
+        let (_home, state, _project) = test_fixtures::test_state(id);
+        state.instances.write().await[0].title = "renamed in memory only".to_string();
+
+        let mut tick = test_fixtures::Tick::default();
+        tick.run(&state).await;
+
+        assert!(!tick.attempted.contains(id));
+    }
+
+    /// A durable `aoe acp stop` fence refuses automatic resume; repeated ticks
+    /// must not count that as a crash loop, and explicit resume still clears it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn durable_user_stop_does_not_crash_loop() {
+        use crate::process::worker_registry::{self, ResumeAuthority, WorkerRecord};
+
+        let id = "sess-stopped";
+        let (_home, state, project) = test_fixtures::test_state(id);
+        let record = WorkerRecord::new(
+            id.into(),
+            std::process::id(),
+            worker_registry::socket_path_for(id).unwrap(),
+            "aoe-agent".into(),
+            "aoe-agent".into(),
+            project.path().to_path_buf(),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        worker_registry::save(&record).unwrap();
+        worker_registry::request_stop(&record).unwrap();
+        worker_registry::retire_selected(&record).unwrap();
+
+        let mut tick = test_fixtures::Tick::default();
+        for _ in 0..=RECONCILER_MAX_RESPAWNS_IN_WINDOW {
+            tick.run(&state).await;
+        }
+
+        assert_eq!(test_fixtures::startup_errors(&state, id), 0);
+        assert!(tick.parked.is_empty());
+        let observed = worker_registry::stop_intent(id).unwrap();
+        worker_registry::admit_resume(id, ResumeAuthority::Explicit, &observed).unwrap();
     }
 }
