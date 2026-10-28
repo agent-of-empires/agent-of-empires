@@ -50,7 +50,9 @@ If you installed shell completions as a static file, regenerate it afterwards so
 Local Unix transport requires a current-user-owned `daemon/` directory with mode
 `0700` and trusted ancestors. AoE creates missing application ancestors without
 group-write bits, including under umask `002`; it does not change existing
-`~/.config` permissions. Follow the recovery advice for the refused directory:
+`~/.config` permissions. On each daemon start, AoE removes group and other write
+permissions from an existing application directory owned by the current user.
+Follow the recovery advice for the refused directory:
 set `daemon/` to mode `0700`, or remove both group and other write permissions from
 another refused ancestor, then retry. A directory owned by another user also
 requires ownership recovery; changing its mode alone is not sufficient.
