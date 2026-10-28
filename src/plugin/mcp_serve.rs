@@ -1,6 +1,6 @@
 //! Asks plugin workers which MCP servers a session gets.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use aoe_plugin_api::{
@@ -11,8 +11,10 @@ use futures_util::future::join_all;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::acp::mcp_rewrite::{context_params, McpRewriteContext};
+use crate::acp::mcp_rewrite::{context_params, McpRewriteContext, PluginServed};
 use crate::plugin::worker_call::WorkerCall;
+use crate::server::session_credential::McpSessionSecret;
+use crate::session::mcp::project_mcp::{ProjectMcpServer, ProjectMcpTransport};
 
 const METHOD: &str = "mcp.session.servers";
 const CALLBACK_TIMEOUT: Duration = Duration::from_millis(5000);
@@ -46,6 +48,11 @@ impl ServedServer {
             entry_key,
         }
     }
+
+    /// Keyed under its plugin's own prefix.
+    pub fn prefixed(&self) -> bool {
+        self.entry_key != self.name
+    }
 }
 
 /// Serde default for the `prefix` flag of a served entry.
@@ -70,16 +77,20 @@ fn parse_names(reply: Value) -> Result<Vec<Entry>, serde_json::Error> {
         .collect())
 }
 
-/// The first capped entries per key.
+/// One entry per key, the first capped keys in reply order. A prefixed entry beats an
+/// unprefixed one on the same key, otherwise the first in reply order wins.
 fn served_by_key(plugin_id: &str, entries: Vec<Entry>) -> Vec<ServedServer> {
     let mut served: Vec<ServedServer> = Vec::new();
     for Entry { name, prefix } in entries {
-        if served.len() == MCP_SERVE_MAX_PER_PLUGIN {
-            break;
-        }
         let entry = ServedServer::new(plugin_id, name, prefix);
-        if !served.iter().any(|s| s.entry_key == entry.entry_key) {
-            served.push(entry);
+        match served.iter().position(|s| s.entry_key == entry.entry_key) {
+            Some(i) => {
+                if entry.prefixed() && !served[i].prefixed() {
+                    served[i] = entry;
+                }
+            }
+            None if served.len() < MCP_SERVE_MAX_PER_PLUGIN => served.push(entry),
+            None => {}
         }
     }
     served
@@ -141,64 +152,117 @@ async fn servers_with_timeout<'a>(
         (&a.plugin_id, &a.name, &a.entry_key).cmp(&(&b.plugin_id, &b.name, &b.entry_key))
     });
 
-    let (served, involved) = drop_collisions(served);
-    for id in involved {
+    let (served, losers) = drop_collisions(served);
+    for (id, keys) in losers {
         caller.report_serve_failure(
             &id,
-            "An MCP server name collides with another plugin's; the colliding servers are skipped for this session.",
+            &format!(
+                "These MCP server keys collide with another plugin's servers and are skipped for this session: {}.",
+                keys.join(", ")
+            ),
         );
     }
     served
 }
 
-/// Removes every entry whose key two plugins produce; returns the survivors and the plugins involved.
-/// Defensive: unreachable while `mcp_prefix` is injective on valid plugin ids.
-fn drop_collisions(served: Vec<ServedServer>) -> (Vec<ServedServer>, BTreeSet<String>) {
-    let mut colliding: BTreeSet<&str> = BTreeSet::new();
-    let mut owner: HashMap<&str, &str> = HashMap::new();
+/// The plugin entries for a session, or none when the daemon has no endpoint the session reaches.
+pub async fn session_plugin_entries(ctx: &McpRewriteContext) -> Vec<PluginServed> {
+    let Some(endpoint) = crate::server::daemon_endpoint::daemon_endpoint() else {
+        return Vec::new();
+    };
+    let Some(base_url) = endpoint.base_url(ctx.sandboxed()) else {
+        return Vec::new();
+    };
+    let served = crate::acp::mcp_rewrite::served_servers(ctx).await;
+    plugin_entries(&endpoint.secret, base_url, &ctx.session_id, &served)
+}
+
+/// One `http` entry per served server, authenticated with the credential for exactly that server.
+pub fn plugin_entries(
+    secret: &McpSessionSecret,
+    base_url: &str,
+    session_id: &str,
+    served: &[ServedServer],
+) -> Vec<PluginServed> {
+    // Plugin ids and validated server names are URL-path safe as they are.
+    served
+        .iter()
+        .map(|s| {
+            let credential = secret.plugin_server_credential_for(&s.plugin_id, &s.name, session_id);
+            let headers = [
+                ("Authorization".to_string(), format!("Bearer {credential}")),
+                ("X-AoE-Session".to_string(), session_id.to_string()),
+            ]
+            .into();
+            PluginServed {
+                plugin_id: s.plugin_id.clone(),
+                server: ProjectMcpServer {
+                    name: s.entry_key.clone(),
+                    transport: ProjectMcpTransport::Http {
+                        url: format!("{base_url}/mcp/plugins/{}/{}", s.plugin_id, s.name),
+                        headers,
+                    },
+                },
+            }
+        })
+        .collect()
+}
+
+/// A key several plugins produce goes to a prefixed entry over an unprefixed one, so no
+/// plugin can take another's namespace, then to the lowest plugin id, since serving has no
+/// `order`. Returns the survivors and each losing plugin's lost keys.
+fn drop_collisions(
+    served: Vec<ServedServer>,
+) -> (Vec<ServedServer>, BTreeMap<String, Vec<String>>) {
+    let rank = |s: &ServedServer| (!s.prefixed(), s.plugin_id.clone());
+    let mut winner: HashMap<String, (bool, String)> = HashMap::new();
     for s in &served {
-        if owner
-            .insert(&s.entry_key, &s.plugin_id)
-            .is_some_and(|prev| prev != s.plugin_id)
-        {
-            colliding.insert(&s.entry_key);
+        let best = winner.entry(s.entry_key.clone()).or_insert_with(|| rank(s));
+        if rank(s) < *best {
+            *best = rank(s);
         }
     }
-    let involved = served
-        .iter()
-        .filter(|s| colliding.contains(s.entry_key.as_str()))
-        .map(|s| s.plugin_id.clone())
-        .collect();
+    let mut losers: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let kept = served
-        .iter()
-        .filter(|s| !colliding.contains(s.entry_key.as_str()))
-        .cloned()
+        .into_iter()
+        .filter(|s| {
+            let won = winner[&s.entry_key].1 == s.plugin_id;
+            if !won {
+                losers
+                    .entry(s.plugin_id.clone())
+                    .or_default()
+                    .push(s.entry_key.clone());
+            }
+            won
+        })
         .collect();
-    (kept, involved)
+    (kept, losers)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
-    use crate::acp::mcp_rewrite::McpSandbox;
+    use crate::acp::mcp_rewrite::{McpRewriter, RewriteError, RewriteFuture};
     use crate::plugin::worker_requests::WorkerRequestError;
+    use crate::session::mcp::project_mcp::ProjectMcpServer;
     use futures_util::future::BoxFuture;
     use serde_json::{json, Value};
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    type Reply = Result<Value, WorkerRequestError>;
+    pub(crate) type Reply = Result<Value, WorkerRequestError>;
 
     #[derive(Default)]
-    struct FakeCaller {
+    pub(crate) struct FakeCaller {
         /// Missing plugin: the call never resolves.
         replies: Mutex<HashMap<String, Reply>>,
-        calls: Mutex<Vec<(String, Value)>>,
-        failures: Mutex<Vec<String>>,
+        pub(crate) calls: Mutex<Vec<(String, Value)>>,
+        pub(crate) failures: Mutex<Vec<String>>,
+        pub(crate) notices: Mutex<Vec<(String, String)>>,
     }
 
     impl FakeCaller {
-        fn with(replies: Vec<(&str, Reply)>) -> Self {
+        pub(crate) fn with(replies: Vec<(&str, Reply)>) -> Self {
             Self {
                 replies: Mutex::new(replies.into_iter().map(|(p, r)| (p.into(), r)).collect()),
                 ..Self::default()
@@ -254,10 +318,17 @@ mod tests {
         fn report_serve_failure(&self, plugin_id: &str, _message: &str) {
             self.failures.lock().unwrap().push(plugin_id.into());
         }
+
+        fn report_serve_notice(&self, plugin_id: &str, message: &str) {
+            self.notices
+                .lock()
+                .unwrap()
+                .push((plugin_id.into(), message.into()));
+        }
     }
 
     /// Manifest validation already rejects `mcp.serve` without a runtime worker.
-    fn manifest(id: &str, serve: bool) -> PluginManifest {
+    pub(crate) fn manifest(id: &str, serve: bool) -> PluginManifest {
         let caps = if serve {
             "\"runtime.worker\", \"mcp.serve\""
         } else {
@@ -269,6 +340,87 @@ mod tests {
         .unwrap()
     }
 
+    pub(crate) fn names(list: &[&str]) -> Reply {
+        Ok(Value::Array(
+            list.iter().map(|n| json!({"name": n})).collect(),
+        ))
+    }
+
+    /// Serves through the real callback against a fake worker, records each hook request,
+    /// and passes the servers through (or fails the hook).
+    pub(crate) struct ServingRewriter {
+        caller: FakeCaller,
+        manifests: Vec<PluginManifest>,
+        fail_hook: bool,
+        pub(crate) requests: Mutex<Vec<Value>>,
+    }
+
+    impl ServingRewriter {
+        pub(crate) fn new(replies: Vec<(&str, Reply)>, fail_hook: bool) -> std::sync::Arc<Self> {
+            let manifests = replies.iter().map(|(id, _)| manifest(id, true)).collect();
+            std::sync::Arc::new(Self {
+                caller: FakeCaller::with(replies),
+                manifests,
+                fail_hook,
+                requests: Mutex::new(Vec::new()),
+            })
+        }
+
+        pub(crate) fn worker_calls(&self) -> usize {
+            self.caller.calls.lock().unwrap().len()
+        }
+
+        pub(crate) fn notices(&self) -> Vec<(String, String)> {
+            self.caller.notices.lock().unwrap().clone()
+        }
+    }
+
+    impl McpRewriter for ServingRewriter {
+        fn rewrite<'a>(
+            &'a self,
+            ctx: &'a McpRewriteContext,
+            servers: Vec<ProjectMcpServer>,
+        ) -> RewriteFuture<'a> {
+            self.requests
+                .lock()
+                .unwrap()
+                .push(crate::acp::mcp_rewrite::request_params(ctx, &servers));
+            let out = if self.fail_hook {
+                Err(RewriteError {
+                    plugin: "acme.hook".into(),
+                    cause: "failed".into(),
+                })
+            } else {
+                Ok(servers)
+            };
+            Box::pin(std::future::ready(out))
+        }
+
+        fn served_servers<'a>(
+            &'a self,
+            ctx: &'a McpRewriteContext,
+        ) -> BoxFuture<'a, Vec<ServedServer>> {
+            Box::pin(servers_for_session(
+                Some(&self.caller),
+                self.manifests.iter(),
+                ctx,
+            ))
+        }
+
+        fn report_serve_notice(&self, plugin_id: &str, message: &str) {
+            self.caller.report_serve_notice(plugin_id, message);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::*;
+    use super::*;
+    use crate::acp::mcp_rewrite::McpSandbox;
+    use crate::plugin::worker_requests::WorkerRequestError;
+    use serde_json::json;
+
     fn ctx(sandboxed: bool) -> McpRewriteContext {
         McpRewriteContext {
             session_id: "s1".into(),
@@ -279,13 +431,8 @@ mod tests {
             }),
             profile: Some("p".into()),
             cwd: "/w".into(),
+            plugin_served: Vec::new(),
         }
-    }
-
-    fn names(list: &[&str]) -> Reply {
-        Ok(Value::Array(
-            list.iter().map(|n| json!({"name": n})).collect(),
-        ))
     }
 
     async fn run(
@@ -340,6 +487,16 @@ mod tests {
                 "same key twice",
                 json!([{"name": "a", "prefix": false}, {"name": "a", "prefix": false}]),
                 vec![("a", "a")],
+            ),
+            (
+                "prefixed beats unprefixed on one key, prefixed first",
+                json!([{"name": "x"}, {"name": "acme_a__x", "prefix": false}]),
+                vec![("x", "acme_a__x")],
+            ),
+            (
+                "prefixed beats unprefixed on one key, unprefixed first",
+                json!([{"name": "acme_a__x", "prefix": false}, {"name": "x"}]),
+                vec![("x", "acme_a__x")],
             ),
         ];
         for (label, reply, want) in cases {
@@ -470,20 +627,92 @@ mod tests {
         ServedServer::new(plugin_id, name.into(), true)
     }
 
-    /// Valid plugin ids never sanitize to the same prefix, so the host-side guard is tested directly.
+    /// Input order does not decide the winner.
     #[test]
-    fn colliding_keys_from_different_plugins_are_all_dropped() {
-        let mut a = served("acme.x", "same");
-        a.entry_key = "shared__same".into();
-        let mut b = served("acme.y", "same");
-        b.entry_key = "shared__same".into();
-        let own = served("acme.x", "own");
-        let (kept, involved) = drop_collisions(vec![a, own.clone(), b, served("acme.z", "ok")]);
-        assert_eq!(kept, [own, served("acme.z", "ok")]);
+    fn colliding_keys_prefer_prefixed_entries_then_the_lowest_plugin_id() {
+        let bare = |plugin: &str, name: &str| ServedServer::new(plugin, name.into(), false);
+        // The prefixed key `acme_b__x` as a bare name of a lower plugin id.
+        let squatter = bare("acme.a", "acme_b__x");
+        // Different plugins never share a prefixed key; forced here to check it is harmless.
+        let forced = |plugin: &str| ServedServer {
+            entry_key: "acme_q__p".into(),
+            ..served(plugin, "p")
+        };
+        let own = served("acme.y", "own");
+        let cases = [
+            (
+                "prefixed beats a lower-id unprefixed",
+                vec![squatter.clone(), served("acme.b", "x")],
+                vec![served("acme.b", "x")],
+                vec![("acme.a", vec!["acme_b__x"])],
+            ),
+            (
+                "two unprefixed: lowest id",
+                vec![
+                    bare("acme.z", "same"),
+                    own.clone(),
+                    bare("acme.x", "same"),
+                    bare("acme.y", "same"),
+                ],
+                vec![own.clone(), bare("acme.x", "same")],
+                vec![("acme.y", vec!["same"]), ("acme.z", vec!["same"])],
+            ),
+            (
+                "two prefixed: lowest id, no panic",
+                vec![forced("acme.r"), forced("acme.q")],
+                vec![forced("acme.q")],
+                vec![("acme.r", vec!["acme_q__p"])],
+            ),
+        ];
+        for (label, input, want_kept, want_losers) in cases {
+            let (kept, losers) = drop_collisions(input);
+            assert_eq!(kept, want_kept, "{label}");
+            let losers: Vec<(&str, Vec<&str>)> = losers
+                .iter()
+                .map(|(p, keys)| (p.as_str(), keys.iter().map(String::as_str).collect()))
+                .collect();
+            assert_eq!(losers, want_losers, "{label}");
+        }
+    }
+
+    /// Each loser loses only the contested entry and is told once.
+    #[tokio::test]
+    async fn a_contested_key_goes_to_the_lowest_plugin_id() {
+        let caller = FakeCaller::with(vec![
+            (
+                "acme.b",
+                Ok(json!([{"name": "docs", "prefix": false}, {"name": "own"}])),
+            ),
+            (
+                "acme.a",
+                Ok(json!([{"name": "docs", "prefix": false}, {"name": "x"}])),
+            ),
+            (
+                "acme.c",
+                Ok(
+                    json!([{"name": "acme_a__x", "prefix": false}, {"name": "docs", "prefix": false}]),
+                ),
+            ),
+        ]);
+        let ms = [
+            manifest("acme.c", true),
+            manifest("acme.b", true),
+            manifest("acme.a", true),
+        ];
+        let out = run(&caller, &ms, CALLBACK_TIMEOUT).await;
+        let got: Vec<(&str, &str)> = out
+            .iter()
+            .map(|s| (s.plugin_id.as_str(), s.entry_key.as_str()))
+            .collect();
         assert_eq!(
-            involved.iter().map(String::as_str).collect::<Vec<_>>(),
-            ["acme.x", "acme.y"]
+            got,
+            [
+                ("acme.a", "docs"),
+                ("acme.a", "acme_a__x"),
+                ("acme.b", "acme_b__own"),
+            ]
         );
+        assert_eq!(*caller.failures.lock().unwrap(), ["acme.b", "acme.c"]);
     }
 
     #[test]
@@ -492,6 +721,41 @@ mod tests {
         let (kept, involved) = drop_collisions(entries.clone());
         assert_eq!(kept, entries);
         assert!(involved.is_empty());
+    }
+
+    #[test]
+    fn plugin_entries_point_at_the_daemon_with_the_server_credential() {
+        use crate::session::mcp::project_mcp::{ProjectMcpServer, ProjectMcpTransport};
+
+        let dir = tempfile::tempdir().unwrap();
+        let secret = McpSessionSecret::load_or_generate(&dir.path().join("secret")).unwrap();
+        let out = plugin_entries(
+            &secret,
+            "http://127.0.0.1:4321",
+            "sess-1",
+            &[served("acme.a", "docs"), served("acme.b", "git.v2")],
+        );
+        let entry = |plugin: &str, name: &str| PluginServed {
+            plugin_id: plugin.into(),
+            server: ProjectMcpServer {
+                name: format!("{}__{}", mcp_prefix(plugin), name),
+                transport: ProjectMcpTransport::Http {
+                    url: format!("http://127.0.0.1:4321/mcp/plugins/{plugin}/{name}"),
+                    headers: [
+                        (
+                            "Authorization".to_string(),
+                            format!(
+                                "Bearer {}",
+                                secret.plugin_server_credential_for(plugin, name, "sess-1")
+                            ),
+                        ),
+                        ("X-AoE-Session".to_string(), "sess-1".to_string()),
+                    ]
+                    .into(),
+                },
+            },
+        };
+        assert_eq!(out, [entry("acme.a", "docs"), entry("acme.b", "git.v2")]);
     }
 
     #[tokio::test]
