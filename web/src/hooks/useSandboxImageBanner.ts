@@ -5,6 +5,9 @@ import { onServerDownChange } from "../lib/connectionState";
 const POLL_MINUTES = 60;
 // Often enough that "updated" follows a pull closely; the Daemon answers from memory.
 const PULL_POLL_MS = 2000;
+// How long "Downloading" stands in for a pull no status has shown. The Daemon answers Update now as
+// soon as it starts the pull, so a reply still missing after this is lost, and statuses are believed.
+const UNCONFIRMED_PULL_MS = 30_000;
 
 export type SandboxImageBannerView =
   | { kind: "available"; image: string; onUpdate: () => void; onDismiss: () => void }
@@ -30,8 +33,8 @@ export function useSandboxImageBanner(): SandboxImageBannerView | null {
   // Set once a status shows the pull this page asked for running; a failed reply arriving after
   // that can't undo it, since the Daemon starts the pull before it answers.
   const pullConfirmed = useRef(false);
-  // True from "Update now" until its reply lands.
-  const replyPending = useRef(false);
+  // When "Update now" was pressed, while its reply is still out; null once it lands.
+  const replyPendingSince = useRef<number | null>(null);
   // Each "Update now" or Retry is a new attempt; a reply to an older one changes nothing.
   const attempt = useRef(0);
   // The digest the latest status offered, and the one the current attempt pulled, so a finished
@@ -60,9 +63,15 @@ export function useSandboxImageBanner(): SandboxImageBannerView | null {
       const refused = s && !("state" in s) ? s.error : null;
       setConfigUnreadable(refused === "config_unreadable");
       // Until the reply lands or a status shows the pull, any other pull state predates it: keep
-      // showing "Downloading" and polling fast rather than flashing the old state back.
+      // showing "Downloading" and polling fast rather than flashing the old state back. Only for a
+      // while: a reply that never comes can't hide a pull that finished unseen.
+      const since = replyPendingSince.current;
       const predatesPull =
-        !!answer && replyPending.current && !pullConfirmed.current && answer.pull.state !== "running";
+        !!answer &&
+        since !== null &&
+        Date.now() - since < UNCONFIRMED_PULL_MS &&
+        !pullConfirmed.current &&
+        answer.pull.state !== "running";
       if (answer) {
         offeredDigest.current = answer.state === "available" ? answer.remote_digest : null;
         setStatus(predatesPull ? { ...answer, pull: { state: "running" } } : answer);
@@ -109,11 +118,11 @@ export function useSandboxImageBanner(): SandboxImageBannerView | null {
     setRefusal(null);
     expectingPull.current = true;
     pullConfirmed.current = false;
-    replyPending.current = true;
+    replyPendingSince.current = Date.now();
     setStatus((s) => s && { ...s, pull: { state: "running" } });
     void pullSandboxImage().then((reply) => {
       if (mine !== attempt.current) return;
-      replyPending.current = false;
+      replyPendingSince.current = null;
       if (!reply.ok && !pullConfirmed.current) {
         // Nothing was pulled, and the Daemon may still hold an older pull's outcome. No status has
         // shown a pull since the click, so the "running" in `status` is this page's own guess.

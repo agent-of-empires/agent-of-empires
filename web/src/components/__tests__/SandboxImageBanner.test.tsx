@@ -376,6 +376,23 @@ describe("SandboxImageBanner", () => {
     }
   });
 
+  it("stops standing in for an unseen pull when the Update now reply never comes", async () => {
+    await mount(status());
+    // The reply never settles, and no status ever catches the pull running.
+    pullSandboxImage.mockImplementationOnce(() => new Promise(() => {}));
+    fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+    fetchSandboxImageStatus.mockResolvedValue(status({ state: "current", pull: { state: "done" } } as never));
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await pollAfter(20_000);
+    expect(banner()?.getAttribute("aria-label")).toBe("Downloading sandbox image");
+    // Past the cap, the Daemon's own status is believed: the pull finished.
+    await pollAfter(12_000);
+    expect(banner()?.getAttribute("aria-label")).toBe("Sandbox image updated");
+  });
+
   it("hides an earlier available update once a check fails", async () => {
     await mount(status());
     expect(banner()).not.toBeNull();
