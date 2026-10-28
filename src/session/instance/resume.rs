@@ -1952,10 +1952,16 @@ mod tests {
         inst.command = "claude".to_string();
         inst.agent_session_id = Some(stale_sid.clone());
         inst.status = Status::Idle;
-        // Real prior conversation on disk so the FIRST attempt takes the
-        // --resume path (and fails); the loop-breaker on the second attempt
-        // then fires from the persisted marker, independent of the transcript.
+        // Seed real history so the first attempt exercises native resume.
         seed_claude_transcript(&mut inst, &stale_sid);
+        let transcript = temp
+            .path()
+            .join(".claude/projects")
+            .join(crate::session::capture::encode_claude_project_path(
+                &project_dir.canonicalize().unwrap().to_string_lossy(),
+            ))
+            .join(format!("{stale_sid}.jsonl"));
+        let original_transcript = std::fs::read(&transcript).unwrap();
 
         let xs = vec![inst.clone()];
         storage
@@ -1971,8 +1977,7 @@ mod tests {
             .args(["kill-session", "-t", &tmux_name])
             .output();
 
-        // First attempt: reproduces the pre-existing `ResumeFailed` path,
-        // as in `resume_fallback_marks_failed_and_preserves_sid_instead_of_launching_fresh`.
+        // The first attempt preserves the conversation and marks the failure.
         let first = inst
             .start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow)
             .unwrap();
@@ -2001,16 +2006,10 @@ mod tests {
         let stored = storage.load().unwrap().remove(0);
         assert_eq!(stored.conversation_state(), inst.conversation_state());
         assert_eq!(stored.resume_probe_failed_sid, None);
-        let transcript = temp
-            .path()
-            .join(".claude/projects")
-            .join(crate::session::capture::encode_claude_project_path(
-                project_path,
-            ))
-            .join(format!("{stale_sid}.jsonl"));
-        assert!(
-            transcript.exists(),
-            "fresh launch must not delete old history"
+        assert_eq!(
+            std::fs::read(&transcript).unwrap(),
+            original_transcript,
+            "fresh launch must preserve old history"
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let pid = loop {
