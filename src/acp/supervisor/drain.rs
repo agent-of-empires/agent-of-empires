@@ -2369,6 +2369,55 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn respawn_reinjects_plugin_served_servers() {
+        use crate::acp::mcp_rewrite::test_support::SlotGuard;
+        use crate::plugin::mcp_serve::test_support::{names, ServingRewriter};
+        use crate::server::daemon_endpoint::{test_support::EndpointGuard, DaemonEndpoint};
+        use crate::server::session_credential::McpSessionSecret;
+        use agent_client_protocol::v1::schema::McpServer;
+
+        let (_home, temp) = isolate_home();
+        let _env = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        let rewriter = ServingRewriter::new(vec![("acme.a", names(&["docs"]))], false);
+        let _slot = SlotGuard::install(rewriter.clone());
+        let secret = std::sync::Arc::new(
+            McpSessionSecret::load_or_generate(&temp.path().join("mcp_session_secret")).unwrap(),
+        );
+        let _endpoint = EndpointGuard::install(DaemonEndpoint {
+            host_url: "http://127.0.0.1:4321".into(),
+            sandbox_url: None,
+            secret: secret.clone(),
+        });
+
+        let mut config = runner_config(worker_registry::socket_path_for("s-plugin").unwrap());
+        config.cwd = temp.path().to_path_buf();
+        Drain::<VecSink>::refresh_launch_env("s-plugin", &mut config).await;
+
+        let [McpServer::Http(server)] = config.mcp_servers.as_slice() else {
+            panic!("one plugin entry expected: {:?}", config.mcp_servers);
+        };
+        assert_eq!(server.name, "acme_a__docs");
+        assert_eq!(server.url, "http://127.0.0.1:4321/mcp/plugins/acme.a/docs");
+        let bearer = format!(
+            "Bearer {}",
+            secret.plugin_server_credential_for("acme.a", "docs", "s-plugin")
+        );
+        assert!(
+            server
+                .headers
+                .iter()
+                .any(|h| h.name == "Authorization" && h.value == bearer),
+            "{:?}",
+            server.headers
+        );
+        assert_eq!(
+            rewriter.requests.lock().unwrap()[0]["servers"][0]["plugin"],
+            "acme.a"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn respawn_reapplies_selected_claude_store_before_native_mcp_discovery() {
         use agent_client_protocol::v1::schema::McpServer;
 

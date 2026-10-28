@@ -378,6 +378,8 @@ After AoE merges the MCP layers and before it hands the set to the agent, on eve
 
 `sandbox` is present only when `sandboxed` is true. `mounts` are the volumes AoE creates the container with, so a plugin can map container paths back to the host: a linked worktree lists both the worktree and its main repo, and a workspace (multi-repo) session lists the workspace directory plus every main repo outside it. Host paths are sent as they are: not redacted, and not secret. `container_workdir` is the directory the agent runs in, or `null` when AoE cannot determine it. When AoE cannot compute the mounts, `mounts` is empty and the session is still reported as sandboxed.
 
+A server an `mcp.serve` plugin provides carries `"plugin": "<plugin id>"`, absent on every other server, so a hook can recognise and pass through its own entries. These entries include their credential headers like any other server; seeing them is part of the `mcp.rewrite` grant. `plugin` is accepted back on an `add` entry and ignored.
+
 The `result` is an edit; unknown fields are rejected:
 
 ```json

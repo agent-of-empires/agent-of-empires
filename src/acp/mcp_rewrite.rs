@@ -6,11 +6,13 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::warn;
 
 use crate::acp::acp_client::{known_container_workdir, AcpError, SandboxLayout};
+use crate::plugin::mcp_serve::ServedServer;
 use crate::session::mcp::project_mcp::{ProjectMcpServer, ProjectMcpTransport};
 use crate::session::{SandboxInfo, WorkspaceInfo};
 
@@ -23,6 +25,15 @@ pub struct McpRewriteContext {
     pub sandbox: Option<McpSandbox>,
     pub profile: Option<String>,
     pub cwd: PathBuf,
+    /// The plugin-served entries injected into this session's set.
+    pub plugin_served: Vec<PluginServed>,
+}
+
+/// A session entry for a server a plugin serves through the daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginServed {
+    pub plugin_id: String,
+    pub server: ProjectMcpServer,
 }
 
 impl McpRewriteContext {
@@ -113,6 +124,10 @@ struct WireServer {
     url: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     headers: BTreeMap<String, String>,
+    /// The serving plugin's id on a plugin entry. Accepted back on an added server, which
+    /// still counts as hook-added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plugin: Option<String>,
 }
 
 impl From<&ProjectMcpServer> for WireServer {
@@ -126,6 +141,7 @@ impl From<&ProjectMcpServer> for WireServer {
             env: BTreeMap::new(),
             url: None,
             headers: BTreeMap::new(),
+            plugin: None,
         };
         match &server.transport {
             ProjectMcpTransport::Stdio { command, args, env } => WireServer {
@@ -212,7 +228,18 @@ pub fn context_params(ctx: &McpRewriteContext) -> Value {
 
 pub fn request_params(ctx: &McpRewriteContext, servers: &[ProjectMcpServer]) -> Value {
     let mut params = context_params(ctx);
-    params["servers"] = json!(servers.iter().map(WireServer::from).collect::<Vec<_>>());
+    let wire: Vec<WireServer> = servers
+        .iter()
+        .map(|server| WireServer {
+            plugin: ctx
+                .plugin_served
+                .iter()
+                .find(|p| p.server == *server)
+                .map(|p| p.plugin_id.clone()),
+            ..WireServer::from(server)
+        })
+        .collect();
+    params["servers"] = json!(wire);
     params
 }
 
@@ -307,6 +334,17 @@ pub trait McpRewriter: Send + Sync {
         ctx: &'a McpRewriteContext,
         servers: Vec<ProjectMcpServer>,
     ) -> RewriteFuture<'a>;
+
+    /// The plugin-served servers this session gets.
+    fn served_servers<'a>(
+        &'a self,
+        _ctx: &'a McpRewriteContext,
+    ) -> BoxFuture<'a, Vec<ServedServer>> {
+        Box::pin(std::future::ready(Vec::new()))
+    }
+
+    /// Tells the user a plugin's MCP server replaced one of their configured servers.
+    fn report_serve_notice(&self, _plugin_id: &str, _message: &str) {}
 }
 
 static REWRITER: Mutex<Option<Arc<dyn McpRewriter>>> = Mutex::new(None);
@@ -317,6 +355,19 @@ fn current_rewriter() -> Option<Arc<dyn McpRewriter>> {
 
 pub fn set_rewriter(rewriter: Option<Arc<dyn McpRewriter>>) {
     *REWRITER.lock().unwrap_or_else(|e| e.into_inner()) = rewriter;
+}
+
+pub fn report_serve_notice(plugin_id: &str, message: &str) {
+    if let Some(rewriter) = current_rewriter() {
+        rewriter.report_serve_notice(plugin_id, message);
+    }
+}
+
+pub async fn served_servers(ctx: &McpRewriteContext) -> Vec<ServedServer> {
+    match current_rewriter() {
+        Some(rewriter) => rewriter.served_servers(ctx).await,
+        None => Vec::new(),
+    }
 }
 
 pub async fn rewrite_servers(
@@ -507,7 +558,36 @@ mod tests {
             }),
             profile: Some("work".into()),
             cwd: "/w".into(),
+            plugin_served: Vec::new(),
         }
+    }
+
+    #[test]
+    fn request_params_mark_exactly_the_injected_plugin_entries() {
+        let injected = http("acme_a__docs", "http://d/mcp/plugins/acme.a/docs", &[]);
+        let mut c = ctx();
+        c.plugin_served = vec![PluginServed {
+            plugin_id: "acme.a".into(),
+            server: injected.clone(),
+        }];
+        let replaced = http("acme_a__docs", "http://gateway/docs", &[]);
+        let p = request_params(&c, &[injected, stdio("ha", &[])]);
+        assert_eq!(p["servers"][0]["plugin"], "acme.a");
+        assert!(p["servers"][1].get("plugin").is_none(), "{p}");
+        let p = request_params(&c, &[replaced]);
+        assert!(
+            p["servers"][0].get("plugin").is_none(),
+            "a hook's replacement is no longer the plugin entry: {p}"
+        );
+    }
+
+    #[test]
+    fn parse_edit_accepts_an_echoed_plugin_marker() {
+        let e = parse_edit(json!({
+            "add": [{"name":"x","type":"http","url":"http://g","plugin":"acme.a"}]
+        }))
+        .unwrap();
+        assert_eq!(e.add, vec![http("x", "http://g", &[])]);
     }
 
     #[test]

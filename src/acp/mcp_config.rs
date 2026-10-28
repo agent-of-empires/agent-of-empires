@@ -21,7 +21,10 @@ pub fn project_servers_to_acp(
     servers
         .into_iter()
         .map(|resolved| {
-            let session_env = if matches!(&resolved.provenance, McpProvenance::ProjectLocal) {
+            let session_env = if matches!(
+                &resolved.provenance,
+                McpProvenance::ProjectLocal | McpProvenance::Plugin { .. }
+            ) {
                 &[]
             } else {
                 session_env
@@ -368,15 +371,23 @@ mod tests {
     }
 
     #[test]
-    fn project_local_authorization_does_not_expand_from_session_environment() {
-        let request = new_session_request(
-            r#"{"mcpServers":{"remote":{"type":"http","url":"https://mcp.invalid","headers":{"Authorization":"Bearer ${GITHUB_TOKEN}"}}}}"#,
-            McpProvenance::ProjectLocal,
-            &[("GITHUB_TOKEN".into(), "synthetic-token".into())],
-        );
+    fn project_local_and_plugin_headers_do_not_expand_from_session_environment() {
+        let plugin = McpProvenance::Plugin {
+            plugin_id: "acme.a".into(),
+        };
+        for provenance in [McpProvenance::ProjectLocal, plugin] {
+            let request = new_session_request(
+                r#"{"mcpServers":{"remote":{"type":"http","url":"https://mcp.invalid","headers":{"Authorization":"Bearer ${GITHUB_TOKEN}","X-Ref":"${GITHUB_TOKEN}"}}}}"#,
+                provenance.clone(),
+                &[("GITHUB_TOKEN".into(), "synthetic-token".into())],
+            );
 
-        assert_eq!(request["mcpServers"].as_array().unwrap().len(), 1);
-        assert_eq!(request["mcpServers"][0]["headers"], serde_json::json!([]));
-        assert!(!request.to_string().contains("synthetic-token"));
+            assert_eq!(
+                request["mcpServers"][0]["headers"],
+                serde_json::json!([{"name": "X-Ref", "value": "${GITHUB_TOKEN}"}]),
+                "{provenance:?}"
+            );
+            assert!(!request.to_string().contains("synthetic-token"));
+        }
     }
 }
