@@ -4430,7 +4430,7 @@
         "web/src/components/session-wizard/SessionWizard.tsx",
         "web/src/components/session-wizard/profileDefaults.ts"
       ],
-      "notes": "A saved project with no sessions opens the wizard on the profile default_tool; one with a session keeps that session's tool (#5008)."
+      "notes": "A saved project with no sessions opens the wizard on the profile default_tool (#5008)."
     },
     {
       "id": "story.wizard-browse-disk",
