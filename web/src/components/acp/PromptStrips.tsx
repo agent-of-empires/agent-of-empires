@@ -487,7 +487,7 @@ function QueuedPromptRow({
         type="button"
         onClick={onRemove}
         title="Drop this queued message"
-        className="shrink-0 rounded p-1 text-text-dim hover:bg-surface-800 hover:text-text-secondary"
+        className="shrink-0 rounded p-1 text-text-subtle hover:bg-surface-800 hover:text-text-secondary"
       >
         <X className="h-3.5 w-3.5" />
       </button>

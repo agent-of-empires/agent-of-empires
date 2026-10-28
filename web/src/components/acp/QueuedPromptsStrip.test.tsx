@@ -152,13 +152,13 @@ describe("QueuedPromptsStrip", () => {
       label: "Queued",
       reason: "sends after compacting",
       action: "disabled",
-      disabledReason: "Waiting: this sends after compacting",
+      disabledReason: "Waiting: this message sends after compacting",
     };
     const btn = renderWithProfile("claude", [mk("a", "go")], { reason, onSendNow: (p) => sent.push(p) }).getByTestId(
       "queued-send-now",
     );
     expect(btn.getAttribute("aria-disabled")).toBe("true");
-    expect(btn.getAttribute("aria-label")).toBe("Waiting: this sends after compacting");
+    expect(btn.getAttribute("aria-label")).toBe("Waiting: this message sends after compacting");
     expect((btn as HTMLButtonElement).disabled).toBe(false);
     fireEvent.click(btn);
     expect(sent).toEqual([]);

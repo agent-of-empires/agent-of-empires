@@ -75,18 +75,18 @@ export function queuedReason(input: QueuedReasonInput): QueuedReason {
   }
   if (input.workerStarting) {
     const reason = `sends when ${agent} starts`;
-    return { label: "Queued", reason, action: "disabled", disabledReason: `Waiting: this ${reason}` };
+    return { label: "Queued", reason, action: "disabled", disabledReason: `Waiting: this message ${reason}` };
   }
   if (input.workerDown) {
     return { label: "Queued", reason: `sends when ${agent} starts`, action: "startAndSend" };
   }
   if (input.cancelling) {
     const reason = `sends once ${agent} stops`;
-    return { label: "Queued", reason, action: "disabled", disabledReason: `Waiting: this ${reason}` };
+    return { label: "Queued", reason, action: "disabled", disabledReason: `Waiting: this message ${reason}` };
   }
   if (input.compacting) {
     const reason = "sends after compacting";
-    return { label: "Queued", reason, action: "disabled", disabledReason: `Waiting: this ${reason}` };
+    return { label: "Queued", reason, action: "disabled", disabledReason: `Waiting: this message ${reason}` };
   }
   if (input.turnActive) {
     const first = input.firstText?.trim() ?? "";

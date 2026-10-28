@@ -80,7 +80,7 @@ describe("queuedReason", () => {
       const got = queuedReason({ ...BASE, ...over });
       expect([got.label, got.reason, got.action], name).toEqual([label, reason, action]);
       expect(got.disabledReason !== undefined, name).toBe(action === "disabled");
-      if (got.disabledReason) expect(got.disabledReason, name).toBe(`Waiting: this ${reason}`);
+      if (got.disabledReason) expect(got.disabledReason, name).toBe(`Waiting: this message ${reason}`);
     }
   });
 });
