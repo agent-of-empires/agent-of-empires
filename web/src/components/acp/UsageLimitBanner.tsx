@@ -201,8 +201,8 @@ export function UsageLimitSection({
   settingsHref: string | null;
   onPrefill: (text: string) => void;
 }) {
-  // A limit with no reported reset still needs a key to scope resume status by.
-  const resume = useRespawnSession(sessionId, rateLimit?.resets_at ?? "unknown");
+  // A limit with no reported reset still needs a key, and a cleared limit ends the incident.
+  const resume = useRespawnSession(sessionId, rateLimit ? (rateLimit.resets_at ?? "unknown") : null);
   const { targets, listFailed } = useSwitchTargets(agent, rateLimit !== null);
   // Taken when the modal opens, so the switch's own Agent change doesn't reload it mid-handoff.
   const [handoff, setHandoff] = useState<{ from: string | null; eligible: string[] } | null>(null);

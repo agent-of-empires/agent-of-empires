@@ -25,6 +25,7 @@ const at = (iso: string) => new Date(iso).toLocaleTimeString([], { hour: "numeri
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
+  vi.unstubAllGlobals();
 });
 
 // The copy's display names are the server's; a case overrides the list to change the switch targets.
@@ -204,7 +205,8 @@ describe("UsageLimitSection", () => {
     const view = render(section("claude", LIMITED));
     // What the switch itself does: a new Agent, and a Stopped that clears the limit.
     const switched = () => view.rerender(section("codex", null));
-    return { onPrefill, switched };
+    const limit = (rateLimit: typeof LIMITED | null) => view.rerender(section("claude", rateLimit));
+    return { onPrefill, switched, limit };
   }
 
   it.each([
@@ -263,6 +265,19 @@ describe("UsageLimitSection", () => {
       expect(onPrefill).not.toHaveBeenCalled();
       expect(screen.getByRole("alert").textContent).toContain("primer unavailable");
     }
+  });
+
+  it("offers Try again for a later limit after an earlier retry succeeded", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, text: async () => "" }));
+    const { limit } = mountSection();
+    const resume = () => screen.getByTestId("usage-limit-resume") as HTMLButtonElement;
+    fireEvent.click(resume());
+    await waitFor(() => expect(resume().textContent).toBe("Resume requested"));
+    limit(null);
+    // Another park with no reported reset is a new incident.
+    limit(LIMITED);
+    expect(resume().textContent).toBe("Try again");
+    expect(resume().disabled).toBe(false);
   });
 
   it("says why Switch Agent is missing when the Agent list fails", async () => {
