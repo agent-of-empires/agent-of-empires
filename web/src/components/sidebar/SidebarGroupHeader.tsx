@@ -185,8 +185,9 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
               />
             </span>
           </span>
-          {group.pinned && (
+          {group.pinned ? (
             <span
+              role="img"
               className="shrink-0 text-[10px] leading-none text-text-dim"
               data-testid="sidebar-group-pinned-marker"
               title="Pinned project (persists without sessions)"
@@ -194,6 +195,18 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
             >
               ◆
             </span>
+          ) : (
+            group.registeredProjects.length > 0 && (
+              <span
+                role="img"
+                className="shrink-0 text-[10px] leading-none text-text-dim"
+                data-testid="sidebar-group-project-marker"
+                title="Project"
+                aria-label="Project"
+              >
+                ◇
+              </span>
+            )
           )}
           <span
             className="text-[13px] md:text-[14px] font-medium truncate flex-1"

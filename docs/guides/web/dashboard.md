@@ -19,7 +19,7 @@ Each sidebar row carries an animated braille glyph encoding the session's state:
 
 The **New session** wizard is one screen of one-line rows, like the TUI dialog; a row with a chevron opens its details in a panel:
 
-- **Project**: pick the working directory from the Recent tab, browse for one, clone a URL, or start a scratch session with no path. The Recent tab lists your saved projects under a "Saved projects" section above the directories of your recent sessions. The recent list keeps a project around after its last session is deleted, so you can quickly start there again; entries whose directory no longer exists are dropped.
+- **Project**: pick the working directory from the Recent tab, browse for one, clone a URL, or start a scratch session with no path. The Recent tab lists your registered Projects under a "Projects" section above the directories of your recent sessions. The recent list keeps a project around after its last session is deleted, so you can quickly start there again; entries whose directory no longer exists are dropped.
 - **Title**: auto-slugifies into a worktree branch name unless you edit the branch.
 - **Group**: search existing groups, including empty groups, or select the create row for a new name; surrounding spaces are trimmed on selection and `/` nests groups. Counts show sessions directly in the group, excluding archived and trashed sessions. Escape closes the suggestions without closing the wizard.
 - **Agent**: the tool, plus instructions, command override, and extra args.
@@ -106,7 +106,7 @@ With more than one row selected, right-click (long-press on touch) any selected 
 
 ## Projects
 
-A **Projects** section near the bottom of the sidebar (above "Snoozed & archived") lists your saved projects that are not pinned and have no live session. It is the same registry the new-session wizard's "Saved projects" tab reads, and it shows on every grouping axis. The section is expanded by default; its collapsed state persists per-browser.
+A **Projects, no sessions** section near the bottom of the sidebar (above "Snoozed & archived") lists your registered Projects that are not pinned and have no live session. It is the same registry the new-session wizard's "Projects" list reads, and it shows on every grouping axis. Repository headers backed by a registered Project carry a ◇ marker, and a pinned one ◆. The section is expanded by default; its collapsed state persists per-browser.
 
 Pinned projects always render above as their own headers, with or without sessions. Projects with live sessions also render above as normal groups.
 
