@@ -688,6 +688,10 @@ impl<'a> RouteAudit<'a> {
             syn::Expr::Path(path) => path.path.is_ident("state"),
             syn::Expr::Field(field) => Self::condition(&field.base),
             syn::Expr::Paren(paren) => Self::condition(&paren.expr),
+            syn::Expr::MethodCall(call) => call.args.is_empty() && Self::condition(&call.receiver),
+            syn::Expr::Binary(binary) if matches!(binary.op, syn::BinOp::Or(_)) => {
+                Self::condition(&binary.left) && Self::condition(&binary.right)
+            }
             _ => false,
         }
     }

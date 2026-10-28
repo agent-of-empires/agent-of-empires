@@ -1503,18 +1503,44 @@ pub(super) async fn resolve_mcp_servers(
             return Vec::new();
         }
     };
-    let ctx = crate::acp::mcp_rewrite::McpRewriteContext {
+    let mut ctx = crate::acp::mcp_rewrite::McpRewriteContext {
         session_id: session_id.to_string(),
         agent: agent_key.to_string(),
         sandbox,
         profile,
         cwd: paths.cwd,
+        plugin_served: Vec::new(),
     };
-    let mut originals: std::collections::HashMap<String, (_, McpProvenance)> = resolved
+    ctx.plugin_served = crate::plugin::mcp_serve::session_plugin_entries(&ctx).await;
+    let mut provenance: std::collections::HashMap<String, McpProvenance> = resolved
         .iter()
-        .map(|s| (s.def.name.clone(), (s.def.clone(), s.provenance.clone())))
+        .map(|s| (s.def.name.clone(), s.provenance.clone()))
         .collect();
-    let defs = resolved.into_iter().map(|s| s.def).collect();
+    let mut defs: Vec<_> = resolved.into_iter().map(|s| s.def).collect();
+    for (plugin_id, keys) in inject_plugin_entries(&mut defs, &ctx.plugin_served) {
+        crate::acp::mcp_rewrite::report_serve_notice(
+            &plugin_id,
+            &format!(
+                "The plugin's MCP servers replace configured servers of the same name in this session: {}.",
+                keys.join(", ")
+            ),
+        );
+    }
+    for served in &ctx.plugin_served {
+        provenance.insert(
+            served.server.name.clone(),
+            McpProvenance::Plugin {
+                plugin_id: served.plugin_id.clone(),
+            },
+        );
+    }
+    let mut originals: std::collections::HashMap<String, (_, McpProvenance)> = defs
+        .iter()
+        .filter_map(|def| {
+            let provenance = provenance.remove(&def.name)?;
+            Some((def.name.clone(), (def.clone(), provenance)))
+        })
+        .collect();
     let defs = crate::acp::mcp_rewrite::rewrite_servers(&ctx, defs).await;
     debug!(
         target: "acp.mcp",
@@ -1538,6 +1564,26 @@ pub(super) async fn resolve_mcp_servers(
         })
         .collect();
     crate::acp::mcp_config::project_servers_to_acp(resolved, &projection_env)
+}
+
+/// Plugin entries win a key collision with user layers. Returns the replaced keys by plugin.
+fn inject_plugin_entries(
+    defs: &mut Vec<crate::session::mcp::project_mcp::ProjectMcpServer>,
+    served: &[crate::acp::mcp_rewrite::PluginServed],
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut replaced: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for p in served {
+        let before = defs.len();
+        defs.retain(|d| d.name != p.server.name);
+        if defs.len() != before {
+            replaced
+                .entry(p.plugin_id.clone())
+                .or_default()
+                .push(p.server.name.clone());
+        }
+        defs.push(p.server.clone());
+    }
+    replaced
 }
 
 fn resolve_mcp_defs(
@@ -2936,6 +2982,380 @@ time.sleep(60)
             "hook dropped everything for the sandbox"
         );
         assert_eq!(plain.len(), 1, "no rewriter leaves the set alone");
+    }
+
+    fn test_endpoint(
+        dir: &std::path::Path,
+    ) -> (
+        std::sync::Arc<crate::server::session_credential::McpSessionSecret>,
+        crate::server::daemon_endpoint::DaemonEndpoint,
+    ) {
+        let secret = std::sync::Arc::new(
+            crate::server::session_credential::McpSessionSecret::load_or_generate(
+                &dir.join("mcp_session_secret"),
+            )
+            .unwrap(),
+        );
+        let endpoint = crate::server::daemon_endpoint::DaemonEndpoint {
+            host_url: "http://127.0.0.1:4321".into(),
+            sandbox_url: None,
+            secret: secret.clone(),
+        };
+        (secret, endpoint)
+    }
+
+    fn test_paths(dir: &std::path::Path) -> McpPaths {
+        McpPaths {
+            cwd: dir.to_path_buf(),
+            config_path: dir.join("config.toml"),
+        }
+    }
+
+    fn hook_servers(request: &serde_json::Value) -> Vec<&serde_json::Value> {
+        let mut servers: Vec<_> = request["servers"].as_array().unwrap().iter().collect();
+        servers.sort_by_key(|s| s["name"].as_str().unwrap().to_string());
+        servers
+    }
+
+    fn sandbox_info_for(name: &str) -> crate::session::SandboxInfo {
+        crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "aoe-sandbox:test".into(),
+            container_name: format!("aoe-sandbox-{name}"),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: Some(format!("/workspace/{name}")),
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            provider: None,
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn plugin_servers_join_the_set_before_the_rewrite_hook() {
+        use crate::acp::mcp_rewrite::test_support::SlotGuard;
+        use crate::plugin::mcp_serve::test_support::{names, ServingRewriter};
+        use crate::plugin::worker_requests::WorkerRequestError;
+        use crate::server::daemon_endpoint::test_support::EndpointGuard;
+        use agent_client_protocol::schema::v1::McpServer;
+
+        let (_home, tmp) = isolate_home();
+        let _env = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        std::fs::write(
+            tmp.path().join(".claude.json"),
+            r#"{ "mcpServers": { "native": { "command": "n" }, "acme_a__docs": { "command": "user" } } }"#,
+        )
+        .unwrap();
+        let rewriter = ServingRewriter::new(
+            vec![
+                ("acme.a", names(&["docs"])),
+                ("acme.bad", Err(WorkerRequestError::Rejected)),
+                ("acme.b", names(&["git"])),
+            ],
+            false,
+        );
+        let _slot = SlotGuard::install(rewriter.clone());
+        let (secret, endpoint) = test_endpoint(tmp.path());
+        let _endpoint = EndpointGuard::install(endpoint);
+
+        let out = resolve_mcp_servers(
+            "claude",
+            "sess-p",
+            None,
+            test_paths(tmp.path()),
+            McpHostEnv::default(),
+            McpSandboxScope::default(),
+            "failed",
+        )
+        .await;
+
+        let requests = rewriter.requests.lock().unwrap();
+        let servers = hook_servers(&requests[0]);
+        let names: Vec<_> = servers
+            .iter()
+            .map(|s| s["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            ["acme_a__docs", "acme_b__git", "native"],
+            "the failing plugin drops only its own servers"
+        );
+        assert_eq!(
+            *servers[0],
+            serde_json::json!({
+                "name": "acme_a__docs",
+                "type": "http",
+                "url": "http://127.0.0.1:4321/mcp/plugins/acme.a/docs",
+                "headers": {
+                    "Authorization": format!(
+                        "Bearer {}",
+                        secret.plugin_server_credential_for("acme.a", "docs", "sess-p")
+                    ),
+                    "X-AoE-Session": "sess-p",
+                },
+                "plugin": "acme.a",
+            }),
+            "the plugin entry replaces the user server of the same name"
+        );
+        assert_eq!(servers[1]["plugin"], "acme.b");
+        assert!(servers[2].get("plugin").is_none());
+
+        let mut forwarded: Vec<_> = out
+            .iter()
+            .map(|s| match s {
+                McpServer::Http(s) => (s.name.as_str(), Some(s.url.as_str())),
+                McpServer::Stdio(s) => (s.name.as_str(), None),
+                _ => panic!("unexpected transport"),
+            })
+            .collect();
+        forwarded.sort();
+        assert_eq!(
+            forwarded,
+            [
+                (
+                    "acme_a__docs",
+                    Some("http://127.0.0.1:4321/mcp/plugins/acme.a/docs")
+                ),
+                (
+                    "acme_b__git",
+                    Some("http://127.0.0.1:4321/mcp/plugins/acme.b/git")
+                ),
+                ("native", None),
+            ]
+        );
+    }
+
+    /// A plugin entry replacing configured servers wins and tells the user once per plugin,
+    /// naming only the keys.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn plugin_entries_replacing_user_servers_notify_once_per_plugin() {
+        use crate::acp::mcp_rewrite::test_support::SlotGuard;
+        use crate::plugin::mcp_serve::test_support::{names, ServingRewriter};
+        use crate::server::daemon_endpoint::test_support::EndpointGuard;
+
+        let (_home, tmp) = isolate_home();
+        let _env = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        std::fs::write(
+            tmp.path().join(".claude.json"),
+            r#"{ "mcpServers": { "docs": { "command": "u" }, "lint": { "command": "u" }, "acme_b__git": { "command": "u" }, "native": { "command": "n" } } }"#,
+        )
+        .unwrap();
+        let rewriter = ServingRewriter::new(
+            vec![
+                (
+                    "acme.a",
+                    Ok(serde_json::json!([
+                        {"name": "docs", "prefix": false},
+                        {"name": "lint", "prefix": false},
+                        {"name": "fresh", "prefix": false},
+                    ])),
+                ),
+                ("acme.b", names(&["git"])),
+            ],
+            false,
+        );
+        let _slot = SlotGuard::install(rewriter.clone());
+        let (_secret, endpoint) = test_endpoint(tmp.path());
+        let _endpoint = EndpointGuard::install(endpoint);
+
+        resolve_mcp_servers(
+            "claude",
+            "sess-n",
+            None,
+            test_paths(tmp.path()),
+            McpHostEnv::default(),
+            McpSandboxScope::default(),
+            "failed",
+        )
+        .await;
+
+        let notice = |keys: &str| {
+            format!("The plugin's MCP servers replace configured servers of the same name in this session: {keys}.")
+        };
+        assert_eq!(
+            rewriter.notices(),
+            [
+                ("acme.a".to_string(), notice("docs, lint")),
+                ("acme.b".to_string(), notice("acme_b__git")),
+            ]
+        );
+        let requests = rewriter.requests.lock().unwrap();
+        let docs = hook_servers(&requests[0])
+            .into_iter()
+            .find(|s| s["name"] == "docs")
+            .unwrap();
+        assert_eq!(docs["plugin"], "acme.a");
+        assert_eq!(docs["type"], "http", "the plugin entry won");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandboxed_plugin_entries_use_the_sandbox_url_and_reach_the_hook() {
+        use crate::acp::mcp_rewrite::test_support::SlotGuard;
+        use crate::plugin::mcp_serve::test_support::{names, ServingRewriter};
+        use crate::server::daemon_endpoint::test_support::EndpointGuard;
+        use agent_client_protocol::schema::v1::McpServer;
+
+        let (_home, tmp) = isolate_home();
+        let _env = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        let rewriter = ServingRewriter::new(vec![("acme.a", names(&["docs"]))], false);
+        let _slot = SlotGuard::install(rewriter.clone());
+        let (secret, mut endpoint) = test_endpoint(tmp.path());
+        endpoint.sandbox_url = Some("http://host.containers.internal:4321".into());
+        let _endpoint = EndpointGuard::install(endpoint);
+        let sandbox = sandbox_info_for("url");
+
+        let out = resolve_mcp_servers(
+            "claude",
+            "sess-u",
+            None,
+            test_paths(tmp.path()),
+            McpHostEnv::default(),
+            McpSandboxScope {
+                sandbox_info: Some(&sandbox),
+                workspace_info: None,
+            },
+            "failed",
+        )
+        .await;
+
+        let requests = rewriter.requests.lock().unwrap();
+        let servers = hook_servers(&requests[0]);
+        assert_eq!(
+            *servers[0],
+            serde_json::json!({
+                "name": "acme_a__docs",
+                "type": "http",
+                "url": "http://host.containers.internal:4321/mcp/plugins/acme.a/docs",
+                "headers": {
+                    "Authorization": format!(
+                        "Bearer {}",
+                        secret.plugin_server_credential_for("acme.a", "docs", "sess-u")
+                    ),
+                    "X-AoE-Session": "sess-u",
+                },
+                "plugin": "acme.a",
+            }),
+            "the hook sees the sandbox entry with the session credential"
+        );
+        let [McpServer::Http(forwarded)] = out.as_slice() else {
+            panic!("one plugin entry expected: {out:?}");
+        };
+        assert_eq!(
+            forwarded.url,
+            "http://host.containers.internal:4321/mcp/plugins/acme.a/docs"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn plugin_servers_need_a_daemon_endpoint_the_session_reaches() {
+        use crate::acp::mcp_rewrite::test_support::SlotGuard;
+        use crate::plugin::mcp_serve::test_support::{names, ServingRewriter};
+        use crate::server::daemon_endpoint::test_support::EndpointGuard;
+        use agent_client_protocol::schema::v1::McpServer;
+
+        let (_home, tmp) = isolate_home();
+        let _env = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        std::fs::write(
+            tmp.path().join(".claude.json"),
+            r#"{ "mcpServers": { "native": { "command": "n" } } }"#,
+        )
+        .unwrap();
+        let sandbox = sandbox_info_for("reach");
+        let resolve = |sandboxed: bool| {
+            resolve_mcp_servers(
+                "claude",
+                "sess-r",
+                None,
+                test_paths(tmp.path()),
+                McpHostEnv::default(),
+                McpSandboxScope {
+                    sandbox_info: sandboxed.then_some(&sandbox),
+                    workspace_info: None,
+                },
+                "failed",
+            )
+        };
+        let names_of = |out: &[McpServer]| -> Vec<String> {
+            let mut n: Vec<String> = out
+                .iter()
+                .map(|s| match s {
+                    McpServer::Http(s) => format!("{}={}", s.name, s.url),
+                    McpServer::Stdio(s) => s.name.clone(),
+                    _ => panic!("unexpected transport"),
+                })
+                .collect();
+            n.sort();
+            n
+        };
+
+        // (case, endpoint: none | host | sandbox, sandboxed, fail hook, expected, worker asked)
+        let cases: [(&str, &str, bool, bool, &[&str], bool); 6] = [
+            ("no endpoint", "none", false, false, &["native"], false),
+            (
+                "host",
+                "host",
+                false,
+                false,
+                &[
+                    "acme_a__docs=http://127.0.0.1:4321/mcp/plugins/acme.a/docs",
+                    "native",
+                ],
+                true,
+            ),
+            (
+                "sandbox without a sandbox url",
+                "host",
+                true,
+                false,
+                &["native"],
+                false,
+            ),
+            (
+                "sandbox with a sandbox url",
+                "sandbox",
+                true,
+                false,
+                &[
+                    "acme_a__docs=http://host.containers.internal:4321/mcp/plugins/acme.a/docs",
+                    "native",
+                ],
+                true,
+            ),
+            (
+                "host ignores the sandbox url",
+                "sandbox",
+                false,
+                false,
+                &[
+                    "acme_a__docs=http://127.0.0.1:4321/mcp/plugins/acme.a/docs",
+                    "native",
+                ],
+                true,
+            ),
+            ("sandbox hook failure", "sandbox", true, true, &[], true),
+        ];
+        for (case, endpoint_kind, sandboxed, fail_hook, expected, asked) in cases {
+            let rewriter = ServingRewriter::new(vec![("acme.a", names(&["docs"]))], fail_hook);
+            let _slot = SlotGuard::install(rewriter.clone());
+            let _endpoint = match endpoint_kind {
+                "none" => EndpointGuard::clear_on_drop(),
+                kind => {
+                    let mut endpoint = test_endpoint(tmp.path()).1;
+                    if kind == "sandbox" {
+                        endpoint.sandbox_url = Some("http://host.containers.internal:4321".into());
+                    }
+                    EndpointGuard::install(endpoint)
+                }
+            };
+            let out = resolve(sandboxed).await;
+            assert_eq!(names_of(&out), expected, "{case}");
+            assert_eq!(rewriter.worker_calls() > 0, asked, "{case}");
+        }
     }
 
     #[tokio::test]

@@ -4,12 +4,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aoe_plugin_api::{McpRewriteScope, PluginManifest};
+use futures_util::future::BoxFuture;
 
 use crate::acp::mcp_rewrite::{
     apply_edit, parse_edit, request_params, McpRewriteContext, McpRewriter, RewriteError,
     RewriteFuture, METHOD,
 };
 use crate::plugin::host::PluginHost;
+use crate::plugin::mcp_serve::{servers_for_session, ServedServer};
 use crate::plugin::worker_call::WorkerCall;
 use crate::session::mcp::project_mcp::ProjectMcpServer;
 
@@ -107,6 +109,23 @@ impl McpRewriter for PluginMcpRewriter {
             let caller = self.host.as_deref().map(|h| h as &dyn WorkerCall);
             run_hooks(caller, &hooks, ctx, servers).await
         })
+    }
+
+    fn served_servers<'a>(
+        &'a self,
+        ctx: &'a McpRewriteContext,
+    ) -> BoxFuture<'a, Vec<ServedServer>> {
+        Box::pin(async move {
+            let registry = crate::plugin::registry();
+            let caller = self.host.as_deref().map(|h| h as &dyn WorkerCall);
+            servers_for_session(caller, registry.active().map(|p| &p.manifest), ctx).await
+        })
+    }
+
+    fn report_serve_notice(&self, plugin_id: &str, message: &str) {
+        if let Some(host) = &self.host {
+            WorkerCall::report_serve_notice(host.as_ref(), plugin_id, message);
+        }
     }
 }
 
@@ -251,6 +270,10 @@ mod tests {
         fn report_serve_failure(&self, _plugin_id: &str, _message: &str) {
             unreachable!("the rewrite chain reports no serve failures")
         }
+
+        fn report_serve_notice(&self, _plugin_id: &str, _message: &str) {
+            unreachable!("hook edits never notify")
+        }
     }
 
     fn hook(id: &str) -> RewriteHook {
@@ -271,6 +294,7 @@ mod tests {
             }),
             profile: None,
             cwd: "/w".into(),
+            plugin_served: Vec::new(),
         }
     }
 

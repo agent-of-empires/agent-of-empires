@@ -30,6 +30,10 @@ pub enum McpProvenance {
     KeptOnRemoval {
         agent: String,
     },
+    /// Served by a plugin through the daemon; injected at launch only.
+    Plugin {
+        plugin_id: String,
+    },
 }
 
 impl McpProvenance {
@@ -40,6 +44,7 @@ impl McpProvenance {
             McpProvenance::Profile { name } => format!("profile:{name}"),
             McpProvenance::ProjectLocal => "project-local".to_string(),
             McpProvenance::KeptOnRemoval { agent } => format!("kept-on-removal:{agent}"),
+            McpProvenance::Plugin { plugin_id } => format!("plugin:{plugin_id}"),
         }
     }
 }

@@ -545,32 +545,10 @@ pub(crate) async fn start_server(
         None
     };
 
-    // Session-scoped `/mcp` credential secret. Only generated when `/mcp` is actually
-    // mounted, so a daemon that never enables it never gets this file on disk.
-    let mcp_session_secret = if config.web.mcp_enabled {
-        match crate::session::get_app_dir() {
-            Ok(dir) => {
-                match crate::server::session_credential::McpSessionSecret::load_or_generate(
-                    &dir.join("mcp_session_secret"),
-                ) {
-                    Ok(secret) => Some(Arc::new(secret)),
-                    Err(e) => {
-                        tracing::warn!(target: "http.middleware",
-                            "/mcp session credentials disabled: failed to load secret: {}",
-                            e
-                        );
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(target: "http.middleware", "/mcp session credentials disabled: app_dir unavailable: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let mcp_session_secret = mcp_session_secret(
+        crate::session::get_app_dir(),
+        mcp_endpoints_wanted(config.web.mcp_enabled, crate::plugin::registry().all()),
+    );
 
     let acp_events_tx = broadcast::channel(ACP_CHANNEL_CAPACITY).0;
     let acp_event_store = {
@@ -925,6 +903,16 @@ pub(crate) async fn start_server(
         tracing::info!(
             target: "http.access",
             "plaintext HTTP from non-loopback peers is rejected with 426"
+        );
+    }
+    // A core-only daemon has no TCP listener, so no endpoint plugin entries could point at.
+    // CityHall denies plugin endpoints, so sessions get no entries for them.
+    let plugin_listener = listener.as_ref().filter(|_| !cityhall_mode);
+    if let Some(listener) = plugin_listener {
+        record_daemon_endpoint(
+            listener.local_addr()?,
+            &allowed_hosts,
+            mcp_session_secret.clone(),
         );
     }
 
@@ -1496,6 +1484,60 @@ fn install_mcp_rewriter(plugin_host: Option<std::sync::Arc<crate::plugin::host::
     )));
 }
 
+/// Whether the daemon needs the session credential secret: for `/mcp`, or for the plugin
+/// endpoints when any installed plugin, active or not, holds `mcp.serve`.
+fn mcp_endpoints_wanted(mcp_enabled: bool, plugins: &[crate::plugin::LoadedPlugin]) -> bool {
+    mcp_enabled
+        || plugins.iter().any(|p| {
+            p.manifest
+                .capabilities
+                .iter()
+                .any(|c| c.as_str() == aoe_plugin_api::MCP_SERVE_CAPABILITY)
+        })
+}
+
+/// The session credential secret, loaded or generated only when `wanted`, so a daemon that
+/// serves no MCP endpoint never gets this file on disk.
+fn mcp_session_secret(
+    app_dir: anyhow::Result<std::path::PathBuf>,
+    wanted: bool,
+) -> Option<Arc<crate::server::session_credential::McpSessionSecret>> {
+    if !wanted {
+        return None;
+    }
+    let loaded = app_dir.and_then(|dir| {
+        crate::server::session_credential::McpSessionSecret::load_or_generate(
+            &dir.join("mcp_session_secret"),
+        )
+    });
+    match loaded {
+        Ok(secret) => Some(Arc::new(secret)),
+        Err(e) => {
+            tracing::warn!(target: "http.middleware",
+                "MCP session credentials disabled: failed to load the secret: {e:#}");
+            None
+        }
+    }
+}
+
+/// Plugin entries need session credentials; none without the secret.
+/// Sandboxes get entries only when the bind is non-loopback and the user allowed
+/// `host.containers.internal`; `allowed_hosts` is the list the DNS-rebinding gate enforces.
+fn record_daemon_endpoint(
+    addr: SocketAddr,
+    allowed_hosts: &[String],
+    secret: Option<Arc<crate::server::session_credential::McpSessionSecret>>,
+) {
+    use crate::server::daemon_endpoint::{
+        host_url_for, sandbox_url_for, set_daemon_endpoint, DaemonEndpoint,
+    };
+    set_daemon_endpoint(secret.map(|secret| DaemonEndpoint {
+        host_url: host_url_for(addr),
+        sandbox_url: sandbox_url_for(addr, allowed_hosts),
+        secret,
+    }));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1547,6 +1589,83 @@ mod tests {
         terminated.cancel();
         assert!(start.await.unwrap().is_err());
         dropped.await.expect("the guard must drop on the signal");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn daemon_endpoint_is_recorded_only_with_a_session_secret() {
+        use crate::server::daemon_endpoint::{daemon_endpoint, test_support::EndpointGuard};
+
+        let _guard = EndpointGuard::clear_on_drop();
+        let dir = tempfile::tempdir().unwrap();
+        let secret = Arc::new(
+            crate::server::session_credential::McpSessionSecret::load_or_generate(
+                &dir.path().join("secret"),
+            )
+            .unwrap(),
+        );
+        let allowed = vec!["host.containers.internal".to_string()];
+        record_daemon_endpoint("0.0.0.0:8123".parse().unwrap(), &allowed, Some(secret));
+        let endpoint = daemon_endpoint().expect("recorded");
+        assert_eq!(endpoint.host_url, "http://127.0.0.1:8123");
+        assert_eq!(
+            endpoint.sandbox_url.as_deref(),
+            Some("http://host.containers.internal:8123")
+        );
+
+        record_daemon_endpoint("127.0.0.1:8123".parse().unwrap(), &allowed, None);
+        assert!(daemon_endpoint().is_none(), "no secret clears the endpoint");
+    }
+
+    /// The secret exists only when `/mcp` is on or an installed plugin serves MCP servers.
+    #[test]
+    fn the_session_secret_is_created_only_when_an_mcp_endpoint_is_served() {
+        let manifest = |caps: &str| {
+            aoe_plugin_api::PluginManifest::from_toml_str(&format!(
+                "id = \"acme.p\"\nname = \"N\"\nversion = \"1.0.0\"\napi_version = 22\ncapabilities = [{caps}]\n\n[runtime]\nkind = \"command\"\ncommand = [\"bin/w\"]\n"
+            ))
+            .unwrap()
+        };
+        let plugin = |caps: &str, enabled: bool| crate::plugin::LoadedPlugin {
+            manifest: manifest(caps),
+            enabled,
+            trust: aoe_plugin_api::TrustLevel::Builtin,
+            validation: crate::plugin::registry::ValidationState::Builtin,
+            source: None,
+            dir: None,
+            manifest_hash: String::new(),
+            granted: false,
+        };
+        let serving = || plugin("\"runtime.worker\", \"mcp.serve\"", false);
+        let plain = || plugin("\"runtime.worker\"", true);
+        // (case, mcp_enabled, installed plugins, wanted)
+        let cases = [
+            ("nothing", false, vec![plain()], false),
+            ("mcp enabled", true, vec![plain()], true),
+            (
+                "an installed serving plugin",
+                false,
+                vec![plain(), serving()],
+                true,
+            ),
+        ];
+        for (case, mcp_enabled, plugins, wanted) in cases {
+            assert_eq!(
+                mcp_endpoints_wanted(mcp_enabled, &plugins),
+                wanted,
+                "{case}"
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let secret = mcp_session_secret(Ok(dir.path().to_path_buf()), wanted);
+            let file = dir.path().join("mcp_session_secret");
+            assert_eq!(secret.is_some(), wanted, "{case}");
+            assert_eq!(file.exists(), wanted, "{case}: no file unless wanted");
+            if wanted {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{case}");
+            }
+        }
     }
 
     #[tokio::test]

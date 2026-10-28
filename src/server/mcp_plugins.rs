@@ -831,12 +831,67 @@ mod tests {
             assert_eq!(status, want, "{uri}");
         }
 
-        let (state, _) = build_state_with(vec![], Some(TOKEN), |state| {
+        // `web.mcp_enabled` off: the plugin endpoint is served while the secret exists, `/mcp`
+        // is not, and the plain session credential authenticates nothing.
+        let unmounted = if cfg!(feature = "web") {
+            StatusCode::METHOD_NOT_ALLOWED
+        } else {
+            StatusCode::NOT_FOUND
+        };
+        let inst = live_session();
+        let id = inst.id.clone();
+        let (state, secret) = build_state_with(vec![inst], Some(TOKEN), |state| {
             state.web_config.mcp_enabled = false;
         });
         let off = test_support::build_router_for_test(state);
-        let (status, _) = call(&off, "/mcp/plugins/acme.serve/srv", Some(TOKEN), None).await;
-        assert_ne!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let derived = secret.plugin_server_credential_for("acme.serve", "srv", &id);
+        let plain = secret.credential_for(&id);
+        let cases = [
+            (
+                "derived credential",
+                "/mcp/plugins/acme.serve/srv",
+                derived.as_str(),
+                Some(id.as_str()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                "daemon token",
+                "/mcp/plugins/acme.serve/srv",
+                TOKEN,
+                None,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            ("daemon token on /mcp", "/mcp", TOKEN, None, unmounted),
+            (
+                "plain credential on /mcp",
+                "/mcp",
+                plain.as_str(),
+                Some(id.as_str()),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "plain credential below /mcp",
+                "/mcp/x",
+                plain.as_str(),
+                Some(id.as_str()),
+                StatusCode::UNAUTHORIZED,
+            ),
+        ];
+        for (case, uri, bearer, session, want) in cases {
+            let (status, body) = call(&off, uri, Some(bearer), session).await;
+            assert_eq!(status, want, "mcp off, {case}: {body}");
+        }
+
+        // Neither `/mcp` nor a serving plugin: no secret, nothing mounted.
+        let (state, _) = build_state_with(vec![], Some(TOKEN), |state| {
+            state.web_config.mcp_enabled = false;
+            state.mcp_session_secret = None;
+        });
+        let none = test_support::build_router_for_test(state);
+        for uri in ["/mcp", "/mcp/plugins/acme.serve/srv"] {
+            let (status, _) = call(&none, uri, Some(TOKEN), None).await;
+            assert_eq!(status, unmounted, "nothing served, {uri}");
+        }
     }
 
     /// Calls are `(envelope id, method, params)`, notifications `(method, params)`.
@@ -907,6 +962,10 @@ mod tests {
 
         fn report_serve_failure(&self, _plugin_id: &str, _message: &str) {
             unreachable!("plugin MCP forwarding reports no host failures")
+        }
+
+        fn report_serve_notice(&self, _plugin_id: &str, _message: &str) {
+            unreachable!("plugin MCP forwarding reports no host notices")
         }
     }
 

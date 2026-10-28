@@ -339,12 +339,16 @@ async fn session_is_live(state: &AppState, session_id: &str) -> bool {
         .any(|inst| inst.id == session_id && !inst.is_archived() && !inst.is_trashed())
 }
 
-/// [`session_credential_claim`], but only for `/mcp` itself: this credential authenticates that
-/// surface alone, never the REST API, WebSocket routes or `/mcp/plugins/...`, which take the
-/// derived credential of [`live_plugin_caller`] instead.
+/// [`session_credential_claim`], but only for `/mcp` itself and only while it is mounted: this
+/// credential authenticates that surface alone, never the REST API, WebSocket routes or
+/// `/mcp/plugins/...`, which take the derived credential of [`live_plugin_caller`] instead.
 fn session_credential_claim_for_mcp(state: &AppState, request: &Request) -> Option<String> {
     let path = request.uri().path();
-    if !is_mcp_path(path) || path == "/mcp/plugins" || path.starts_with("/mcp/plugins/") {
+    if !state.web_config.mcp_enabled
+        || !is_mcp_path(path)
+        || path == "/mcp/plugins"
+        || path.starts_with("/mcp/plugins/")
+    {
         return None;
     }
     session_credential_claim(state, request)
