@@ -5,6 +5,7 @@ import { useCallback, useState } from "react";
 import { WrapText } from "lucide-react";
 
 import { useAcpPrefs } from "../../lib/acpPrefs";
+import { CopyMarkdownButton } from "./CopyMarkdownButton";
 
 export function useWrapState(): [boolean, () => void] {
   const { wrapToolOutput } = useAcpPrefs();
@@ -36,11 +37,20 @@ export function WrapToggle({ wrapped, onToggle }: { wrapped: boolean; onToggle: 
   );
 }
 
-/** Slim in-flow strip for blocks without a header of their own. */
-export function WrapBar({ wrapped, onToggle }: { wrapped: boolean; onToggle: () => void }) {
+/** Slim in-flow strip for blocks without a header of their own. `copyText` adds a copy of the whole block. */
+export function WrapBar({
+  wrapped,
+  onToggle,
+  copyText,
+}: {
+  wrapped: boolean;
+  onToggle: () => void;
+  copyText?: string;
+}) {
   return (
-    <div className="flex justify-end px-1">
+    <div className="flex items-center justify-end px-1">
       <WrapToggle wrapped={wrapped} onToggle={onToggle} />
+      {copyText !== undefined && <CopyMarkdownButton compact source={copyText} label="Copy output" />}
     </div>
   );
 }

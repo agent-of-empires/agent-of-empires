@@ -68,6 +68,9 @@ pub struct CreateSessionBody {
     pub sandbox_image: Option<String>,
     #[serde(default)]
     pub extra_env: Vec<String>,
+    /// Host-only env for `host_hooks.before_start`; never enters the container. Sandbox only.
+    #[serde(default)]
+    pub hook_env: Vec<String>,
     #[serde(default)]
     pub extra_repo_paths: Vec<String>,
     /// Repository names or paths override the shared base_branch.

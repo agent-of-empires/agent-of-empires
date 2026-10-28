@@ -1,12 +1,15 @@
 // @vitest-environment jsdom
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
+import { writeClipboard } from "../../../../lib/clipboard";
 import { DiffCommentsUserCard } from "../../comments/DiffCommentsUserCard";
 import type { DiffCommentsCardPayload } from "../../comments/buildPrompt";
 import type { DiffComment } from "../../comments/types";
 import { renderWithLateResolution } from "../../../../__tests__/lateResolution";
+
+vi.mock("../../../../lib/clipboard", () => ({ writeClipboard: vi.fn().mockResolvedValue(true) }));
 
 // The deferred branch exposes the actual request-start boundary.
 const highlighter = vi.hoisted(() => ({
@@ -130,5 +133,26 @@ describe("DiffCommentsUserCard", () => {
 
     expect(text).toContain("plain b body");
     expect(html).not.toContain("OLD_A");
+  });
+});
+
+describe("DiffCommentsUserCard copy", () => {
+  it("copies the prompt the agent received, with its framing and comments", () => {
+    const { getByRole } = render(
+      <DiffCommentsUserCard
+        payload={{
+          intro: "Please review.",
+          outro: "Thanks.",
+          isMultiRepo: false,
+          comments: [comment({ body: "rename this" })],
+        }}
+      />,
+    );
+    fireEvent.click(getByRole("button", { name: "Copy prompt" }));
+    const copied = vi.mocked(writeClipboard).mock.lastCall?.[0] ?? "";
+    expect(copied.startsWith("Please review.")).toBe(true);
+    expect(copied).toContain("### `src/app.ts` line 10 (new)");
+    expect(copied).toContain("rename this");
+    expect(copied.trimEnd().endsWith("Thanks.")).toBe(true);
   });
 });
