@@ -12,6 +12,7 @@ pub(crate) mod attach_project;
 pub mod auth;
 pub mod callback;
 pub(crate) mod create_progress;
+pub(crate) mod daemon_endpoint;
 pub(crate) mod disk_watch;
 pub(crate) mod idle_reap;
 pub(crate) mod ingress;
