@@ -104,7 +104,7 @@ Use the sidebar's **Projects, no sessions** section to add a Project, edit its d
 
 Remove targets the registrations represented by that project row, using the profile captured when the action starts. It does not request deletion from unrelated profiles. Global registrations are shared, so removing one changes every profile's merged view.
 
-Saved-project suggestions in the new-session wizard follow the selected profile. An open project form keeps its original profile even if the daemon's default profile changes. The picker for adding a repository to an existing session uses that session's profile. Unregistered paths can still be entered directly.
+Registered Project suggestions in the new-session wizard follow the selected profile. An open project form keeps its original profile even if the daemon's default profile changes. The picker for adding a repository to an existing session uses that session's profile. Unregistered paths can still be entered directly.
 
 Multi-repo sessions are bucketed into a single **Multi-repo** group at the bottom of the sidebar, regardless of which repo was chosen as the primary. Each session row shows a chip per repo under the title.
 
