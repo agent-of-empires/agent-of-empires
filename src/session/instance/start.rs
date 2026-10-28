@@ -75,6 +75,10 @@ pub enum StartOutcome {
     /// actually occurred this call depends on the caller having killed
     /// any pre-existing pane first.
     Fresh,
+    /// A previous resume probe failed for `sid`; this attempt started fresh
+    /// instead of retrying it. The old conversation remains in native history,
+    /// but is no longer this session's active association.
+    FreshAfterFailedResume { sid: String },
 }
 
 /// What `start_with_size_opts` did with the agent's session id this call.
@@ -234,9 +238,8 @@ impl Instance {
         }
         self.reconcile_sidecar_into_disk_in(storage)?;
         let expected = self.apply_fresh_launch_intent_in(storage);
-        if let Err(error) = self
-            .preflight_resume_launch_in(CaptureStorage::Scoped(storage), ResumeAttemptPolicy::Allow)
-        {
+        self.capture_resume_launch_target_in(CaptureStorage::Scoped(storage));
+        if let Err(error) = self.preflight_resume_launch() {
             self.adopt_conversation_state(expected);
             self.fail_reserved_launch(storage, generation, &error, false);
             return Err(error);
@@ -1274,14 +1277,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
-    fn direct_start_refuses_failed_resume_before_replacing_a_dead_pane() {
+    fn direct_start_attests_failed_resume_before_retrying_a_dead_pane() {
         if std::env::var_os("AOE_FROZEN_NATIVE_TEST_CHILD").is_some() {
             crate::process::exec_frozen_environment().unwrap();
             return;
         }
         use crate::session::instance::test_helpers::{seed_claude_transcript, tool_instance};
         use crate::tmux::test_helpers::{
-            only_pane_id, pane_field, tmux_available, wait_for_pane_command, TmuxTestSession,
+            only_pane_id, pane_field, tmux_available, TmuxTestSession,
         };
         if !tmux_available() {
             return;
@@ -1295,10 +1298,15 @@ mod tests {
             "AOE_DAEMON_URL",
         ])
         .and_set("AOE_TMUX_SOCKET", root.path().join("tmux.sock"));
+        let ready = root.path().join("direct-agent-ready");
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\nprintf '%s\\n' \"$$\" > {}\nexec /bin/sleep 60\n",
+            crate::session::environment::shell_escape(ready.to_str().unwrap())
+        );
         let _agent = crate::session::test_support::install_login_shell_path_command(
             root.path(),
             "claude",
-            "#!/bin/sh\nexec /bin/sleep 60\n",
+            &script,
         );
         crate::session::config::update_config(|config| {
             config.systemd.enabled = false;
@@ -1318,6 +1326,7 @@ mod tests {
         seed_claude_transcript(&mut instance, sid);
         instance.resume_probe_failed_sid = Some(sid.into());
         instance.omp_capture_generation = Some("outgoing-generation".into());
+        instance.extra_args = "--resume unexpected-conversation".into();
         assert!(instance.supports_native_resume());
         let before = instance.conversation_state();
         let store = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
@@ -1344,7 +1353,6 @@ mod tests {
             .status
             .success());
         let pane = only_pane_id(&name);
-        wait_for_pane_command(&pane, "sleep");
         assert!(crate::tmux::tmux_command()
             .args(["set-option", "-t", &name, "remain-on-exit", "on",])
             .output()
@@ -1368,11 +1376,11 @@ mod tests {
         let pid = pane_field(&pane, "#{pane_pid}");
         let _helper = frozen_test_helper(
             root.path(),
-            "direct_start_refuses_failed_resume_before_replacing_a_dead_pane",
+            "direct_start_attests_failed_resume_before_retrying_a_dead_pane",
         );
         let error = instance
             .start_with_size_opts(None, true)
-            .expect_err("a direct Default start must not retry a previously failed conversation");
+            .expect_err("unattested arguments must refuse before replacing the dead pane");
         assert!(error.is::<ManagedResumeRefused>(), "{error:#}");
         let public_error = instance.last_error.as_deref().unwrap();
         assert!(!public_error.contains(sid), "{public_error}");
@@ -1383,6 +1391,7 @@ mod tests {
         assert_eq!(only_pane_id(&name), pane);
         assert_eq!(pane_field(&pane, "#{pane_pid}"), pid);
         assert_eq!(pane_field(&pane, "#{pane_dead}"), "1");
+        assert!(!ready.exists(), "refusal must not launch the native agent");
         let stored = store.load().unwrap().remove(0);
         assert_eq!(stored.conversation_state(), before);
         assert_eq!(stored.resume_probe_failed_sid.as_deref(), Some(sid));
@@ -1391,6 +1400,45 @@ mod tests {
             Some("outgoing-generation")
         );
         assert!(stored.lifecycle_reservation.is_none());
+
+        store
+            .update(|rows, _| {
+                rows[0].extra_args.clear();
+                Ok(())
+            })
+            .unwrap();
+        let outcome = instance.start_with_size_opts(None, true).unwrap();
+        assert_eq!(outcome, LaunchSidOutcome::Existing { sid: sid.into() });
+        let replacement = only_pane_id(&name);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let native_pid = loop {
+            if let Some(pid) = std::fs::read_to_string(&ready)
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+            {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "direct retry did not start its native agent"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(crate::process::worker::is_pid_alive(native_pid));
+        assert_ne!(pane_field(&replacement, "#{pane_pid}"), pid);
+        assert_eq!(pane_field(&replacement, "#{pane_dead}"), "0");
+        let stored = store.load().unwrap().remove(0);
+        assert_eq!(stored.agent_session_id, before.session_id);
+        assert_eq!(stored.agent_session_binding, before.binding);
+        assert_eq!(stored.resume_intent, before.intent);
+        assert_eq!(stored.resume_binding, before.resume_binding);
+        let active = stored.active_execution.as_ref().unwrap();
+        assert!(!active.launch_id.is_empty());
+        assert_eq!(active.binding.agent, "claude");
+        assert_eq!(stored.active_execution, instance.active_execution);
+        assert_eq!(stored.resume_probe_failed_sid, None);
+        assert!(stored.lifecycle_reservation.is_none());
+        instance.kill_clean_in(&store).unwrap();
     }
 
     #[cfg(unix)]

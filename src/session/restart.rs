@@ -98,7 +98,12 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
 
 /// Whether the restart left the agent running in a live pane.
 pub(crate) fn launched_agent(outcome: &Result<StartOutcome, String>) -> bool {
-    matches!(outcome, Ok(StartOutcome::Fresh | StartOutcome::Resumed))
+    matches!(
+        outcome,
+        Ok(StartOutcome::Fresh
+            | StartOutcome::Resumed
+            | StartOutcome::FreshAfterFailedResume { .. })
+    )
 }
 
 /// Wait for the restarted pane to become live and past its boot shell, then
@@ -262,11 +267,14 @@ mod tests {
     }
 
     #[test]
-    fn restart_wake_is_suppressed_for_resume_failed() {
-        let outcome = Ok(StartOutcome::ResumeFailed {
-            sid: "11111111-2222-3333-4444-555555555555".to_string(),
-        });
-
-        assert!(!launched_agent(&outcome));
+    fn restart_wake_requires_a_successful_launch() {
+        let sid = "11111111-2222-3333-4444-555555555555".to_string();
+        assert!(!launched_agent(&Ok(StartOutcome::ResumeFailed {
+            sid: sid.clone(),
+        })));
+        assert!(launched_agent(&Ok(StartOutcome::FreshAfterFailedResume {
+            sid,
+        })));
+        assert!(!launched_agent(&Err("launch refused".into())));
     }
 }

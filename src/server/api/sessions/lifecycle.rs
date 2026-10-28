@@ -2907,7 +2907,11 @@ async fn prepare_agent_session_inner(
         };
         if matches!(
             outcome,
-            Some(crate::session::StartOutcome::Fresh | crate::session::StartOutcome::Resumed)
+            Some(
+                crate::session::StartOutcome::Fresh
+                    | crate::session::StartOutcome::Resumed
+                    | crate::session::StartOutcome::FreshAfterFailedResume { .. }
+            )
         ) {
             let wake_message = requested_wake_message.unwrap_or_else(|| {
                 crate::session::resolve_config(&profile)
@@ -3016,7 +3020,7 @@ mod durable_stop_tests {
         let transcript = root.path().join("private-transcript.jsonl");
         std::fs::write(&transcript, "private-conversation-body\n").unwrap();
         let sid = "11111111-2222-4333-8444-555555555555";
-        for (tool, failed_probe) in [("omp", false), ("omp", true), ("prime-agent", false)] {
+        for tool in ["omp", "prime-agent"] {
             let mut row = Instance::new("managed refusal", project.to_str().unwrap());
             row.tool = tool.into();
             row.command = tool.into();
@@ -3026,7 +3030,6 @@ mod durable_stop_tests {
             let mut binding = crate::session::ConversationBinding::unknown(sid);
             binding.transcript_path = Some(transcript.clone());
             row.agent_session_binding = Some(binding);
-            row.resume_probe_failed_sid = failed_probe.then(|| sid.into());
             row.omp_capture_generation = Some("original-generation".into());
             if tool == "omp" {
                 assert!(row.supports_native_resume());
@@ -3035,16 +3038,12 @@ mod durable_stop_tests {
                 assert!(row.launch_invokes_resolved_agent_directly(agent));
                 assert_eq!(row.command, "prime-agent");
                 assert_eq!(row.agent_session_id.as_deref(), Some(sid));
-                assert!(row.resume_probe_failed_sid.is_none());
                 assert_eq!(
                     std::fs::read_to_string(project.join(".prime/agent/settings.json")).unwrap(),
                     r#"{"sessionDir":7}"#
                 );
             }
             assert_eq!(row.resume_intent, crate::session::ResumeIntent::Default);
-            if failed_probe {
-                assert_eq!(row.resume_probe_failed_sid, row.agent_session_id);
-            }
             let conversation = row.conversation_state();
             let name = crate::tmux::Session::generate_name(&row.id, &row.title);
             let _pane = TmuxTestSession::from_name(&name);
@@ -3119,11 +3118,7 @@ mod durable_stop_tests {
                 headers[crate::daemon::ERROR_CODE_HEADER],
                 "managed_resume_refused"
             );
-            let expected_cause = if failed_probe {
-                crate::session::ManagedResumeCause::PreviousResumeProbeFailed
-            } else {
-                crate::session::ManagedResumeCause::ExecutionContextUnattested
-            };
+            let expected_cause = crate::session::ManagedResumeCause::ExecutionContextUnattested;
             assert_eq!(
                 headers[crate::daemon::MANAGED_RESUME_CAUSE_HEADER],
                 expected_cause.as_str(),

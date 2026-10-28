@@ -1297,6 +1297,7 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
 
     let mut succeeded: Vec<(String, String)> = Vec::new();
     let mut failed: Vec<(String, String)> = Vec::new();
+    let mut fresh_after_failed_resume: Vec<(String, String)> = Vec::new();
     let mut restarted: Vec<crate::session::Instance> = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
     while let Some(joined) = join_set.join_next().await {
@@ -1317,6 +1318,10 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
                 title,
                 format!("resume failed for sid {sid}; preserved for explicit retry"),
             )),
+            Ok(StartOutcome::FreshAfterFailedResume { sid }) => {
+                fresh_after_failed_resume.push((title.clone(), sid));
+                succeeded.push((id, title));
+            }
             Ok(StartOutcome::Resumed | StartOutcome::Fresh) => succeeded.push((id, title)),
             Err(e) => failed.push((title, e.to_string())),
         }
@@ -1345,6 +1350,12 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
     println!("✓ Restarted {}/{} sessions:", succeeded.len(), total);
     for (_id, title) in &succeeded {
         println!("  · {}", title);
+    }
+    for (title, sid) in &fresh_after_failed_resume {
+        println!(
+            "  · {}: started fresh after a prior resume failed for sid {}; the old conversation remains in the agent's history",
+            title, sid
+        );
     }
     if !orphaned.is_empty() {
         println!(
@@ -1496,6 +1507,12 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     match outcome {
         StartOutcome::ResumeFailed { sid } => {
             bail!("Resume failed for sid {sid}; preserved for explicit retry");
+        }
+        StartOutcome::FreshAfterFailedResume { sid } => {
+            println!(
+                "Restarted session: {} (started fresh after a prior resume failed for sid {}; the old conversation remains in the agent's history)",
+                title, sid
+            );
         }
         StartOutcome::Resumed | StartOutcome::Fresh => {
             println!("✓ Restarted session: {}", title);
