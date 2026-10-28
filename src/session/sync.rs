@@ -1458,15 +1458,7 @@ mod tests {
             if qualified {
                 attach_poller_with_omp_update(&mut inst, captured_sid, generation);
             } else {
-                let poller = SessionPoller::new(
-                    format!("test-tmux-{}", inst.id),
-                    inst.tool.clone(),
-                    inst.active_execution.clone(),
-                );
-                let mut observation = SessionIdObservation::unguarded(captured_sid.into());
-                observation.execution = inst.active_execution.clone();
-                poller.inject_test_observation(&inst.id, observation);
-                inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
+                attach_poller_with_update(&mut inst, captured_sid);
             }
             let mut instances = vec![inst];
 
