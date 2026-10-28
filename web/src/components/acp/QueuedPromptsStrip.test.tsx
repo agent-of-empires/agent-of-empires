@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { AgentProfileProvider } from "../../lib/agentProfileContext";
 import type { QueuedPrompt } from "../../lib/acpTypes";
 import { QueuedPromptsStrip } from "./PromptStrips";
+import type { QueuedReason } from "./queuedReason";
 
 afterEach(() => {
   cleanup();
@@ -21,16 +22,16 @@ const SERVER_CLEAR_ALIASES: Record<string, string[]> = {
   gemini: [],
 };
 
+const IDLE: QueuedReason = { label: "Queued", reason: null, action: "send" };
+
 function renderWithProfile(
   toolKey: string,
   queued: QueuedPrompt[],
   opts: {
     onSendNow?: (prompt: QueuedPrompt) => void;
     canSendNow?: boolean;
-    sendNowInterrupts?: boolean;
-    pendingResume?: boolean;
-    waitingFor?: string | null;
-    connecting?: boolean;
+    onStartAndSend?: () => void;
+    reason?: QueuedReason;
     agent?: string;
   } = {},
 ) {
@@ -43,10 +44,9 @@ function renderWithProfile(
         onClear={() => {}}
         onSendNow={opts.onSendNow ?? (() => {})}
         canSendNow={opts.canSendNow ?? true}
-        sendNowInterrupts={opts.sendNowInterrupts ?? false}
-        pendingResume={opts.pendingResume ?? false}
-        waitingFor={opts.waitingFor}
-        connecting={opts.connecting}
+        onStartAndSend={opts.onStartAndSend}
+        reason={opts.reason ?? IDLE}
+        soloAliases={SERVER_CLEAR_ALIASES[toolKey] ?? []}
         agent={opts.agent ?? "Claude Code"}
       />
     </AgentProfileProvider>,
@@ -75,25 +75,28 @@ describe("QueuedPromptsStrip", () => {
     expect(tooltip.textContent).not.toMatch(/tab stays open|other devices|Three closed chats/);
   });
 
-  it.each<[string, boolean, string | null, string, boolean?, boolean?]>([
-    ["a new Session names the Agent it waits for", true, "Claude Code", "Pending until Claude Code is ready (1)"],
-    ["a resumed Session waits to resume", true, null, "Pending until session resumes (1)"],
-    ["a running Session just queues", false, "Claude Code", "Queued (1)"],
-    ["an open connection holds an unconfirmed row", false, null, "Queuing (1)", false, true],
-    ["a running Worker with the connection down keeps a confirmed row queued", true, null, "Queued (1)", true],
+  it.each<[string, QueuedReason, string, string | null]>([
     [
-      "a running Worker with the connection down holds an unconfirmed row",
-      true,
-      null,
-      "Pending until connected (1)",
-      true,
-      true,
+      "a held queue names why",
+      { label: "Queued", reason: "sends when Codex finishes", action: "stopAndSend" },
+      "Queued (1)",
+      "· sends when Codex finishes",
     ],
-  ])("%s", (_label, pendingResume, waitingFor, header, connecting = false, pending = false) => {
-    const row = { ...mk("a", "hello"), ...(pending ? { pending } : {}) };
-    const { container } = renderWithProfile("claude", [row], { pendingResume, waitingFor, connecting });
-    expect(container.textContent).toContain(header);
-    expect(container.textContent).not.toContain("Held in this tab");
+    ["an idle queue has no reason", IDLE, "Queued (1)", null],
+    // Offline with a row the Daemon never got: nothing has been sent yet.
+    [
+      "an offline pending row",
+      { label: "Not sent", reason: "sends when this dashboard reconnects", action: "dropOnly" },
+      "Not sent (1)",
+      "· sends when this dashboard reconnects",
+    ],
+  ])("%s", (_label, reason, header, reasonText) => {
+    const { getByTestId, queryByTestId } = renderWithProfile("claude", [mk("a", "hello")], { reason });
+    const headerEl = getByTestId("queued-strip-header");
+    expect(headerEl.textContent?.startsWith(header)).toBe(true);
+    expect(queryByTestId("queued-strip-reason")?.textContent ?? null).toBe(reasonText);
+    // The header reads at the validated subtle contrast, not the dimmer token.
+    expect(headerEl.closest("div")?.outerHTML).not.toContain("text-text-dim");
   });
 
   // Two entries stay under the desktop collapse threshold, so both rows render.
@@ -124,28 +127,55 @@ describe("QueuedPromptsStrip", () => {
     expect(queryByRole("button", { name: /clear all/i }) !== null).toBe(shown);
   });
 
-  it("force-sends the row's prompt when Send now is clicked", () => {
+  it.each<[QueuedReason["action"], string, boolean, string | null]>([
+    ["send", "Send this queued message now", true, "Send this queued message now"],
+    ["stopAndSend", "Stop and send", true, null],
+    // The first row is a clear alias, so it runs as its own turn.
+    ["stopAndRun", "Stop and run", true, null],
+    ["startAndSend", "Start and send", false, null],
+  ])("the %s action renders %s", (action, text, viaSendNow, ariaLabel) => {
+    const sent: string[] = [];
+    const first = action === "stopAndRun" ? "/clear" : "go";
+    const btn = renderWithProfile("claude", [mk("a", first)], {
+      reason: { label: "Queued", reason: "why", action: action === "stopAndRun" ? "stopAndSend" : action },
+      onSendNow: (p) => sent.push(`send:${p.text}`),
+      onStartAndSend: () => sent.push("start"),
+    }).getByTestId("queued-send-now");
+    expect(btn.getAttribute("aria-label") ?? btn.textContent).toBe(ariaLabel ?? text);
+    fireEvent.click(btn);
+    expect(sent).toEqual([viaSendNow ? `send:${first}` : "start"]);
+  });
+
+  it("keeps a waiting row's action focusable, says why, and does nothing on click", () => {
     const sent: QueuedPrompt[] = [];
-    const row = mk("a", "ship it");
-    const { getByTestId } = renderWithProfile("claude", [row], { onSendNow: (p) => sent.push(p) });
-    fireEvent.click(getByTestId("queued-send-now"));
-    expect(sent).toEqual([row]);
+    const reason: QueuedReason = {
+      label: "Queued",
+      reason: "sends after compacting",
+      action: "disabled",
+      disabledReason: "Waiting: this sends after compacting",
+    };
+    const btn = renderWithProfile("claude", [mk("a", "go")], { reason, onSendNow: (p) => sent.push(p) }).getByTestId(
+      "queued-send-now",
+    );
+    expect(btn.getAttribute("aria-disabled")).toBe("true");
+    expect(btn.getAttribute("aria-label")).toBe("Waiting: this sends after compacting");
+    expect((btn as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(btn);
+    expect(sent).toEqual([]);
   });
 
   it.each([
-    [false, true, "Send this queued message now", false],
-    [true, true, "Stop the current turn and send this queued message", false],
-    [false, false, "Send this queued message now", true],
-  ])(
-    "labels Send now (interrupts=%s, canSendNow=%s) as %s, disabled=%s",
-    (sendNowInterrupts, canSendNow, label, disabled) => {
-      const btn = renderWithProfile("claude", [mk("a", "go")], { sendNowInterrupts, canSendNow }).getByTestId(
-        "queued-send-now",
-      );
-      expect(btn.getAttribute("aria-label")).toBe(label);
-      expect((btn as HTMLButtonElement).disabled).toBe(disabled);
-    },
-  );
+    [true, false],
+    [false, true],
+  ])("Send now with canSendNow=%s is disabled=%s", (canSendNow, disabled) => {
+    const btn = renderWithProfile("claude", [mk("a", "go")], { canSendNow }).getByTestId("queued-send-now");
+    expect((btn as HTMLButtonElement).disabled).toBe(disabled);
+  });
+
+  it("hides the row action when the row can only be dropped", () => {
+    const reason: QueuedReason = { label: "Not sent", reason: "x", action: "dropOnly" };
+    expect(renderWithProfile("claude", [mk("a", "go")], { reason }).queryByTestId("queued-send-now")).toBeNull();
+  });
 
   it("renders a thumbnail for an image attachment and no strip for text-only rows", () => {
     const withImage: QueuedPrompt = {
@@ -166,12 +196,12 @@ describe("QueuedPromptsStrip", () => {
     // `block` would override line-clamp's -webkit-box display and render the whole paste.
     expect(textButton.className.split(/\s+/)).not.toContain("block");
 
-    fireEvent.click(getByRole("button", { name: "Show full queued prompt" }));
+    fireEvent.click(getByRole("button", { name: "Show full queued message" }));
     expect(getByTitle("Click to edit").className).not.toContain("line-clamp-3");
     const box = getByTitle("Click to edit").parentElement as HTMLElement;
     expect(box.className).toContain("max-h-48");
     expect(box.className).toContain("overflow-y-auto");
-    const collapseToggle = getByRole("button", { name: "Collapse queued prompt" });
+    const collapseToggle = getByRole("button", { name: "Collapse queued message" });
     expect(collapseToggle.textContent).toBe("Show less");
     expect(box.contains(collapseToggle)).toBe(false);
   });

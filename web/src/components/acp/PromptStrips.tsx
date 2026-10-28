@@ -7,6 +7,7 @@ import { useAcpPrefs } from "../../lib/acpPrefs";
 import { useClearAliases } from "../../lib/agentProfileContext";
 import { isClearAlias } from "../../lib/agentProfiles";
 import { isQueuedPromptLong, queuedStripLayout } from "./queuedPromptsLayout";
+import type { QueuedAction, QueuedReason } from "./queuedReason";
 import { Tooltip } from "../Tooltip";
 
 const AMBER_STRIP = "border-amber-900/40 bg-amber-950/20";
@@ -15,9 +16,9 @@ const AMBER_DISMISS =
   "inline-flex shrink-0 items-center justify-center rounded-md border border-amber-700/40 bg-amber-900/20 p-1 text-amber-200 hover:bg-amber-900/60";
 
 /** Full-width strip above the composer, content aligned with the transcript column. */
-function Strip({ tone, children }: { tone: string; children: React.ReactNode }) {
+function Strip({ tone, testId, children }: { tone: string; testId?: string; children: React.ReactNode }) {
   return (
-    <div className={`border-t ${tone} px-4 py-2`}>
+    <div data-testid={testId} className={`border-t ${tone} px-4 py-2`}>
       <div className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl">{children}</div>
     </div>
   );
@@ -250,13 +251,12 @@ interface QueuedPromptsStripProps {
   /** Send now when the agent is free, or interrupt a running non-steerable turn. */
   onSendNow: (prompt: QueuedPrompt) => void;
   canSendNow: boolean;
-  sendNowInterrupts: boolean;
-  /** The drain cannot fire yet (disconnected, stopped, restarting, cold-starting). */
-  pendingResume: boolean;
-  /** For a Session that has never started: the Agent it waits for. */
-  waitingFor?: string | null;
-  /** The Worker is running; only the connection is down. */
-  connecting?: boolean;
+  /** Why the queue is waiting, and what a row's action does about it. */
+  reason: QueuedReason;
+  /** Start the Session, after which the Daemon sends the queue. */
+  onStartAndSend?: () => void;
+  /** Commands that run as their own turn: clear and compact aliases. */
+  soloAliases?: readonly string[];
   /** The Session's Agent, by display name, for the header's tooltip. */
   agent: string;
 }
@@ -268,10 +268,9 @@ export function QueuedPromptsStrip({
   onClear,
   onSendNow,
   canSendNow,
-  sendNowInterrupts,
-  pendingResume,
-  waitingFor = null,
-  connecting = false,
+  reason,
+  onStartAndSend,
+  soloAliases = NO_ALIASES,
   agent,
 }: QueuedPromptsStripProps) {
   const isMobile = useIsCoarsePointer();
@@ -281,8 +280,8 @@ export function QueuedPromptsStrip({
   const layout = queuedStripLayout({ queuedCount: queued.length, isMobile, expanded });
   const visible = queued.slice(0, layout.visibleCount);
   return (
-    <Strip tone="border-surface-800 bg-surface-900/60">
-      <div className="flex items-center justify-between gap-2 pb-1.5 text-[11px] uppercase tracking-wider text-text-dim">
+    <Strip tone="border-surface-800 bg-surface-900/60" testId="queued-strip">
+      <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-0.5 pb-1.5 text-[11px] text-text-subtle">
         {/* The Daemon holds the queue, except rows it hasn't confirmed yet: those live only here. */}
         <Tooltip
           multiline
@@ -295,23 +294,25 @@ export function QueuedPromptsStrip({
           <span
             tabIndex={0}
             data-testid="queued-strip-header"
-            className="flex min-w-0 items-center gap-1 wrap-anywhere rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
+            className="flex min-w-0 flex-wrap items-baseline gap-x-1 rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
           >
-            <Clock className="h-3 w-3 shrink-0" />
-            {pendingResume
-              ? waitingFor
-                ? `Pending until ${waitingFor} is ready (${queued.length})`
-                : connecting
-                  ? `${queued.some((q) => q.pending) ? "Pending until connected" : "Queued"} (${queued.length})`
-                  : `Pending until session resumes (${queued.length})`
-              : `${queued.some((q) => q.pending) ? "Queuing" : "Queued"} (${queued.length})`}
+            <span className="flex shrink-0 items-center gap-1 uppercase tracking-wider">
+              <Clock className="h-3 w-3 shrink-0" />
+              {`${reason.label} (${queued.length})`}
+            </span>
+            {/* Sentence case after the label; at a narrow width it wraps under it rather than truncating. */}
+            {reason.reason && (
+              <span data-testid="queued-strip-reason" className="min-w-0 wrap-anywhere">
+                · {reason.reason}
+              </span>
+            )}
           </span>
         </Tooltip>
         {queued.length > 1 && (
           <button
             type="button"
             onClick={onClear}
-            className="shrink-0 text-text-dim hover:text-text-secondary transition-colors"
+            className="shrink-0 uppercase tracking-wider text-text-subtle hover:text-text-secondary transition-colors"
           >
             Clear all
           </button>
@@ -343,8 +344,10 @@ export function QueuedPromptsStrip({
                 onRemove={() => onRemove(q.id)}
                 onEdit={(text) => onEdit(q.id, text)}
                 onSendNow={() => onSendNow(q)}
+                onStartAndSend={onStartAndSend}
                 canSendNow={canSendNow}
-                sendNowInterrupts={sendNowInterrupts}
+                action={rowAction(reason.action, isClearAlias(q.text, soloAliases))}
+                disabledReason={reason.disabledReason}
               />
             </Fragment>
           );
@@ -354,7 +357,7 @@ export function QueuedPromptsStrip({
         <button
           type="button"
           onClick={() => setExpanded((v) => !v)}
-          className="mt-1.5 w-full rounded-md border border-sky-700/20 bg-sky-950/10 px-2 py-1 text-[11px] font-medium uppercase tracking-wider text-sky-300 hover:bg-sky-950/30"
+          className="mt-1.5 w-full rounded-md border border-dashed border-status-unread/40 px-2 py-1 text-[11px] font-medium uppercase tracking-wider text-status-unread hover:bg-surface-800/60"
         >
           {layout.toggleLabel}
         </button>
@@ -363,28 +366,46 @@ export function QueuedPromptsStrip({
   );
 }
 
+const NO_ALIASES: readonly string[] = [];
+
+/** A row's own action: a solo command runs as its own turn, anything else sends. */
+function rowAction(action: QueuedAction, solo: boolean): QueuedAction {
+  if (action === "stopAndSend" || action === "stopAndRun") return solo ? "stopAndRun" : "stopAndSend";
+  return action;
+}
+
+const ACTION_TEXT: Partial<Record<QueuedAction, string>> = {
+  stopAndSend: "Stop and send",
+  stopAndRun: "Stop and run",
+  startAndSend: "Start and send",
+};
+
 function QueuedPromptRow({
   prompt,
   onRemove,
   onEdit,
   onSendNow,
+  onStartAndSend,
   canSendNow,
-  sendNowInterrupts,
+  action,
+  disabledReason,
 }: {
   prompt: QueuedPrompt;
   onRemove: () => void;
   onEdit: (text: string) => void;
   onSendNow: () => void;
+  onStartAndSend?: () => void;
   canSendNow: boolean;
-  sendNowInterrupts: boolean;
+  action: QueuedAction;
+  disabledReason?: string;
 }) {
   const [editing, setEditing] = useState(false);
   const [rowExpanded, setRowExpanded] = useState(false);
   const isLong = isQueuedPromptLong(prompt.text);
 
   return (
-    <li className="group flex items-start gap-2 rounded-lg border border-sky-700/30 bg-sky-950/15 px-2.5 py-1.5">
-      <span className="mt-0.5 inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-sky-500/20 text-[10px] font-semibold text-sky-300">
+    <li className="group flex items-start gap-2 rounded-lg border border-dashed border-status-unread/60 bg-transparent px-2.5 py-1.5">
+      <span className="mt-0.5 inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-status-unread/15 text-[10px] font-semibold text-status-unread">
         ⏱
       </span>
       {editing ? (
@@ -422,8 +443,8 @@ function QueuedPromptRow({
                 e.stopPropagation();
                 setRowExpanded((v) => !v);
               }}
-              className="mt-0.5 text-[11px] font-medium text-sky-300 hover:text-sky-200"
-              aria-label={rowExpanded ? "Collapse queued prompt" : "Show full queued prompt"}
+              className="mt-0.5 text-[11px] font-medium text-status-unread hover:text-text-primary"
+              aria-label={rowExpanded ? "Collapse queued message" : "Show full queued message"}
             >
               {rowExpanded ? "Show less" : "…"}
             </button>
@@ -433,7 +454,7 @@ function QueuedPromptRow({
               {prompt.attachments.map((att, i) => (
                 <span
                   key={`${att.name ?? att.kind}-${i}`}
-                  className="flex items-center gap-1 rounded border border-sky-700/40 bg-sky-950/30 py-0.5 pl-0.5 pr-1.5 text-[10px] text-sky-200"
+                  className="flex items-center gap-1 rounded border border-status-unread/40 py-0.5 pl-0.5 pr-1.5 text-[10px] text-text-secondary"
                   title={att.name ?? att.kind}
                 >
                   {att.kind === "image" && att.dataB64 ? (
@@ -453,26 +474,14 @@ function QueuedPromptRow({
           )}
         </div>
       )}
-      {!editing && (
-        <button
-          type="button"
-          onClick={onSendNow}
-          disabled={!canSendNow}
-          title={
-            !canSendNow
-              ? "Waiting to resume; this sends automatically once the session is back"
-              : sendNowInterrupts
-                ? "Stop the current turn and send this message now"
-                : "Send this message now"
-          }
-          aria-label={
-            sendNowInterrupts ? "Stop the current turn and send this queued message" : "Send this queued message now"
-          }
-          data-testid="queued-send-now"
-          className="shrink-0 rounded p-1 text-sky-300 hover:bg-surface-800 hover:text-sky-200 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-sky-300"
-        >
-          <SendHorizontal className="h-3.5 w-3.5" />
-        </button>
+      {!editing && action !== "dropOnly" && (
+        <QueuedRowAction
+          action={action}
+          disabledReason={disabledReason}
+          canSendNow={canSendNow}
+          onSendNow={onSendNow}
+          onStartAndSend={onStartAndSend}
+        />
       )}
       <button
         type="button"
@@ -483,6 +492,66 @@ function QueuedPromptRow({
         <X className="h-3.5 w-3.5" />
       </button>
     </li>
+  );
+}
+
+function QueuedRowAction({
+  action,
+  disabledReason,
+  canSendNow,
+  onSendNow,
+  onStartAndSend,
+}: {
+  action: QueuedAction;
+  disabledReason?: string;
+  canSendNow: boolean;
+  onSendNow: () => void;
+  onStartAndSend?: () => void;
+}) {
+  const text = ACTION_TEXT[action];
+  if (action === "disabled") {
+    // `aria-disabled`, not `disabled`: a disabled button gets no hover or focus, so its reason
+    // couldn't show.
+    return (
+      <Tooltip text={disabledReason ?? "Waiting"} multiline>
+        <button
+          type="button"
+          aria-disabled="true"
+          aria-label={disabledReason}
+          data-testid="queued-send-now"
+          className="shrink-0 cursor-not-allowed rounded p-1 text-status-unread opacity-40"
+        >
+          <SendHorizontal className="h-3.5 w-3.5" />
+        </button>
+      </Tooltip>
+    );
+  }
+  if (text) {
+    const start = action === "startAndSend";
+    return (
+      <button
+        type="button"
+        onClick={start ? onStartAndSend : onSendNow}
+        disabled={start ? !onStartAndSend : !canSendNow}
+        data-testid="queued-send-now"
+        className="shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium text-status-unread hover:bg-surface-800 hover:text-text-primary disabled:cursor-not-allowed disabled:opacity-40"
+      >
+        {text}
+      </button>
+    );
+  }
+  return (
+    <button
+      type="button"
+      onClick={onSendNow}
+      disabled={!canSendNow}
+      title={canSendNow ? "Send this message now" : "Send now needs this dashboard connected and the Agent running"}
+      aria-label="Send this queued message now"
+      data-testid="queued-send-now"
+      className="shrink-0 rounded p-1 text-status-unread hover:bg-surface-800 hover:text-text-primary disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
+    >
+      <SendHorizontal className="h-3.5 w-3.5" />
+    </button>
   );
 }
 
