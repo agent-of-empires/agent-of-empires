@@ -324,36 +324,34 @@ pub(crate) fn project_base_branches(profile: &str) -> std::collections::HashMap<
     merge_base_branches(global, scoped)
 }
 
-/// Per-scope defaults keyed by repo root, profile over global. Within a scope, a registration at
-/// the root itself wins over a linked worktree that collapses to the same root.
+/// Defaults keyed by repo root. A profile row shadows a global row at the same path first; unset
+/// rows are then dropped, and rows collapsing to one root rank profile over global, then a
+/// registration at the root itself over a linked-worktree alias.
 fn merge_base_branches(
     global: Vec<crate::session::projects::Project>,
     scoped: Vec<crate::session::projects::Project>,
 ) -> std::collections::HashMap<String, String> {
-    let by_root = |projects: Vec<crate::session::projects::Project>| {
-        let mut map = std::collections::HashMap::<String, Option<String>>::new();
-        for p in projects {
-            let key = project_root_key(&p.path);
-            let is_root = crate::session::projects::canonical_key(&p.path) == key;
-            let base = p
-                .default_base_branch
-                .map(|b| b.trim().to_string())
-                .filter(|b| !b.is_empty());
-            if base.is_none() && !is_root {
-                continue;
-            }
-            if is_root || !map.contains_key(&key) {
-                map.insert(key, base);
-            }
+    use crate::session::projects::{canonical_key, merge_project_scopes, ProjectScope};
+    let mut best = std::collections::HashMap::<String, ((bool, bool), String)>::new();
+    for p in merge_project_scopes(global, scoped, |p| canonical_key(&p.path)) {
+        let Some(base) = p
+            .default_base_branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+        else {
+            continue;
+        };
+        let key = project_root_key(&p.path);
+        let rank = (
+            p.scope == ProjectScope::Profile,
+            canonical_key(&p.path) == key,
+        );
+        if best.get(&key).is_none_or(|(r, _)| rank > *r) {
+            best.insert(key, (rank, base.to_string()));
         }
-        map
-    };
-    let mut merged = by_root(global);
-    merged.extend(by_root(scoped));
-    merged
-        .into_iter()
-        .filter_map(|(k, base)| Some((k, base?)))
-        .collect()
+    }
+    best.into_iter().map(|(k, (_, base))| (k, base)).collect()
 }
 
 /// Registry key for a project: its repo root, so a project registered at
@@ -2636,8 +2634,30 @@ mod tests {
         // An unset worktree alias never replaces or hides a configured base.
         let bases = merge_base_branches(vec![proj(&root, "release", g)], vec![proj(&wt, "", pr)]);
         assert_eq!(bases.get(&key).map(String::as_str), Some("release"));
-        let bases = merge_base_branches(vec![proj(&wt, "", g), proj(&wt, "release", g)], vec![]);
+        // An unset root row does not hide a configured worktree alias.
+        let bases = merge_base_branches(vec![proj(&root, "", g), proj(&wt, "release", g)], vec![]);
         assert_eq!(bases.get(&key).map(String::as_str), Some("release"));
+    }
+
+    #[test]
+    fn merge_base_branches_lets_unset_profile_shadow_same_path_global() {
+        use crate::session::projects::{Project, ProjectScope};
+        let dir = tempfile::Builder::new()
+            .prefix("aoe-test-")
+            .tempdir()
+            .unwrap();
+        let bare = dir.path().join(".git");
+        git2::Repository::init_bare(&bare).unwrap();
+        let proj = |base: Option<&str>, scope| {
+            let mut p = Project::new("p", bare.to_string_lossy(), scope);
+            p.default_base_branch = base.map(str::to_string);
+            p
+        };
+        let bases = merge_base_branches(
+            vec![proj(Some("release"), ProjectScope::Global)],
+            vec![proj(None, ProjectScope::Profile)],
+        );
+        assert!(bases.is_empty());
     }
 
     /// Create a repo with `main` plus a second branch holding a distinct
