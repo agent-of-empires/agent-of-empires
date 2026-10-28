@@ -6219,7 +6219,8 @@ mod tests {
             };
 
             let stages = run_with_capture(|| {
-                let _ = perform_deletion(&request);
+                let result = perform_deletion(&request);
+                assert!(result.success, "{:?}", result.errors);
             });
             assert!(
                 !stages.iter().any(|s| s == "sandbox_worktree_preclean"),
