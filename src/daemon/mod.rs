@@ -48,6 +48,8 @@ pub use wire::{
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
+/// A destroy hook may run for minutes per row, so the bulk purge outlives `DEFAULT_TIMEOUT`.
+const EMPTY_TRASH_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
 const MAX_SUCCESS_BODY_BYTES: usize = 16 * 1024 * 1024;
 
@@ -756,8 +758,18 @@ impl DaemonClient {
         body: &EmptyTrashBody,
         epoch: &str,
     ) -> Result<MutationReceipt<EmptyTrashOutcome>, DaemonClientError> {
+        self.empty_trash_within(body, epoch, EMPTY_TRASH_TIMEOUT)
+            .await
+    }
+
+    async fn empty_trash_within(
+        &self,
+        body: &EmptyTrashBody,
+        epoch: &str,
+        timeout: Duration,
+    ) -> Result<MutationReceipt<EmptyTrashOutcome>, DaemonClientError> {
         let url = format!("{}/empty-trash", self.sessions_url);
-        self.request_mutation_with_outcome(self.http.post(url).json(body), epoch)
+        self.request_mutation_with_outcome(self.http.post(url).json(body).timeout(timeout), epoch)
             .await
     }
 
@@ -1491,6 +1503,45 @@ mod tests {
         assert_eq!(captured.epoch.as_deref(), Some("epoch-1"));
         let body: serde_json::Value = serde_json::from_slice(&captured.body).unwrap();
         assert_eq!(body["profile"], "work");
+    }
+
+    #[tokio::test]
+    async fn empty_trash_waits_for_a_slow_batch_within_its_own_deadline() {
+        let app = axum::Router::new().route(
+            "/api/sessions/empty-trash",
+            axum::routing::post(|| async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                (
+                    [
+                        (RUNTIME_EPOCH_HEADER, "epoch-1"),
+                        (RUNTIME_REVISION_HEADER, "3"),
+                    ],
+                    r#"{"sessions":[],"failures":[]}"#,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind slow test server");
+        let base = format!("http://{}", listener.local_addr().expect("server addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve slow test");
+        });
+        let client = DaemonClient::new(&base, None).expect("test client");
+        let body = EmptyTrashBody {
+            profile: "work".into(),
+        };
+        let early = client
+            .empty_trash_within(&body, "epoch-1", Duration::from_millis(50))
+            .await;
+        assert!(
+            matches!(early, Err(DaemonClientError::Timeout)),
+            "{early:?}"
+        );
+        client
+            .empty_trash_within(&body, "epoch-1", Duration::from_secs(10))
+            .await
+            .expect("a slow bulk purge returns its receipt inside the request's own deadline");
     }
 
     #[tokio::test]

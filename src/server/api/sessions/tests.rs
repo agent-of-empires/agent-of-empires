@@ -10209,3 +10209,51 @@ async fn empty_trash_skips_a_row_moved_to_another_profile_mid_purge() -> anyhow:
         .any(|row| row.id == second.id && row.is_trashed()));
     Ok(())
 }
+
+/// A client that disconnects mid-purge must not abort the owned batch.
+#[tokio::test]
+async fn empty_trash_batch_survives_the_client_disconnecting() -> anyhow::Result<()> {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let root = crate::session::get_app_dir()?;
+    crate::session::purge_owners::initialize(&root)?;
+    crate::tmux::tool_retirement::initialize(&root)?;
+    let profile = "empty-trash-disconnect";
+    let project = tempfile::tempdir()?;
+    let mut row = Instance::new("only", project.path().to_str().unwrap());
+    row.source_profile = profile.into();
+    row.trash();
+    crate::server::test_support::seed_instances_on_disk_for_test(profile, vec![row.clone()]);
+    let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+
+    let submission = state.session_service.prompt_submission(&row.id).await;
+    let mut claims = state.session_service.watch_submission_claims();
+    let mut request = Box::pin(empty_trash(
+        State(state.clone()),
+        Ok(Json(crate::daemon::EmptyTrashBody {
+            profile: profile.into(),
+        })),
+    ));
+    assert!(futures_util::poll!(request.as_mut()).is_pending());
+    let claimed = tokio::time::timeout(std::time::Duration::from_secs(10), claims.recv())
+        .await?
+        .expect("claim channel open");
+    assert_eq!(claimed, row.id, "the batch is parked on the row");
+    drop(request);
+    drop(submission);
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while state
+            .instances
+            .read()
+            .await
+            .iter()
+            .any(|existing| existing.id == row.id)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    Ok(())
+}
