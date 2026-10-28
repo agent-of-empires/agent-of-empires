@@ -8,9 +8,12 @@ const BOOST_MS = 15000;
 
 function toast(n: PluginUiNotification): void {
   const message = n.body ? `${n.title}: ${n.body}` : n.title;
+  const failing = n.tone === "danger" || n.tone === "warn";
   if (n.href) {
     reportOpenLink(message, n.href);
-  } else if (n.tone === "danger" || n.tone === "warn") {
+  } else if (n.link) {
+    reportOpenLink(message, n.link, failing ? "error" : "info");
+  } else if (failing) {
     reportError(message);
   } else {
     reportInfo(message);

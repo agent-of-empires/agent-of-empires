@@ -1016,6 +1016,8 @@ export interface PluginUiNotification {
    *  toast is rendered as click-to-open: a browser blocks `window.open` from an
    *  async push, so the open happens on the user's click. Always http/https. */
   href?: string;
+  /** A dashboard path to a deep-linked plugin page (`ui.notify` `link`). The toast keeps its tone and opens the path on click. */
+  link?: string;
 }
 
 /** A page an active plugin declares; `url` serves its HTML to a sandboxed frame. */
@@ -1027,6 +1029,8 @@ export interface PluginPage {
   url: string;
   /** The plugin's granted capabilities; the page bridge gates on them. */
   capabilities: string[];
+  /** The page takes the `?link=` value of its dashboard URL over the bridge. Absent on older daemons. */
+  deep_link?: boolean;
 }
 
 export interface PluginUiState {
