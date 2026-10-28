@@ -21,6 +21,7 @@ export function buildCreateRequest(d: WizardData, acpCapable: boolean): CreateSe
     sandbox: d.sandboxEnabled,
     sandbox_image: d.sandboxEnabled ? d.sandboxImage : undefined,
     extra_env: d.sandboxEnabled && d.extraEnv.length > 0 ? d.extraEnv.filter(Boolean) : undefined,
+    hook_env: d.sandboxEnabled && d.hookEnv.some(Boolean) ? d.hookEnv.filter(Boolean) : undefined,
     extra_repo_paths: !d.scratch && d.extraRepoPaths.length > 0 ? d.extraRepoPaths : undefined,
     // A base is meaningless when attaching to an existing branch.
     repo_bases: newBranch

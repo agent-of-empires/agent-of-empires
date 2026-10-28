@@ -184,16 +184,18 @@ impl ChannelSink {
         };
 
         // Fold before broadcasting, in the same seq order the log is written in.
-        if persisted {
-            self.control_cache.apply_if_cached(session_id, seq, event);
+        let sidebar_status = if persisted {
+            self.control_cache.apply_if_cached(session_id, seq, event)
         } else {
             self.control_cache.forget(session_id);
-        }
+            None
+        };
         let _ = self.tx.send(crate::server::AcpBroadcastFrame {
             session_id: session_id.to_string(),
             seq,
             event: Arc::new(event.clone()),
             worker_generation,
+            sidebar_status,
         });
         persisted
     }

@@ -102,6 +102,9 @@ pub enum SupervisorError {
     /// The previous runner is not proven dead yet.
     #[error("session {0:?} is still stopping its previous structured view worker")]
     TeardownPending(String),
+    /// The worker a caller observed is no longer the running one.
+    #[error("session {0:?} worker changed before the stop claimed it")]
+    Superseded(String),
     #[error(transparent)]
     Blocked(crate::session::StartBlocked),
     #[error("session {0:?} no longer exists")]
@@ -308,6 +311,10 @@ impl Drop for RestartRequestGuard {
 }
 
 impl RestartRequestGuard {
+    pub(crate) fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+
     pub(crate) fn is_cancelled(&self) -> bool {
         self.cancellation.is_cancelled()
     }
@@ -569,6 +576,13 @@ impl<S: BroadcastSink> Supervisor<S> {
         if let Ok(mut guard) = self.next_seqs.lock() {
             guard.extend(pairs);
         }
+    }
+
+    /// The running epoch, for a caller that must stop only that epoch.
+    pub(crate) fn running_lease(&self, session_id: &str) -> Option<Lease> {
+        lock_recover(&self.lifecycle)
+            .running(session_id)
+            .map(|(lease, _)| lease)
     }
 
     /// Whether this session has a worker up or coming up.
@@ -886,15 +900,16 @@ mod tests {
         };
 
         // The stop request must publish its fence before waiting for workers.
-        for _ in 0..100 {
-            if lock_recover(&sup.spawn_requests)
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !lock_recover(&sup.spawn_requests)
                 .stop_fences
                 .contains_key("s-fence-cancel")
             {
-                break;
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
+        })
+        .await
+        .expect("stop fence is published");
         assert!(lock_recover(&sup.spawn_requests)
             .stop_fences
             .contains_key("s-fence-cancel"));
@@ -927,12 +942,12 @@ mod tests {
                     .await
             })
         };
-        for _ in 0..100 {
-            if pending.cancellation().is_cancelled() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            pending.cancellation().cancelled(),
+        )
+        .await
+        .expect("pending spawn is cancelled");
         assert!(pending.cancellation().is_cancelled());
         stopping.abort();
         assert!(matches!(stopping.await, Err(join) if join.is_cancelled()));

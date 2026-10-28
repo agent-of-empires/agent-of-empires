@@ -477,11 +477,36 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
     // Acquire the launch exclusion only after the old worker has stopped. It
     // owns the submission mutex, so taking it before the stop barrier would
     // prevent an external stop from completing while restart waits here.
-    let exclusion =
-        match crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &id, true).await {
-            Ok(exclusion) => exclusion,
-            Err(_) => return session_not_found(),
-        };
+    let exclusion = tokio::select! {
+        biased;
+        _ = restart.cancellation().cancelled() => {
+            return supervisor_error_response(
+                "restart cancelled by a stop request",
+                &crate::acp::supervisor::SupervisorError::SpawnCancelled(id.clone()),
+            );
+        }
+        exclusion = crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &id, true) => {
+            match exclusion {
+                Ok(exclusion) => exclusion,
+                Err(_) => return session_not_found(),
+            }
+        }
+    };
+    let Some(instance) = find_instance(&state, &id).await else {
+        return session_not_found();
+    };
+    let explicit = req.agent.clone().or_else(|| instance.agent_name.clone());
+    let agent = pick_agent(&state, &instance, explicit.as_deref()).await;
+    if instance.source_profile != preflight_instance.source_profile
+        || instance.project_path != preflight_instance.project_path
+        || agent != preflight_agent
+    {
+        return (
+            StatusCode::CONFLICT,
+            "session changed during restart preflight; retry the restart",
+        )
+            .into_response();
+    }
     let instance =
         match crate::server::api::sessions::resume_structured_stop(&state, instance).await {
             Ok(instance) => instance,
@@ -2438,6 +2463,84 @@ mod tests {
                 .status(),
             StatusCode::NO_CONTENT
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restart_rechecks_session_and_cancellation_after_waiting_for_exclusion() {
+        for cancel in [false, true] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let mut instance =
+                crate::session::Instance::new("restart-exclusion", "/tmp/aoe-restart-exclusion");
+            instance.view = crate::session::View::Structured;
+            instance.agent_name = Some("claude".into());
+            instance.source_profile = "default".into();
+            let id = instance.id.clone();
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![instance.clone()],
+            );
+            let state = crate::server::test_support::build_test_app_state_with_launcher(
+                vec![instance],
+                crate::server::test_support::succeeding_launcher(),
+            );
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            state.acp_supervisor.test_insert_worker(&id).await;
+            let lock = state.instance_lock(&id).await;
+            let guard = lock.lock().await;
+            let mut claims = state.session_service.watch_submission_claims();
+            let request = {
+                let state = Arc::clone(&state);
+                let id = id.clone();
+                tokio::spawn(async move {
+                    restart_acp(
+                        State(state),
+                        Path(id),
+                        Ok(Json(SpawnAcpRequest {
+                            agent: None,
+                            model: None,
+                            additional_dirs: Vec::new(),
+                            provider_env: Vec::new(),
+                        })),
+                    )
+                    .await
+                    .into_response()
+                })
+            };
+            for _ in 0..2 {
+                assert_eq!(
+                    tokio::time::timeout(std::time::Duration::from_secs(3), claims.recv())
+                        .await
+                        .expect("restart reaches each submission barrier"),
+                    Some(id.clone())
+                );
+            }
+            assert_eq!(
+                state.acp_supervisor.worker_state(&id).await,
+                crate::daemon::AcpWorkerState::Absent
+            );
+            if cancel {
+                state.acp_supervisor.cancel_restart_request(&id).await;
+            } else {
+                let mut instances = state.instances.write().await;
+                instances
+                    .iter_mut()
+                    .find(|row| row.id == id)
+                    .unwrap()
+                    .agent_name = Some("codex".into());
+                drop(instances);
+                drop(guard);
+            }
+            let response = tokio::time::timeout(std::time::Duration::from_secs(3), request)
+                .await
+                .expect("restart finishes")
+                .expect("restart task");
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(
+                state.acp_supervisor.worker_state(&id).await,
+                crate::daemon::AcpWorkerState::Absent
+            );
+        }
     }
 
     #[tokio::test]

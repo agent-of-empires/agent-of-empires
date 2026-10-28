@@ -659,12 +659,12 @@ pub(super) async fn wait_until_left_starting(
 pub async fn create_session(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<CreateSessionQuery>,
-    local: Option<axum::Extension<crate::server::auth::LocalAuthorization>>,
+    local: Option<axum::Extension<crate::server::principal::Principal>>,
     body: Result<Json<CreateSessionBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    let local_owner = matches!(
+    let local_owner = crate::server::principal::authorize(
         local.as_deref(),
-        Some(crate::server::auth::LocalAuthorization::UnixOwner(_))
+        crate::server::principal::Capability::CreateHookDetail,
     );
     if state.read_only {
         return crate::server::api::read_only_response();
@@ -764,6 +764,7 @@ pub async fn create_session(
         body.command_override = String::new();
         body.extra_args = String::new();
         body.extra_env = Vec::new();
+        body.hook_env = Vec::new();
         body.yolo_mode = false;
         body.worktree_enabled = false;
         body.worktree_branch = None;
@@ -830,6 +831,14 @@ pub async fn create_session(
             StatusCode::BAD_REQUEST,
             "validation_failed",
             "Cannot combine scratch with path",
+        );
+    }
+
+    if !body.hook_env.is_empty() && !body.sandbox {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "hook_env requires sandbox; host_hooks.before_start only runs for sandboxed sessions",
         );
     }
 
@@ -1151,6 +1160,7 @@ pub async fn create_session(
         sandbox_image: body.sandbox_image,
         yolo_mode: body.yolo_mode,
         extra_env: body.extra_env,
+        before_start_hook_env: body.hook_env,
         extra_args: body.extra_args,
         command_override: body.command_override,
         extra_repo_paths: body.extra_repo_paths,
@@ -1318,7 +1328,7 @@ fn create_failure(e: &anyhow::Error) -> Option<crate::server::create_progress::C
 pub async fn create_session_progress(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
-    local: Option<axum::Extension<crate::server::auth::LocalAuthorization>>,
+    local: Option<axum::Extension<crate::server::principal::Principal>>,
 ) -> impl IntoResponse {
     match state.create_progress.snapshot(&key, local.as_deref()) {
         Some(snapshot) => Json(snapshot).into_response(),

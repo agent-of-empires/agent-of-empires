@@ -234,7 +234,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
         let lease = reservation.lease().clone();
         if req.launch_admission.is_none() {
-            match await_resume(
+            match await_resume_to_completion(
                 reservation.cancellation(),
                 capture_durable_launch(
                     req.source_profile.as_deref(),
@@ -251,7 +251,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
         }
         lease.set_admission(req.launch_admission.clone());
-        match await_resume(
+        match await_resume_to_completion(
             reservation.cancellation(),
             admit_durable_launch(req.launch_admission.as_ref(), &req.session_id),
         )
@@ -291,7 +291,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             "spawning structured view worker"
         );
         // The hooks above may re-enter aoe, so the lifecycle lock is taken only for each check.
-        match await_resume(
+        match await_resume_to_completion(
             reservation.cancellation(),
             admit_durable_launch(req.launch_admission.as_ref(), &req.session_id),
         )
@@ -491,7 +491,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
         // Every worker runs through `aoe __acp-runner` so it survives `aoe serve --stop`.
         let socket_path = worker_registry::socket_path_for(&req.session_id).map_err(|e| {
-            SupervisorError::Acp(AcpError::Spawn(format!("worker socket path: {e}")))
+            SupervisorError::Acp(AcpError::Spawn(format!("worker socket path: {e:#}")))
         })?;
         let mcp_servers = resolve_mcp_servers(
             &req.agent,
@@ -1384,6 +1384,30 @@ mod tests {
     use crate::acp::approvals::{ApprovalDecision, Nonce};
     use crate::acp::runner_lifecycle::test_support::FakeProcessControl;
     use crate::daemon::AcpWorkerState;
+
+    #[tokio::test]
+    async fn cancellation_waits_for_started_work_to_finish() {
+        let cancellation = CancellationToken::new();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let token = cancellation.clone();
+        let mut work = tokio::spawn(async move {
+            await_resume_to_completion(&token, async {
+                started_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+            })
+            .await
+        });
+        started_rx.await.unwrap();
+        cancellation.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut work)
+                .await
+                .is_err()
+        );
+        release_tx.send(()).unwrap();
+        assert!(work.await.unwrap().is_err());
+    }
 
     #[tokio::test]
     #[serial_test::serial]

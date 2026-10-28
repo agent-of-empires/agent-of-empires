@@ -16,9 +16,9 @@ use super::launch::{
 };
 use super::teardown::{settle_sweeping_if_owed, tear_down_runner, wait_for_exit};
 use super::{
-    lock_recover, next_seq, BroadcastSink, Launcher, PendingContextReset, ResumeReservation,
-    SeqMap, SharedSet, Supervisor, SupervisorError, WorkerKind, Workers, MAX_RESPAWNS_IN_WINDOW,
-    RESPAWN_BACKOFF, RESTART_WINDOW,
+    lock_recover, next_seq, BroadcastSink, Launcher, PendingContextReset, SeqMap, SharedSet,
+    Supervisor, SupervisorError, WorkerKind, Workers, MAX_RESPAWNS_IN_WINDOW, RESPAWN_BACKOFF,
+    RESTART_WINDOW,
 };
 use crate::acp::acp_client::{AcpError, SpawnConfig};
 use crate::acp::runner_lifecycle::{
@@ -1503,7 +1503,7 @@ mod tests {
             .await
             .expect("the replacement freezes proof before its stop gate");
         assert_eq!(sup.worker_state("s-resp").await, AcpWorkerState::Resuming);
-        sup.shutdown_idle("s-resp").await.expect("cancel");
+        sup.shutdown_idle("s-resp", None).await.expect("cancel");
         gate.open.notify_one();
 
         tokio::time::timeout(Duration::from_secs(5), drain)
@@ -2191,7 +2191,7 @@ mod tests {
             flagged = sup.take_respawned_in_place();
         }
         assert_eq!(flagged, vec!["s-crash".to_string()]);
-        sup.shutdown_idle("s-crash").await.expect("shutdown");
+        sup.shutdown_idle("s-crash", None).await.expect("shutdown");
     }
 
     #[tokio::test]
@@ -2352,7 +2352,7 @@ mod tests {
             .host_environment
             .contains(&("HOOK_VALUE".into(), "kept".into())));
 
-        sup.shutdown_idle("s-store").await.expect("shutdown");
+        sup.shutdown_idle("s-store", None).await.expect("shutdown");
         held_senders.lock().unwrap().clear();
         tokio::time::timeout(Duration::from_secs(5), drain)
             .await

@@ -251,6 +251,83 @@ describe("usePaneLayout outside a repository (#4574)", () => {
     expect(dockTabs(result.current.layout, "right")).toEqual(expected);
   });
 
+  type Api = ReturnType<typeof usePaneLayout>;
+  const unknownThenKnown = (known: boolean, ...actions: ((api: Api) => void)[]) => {
+    seededTemplate();
+    localStorage.setItem("aoe-web-settings", JSON.stringify({ autoOpenDiffPane: true, autoOpenTerminalPane: true }));
+    const { result, rerender } = renderHook(({ outside }) => usePaneLayout("s1", outside), {
+      initialProps: { outside: null as boolean | null },
+    });
+    for (const action of actions) act(() => action(result.current));
+    rerender({ outside: known });
+    return result;
+  };
+
+  it.each([
+    [false, ["diff", "terminal:0", "plugin:p:a"]],
+    [true, ["terminal:0", "plugin:p:a"]],
+  ])("keeps a mutation made while status is unknown, adding Diff only for git (outside=%s)", (known, expected) => {
+    const result = unknownThenKnown(known, (api) => api.openTab("plugin:p:a", "right"));
+    expect(dockTabs(result.current.layout, "right")).toEqual(expected);
+  });
+
+  it("lets a second action see the first while status is unknown", () => {
+    const result = unknownThenKnown(
+      false,
+      (api) => api.setDockCollapsed("right", true),
+      (api) => api.setDockCollapsed("right", false),
+    );
+    expect(isDockCollapsed(result.current.layout, "right")).toBe(false);
+  });
+
+  it("keeps a Diff toggled open while status is unknown", () => {
+    const result = unknownThenKnown(false, (api) => api.toggleKind("diff", "right"));
+    expect(dockTabs(result.current.layout, "right")).toEqual(["terminal:0", "diff"]);
+  });
+
+  it("leaves Diff closed when the user closed it while status was unknown", () => {
+    const result = unknownThenKnown(
+      false,
+      (api) => api.toggleKind("diff", "right"),
+      (api) => api.toggleKind("diff", "right"),
+    );
+    expect(dockTabs(result.current.layout, "right")).toEqual(["terminal:0"]);
+  });
+
+  it("restores Diff as the active tab after a dock-only action while status was unknown", () => {
+    const result = unknownThenKnown(false, (api) => api.setDockCollapsed("right", true));
+    expect(groups(result.current.layout)).toEqual([[["diff", "terminal:0"], "diff"]]);
+    expect(isDockCollapsed(result.current.layout, "right")).toBe(true);
+  });
+
+  it("still adds Diff for a git Session after a reload inside the unknown window", () => {
+    seededTemplate();
+    localStorage.setItem("aoe-web-settings", JSON.stringify({ autoOpenDiffPane: true, autoOpenTerminalPane: true }));
+    const first = renderHook(() => usePaneLayout("s1", null));
+    act(() => first.result.current.openTab("plugin:p:a", "right"));
+    first.unmount();
+    const reloaded = renderHook(() => usePaneLayout("s1", false));
+    expect(dockTabs(reloaded.result.current.layout, "right")).toEqual(["diff", "terminal:0", "plugin:p:a"]);
+  });
+
+  it("leaves a stored layout alone when status becomes known", () => {
+    localStorage.setItem(
+      "aoe-pane-layout-v2",
+      JSON.stringify({
+        version: 2,
+        template: { ...layout(["diff"]), nextTerminalIndex: 1 },
+        sessions: { s1: { ...layout([]), nextTerminalIndex: 1 } },
+      }),
+    );
+    const { result, rerender } = renderHook(({ outside }) => usePaneLayout("s1", outside), {
+      initialProps: { outside: null as boolean | null },
+    });
+    act(() => result.current.openTab("plugin:p:a", "right"));
+    expect(dockTabs(result.current.layout, "right")).toEqual(["plugin:p:a"]);
+    rerender({ outside: false });
+    expect(dockTabs(result.current.layout, "right")).toEqual(["plugin:p:a"]);
+  });
+
   it("applies a flag that arrives after seeding, but never closes a Diff the user opened", () => {
     seededTemplate();
     const { result, rerender } = renderHook(({ outside }) => usePaneLayout("s1", outside), {

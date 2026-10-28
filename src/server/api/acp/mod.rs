@@ -78,6 +78,7 @@ fn supervisor_error_response(context: &str, err: &SupervisorError) -> Response {
         SupervisorError::RestartInProgress(_) => {
             (StatusCode::CONFLICT, format!("restart_in_progress: {err}"))
         }
+        SupervisorError::Superseded(_) => (StatusCode::CONFLICT, err.to_string()),
         SupervisorError::CapacityFull { .. }
         | SupervisorError::TeardownPending(_)
         | SupervisorError::NativeStoreUnavailable => {
@@ -926,6 +927,7 @@ mod tests {
                     seq: seq as u64 + 1,
                     event: Arc::new(event),
                     worker_generation: None,
+                    sidebar_status: None,
                 })
                 .unwrap();
         }
@@ -973,6 +975,7 @@ mod tests {
                     acp_session_id: "drained".into(),
                 }),
                 worker_generation: None,
+                sidebar_status: None,
             })
             .unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
