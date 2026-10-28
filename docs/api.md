@@ -589,6 +589,29 @@ what the agent printed back, or as a polling read-only view.
 | `lines` | `200` | Number of trailing lines to capture. Clamped to `1..=2000`. |
 | `format` | `text` | `text` strips ANSI escape sequences. `ansi` returns the raw pane bytes (use this if your client renders color). |
 
+### Driving a session as a subagent
+
+`send` and `output` are the minimum primitives for running a session as a controlled subagent:
+
+1. `POST /api/sessions/{id}/send` with the prompt.
+2. Poll until the session's `status` returns to `Idle` (cheaper than polling `output`), or until pane content stabilizes across two reads a second apart.
+3. Read `output` once and capture its trailing region as the reply.
+
+Status transitions also reach `callback_url` and push subscribers.
+
+## MCP server
+
+With `[web] mcp_enabled = true` in `config.toml` (read at daemon startup), the daemon serves a [Model Context Protocol](https://modelcontextprotocol.io) server over Streamable HTTP at `POST /mcp`. With the setting off the route does not exist. It takes the same token as the rest of the API and reports `401` without one.
+
+A session can instead authenticate as itself: a bearer token equal to `HMAC-SHA256(secret, session_id)`, hex-encoded, presented alongside an `X-AoE-Session` header naming that `session_id`. The secret is generated once per app directory and never rotates. The pair is accepted only for a session that still exists and is neither archived nor trashed; any other case (wrong session id, wrong bearer, unknown or gone session) reports the same `401` as a missing token.
+
+| Tool | Arguments | Returns |
+| --- | --- | --- |
+| `list_sessions` | `state` (`live`, the default, or `all`), `group` (a group path, including everything beneath it), `children_of` (a session id) | The `GET /api/sessions` body, PascalCase `status` included. |
+| `whoami` | none | The calling session (same shape as `GET /api/sessions`'s rows) when authenticated via its own `X-AoE-Session` credential, `null` otherwise. |
+
+Both tools declare an `outputSchema` and return the result as `structuredContent`.
+
 **Responses**
 
 | Status | Body | When |
