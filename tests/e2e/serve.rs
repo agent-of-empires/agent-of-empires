@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 use serial_test::parallel;
 
 use crate::harness::{
-    app_dir_in, pick_free_port, require_node, require_tmux, wait_for_port, TuiTestHarness,
+    app_dir_in, pick_free_port, require_node, require_tmux, wait_for_port, wait_until,
+    TuiTestHarness,
 };
 
 /// Resolve the daemon's PID file inside the harness's isolated home.
@@ -24,6 +25,284 @@ fn daemon_launch_path(h: &TuiTestHarness) -> PathBuf {
 /// True iff the kernel still has a process with this PID.
 fn pid_alive(pid: i32) -> bool {
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+}
+
+fn daemon_pid(h: &TuiTestHarness) -> Option<u32> {
+    std::fs::read_to_string(daemon_pid_path(h))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Primary URL published by the running daemon, token included.
+fn primary_serve_url(h: &TuiTestHarness) -> Option<String> {
+    let raw = std::fs::read_to_string(app_dir_in(h.home_path()).join("serve.url")).ok()?;
+    raw.lines()
+        .next()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
+fn serve_url_parts(url: &str) -> Result<(u16, String), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|error| error.to_string())?;
+    let port = parsed
+        .port()
+        .ok_or_else(|| format!("serve.url has no explicit port: {url}"))?;
+    let token = parsed
+        .query_pairs()
+        .find(|(key, _)| key == "token")
+        .map(|(_, value)| value.into_owned())
+        .ok_or_else(|| format!("serve.url has no token: {url}"))?;
+    Ok((port, token))
+}
+
+/// Ask the running daemon whether it still requires the passphrase gate.
+fn login_status_required(port: u16, token: &str) -> Result<bool, String> {
+    let url = format!("http://127.0.0.1:{port}/api/login/status?token={token}");
+    let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+    runtime.block_on(async {
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .map_err(|error| error.to_string())?
+            .get(&url)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.map_err(|error| error.to_string())?;
+        if !status.is_success() {
+            return Err(format!("GET {url} returned {status}: {body}"));
+        }
+        body["required"]
+            .as_bool()
+            .ok_or_else(|| format!("login status has no `required` flag: {body}"))
+    })
+}
+
+fn assert_original_passphrase_login(h: &TuiTestHarness, passphrase: &str) {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    let url = primary_serve_url(h).expect("successor URL");
+    let (port, token) = serve_url_parts(&url).expect("successor endpoint");
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap()
+            .post(format!("http://127.0.0.1:{port}/api/login"))
+            .bearer_auth(token)
+            .json(&serde_json::json!({
+                "passphrase": passphrase,
+                "device_binding_secret": URL_SAFE_NO_PAD.encode([0x5Au8; 32]),
+            }))
+            .send()
+            .await
+            .expect("successor login response");
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::OK,
+            "successor rejected the original passphrase"
+        );
+    });
+}
+
+fn wait_for_published_dashboard(h: &TuiTestHarness) -> (u16, String) {
+    wait_until(Duration::from_secs(30), Duration::from_millis(100), || {
+        let url = primary_serve_url(h).ok_or("serve.url missing")?;
+        let (port, token) = serve_url_parts(&url)?;
+        if !wait_for_port(port, Duration::from_secs(1)) {
+            return Err(format!("daemon port {port} is not bound"));
+        }
+        Ok((port, token))
+    })
+}
+
+fn wait_for_local_dashboard(h: &TuiTestHarness) -> (u16, String) {
+    let parts = wait_for_published_dashboard(h);
+    // The dialog ignores R while it is still Starting; wait for the Active footer.
+    h.wait_for("R: restart");
+    parts
+}
+
+fn restart_local_from_tui(h: &TuiTestHarness) -> u32 {
+    let before = daemon_pid(h).expect("serve.pid missing before restart");
+    // Queue confirmation before the renderer barrier consumes its deadline.
+    h.send_keys("RR");
+    wait_until(Duration::from_secs(30), Duration::from_millis(100), || {
+        let pid = daemon_pid(h).ok_or("serve.pid missing after restart")?;
+        if pid == before {
+            return Err(format!("successor still reports predecessor PID {before}"));
+        }
+        if !pid_alive(pid as i32) {
+            return Err(format!("successor PID {pid} is not alive"));
+        }
+        Ok(pid)
+    })
+}
+
+/// Wait for the published daemon to answer and return its passphrase requirement.
+fn wait_for_login_status(h: &TuiTestHarness) -> bool {
+    wait_until(Duration::from_secs(30), Duration::from_millis(100), || {
+        let url = primary_serve_url(h).ok_or("serve.url missing")?;
+        let (port, token) = serve_url_parts(&url)?;
+        login_status_required(port, &token)
+    })
+}
+
+/// Re-execute Local flows with no interface connected to the host network.
+fn isolated_local_network() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        const MARKER: &str = "AOE_LOCAL_NETWORK_TEST";
+        const ACK: &str = "AOE_LOCAL_NETWORK_ACK";
+        let thread = std::thread::current();
+        let test = thread.name().expect("named test thread");
+        if std::env::var(MARKER).as_deref() == Ok(test) {
+            std::fs::write(std::env::var_os(ACK).expect("child acknowledgment"), test)
+                .expect("acknowledge confined test");
+            return true;
+        }
+        let binary = std::path::Path::new(env!("CARGO_BIN_EXE_aoe"))
+            .canonicalize()
+            .unwrap();
+        let binary_dir = binary.parent().unwrap();
+        let directory = tempfile::tempdir_in(binary_dir).unwrap();
+        let acknowledgment = directory.path().join("entered");
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let executable = std::env::current_exe().unwrap();
+        let executable_dir = executable.parent().unwrap();
+        let output = std::process::Command::new("bwrap")
+            .args([
+                "--unshare-user",
+                "--unshare-net",
+                "--uid",
+                "0",
+                "--gid",
+                "0",
+                "--cap-add",
+                "CAP_NET_ADMIN",
+                "--ro-bind",
+                "/usr",
+                "/usr",
+                "--ro-bind",
+                "/etc",
+                "/etc",
+                "--symlink",
+                "usr/bin",
+                "/bin",
+                "--symlink",
+                "usr/lib",
+                "/lib",
+                "--symlink",
+                "usr/lib64",
+                "/lib64",
+                "--proc",
+                "/proc",
+                "--dev",
+                "/dev",
+                "--tmpfs",
+                "/tmp",
+                "--bind",
+                manifest,
+                manifest,
+            ])
+            .arg("--bind")
+            .arg(binary_dir)
+            .arg(binary_dir)
+            .arg("--ro-bind")
+            .arg(executable_dir)
+            .arg(executable_dir)
+            .args(["--", "sh", "-ec"])
+            .arg(
+                "ip link set lo up; \
+                 ip link add aoe-fixture type dummy; \
+                 ip address add 192.0.2.1/32 dev aoe-fixture; \
+                 ip link set aoe-fixture up; \
+                 printf ready > \"$AOE_LOCAL_NETWORK_ACK\"; exec \"$@\"",
+            )
+            .arg("aoe-local-network")
+            .arg(&executable)
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(MARKER, test)
+            .env(ACK, &acknowledgment)
+            .env_remove("AOE_SERVE_PASSPHRASE")
+            .env_remove("AOE_CITYHALL_MODE")
+            .env_remove("TMUX")
+            .output();
+        let output = match output {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return local_network_unavailable("bubblewrap is unavailable");
+            }
+            Err(error) => panic!("launch confined Local flow: {error}"),
+        };
+        if !acknowledgment.exists() && !output.status.success() {
+            return local_network_unavailable(&format!(
+                "network namespace setup unavailable: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        assert_eq!(std::fs::read_to_string(acknowledgment).unwrap(), test);
+        assert!(
+            output.status.success(),
+            "confined Local flow failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        local_network_unavailable("Linux network namespaces are required")
+    }
+}
+
+fn local_network_unavailable(reason: &str) -> bool {
+    assert!(
+        std::env::var_os("AOE_REQUIRE_LOCAL_NETWORK_TESTS").is_none(),
+        "Required Local restart coverage unavailable: {reason}"
+    );
+    eprintln!("Skipping Local flow: {reason}");
+    false
+}
+
+#[test]
+#[parallel]
+fn cli_read_daemon_stops_when_its_harness_drops() {
+    use fs2::FileExt;
+
+    for unwind in [false, true] {
+        let mut lifetime = None;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let h = TuiTestHarness::new_in_tmp("cli_read_cleanup");
+            h.run_cli_ok(&["list", "--json"]);
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(app_dir_in(h.home_path()).join("daemon/lifetime.lock"))
+                .unwrap();
+            assert_eq!(
+                lock.try_lock_exclusive().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            lifetime = Some(lock);
+            if unwind {
+                panic!("exercise harness cleanup during unwinding");
+            }
+        }));
+        assert_eq!(result.is_err(), unwind);
+        lifetime
+            .expect("read must have started a daemon")
+            .try_lock_exclusive()
+            .expect("daemon retained lifetime ownership after harness teardown");
+    }
 }
 
 #[test]
@@ -50,13 +329,13 @@ fn tui_disconnect_hides_sessions_and_explicit_reconnect_restores_them() {
         "{}",
         String::from_utf8_lossy(&stopped.stderr)
     );
-    h.wait_for("Runtime unavailable");
+    h.wait_for("Not responding");
     assert!(!h.capture_screen().contains("offline-visible-session"));
     h.send_keys("n");
-    assert!(h.capture_screen().contains("Runtime unavailable"));
+    assert!(h.capture_screen().contains("Not responding"));
     h.send_keys("r");
     h.wait_for_timeout("offline-visible-session", Duration::from_secs(30));
-    assert!(!h.capture_screen().contains("Runtime unavailable"));
+    assert!(!h.capture_screen().contains("Not responding"));
 }
 
 #[cfg(unix)]
@@ -742,10 +1021,11 @@ async fn native_creation_progress_reports_phases_to_the_local_stream() {
     use agent_of_empires::{
         acp::client::DaemonEndpoint,
         daemon::{
-            CreateSessionBody, CreationPhase, CreationProgress, DaemonClient, RuntimeConnection,
-            RuntimeEvent,
+            ApiErrorCode, CreateSessionBody, CreationPhase, CreationProgress, DaemonClient,
+            RuntimeConnection, RuntimeEvent, RUNTIME_EPOCH_HEADER,
         },
     };
+    const PHASE_TIMEOUT: Duration = Duration::from_secs(20);
     require_tmux!();
     let mut h = TuiTestHarness::new_in_tmp("native_creation_progress");
     h.set_env("AGENT_OF_EMPIRES_PROFILE", "default");
@@ -755,11 +1035,29 @@ async fn native_creation_progress_reports_phases_to_the_local_stream() {
     std::fs::write(&agent, "#!/bin/sh\nexec sleep 120\n").unwrap();
     let app = crate::harness::app_dir_in(h.home_path());
     let config_path = app.join("config.toml");
-    let release = h.home_path().join("hook-release");
-    // One line then block: the first output line must reach the stream even
-    // though the hook never finishes on its own.
+    struct ReleaseHook(tempfile::TempDir);
+    impl Drop for ReleaseHook {
+        fn drop(&mut self) {
+            let gate = self.0.path();
+            if std::fs::write(gate.join("release"), []).is_err() || !gate.join("started").exists() {
+                return;
+            }
+            let finished = gate.join("finished");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !finished.exists() {
+                if Instant::now() >= deadline {
+                    eprintln!("creation hook did not acknowledge release before cleanup");
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+    let release = ReleaseHook(tempfile::tempdir_in(h.home_path()).unwrap());
     let command = format!(
-        "echo building dependency graph; i=0; while [ ! -f {release:?} ] && [ \"$i\" -lt 400 ]; do i=$((i+1)); sleep 0.05; done"
+        ": > {gate:?}/started; echo building dependency graph; i=0; while [ -d {gate:?} ] && [ ! -f {gate:?}/release ] && [ \"$i\" -lt {max_polls} ]; do i=$((i+1)); sleep 0.05; done; if [ -d {gate:?} ]; then : > {gate:?}/finished; test -f {gate:?}/release; fi",
+        gate = release.0.path(),
+        max_polls = (PHASE_TIMEOUT * 6).as_millis() / 50
     );
     let mut config = std::fs::read_to_string(&config_path).unwrap();
     config.push_str(&format!(
@@ -780,6 +1078,12 @@ async fn native_creation_progress_reports_phases_to_the_local_stream() {
     let socket = app.join("daemon/api.sock");
     let sdk = DaemonClient::new_unix(&socket).unwrap();
     let epoch = sdk.runtime_info().await.unwrap().epoch;
+    let http = reqwest::Client::builder()
+        .unix_socket(socket.clone())
+        .no_proxy()
+        .timeout(PHASE_TIMEOUT * 5)
+        .build()
+        .unwrap();
     let endpoint = DaemonEndpoint::local_unix(socket);
     let mut connection = RuntimeConnection::connect(&endpoint, None).await.unwrap();
     assert!(
@@ -796,27 +1100,35 @@ async fn native_creation_progress_reports_phases_to_the_local_stream() {
         connection: &mut RuntimeConnection,
         ready: impl Fn(&CreationProgress) -> bool,
     ) -> CreationProgress {
-        loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(20), connection.next_event())
-                .await
-                .expect("creation progress arrived")
-                .expect("runtime stream stayed connected")
-            {
-                RuntimeEvent::Progress(progress) => {
-                    if let Some(entry) = progress.iter().find(|entry| ready(entry)) {
-                        return entry.clone();
+        tokio::time::timeout(PHASE_TIMEOUT, async {
+            loop {
+                match connection
+                    .next_event()
+                    .await
+                    .expect("runtime stream stayed connected")
+                {
+                    RuntimeEvent::Progress(progress) => {
+                        if let Some(entry) = progress.iter().find(|entry| ready(entry)) {
+                            return entry.clone();
+                        }
                     }
+                    RuntimeEvent::Snapshot(_) | RuntimeEvent::OwnerDiagnostics(_) => {}
                 }
-                RuntimeEvent::Snapshot(_) | RuntimeEvent::OwnerDiagnostics(_) => {}
             }
-        }
+        })
+        .await
+        .expect("creation progress arrived")
     }
 
-    let creator = sdk.clone();
     let create_epoch = epoch.clone();
-    let create = tokio::spawn(async move { creator.create_session(&body, &create_epoch).await });
-    // The phase change publishes before the command starts, so wait for the
-    // frame that actually names the hook and its output.
+    let create = tokio::spawn(async move {
+        http.post("http://localhost/api/sessions")
+            .header(RUNTIME_EPOCH_HEADER, create_epoch)
+            .json(&body)
+            .send()
+            .await
+    });
+    // Wait for the hook's command and output, not just its phase.
     let observed = read_progress(&mut connection, |entry| {
         entry.phase == CreationPhase::CreateHooks
             && !entry.cancelled
@@ -837,14 +1149,31 @@ async fn native_creation_progress_reports_phases_to_the_local_stream() {
         "progress must carry the hook's first line, got: {:?}",
         observed.output
     );
+    tokio::time::timeout(PHASE_TIMEOUT, async {
+        while !connection
+            .snapshot()
+            .contents
+            .sessions
+            .iter()
+            .any(|row| row.id == observed.session_id)
+        {
+            connection
+                .next_snapshot()
+                .await
+                .expect("runtime stream stayed connected");
+        }
+    })
+    .await
+    .expect("the reservation reached the canonical snapshot");
     let pending = sdk
         .list_sessions(None)
         .await
         .unwrap()
         .sessions
         .into_iter()
-        .find(|row| row.title == "progress")
+        .find(|row| row.id == observed.session_id)
         .expect("the reservation is published while provisioning");
+    assert_eq!(pending.title, "progress");
     assert!(
         sdk.cancel_creation(&pending.id, &epoch).await.is_ok(),
         "a pending creation accepts cancellation"
@@ -854,22 +1183,31 @@ async fn native_creation_progress_reports_phases_to_the_local_stream() {
         observed.session_id, pending.id,
         "the pending cancellation must name the creation it fences"
     );
-    std::fs::write(&release, "continue").unwrap();
-    let cancelled = create.await.unwrap();
-    assert!(
-        cancelled.is_err(),
-        "a cancelled creation must not report success"
+    std::fs::write(release.0.path().join("release"), "continue").unwrap();
+    let cancelled = create
+        .await
+        .unwrap()
+        .expect("creation returned an HTTP response");
+    assert_eq!(
+        ApiErrorCode::from_headers(cancelled.status(), cancelled.headers(), false),
+        Some(ApiErrorCode::CreationCancelled),
+        "expected a cancellation response, got {}",
+        cancelled.status()
     );
-    loop {
-        match tokio::time::timeout(std::time::Duration::from_secs(20), connection.next_event())
-            .await
-            .expect("progress cleared")
-            .expect("runtime stream stayed connected")
-        {
-            RuntimeEvent::Progress(progress) if progress.is_empty() => break,
-            _ => {}
+    tokio::time::timeout(PHASE_TIMEOUT, async {
+        loop {
+            match connection
+                .next_event()
+                .await
+                .expect("runtime stream stayed connected")
+            {
+                RuntimeEvent::Progress(progress) if progress.is_empty() => break,
+                _ => {}
+            }
         }
-    }
+    })
+    .await
+    .expect("progress cleared");
     assert!(connection.creation_progress().is_empty());
     let rows = sdk.list_sessions(None).await.unwrap().sessions;
     assert!(
@@ -1283,7 +1621,7 @@ async fn daemon_trash_restore_purge_preserves_collisions_and_allows_retry() {
         .unwrap();
     assert!(matches!(
         moved.outcome.relocation,
-        agent_of_empires::daemon::TrashRelocationOutcome::Relocated
+        agent_of_empires::daemon::TrashRelocationOutcome::Relocated { warning: None }
     ));
     let moved: RuntimeSnapshot = client
         .get("http://localhost/api/runtime/snapshot")
@@ -1895,10 +2233,10 @@ async fn daemon_terminal_commands_apply_dimensions_archive_and_abandon_policy() 
     );
 }
 
-/// Pressing `R` from the home screen opens the serve ModePicker,
-/// which must render both cards (Local + Internet) and surface the
-/// transport-picker-deferred hint on the Tunnel card ("Pick transport
-/// on next screen.").
+/// `R` opens Connections, and Enter on its Web dashboard row opens the
+/// serve ModePicker, which must render both cards (Local + Internet) and
+/// surface the transport-picker-deferred hint on the Tunnel card ("Pick
+/// transport on next screen.").
 #[test]
 #[parallel]
 fn tui_serve_dialog_opens_to_mode_picker() {
@@ -1909,6 +2247,8 @@ fn tui_serve_dialog_opens_to_mode_picker() {
 
     h.wait_for(" aoe ");
     h.send_keys("R");
+    h.wait_for("Connections");
+    h.send_keys("Enter");
 
     h.wait_for("How should this be reachable?");
     h.assert_screen_contains("Local network");
@@ -1932,6 +2272,8 @@ fn tui_serve_dialog_escape_returns_home() {
 
     h.wait_for(" aoe ");
     h.send_keys("R");
+    h.wait_for("Connections");
+    h.send_keys("Enter");
     h.wait_for("How should this be reachable?");
 
     h.send_keys("Escape");
@@ -1953,9 +2295,9 @@ fn tui_footer_web_entry_tracks_core_to_web_promotion() {
     assert!(!h.capture_screen().contains(&format!("R \u{25CF} {what}")));
 
     h.start_daemon();
-    h.wait_for("Runtime unavailable");
+    h.wait_for("Not responding");
     h.send_keys("r");
-    h.wait_for_absent("Runtime unavailable", Duration::from_secs(10));
+    h.wait_for_absent("Not responding", Duration::from_secs(10));
     h.wait_for(&format!("R \u{25CF} {what}"));
 }
 
@@ -2572,6 +2914,169 @@ fn cli_serve_replay_rejects_missing_or_unbound_passphrases() {
         "{}",
         String::from_utf8_lossy(&stop.stderr)
     );
+}
+
+/// Issue #4896: a Local dashboard launched from the TUI inherits
+/// `AOE_SERVE_PASSPHRASE`, so the passphrase gate is on. Restarting it from
+/// the same TUI must keep that gate, not silently rebuild the successor
+/// without the credential.
+#[test]
+#[parallel]
+fn tui_local_restart_preserves_the_env_passphrase_gate() {
+    require_tmux!();
+    if !isolated_local_network() {
+        return;
+    }
+
+    let mut h = TuiTestHarness::new("serve_local_restart_passphrase");
+    h.stop_daemon_on_drop();
+    h.set_env("AOE_SERVE_PASSPHRASE", "e2e-local-restart-gate");
+    h.spawn_tui();
+    h.wait_for_ready();
+
+    h.send_keys("R");
+    h.wait_for("Connections");
+    h.send_keys("Enter");
+    h.wait_for("How should this be reachable?");
+    h.send_keys("L");
+    let (port, token) = wait_for_local_dashboard(&h);
+    assert!(
+        login_status_required(port, &token).unwrap(),
+        "the TUI-launched Local dashboard did not enable the passphrase gate"
+    );
+
+    let successor = restart_local_from_tui(&h);
+    assert!(
+        wait_for_login_status(&h),
+        "Local restart dropped the passphrase gate (successor PID {successor}); \
+         /api/login/status reported required=false"
+    );
+    assert_original_passphrase_login(&h, "e2e-local-restart-gate");
+}
+
+/// Issue #4896: the preserved credential must come from the recorded launch,
+/// not from the environment of whichever TUI presses Restart. This restarts
+/// from a fresh TUI process whose environment lacks `AOE_SERVE_PASSPHRASE`.
+#[test]
+#[parallel]
+fn tui_local_restart_preserves_the_gate_without_the_env_variable() {
+    require_tmux!();
+    if !isolated_local_network() {
+        return;
+    }
+    assert!(
+        std::env::var_os("AOE_SERVE_PASSPHRASE").is_none(),
+        "test requires an unset ambient AOE_SERVE_PASSPHRASE to prove the variable is not the source"
+    );
+
+    let mut h = TuiTestHarness::new("serve_local_restart_passphrase_new_tui");
+    h.stop_daemon_on_drop();
+    h.set_env("AOE_SERVE_PASSPHRASE", "e2e-local-restart-gate");
+    h.spawn_tui();
+    h.wait_for_ready();
+
+    h.send_keys("R");
+    h.wait_for("Connections");
+    h.send_keys("Enter");
+    h.wait_for("How should this be reachable?");
+    h.send_keys("L");
+    let (port, token) = wait_for_local_dashboard(&h);
+    assert!(
+        login_status_required(port, &token).unwrap(),
+        "the TUI-launched Local dashboard did not enable the passphrase gate"
+    );
+
+    // A fresh tmux server is required: tmux pins the global environment from
+    // its first client, so reusing the server would leak the old variable.
+    h.kill_tui();
+    let killed = h.tmux().arg("kill-server").status();
+    assert!(
+        killed.is_ok_and(|status| status.success()),
+        "failed to dispose of the first tmux server"
+    );
+    h.remove_env("AOE_SERVE_PASSPHRASE");
+    h.spawn_tui();
+    h.wait_for_ready();
+    h.send_keys("R");
+    h.wait_for("Connections");
+    h.send_keys("Enter");
+    h.wait_for("R: restart");
+
+    let successor = restart_local_from_tui(&h);
+    assert!(
+        wait_for_login_status(&h),
+        "Local restart from a TUI without AOE_SERVE_PASSPHRASE dropped the gate \
+         (successor PID {successor}); /api/login/status reported required=false"
+    );
+    assert_original_passphrase_login(&h, "e2e-local-restart-gate");
+
+    h.wait_for("R: restart");
+    std::fs::remove_file(app_dir_in(h.home_path()).join("serve.passphrase")).unwrap();
+    h.send_keys("RR");
+    h.wait_for("Dashboard start failed");
+    assert_eq!(daemon_pid(&h), Some(successor));
+    assert!(
+        wait_for_login_status(&h),
+        "missing credentials must leave the healthy predecessor gated"
+    );
+}
+
+/// CLI restart replays the recorded passphrase without requiring
+/// `AOE_SERVE_PASSPHRASE` in the caller's environment.
+#[test]
+#[parallel]
+fn cli_serve_restart_replays_the_recorded_passphrase_gate() {
+    let mut h = TuiTestHarness::new("serve_cli_restart_passphrase");
+    h.remove_env("AOE_SERVE_PASSPHRASE");
+    h.stop_daemon_on_drop();
+
+    let port = pick_free_port();
+    let port_s = port.to_string();
+    let start = h.run_cli(&[
+        "serve",
+        "--daemon",
+        "--port",
+        &port_s,
+        "--auth",
+        "token",
+        "--passphrase",
+        "e2e-cli-restart-gate",
+    ]);
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    assert!(
+        wait_for_port(port, Duration::from_secs(10)),
+        "daemon never bound port {port}"
+    );
+    let (port, token) = wait_for_published_dashboard(&h);
+    assert!(
+        login_status_required(port, &token).unwrap(),
+        "the CLI-launched daemon did not enable the passphrase gate"
+    );
+
+    let before = daemon_pid(&h).expect("serve.pid missing before restart");
+    let restart = h.run_cli(&["serve", "--restart"]);
+    assert!(
+        restart.status.success(),
+        "aoe serve --restart failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&restart.stdout),
+        String::from_utf8_lossy(&restart.stderr),
+    );
+    wait_until(Duration::from_secs(30), Duration::from_millis(100), || {
+        let pid = daemon_pid(&h).ok_or("serve.pid missing after restart")?;
+        if pid == before {
+            return Err(format!("successor still reports predecessor PID {before}"));
+        }
+        Ok(())
+    });
+    assert!(
+        wait_for_login_status(&h),
+        "CLI restart dropped the recorded passphrase gate"
+    );
+    assert_original_passphrase_login(&h, "e2e-cli-restart-gate");
 }
 
 /// Regression guard for the sink consolidation (issue #1124): the daemon
@@ -3491,6 +3996,21 @@ fn cli_serve_daemon_profile_reaches_the_served_layer() {
     }
 }
 
+/// Replace the live Daemon's worker directory with a file. The Daemon may
+/// recreate the directory between the delete and the write, so retry until
+/// the file holds; a file cannot be recreated as a directory.
+fn block_workers_dir(workers: &std::path::Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let _ = std::fs::remove_dir_all(workers);
+        if std::fs::write(workers, "not a directory").is_ok() && workers.is_file() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "could not block {workers:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// A running Daemon stays administrable when pending migrations would fail.
 #[test]
 #[parallel]
@@ -3503,8 +4023,7 @@ fn cli_serve_controls_skip_migrations_and_lock() {
     let version = app.join(".schema_version");
     std::fs::write(&version, "39").unwrap();
     let workers = app.join("acp-workers");
-    std::fs::remove_dir_all(&workers).unwrap();
-    std::fs::write(&workers, "not a directory").unwrap();
+    block_workers_dir(&workers);
 
     for flag in ["--status", "--stop"] {
         h.run_cli(&["serve", flag]);
@@ -3529,8 +4048,7 @@ fn cli_serve_restart_reports_replacement_startup_failure() {
     let app = app_dir_in(h.home_path());
     std::fs::write(app.join(".schema_version"), "39").unwrap();
     let workers = app.join("acp-workers");
-    let _ = std::fs::remove_dir_all(&workers);
-    std::fs::write(&workers, "not a directory").unwrap();
+    block_workers_dir(&workers);
 
     h.run_cli_err(&["serve", "--restart"]);
     h.run_cli_err(&["serve", "--status"]);

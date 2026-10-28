@@ -7,6 +7,7 @@ import {
   findCursorCharIndex,
   isHttpUrl,
   lineText,
+  linkifyLine,
   splitCellRuns,
   splitUrls,
   textWidth,
@@ -179,6 +180,61 @@ it.each([
   ["localhost:3000 is up", [{ text: "localhost:3000 is up", url: null }]],
 ])("splitUrls(%j)", (text, expected) => {
   expect(splitUrls(text)).toEqual(expected);
+});
+
+describe("linkifyLine", () => {
+  const URL = "https://github.example.com/trusted-environments/control-plane/issues/1375";
+  const links = (rows: ReturnType<typeof wrapLine>) =>
+    rows.flatMap((r) => r.filter((s) => s.url).map((s) => [s.text, s.url]));
+
+  it("links a URL split across style segments with the full href", () => {
+    const line = linkifyLine([seg("see https://github.example.com/trusted-", "red"), seg("environments/x).")]);
+    expect(line.map((s) => [s.text, s.url, s.style.fg])).toEqual([
+      ["see ", undefined, "red"],
+      ["https://github.example.com/trusted-", "https://github.example.com/trusted-environments/x", "red"],
+      ["environments/x", "https://github.example.com/trusted-environments/x", undefined],
+      [").", undefined, undefined],
+    ]);
+  });
+
+  it("keeps the text of a URL that continues from a shorter earlier segment", () => {
+    const line = linkifyLine([seg("https://", "red"), seg("example.com/path", "blue")]);
+    expect(line.map((s) => [s.text, s.url, s.style.fg])).toEqual([
+      ["https://", "https://example.com/path", "red"],
+      ["example.com/path", "https://example.com/path", "blue"],
+    ]);
+    expect(lineText(line)).toBe("https://example.com/path");
+  });
+
+  it("keeps the full href on every row after a client-side wrap", () => {
+    const rows = wrapLine(linkifyLine([seg(`(${URL}). Per the spec`)]), 40);
+    expect(rows.length).toBeGreaterThan(1);
+    const found = links(rows);
+    expect(new Set(found.map(([, url]) => url))).toEqual(new Set([URL]));
+    expect(found.map(([text]) => text).join("")).toBe(URL);
+  });
+
+  it("leaves an OSC 8 segment untouched and does not scan across it", () => {
+    const osc = { text: "https://label.example", style: {}, url: "https://target.example" };
+    const line = [seg("https://a.example/x"), osc, seg("/y https://b.example")];
+    expect(linkifyLine(line).map((s) => [s.text, s.url])).toEqual([
+      ["https://a.example/x", "https://a.example/x"],
+      ["https://label.example", "https://target.example"],
+      ["/y ", undefined],
+      ["https://b.example", "https://b.example"],
+    ]);
+  });
+
+  it("does not overwrite a non-http OSC 8 target with a URL in its label", () => {
+    const mail = { text: "see https://label.example", style: {}, url: "mailto:a@b.example" };
+    const line = [seg("x"), mail, seg("y")];
+    expect(linkifyLine(line)).toEqual(line);
+  });
+
+  it("returns the line unchanged when it has no URL", () => {
+    const line = [seg("plain", "red"), seg(" text")];
+    expect(linkifyLine(line)).toBe(line);
+  });
 });
 
 describe("LineParseCache", () => {

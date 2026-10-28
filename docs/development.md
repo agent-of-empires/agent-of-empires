@@ -12,7 +12,28 @@ cargo fmt
 cargo clippy
 ```
 
+Local dashboard end-to-end tests on Linux require `bubblewrap`, `iproute2`, and
+`tmux`. Host security policy must allow `CAP_NET_ADMIN` in bubblewrap's children
+to configure their private network namespace. The
+[web-e2e CI leg](../.github/workflows/tests.yml) requires this coverage with
+`AOE_REQUIRE_LOCAL_NETWORK_TESTS=1`; unavailable confinement fails the job.
+
+The core-rest CI leg requires the scoped cancellation case to run with
+`AOE_REQUIRE_SCOPED_TESTS=1`; any setup path that skips it must fail. Local runs
+may skip the scoped case when no usable user manager exists; unscoped
+cancellation still runs.
+
+Creation-progress events are advisory and publish independently of session
+snapshots. Tests that need a published session must wait for its ID in the
+canonical snapshot. Hold in-flight fixture gates until explicit release, with
+cleanup that waits for release acknowledgment and lets a late hook exit when
+its gate directory disappears. Keep request deadlines longer than the bounded
+scenario and assert the expected API error code, not merely any error. Keep an
+emergency hook watchdog beyond the request budget for abrupt test-process exit.
+
 The binary is `target/{profile}/aoe`. Web commands and test selection live in `web/AGENTS.md`.
+
+When adding a mutating REST route, classify it in the CityHall allow or deny table in `src/server/access.rs`. Audit its handler or declare an exact, justified exemption in `src/server/api/mod.rs`.
 
 Debug builds carry line tables only, and dependencies carry no debug info, to keep `target/` small across worktrees. Panics still name the file and line in this crate, but a debugger has no local values; rebuild with `RUSTFLAGS="-Cdebuginfo=2"` for a full debugging session.
 

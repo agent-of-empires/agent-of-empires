@@ -58,6 +58,11 @@ describe("SystemNotices", () => {
       /Structured view disconnected\. Reconnecting \(1\/7\)/,
     ],
     [
+      "a retry while replay still delivers events",
+      { status: "closed", reconnecting: true, retryCount: 2, hasEverOpened: true, replayedWhileDown: true },
+      /Live updates unavailable, showing history fetched over HTTP\. Reconnecting \(2\/7\)/,
+    ],
+    [
       "a reconnect",
       { status: "connecting", hasEverOpened: true, newSessionStarting: true },
       /Reconnecting to structured view/,

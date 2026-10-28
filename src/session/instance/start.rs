@@ -717,8 +717,7 @@ impl Instance {
 
         // A takeover can replace the pane without changing the agent or the execution, and a poller
         // for either would then be watching the pane this launch is replacing.
-        self.stop_poller();
-        self.session_id_poller = None;
+        self.capture_poller.clear();
         if !self.is_sandboxed() {
             self.install_agent_status_hooks(self.status_agent());
         }
@@ -931,6 +930,12 @@ impl Instance {
         if let Some(canonical) = prepared.canonical_conversation.take() {
             self.adopt_conversation_state(canonical);
         }
+        // Before the `take` below consumes the execution.
+        self.launch_executable = prepared
+            .execution
+            .as_ref()
+            .filter(|execution| execution.inputs.container.is_none())
+            .map(|execution| execution.program.clone());
         if let Some(execution) = prepared.execution.take() {
             let attested = self.attested_claude_store_route(&execution);
             self.active_execution = Some(ActiveExecution {
@@ -1136,11 +1141,12 @@ impl Instance {
 
         // A launch re-evaluates the row, so its schedule goes. Clearing the working copy is not
         // enough: the live row keeps its own until the relaunch merge sees the stamp below.
-        self.poller_repair.reset();
+        self.capture_poller.reset_repair();
         self.maybe_start_poller_since_in(CaptureStorage::Scoped(storage))?;
 
         self.status = Status::Starting;
         self.last_start_time = Some(std::time::Instant::now());
+        self.started_at = Some(Utc::now());
 
         // Apply status bar options in a background thread to avoid blocking
         // the TUI on the multiple tmux subprocess calls they require.

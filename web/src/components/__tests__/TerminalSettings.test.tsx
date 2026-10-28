@@ -37,13 +37,15 @@ describe("TerminalSettings localStorage contract", () => {
     expect(readStored()[key]).toBe(expected);
   });
 
-  it("checkboxes write the keyboard and persistent-terminal flags", () => {
+  it("checkboxes write the keyboard, persistent-terminal and scrollbar flags", () => {
     const { container } = render(<TerminalSettings />);
     const checkboxes = container.querySelectorAll("input[type=checkbox]");
     fireEvent.click(checkboxes[0]!);
     expect(readStored().autoOpenKeyboard).toBe(false);
     fireEvent.click(checkboxes[1]!);
     expect(readStored().persistentTerminals).toBe(true);
+    fireEvent.click(checkboxes[2]!);
+    expect(readStored().showForwardScrollbar).toBe(true);
   });
 
   it("lists detected fonts as datalist suggestions", () => {

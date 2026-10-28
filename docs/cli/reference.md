@@ -101,6 +101,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe mcp add`↴](#aoe-mcp-add)
 * [`aoe mcp edit`↴](#aoe-mcp-edit)
 * [`aoe mcp remove`↴](#aoe-mcp-remove)
+* [`aoe mcp config`↴](#aoe-mcp-config)
 * [`aoe skill`↴](#aoe-skill)
 * [`aoe skill list`↴](#aoe-skill-list)
 * [`aoe skill view`↴](#aoe-skill-view)
@@ -193,7 +194,7 @@ Run without arguments to launch the TUI dashboard.
 * `-p`, `--profile <PROFILE>` — Profile to use (separate workspace with its own sessions). Commands that consume or create profile state require an existing profile: an unknown name is refused, not created (make one with `aoe profile create`). Profile-independent commands such as `list --all` and `serve --stop` ignore it. `AGENT_OF_EMPIRES_PROFILE` names one too, and an explicit `-p` wins over it
 * `--daemon-url <DAEMON_URL>` — Select a daemon endpoint for read-only CLI commands or the TUI.
 
-   Explicit CLI endpoints never fall back. `AOE_DAEMON_URL` discovery may fall back to local storage before reaching a TCP peer, with a notice. Authenticate with `AOE_DAEMON_TOKEN` or `AOE_DAEMON_PASSPHRASE`. An unauthenticated daemon needs neither. See the HTTP API reference for transport and fallback rules.
+   Explicit endpoints and `AOE_DAEMON_URL` never fall back to local storage or start a local daemon. Authenticate with `AOE_DAEMON_TOKEN` or `AOE_DAEMON_PASSPHRASE`. An unauthenticated daemon needs neither. See the HTTP API reference for transport and authentication rules.
 * `--no-autostart` — Fail instead of starting a local daemon when none is running
 
    Also read from `AOE_NO_AUTOSTART=1`. Has no effect with `--daemon-url` or `AOE_DAEMON_URL`, which never start a daemon.
@@ -230,6 +231,7 @@ Add a new session
 * `--no-submodules` — Skip `git submodule update --init --recursive` after creating the worktree, overriding the `worktree.init_submodules` config (default true). Useful for repos with large or deeply nested submodule trees that you don't need inside the agent session
 * `-s`, `--sandbox` — Run session in a container sandbox
 * `--sandbox-image <SANDBOX_IMAGE>` — Custom container image for sandbox (implies --sandbox)
+* `--hook-env <KEY[=VALUE]>` — Env var for the host `before_start` hook only, never the container (`KEY=VALUE` or `KEY`; repeatable; requires --sandbox)
 * `-y`, `--yolo` — Enable YOLO mode (skip permission prompts)
 * `--trust-hooks` — Automatically trust this repository's hooks and project-local MCP servers without prompting
 * `--extra-args <EXTRA_ARGS>` — Extra arguments to append after the agent binary
@@ -356,7 +358,9 @@ Remove a session
 
 ###### **Options:**
 
-* `--delete-worktree` — Delete worktree directory (default: keep worktree)
+* `--delete-worktree` — With --purge, delete the worktree directory (default: keep it).
+
+   Without --purge, trashing moves a managed worktree into a sibling `.aoe-trash` folder, unless another session uses it.
 * `--delete-branch` — Delete git branch after worktree removal (default: per config)
 * `--force` — Force worktree removal even with untracked/modified files
 * `--keep-container` — Keep container instead of deleting it (default: delete per config)
@@ -1515,6 +1519,7 @@ Inspect the effective MCP server set (provenance, conflicts, drift)
 * `add` — Add an AoE-owned MCP server to the global mcp.json
 * `edit` — Edit an AoE-owned MCP server. Secrets you do not mention keep their stored value
 * `remove` — Remove an AoE-owned MCP server
+* `config` — Print an MCP client config for the running daemon's `/mcp` server, ready to paste into an agent's `mcpServers` (for example a Claude Code `.mcp.json`)
 
 
 
@@ -1589,6 +1594,14 @@ Remove an AoE-owned MCP server
 ###### **Arguments:**
 
 * `<NAME>` — Name of the AoE-owned server to remove
+
+
+
+## `aoe mcp config`
+
+Print an MCP client config for the running daemon's `/mcp` server, ready to paste into an agent's `mcpServers` (for example a Claude Code `.mcp.json`)
+
+**Usage:** `aoe mcp config`
 
 
 
@@ -1764,7 +1777,8 @@ Start the aoe daemon: REST/WebSocket API, plus the web dashboard in builds that 
   Possible values: `token`, `passphrase`, `none`
 
 * `--no-auth` — Disable authentication (only allowed with localhost binding). Alias for --auth=none
-* `--behind-proxy` — Mark this server as sitting behind a reverse proxy that terminates TLS upstream. Sets cookies as `; Secure` and trusts the `X-Forwarded-For` / `cf-connecting-ip` headers from loopback peers. Does NOT auto-spawn a tunnel (unlike --remote). Required when --auth=passphrase or --auth=none is combined with a non-loopback bind
+* `--behind-proxy` — Mark this server as sitting behind a reverse proxy that terminates TLS upstream. Sets cookies as `; Secure` and trusts the `X-Forwarded-For` header from loopback peers. Does NOT auto-spawn a tunnel (unlike --remote). Required when --auth=passphrase or --auth=none is combined with a non-loopback bind
+* `--dangerously-allow-plaintext-remote` — Accept plain HTTP from non-loopback peers. By default the server answers those with 426 before authentication: bearer tokens and passphrases would cross the network in the clear. A TLS proxy or tunnel in front of a loopback listener (`--behind-proxy`, `--remote`) needs no opt-out. This applies to this bind only, is never inferred from the address, and is logged at every start
 * `--allowed-host <HOST>` — Extra `Host` header value to accept (repeatable). The DNS-rebinding gate trusts loopback, any routable IP-literal `Host` (LAN/tailnet IPs can't be rebound), and a non-wildcard `--host` by default. A browser `Origin` is accepted without `--allowed-origin` only when it is allowlisted or has the exact same authority as `Host`; add a HOSTNAME or mDNS name here when serving behind a reverse proxy, a custom tunnel, or by name when binding `0.0.0.0` (access by IP needs no flag). Auto-injected tunnel hosts (`--remote`) need no flag
 * `--allowed-origin <ORIGIN>` — Extra browser `Origin` to accept (repeatable, full origin `scheme://host[:port]`, e.g. `https://aoe.example.com:8443`). Needed only for a reverse proxy on a nonstandard port; standard 80/443 origins for `--allowed-host` entries are derived automatically
 * `--read-only` — Read-only mode: view terminals but cannot send keystrokes

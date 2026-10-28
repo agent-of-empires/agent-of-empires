@@ -5,6 +5,10 @@ use crate::daemon::{
     AttachProjectBody, AttachProjectOutcome, AttachedProject, AttachedWorkerOutcome, RenameOutcome,
     RenameSessionBody, SetWorktreeNameBody, WorktreeEditOutcome,
 };
+use crate::session::rename_transaction::{
+    apply_worktree_edit, ensure_container_released, ensure_idle, ensure_unique, rekey_tmux,
+    rekey_warning, RenameRefusal, WorktreeChange,
+};
 use crate::session::SessionStore;
 
 pub async fn rename_session(
@@ -77,10 +81,6 @@ fn edit_identity_matches(row: &Instance, expected: &Instance) -> bool {
         && row.lifecycle_reservation.is_none()
         && row.worktree_info == expected.worktree_info
 }
-
-#[derive(Debug, thiserror::Error)]
-#[error("session is active or its sandbox still holds the worktree")]
-struct WorktreeHeld;
 
 async fn edit_session(
     state: &Arc<AppState>,
@@ -220,7 +220,7 @@ async fn edit_session(
                     before.worktree_info.is_some(),
                     crate::session::worktree_edit::WorktreeEditError::NotManaged
                 );
-                anyhow::ensure!(!tied, TiedWorktree);
+                anyhow::ensure!(!tied, RenameRefusal::Tied);
                 (Some(body.name.trim().to_owned()), body.rename_branch, false)
             }
         };
@@ -251,11 +251,14 @@ async fn edit_session(
                 rename_branch,
             );
             // Standalone workdir editing has always refused active sessions, even a no-op.
-            anyhow::ensure!(
-                !(before.status.blocks_worktree_edit()
-                    && (!allow_unchanged || after.project_path != before.project_path || renames)),
-                WorktreeHeld
-            );
+            ensure_idle(
+                before.status.blocks_worktree_edit(),
+                WorktreeChange {
+                    moves_dir: after.project_path != before.project_path,
+                    renames_branch: renames,
+                },
+                !allow_unchanged,
+            )?;
         }
         let target = if target_profile != before.source_profile {
             Some(crate::server::session_store::NativeSessionStore::open(
@@ -272,7 +275,7 @@ async fn edit_session(
             Some(target) => target.load()?,
             None => native.load()?,
         };
-        validate_edit_duplicate(&rows, &before, &after)?;
+        ensure_unique(&rows, &before, &after)?;
         let moves = after.project_path != before.project_path;
         Ok((
             native,
@@ -319,6 +322,8 @@ async fn edit_session(
     }
     let effect_applied = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let effect_flag = effect_applied.clone();
+    let move_warning = Arc::new(std::sync::Mutex::new(None::<String>));
+    let move_warning_slot = move_warning.clone();
     let old_title = before.title.clone();
     let new_title = after.title.clone();
     let structured = before.is_structured();
@@ -330,15 +335,15 @@ async fn edit_session(
             let Some(name) = name.as_deref() else {
                 return Ok(());
             };
-            if moves
-                && crate::session::worktree_edit::ensure_sandbox_container_released(
-                    &before.id,
-                    before.is_sandboxed(),
-                )
-            {
-                return Err(WorktreeHeld.into());
-            }
-            let result = crate::session::worktree_edit::edit_worktree_workdir(
+            ensure_container_released(
+                &before.id,
+                before.is_sandboxed(),
+                WorktreeChange {
+                    moves_dir: moves,
+                    renames_branch: false,
+                },
+            )?;
+            let result = apply_worktree_edit(
                 crate::session::worktree_edit::WorktreeEditRequest {
                     worktree_info: before
                         .worktree_info
@@ -348,9 +353,12 @@ async fn edit_session(
                     new_name: name,
                     rename_branch,
                 },
+                &before.id,
+                before.is_sandboxed(),
             );
             match result {
                 Ok(result) => {
+                    *move_warning_slot.lock().expect("move warning slot") = result.warning.clone();
                     effect_flag.store(
                         result.new_path != std::path::Path::new(&before.project_path)
                             || result.new_branch.as_deref().is_some_and(|branch| {
@@ -369,12 +377,6 @@ async fn edit_session(
                                 .is_some_and(|worktree| worktree.branch == branch)),
                         "git edit landed at a different path or branch than the metadata candidate"
                     );
-                    if moves {
-                        crate::session::worktree_edit::discard_sandbox_container_after_move(
-                            &before.id,
-                            before.is_sandboxed(),
-                        );
-                    }
                     Ok(())
                 }
                 Err(crate::session::worktree_edit::WorktreeEditError::Unchanged)
@@ -410,7 +412,7 @@ async fn edit_session(
                         edit_identity_matches(candidate, after),
                         crate::session::LifecycleReservationError::Superseded
                     );
-                    validate_edit_duplicate(rows, before, candidate)
+                    ensure_unique(rows, before, candidate).map_err(Into::into)
                 },
                 |candidates| effect(&candidates[0]),
             )?;
@@ -424,7 +426,7 @@ async fn edit_session(
                     edit_identity_matches(row, before),
                     crate::session::LifecycleReservationError::Superseded
                 );
-                validate_edit_duplicate(rows, before, after)?;
+                ensure_unique(rows, before, after)?;
                 effect(after)?;
                 let row = rows
                     .iter_mut()
@@ -477,12 +479,14 @@ async fn edit_session(
         }
     };
     let mut warnings = Vec::new();
+    warnings.extend(move_warning.lock().expect("move warning slot").take());
     if old_title != new_title && !structured {
         let rekey_id = id.to_owned();
-        match tokio::task::spawn_blocking(move || crate::tmux::rekey_session(&rekey_id, &old_title, &new_title)).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => warnings.push(format!("Session metadata was renamed, but its live tmux session could not be rekeyed: {error}")),
-            Err(error) => warnings.push(format!("Session metadata was renamed, but its live tmux session could not be rekeyed: {error}")),
+        match tokio::task::spawn_blocking(move || rekey_tmux(&rekey_id, &old_title, &new_title))
+            .await
+        {
+            Ok(warning) => warnings.extend(warning),
+            Err(error) => warnings.push(rekey_warning(&error)),
         }
     }
     drop(locks);
@@ -491,31 +495,6 @@ async fn edit_session(
     drop(namespace);
     Ok(warnings)
 }
-
-fn validate_edit_duplicate(
-    rows: &[Instance],
-    before: &Instance,
-    after: &Instance,
-) -> anyhow::Result<()> {
-    let pair_changed = before.title != after.title
-        || before.source_profile != after.source_profile
-        || before.project_path.trim_end_matches('/') != after.project_path.trim_end_matches('/');
-    if pair_changed
-        && is_duplicate_session(
-            rows.iter(),
-            &after.title,
-            &after.project_path,
-            (before.source_profile == after.source_profile).then_some(before.id.as_str()),
-        )
-    {
-        return Err(EditDuplicate(after.title.clone()).into());
-    }
-    Ok(())
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("standalone workdir editing is disabled while the directory follows the session title")]
-struct TiedWorktree;
 
 fn session_edit_error(error: &anyhow::Error, partial: bool) -> axum::response::Response {
     if partial {
@@ -539,33 +518,17 @@ fn session_edit_error(error: &anyhow::Error, partial: bool) -> axum::response::R
             "Session changed while preparing its edit",
         );
     }
-    if error.is::<WorktreeHeld>() {
-        return api_error(
-            StatusCode::CONFLICT,
-            "session_running",
-            "Stop the session before editing its worktree directory or branch",
-        );
-    }
-    if error.is::<TiedWorktree>() {
-        return api_error(StatusCode::CONFLICT, "tied", "Renaming is unified while Tie Worktree Directory to Session Name is on; rename the session instead");
+    if let Some(refusal) = error.downcast_ref::<RenameRefusal>() {
+        let code = match refusal {
+            RenameRefusal::Duplicate(_) => "duplicate_session",
+            RenameRefusal::Running | RenameRefusal::ContainerHoldsWorktree => "session_running",
+            RenameRefusal::Tied => "tied",
+        };
+        return api_error(StatusCode::CONFLICT, code, refusal.to_string());
     }
     if let Some(error) = error.downcast_ref::<crate::session::worktree_edit::WorktreeEditError>() {
         let (status, message) = worktree_edit_error_response(error);
         return api_error(status, "worktree_edit_failed", message);
-    }
-    // Preserve duplicate-session classification without parsing an error string.
-    if error.is::<EditDuplicate>() {
-        return api_error(
-            StatusCode::CONFLICT,
-            "duplicate_session",
-            duplicate_session_error(
-                &error
-                    .downcast_ref::<EditDuplicate>()
-                    .expect("checked above")
-                    .0,
-            )
-            .to_string(),
-        );
     }
     tracing::error!(target: "http.api.sessions", %error, "session edit failed");
     api_error(
@@ -574,10 +537,6 @@ fn session_edit_error(error: &anyhow::Error, partial: bool) -> axum::response::R
         "Could not persist the session edit",
     )
 }
-
-#[derive(Debug, thiserror::Error)]
-#[error("session title/path already exists: {0}")]
-struct EditDuplicate(String);
 
 /// Quiesce a structured-view worker before its worktree directory or profile
 /// moves. A live ACP worker is pinned to its launch cwd and profile: moving the

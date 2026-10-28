@@ -670,6 +670,19 @@ mod tests {
                 picker >= TEXT_CONTRAST_RATIO,
                 "{name}: text-primary on surface-800 is {picker:.2}, below body-text AA"
             );
+            // Selected list and menu items: `bg-brand-600/20 text-text-primary`.
+            for surface in [
+                "--color-surface-900",
+                "--color-surface-850",
+                "--color-surface-800",
+            ] {
+                let selected = composite(var("--color-brand-600"), var(surface), 0.2);
+                let ratio = contrast_ratio(var("--color-text-primary"), selected);
+                assert!(
+                    ratio >= TEXT_CONTRAST_RATIO,
+                    "{name}: text-primary on selected fill over {surface} is {ratio:.2}, below body-text AA"
+                );
+            }
             let frame = var("--color-session-active");
             let fill = var("--color-surface-800");
             // The third surface is the fill an open row takes while it is also

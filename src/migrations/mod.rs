@@ -57,6 +57,10 @@ mod v045_runner_scope_ownership;
 mod v046_reconcile_runtime_lineages;
 mod v047_tool_retirements;
 mod v048_terminal_handoffs;
+mod v049_session_started_at;
+mod v050_sound_volume_split;
+mod v051_structured_view;
+mod v052_runtime_filter_acp_target;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -97,7 +101,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 48;
+const CURRENT_VERSION: u32 = 52;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -264,6 +268,14 @@ const MIGRATIONS: &[Migration] = &[
     ),
     (47, "tool_retirements", v047_tool_retirements::run),
     (48, "terminal_handoffs", v048_terminal_handoffs::run),
+    (49, "session_started_at", v049_session_started_at::run),
+    (50, "sound_volume_split", v050_sound_volume_split::run),
+    (51, "structured_view", v051_structured_view::run),
+    (
+        52,
+        "runtime_filter_acp_target",
+        v052_runtime_filter_acp_target::run,
+    ),
 ];
 
 /// The data-schema version this build targets, i.e. the version every install

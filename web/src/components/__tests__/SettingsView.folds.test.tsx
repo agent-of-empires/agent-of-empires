@@ -87,7 +87,8 @@ function renderView(tab: string) {
 }
 
 function expandAdvanced(container: HTMLElement) {
-  const trigger = container.querySelector("button[aria-expanded]") as HTMLButtonElement;
+  // Scoped to the tab content, which the Settings tab intro's Details toggle sits outside.
+  const trigger = container.querySelector("fieldset button[aria-expanded]") as HTMLButtonElement;
   expect(trigger).toBeTruthy();
   fireEvent.click(trigger);
 }

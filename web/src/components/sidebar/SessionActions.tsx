@@ -20,6 +20,7 @@ import { StatusGlyph } from "../StatusGlyph";
 import type { RowModel } from "./rowModel";
 import { BulkTriageMenuItems, SingleRowMenuItems, type SingleRowActions } from "./SessionRowMenu";
 import type { SessionAction } from "./sessionActionTargets";
+import { RecreateContainerDialog } from "./RecreateContainerDialog";
 import { SnoozeModal } from "./SnoozeModal";
 import type { RowBulkApi, RowContextScope } from "./types";
 import { WorkdirNameModal } from "./WorkdirNameModal";
@@ -34,6 +35,7 @@ export interface SessionActionHandlers {
   onDelete?: (sessionIds: string[]) => void;
   onStop?: (sessionId: string) => void;
   onStart?: (sessionId: string) => void;
+  onRestartForUpdate?: (sessionId: string) => void;
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
   /** Opens the wizard prefilled from this row's project, like the group header's "+". */
   onCreateSession?: (repoPath: string) => void;
@@ -77,12 +79,13 @@ export function SessionActionsMenu({
   extraItems?: ReactNode;
 }) {
   const [modal, setModal] = useState<Modal>(null);
+  const [recreating, setRecreating] = useState<SessionResponse | null>(null);
   const owner = useSessionActions();
   const colorsEnabled = useSessionColorsEnabled();
   const unreadEnabled = useUnreadIndicatorEnabled();
   const { label } = model;
   const actions = {
-    ...buildRowActions(workspace, handlers, model, closeMenu, setModal, () => {
+    ...buildRowActions(workspace, handlers, model, closeMenu, setModal, setRecreating, () => {
       if (model.firstSession) owner.openAttach(model.firstSession);
     }),
     rename: onRename,
@@ -150,6 +153,15 @@ export function SessionActionsMenu({
           handlers.onSnooze(workspace, minutes);
         }}
       />
+      {recreating &&
+        createPortal(
+          <RecreateContainerDialog
+            sessionId={recreating.id}
+            sessionTitle={recreating.title}
+            onClose={() => setRecreating(null)}
+          />,
+          document.body,
+        )}
     </>
   );
 }
@@ -162,6 +174,7 @@ function buildRowActions(
   model: RowModel,
   closeMenu: () => void,
   setModal: (m: Modal) => void,
+  setRecreating: (session: SessionResponse) => void,
   openAttach: () => void,
 ): Omit<SingleRowActions, "rename" | "notify" | "color"> {
   const after = (fn: () => unknown) => () => {
@@ -214,6 +227,8 @@ function buildRowActions(
     }),
     stop: afterTarget("stop", (s) => props.onStop?.(s.id)),
     start: afterTarget("start", (s) => props.onStart?.(s.id)),
+    restartUpdate: afterTarget("restartUpdate", (s) => props.onRestartForUpdate?.(s.id)),
+    recreateContainer: afterTarget("recreateContainer", setRecreating),
     pin: () => props.onPinToggle(workspace, !model.effectivePinned),
     archive: after(() => props.onArchiveToggle(workspace, !model.effectiveArchived)),
     openSnooze: after(() => setModal("snooze")),

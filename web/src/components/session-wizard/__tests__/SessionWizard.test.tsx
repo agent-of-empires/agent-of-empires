@@ -9,6 +9,7 @@ import {
   fetchAgents,
   fetchCreateProgress,
   fetchDockerStatus,
+  fetchGroups,
   fetchIsGitRepo,
   fetchProfiles,
   fetchProjects,
@@ -183,14 +184,21 @@ describe("SessionWizard structured view payload", () => {
 
   it.each([
     ["terminal", "terminal"],
-    ["auto", "structured"],
     ["structured", "structured"],
+    ["off", "terminal"],
   ])("opens on and sends the configured default view %s (#3517)", async (setting, view) => {
-    vi.mocked(fetchSettings).mockResolvedValueOnce({ acp: { default_new_session_view: setting } } as never);
+    vi.mocked(fetchSettings).mockResolvedValueOnce({ acp: { structured_view: setting } } as never);
     renderWizard();
     await launch();
     await waitFor(() => expect(createSession).toHaveBeenCalled());
     expect(payload()).toMatchObject({ tool: "claude", view });
+  });
+
+  it("hides the structured toggle when structured_view is off", async () => {
+    vi.mocked(fetchSettings).mockResolvedValueOnce({ acp: { structured_view: "off" } } as never);
+    renderWizard();
+    await screen.findByRole("switch", { name: "Auto-approve actions" });
+    await waitFor(() => expect(screen.queryByRole("switch", { name: "Use structured view" })).toBeNull());
   });
 
   it("sends profile-resolved agent model and effort defaults", async () => {
@@ -435,6 +443,8 @@ describe("SessionWizard rows", () => {
       fireEvent.click(await screen.findByText("Profile"));
       fireEvent.click(screen.getByRole("radio", { name: /work/ }));
       await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("work"));
+      // Groups are per profile.
+      await waitFor(() => expect(fetchGroups).toHaveBeenLastCalledWith("work"));
       await launch();
       await waitFor(() => expect(createSession).toHaveBeenCalled());
       expect(payload()).toMatchObject({ profile: "work" });
@@ -443,7 +453,7 @@ describe("SessionWizard rows", () => {
     // #4086: a view toggled while the settings response is pending is newer than the response.
     it("keeps a view toggled while the profile response is pending", async () => {
       vi.mocked(fetchProfiles).mockResolvedValue(PROFILES);
-      const terminal = { acp: { default_new_session_view: "terminal" } } as never;
+      const terminal = { acp: { structured_view: "terminal" } } as never;
       let release!: (v: never) => void;
       vi.mocked(fetchSettings)
         .mockResolvedValueOnce(terminal)
@@ -470,7 +480,7 @@ describe("SessionWizard rows", () => {
       try {
         vi.mocked(fetchSettings)
           .mockResolvedValueOnce({} as never)
-          .mockResolvedValueOnce({ acp: { default_new_session_view: "terminal" } } as never);
+          .mockResolvedValueOnce({ acp: { structured_view: "terminal" } } as never);
         renderWizard();
         fireEvent.click(await screen.findByRole("switch", { name: "Use structured view" }));
         fireEvent.click(screen.getByText("Profile"));
@@ -755,7 +765,7 @@ describe("SessionWizard served-profile authority", () => {
   const settings = (profile: string) => ({
     session: { yolo_mode_default: profile === "Beta", agent_command_override: { claude: profile + "-claude" } },
     worktree: { enabled: true },
-    acp: { default_new_session_view: "terminal" },
+    acp: { structured_view: "terminal" },
   });
   const open = (label: string) => fireEvent.click(screen.getByText(label).closest("button")!);
   const chooseProfile = async (profile: string) => {
@@ -978,5 +988,61 @@ describe("SessionWizard Docker readiness", () => {
 
     answer(true);
     await waitFor(() => expect(launchButton().disabled).toBe(false));
+  });
+});
+
+describe("SessionWizard Group field", () => {
+  it("never offers one profile's Groups under another while its list loads", async () => {
+    vi.mocked(fetchProfiles).mockResolvedValue([
+      { name: "default", is_default: true },
+      { name: "work", is_default: false },
+    ]);
+    vi.mocked(fetchGroups).mockResolvedValueOnce([{ path: "home-group", session_count: 1 }]);
+    renderWizard();
+    const field = await screen.findByRole("combobox", { name: "Group" });
+    fireEvent.focus(field);
+    await screen.findByRole("option", { name: "home-group · 1 session" });
+    fireEvent.blur(field);
+    let release: (groups: { path: string; session_count: number }[]) => void = () => {};
+    vi.mocked(fetchGroups).mockReturnValueOnce(new Promise((resolve) => (release = resolve)));
+    fireEvent.click(await screen.findByText("Profile"));
+    fireEvent.click(screen.getByRole("radio", { name: /work/ }));
+    await waitFor(() => expect(fetchGroups).toHaveBeenLastCalledWith("work"));
+    const again = await screen.findByRole("combobox", { name: "Group" });
+    fireEvent.focus(again);
+    expect(screen.queryByRole("option", { name: /home-group/ })).toBeNull();
+    await act(async () => release([{ path: "work-group", session_count: 2 }]));
+    await screen.findByRole("option", { name: "work-group · 2 sessions" });
+  });
+
+  it("refetches Groups when the served profile changes, dropping the old list first", async () => {
+    vi.mocked(fetchGroups).mockResolvedValueOnce([{ path: "alpha-group", session_count: 1 }]);
+    const props = { onClose: () => {}, onCreated: () => {}, prefill: { path: "/tmp/proj", tool: "claude" } };
+    const view = render(<SessionWizard servedProfile="Alpha" {...props} />);
+    const field = await screen.findByRole("combobox", { name: "Group" });
+    fireEvent.focus(field);
+    await screen.findByRole("option", { name: "alpha-group · 1 session" });
+    fireEvent.blur(field);
+    let release: (groups: { path: string; session_count: number }[]) => void = () => {};
+    vi.mocked(fetchGroups).mockReturnValueOnce(new Promise((resolve) => (release = resolve)));
+    const calls = vi.mocked(fetchGroups).mock.calls.length;
+    view.rerender(<SessionWizard servedProfile="Beta" {...props} />);
+    await waitFor(() => expect(vi.mocked(fetchGroups).mock.calls.length).toBe(calls + 1));
+    fireEvent.focus(field);
+    expect(screen.queryByRole("option", { name: /alpha-group/ })).toBeNull();
+    await act(async () => release([{ path: "beta-group", session_count: 2 }]));
+    await screen.findByRole("option", { name: "beta-group · 2 sessions" });
+  });
+
+  it("launches with the typed group while its list is open", async () => {
+    vi.mocked(fetchGroups).mockResolvedValue([{ path: "client/api", session_count: 2 }]);
+    renderWizard();
+    const field = await screen.findByRole("combobox", { name: "Group" });
+    fireEvent.focus(field);
+    fireEvent.change(field, { target: { value: "client/new" } });
+    expect(field.getAttribute("aria-expanded")).toBe("true");
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload()).toMatchObject({ group: "client/new" });
   });
 });

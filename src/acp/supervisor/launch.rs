@@ -345,7 +345,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
         // Every worker runs through `aoe __acp-runner` so it survives `aoe serve --stop`.
         let socket_path = worker_registry::socket_path_for(&req.session_id).map_err(|e| {
-            SupervisorError::Acp(AcpError::Spawn(format!("worker socket path: {e}")))
+            SupervisorError::Acp(AcpError::Spawn(format!("worker socket path: {e:#}")))
         })?;
         let mcp_servers = resolve_mcp_servers(
             &req.agent,
@@ -921,6 +921,15 @@ fn admission_error(error: anyhow::Error, session_id: &str) -> SupervisorError {
     } else {
         SupervisorError::Acp(AcpError::Spawn(format!("launch admission: {error:#}")))
     }
+}
+
+/// Admit a launch with no captured admission, such as a crash respawn, against the row as stored now.
+pub(super) async fn admit_stored_row(
+    profile: Option<&str>,
+    session_id: &str,
+) -> Result<(), SupervisorError> {
+    let (admission, _) = capture_durable_launch(profile, session_id, None, false).await?;
+    admit_durable_launch(admission.as_ref(), session_id).await
 }
 
 /// Check the same authority and generation before hooks, after hooks and after handshake.

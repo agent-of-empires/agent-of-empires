@@ -11,7 +11,7 @@ import { useRespawnSession } from "../../hooks/useRespawnSession";
 import { useWebSettings } from "../../hooks/useWebSettings";
 import { lastClearIndex } from "../../lib/acpHistoryWindow";
 import { visibleSessionNotices } from "../../lib/acpTypes";
-import { agentDisplayName } from "../../lib/agentDisplayName";
+import { useAgentDisplayNames } from "../../lib/agentDisplayName";
 import { isNewSessionStarting } from "./startupWait";
 import { AgentProfileProvider } from "../../lib/agentProfileContext";
 import { conversationFontSizeRem } from "../../lib/conversationFontSize";
@@ -167,8 +167,9 @@ function AcpChrome({
 }: ChromeProps) {
   const { sessionId, acpWorkerState, acpAgent } = view;
   const { state, status } = ctx;
+  const agentName = useAgentDisplayNames();
   const startingAgent = isNewSessionStarting(state, ctx, acpWorkerState, !!view.startedBefore)
-    ? agentDisplayName(state.agent ?? acpAgent)
+    ? agentName(state.agent ?? acpAgent)
     : null;
   // Neither can start until restored or unarchived, so nothing here may send (#4116).
   const readOnly = !!view.trashedAt || !!view.archivedAt;
@@ -239,6 +240,7 @@ function AcpChrome({
               rateLimitAutoResume={view.rateLimitAutoResume}
               rateLimitRetriesExhausted={state.rateLimitRetriesExhausted}
               hasEverOpened={ctx.hasEverOpened}
+              replayedWhileDown={ctx.replayedWhileDown}
               reconnecting={ctx.reconnecting}
               retryCount={ctx.retryCount}
               retryCountdown={ctx.retryCountdown}

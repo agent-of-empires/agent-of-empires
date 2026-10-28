@@ -4,7 +4,7 @@ Run one session across several git repositories. Each repo gets its own worktree
 
 For fixed sibling repos that rarely change, an [`on_create` hook](repo-config.md) is simpler than a workspace.
 
-## Quick Start
+## Quick start
 
 Register repos once, then start a session:
 
@@ -12,6 +12,7 @@ Register repos once, then start a session:
 aoe project add /path/to/backend
 aoe project add /path/to/frontend
 aoe project add /path/to/shared-lib
+
 aoe add /path/to/backend --project frontend --project shared-lib \
   -w feat/auth-rewrite -b
 ```
@@ -42,7 +43,7 @@ The session starts in the workspace root with all the worktrees as siblings:
 └── shared-lib/   ← branch feat/auth-rewrite
 ```
 
-The agent navigates between them like any normal multi-repo working tree. Use `cd` and standard git commands; AoE does not impose any cross-repo orchestration.
+The agent navigates between them with ordinary `cd` and git commands; AoE imposes no cross-repo orchestration.
 
 ### Adding a repo to an existing session
 
@@ -58,38 +59,21 @@ What that means for the session depends on the shape it started in:
 
 | Session was | What happens | Working directory |
 |---|---|---|
-| A multi-repo workspace | The new repo's worktree is created in the workspace it already has | Unchanged |
-| A worktree session | A workspace directory is created and the session's worktree is moved into it, so uncommitted work travels | Moves to the workspace |
-| An in-place session | A workspace directory is created with a *fresh* worktree of the session's repo | Moves to the workspace |
+| A multi-repo workspace | The new repo's worktree joins the existing workspace | Unchanged |
+| A worktree session | A workspace is created and the session's worktree moves into it, so uncommitted work travels | Moves |
+| An in-place session | A workspace is created with a *fresh* worktree of the session's repo | Moves |
 
-The last row is why AoE never touches your own checkout: it creates a worktree of
-your repo rather than adopting the directory you are working in. The trade is that
-uncommitted work in that checkout would be left behind, so attaching to an
-in-place session with a dirty checkout is refused. Commit or stash first.
+That last row is why AoE never touches your own checkout: it creates a worktree rather than adopting the directory you work in. Uncommitted work there would be left behind, so attaching to an in-place session with a dirty checkout is refused. Commit or stash first.
 
-The session's branch name is only a suggestion. If the added repo does not have
-that branch, AoE creates it from that repo's own base branch. If it already
-exists, the attach is refused, because a same-named branch in another repo can
-hold unrelated commits: pass `--attach-existing-branch` (or tick the box in the
-web modal) to check it out as-is. AoE then records that it did not create the
-branch and leaves it alone when the session is deleted.
+The session's branch name is a suggestion: if the added repo lacks that branch, AoE creates it from that repo's own base. If it already exists the attach is refused, since a same-named branch elsewhere can hold unrelated commits; pass `--attach-existing-branch` (or tick the box in the web modal) to check it out as-is, and AoE then leaves that branch alone when the session is deleted.
 
 Unless the session is already a workspace, its directory moves, so it is stopped for the move and restarted. A known conversation bound to the old directory blocks the move; other sessions may attempt to resume their stored ID, but continuity is not guaranteed. Attaching is refused mid-turn. Everything that can refuse the attach is checked before stopping; if conversion later fails, AoE attempts to restore the worker.
 
-Scratch sessions cannot be attached to: they have no repo of their own, only a
-throwaway directory that deletion removes.
+Scratch sessions cannot accept attached repositories; they have no repository of their own.
 
-Sandboxed sessions have their container removed and recreated, since bind mounts
-are fixed when the container is created and the container mounts the common
-ancestor of the workspace and every repo. Build caches (`target/`,
-`node_modules/`) go with the container under the default
-[volume ignores strategy](sandbox.md#volume-ignores-strategy-macosvirtiofs). Under
-`"named"` they are keyed on their container path, so they survive an attach that
-leaves that path alone. Attaching a repo from outside the current common ancestor
-moves every mount, so those caches start empty and the volumes they leave behind
-have to be removed by hand.
+A sandboxed session has its container recreated, since bind mounts are fixed at creation and the container mounts the common ancestor of the workspace and every repo. Build caches go with the container under the default [volume ignores strategy](sandbox.md#volume-ignores-strategy); under `"named"` they are keyed on their container path and survive an attach that leaves that path alone. Attaching a repo from outside the current common ancestor moves every mount, so those caches start cold and the volumes they leave behind need removing by hand.
 
-## The Project Registry
+## The project registry
 
 Saved repo paths the pickers draw from, in two scopes:
 
@@ -100,13 +84,11 @@ Saved repo paths the pickers draw from, in two scopes:
 
 See [File Locations](configuration.md#file-locations) for `<app_dir>`. `aoe project add` defaults to global, or to the selected profile with `-p <profile>`; `--scope global` or `--scope profile` overrides that choice. A path already registered in another scope is refused unless `--allow-override` lets a profile entry shadow the global one.
 
-### Saved projects versus pinned projects
-
 Saved projects appear in pickers even without sessions. **Pinning** keeps a project header visible when empty; unpinning leaves the registration intact. Only **Remove** or `aoe project remove` deletes the entry.
 
 Pin from the TUI project view (`g`, Project grouping, then `p` on a header or its context menu), or the web project header's actions menu. Pinning registers an unsaved repo globally and marks it with `◆`. Empty pinned web projects sort below active repositories and retain their **New session** action. Pins live in the registry and appear on the other surface when refreshed.
 
-## CLI Reference
+## CLI
 
 Use `aoe project list`, `aoe project add <path>` and `aoe project remove <name-or-path>` to manage registrations. See the [CLI Reference](../cli/reference.md) for scope, naming, override and JSON flags.
 

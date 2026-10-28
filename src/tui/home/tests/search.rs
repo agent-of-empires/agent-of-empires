@@ -409,6 +409,8 @@ fn persist_tips_outcome_merges_seen_sets_disabled_and_updates_badge() {
 #[serial]
 fn footer_tips_badge_renders_hovers_and_opens_overlay() {
     let mut env = create_test_env_with_sessions(1);
+    // A healthy runtime, so the R entry carries the Web dashboard rather than a Daemon limit.
+    let _runtime = env.view.session_feed.terminal_driver_for_test();
     earn_tip(&mut env);
     let n = env.view.tips_unseen;
     assert!(n > 0);
@@ -440,8 +442,9 @@ fn footer_tips_badge_renders_hovers_and_opens_overlay() {
     );
     env.view.tips_dialog = None;
 
-    // Compact Tips use their painted icon width beside the critical Enter action.
-    let thin = render_home_to_string(&mut env.view, 30, 40);
+    // Compact Tips use their painted icon width beside the critical Enter action, at the
+    // right edge of a footer too narrow for anything else.
+    let thin = render_home_to_string(&mut env.view, 12, 40);
     assert!(thin.contains('\u{1f4a1}'), "compact badge survives\n{thin}");
     let compact = env.view.tips_badge_rect.expect("compact badge hit area");
     assert_eq!(
@@ -455,10 +458,11 @@ fn footer_tips_badge_renders_hovers_and_opens_overlay() {
         .find(|(key, _)| key.code == KeyCode::Enter)
         .expect("critical Enter remains available")
         .1;
-    assert_eq!(enter.right(), compact.x);
+    assert!(enter.right() <= compact.x, "the badge never covers Enter");
+    assert_eq!(compact.right(), 12);
     assert!(env
         .view
-        .footer_button_at(compact.x - 1, compact.y)
+        .footer_button_at(enter.right() - 1, compact.y)
         .is_some());
     assert_eq!(env.view.footer_button_at(compact.x, compact.y), None);
     assert!(!env.view.handle_tips_badge_click(compact.x - 1, compact.y));
@@ -477,7 +481,7 @@ fn footer_tips_badge_renders_hovers_and_opens_overlay() {
         !thin.contains("Diff"),
         "low-priority hints drop to make room for the badge\n{thin}"
     );
-    render_home_to_string(&mut env.view, 30 - compact.width, 40);
+    render_home_to_string(&mut env.view, 12 - compact.width, 40);
     assert!(env.view.tips_badge_rect.is_none());
     assert!(!env.view.handle_tips_badge_click(compact.x, compact.y));
 

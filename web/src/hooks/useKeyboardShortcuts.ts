@@ -12,6 +12,9 @@ export function useKeyboardShortcuts(getActions: () => ShortcutActions) {
         target instanceof HTMLElement &&
         (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
 
+      // A field that marks itself closes its own open list on Escape; the surface around it stays.
+      if (e.key === "Escape" && target?.closest('[data-owns-escape][aria-expanded="true"]')) return;
+
       const isSessionInput = !!target?.closest(
         '[data-term="agent"], [data-term="paired"], [data-session-composer], [data-keyboard-proxy][data-session-input]',
       );

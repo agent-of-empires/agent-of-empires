@@ -21,6 +21,7 @@ The **New session** wizard is one screen of one-line rows, like the TUI dialog; 
 
 - **Project**: pick the working directory from the Recent tab, browse for one, clone a URL, or start a scratch session with no path. The Recent tab lists your saved projects under a "Saved projects" section above the directories of your recent sessions. The recent list keeps a project around after its last session is deleted, so you can quickly start there again; entries whose directory no longer exists are dropped.
 - **Title**: auto-slugifies into a worktree branch name unless you edit the branch.
+- **Group**: search existing groups, including empty groups, or select the create row for a new name; surrounding spaces are trimmed on selection and `/` nests groups. Counts show sessions directly in the group, excluding archived and trashed sessions. Escape closes the suggestions without closing the wizard.
 - **Agent**: the tool, plus instructions, command override, and extra args.
 - **Structured**, **Auto-approve**, **Worktree**, and **Sandbox** switches; the Worktree and Sandbox rows open their branch, base, image, and env options.
 
@@ -37,7 +38,7 @@ The palette (top-bar button or keyboard shortcut) is a fuzzy launcher for global
 
 When an embedded agent or paired terminal, or the structured-session composer, has keyboard focus, press `Ctrl+Q` to return focus to the active session in the sidebar. Then press `a` to move to the next session needing attention; `a` works when a terminal or text field is not focused.
 
-With a session row focused, use **↑** and **↓** to move through visible rows without opening one; press **Enter** to open the focused row.
+With a session row or Group header focused, use **↑** and **↓** to move through visible headers and rows without opening one; press **Enter** on a row to open it. On a Group header, **Enter** or **Space** collapses or expands it, **←** collapses it, and **→** expands it or, once expanded, moves to its first row. **←** on a row moves to its header. **Shift+F10** or the **Menu** key opens the header's menu. **Tab** stops once on the header itself, then on its **+** (New session) button; compact mode hides the **+**.
 
 Individual settings appear under `Settings`: a writable toggle flips inline with a toast, while read-only servers and settings needing elevation open the settings view instead. The Settings header has its own search box (the TUI settings screen uses `/`) that filters across every tab.
 

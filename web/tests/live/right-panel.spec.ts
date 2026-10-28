@@ -60,29 +60,32 @@ test("diff pane in a non-git session stays closed until opened, then shows one n
       return layout ? [...layout.right, ...layout.bottom].flatMap((g: { tabs: string[] }) => g.tabs) : null;
     }, session!.id);
 
-  // Hold the browser's first Session list so the unknown state is observable: a
-  // deep link mounts the layout before that list arrives.
+  // Hold every Session list GET, polling included, so the unknown state is observable: a
+  // deep link mounts the layout before any list arrives.
   let release!: () => void;
   const gate = new Promise<void>((r) => (release = r));
-  let held = false;
+  let heldGets = 0;
   await page.route("**/api/sessions", async (route) => {
-    if (!held && route.request().method() === "GET") {
-      held = true;
+    if (route.request().method() === "GET") {
+      heldGets++;
       await gate;
     }
     await route.continue();
   });
   const diffFilesRequested = page.waitForRequest((r) => r.url().includes(`/sessions/${session!.id}/diff/files`));
+  const diffToggle = page.getByTestId("pane-toggle-diff").first();
   try {
     await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(session!.id)}`);
     // The diff-files effect establishes the unknown-session layout window.
     await diffFilesRequested;
-    expect(held).toBe(true);
+    expect(heldGets).toBeGreaterThan(0);
     expect(await storedTabs()).toBeNull();
+    // The toggle renders only once the Session is known, so it must not be awaited before release.
+    await expect(diffToggle).toHaveCount(0);
   } finally {
     release();
   }
-  const diffToggle = page.getByTestId("pane-toggle-diff").first();
+  await expect(diffToggle).toBeVisible({ timeout: 10_000 });
   await expect.poll(storedTabs).not.toBeNull();
   const pinned = (await storedTabs())!;
   expect(pinned.some((t) => t.startsWith("terminal:"))).toBe(true);

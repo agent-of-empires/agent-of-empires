@@ -641,7 +641,7 @@ fn capture_launched_session_id_with_wait(
     notify: bool,
     mut wait: impl FnMut(Duration),
 ) {
-    if inst.session_id_poller.is_none() {
+    if inst.capture_poller.handle().is_none() {
         return;
     }
 
@@ -708,7 +708,7 @@ fn capture_launched_session_id_with_wait(
 
 /// Lease one poller's newest observation from its sticky mailbox.
 fn drain_poller(inst: &Instance) -> Option<SessionIdObservation> {
-    let arc = inst.session_id_poller.as_ref()?;
+    let arc = inst.capture_poller.handle()?;
     let mut guard = match arc.lock() {
         Ok(g) => g,
         Err(poisoned) => {
@@ -731,7 +731,7 @@ pub(crate) fn pending_poller_observation_matches(
     inst: &Instance,
     predicate: impl FnOnce(&SessionIdObservation) -> bool,
 ) -> bool {
-    let Some(arc) = inst.session_id_poller.as_ref() else {
+    let Some(arc) = inst.capture_poller.handle() else {
         return false;
     };
     let mut guard = match arc.lock() {
@@ -749,7 +749,7 @@ pub(crate) fn pending_poller_observation_matches(
 }
 
 fn acknowledge_poller_observation(inst: &Instance, observation: &SessionIdObservation) {
-    let Some(poller) = inst.session_id_poller.as_ref() else {
+    let Some(poller) = inst.capture_poller.handle() else {
         return;
     };
     let expected = (inst.id.clone(), observation.clone());
@@ -782,7 +782,7 @@ fn request_poller_retry(instances: &[Instance], id: &str) {
     let Some(poller) = instances
         .iter()
         .find(|inst| inst.id == id)
-        .and_then(|inst| inst.session_id_poller.as_ref())
+        .and_then(|inst| inst.capture_poller.handle())
     else {
         return;
     };
@@ -1056,7 +1056,8 @@ mod tests {
             inst.active_execution.clone(),
         );
         poller.inject_test_update(&inst.id, sid);
-        inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
+        inst.capture_poller
+            .set_handle(Some(Arc::new(Mutex::new(poller))));
     }
 
     fn attach_poller_with_omp_update(inst: &mut Instance, sid: &str, generation: &str) {
@@ -1078,7 +1079,8 @@ mod tests {
             observation.scope_to(binding);
         }
         poller.inject_test_observation(&inst.id, observation);
-        inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
+        inst.capture_poller
+            .set_handle(Some(Arc::new(Mutex::new(poller))));
     }
 
     fn attach_poller_with_legacy_omp_update(inst: &mut Instance, sid: &str) {
@@ -1088,7 +1090,8 @@ mod tests {
             inst.active_execution.clone(),
         );
         poller.inject_test_omp_legacy_update(&inst.id, sid);
-        inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
+        inst.capture_poller
+            .set_handle(Some(Arc::new(Mutex::new(poller))));
     }
 
     fn pinned_omp_instance(profile: &str, sid: &str, generation: &str) -> Instance {
@@ -1625,8 +1628,8 @@ mod tests {
         let repeated = drain_and_persist_session_ids(&mut instances, &file_watch);
         assert!(!repeated.touched());
         assert!(instances[0]
-            .session_id_poller
-            .as_ref()
+            .capture_poller
+            .handle()
             .unwrap()
             .lock()
             .unwrap()
@@ -1702,7 +1705,9 @@ mod tests {
             claimant.active_execution.clone(),
         );
         poller.inject_test_observation(&claimant.id, observed);
-        claimant.session_id_poller = Some(Arc::new(Mutex::new(poller)));
+        claimant
+            .capture_poller
+            .set_handle(Some(Arc::new(Mutex::new(poller))));
         let file_watch = FileWatchService::noop();
         let mut instances = vec![claimant];
         let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
@@ -1711,8 +1716,8 @@ mod tests {
         assert!(outcome.rolled_back.is_empty());
         assert!(instances[0].agent_session_id.is_none());
         assert!(instances[0]
-            .session_id_poller
-            .as_ref()
+            .capture_poller
+            .handle()
             .unwrap()
             .lock()
             .unwrap()
@@ -1769,7 +1774,8 @@ mod tests {
             crate::session::poller::SessionIdObservation::instance_sidecar(sid.into(), None);
         observation.execution = inst.active_execution.clone();
         poller.inject_test_observation(&inst.id, observation);
-        inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
+        inst.capture_poller
+            .set_handle(Some(Arc::new(Mutex::new(poller))));
         let mut instances = vec![inst];
         let outcome = drain_and_persist_session_ids(&mut instances, &FileWatchService::noop());
         assert_eq!(outcome.applied, vec![instances[0].id.clone()]);
@@ -1832,7 +1838,9 @@ mod tests {
             qualified_observation.execution = qualified.active_execution.clone();
             qualified_observation.scope_to(source);
             qualified_poller.inject_test_observation(&qualified.id, qualified_observation);
-            qualified.session_id_poller = Some(Arc::new(Mutex::new(qualified_poller)));
+            qualified
+                .capture_poller
+                .set_handle(Some(Arc::new(Mutex::new(qualified_poller))));
 
             let id_only_poller = SessionPoller::new(
                 format!("test-tmux-{}", id_only.id),
@@ -1843,7 +1851,9 @@ mod tests {
                 crate::session::poller::SessionIdObservation::instance_sidecar(sid.into(), None);
             id_only_observation.execution = id_only.active_execution.clone();
             id_only_poller.inject_test_observation(&id_only.id, id_only_observation);
-            id_only.session_id_poller = Some(Arc::new(Mutex::new(id_only_poller)));
+            id_only
+                .capture_poller
+                .set_handle(Some(Arc::new(Mutex::new(id_only_poller))));
 
             let qualified_id = qualified.id.clone();
             let id_only_id = id_only.id.clone();
@@ -1971,7 +1981,8 @@ mod tests {
             inst.active_execution.clone(),
         );
         poller.inject_test_sidecar_update(&inst.id, "pi-new-conversation", None);
-        inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
+        inst.capture_poller
+            .set_handle(Some(Arc::new(Mutex::new(poller))));
 
         let file_watch = FileWatchService::noop();
         let mut instances = [inst];
@@ -1983,7 +1994,7 @@ mod tests {
             "an attributable observation must be adopted"
         );
         assert!(
-            instances[0].session_id_poller.is_some(),
+            instances[0].capture_poller.handle().is_some(),
             "a sidecar poller keeps watching for the next switch"
         );
     }
@@ -2023,7 +2034,8 @@ mod tests {
                 inst.active_execution.clone(),
             );
             poller.inject_test_sidecar_update(&inst.id, new, Some(&path));
-            inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
+            inst.capture_poller
+                .set_handle(Some(Arc::new(Mutex::new(poller))));
             let file_watch = FileWatchService::noop();
             let mut instances = [inst];
             let stored = || Storage::new_unwatched(profile).unwrap().load().unwrap()[0].clone();
@@ -2047,7 +2059,7 @@ mod tests {
                 Some(path.as_str()),
                 "{label}: the live snapshot must retain the durable path"
             );
-            let poller = instances[0].session_id_poller.as_ref().unwrap();
+            let poller = instances[0].capture_poller.handle().unwrap();
             assert!(
                 poller.lock().unwrap().latest_observation().is_none(),
                 "{label}: a stored path acknowledges its observation"
@@ -2076,13 +2088,13 @@ mod tests {
         );
         poller.inject_test_sidecar_update(&inst.id, sid, Some(&path));
         let poller = Arc::new(Mutex::new(poller));
-        inst.session_id_poller = Some(poller.clone());
+        inst.capture_poller.set_handle(Some(poller.clone()));
         let fail_next = Instance::fail_next_pi_path_write_for_test();
 
         inst.stop_and_flush_poller();
         assert!(fail_next.was_consumed());
 
-        assert!(inst.session_id_poller.is_none());
+        assert!(inst.capture_poller.handle().is_none());
         let stored = Storage::new_unwatched(profile).unwrap().load().unwrap();
         assert_eq!(stored[0].agent_session_id.as_deref(), Some(sid));
         assert_eq!(stored[0].pi_session_path.as_deref(), Some(path.as_str()));
@@ -2140,7 +2152,7 @@ mod tests {
         );
         poller.inject_test_observation(&inst.id, observation);
         let poller = Arc::new(Mutex::new(poller));
-        inst.session_id_poller = Some(poller.clone());
+        inst.capture_poller.set_handle(Some(poller.clone()));
 
         let mut next_execution = execution;
         next_execution.launch_id = uuid::Uuid::new_v4().to_string();
@@ -2158,7 +2170,7 @@ mod tests {
         let _hook = Instance::set_after_final_pi_drain_hook_for_test(move |inst| {
             assert!(Instance::fail_next_pi_path_write_consumed_for_test());
             assert_eq!(inst.pi_session_path, None);
-            assert!(inst.session_id_poller.is_some());
+            assert!(inst.capture_poller.handle().is_some());
             assert!(crate::session::sync::pending_poller_observation_matches(
                 inst,
                 |observation| inst.observation_is_current_pi_path(observation),
@@ -2178,7 +2190,7 @@ mod tests {
         inst.stop_and_flush_poller();
         assert!(fail_next.was_consumed());
 
-        assert!(inst.session_id_poller.is_none());
+        assert!(inst.capture_poller.handle().is_none());
         assert_eq!(inst.pi_session_path, None);
         let stored = Storage::new_unwatched(profile).unwrap().load().unwrap();
         assert_eq!(stored[0].agent_session_id.as_deref(), Some(sid));
@@ -2212,7 +2224,8 @@ mod tests {
             inst.active_execution.clone(),
         );
         poller.inject_test_observation(&inst.id, observation);
-        inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
+        inst.capture_poller
+            .set_handle(Some(Arc::new(Mutex::new(poller))));
 
         FAIL_PI_PATH_WRITES.with(|fail| fail.set(true));
         let mut instances = [inst];
@@ -2222,8 +2235,8 @@ mod tests {
         let stored = Storage::new_unwatched(profile).unwrap().load().unwrap();
         assert_eq!(stored[0].pi_session_path.as_deref(), Some(path.as_str()));
         assert!(instances[0]
-            .session_id_poller
-            .as_ref()
+            .capture_poller
+            .handle()
             .unwrap()
             .lock()
             .unwrap()
@@ -2292,7 +2305,7 @@ mod tests {
         );
         poller.inject_test_observation(&inst.id, observation);
         let old_poller = Arc::new(Mutex::new(poller));
-        inst.session_id_poller = Some(old_poller.clone());
+        inst.capture_poller.set_handle(Some(old_poller.clone()));
 
         let mut instances = [inst];
         let outcome = drain_and_persist_session_ids(&mut instances, &FileWatchService::noop());
@@ -2301,7 +2314,7 @@ mod tests {
             instances[0].active_execution.as_ref(),
             Some(&peer_execution)
         );
-        assert!(instances[0].session_id_poller.is_none());
+        assert!(instances[0].capture_poller.handle().is_none());
         let stored = storage.load().unwrap();
         assert_eq!(stored[0].active_execution, Some(peer_execution));
         assert_eq!(
@@ -2340,7 +2353,8 @@ mod tests {
             inst.active_execution.clone(),
         );
         poller.inject_test_sidecar_update(&inst.id, old, Some(&path));
-        inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
+        inst.capture_poller
+            .set_handle(Some(Arc::new(Mutex::new(poller))));
         let file_watch = FileWatchService::noop();
         drain_and_persist_session_ids(std::slice::from_mut(&mut inst), &file_watch);
 
@@ -2348,7 +2362,8 @@ mod tests {
         assert_eq!(disk[0].agent_session_id.as_deref(), Some(new));
         assert_eq!(disk[0].pi_session_path, None);
         assert!(
-            inst.session_id_poller
+            inst.capture_poller
+                .handle()
                 .unwrap()
                 .lock()
                 .unwrap()
@@ -2387,7 +2402,8 @@ mod tests {
             inst.active_execution.clone(),
         );
         poller.inject_test_sidecar_update(&inst.id, sid, Some(published));
-        inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
+        inst.capture_poller
+            .set_handle(Some(Arc::new(Mutex::new(poller))));
 
         let file_watch = FileWatchService::noop();
         let mut instances = [inst];
@@ -2427,7 +2443,7 @@ mod tests {
             inst.active_execution.clone(),
         );
         let poller = Arc::new(Mutex::new(poller));
-        inst.session_id_poller = Some(poller.clone());
+        inst.capture_poller.set_handle(Some(poller.clone()));
 
         let inst_id = inst.id.clone();
         let mut waited = false;
@@ -2530,7 +2546,7 @@ mod tests {
                 inst.tool.clone(),
                 inst.active_execution.clone(),
             )));
-            inst.session_id_poller = Some(poller.clone());
+            inst.capture_poller.set_handle(Some(poller.clone()));
             let sidecar = crate::hooks::ensure_instance_dir_path(&inst.id).unwrap();
 
             let inst_id = inst.id.clone();
@@ -2619,11 +2635,12 @@ mod tests {
                 inst.mark_pi_extension_launched_for_test();
             }
             seed_instance_on_disk(&profile, &inst);
-            inst.session_id_poller = Some(Arc::new(Mutex::new(SessionPoller::new(
-                format!("test-tmux-{}", inst.id),
-                inst.tool.clone(),
-                inst.active_execution.clone(),
-            ))));
+            inst.capture_poller
+                .set_handle(Some(Arc::new(Mutex::new(SessionPoller::new(
+                    format!("test-tmux-{}", inst.id),
+                    inst.tool.clone(),
+                    inst.active_execution.clone(),
+                )))));
 
             let mut ticks = 0;
             capture_launched_session_id_with_wait(
@@ -2660,7 +2677,7 @@ mod tests {
         poller.inject_test_update(&inst.id, older);
         poller.inject_test_update(&inst.id, newer);
         let poller = Arc::new(Mutex::new(poller));
-        inst.session_id_poller = Some(poller.clone());
+        inst.capture_poller.set_handle(Some(poller.clone()));
 
         let file_watch = FileWatchService::noop();
         let mut instances = vec![inst];
@@ -2693,7 +2710,7 @@ mod tests {
             inst.active_execution.clone(),
         )));
         poller.lock().unwrap().inject_test_update(&inst.id, sid);
-        inst.session_id_poller = Some(poller.clone());
+        inst.capture_poller.set_handle(Some(poller.clone()));
 
         let stale_consumer = inst.clone();
         let leased = drain_poller(&stale_consumer).unwrap();

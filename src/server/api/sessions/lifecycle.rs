@@ -664,8 +664,11 @@ pub async fn trash_session(
         Ok(crate::session::trash::RelocateOutcome::Skipped) => {
             crate::daemon::TrashRelocationOutcome::Skipped
         }
-        Ok(crate::session::trash::RelocateOutcome::Relocated { .. }) => {
-            crate::daemon::TrashRelocationOutcome::Relocated
+        Ok(crate::session::trash::RelocateOutcome::Relocated { warning, .. }) => {
+            if let Some(warning) = &warning {
+                tracing::warn!(target: "http.api.sessions", session = %id, %warning, "trashed worktree is degraded");
+            }
+            crate::daemon::TrashRelocationOutcome::Relocated { warning }
         }
         Err(error) => {
             if let Some(response) = lifecycle_rejection(&state, &error) {
@@ -748,7 +751,13 @@ pub async fn restore_session(
                 let now = chrono::Utc::now();
                 if !row.is_trashed() {
                     if row.has_fresh_lifecycle_reservation(now) {
-                        return Err(LifecycleTargetError::Busy.into());
+                        return Err(row.lifecycle_reservation.as_ref().map_or(
+                            LifecycleTargetError::Busy.into(),
+                            |reservation| {
+                                crate::session::LifecycleReservationError::Busy(reservation.op)
+                                    .into()
+                            },
+                        ));
                     }
                     return Ok(None);
                 }
@@ -763,8 +772,8 @@ pub async fn restore_session(
                     crate::session::claim::RestoreClaimDecision::AlreadyGone => {
                         Err(LifecycleTargetError::Missing.into())
                     }
-                    crate::session::claim::RestoreClaimDecision::Busy(_) => {
-                        Err(LifecycleTargetError::Busy.into())
+                    crate::session::claim::RestoreClaimDecision::Busy(holder) => {
+                        Err(crate::session::LifecycleReservationError::Busy(holder).into())
                     }
                 }
             })?;
@@ -773,9 +782,8 @@ pub async fn restore_session(
             };
             instance.source_profile = profile;
             instance.file_watch = Some(worker_state.file_watch.clone());
-            if let crate::session::trash::RestoreOutcome::Failed { reason } =
-                crate::session::trash::restore_worktree_location(&mut instance)
-            {
+            let warning = match crate::session::trash::restore_worktree_location(&mut instance) {
+                crate::session::trash::RestoreOutcome::Failed { reason } => {
                 store.update(|rows, _| {
                     let row = rows
                         .iter_mut()
@@ -790,7 +798,10 @@ pub async fn restore_session(
                     Ok(())
                 })?;
                 return Err(WorktreeFailure(reason).into());
-            }
+                }
+                crate::session::trash::RestoreOutcome::Restored { warning, .. } => warning,
+                crate::session::trash::RestoreOutcome::NoChange => None,
+            };
             store.update(|rows, _| {
                 match crate::session::claim::finalize_restore_commit(
                     rows,
@@ -804,11 +815,14 @@ pub async fn restore_session(
                         Err(LifecycleTargetError::Missing.into())
                     }
                     crate::session::claim::RestoreCommit::Superseded => {
-                        Err(LifecycleTargetError::Busy.into())
+                        Err(crate::session::LifecycleReservationError::Superseded.into())
                     }
                 }
             })?;
-            Ok(crate::daemon::RestoreOutcome::Restored)
+            if let Some(warning) = &warning {
+                tracing::warn!(target: "http.api.sessions", session = %worker_id, %warning, "restored worktree is degraded");
+            }
+            Ok(crate::daemon::RestoreOutcome::Restored { warning })
         })
         .await
         .map_err(anyhow::Error::from)
@@ -1140,21 +1154,50 @@ pub(crate) fn lifecycle_rejection(
     if error.is::<crate::session::SessionGone>() {
         return Some(crate::server::api::session_not_found());
     }
-    if matches!(
-        error.downcast_ref::<LifecycleTargetError>(),
-        Some(LifecycleTargetError::Busy)
-    ) || matches!(
-        error.downcast_ref::<crate::session::LifecycleReservationError>(),
-        Some(
-            crate::session::LifecycleReservationError::Busy(_)
-                | crate::session::LifecycleReservationError::Superseded
+    let (code, operation, message) = match error
+        .downcast_ref::<crate::session::LifecycleReservationError>()
+    {
+        Some(crate::session::LifecycleReservationError::Busy(operation)) => (
+            "lifecycle_busy",
+            Some(*operation),
+            format!(
+                "Session is busy with {}; nothing changed, retry when it finishes",
+                serde_json::json!(operation)
+                    .as_str()
+                    .unwrap_or("another operation")
+            ),
+        ),
+        Some(crate::session::LifecycleReservationError::Superseded) => (
+            "lifecycle_superseded",
+            None,
+            "Session changed after it was selected; refresh and check before retrying".to_owned(),
+        ),
+        _ if matches!(
+            error.downcast_ref::<LifecycleTargetError>(),
+            Some(LifecycleTargetError::Busy)
+        ) =>
+        {
+            (
+                "lifecycle_busy",
+                None,
+                "Session lifecycle is busy".to_owned(),
+            )
+        }
+        _ => return None,
+    };
+    let header = if code == "lifecycle_superseded" {
+        crate::daemon::ApiErrorCode::LifecycleSuperseded.header()
+    } else {
+        crate::daemon::ApiErrorCode::LifecycleLocked.header()
+    };
+    Some(
+        (
+            StatusCode::CONFLICT,
+            header,
+            Json(serde_json::json!({"error": code, "operation": operation, "message": message})),
         )
-    ) {
-        return Some((StatusCode::CONFLICT,
-            crate::daemon::ApiErrorCode::LifecycleLocked.header(),
-            Json(serde_json::json!({"error": "lifecycle_busy", "message": "Session lifecycle is busy"}))).into_response());
-    }
-    None
+            .into_response(),
+    )
 }
 
 async fn adopt_lifecycle_commit<R>(
@@ -1783,6 +1826,126 @@ pub async fn restart_session(
     .await
 }
 
+/// Restart a sandboxed session on a new container, created from the current local image. The
+/// container's filesystem outside its mounts is lost; the conversation resumes as on a restart.
+pub async fn recreate_container(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    if let Some(response) = crate::server::api::read_only_block(&state)
+        .or_else(|| crate::server::api::cityhall_block(&state))
+    {
+        return response;
+    }
+    let sandboxed = {
+        let instances = state.instances.read().await;
+        let Some(instance) = instances.iter().find(|row| row.id == id) else {
+            return crate::server::api::session_not_found();
+        };
+        instance.is_sandboxed()
+    };
+    if !sandboxed {
+        return api_error(
+            StatusCode::CONFLICT,
+            "not_sandboxed",
+            "Only a sandboxed session has a container to recreate".to_string(),
+        );
+    }
+    prepare_agent_session(
+        state,
+        id,
+        Ok(None),
+        AgentPreparation::Restart,
+        Some(Arc::new(crate::daemon::RestartSessionBody {
+            discard_sandbox_container: true,
+            ..Default::default()
+        })),
+    )
+    .await
+}
+
+/// Restart a session whose agent binary was replaced after launch (#4214). Eligibility is
+/// re-checked here because the list that offered it may be several seconds old.
+pub async fn restart_for_update(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
+    let instance = {
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            return crate::server::api::session_not_found();
+        };
+        inst.clone()
+    };
+    let structured_ready = state
+        .acp_supervisor
+        .worker_states_snapshot()
+        .await
+        .get(&id)
+        .is_some_and(|(worker, _)| *worker == crate::daemon::AcpWorkerState::Running)
+        && state
+            .acp_event_store
+            .pending_approval_requests(&id)
+            .is_empty();
+    let resume_available = update_restart_resumable(&instance, &context_resume_for(&instance));
+    if !crate::session::update_restart::offer_pending(&instance, resume_available, structured_ready)
+    {
+        return api_error(
+            StatusCode::CONFLICT,
+            "not_eligible",
+            "Session is busy or its agent is not out of date".to_string(),
+        );
+    }
+    apply_update_restart(&state, id, instance).await
+}
+
+/// Restart an eligible session onto the updated agent.
+pub(super) async fn apply_update_restart(
+    state: &Arc<AppState>,
+    id: String,
+    instance: Instance,
+) -> axum::response::Response {
+    if instance.is_structured() {
+        // The reconciler terminates the worker once its turn drains and respawns it against the
+        // stored conversation.
+        state.acp_supervisor.mark_build_respawn_pending(&id);
+        let response = SessionResponse::from_instance(
+            &instance,
+            crate::claude_settings::read_tui_fullscreen(),
+        );
+        return (StatusCode::ACCEPTED, Json(response)).into_response();
+    }
+    // The offer promises the conversation survives, and a restart that honors
+    // `auto_resume_on_restart` would start a new one when it is off.
+    let auto_resume = crate::session::resolve_config(&instance.effective_profile())
+        .map(|config| config.session.auto_resume_on_restart)
+        .unwrap_or(true);
+    if !auto_resume {
+        return api_error(
+            StatusCode::CONFLICT,
+            "auto_resume_disabled",
+            "auto_resume_on_restart is off, so a restart would start a new conversation"
+                .to_string(),
+        );
+    }
+    let body = crate::daemon::RestartSessionBody {
+        wake_message: Some(String::new()),
+        only_if_idle: true,
+        ..Default::default()
+    };
+    prepare_agent_session(
+        state.clone(),
+        id,
+        Ok(None),
+        AgentPreparation::Restart,
+        Some(Arc::new(body)),
+    )
+    .await
+}
+
 fn admit_restart(
     row: &mut Instance,
     body: &crate::daemon::RestartSessionBody,
@@ -1834,6 +1997,7 @@ fn reserve_structured_restart(
     instance: &Instance,
     expected_generation: Option<u64>,
     body: &crate::daemon::RestartSessionBody,
+    restart_origin: RestartOrigin,
 ) -> anyhow::Result<(crate::server::session_store::NativeSessionStore, Instance)> {
     use crate::session::SessionStore;
     let native = crate::server::session_store::NativeSessionStore::open(
@@ -1857,6 +2021,13 @@ fn reserve_structured_restart(
             && expected_generation.is_none_or(|expected| expected == probe.lifecycle_generation),
         crate::session::LifecycleReservationError::Superseded
     );
+    if matches!(restart_origin, RestartOrigin::StartupRecovery) {
+        // Preserve archived/trashed refusals.
+        probe
+            .ensure_startable()
+            .map_err(LifecycleTargetError::Blocked)?;
+        return Err(LifecycleTargetError::Busy.into());
+    }
     admit_restart(&mut probe, body, false)?;
     if let Some(target) = body
         .profile
@@ -2131,6 +2302,29 @@ pub(super) enum AgentPreparation {
     Ensure,
 }
 
+#[derive(Clone, Copy)]
+enum RestartOrigin {
+    Explicit,
+    StartupRecovery,
+}
+
+fn select_restart_wake_message(
+    origin: RestartOrigin,
+    requested: Option<String>,
+    profile: &str,
+) -> String {
+    requested.unwrap_or_else(|| {
+        let session = crate::session::resolve_config(profile)
+            .map(|config| config.session)
+            .unwrap_or_default();
+        if matches!(origin, RestartOrigin::StartupRecovery) && !session.startup_recovery_wake {
+            String::new()
+        } else {
+            session.restart_wake_message
+        }
+    })
+}
+
 pub(super) async fn prepare_agent_session(
     state: Arc<AppState>,
     id: String,
@@ -2141,7 +2335,16 @@ pub(super) async fn prepare_agent_session(
     preparation: AgentPreparation,
     restart: Option<Arc<crate::daemon::RestartSessionBody>>,
 ) -> axum::response::Response {
-    prepare_agent_session_inner(state, id, body, preparation, restart, None).await
+    prepare_agent_session_inner(
+        state,
+        id,
+        body,
+        preparation,
+        restart,
+        None,
+        RestartOrigin::Explicit,
+    )
+    .await
 }
 
 pub(crate) async fn recovery_restart(
@@ -2159,6 +2362,7 @@ pub(crate) async fn recovery_restart(
             ..Default::default()
         })),
         Some(expected_generation),
+        RestartOrigin::StartupRecovery,
     )
     .await
 }
@@ -2173,6 +2377,7 @@ async fn prepare_agent_session_inner(
     preparation: AgentPreparation,
     restart: Option<Arc<crate::daemon::RestartSessionBody>>,
     expected_generation: Option<u64>,
+    restart_origin: RestartOrigin,
 ) -> axum::response::Response {
     if preparation == AgentPreparation::Ensure && state.cityhall_mode {
         return crate::server::api::cityhall_response();
@@ -2217,6 +2422,15 @@ async fn prepare_agent_session_inner(
     if state.cityhall_mode && !instance.is_structured() {
         return crate::server::api::cityhall_response();
     }
+    // The eligibility check that asked for this ran before these locks, and a prompt can land
+    // while it waited, so the idle promise is enforced on the row this request reloaded.
+    if restart.as_ref().is_some_and(|body| body.only_if_idle) && instance.status != Status::Idle {
+        return api_error(
+            StatusCode::CONFLICT,
+            "not_eligible",
+            "Session is busy or its agent is not out of date".to_string(),
+        );
+    }
     // #4116: a shelved row refuses every start path with its own code, decided on
     // the row this request reloaded. It answers before the lifecycle reservation,
     // before the store write that would report it missing, and before the
@@ -2247,14 +2461,7 @@ async fn prepare_agent_session_inner(
         }
     }
     if instance.is_structured()
-        && expected_generation.is_some()
-        && (instance.status == Status::Stopped || instance.is_idle_dormant())
-    {
-        // Recovery is not an explicit user resume and cannot consume a native stop.
-        return lifecycle_rejection(&state, &LifecycleTargetError::Busy.into())
-            .unwrap_or_else(|| StatusCode::CONFLICT.into_response());
-    }
-    if instance.is_structured()
+        && matches!(restart_origin, RestartOrigin::Explicit)
         && (instance.status == Status::Stopped || instance.is_idle_dormant())
     {
         instance = match resume_structured_stop(&state, instance).await {
@@ -2267,7 +2474,13 @@ async fn prepare_agent_session_inner(
         let candidate = instance.clone();
         let restart_body = restart.clone().expect("restart body");
         let reserved = tokio::task::spawn_blocking(move || {
-            reserve_structured_restart(worker_state, &candidate, expected_generation, &restart_body)
+            reserve_structured_restart(
+                worker_state,
+                &candidate,
+                expected_generation,
+                &restart_body,
+                restart_origin,
+            )
         })
         .await;
         let (native, reserved) = match reserved {
@@ -2767,13 +2980,8 @@ async fn prepare_agent_session_inner(
                     | crate::session::StartOutcome::FreshAfterFailedResume { .. }
             )
         ) {
-            let wake_message = requested_wake_message.unwrap_or_else(|| {
-                crate::session::resolve_config(&profile)
-                    .map(|config| config.session.restart_wake_message)
-                    .unwrap_or_else(|_| {
-                        crate::session::config::SessionConfig::default().restart_wake_message
-                    })
-            });
+            let wake_message =
+                select_restart_wake_message(restart_origin, requested_wake_message, &profile);
             if !wake_message.is_empty() {
                 crate::session::restart::spawn_wake_worker(
                     id.clone(),
@@ -2946,6 +3154,7 @@ mod durable_stop_tests {
                 &row,
                 None,
                 &crate::daemon::RestartSessionBody::default(),
+                RestartOrigin::Explicit,
             )
         })
         .await
@@ -3086,7 +3295,11 @@ mod durable_stop_tests {
                 .await;
             match reason {
                 "provider_switch" => state.acp_supervisor.shutdown(&row.id).await.unwrap(),
-                "idle" => state.acp_supervisor.shutdown_idle(&row.id).await.unwrap(),
+                "idle" => state
+                    .acp_supervisor
+                    .shutdown_idle(&row.id, None)
+                    .await
+                    .unwrap(),
                 "detach" => state.acp_supervisor.detach_all().await,
                 _ => unreachable!(),
             }
@@ -3272,4 +3485,72 @@ pub async fn update_session_unread(
     drop(_guard);
     drop(namespace);
     crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
+}
+
+#[cfg(test)]
+mod restart_wake_tests {
+    use super::{select_restart_wake_message, RestartOrigin};
+
+    #[test]
+    #[serial_test::serial]
+    fn restart_wake_selection_respects_origin_and_profile_policy() -> anyhow::Result<()> {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let config_path = crate::session::get_app_dir()?.join("config.toml");
+        let profile = "wake-policy";
+        let default_message = "wake up: pick up what you were doing";
+        for (global, overrides, recovered, explicit) in [
+            ("", "", "", default_message),
+            (
+                "startup_recovery_wake = false\nrestart_wake_message = '  custom text  '",
+                "",
+                "",
+                "  custom text  ",
+            ),
+            (
+                "startup_recovery_wake = true",
+                "",
+                default_message,
+                default_message,
+            ),
+            (
+                "startup_recovery_wake = true\nrestart_wake_message = '  custom text  '",
+                "",
+                "  custom text  ",
+                "  custom text  ",
+            ),
+            (
+                "startup_recovery_wake = true\nrestart_wake_message = ''",
+                "",
+                "",
+                "",
+            ),
+            (
+                "startup_recovery_wake = false",
+                "startup_recovery_wake = true\nrestart_wake_message = 'profile text'",
+                "profile text",
+                "profile text",
+            ),
+            (
+                "startup_recovery_wake = true",
+                "startup_recovery_wake = false",
+                "",
+                default_message,
+            ),
+        ] {
+            std::fs::write(&config_path, format!("[session]\n{global}\n"))?;
+            let profile_config = toml::from_str(&format!("[session]\n{overrides}\n"))?;
+            crate::session::config::profile_config::save_profile_config(profile, &profile_config)?;
+            for (origin, expected) in [
+                (RestartOrigin::StartupRecovery, recovered),
+                (RestartOrigin::Explicit, explicit),
+            ] {
+                assert_eq!(
+                    select_restart_wake_message(origin, None, profile),
+                    expected,
+                    "global={global:?}, profile={overrides:?}"
+                );
+            }
+        }
+        Ok(())
+    }
 }

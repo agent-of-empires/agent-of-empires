@@ -42,7 +42,7 @@ use tokio_tungstenite::WebSocketStream;
 use tracing::debug;
 
 use super::discovery::DaemonEndpoint;
-use super::passphrase_session::{self, PassphraseSessionCache};
+use super::passphrase_session::{self, Credential, PassphraseSessionCache};
 use crate::acp::protocol::AcpBroadcastFrame;
 use crate::acp::state::AcpState;
 use crate::acp::transcript::{TranscriptDelta, TranscriptRow};
@@ -182,37 +182,35 @@ where
 
 /// Open the session stream, retrying once after a fresh passphrase login if a
 /// *cached* session was rejected (rotated passphrase, expired or evicted
-/// session). A first-ever login failure is not retried: the passphrase itself
-/// is wrong, not merely stale.
+/// session), or if a bearer token alone was refused and a passphrase resolves (a
+/// daemon that also requires the second factor). A first-ever login failure is
+/// not retried: the passphrase itself is wrong, not merely stale.
 async fn connect_session(
     endpoint: &DaemonEndpoint,
     path: &str,
     query: &str,
 ) -> Result<NativeSocket, WsError> {
     let cache = PassphraseSessionCache::default();
-    let had_cached_session = cache.get(endpoint).is_some();
-    let headers = session_headers(endpoint, &cache).await?;
+    let may_retry = passphrase_session::may_retry_with_login(endpoint, &cache);
+    let headers = session_headers(endpoint, &cache, false).await?;
     match websocket::connect_with_headers(endpoint, path, Some(query), &headers).await {
-        Err(error) if had_cached_session && is_unauthorized(&error) => {
+        Err(error) if may_retry && is_unauthorized(&error) => {
             cache.invalidate(endpoint);
-            let headers = session_headers(endpoint, &cache).await?;
+            let headers = session_headers(endpoint, &cache, true).await?;
             websocket::connect_with_headers(endpoint, path, Some(query), &headers).await
         }
         connected => connected,
     }
 }
 
-/// The passphrase-login headers this upgrade must carry, or none when the
-/// endpoint needs none: a resolved bearer token already rides the
-/// `Authorization` header, a local Unix-socket daemon is authorized by its
-/// peer owner, and `--auth=none` resolves no passphrase at all.
+/// The passphrase-login headers this upgrade must carry, or none when the endpoint needs
+/// none: a bearer token already rides the `Authorization` header.
 async fn session_headers(
     endpoint: &DaemonEndpoint,
     cache: &PassphraseSessionCache,
+    force_session: bool,
 ) -> Result<Vec<(HeaderName, HeaderValue)>, WsError> {
-    if endpoint.bearer_token().is_some()
-        || endpoint.unix_path().is_some()
-        || endpoint.resolved_passphrase().is_none()
+    if passphrase_session::select_credential(endpoint, cache, force_session) != Credential::Session
     {
         return Ok(Vec::new());
     }
@@ -535,7 +533,7 @@ mod tests {
         let _env = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_PASSPHRASE"]);
         let e = endpoint("http://127.0.0.1:8080", Some("tok"));
         let cache = PassphraseSessionCache::default();
-        assert!(session_headers(&e, &cache).await.unwrap().is_empty());
+        assert!(session_headers(&e, &cache, false).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -544,7 +542,24 @@ mod tests {
         let _env = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_PASSPHRASE"]);
         let e = endpoint("http://127.0.0.1:8080", None);
         let cache = PassphraseSessionCache::default();
-        assert!(session_headers(&e, &cache).await.unwrap().is_empty());
+        assert!(session_headers(&e, &cache, false).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_cached_session_wins_over_a_bearer_but_a_bearer_alone_sends_no_session() {
+        let _app = crate::session::test_support::isolate_app_dir();
+        let _env =
+            crate::session::test_support::EnvGuard::set(&[("AOE_DAEMON_PASSPHRASE", "hunter2")]);
+        let e = endpoint("http://127.0.0.1:8080", Some("tok"));
+        let cache = PassphraseSessionCache::default();
+        assert!(session_headers(&e, &cache, false).await.unwrap().is_empty());
+        cache.set_for_test(passphrase_session::PassphraseSession {
+            cookie: "aoe_session=abc123".to_string(),
+            binding_secret: "the-binding-secret".to_string(),
+        });
+        let headers = session_headers(&e, &cache, false).await.unwrap();
+        assert!(headers.iter().any(|(name, _)| *name == header::COOKIE));
     }
 
     #[tokio::test]
@@ -560,7 +575,7 @@ mod tests {
             binding_secret: "the-binding-secret".to_string(),
         });
 
-        let headers = session_headers(&e, &cache).await.unwrap();
+        let headers = session_headers(&e, &cache, false).await.unwrap();
         let value_of = |name: header::HeaderName| {
             headers
                 .iter()

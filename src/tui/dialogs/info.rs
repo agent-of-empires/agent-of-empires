@@ -188,7 +188,7 @@ impl InfoDialog {
 /// traces exceed any width). Every output row fits in `width`, so the row
 /// count is exact for sizing and scroll math; leading whitespace
 /// (stack-trace indentation) is preserved.
-fn wrap_to_width(message: &str, width: usize) -> Vec<String> {
+pub(super) fn wrap_to_width(message: &str, width: usize) -> Vec<String> {
     use unicode_width::UnicodeWidthChar;
     let width = width.max(1);
     let mut rows = Vec::new();

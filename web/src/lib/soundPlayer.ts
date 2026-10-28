@@ -6,7 +6,12 @@ export type SoundEvent = "approval" | "waiting" | "idle" | "error";
 interface SoundSettings {
   enabled?: boolean;
   browser_enabled?: boolean;
-  volume?: number;
+  browser_volume?: number;
+  browser_scope?: "all" | "other_sessions" | "hidden_tab";
+  browser_approval_enabled?: boolean;
+  browser_waiting_enabled?: boolean;
+  browser_idle_enabled?: boolean;
+  browser_error_enabled?: boolean;
   on_approval?: string | null;
   on_waiting?: string | null;
   on_idle?: string | null;
@@ -16,7 +21,12 @@ interface SoundSettings {
 const SETTINGS_KEYS = [
   "enabled",
   "browser_enabled",
-  "volume",
+  "browser_volume",
+  "browser_scope",
+  "browser_approval_enabled",
+  "browser_waiting_enabled",
+  "browser_idle_enabled",
+  "browser_error_enabled",
   "on_approval",
   "on_waiting",
   "on_idle",
@@ -107,18 +117,40 @@ function ensureSoundUrl(name: string): Promise<string | null> {
   return load;
 }
 
+export interface SoundContext {
+  /** Sessions the sound is for; it plays while any of them is in scope. */
+  sessionIds?: readonly string[];
+  /** Reads the session open in this tab now, since it can change while a sound loads. */
+  activeSessionId?: () => string | null;
+}
+
+function inScope(sound: SoundSettings, { sessionIds, activeSessionId }: SoundContext): boolean {
+  switch (sound.browser_scope) {
+    case "other_sessions": {
+      const active = activeSessionId?.();
+      return !sessionIds?.length || sessionIds.some((id) => id !== active);
+    }
+    case "hidden_tab":
+      return document.hidden;
+    default:
+      return true;
+  }
+}
+
 /** Resolves true when the sound started playing. A settings save or cache clear mid-way drops it. */
-export async function playSoundFor(event: SoundEvent): Promise<boolean> {
+export async function playSoundFor(event: SoundEvent, context: SoundContext = {}): Promise<boolean> {
   const generation = cacheGeneration;
   const sound = await loadSettings();
   if (generation !== cacheGeneration) return false;
   if (!sound || !sound.enabled || sound.browser_enabled === false) return false;
+  if (sound[`browser_${event}_enabled` as const] === false || !inScope(sound, context)) return false;
   const name = await resolveSoundName(sound, event, generation);
   if (!name || generation !== cacheGeneration) return false;
   const url = await ensureSoundUrl(name);
-  if (!url || generation !== cacheGeneration) return false;
+  // The tab may have come back to the foreground while the sound loaded.
+  if (!url || generation !== cacheGeneration || !inScope(sound, context)) return false;
   const audio = new Audio(url);
-  const volume = typeof sound.volume === "number" ? sound.volume : 1.0;
+  const volume = typeof sound.browser_volume === "number" ? sound.browser_volume : 1.0;
   // The host scale tops out at 1.5; HTMLAudioElement at 1.0.
   audio.volume = Math.max(0, Math.min(1, volume));
   try {

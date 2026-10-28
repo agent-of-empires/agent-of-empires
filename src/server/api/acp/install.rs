@@ -85,6 +85,18 @@ async fn install_on_host(package: &str) -> Result<std::process::Output, Response
     .await
 }
 
+/// Whether the session's sandbox container is running.
+async fn container_running(session_id: &str) -> bool {
+    let sid = session_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::containers::DockerContainer::from_session_id(&sid)
+            .is_running()
+            .unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false)
+}
+
 /// Install inside the session's running sandbox container via `<runtime> exec`.
 async fn install_in_container(
     session_id: &str,
@@ -92,15 +104,7 @@ async fn install_in_container(
 ) -> Result<std::process::Output, Response> {
     use crate::containers::DockerContainer;
 
-    let sid = session_id.to_string();
-    let running = tokio::task::spawn_blocking(move || {
-        DockerContainer::from_session_id(&sid)
-            .is_running()
-            .unwrap_or(false)
-    })
-    .await
-    .unwrap_or(false);
-    if !running {
+    if !container_running(session_id).await {
         return Err(api_error(
             StatusCode::CONFLICT,
             "container_not_running",
@@ -149,7 +153,7 @@ pub struct AgentInstallInfo {
     pub display_name: String,
     pub install_command: Option<&'static str>,
     pub npm_installable: bool,
-    /// Whether `install-agent` accepts requests (`install_gate`).
+    /// Whether `install-agent` accepts requests for this Session.
     pub install_allowed: bool,
     pub sandboxed: bool,
 }
@@ -175,15 +179,16 @@ pub async fn agent_install_info(
             .as_deref()
             .and_then(crate::acp::install_hints::npm_package_for)
             .is_some(),
-        install_allowed: install_gate(&state).is_ok(),
+        install_allowed: install_gate(&state).is_ok()
+            && (!instance.is_sandboxed() || container_running(&id).await),
         sandboxed: instance.is_sandboxed(),
         agent,
     })
     .into_response()
 }
 
-/// Whether `install-agent` accepts requests; `install-info` reports the same
-/// answer, so the banner never offers an install that is refused.
+/// Session-independent refusals of `install-agent`. `install-info` applies the
+/// same gate plus the container check, so the banner never offers a refused install.
 fn install_gate(state: &AppState) -> Result<(), Response> {
     if let Some(resp) = read_only_block(state).or_else(|| cityhall_block(state)) {
         return Err(resp);
@@ -308,6 +313,7 @@ mod tests {
                 extra_env: None,
                 custom_instruction: None,
                 before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
                 container_workdir: None,
             });
             inst
@@ -333,7 +339,14 @@ mod tests {
         let get = |id: &'static str| fetch(state.clone(), id);
         let claude_npm = "npm install -g @agentclientprotocol/claude-agent-acp@latest";
         for (id, agent, name, command, npm, sandboxed) in [
-            ("claude", "claude", "Claude", Some(claude_npm), true, false),
+            (
+                "claude",
+                "claude",
+                "Claude Code",
+                Some(claude_npm),
+                true,
+                false,
+            ),
             (
                 "opencode",
                 "opencode",
@@ -354,7 +367,7 @@ mod tests {
             (
                 "sandboxed",
                 "claude",
-                "Claude",
+                "Claude Code",
                 Some(claude_npm),
                 true,
                 true,
@@ -402,5 +415,13 @@ mod tests {
                 assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{label}");
             }
         }
+
+        // The loop leaves the setting on; a stopped container still refuses.
+        let body = fetch(state.clone(), "sandboxed").await.1;
+        assert_eq!(body["install_allowed"], false, "stopped container");
+        let refused = install_agent(State(state), Path("sandboxed".to_string()))
+            .await
+            .into_response();
+        assert_eq!(refused.status(), StatusCode::CONFLICT, "stopped container");
     }
 }

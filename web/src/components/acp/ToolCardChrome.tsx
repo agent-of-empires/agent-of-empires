@@ -10,7 +10,7 @@ import {
   type CSSProperties,
   type SetStateAction,
 } from "react";
-import { ArrowUpRight, ChevronDown, Copy as CopyIcon } from "lucide-react";
+import { ArrowUpRight, ChevronDown } from "lucide-react";
 
 import { useShikiTheme } from "../../hooks/useShikiTheme";
 import { parseJsonObject } from "../../lib/acpArgs";
@@ -21,6 +21,7 @@ import { highlightSnippet } from "../../lib/snippetHighlighter";
 import { useAcpFileRef } from "./AcpFileRefContext";
 import { useToolExpansionStore, useToolId, type ExpansionOverride } from "./ToolExpansion";
 import { useToolDisplayMode } from "./ToolDisplayMode";
+import { CopyMarkdownButton } from "./CopyMarkdownButton";
 import { WrapBar, WrapLines, WrapToggle, useWrapState } from "./WrapToggle";
 
 export interface ToolCardProps {
@@ -259,22 +260,6 @@ export function formatDurationSeconds(seconds: number): string {
   return pair(Math.floor(h / 24), "d", h % 24, "h");
 }
 
-function CopyButton({ text }: { text: string }) {
-  return (
-    <button
-      type="button"
-      title="Copy"
-      onClick={(e) => {
-        e.stopPropagation();
-        navigator.clipboard?.writeText(text).catch(() => {});
-      }}
-      className="rounded p-1 text-text-dim hover:bg-surface-800 hover:text-text-secondary"
-    >
-      <CopyIcon className="h-3 w-3" />
-    </button>
-  );
-}
-
 /** Labelled, copyable raw text block ("input" / "output"). */
 export function RawBlock({ label, text }: { label: "input" | "output"; text: string }) {
   const [wrapped, toggleWrap] = useWrapState();
@@ -284,7 +269,7 @@ export function RawBlock({ label, text }: { label: "input" | "output"; text: str
         <span>{label}</span>
         <span className="flex items-center">
           <WrapToggle wrapped={wrapped} onToggle={toggleWrap} />
-          <CopyButton text={text} />
+          <CopyMarkdownButton compact source={text} label={`Copy ${label}`} />
         </span>
       </div>
       <pre
@@ -381,7 +366,7 @@ export function HighlightedBlock({
 
   return (
     <div className="border-t border-surface-800 bg-surface-950">
-      <WrapBar wrapped={wrapped} onToggle={toggleWrap} />
+      <WrapBar wrapped={wrapped} onToggle={toggleWrap} copyText={unwrapped.text} />
       {ansi ? (
         <AnsiBlock text={shown} wrapped={wrapped} />
       ) : html ? (

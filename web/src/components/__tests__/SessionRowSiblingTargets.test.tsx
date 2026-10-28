@@ -32,9 +32,16 @@ describe("resolveActionTargets", () => {
       sibling("acp", { ...structured, acp_can_fork: false }),
       sibling("fork", structured),
       sibling("capable", { view: "terminal", acp_capable: true }),
+      sibling("stale", { status: "Idle", update_restart: true }),
+      sibling("hidden", { view: "terminal", acp_capable: true, structured_view_off: true }),
+      sibling("boxed", { status: "Running", is_sandboxed: true }),
+      sibling("boxed-archived", { status: "Stopped", is_sandboxed: true, archived_at: "2026-01-01T00:00:00Z" }),
+      sibling("boxed-creating", { status: "Creating", is_sandboxed: true }),
     ];
     const t = resolveActionTargets(sessions, EMPTY_OPTIMISTIC);
-    expect(ids(t.stop)).toEqual(["running", "acp", "fork", "capable"]);
+    expect(ids(t.stop)).toEqual(["running", "acp", "fork", "capable", "stale", "hidden", "boxed"]);
+    expect(ids(t.restartUpdate)).toEqual(["stale"]);
+    expect(ids(t.recreateContainer)).toEqual(["boxed"]);
     expect(ids(t.start)).toEqual(["stopped"]);
     expect(ids(t.fork)).toEqual(["fork"]);
     expect(ids(t.summarize)).toEqual(["acp", "fork"]);
@@ -66,6 +73,20 @@ describe("shared-worktree row session actions (#3387)", () => {
     expect(screen.queryByTestId("sidebar-context-menu-stop-target")).toBeNull();
     click("sidebar-context-menu-stop");
     expect(onStop).toHaveBeenCalledWith("s2");
+  });
+
+  it("Restart to apply update acts on the stale sibling only", () => {
+    const onRestartForUpdate = vi.fn();
+    openRowMenu(makeWorkspace("w", [sibling("s1", { status: "Idle" }), sibling("s2", { update_restart: true })]), {
+      onRestartForUpdate,
+    });
+    click("sidebar-context-menu-restart-update");
+    expect(onRestartForUpdate).toHaveBeenCalledWith("s2");
+  });
+
+  it("hides Restart to apply update when no sibling is stale", () => {
+    openRowMenu(makeWorkspace("w", [sibling("s1", { status: "Idle" })]));
+    expect(screen.queryByTestId("sidebar-context-menu-restart-update")).toBeNull();
   });
 
   it("Start is offered for a stopped sibling while another runs", () => {
