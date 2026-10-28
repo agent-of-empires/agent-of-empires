@@ -102,6 +102,8 @@ This records an assertion about the intended native target, separately from any 
 
 When a launch requests resume, AoE preserves an unknown stored ID and attempts it only when native execution resolves. A qualified capture can establish its binding. If the native resume probe fails, AoE preserves the ID, records a durable failure marker, and returns `resume_failed` without starting fresh in that call.
 
+Same-ID observations, including binding qualification and OMP launch confirmation, preserve the durable failure marker. Capturing a different ID clears it; an explicit `set-session-id` assertion or a successful launch can also clear it.
+
 On the next orchestrated restart or send-driven revival under `Default`, a resume-capable conversation with that marker starts fresh instead of repeating the probe. This applies to both restart policies, including when `auto_resume_on_restart = false`. The fresh launch abandons the AoE association with the old conversation, not its native transcript. CLI restart reports the fresh result; sends and restart wake messages may then reach the new conversation.
 
 AoE reports this fresh result only after the new association, or the cleared association for an agent that publishes its own ID later, is durably committed. A publication failure refuses the launch instead of reporting fresh success with the old association still stored.

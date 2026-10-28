@@ -229,7 +229,7 @@ agent_detect_as = { "lenovo-claude" = "claude" }
 - **`agent_detect_as`** reuses built-in status detection and ACP adapter inheritance. It never proves which native CLI owns a terminal conversation. Use [status rules](#status-rules-for-custom-agents) when output differs from the built-in.
 - **`agent_acp_cmd`** (optional): ACP launch command that lets the agent run in the structured view (see below).
 - **`agent_execution_as`** declares the native agent actually invoked by an opaque wrapper, together with its `agent_config_dir` store contract. This is required for managed resume and fork through such a wrapper.
-  Bare, non-path wrappers can start fresh and capture their pane-scoped published ID without this contract. Resuming the recorded conversation requires the contract. Explicit Cleared intent or disabled `auto_resume_on_restart` still selects a fresh launch; a failed-resume marker instead preserves the ID until explicit recovery. See [Execution identity and wrappers](session-resume.md#execution-identity-and-wrappers).
+  Bare, non-path wrappers can start fresh and capture their pane-scoped published ID without this contract. Resuming the recorded conversation requires the contract. See [Execution identity and wrappers](session-resume.md#execution-identity-and-wrappers) for wrapper contracts and [Pinning or resetting a conversation](session-resume.md#pinning-or-resetting-a-conversation) for failed-resume recovery.
 - **`agent_config_dir`** (optional): The config directory the wrapper points its CLI at, when that is not the built-in default (see below).
 - **`default_tool`** can select a custom-agent name for new sessions.
 

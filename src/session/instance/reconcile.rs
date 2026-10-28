@@ -90,13 +90,17 @@ impl Instance {
             return Ok(());
         }
         let baseline = self.conversation_state();
-        match super::sid_persist::persist_session_with_storage(
+        let commit = super::sid_persist::persist_session_with_storage(
             storage,
             &self.id,
             &observation,
             &baseline,
-        ) {
-            SidWrite::Applied => self.apply_conversation_observation(&observation),
+        );
+        match commit.outcome {
+            SidWrite::Applied => {
+                self.apply_conversation_observation(&observation);
+                self.resume_probe_failed_sid = commit.failed_sid;
+            }
             // Nothing was written in any of these arms: a peer wrote between
             // reconcile and CAS, a peer durably owns the sid, or the row pins
             // another conversation. Reloading converges on all three.
