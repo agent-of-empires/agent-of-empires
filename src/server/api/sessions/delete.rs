@@ -655,7 +655,8 @@ pub(crate) async fn purge_expired_trash(state: &Arc<AppState>) {
         }
         let recent_entry = crate::session::recent_project_entry_for(&instance);
         let body = DeleteSessionBody {
-            delete_worktree: config.worktree.auto_cleanup,
+            delete_worktree: config.worktree.auto_cleanup
+                && instance.has_managed_worktree_or_workspace(),
             delete_branch: config.worktree.should_delete_branch_on_cleanup(),
             delete_sandbox: config.sandbox.auto_cleanup,
             force_delete: true,
