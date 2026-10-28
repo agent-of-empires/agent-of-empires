@@ -180,11 +180,38 @@ fn build_custom_agent_infos(
     entries
 }
 
+#[derive(Deserialize)]
+pub struct AgentsQuery {
+    profile: Option<String>,
+}
+
+/// `GET /api/agents[?profile=]`: the agents as the profile resolves them, so the
+/// wizard reads a custom agent's base from the profile it creates in.
 pub async fn list_agents(
     State(state): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<AgentsQuery>,
 ) -> Result<Json<Vec<AgentInfo>>, axum::response::Response> {
     let _namespace = state.profile_namespace.read().await;
-    let profile = state.served_profile().to_string();
+    let profile = match query.profile.filter(|p| !p.is_empty()) {
+        Some(name) => {
+            let known = state
+                .canonical_metadata
+                .read()
+                .await
+                .profiles
+                .iter()
+                .any(|p| p.name == name);
+            if !known {
+                return Err(api_error(
+                    StatusCode::NOT_FOUND,
+                    "profile_not_found",
+                    format!("Profile '{name}' doesn't exist."),
+                ));
+            }
+            name
+        }
+        None => state.served_profile().to_string(),
+    };
     let result = tokio::task::spawn_blocking(move || {
         let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
         let tools = crate::tmux::AvailableTools::detect();
@@ -3456,6 +3483,43 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn agents_resolve_the_requested_profile() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        for (profile, base) in [("alpha", "pi"), ("beta", "claude")] {
+            crate::session::create_profile(profile).unwrap();
+            std::fs::write(
+                crate::session::config::profile_config::get_profile_config_path(profile).unwrap(),
+                format!(
+                    "[session.custom_agents]\nwrapper = \"{base}\"\n\n[session.agent_detect_as]\nwrapper = \"{base}\"\n"
+                ),
+            )
+            .unwrap();
+        }
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        for (profile, always_yolo) in [("alpha", true), ("beta", false)] {
+            let query = AgentsQuery {
+                profile: Some(profile.into()),
+            };
+            let Ok(Json(agents)) =
+                list_agents(State(state.clone()), axum::extract::Query(query)).await
+            else {
+                panic!("{profile}: list_agents failed");
+            };
+            let wrapper = agents.iter().find(|a| a.name == "wrapper").unwrap();
+            assert_eq!(wrapper.always_yolo, always_yolo, "{profile}");
+        }
+        let unknown = AgentsQuery {
+            profile: Some("gone".into()),
+        };
+        let Err(response) = list_agents(State(state), axum::extract::Query(unknown)).await else {
+            panic!("an unknown profile must not list agents");
+        };
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
     /// `acp_installed` follows the structured create check, so a custom
     /// agent counts when its adapter is on the configured `environment` PATH.
     #[tokio::test]
@@ -3489,7 +3553,12 @@ mod tests {
         })
         .unwrap();
         let state = crate::server::test_support::build_test_app_state(Vec::new());
-        let Ok(Json(agents)) = list_agents(State(state)).await else {
+        let Ok(Json(agents)) = list_agents(
+            State(state),
+            axum::extract::Query(AgentsQuery { profile: None }),
+        )
+        .await
+        else {
             panic!("list_agents failed");
         };
         for (name, installed) in [("on-path", true), ("missing", false), ("terminal", false)] {

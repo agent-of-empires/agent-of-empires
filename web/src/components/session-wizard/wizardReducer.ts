@@ -85,6 +85,7 @@ export type Action =
   | { type: "SUBMIT_CANCEL" }
   | { type: "SET_AGENTS"; agents: AgentInfo[] }
   | { type: "AGENTS_FAILED" }
+  | { type: "AGENTS_LOADING" }
   | { type: "SET_GROUPS"; groups: GroupInfo[]; groupsFor: string }
   | { type: "SET_PROFILES"; profiles: ProfileInfo[] }
   | { type: "SET_DOCKER"; available: boolean; runtimeName: string | null }
@@ -264,6 +265,8 @@ export function reducer(state: WizardState, action: Action): WizardState {
       return { ...state, agents: action.agents, agentsStatus: "ready" };
     case "AGENTS_FAILED":
       return { ...state, agentsStatus: "failed" };
+    case "AGENTS_LOADING":
+      return { ...state, agentsStatus: "loading" };
     case "SET_GROUPS":
       return { ...state, groups: action.groups, groupsFor: action.groupsFor };
     case "SET_PROFILES":

@@ -1914,8 +1914,9 @@ export async function signOutAllDevices(): Promise<boolean> {
 // --- Wizard APIs ---
 
 /** Null when the request failed, so callers can tell "no agents" from "unknown". */
-export async function fetchAgents(): Promise<AgentInfo[] | null> {
-  return fetchJson<AgentInfo[]>("/api/agents");
+export async function fetchAgents(profile?: string): Promise<AgentInfo[] | null> {
+  const query = profile ? `?profile=${encodeURIComponent(profile)}` : "";
+  return fetchJson<AgentInfo[]>(`/api/agents${query}`);
 }
 
 export async function fetchProfiles(): Promise<ProfileInfo[]> {

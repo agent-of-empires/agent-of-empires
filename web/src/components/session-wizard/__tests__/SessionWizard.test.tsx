@@ -19,7 +19,7 @@ import {
 import { agent } from "./fixtures";
 import { toastBus } from "../../../lib/toastBus";
 import { startPendingCreates } from "../../../lib/pendingCreates";
-import type { DockerStatusResponse } from "../../../lib/types";
+import type { AgentInfo, DockerStatusResponse } from "../../../lib/types";
 
 const createSession = vi.fn();
 const reviewCreationTrust = vi.fn();
@@ -1099,6 +1099,43 @@ describe("SessionWizard Yolo mode", () => {
 
   const AGENTS = [agent("claude"), agent("pi", { always_yolo: true, acp_capable: false })];
   const launchButton = () => screen.getByText(/Launch session/).closest("button") as HTMLButtonElement;
+
+  it("reads a custom agent's Yolo mode from the profile it creates in", async () => {
+    vi.mocked(fetchProfiles).mockResolvedValueOnce([
+      { name: "alpha", is_default: true },
+      { name: "beta", is_default: false },
+    ]);
+    // Alpha's `wrapper` runs Pi and Beta's runs Claude. Beta's first answer is held.
+    const wrapper = (always_yolo: boolean) => [agent("claude"), agent("wrapper", { kind: "custom", always_yolo })];
+    let answerBeta: (agents: AgentInfo[]) => void = () => {};
+    let betaCalls = 0;
+    vi.mocked(fetchAgents).mockImplementation((profile) => {
+      if (profile !== "beta") return Promise.resolve(wrapper(true));
+      return betaCalls++ === 0 ? new Promise((resolve) => (answerBeta = resolve)) : Promise.resolve(wrapper(false));
+    });
+    const pickProfile = (name: string) => {
+      fireEvent.click(screen.getByText("Profile"));
+      fireEvent.click(screen.getByRole("radio", { name: new RegExp(name) }));
+    };
+    renderWizard({ path: "/tmp/proj", tool: "wrapper" }, "alpha");
+    await waitFor(() => expect(yoloRow()).toContain("always on for wrapper"));
+
+    pickProfile("beta");
+    await waitFor(() => expect(yoloRow()).toContain("checking the agent…"));
+    expect(launchButton().disabled).toBe(true);
+    pickProfile("alpha");
+    await waitFor(() => expect(yoloRow()).toContain("always on for wrapper"));
+    // Beta's late answer is for a profile no longer selected.
+    await act(async () => answerBeta(wrapper(false)));
+    expect(yoloRow()).toContain("always on for wrapper");
+
+    pickProfile("beta");
+    await waitFor(() => expect(yoloRow()).toContain("asks before running commands"));
+    expect(yolo().disabled).toBe(false);
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload()).toMatchObject({ profile: "beta", tool: "wrapper", yolo_mode: false });
+  });
 
   it("waits for the agent list before promising prompts or launching", async () => {
     let answer: (agents: typeof AGENTS) => void = () => {};

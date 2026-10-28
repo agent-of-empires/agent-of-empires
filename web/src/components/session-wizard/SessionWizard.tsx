@@ -286,11 +286,14 @@ export function SessionWizard({
     };
   }, [state.data.profile, groupsKey]);
 
+  // A custom agent's base comes from the profile the session is created in.
+  const agentsProfile = state.data.profile || servedProfile;
   useEffect(() => {
     let alive = true;
     let retry: ReturnType<typeof setTimeout> | undefined;
+    dispatch({ type: "AGENTS_LOADING" });
     const load = (attempt: number) =>
-      void fetchAgents().then((agents) => {
+      void fetchAgents(agentsProfile || undefined).then((agents) => {
         if (!alive) return;
         if (agents) {
           setAgentNames(agents);
@@ -304,7 +307,7 @@ export function SessionWizard({
       alive = false;
       clearTimeout(retry);
     };
-  }, []);
+  }, [agentsProfile]);
 
   useEffect(() => {
     const generations = defaultsGeneration;
