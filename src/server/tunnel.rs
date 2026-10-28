@@ -543,7 +543,7 @@ impl FunnelStartGuard {
 
     /// Turn the Funnel back off and wait for it, bounded; the Daemon may exit right after.
     async fn reset(&mut self) {
-        if !std::mem::take(&mut self.armed) {
+        if !self.armed {
             return;
         }
         let off = Command::new(&self.program)
@@ -551,7 +551,10 @@ impl FunnelStartGuard {
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true)
             .output();
-        match tokio::time::timeout(FUNNEL_OFF_TIMEOUT, off).await {
+        let result = tokio::time::timeout(FUNNEL_OFF_TIMEOUT, off).await;
+        // Disarm only now: a start cancelled mid-reset kills `off`, so Drop must send it again.
+        self.armed = false;
+        match result {
             Ok(Ok(out)) if out.status.success() => {
                 info!("Turned off the Tailscale Funnel this start switched on")
             }
@@ -641,6 +644,12 @@ fn funnel_preflight(parsed: &serde_json::Value, local_port: u16) -> FunnelPrefli
         return preflight;
     };
     let expected_proxy_substring = format!("127.0.0.1:{}", local_port);
+    // A bare substring would take port 8080's proxy for port 808's.
+    let proxies_to_us = |proxy: &str| {
+        proxy
+            .match_indices(&expected_proxy_substring)
+            .any(|(i, m)| !proxy[i + m.len()..].starts_with(|c: char| c.is_ascii_digit()))
+    };
     for (vhost, cfg) in web.iter() {
         if !vhost.ends_with(":443") {
             continue;
@@ -650,7 +659,7 @@ fn funnel_preflight(parsed: &serde_json::Value, local_port: u16) -> FunnelPrefli
         };
         for (path, handler) in handlers.iter() {
             if let Some(proxy) = handler.get("Proxy").and_then(|v| v.as_str()) {
-                if proxy.contains(&expected_proxy_substring) {
+                if proxies_to_us(proxy) {
                     preflight.ours_present = true;
                     continue;
                 }
@@ -990,10 +999,11 @@ mod tests {
     #[test]
     fn funnel_preflight_tells_ours_from_a_conflict() {
         let proxy = |to: &str| serde_json::json!({"Web": {"node.ts.net:443": {"Handlers": {"/": {"Proxy": to}}}}});
-        // (status document, expected): only a :443 handler proxying to this port is ours.
+        // (port, status document, expected): only a :443 handler proxying to this port is ours.
         let cases = [
-            (serde_json::json!({}), FunnelPreflight::default()),
+            (8081, serde_json::json!({}), FunnelPreflight::default()),
             (
+                8081,
                 proxy("http://127.0.0.1:8081"),
                 FunnelPreflight {
                     conflicting: None,
@@ -1001,8 +1011,19 @@ mod tests {
                 },
             ),
             // A stale loopback backend from another port is replaced, and isn't ours to keep.
-            (proxy("http://127.0.0.1:9999"), FunnelPreflight::default()),
             (
+                8081,
+                proxy("http://127.0.0.1:9999"),
+                FunnelPreflight::default(),
+            ),
+            // Port 808 is a prefix of 8080, not the same port.
+            (
+                808,
+                proxy("http://127.0.0.1:8080"),
+                FunnelPreflight::default(),
+            ),
+            (
+                8081,
                 proxy("http://10.0.0.5:80"),
                 FunnelPreflight {
                     conflicting: Some("proxy / -> http://10.0.0.5:80".into()),
@@ -1010,18 +1031,20 @@ mod tests {
                 },
             ),
         ];
-        for (doc, expected) in cases {
-            assert_eq!(funnel_preflight(&doc, 8081), expected, "{doc}");
+        for (port, doc, expected) in cases {
+            assert_eq!(funnel_preflight(&doc, port), expected, "{port} {doc}");
         }
     }
 
     /// A fake `tailscale` that logs each call's arguments. `status --json` answers the
-    /// capability check first; the second call is the URL read, shaped by `url_read`.
+    /// capability check first; the second call is the URL read, shaped by `url_read`, and
+    /// `off` shapes `funnel --https=443 off`.
     #[cfg(unix)]
     fn fake_tailscale(
         dir: &std::path::Path,
         funnel_status: &str,
         url_read: &str,
+        off: &str,
     ) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let fake = dir.join("tailscale");
@@ -1039,6 +1062,7 @@ case "$*" in
     fi
     {url_read} ;;
   "funnel status --json") echo '{funnel_status}' ;;
+  "funnel --https=443 off") {off} ;;
   *) exit 0 ;;
 esac
 "#,
@@ -1075,7 +1099,7 @@ esac
         ];
         for (funnel_status, url_read, succeeds, off) in cases {
             let dir = tempfile::tempdir().unwrap();
-            let fake = fake_tailscale(dir.path(), funnel_status, url_read);
+            let fake = fake_tailscale(dir.path(), funnel_status, url_read, "");
             let result = TunnelHandle::spawn_tailscale_with(fake.as_os_str(), 8081).await;
             assert_eq!(result.is_ok(), succeeds, "{funnel_status} / {url_read}");
             // Awaited before the error returns, not left to a thread that may die with the Daemon.
@@ -1099,56 +1123,63 @@ esac
     // The test polls the fake's log with real sleeps, so the start needs its own worker.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_cancelled_tailscale_start_turns_off_the_funnel_it_switched_on() {
-        let dir = tempfile::tempdir().unwrap();
-        let release = dir.path().join("release");
-        // The URL read blocks until released, so the start is mid-flight after `funnel --bg`.
-        let url_read = format!(
-            "while [ ! -f '{}' ]; do sleep 0.05; done; exit 1",
-            release.display()
-        );
-        let fake = fake_tailscale(dir.path(), "{}", &url_read);
-        let program = fake.clone();
-        let start = tokio::spawn(async move {
-            TunnelHandle::spawn_tailscale_with(program.as_os_str(), 8081).await
-        });
+        const OFF: &str = "funnel --https=443 off";
+        let count = |calls: &[String], want: &str| calls.iter().filter(|c| *c == want).count();
+        // (where the start is blocked when it's cancelled, `off` calls expected)
+        let cases = [
+            ("url read", 1),
+            // The cancel kills the awaited `off`, which may not have run, so Drop sends another.
+            ("reset", 2),
+        ];
+        for (blocked_in, offs) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let release = dir.path().join("release");
+            let block = format!(
+                "while [ ! -f '{}' ]; do sleep 0.05; done",
+                release.display()
+            );
+            let (url_read, off) = if blocked_in == "url read" {
+                (format!("{block}; exit 1"), String::new())
+            } else {
+                let once = dir.path().join("off-once");
+                let once = once.display();
+                let off = format!("if [ ! -f '{once}' ]; then touch '{once}'; {block}; fi");
+                ("exit 1".to_owned(), off)
+            };
+            let fake = fake_tailscale(dir.path(), "{}", &url_read, &off);
+            let program = fake.clone();
+            let start = tokio::spawn(async move {
+                TunnelHandle::spawn_tailscale_with(program.as_os_str(), 8081).await
+            });
 
-        let wait_for = |want: &str| {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            loop {
-                let calls = argv_log(dir.path());
-                if calls
-                    .iter()
-                    .filter(|c| c.as_str() == "status --json")
-                    .count()
-                    >= 2
-                    && want == "url read"
-                    || calls.iter().any(|c| c == want)
-                {
-                    return calls;
+            let wait_for = |done: &dyn Fn(&[String]) -> bool| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                loop {
+                    let calls = argv_log(dir.path());
+                    if done(&calls) {
+                        return calls;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "{blocked_in}: stuck at {calls:?}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(20));
                 }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "no {want:?} in {calls:?}"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-        };
-        let before = wait_for("url read");
-        assert!(
-            before.iter().any(|c| c == "funnel --bg --yes 8081"),
-            "{before:?}"
-        );
-        start.abort();
-        let after = wait_for("funnel --https=443 off");
-        std::fs::write(&release, "").unwrap();
-        assert_eq!(
-            after
-                .iter()
-                .filter(|c| *c == "funnel --https=443 off")
-                .count(),
-            1,
-            "{after:?}"
-        );
+            };
+            let before = if blocked_in == "url read" {
+                wait_for(&|c| count(c, "status --json") >= 2)
+            } else {
+                wait_for(&|c| count(c, OFF) >= 1)
+            };
+            assert!(
+                before.iter().any(|c| c == "funnel --bg --yes 8081"),
+                "{before:?}"
+            );
+            start.abort();
+            let after = wait_for(&|c| count(c, OFF) >= offs);
+            std::fs::write(&release, "").unwrap();
+            assert_eq!(count(&after, OFF), offs, "{blocked_in}: {after:?}");
+        }
     }
 
     // The telemetry `serve_mode` signal reads `mode_label()`, so a named
