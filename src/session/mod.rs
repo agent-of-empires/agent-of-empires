@@ -32,6 +32,7 @@ pub(crate) mod projection;
 pub mod projects;
 pub(crate) mod purge_owners;
 pub(crate) mod recovery;
+pub mod rename_transaction;
 pub mod restart;
 pub mod sandbox_store_reclaim;
 pub mod scope;

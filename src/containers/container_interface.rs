@@ -148,6 +148,8 @@ pub struct ContainerConfig {
     pub environment: Vec<EnvEntry>,
     pub cpu_limit: Option<String>,
     pub memory_limit: Option<String>,
+    /// Systemd slice the container's cgroup is created under; `None` when scopes are unavailable.
+    pub cgroup_parent: Option<String>,
     pub port_mappings: Vec<String>,
     pub network: Option<String>,
     pub selinux_relabel: bool,
@@ -163,6 +165,9 @@ pub(crate) const SHARED_CREDENTIAL_MOUNTS_LABEL: &str =
     "com.agent-of-empires.shared-credential-mounts";
 
 pub(crate) const AGENT_TOOL_LABEL: &str = "com.agent-of-empires.agent-tool";
+
+/// The systemd slice aoe passed as `--cgroup-parent`; read back to start the container the same way.
+pub(crate) const CGROUP_PARENT_LABEL: &str = "com.agent-of-empires.cgroup-parent";
 
 impl ContainerConfig {
     pub(crate) fn mount_fingerprint(&self) -> String {

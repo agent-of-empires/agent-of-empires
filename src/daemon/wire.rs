@@ -68,6 +68,9 @@ pub struct CreateSessionBody {
     pub sandbox_image: Option<String>,
     #[serde(default)]
     pub extra_env: Vec<String>,
+    /// Host-only env for `host_hooks.before_start`; never enters the container. Sandbox only.
+    #[serde(default)]
+    pub hook_env: Vec<String>,
     #[serde(default)]
     pub extra_repo_paths: Vec<String>,
     /// Repository names or paths override the shared base_branch.
@@ -1099,6 +1102,10 @@ pub struct SessionResponse {
     /// non-forkable agents.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub acp_can_fork: bool,
+    /// `acp.structured_view = off` for this session's profile and project: a
+    /// terminal session may not switch into the structured view.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub structured_view_off: bool,
     /// Whether switching this session between terminal and structured view
     /// preserves the conversation (only claude pairings share one
     /// CLI-resumable transcript). Server-owned via

@@ -16,7 +16,8 @@ use super::api_error;
 use super::validate_profile_name;
 use super::AppState;
 use crate::server::auth::AuthenticatedTokenHash;
-use crate::server::auth::{handler_elevated, AuthenticatedSession, LocalAuthorization};
+use crate::server::auth::{handler_elevated, AuthenticatedSession};
+use crate::server::principal::{authorize, Capability, Principal};
 use crate::session::config::settings_schema::{
     clear_path, rewrite_plugin_sections, runtime_schema, strip_local_only, validate_patch,
     validate_patch_with, PatchRejection, Scope,
@@ -494,7 +495,7 @@ pub async fn update_settings(
     axum::extract::Query(query): axum::extract::Query<SettingsQuery>,
     headers: HeaderMap,
     session: Option<Extension<AuthenticatedSession>>,
-    loopback: Option<Extension<LocalAuthorization>>,
+    loopback: Option<Extension<Principal>>,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> axum::response::Response {
     // CityHall mode exposes only the theme control, which writes through the
@@ -550,13 +551,18 @@ async fn save_settings_patch(
     mut machine: serde_json::Value,
     mut profile_patch: serde_json::Value,
     session: Option<Extension<AuthenticatedSession>>,
-    loopback: Option<Extension<LocalAuthorization>>,
+    loopback: Option<Extension<Principal>>,
     stamp: Option<WriteStamp>,
 ) -> axum::response::Response {
     // Machine-wide leaves set what every profile inherits, so they are the
     // privileged half of this surface. The route-level gate cannot see which
     // layer a request writes, so the check belongs here.
-    let elevated = handler_elevated(&state, session.as_deref(), loopback.is_some()).await;
+    let elevated = handler_elevated(
+        &state,
+        session.as_deref(),
+        authorize(loopback.as_deref(), Capability::SkipElevation),
+    )
+    .await;
     if !is_empty_patch(&machine) && !elevated {
         return reject_response(PatchRejection::NeedsElevation {
             path: first_leaf(&machine).unwrap_or_else(|| "<root>".to_string()),
@@ -2558,7 +2564,7 @@ pub async fn update_profile_settings(
     axum::extract::Path(name): axum::extract::Path<String>,
     headers: HeaderMap,
     session: Option<axum::Extension<AuthenticatedSession>>,
-    loopback: Option<axum::Extension<LocalAuthorization>>,
+    loopback: Option<axum::Extension<Principal>>,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
@@ -2586,7 +2592,12 @@ pub async fn update_profile_settings(
                 .into_response();
         }
     }
-    let elevated = handler_elevated(&state, session.as_deref(), loopback.is_some()).await;
+    let elevated = handler_elevated(
+        &state,
+        session.as_deref(),
+        authorize(loopback.as_deref(), Capability::SkipElevation),
+    )
+    .await;
 
     // Validate every leaf against the schema. Global-only fields are invalid here.
     // Elevation failures retain the payload consumed by the web prompt.
@@ -3490,7 +3501,7 @@ mod tests {
                     }),
                     HeaderMap::new(),
                     None,
-                    Some(axum::Extension(LocalAuthorization::UnixOwner(0))),
+                    Some(axum::Extension(Principal::LocalPeer { uid: 0 })),
                     Ok(Json(body)),
                 )
                 .await

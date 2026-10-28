@@ -1931,6 +1931,8 @@ fn confirm_delete_dialog_cancel_leaves_session() {
 fn serve_status_renders_from_the_probe_worker() {
     let what = if cfg!(feature = "web") { "Web" } else { "API" };
     let mut env = create_test_env_with_sessions(1);
+    // A healthy runtime, so the R entry carries the Web dashboard rather than a Daemon limit.
+    let _runtime = env.view.session_feed.terminal_driver_for_test();
     let idle = render_home_to_string(&mut env.view, 160, 40);
     assert!(idle.contains(&format!("R {what}")), "{idle}");
 

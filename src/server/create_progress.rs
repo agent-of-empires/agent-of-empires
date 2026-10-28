@@ -170,7 +170,7 @@ impl CreateProgressRegistry {
     pub fn snapshot(
         &self,
         key: &str,
-        local: Option<&super::auth::LocalAuthorization>,
+        local: Option<&super::principal::Principal>,
     ) -> Option<CreateProgressSnapshot> {
         self.live
             .lock()
@@ -178,7 +178,10 @@ impl CreateProgressRegistry {
             .get(key)
             .filter(|p| {
                 p.visibility == CreateProgressVisibility::WebReadable
-                    || matches!(local, Some(super::auth::LocalAuthorization::UnixOwner(_)))
+                    || super::principal::authorize(
+                        local,
+                        super::principal::Capability::CreationProgress,
+                    )
             })
             .map(|p| p.snapshot())
     }
