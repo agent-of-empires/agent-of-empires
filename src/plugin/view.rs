@@ -46,6 +46,8 @@ pub struct PluginPageView {
     pub url: String,
     /// The page's bridge gates on these; the grant covers all of them for an active plugin.
     pub capabilities: Vec<String>,
+    /// The page opted in to receive the `?link=` value of its dashboard URL.
+    pub deep_link: bool,
 }
 
 pub fn page_url(plugin_id: &str, page_id: &str) -> String {
@@ -104,6 +106,7 @@ impl LoadedPlugin {
                 icon: u.icon.clone(),
                 url: page_url(self.id(), &u.id),
                 capabilities: self.capability_ids(),
+                deep_link: u.deep_link,
             })
     }
 }

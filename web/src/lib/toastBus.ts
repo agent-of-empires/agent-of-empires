@@ -7,7 +7,7 @@ export interface ToastApi {
   /** A click-to-open toast: tapping it opens `href` in a new tab. Used for a
    *  worker `ui.open_url`, which cannot `window.open` from an async push without
    *  the popup blocker, so the open waits for the user's click. */
-  openLink: (message: string, href: string) => void;
+  openLink: (message: string, href: string, kind?: ToastKind) => void;
 }
 
 interface ToastBus {
@@ -24,6 +24,6 @@ export function reportInfo(message: string): void {
   toastBus.handler?.info(message);
 }
 
-export function reportOpenLink(message: string, href: string): void {
-  toastBus.handler?.openLink(message, href);
+export function reportOpenLink(message: string, href: string, kind?: ToastKind): void {
+  toastBus.handler?.openLink(message, href, kind);
 }

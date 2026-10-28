@@ -1362,6 +1362,7 @@ mod tests {
             title: None,
             icon: None,
             entry: None,
+            deep_link: false,
         }
     }
 

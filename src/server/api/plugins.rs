@@ -1522,6 +1522,7 @@ id = "voice"
                 "icon": null,
                 "url": "/api/plugins/acme.board/pages/board",
                 "capabilities": [],
+                "deep_link": false,
             }])
         );
     }

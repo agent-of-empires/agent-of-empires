@@ -238,6 +238,14 @@ struct EntryKey {
     session_id: Option<String>,
 }
 
+/// What a notification points at.
+pub enum NotifyTarget {
+    /// A URL a worker asked the surface to open (`ui.open_url`); the TUI opens it at once.
+    Href(String),
+    /// A dashboard path to a plugin page item (`ui.notify` `link`); shown, never auto-opened.
+    Link(String),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Notification {
     pub seq: u64,
@@ -250,6 +258,9 @@ pub struct Notification {
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub href: Option<String>,
+    /// A dashboard path to a plugin page item; shown as a clickable toast, never auto-opened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -478,7 +489,7 @@ impl UiStore {
         title: String,
         body: Option<String>,
         session_id: Option<String>,
-        href: Option<String>,
+        target: Option<NotifyTarget>,
     ) -> Result<u64, UiError> {
         if title.is_empty() {
             return Err(UiError::BadRequest("notification title is required".into()));
@@ -489,13 +500,18 @@ impl UiStore {
         if body.as_ref().is_some_and(|b| b.len() > MAX_BODY_LEN) {
             return Err(UiError::BadRequest("notification body too long".into()));
         }
-        if let Some(href) = &href {
-            if !crate::util::is_allowed_href(href) {
-                return Err(UiError::BadRequest(
-                    "notification href must be http/https or a relative path".into(),
-                ));
+        let (href, link) = match target {
+            Some(NotifyTarget::Href(href)) => {
+                if !crate::util::is_allowed_href(&href) {
+                    return Err(UiError::BadRequest(
+                        "notification href must be http/https or a relative path".into(),
+                    ));
+                }
+                (Some(href), None)
             }
-        }
+            Some(NotifyTarget::Link(path)) => (None, Some(path)),
+            None => (None, None),
+        };
         let mut inner = self.write();
         inner.notify_seq += 1;
         let seq = inner.notify_seq;
@@ -507,6 +523,7 @@ impl UiStore {
             body,
             session_id,
             href,
+            link,
         });
         while inner.notifications.len() > NOTIFICATION_RING {
             inner.notifications.pop_front();
@@ -1270,7 +1287,7 @@ mod tests {
                 "Open".into(),
                 None,
                 None,
-                Some(href.into()),
+                Some(NotifyTarget::Href(href.into())),
             );
             assert_eq!(result.is_ok(), ok, "{href}: {result:?}");
             if ok {

@@ -65,6 +65,20 @@ describe("usePluginUiState notifications", () => {
     expect(reportOpenLink).toHaveBeenCalledWith("Open link", "https://example.com/pr/1");
     expect(reportInfo).not.toHaveBeenCalled();
   });
+
+  it("keeps the tone of a notification carrying a deep link", async () => {
+    const path = "/plugins/acme.kit/approvals?link=ab12";
+    const danger = note(2, "Approve?", { tone: "danger", link: path });
+    const info = note(3, "FYI", { link: path });
+    mountPolling(snapshot(note(1, "seed")), snapshot(note(1, "seed"), danger, info));
+    await tick(0);
+    await tick(3000);
+    expect(vi.mocked(reportOpenLink).mock.calls).toEqual([
+      ["Approve?", path, "error"],
+      ["FYI", path, "info"],
+    ]);
+    expect(reportError).not.toHaveBeenCalled();
+  });
 });
 
 describe("usePluginUiState refresh indicator", () => {

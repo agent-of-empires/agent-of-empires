@@ -2131,6 +2131,7 @@ function AppContent({
           readOnly={serverAbout?.read_only ?? false}
           cityhall={caps.cityhall}
           theme={resolvedTheme}
+          link={searchParams.get("link")}
           selectedSessionId={activeSessionId}
           onSelectSession={selectPluginPageSession}
           renderSession={() => {

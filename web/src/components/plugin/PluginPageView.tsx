@@ -19,6 +19,7 @@ import {
   themePayload,
   type BridgeCall,
 } from "../../lib/pluginBridge";
+import { isDeepLinkValue } from "../../lib/pluginHref";
 import { usePluginPages } from "../../lib/pluginUiContext";
 import type { SessionMenuRequest } from "./PluginSessionMenu";
 import { requestOpenSession } from "../../lib/sessionRoute";
@@ -35,6 +36,8 @@ interface Props {
   readOnly: boolean;
   cityhall: boolean;
   theme: ResolvedTheme | null;
+  /** The `?link=` value of the dashboard URL; forwarded only to a page that declares `deep_link`. */
+  link: string | null;
   /** The split pane's session, kept by the dashboard so its docks follow it. */
   selectedSessionId: string | null;
   onSelectSession: (id: string | null) => void;
@@ -127,6 +130,7 @@ export function PluginPageView({
   readOnly,
   cityhall,
   theme,
+  link: rawLink,
   selectedSessionId,
   onSelectSession,
   renderSession,
@@ -134,6 +138,8 @@ export function PluginPageView({
 }: Props) {
   const pages = usePluginPages();
   const page = pages?.find((p) => p.plugin_id === pluginId && p.id === pageId);
+  const link = page?.deep_link && isDeepLinkValue(rawLink) ? rawLink : null;
+  const linkRef = useRef(link);
   const [attempt, setAttempt] = useState(0);
   // Keyed by URL, not the page object, which a poll replaces whenever any plugin's pages change.
   const pageUrl = page?.url;
@@ -174,6 +180,11 @@ export function PluginPageView({
     shownRef.current = shown;
     port.current?.postMessage(bridgePush("selection", { sessionId: shown }));
   }, [shown]);
+  // A second link while the page is open arrives here instead of remounting it.
+  useEffect(() => {
+    linkRef.current = link;
+    port.current?.postMessage(bridgePush("link", { link }));
+  }, [link]);
 
   // The last request stays mounted after its menu closes, so a picker it opened can finish.
   const [menuRequest, setMenuRequest] = useState<SessionMenuRequest | null>(null);
@@ -260,7 +271,14 @@ export function PluginPageView({
       channel.onmessage = serve(channel);
       channel.postMessage(bridgeReply(req.id, null));
       channel.postMessage(
-        bridgePush("context", { readOnly, cityhall, pluginId, pageId, bridgeVersion: BRIDGE_VERSION }),
+        bridgePush("context", {
+          readOnly,
+          cityhall,
+          pluginId,
+          pageId,
+          bridgeVersion: BRIDGE_VERSION,
+          link: linkRef.current,
+        }),
       );
       if (theme) channel.postMessage(bridgePush("theme", themePayload(theme)));
       channel.postMessage(bridgePush("selection", { sessionId: shownRef.current }));
