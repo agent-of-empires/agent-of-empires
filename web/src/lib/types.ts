@@ -80,6 +80,8 @@ export interface SessionResponse {
   acp_capable?: boolean;
   /** Captured ACP session id; required for a structured fork. */
   acp_session_id?: string;
+  /** An import whose history arrives once its Agent loads it; its `acp_session_id` is set from creation. */
+  import_pending?: boolean;
   /** Resolved ACP registry key, used as the current agent before any `AgentSwitched`. */
   acp_agent?: string;
   /** Pinned LLM backend ("api" | "bedrock" | "vertex"); absent means the host decides. */

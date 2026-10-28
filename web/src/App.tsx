@@ -146,6 +146,7 @@ import { BottomDock } from "./components/BottomDock";
 import { PaneDndController } from "./components/PaneDndController";
 import { visibleToFullIndex, type DropTarget } from "./components/paneDnd";
 import { BackgroundAgentsPanel } from "./components/acp/BackgroundAgentsPanel";
+import { hasStartedBefore } from "./components/acp/startupWait";
 import { DiffPane } from "./components/DiffPane";
 import { FilesPane } from "./components/FilesPane";
 import { FileContentViewer } from "./components/diff/FileContentViewer";
@@ -2002,6 +2003,7 @@ function AppContent({
                             rateLimitAutoResume={session.rate_limit_auto_resume}
                             tool={session.tool}
                             acpAgent={session.acp_agent ?? null}
+                            startedBefore={hasStartedBefore(session)}
                             acpProvider={session.acp_provider ?? null}
                             clearAliases={session.clear_aliases}
                             archivedAt={session.archived_at ?? null}

@@ -3706,7 +3706,7 @@
         "web/src/components/acp/PromptStrips.tsx",
         "web/src/components/acp/ComposerControls.tsx"
       ],
-      "notes": "A new Session shows one startup line naming the Agent with an elapsed count, switching to a neutral line at 15s with no duration or delivery promise; the queued strip and Send button say what they wait for. Reduced motion holds one breathe frame. First-dial backoff keeps the startup line; exhausted retries stop it and expose Reconnect even before the first successful connection. The disconnected new-Session Send and Queue follow-up labels and titles use Pending until the Agent is ready; connected Send and resumed-Session copy remain unchanged."
+      "notes": "A new Session shows one startup line naming the Agent with an elapsed count, switching to a neutral line at 15s with no duration or delivery promise; the queued strip and Send button say what they wait for. Reduced motion holds one breathe frame. First-dial backoff keeps the startup line; exhausted retries stop it and expose Reconnect even before the first successful connection. The disconnected new-Session Send and Queue follow-up labels and titles use Pending until the Agent is ready; connected Send and resumed-Session copy remain unchanged. A Session that already has an acp_session_id (an older one) never shows the startup line, including before its replay loads; an import still pending its history does show it."
     },
     {
       "id": "acp.startup-error-screen",

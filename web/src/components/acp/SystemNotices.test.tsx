@@ -80,7 +80,7 @@ describe("SystemNotices", () => {
 
   it.each([false, true])("offers recovery after retry exhaustion (previously connected: %s)", (hasEverOpened) => {
     const props = noticeProps({ status: "closed", hasEverOpened, retryCount: 7 });
-    const starting = isNewSessionStarting(emptyAcpState(), props, "resuming");
+    const starting = isNewSessionStarting(emptyAcpState(), props, "resuming", false);
     const { getByRole, queryByText } = render(<SystemNotices {...props} newSessionStarting={starting} />);
     expect(starting).toBe(false);
     expect(
