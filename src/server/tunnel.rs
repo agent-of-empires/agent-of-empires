@@ -170,6 +170,13 @@ impl TunnelHandle {
     /// Configure Tailscale Funnel for the local port and return a handle carrying the
     /// stable `https://<host>.<tailnet>.ts.net` URL.
     pub async fn spawn_tailscale(local_port: u16) -> anyhow::Result<Self> {
+        Self::spawn_tailscale_with(std::ffi::OsStr::new("tailscale"), local_port).await
+    }
+
+    async fn spawn_tailscale_with(
+        program: &std::ffi::OsStr,
+        local_port: u16,
+    ) -> anyhow::Result<Self> {
         // Hard cap on each tailscale command so we never wedge if tailscale pops an
         // interactive prompt (HTTPS-certs consent, Funnel-not-enabled-in-ACL, node not
         // signed in).
@@ -181,7 +188,7 @@ impl TunnelHandle {
         );
 
         // Pre-flight 1.
-        if let Err(e) = check_funnel_capability().await {
+        if let Err(e) = check_funnel_capability(program).await {
             debug!(reason = %e, "spawn_tailscale: funnel cap check failed");
             anyhow::bail!(
                 "Tailscale Funnel is not enabled for this tailnet. \
@@ -191,7 +198,8 @@ impl TunnelHandle {
         }
 
         // Pre-flight 2.
-        if let Some(existing) = inspect_existing_funnel(local_port).await {
+        let preflight = inspect_existing_funnel(program, local_port).await;
+        if let Some(existing) = preflight.conflicting {
             anyhow::bail!(
                 "port 443 is already configured on this node for a different \
                  backend ({}). Run `tailscale funnel reset` to clear the \
@@ -208,7 +216,7 @@ impl TunnelHandle {
             local_port
         );
 
-        let mut child = Command::new("tailscale")
+        let mut child = Command::new(program)
             .args(funnel_args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -297,16 +305,28 @@ impl TunnelHandle {
             );
         }
 
+        // Funnel is on now. If it was off on :443 before, this start owns it: a start that
+        // fails or is cancelled from here turns it back off, so no Funnel is left pointing at a
+        // port nothing serves. A Funnel the user already had on this port is never touched.
+        let mut guard = FunnelStartGuard::new(program, !preflight.ours_present);
+
         // Read the stable funnel URL from `tailscale status`.
         info!("Reading stable URL from `tailscale status --json`...");
-        let url = tokio::time::timeout(STEP_TIMEOUT, tailscale_funnel_url())
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
+        let url = match tokio::time::timeout(STEP_TIMEOUT, tailscale_funnel_url(program)).await {
+            Ok(Ok(url)) => url,
+            Ok(Err(e)) => {
+                guard.reset().await;
+                return Err(e);
+            }
+            Err(_) => {
+                guard.reset().await;
+                anyhow::bail!(
                     "tailscale status timed out after {}s",
                     STEP_TIMEOUT.as_secs()
-                )
-            })??;
+                );
+            }
+        };
+        guard.disarm();
         info!(url = %url, "Tailscale Funnel established");
 
         Ok(TunnelHandle {
@@ -496,42 +516,142 @@ pub async fn tailscale_available() -> bool {
     out.status.success()
 }
 
+/// The `tailscale funnel` arguments that turn off the :443 Funnel. Scoped to :443, which the
+/// pre-flight found empty or already ours; `tailscale funnel reset` would clear everything.
+const FUNNEL_OFF_ARGS: [&str; 3] = ["funnel", "--https=443", "off"];
+/// How long turning the Funnel back off may take.
+const FUNNEL_OFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Turns off the :443 Funnel a Tailscale start switched on, unless the start finishes.
+/// The error path awaits [`Self::reset`]; `Drop` only covers a start that was cancelled.
+struct FunnelStartGuard {
+    program: std::ffi::OsString,
+    armed: bool,
+}
+
+impl FunnelStartGuard {
+    fn new(program: &std::ffi::OsStr, armed: bool) -> Self {
+        Self {
+            program: program.to_owned(),
+            armed,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    /// Turn the Funnel back off and wait for it, bounded; the Daemon may exit right after.
+    async fn reset(&mut self) {
+        if !std::mem::take(&mut self.armed) {
+            return;
+        }
+        let off = Command::new(&self.program)
+            .args(FUNNEL_OFF_ARGS)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output();
+        match tokio::time::timeout(FUNNEL_OFF_TIMEOUT, off).await {
+            Ok(Ok(out)) if out.status.success() => {
+                info!("Turned off the Tailscale Funnel this start switched on")
+            }
+            Ok(Ok(out)) => warn!(
+                exit = ?out.status.code(),
+                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                "Couldn't turn off the Tailscale Funnel this start switched on"
+            ),
+            Ok(Err(e)) => warn!(error = %e, "Couldn't run `tailscale funnel --https=443 off`"),
+            Err(_) => warn!("`tailscale funnel --https=443 off` timed out"),
+        }
+    }
+}
+
+impl Drop for FunnelStartGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Cancelled mid-start: there's no task to await in, so turn it off on a thread,
+        // bounded and reaped by `run_with_timeout`.
+        let program = std::mem::take(&mut self.program);
+        std::thread::spawn(move || {
+            let result = crate::process::run_with_timeout(
+                std::process::Command::new(program)
+                    .args(FUNNEL_OFF_ARGS)
+                    .stdin(std::process::Stdio::null()),
+                FUNNEL_OFF_TIMEOUT,
+            );
+            match result {
+                Ok(Some(out)) if out.status.success() => {
+                    info!("Turned off the Tailscale Funnel a cancelled start switched on")
+                }
+                other => warn!(
+                    ?other,
+                    "Couldn't turn off the Tailscale Funnel a cancelled start switched on"
+                ),
+            }
+        });
+    }
+}
+
+/// What `tailscale funnel status --json` says about :443 before a start.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct FunnelPreflight {
+    /// A :443 handler this start must not replace.
+    conflicting: Option<String>,
+    /// A :443 handler already proxies to this port, so the Funnel isn't this start's to turn off.
+    ours_present: bool,
+}
+
 /// Probe `tailscale funnel status --json` to see if port 443 is already configured.
-async fn inspect_existing_funnel(local_port: u16) -> Option<String> {
-    let out = Command::new("tailscale")
+async fn inspect_existing_funnel(program: &std::ffi::OsStr, local_port: u16) -> FunnelPreflight {
+    let out = Command::new(program)
         .args(["funnel", "status", "--json"])
         .stdin(std::process::Stdio::null())
         .output()
-        .await
-        .ok()?;
+        .await;
+    let Ok(out) = out else {
+        return FunnelPreflight::default();
+    };
     if !out.status.success() {
         debug!(
             exit = ?out.status.code(),
             stderr = %String::from_utf8_lossy(&out.stderr).trim(),
             "inspect_existing_funnel: `tailscale funnel status --json` non-zero; assuming empty"
         );
-        return None;
+        return FunnelPreflight::default();
     }
     let parsed: serde_json::Value = match serde_json::from_slice(&out.stdout) {
         Ok(v) => v,
         Err(e) => {
             debug!(error = %e, "inspect_existing_funnel: JSON parse failed; assuming empty");
-            return None;
+            return FunnelPreflight::default();
         }
     };
 
+    funnel_preflight(&parsed, local_port)
+}
+
+/// Read a `tailscale funnel status --json` document for a start on `local_port`.
+fn funnel_preflight(parsed: &serde_json::Value, local_port: u16) -> FunnelPreflight {
+    let mut preflight = FunnelPreflight::default();
     // Walk the Web map looking for a port-443 handler whose target isn't something we can
     // safely replace.
-    let web = parsed.get("Web")?.as_object()?;
+    let Some(web) = parsed.get("Web").and_then(|w| w.as_object()) else {
+        return preflight;
+    };
     let expected_proxy_substring = format!("127.0.0.1:{}", local_port);
     for (vhost, cfg) in web.iter() {
         if !vhost.ends_with(":443") {
             continue;
         }
-        let handlers = cfg.get("Handlers").and_then(|h| h.as_object())?;
+        let Some(handlers) = cfg.get("Handlers").and_then(|h| h.as_object()) else {
+            continue;
+        };
         for (path, handler) in handlers.iter() {
             if let Some(proxy) = handler.get("Proxy").and_then(|v| v.as_str()) {
                 if proxy.contains(&expected_proxy_substring) {
+                    preflight.ours_present = true;
                     continue;
                 }
                 // A different-port loopback backend looks like a prior
@@ -552,7 +672,8 @@ async fn inspect_existing_funnel(local_port: u16) -> Option<String> {
                     proxy = %proxy,
                     "inspect_existing_funnel: port 443 already held by different proxy backend"
                 );
-                return Some(format!("proxy {} -> {}", path, proxy));
+                preflight.conflicting = Some(format!("proxy {} -> {}", path, proxy));
+                return preflight;
             } else if let Some(p) = handler.get("Path").and_then(|v| v.as_str()) {
                 debug!(
                     vhost = %vhost,
@@ -560,14 +681,16 @@ async fn inspect_existing_funnel(local_port: u16) -> Option<String> {
                     file_path = %p,
                     "inspect_existing_funnel: port 443 held by file-server handler"
                 );
-                return Some(format!("file server {} -> {}", path, p));
+                preflight.conflicting = Some(format!("file server {} -> {}", path, p));
+                return preflight;
             } else if handler.get("Text").is_some() {
                 debug!(
                     vhost = %vhost,
                     path = %path,
                     "inspect_existing_funnel: port 443 held by static-text handler"
                 );
-                return Some(format!("static text at {}", path));
+                preflight.conflicting = Some(format!("static text at {}", path));
+                return preflight;
             } else {
                 debug!(
                     vhost = %vhost,
@@ -575,7 +698,8 @@ async fn inspect_existing_funnel(local_port: u16) -> Option<String> {
                     handler = ?handler,
                     "inspect_existing_funnel: port 443 held by unknown handler type"
                 );
-                return Some(format!("unknown handler at {}", path));
+                preflight.conflicting = Some(format!("unknown handler at {}", path));
+                return preflight;
             }
         }
     }
@@ -583,15 +707,15 @@ async fn inspect_existing_funnel(local_port: u16) -> Option<String> {
         local_port = local_port,
         "inspect_existing_funnel: port 443 free or already matches our local port"
     );
-    None
+    preflight
 }
 
 /// Verify this node has the Funnel node-capability set in its ACL.
-async fn check_funnel_capability() -> anyhow::Result<()> {
+async fn check_funnel_capability(program: &std::ffi::OsStr) -> anyhow::Result<()> {
     // Tailscale emits the cap key with the allowed-port list appended as a query string,
     // e.g. `?ports=443,8443,10000`.
     const FUNNEL_CAP_PREFIX: &str = "https://tailscale.com/cap/funnel-ports";
-    let out = Command::new("tailscale")
+    let out = Command::new(program)
         .args(["status", "--json"])
         .stdin(std::process::Stdio::null())
         .output()
@@ -621,8 +745,8 @@ async fn check_funnel_capability() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn tailscale_funnel_url() -> anyhow::Result<String> {
-    let out = Command::new("tailscale")
+async fn tailscale_funnel_url(program: &std::ffi::OsStr) -> anyhow::Result<String> {
+    let out = Command::new(program)
         .args(["status", "--json"])
         .output()
         .await
@@ -862,6 +986,170 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn funnel_preflight_tells_ours_from_a_conflict() {
+        let proxy = |to: &str| serde_json::json!({"Web": {"node.ts.net:443": {"Handlers": {"/": {"Proxy": to}}}}});
+        // (status document, expected): only a :443 handler proxying to this port is ours.
+        let cases = [
+            (serde_json::json!({}), FunnelPreflight::default()),
+            (
+                proxy("http://127.0.0.1:8081"),
+                FunnelPreflight {
+                    conflicting: None,
+                    ours_present: true,
+                },
+            ),
+            // A stale loopback backend from another port is replaced, and isn't ours to keep.
+            (proxy("http://127.0.0.1:9999"), FunnelPreflight::default()),
+            (
+                proxy("http://10.0.0.5:80"),
+                FunnelPreflight {
+                    conflicting: Some("proxy / -> http://10.0.0.5:80".into()),
+                    ours_present: false,
+                },
+            ),
+        ];
+        for (doc, expected) in cases {
+            assert_eq!(funnel_preflight(&doc, 8081), expected, "{doc}");
+        }
+    }
+
+    /// A fake `tailscale` that logs each call's arguments. `status --json` answers the
+    /// capability check first; the second call is the URL read, shaped by `url_read`.
+    #[cfg(unix)]
+    fn fake_tailscale(
+        dir: &std::path::Path,
+        funnel_status: &str,
+        url_read: &str,
+    ) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let fake = dir.join("tailscale");
+        let log = dir.join("argv.log");
+        let count = dir.join("status-count");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$*" >> '{log}'
+case "$*" in
+  "status --json")
+    n=$(cat '{count}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{count}'
+    if [ "$n" = 1 ]; then
+      echo '{{"Self":{{"CapMap":{{"https://tailscale.com/cap/funnel-ports?ports=443":[]}},"DNSName":"node.ts.net."}}}}'
+      exit 0
+    fi
+    {url_read} ;;
+  "funnel status --json") echo '{funnel_status}' ;;
+  *) exit 0 ;;
+esac
+"#,
+            log = log.display(),
+            count = count.display(),
+        );
+        std::fs::write(&fake, script).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        fake
+    }
+
+    #[cfg(unix)]
+    fn argv_log(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("argv.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_tailscale_start_turns_off_only_the_funnel_it_switched_on() {
+        const OFF: &str = "funnel --https=443 off";
+        let ours =
+            r#"{"Web":{"node.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8081"}}}}}"#;
+        let ok_url = r#"echo '{"Self":{"DNSName":"node.ts.net."}}'"#;
+        // (funnel status before the start, URL read, start succeeds, Funnel turned off)
+        let cases = [
+            ("{}", "exit 1", false, true),
+            // The user's own Funnel to this port is left alone, even when the start fails.
+            (ours, "exit 1", false, false),
+            ("{}", ok_url, true, false),
+        ];
+        for (funnel_status, url_read, succeeds, off) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let fake = fake_tailscale(dir.path(), funnel_status, url_read);
+            let result = TunnelHandle::spawn_tailscale_with(fake.as_os_str(), 8081).await;
+            assert_eq!(result.is_ok(), succeeds, "{funnel_status} / {url_read}");
+            // Awaited before the error returns, not left to a thread that may die with the Daemon.
+            let calls = argv_log(dir.path());
+            assert_eq!(
+                calls.iter().filter(|c| *c == OFF).count(),
+                usize::from(off),
+                "{calls:?}"
+            );
+            // A running handle keeps the Funnel when it's released.
+            drop(result);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert_eq!(
+                argv_log(dir.path()).iter().filter(|c| *c == OFF).count(),
+                usize::from(off)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    // The test polls the fake's log with real sleeps, so the start needs its own worker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_tailscale_start_turns_off_the_funnel_it_switched_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let release = dir.path().join("release");
+        // The URL read blocks until released, so the start is mid-flight after `funnel --bg`.
+        let url_read = format!(
+            "while [ ! -f '{}' ]; do sleep 0.05; done; exit 1",
+            release.display()
+        );
+        let fake = fake_tailscale(dir.path(), "{}", &url_read);
+        let program = fake.clone();
+        let start = tokio::spawn(async move {
+            TunnelHandle::spawn_tailscale_with(program.as_os_str(), 8081).await
+        });
+
+        let wait_for = |want: &str| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let calls = argv_log(dir.path());
+                if calls
+                    .iter()
+                    .filter(|c| c.as_str() == "status --json")
+                    .count()
+                    >= 2
+                    && want == "url read"
+                    || calls.iter().any(|c| c == want)
+                {
+                    return calls;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no {want:?} in {calls:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        let before = wait_for("url read");
+        assert!(
+            before.iter().any(|c| c == "funnel --bg --yes 8081"),
+            "{before:?}"
+        );
+        start.abort();
+        let after = wait_for("funnel --https=443 off");
+        std::fs::write(&release, "").unwrap();
+        assert_eq!(
+            after
+                .iter()
+                .filter(|c| *c == "funnel --https=443 off")
+                .count(),
+            1,
+            "{after:?}"
+        );
+    }
 
     // The telemetry `serve_mode` signal reads `mode_label()`, so a named
     // Cloudflare tunnel must bucket to "tunnel" rather than leak the configured
