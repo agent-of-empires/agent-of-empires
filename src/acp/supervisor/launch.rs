@@ -1116,6 +1116,27 @@ pub(super) fn apply_declared_config_dir(
         .or_else(dirs::home_dir)
         .filter(|home| home.is_absolute())?;
     let dir = session.agent_config_dir_for(key, &home)?;
+    if variable == "CLAUDE_CONFIG_DIR" {
+        // Setting the variable moves `.claude.json` into the store, so an implicit default stays unset.
+        let ambient = environment
+            .iter()
+            .rev()
+            .find(|(name, _)| name == variable)
+            .map(|(_, value)| value.clone())
+            .or_else(|| std::env::var(variable).ok())
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from);
+        if crate::session::capture::is_default_claude_store(&dir, &home)
+            && !crate::session::capture::is_explicit_claude_store_route(
+                &dir,
+                &home,
+                Some(&dir),
+                ambient.as_deref(),
+            )
+        {
+            return None;
+        }
+    }
     overlay_env(
         environment,
         vec![(variable.into(), dir.to_string_lossy().into_owned())],
@@ -1456,6 +1477,23 @@ mod tests {
                 vec![pair("CLAUDE_CONFIG_DIR", "/d")],
                 Some(PathBuf::from("/d"))
             )
+        );
+
+        // The exact default store is implicit unless an ambient route names it.
+        let default_store = cfg(&[("claude", "~/.claude")]);
+        let mut env = vec![pair("HOME", "/home/u")];
+        assert_eq!(
+            apply_declared_config_dir(&mut env, &default_store, "claude", "claude", "claude"),
+            None
+        );
+        assert_eq!(env, vec![pair("HOME", "/home/u")]);
+        let mut env = vec![
+            pair("HOME", "/home/u"),
+            pair("CLAUDE_CONFIG_DIR", "/home/u/.claude"),
+        ];
+        assert_eq!(
+            apply_declared_config_dir(&mut env, &default_store, "claude", "claude", "claude"),
+            Some(PathBuf::from("/home/u/.claude"))
         );
 
         // A relative effective HOME would resolve differently per process: no export.
