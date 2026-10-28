@@ -104,7 +104,7 @@ Capabilities depend on channels the adapter advertises; unavailable mode, slash-
 
 ## Quickstart
 
-In the web dashboard, create a session and choose an ACP-capable agent; **Structured** defaults on. The CLI and TUI default to terminal view unless configured otherwise. In the TUI, enable the offered **Structured** field; from the CLI:
+In the web dashboard or TUI, create a session and choose an ACP-capable agent; **Structured** defaults on. Set `acp.structured_view` to `terminal` to preselect terminal view, or `off` to hide the option. The CLI defaults to terminal view; opt in with:
 
 ```bash
 aoe acp doctor
@@ -200,7 +200,7 @@ The remote picker uses bearer authentication only. Credentials require HTTPS out
 
 With no explicit remote or TCP endpoint, native clients use the local owner-verified Unix API and need neither credential variable. The kernel peer identity authorizes the connection, including when the dashboard runs with `--behind-proxy`. This is a same-OS-user trust boundary, not daemon-instance authentication; namespace and tmux checks establish runtime consistency. See the [native transport trust model](api.md#authentication).
 
-For runtime reads and ACP requests to a daemon running `--auth=passphrase`, use `AOE_DAEMON_PASSPHRASE` instead of a bearer token. These clients share the `/api/login` handshake, device binding, and persisted session cache. Login secrets never follow redirects; loopback login bypasses environment proxies. ACP TCP discovery can also read the saved `serve.passphrase` file. A revoked cached session triggers a fresh login; failed authentication never substitutes local rows. TCP loopback callers remain a separate authentication path; behind a proxy, the passphrase wall applies to them too.
+For runtime reads and ACP requests to a daemon running `--auth=passphrase`, use `AOE_DAEMON_PASSPHRASE` instead of a bearer token. These clients share the `/api/login` handshake, device binding, and persisted session cache. Login secrets never follow redirects; loopback login bypasses environment proxies. ACP TCP discovery can also read the saved `serve.passphrase` file. A revoked cached session triggers a fresh login; failed authentication never substitutes local rows. TCP loopback clients must authenticate and step up for sensitive writes, with or without a proxy. See [dashboard authentication](guides/web-dashboard.md#authentication).
 
 ## Headless CLI verbs
 

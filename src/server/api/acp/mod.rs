@@ -75,6 +75,7 @@ fn supervisor_error_response(context: &str, err: &SupervisorError) -> Response {
             StatusCode::CONFLICT,
             "structured view worker already running for session".to_string(),
         ),
+        SupervisorError::Superseded(_) => (StatusCode::CONFLICT, err.to_string()),
         SupervisorError::CapacityFull { .. }
         | SupervisorError::TeardownPending(_)
         | SupervisorError::NativeStoreUnavailable => {

@@ -3113,6 +3113,7 @@ pub(crate) fn build_container_config(
         environment,
         cpu_limit: sandbox_config.cpu_limit.clone(),
         memory_limit: sandbox_config.memory_limit.clone(),
+        cgroup_parent: None,
         port_mappings: sandbox_config.port_mappings.clone(),
         network: sanitize_network(sandbox_config.network.as_deref()),
         selinux_relabel: sandbox_config.selinux_relabel,

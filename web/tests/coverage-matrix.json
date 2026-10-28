@@ -298,9 +298,15 @@
         "src/components/__tests__/LiveTerminalView.compose.test.tsx",
         "src/components/__tests__/MobileTerminalToolbar.test.tsx",
         "src/components/__tests__/ArrowJoystick.test.tsx",
-        "src/components/settings/__tests__/MobileKeysSettings.test.tsx"
+        "src/components/settings/__tests__/MobileKeysSettings.test.tsx",
+        "tests/live-terminal-forward-scrollbar.spec.ts",
+        "src/components/live-terminal/ForwardScrollbar.test.tsx",
+        "src/components/__tests__/MobileLiveTerminal.scrollbar.test.tsx",
+        "src/lib/__tests__/forwardScrollbar.test.ts"
       ],
       "components": [
+        "web/src/components/live-terminal/ForwardScrollbar.tsx",
+        "web/src/lib/forwardScrollbar.ts",
         "web/src/components/TerminalComposeSheet.tsx",
         "web/src/components/LiveTerminalView.tsx",
         "web/src/components/MobileTerminalToolbar.tsx",
@@ -570,6 +576,20 @@
         "src/server/mcp.rs"
       ],
       "notes": "The real schema-driven switch persists machine-wide, rejects profile overrides, survives reload, and changes MCP route availability only after daemon restart."
+    },
+    {
+      "id": "settings.startup-recovery-wake",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/settings-persistence.spec.ts", "tests/live/startup-recovery.spec.ts"],
+      "components": [
+        "web/src/components/SettingsView.tsx",
+        "web/src/components/settings/SchemaSection.tsx",
+        "src/session/config/mod.rs",
+        "src/server/api/sessions/lifecycle.rs",
+        "src/server/startup_recovery.rs"
+      ],
+      "notes": "The real schema switch defaults off, validates boolean PATCH values, persists per profile, and resets to machine inheritance. Missing Idle/Waiting/Running panes still resume; opted-in default/custom text, empty opt-out, profile precedence, failed resume, and unchanged explicit API/CLI restart wake behavior use private fake agents."
     },
     {
       "id": "settings.list-field",
@@ -1145,7 +1165,8 @@
       "specs": [
         "tests/wizard.spec.ts",
         "tests/wizard-project.spec.ts",
-        "src/components/session-wizard/__tests__/SessionWizard.test.tsx"
+        "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
+        "src/components/session-wizard/__tests__/SandboxPanel.test.tsx"
       ],
       "components": [
         "web/src/components/DirectoryBrowser.tsx",
@@ -1783,6 +1804,34 @@
       ]
     },
     {
+      "id": "sidebar.recreate-container",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/__tests__/RecreateContainerDialog.test.tsx",
+        "src/components/__tests__/SessionRowSiblingTargets.test.tsx"
+      ],
+      "components": [
+        "web/src/components/sidebar/RecreateContainerDialog.tsx",
+        "web/src/components/sidebar/sessionActionTargets.ts",
+        "web/src/components/sidebar/SessionRowMenu.tsx",
+        "web/src/components/sidebar/SessionActions.tsx",
+        "web/src/lib/api.ts"
+      ],
+      "notes": "Offered only for a sandboxed, unarchived session that is not creating or deleting. The confirmation names what is lost, sends one POST, and stays open with the server's message on a refusal. The daemon side is covered by recreate_container_removes_the_container_before_the_agent_restarts."
+    },
+    {
+      "id": "sidebar.recreate-container-layout",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/sidebar-recreate-container.spec.ts"],
+      "components": [
+        "web/src/components/sidebar/RecreateContainerDialog.tsx",
+        "web/src/components/sidebar/SessionRowMenu.tsx"
+      ],
+      "notes": "The item is reachable under More on desktop and in the 375 px bottom sheet, and the dialog and both buttons fit that viewport."
+    },
+    {
       "id": "sidebar.repo-appearance",
       "kind": "mocked-playwright",
       "risk": "low",
@@ -2348,6 +2397,53 @@
       "specs": ["src/components/acp/activityMessages.test.ts", "tests/live/acp-transcript.spec.ts"],
       "components": ["web/src/components/acp/activityMessages.ts", "web/src/lib/acpTypes.ts"],
       "notes": "Back-to-back agent messages render as separate paragraphs: the server marks the row that opens a new ACP message (message_start), and only that mark breaks the text, so one streamed message never splits mid-word."
+    },
+    {
+      "id": "acp.copy-message-markdown",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": [
+        "src/components/acp/ThreadMessages.test.tsx",
+        "src/components/acp/messageMarkdown.test.ts",
+        "src/components/acp/Markdown.test.tsx",
+        "tests/acp-message-copy.spec.ts"
+      ],
+      "components": [
+        "web/src/components/acp/ThreadMessages.tsx",
+        "web/src/components/acp/MessageCopyMenu.tsx",
+        "web/src/components/acp/CopyMarkdownButton.tsx",
+        "web/src/components/acp/Markdown.tsx"
+      ],
+      "notes": "Text parts of a multi-part message and the whole message copy as raw markdown; the message menu can add tool calls. The mocked browser spec pins hover reveal, touch visibility and that the buttons do not overlap."
+    },
+    {
+      "id": "acp.copy-blocks",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": [
+        "src/components/acp/__tests__/copyActions.test.tsx",
+        "src/components/acp/__tests__/StartupErrorScreen.test.tsx",
+        "src/components/acp/__tests__/BackgroundAgentsPanel.test.tsx",
+        "src/components/acp/ToolCards.render.test.tsx",
+        "src/components/diff/comments/__tests__/DiffCommentsUserCard.test.tsx",
+        "src/lib/unifiedDiff.test.ts",
+        "src/lib/checklistMarkdown.test.ts",
+        "tests/acp-copy-blocks.spec.ts"
+      ],
+      "components": [
+        "web/src/components/acp/CopyRow.tsx",
+        "web/src/components/acp/ToolOutputMedia.tsx",
+        "web/src/components/acp/ToolCardChrome.tsx",
+        "web/src/components/acp/ToolErrorBody.tsx",
+        "web/src/components/acp/TodoCards.tsx",
+        "web/src/components/acp/PlanStrip.tsx",
+        "web/src/components/acp/ElicitationAnswerCard.tsx",
+        "web/src/components/acp/StartupErrorScreen.tsx",
+        "web/src/components/acp/BackgroundAgentsPanel.tsx",
+        "web/src/components/diff/StringDiff.tsx",
+        "web/src/components/diff/comments/DiffCommentsUserCard.tsx"
+      ],
+      "notes": "Tool input and output, tool errors, edit diffs, todo lists, the plan, answers, review prompts, sub-agent prompt and result, and install commands each copy their own content. Prompt, diff and error copies are pinned in a mocked browser; the rest are unit tests."
     },
     {
       "id": "acp.tool-group-chunking",
@@ -3299,8 +3395,16 @@
       "id": "acp.ws-reconnect-liveness",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/hooks/useAcpSession.test.ts", "tests/acp-reconnect-hung-dial.spec.ts"],
-      "components": ["web/src/hooks/useAcpSession.ts", "web/src/hooks/acpSession/useAcpConnection.ts"]
+      "specs": [
+        "src/hooks/useAcpSession.test.ts",
+        "src/components/acp/SystemNotices.test.tsx",
+        "tests/acp-reconnect-hung-dial.spec.ts"
+      ],
+      "components": [
+        "web/src/hooks/useAcpSession.ts",
+        "web/src/hooks/acpSession/useAcpConnection.ts",
+        "web/src/components/acp/SystemNotices.tsx"
+      ]
     },
     {
       "id": "acp.args",

@@ -651,6 +651,29 @@ impl ServeLaunch {
     }
 }
 
+impl ServeLaunch {
+    /// Replay the recorded launch, taking only what the TUI restart controls
+    /// (bind, exposure, port, dashboard enablement, passphrase) from `requested`,
+    /// so recorded policy such as `--read-only` and the allowlists survives.
+    fn overlay_tui_args(&self, requested: ServeArgs) -> ServeArgs {
+        let mut args = self.to_serve_args(None);
+        if self.core_only {
+            args.auth = requested.auth;
+        }
+        args.core_only = requested.core_only;
+        args.port = requested.port;
+        args.host = requested.host;
+        args.remote = requested.remote;
+        if !args.remote {
+            args.tunnel_name = None;
+            args.tunnel_url = None;
+        }
+        args.no_tailscale = requested.no_tailscale;
+        args.passphrase = requested.passphrase;
+        args
+    }
+}
+
 fn launch_file(name: &str) -> Result<crate::session::ResolvedDataFile> {
     crate::session::AnchoredDir::open(&crate::session::get_app_dir()?)?
         .bind_file(std::ffi::OsStr::new(name))
@@ -1186,6 +1209,18 @@ pub fn daemon_pid() -> Option<u32> {
         DaemonStatus::Verified(pid) => Some(pid),
         DaemonStatus::Absent | DaemonStatus::Unverified => None,
     }
+}
+
+/// The verified daemon's recorded launch, which a TUI restart replays.
+pub(crate) fn recorded_launch() -> Option<ServeLaunch> {
+    managed_launch(daemon_pid()?).ok()
+}
+
+/// Whether the verified daemon already runs `passphrase`.
+pub(crate) fn daemon_runs_passphrase(passphrase: &str) -> bool {
+    recorded_launch()
+        .and_then(|launch| recall_serve_passphrase(&launch).ok().flatten())
+        .is_some_and(|running| running == passphrase)
 }
 
 /// Returns a verified daemon only when it exposes the web dashboard.
@@ -1811,8 +1846,6 @@ async fn start_daemon(
     let client = endpoint.daemon_client()?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
     let ready = tokio::time::timeout_at(deadline, async {
-        #[cfg(target_os = "linux")]
-        let mut require_local_read = None;
         loop {
             if let Some(status) = child.try_wait()? {
                 anyhow::bail!("Daemon exited before readiness: {status}");
@@ -1826,27 +1859,6 @@ async fn start_daemon(
                 && crate::process::process_birth_identity(pid)
                     .is_ok_and(|current| current.as_ref() == Some(&birth))
             {
-                #[cfg(target_os = "linux")]
-                {
-                    use crate::cli::runtime_read::uds::{self, TrustedPathError};
-                    let required = *require_local_read.get_or_insert_with(|| {
-                        !args.cityhall
-                            && match uds::existing_app_namespace() {
-                                Ok(_) | Err(TrustedPathError::Missing) => true,
-                                Err(TrustedPathError::Invalid | TrustedPathError::Refused(_)) => {
-                                    false
-                                }
-                            }
-                    });
-                    if required
-                        && !uds::connect(deadline)
-                            .await
-                            .is_ok_and(|connection| connection.owned_by(pid))
-                    {
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                        continue;
-                    }
-                }
                 return Ok::<(), anyhow::Error>(());
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1916,7 +1928,10 @@ pub(crate) async fn restart_daemon_with_receipt(
 
     let launch = managed_launch(pid)?;
     let predecessor_passphrase = recall_serve_passphrase(&launch)?;
-    let mut args = override_args.unwrap_or_else(|| launch.to_serve_args(None));
+    let mut args = match override_args {
+        Some(requested) => launch.overlay_tui_args(requested),
+        None => launch.to_serve_args(None),
+    };
     args.passphrase = resolve_launch_passphrase(
         args.passphrase.take(),
         Some(predecessor_passphrase.as_deref()),
@@ -2481,6 +2496,56 @@ mod tests {
             allowed_origin: vec!["https://aoe.example.com:8443".to_string()],
             additional_fields: serde_json::Map::new(),
         }
+    }
+
+    #[test]
+    fn tui_restart_overlay_keeps_recorded_policy() {
+        use clap::Parser;
+        let tui_args = |argv: &[&str]| {
+            let parsed = crate::cli::Cli::try_parse_from(argv).unwrap();
+            let Some(crate::cli::Commands::Serve(args)) = parsed.command else {
+                unreachable!();
+            };
+            args
+        };
+        let mut recorded = sample_launch();
+        recorded.auth_mode = AuthMode::Token;
+        let local = recorded.overlay_tui_args(tui_args(&[
+            "aoe", "serve", "--daemon", "--port", "8080", "--host", "0.0.0.0",
+        ]));
+        let tunnel = recorded.overlay_tui_args(tui_args(&[
+            "aoe",
+            "serve",
+            "--daemon",
+            "--port",
+            "8080",
+            "--remote",
+            "--host",
+            "127.0.0.1",
+            "--no-tailscale",
+        ]));
+        for args in [&local, &tunnel] {
+            assert!(args.read_only && args.behind_proxy && args.cityhall);
+            assert!(args.dangerously_allow_plaintext_remote);
+            assert_eq!(args.allowed_host, recorded.allowed_host);
+            assert_eq!(args.allowed_origin, recorded.allowed_origin);
+            assert_eq!(args.auth, Some(AuthMode::Token));
+            assert_eq!(args.port, Some(8080));
+        }
+        assert!(!local.remote && local.host == "0.0.0.0");
+        assert!(tunnel.remote && tunnel.host == "127.0.0.1");
+        // clap requires `--remote` for the tunnel flags, so a Local restart must not replay them.
+        assert_eq!((&local.tunnel_name, &local.tunnel_url), (&None, &None));
+        assert_eq!(tunnel.tunnel_name, recorded.tunnel_name);
+        assert_eq!(tunnel.tunnel_url, recorded.tunnel_url);
+
+        let mut core = sample_launch();
+        core.core_only = true;
+        let dashboard = core.overlay_tui_args(tui_args(&[
+            "aoe", "serve", "--daemon", "--port", "8080", "--host", "0.0.0.0",
+        ]));
+        assert!(!dashboard.core_only);
+        assert_eq!((dashboard.port, dashboard.auth), (Some(8080), None));
     }
 
     #[test]

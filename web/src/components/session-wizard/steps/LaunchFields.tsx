@@ -36,10 +36,21 @@ export function LabeledInput({
   );
 }
 
-export function EnvVarList({ values, onChange }: { values: string[]; onChange: (v: string[]) => void }) {
+export function EnvVarList({
+  values,
+  onChange,
+  label = "Environment variables",
+  hint,
+}: {
+  values: string[];
+  onChange: (v: string[]) => void;
+  label?: string;
+  hint?: string;
+}) {
   return (
-    <div>
-      <label className="block text-sm text-text-dim mb-1.5">Environment variables</label>
+    <fieldset className="m-0 min-w-0 border-0 p-0">
+      <legend className="block text-sm text-text-dim mb-1.5">{label}</legend>
+      {hint && <p className="text-xs text-text-dim mb-1.5">{hint}</p>}
       {values.map((env, i) => (
         <div key={i} className="flex gap-2 mb-1">
           <input
@@ -47,9 +58,11 @@ export function EnvVarList({ values, onChange }: { values: string[]; onChange: (
             value={env}
             onChange={(e) => onChange(values.map((v, j) => (j === i ? e.target.value : v)))}
             placeholder="KEY=value"
+            aria-label={`${label} ${i + 1}`}
             className="flex-1 bg-surface-900 border border-surface-700 rounded-md px-2 py-1.5 text-base md:text-sm font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
           />
           <button
+            aria-label={`Remove ${label} ${i + 1}`}
             onClick={() => onChange(values.filter((_, j) => j !== i))}
             className="px-2 text-text-dim hover:text-status-error cursor-pointer"
           >
@@ -58,11 +71,12 @@ export function EnvVarList({ values, onChange }: { values: string[]; onChange: (
         </div>
       ))}
       <button
+        aria-label={`Add ${label}`}
         onClick={() => onChange([...values, ""])}
         className="text-xs text-text-dim hover:text-text-secondary cursor-pointer"
       >
         + Add variable
       </button>
-    </div>
+    </fieldset>
   );
 }
