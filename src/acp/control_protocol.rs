@@ -33,15 +33,23 @@ pub const MAX_CONTROL_QUEUE_BYTES: usize = 128 * 1024 * 1024;
 #[notification(method = "_aoe/session_replayed")]
 pub struct SessionReplayed {}
 
-/// Daemon-minted notification written after a local prompt's completion.
-///
-/// The crate handles notifications in order, so the waiter resolves only after
-/// the updates the agent sent before its reply have been applied.
+/// Daemon-minted completion barrier, ordered behind preceding SDK notifications.
+/// Adopted payloads contain only the bounded classified diagnostic, never ACP data.
 #[derive(
     Debug, Clone, Default, Serialize, Deserialize, agent_client_protocol::JsonRpcNotification,
 )]
 #[notification(method = "_aoe/prompt_completed")]
-pub(crate) struct PromptCompletedMarker {}
+pub(crate) struct PromptCompletedMarker {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopted: Option<Box<AdoptedPromptCompletion>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct AdoptedPromptCompletion {
+    pub turn: u64,
+    pub diagnostic: Option<crate::acp::state::Event>,
+    pub reason: String,
+}
 
 /// A single control frame.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

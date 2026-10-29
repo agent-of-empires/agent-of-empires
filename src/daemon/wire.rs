@@ -893,6 +893,8 @@ pub struct SessionResponse {
     /// `last_accessed_at` but leaves `idle_entered_at` alone.
     pub idle_entered_at: Option<String>,
     pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_evidence: Option<crate::session::OperationErrorEvidence>,
     pub branch: Option<String>,
     pub main_repo_path: Option<String>,
     /// Base branch the worktree was created from when AoE managed the

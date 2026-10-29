@@ -101,6 +101,7 @@ impl Instance {
             identity_publisher_launched: false,
             pi_session_path: None,
             last_error: None,
+            last_error_evidence: None,
             capture_poller: Default::default(),
             retroactive_capture_excludes: HashSet::new(),
             pane_dead_observed: false,

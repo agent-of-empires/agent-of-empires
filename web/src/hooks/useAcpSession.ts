@@ -1,5 +1,5 @@
 // Structured view session: reduces the ACP stream into AcpState and exposes the user's actions.
-// Failed actions surface through `state.lastError` rather than being silently lost.
+// Failed actions surface through transient interaction errors without replacing operation diagnostics.
 
 import { useCallback, useEffect, useMemo, useReducer, useRef, type Dispatch } from "react";
 import {
@@ -133,10 +133,14 @@ export function useAcpSession(
         dispatch(
           outcome.kind === "resolved"
             ? { kind: "approval_resolved_locally", nonce }
-            : { kind: "error", message: outcome.message },
+            : { kind: "error", message: outcome.message, target: { kind: "approval", nonce } },
         );
       } catch (e) {
-        dispatch({ kind: "error", message: `Network error resolving approval: ${describeError(e)}` });
+        dispatch({
+          kind: "error",
+          message: `Network error resolving approval: ${describeError(e)}`,
+          target: { kind: "approval", nonce },
+        });
       }
     },
     [sessionId],
@@ -150,7 +154,11 @@ export function useAcpSession(
       try {
         res = await fetch(acpUrl(sessionId, `elicitations/${encodeURIComponent(nonce)}`), jsonPost(resolution));
       } catch (e) {
-        dispatch({ kind: "error", message: `Network error resolving question: ${describeError(e)}` });
+        dispatch({
+          kind: "error",
+          message: `Network error resolving question: ${describeError(e)}`,
+          target: { kind: "elicitation", nonce },
+        });
         throw e;
       }
       const detail = res.ok ? "" : await safeText(res);
@@ -159,7 +167,7 @@ export function useAcpSession(
         dispatch({ kind: "elicitation_resolved_locally", nonce, resolution });
         return;
       }
-      dispatch({ kind: "error", message: outcome.message });
+      dispatch({ kind: "error", message: outcome.message, target: { kind: "elicitation", nonce } });
       throw new Error(outcome.message);
     },
     [sessionId],

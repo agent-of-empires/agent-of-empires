@@ -15,6 +15,7 @@ mod tests;
 
 use crate::acp::agent_compat::ExpectedAgent;
 use crate::acp::agent_profiles::AgentProfile;
+use crate::acp::control_protocol::PromptCompletedMarker;
 use crate::acp::state::Event;
 use agent_client_protocol::schema::v1::{
     CreateElicitationRequest, CreateElicitationResponse, CreateTerminalRequest,
@@ -33,13 +34,13 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{error, info, warn};
 
 use super::commands::{ClientCmd, ConnectMode};
-use super::control::DaemonControlClient;
+use super::control::{publish_adopted_completion, DaemonControlClient};
 use super::errors::{acp_internal_error, AcpError};
 use super::fs_handlers::{handle_read_text_file, handle_write_text_file};
 use super::lifecycle::TerminalClaim;
 use super::pending::PendingResponders;
 use super::permission_handlers::{handle_elicitation_request, handle_permission_request};
-use super::rate_limit::{captured_rate_limit_resets_at, classify_rate_limit_from_message};
+use super::rate_limit::captured_rate_limit_resets_at;
 use super::session_identity::{SessionIngress, SessionIngressNotification};
 use super::terminal_handlers::{
     handle_create_terminal, handle_kill_terminal, handle_release_terminal, handle_terminal_output,
@@ -202,9 +203,21 @@ pub(super) async fn run_connection_task<W, R>(
         .name("aoe-acp")
         .on_close({
             let control = control.clone();
+            let shared = shared.clone();
             move |_connection| async move {
                 if let Some(control) = control {
                     control.shutdown();
+                }
+                // EOF already failed pending SDK requests. Let the local owner
+                // consume an earlier response and enqueue its terminal before
+                // this fatal close cancels the foreground.
+                let settled = shared.local_prompt_settled.notified();
+                tokio::pin!(settled);
+                settled.as_mut().enable();
+                if shared.prompt_epoch.load(Ordering::Acquire) != 0
+                    && shared.prompt_in_flight.load(Ordering::Acquire)
+                {
+                    settled.await;
                 }
                 Err(acp_internal_error("agent transport closed".into()))
             }
@@ -227,7 +240,26 @@ pub(super) async fn run_connection_task<W, R>(
                             }
                             SessionIngressNotification::PromptCompleted(marker) => {
                                 if let Some(control) = control.as_ref() {
-                                    control.deliver_prompt_completion(marker);
+                                    if let Some(adopted) = marker.adopted {
+                                        shared.wait_initial_session_commit().await;
+                                        if publish_adopted_completion(
+                                            *adopted,
+                                            &shared.event_tx,
+                                            &control.completion,
+                                            &shared.prompt_in_flight,
+                                            &shared.terminal_claim,
+                                        )
+                                        .await
+                                        {
+                                            shared
+                                                .adopted_turn_active
+                                                .store(false, Ordering::Relaxed);
+                                        }
+                                    } else {
+                                        control.deliver_prompt_completion(
+                                            PromptCompletedMarker::default(),
+                                        );
+                                    }
                                 }
                                 return Ok(());
                             }
@@ -266,22 +298,24 @@ pub(super) async fn run_connection_task<W, R>(
                 let pending = pending_responders.clone();
                 move |request: RequestPermissionRequest,
                       responder: Responder<RequestPermissionResponse>,
-                      _conn| {
+                      connection: ConnectionTo<Agent>| {
                     let (shared, pending) = (shared.clone(), pending.clone());
                     async move {
-                        let _guard = match shared.ingress.request(&request.session_id).await {
-                            Ok(guard) => guard,
-                            Err(error) => return reply(responder, Err(error)),
-                        };
-                        let outcome = handle_permission_request(
-                            request,
-                            shared.event_tx.clone(),
-                            pending,
-                            profile,
-                            shared.tool_context_cache.clone(),
-                        )
-                        .await;
-                        reply(responder, outcome)
+                        connection.spawn(async move {
+                            let _guard = match shared.ingress.request(&request.session_id).await {
+                                Ok(guard) => guard,
+                                Err(error) => return reply(responder, Err(error)),
+                            };
+                            let outcome = handle_permission_request(
+                                request,
+                                shared.event_tx.clone(),
+                                pending,
+                                profile,
+                                shared.tool_context_cache.clone(),
+                            )
+                            .await;
+                            reply(responder, outcome)
+                        })
                     }
                 }
             },
@@ -293,22 +327,25 @@ pub(super) async fn run_connection_task<W, R>(
                 let ingress = ingress.clone();
                 move |request: CreateElicitationRequest,
                       responder: Responder<CreateElicitationResponse>,
-                      _conn| {
+                      connection: ConnectionTo<Agent>| {
                     let (event_tx, pending) = (event_tx.clone(), pending_responders.clone());
                     let ingress = ingress.clone();
                     async move {
-                        // Only a session-scoped elicitation carries an identity
-                        // to fence on.
-                        let _guard = if let ElicitationScope::Session(scope) = request.scope() {
-                            match ingress.request(&scope.session_id).await {
-                                Ok(guard) => Some(guard),
-                                Err(error) => return reply(responder, Err(error)),
-                            }
-                        } else {
-                            None
-                        };
-                        let outcome = handle_elicitation_request(request, event_tx, pending).await;
-                        reply(responder, outcome)
+                        connection.spawn(async move {
+                            // Only a session-scoped elicitation carries an identity
+                            // to fence on.
+                            let _guard = if let ElicitationScope::Session(scope) = request.scope() {
+                                match ingress.request(&scope.session_id).await {
+                                    Ok(guard) => Some(guard),
+                                    Err(error) => return reply(responder, Err(error)),
+                                }
+                            } else {
+                                None
+                            };
+                            let outcome =
+                                handle_elicitation_request(request, event_tx, pending).await;
+                            reply(responder, outcome)
+                        })
                     }
                 }
             },
@@ -434,11 +471,16 @@ async fn report_connection_error(
         session = %label,
         "ACP connection task ended with error: {:?}", e
     );
-    let message = format!("ACP connection failed: {e}");
-    let rate_limit = classify_rate_limit_from_message(
-        &message,
-        captured_rate_limit_resets_at(&shared.rate_limit_rejections, chrono::Utc::now()),
-    );
+    let resets_at =
+        captured_rate_limit_resets_at(&shared.rate_limit_rejections, chrono::Utc::now());
+    let rate_limit = super::rate_limit::classify_rate_limit_error(e, resets_at).or_else(|| {
+        super::rate_limit::classify_rate_limit_from_message(&e.message, resets_at).map(
+            |mut info| {
+                info.status = super::errors::public_error_message(e);
+                info
+            },
+        )
+    });
     if let Some(tx) = ready_tx.lock().await.take() {
         // A handshake-time limit fails the spawn as rate-limited so the
         // supervisor parks instead of burning respawn budget (#3514).
@@ -452,7 +494,10 @@ async fn report_connection_error(
                 );
                 AcpError::RateLimited(Box::new(info))
             }
-            None => AcpError::Spawn(message),
+            None => AcpError::Spawn(format!(
+                "ACP connection failed: {}",
+                super::errors::public_error_message(e)
+            )),
         };
         let _ = tx.send(Err(err));
     } else if let Some(info) = rate_limit {
@@ -476,6 +521,13 @@ async fn report_connection_error(
             })
             .await;
     } else {
-        let _ = event_tx.send(Event::AgentStartupError { message }).await;
+        let _ = event_tx
+            .send(Event::AgentStartupError {
+                message: format!(
+                    "ACP connection failed: {}",
+                    super::errors::public_error_message(e)
+                ),
+            })
+            .await;
     }
 }

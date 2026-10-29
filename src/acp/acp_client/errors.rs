@@ -172,17 +172,71 @@ pub(super) fn acp_internal_error(message: String) -> agent_client_protocol::Erro
     err
 }
 
-/// Preserves `code` / `message` / `data` from the runner's `HandshakeFailed`
-/// so `AgentStartupError` surfaces the same `data.details` remediation the
-/// byte-relay handshake did. A malformed object falls back to internal error.
+/// Public diagnostics exclude arbitrary ACP data and redact known secret shapes.
+pub(super) fn public_error_message(error: &agent_client_protocol::Error) -> String {
+    let scrubbed = super::spawn::scrub_stderr_secrets(&error.message);
+    if scrubbed.len() <= 2048 {
+        scrubbed.into_owned()
+    } else {
+        super::delete::truncate_for_log(&scrubbed, 2048)
+    }
+}
+
+pub(super) fn prompt_runtime_error(
+    error: &agent_client_protocol::Error,
+    source: crate::session::ErrorEvidenceSource,
+) -> crate::acp::state::Event {
+    use crate::session::{ErrorBlockingScope, ErrorOperation, OperationErrorEvidence};
+    let mut evidence = OperationErrorEvidence::new(source, ErrorOperation::Prompt);
+    evidence.blocking_scope = Some(ErrorBlockingScope::Operation);
+    evidence.reported_code = Some(i32::from(error.code));
+    crate::acp::state::Event::PromptRuntimeError {
+        message: public_error_message(error),
+        evidence: Some(evidence),
+    }
+}
+
+pub(super) fn control_transport_closed_error() -> agent_client_protocol::Error {
+    acp_internal_error("runner control channel closed during prompt".into()).data(
+        serde_json::json!({
+            "reason": agent_client_protocol::INCOMING_TRANSPORT_CLOSED_REASON,
+            "method": "session/prompt",
+        }),
+    )
+}
+
+/// Preserve private code/data for the existing structured classifiers.
+/// Public diagnostics use only the bounded, scrubbed message.
 pub(super) fn acp_error_from_value(error: serde_json::Value) -> agent_client_protocol::Error {
-    serde_json::from_value(error.clone())
-        .unwrap_or_else(|_| acp_internal_error(format!("runner handshake failed: {error}")))
+    serde_json::from_value(error).unwrap_or_else(|cause| {
+        tracing::warn!(target: "acp.protocol", ?cause, "invalid runner error envelope");
+        acp_internal_error("runner returned an invalid error envelope".into())
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_prompt_errors_preserve_message_without_private_data_or_secret_shapes() {
+        let error = agent_client_protocol::Error::new(
+            -32603,
+            "request failed: sk-ant-abcdefghijklmnop1234567890",
+        );
+        let error = error.data(serde_json::json!({"privateTokenMarker": "must-not-leak"}));
+        let event = prompt_runtime_error(
+            &error,
+            crate::session::ErrorEvidenceSource::LocalPromptResult,
+        );
+        let public = serde_json::to_string(&event).unwrap();
+        assert!(!public.contains("privateTokenMarker"));
+        assert!(!public.contains("must-not-leak"));
+        assert!(!public.contains("sk-ant-abcdefghijklmnop1234567890"));
+        assert!(public.contains("request failed"));
+        let long = agent_client_protocol::Error::new(-32603, "é".repeat(3000));
+        assert!(public_error_message(&long).len() <= 2051);
+    }
 
     fn spawn_message(error: AcpError) -> String {
         match error {

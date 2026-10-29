@@ -147,7 +147,7 @@ const RESUME_PROBE_POLL: std::time::Duration = std::time::Duration::from_millis(
 
 /// Grace window we keep observing after the pane stops running its boot
 /// shell, before declaring `Alive`. Sized to cover the longest in-pane
-/// boot a real agent takes before it would have crashed on a bad sid:
+/// boot before a native session rejection can exit:
 /// opencode (bun-compiled native binary that loads JS, parses argv, and
 /// hits the session-not-found path) reaches `pane_dead = true` between
 /// ~900ms and ~1100ms after spawn on a warm cache, longer on cold or
@@ -425,6 +425,7 @@ impl Instance {
         if self.status == Status::Error {
             self.status = Status::Idle;
             self.last_error = None;
+            self.last_error_evidence = None;
             self.last_error_check = None;
         }
         let generation = self.acquire_lifecycle_reservation(
@@ -595,6 +596,14 @@ impl Instance {
         };
         if let StartOutcome::Indeterminate { cause } = outcome {
             self.last_error = Some(cause.message().to_owned());
+            if self.lifecycle_generation == generation {
+                self.record_terminal_error(
+                    ErrorEvidenceSource::TmuxObservation,
+                    RuntimeEvidence::Unknown,
+                );
+            } else {
+                self.last_error_evidence = None;
+            }
             self.last_error_check = Some(std::time::Instant::now());
             // A failed release cannot turn missing evidence into teardown authority.
             if let Err(error) = self.release_indeterminate_launch(storage, generation) {
@@ -918,6 +927,10 @@ impl Instance {
         }
         self.capture_poller.clear();
         self.status = Status::Error;
+        self.record_terminal_error(
+            ErrorEvidenceSource::TmuxObservation,
+            RuntimeEvidence::PaneExited { exit_code: None },
+        );
         self.last_error = Some(format!(
             "resume failed for sid {}; preserved for explicit retry",
             stale_sid

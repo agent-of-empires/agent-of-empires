@@ -419,6 +419,7 @@ pub enum SidebarPhase {
     Active,
     Waiting,
     Error,
+    PromptFailed,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -455,6 +456,9 @@ pub struct AcpState {
     pub last_agent_switch: Option<AgentSwitchInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_error: Option<StartupErrorDetail>,
+    /// The diagnostic message stays in the event/transcript, independently of liveness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_error: Option<crate::session::OperationErrorEvidence>,
     /// Full snapshot of the adapter's per-session selectors.
     #[serde(default)]
     pub config_options: Vec<ConfigOptionDescriptor>,
@@ -710,9 +714,12 @@ pub enum Event {
     BackgroundTaskFinished {
         task_id: String,
     },
-    /// The adapter runtime failed a prompt before emitting any transcript.
+    /// A prompt operation failed, possibly after transcript or tool output.
+    /// This does not establish process death or invalidate conversation history.
     PromptRuntimeError {
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<crate::session::OperationErrorEvidence>,
     },
     AgentMessageChunk {
         text: String,
@@ -853,7 +860,7 @@ impl AcpState {
     /// the row `Running` between main turns.
     pub fn sidebar_status(&self) -> Status {
         match self.sidebar_phase {
-            SidebarPhase::Error => Status::Error,
+            SidebarPhase::Error | SidebarPhase::PromptFailed => Status::Error,
             SidebarPhase::Waiting => Status::Waiting,
             SidebarPhase::Active => Status::Running,
             SidebarPhase::Idle if self.has_active_background_agent() => Status::Running,
@@ -866,7 +873,12 @@ impl AcpState {
             Event::PlanUpdated { plan } => self.current_plan = Some(plan),
             Event::TodoListUpdated { todos } => self.todos = todos,
             Event::ToolCallStarted { tool_call } => {
-                self.sidebar_phase = SidebarPhase::Active;
+                if !matches!(
+                    self.sidebar_phase,
+                    SidebarPhase::Error | SidebarPhase::PromptFailed
+                ) {
+                    self.sidebar_phase = SidebarPhase::Active;
+                }
                 self.start_tool_call(tool_call)
             }
             Event::ToolCallCompleted { tool_call_id, .. } => {
@@ -909,7 +921,12 @@ impl AcpState {
                 }
             }
             Event::ApprovalRequested { approval } => {
-                self.sidebar_phase = SidebarPhase::Waiting;
+                if !matches!(
+                    self.sidebar_phase,
+                    SidebarPhase::Error | SidebarPhase::PromptFailed
+                ) {
+                    self.sidebar_phase = SidebarPhase::Waiting;
+                }
                 self.pending_approvals.push(approval)
             }
             Event::ApprovalResolved { nonce, .. } => {
@@ -921,7 +938,12 @@ impl AcpState {
                 if self.pending_approvals.remove(pos).resolved.is_some() {
                     return Err(StateError::ApprovalAlreadyResolved(nonce));
                 }
-                self.sidebar_phase = SidebarPhase::Active;
+                if !matches!(
+                    self.sidebar_phase,
+                    SidebarPhase::Error | SidebarPhase::PromptFailed
+                ) {
+                    self.sidebar_phase = SidebarPhase::Active;
+                }
             }
             Event::ElicitationRequested { elicitation } => {
                 // The asking tool call is now waiting on the user, not running.
@@ -931,12 +953,22 @@ impl AcpState {
                 {
                     self.in_flight_tool = None;
                 }
-                self.sidebar_phase = SidebarPhase::Waiting;
+                if !matches!(
+                    self.sidebar_phase,
+                    SidebarPhase::Error | SidebarPhase::PromptFailed
+                ) {
+                    self.sidebar_phase = SidebarPhase::Waiting;
+                }
                 self.pending_elicitations.push(elicitation)
             }
             Event::ElicitationResolved { nonce, .. } => {
                 self.pending_elicitations.retain(|e| e.nonce != nonce);
-                self.sidebar_phase = SidebarPhase::Active;
+                if !matches!(
+                    self.sidebar_phase,
+                    SidebarPhase::Error | SidebarPhase::PromptFailed
+                ) {
+                    self.sidebar_phase = SidebarPhase::Active;
+                }
             }
             Event::DiffEmitted { diff } => {
                 self.recent_diffs.push(diff);
@@ -950,8 +982,10 @@ impl AcpState {
                 self.thinking = Some(ThinkingSignal {
                     started_at: Utc::now(),
                 });
-                self.turn_active = true;
-                self.sidebar_phase = SidebarPhase::Active;
+                if self.sidebar_phase != SidebarPhase::PromptFailed {
+                    self.turn_active = true;
+                    self.sidebar_phase = SidebarPhase::Active;
+                }
             }
             Event::ThinkingEnded => self.thinking = None,
             Event::RateLimit { info } => self.rate_limit = Some(info),
@@ -1015,9 +1049,11 @@ impl AcpState {
                     reason,
                 });
             }
-            Event::PromptRuntimeError { .. } => {
+            Event::PromptRuntimeError { evidence, .. } => {
+                self.operation_error = evidence;
                 self.turn_active = false;
                 self.cancelling = false;
+                self.sidebar_phase = SidebarPhase::Error;
             }
             Event::AgentStartupError { .. } => {
                 self.turn_active = false;
@@ -1043,6 +1079,10 @@ impl AcpState {
             // selectors are never re-announced, so they stay.
             Event::SessionCleared => {
                 self.usage = None;
+                self.operation_error = None;
+                if self.sidebar_phase == SidebarPhase::PromptFailed {
+                    self.sidebar_phase = SidebarPhase::Idle;
+                }
                 self.current_plan = None;
                 self.mode = SessionMode::Default;
                 self.pending_approvals = Vec::new();
@@ -1135,7 +1175,11 @@ impl AcpState {
                 self.background_tasks.retain(|id| *id != task_id);
             }
             // Titles live on `Instance`; wakeups and monitors are read from the log.
-            Event::AgentMessageChunk { .. } => self.sidebar_phase = SidebarPhase::Active,
+            Event::AgentMessageChunk { .. } => {
+                if self.sidebar_phase != SidebarPhase::PromptFailed {
+                    self.sidebar_phase = SidebarPhase::Active;
+                }
+            }
             Event::SessionTitleSuggested { .. }
             | Event::ToolCallContent { .. }
             | Event::ModeSwitchFailed { .. }
@@ -1174,6 +1218,7 @@ impl AcpState {
         let steered = self.turn_active && self.steering;
         self.turn_active = true;
         self.sidebar_phase = SidebarPhase::Active;
+        self.operation_error = None;
         if !steered {
             self.cancelling = false;
         }
@@ -1193,7 +1238,13 @@ impl AcpState {
     /// The turn is over however it ended, so every in-turn phase clears.
     fn end_turn(&mut self, reason: &str) {
         self.turn_active = false;
-        self.sidebar_phase = SidebarPhase::Idle;
+        self.sidebar_phase = if reason == "prompt_failed" {
+            SidebarPhase::PromptFailed
+        } else if reason == "session_reset_failed" {
+            SidebarPhase::Error
+        } else {
+            SidebarPhase::Idle
+        };
         self.cancelling = false;
         self.compacting = false;
         self.compaction_tool_id = None;
@@ -1208,6 +1259,10 @@ impl AcpState {
     fn switch_agent(&mut self, from: String, to: String, reason: String) {
         self.agent = AgentName(to.clone());
         self.rate_limit = None;
+        self.operation_error = None;
+        if self.sidebar_phase == SidebarPhase::PromptFailed {
+            self.sidebar_phase = SidebarPhase::Idle;
+        }
         // The prior agent's advisories say nothing about the new one.
         self.session_notices.clear();
         self.in_flight_tool = None;
@@ -1299,6 +1354,124 @@ mod tests {
             s.apply_event(s.last_seq.saturating_add(1), event).unwrap();
         }
         s
+    }
+
+    #[test]
+    fn failed_operation_metadata_replays_without_erasing_owned_state() {
+        use crate::session::{
+            ErrorEvidenceSource, ErrorOperation, OperationErrorEvidence, RuntimeEvidence,
+        };
+        let evidence = OperationErrorEvidence::new(
+            ErrorEvidenceSource::LocalPromptResult,
+            ErrorOperation::Prompt,
+        );
+        let mut state = applied([prompt("work"), super::test_support::chunk("partial output")]);
+        state.usage = Some(SessionUsage {
+            used: 12,
+            size: 100,
+            cost: None,
+        });
+        let approval = crate::acp::permissions::build_approval(
+            ToolCall {
+                id: "pending".into(),
+                name: "shell".into(),
+                kind: "execute".into(),
+                args_preview: "{}".into(),
+                started_at: Utc::now(),
+                parent_tool_call_id: None,
+                memory_recall: None,
+                diffs: Vec::new(),
+            },
+            Vec::new(),
+        );
+        state.pending_approvals.push(approval);
+        state.pending_elicitations.push(Elicitation {
+            nonce: Nonce("pending-question".into()),
+            message: "Choose".into(),
+            title: None,
+            description: None,
+            tool_call_id: None,
+            questions: Vec::new(),
+            requested_at: Utc::now(),
+            resolved: None,
+        });
+        for metadata in [Some(evidence), None] {
+            let mut replay = state.clone();
+            let event = Event::PromptRuntimeError {
+                message: "request failed".into(),
+                evidence: metadata,
+            };
+            let decoded: Event =
+                serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+            replay.apply_event(replay.last_seq + 1, decoded).unwrap();
+            replay
+                .apply_event(replay.last_seq + 1, stopped("prompt_failed"))
+                .unwrap();
+            replay
+                .apply_event(replay.last_seq + 1, Event::ThinkingStarted)
+                .unwrap();
+            replay
+                .apply_event(
+                    replay.last_seq + 1,
+                    super::test_support::chunk("late native output"),
+                )
+                .unwrap();
+            replay
+                .apply_event(
+                    replay.last_seq + 1,
+                    Event::BackgroundTaskStarted {
+                        task_id: "owned-background-work".into(),
+                        tool_call_id: Some("background-tool".into()),
+                        description: "background activity remains observed".into(),
+                    },
+                )
+                .unwrap();
+            assert!(
+                replay.has_active_background_agent(),
+                "background observations survive the failed main turn"
+            );
+            assert!(!replay.turn_active);
+            assert_eq!(replay.sidebar_status(), Status::Error);
+            assert_eq!(replay.operation_error, metadata);
+            assert_eq!(replay.pending_approvals.len(), 1);
+            assert_eq!(replay.pending_elicitations.len(), 1);
+            assert_eq!(
+                serde_json::to_value(&replay.usage).unwrap(),
+                serde_json::to_value(&state.usage).unwrap()
+            );
+            assert!(replay.startup_error.is_none());
+            if let Some(evidence) = replay.operation_error {
+                assert_eq!(evidence.runtime, RuntimeEvidence::Unknown);
+                assert_eq!(evidence.retryable, None);
+            }
+            replay
+                .apply_event(
+                    replay.last_seq + 1,
+                    Event::AcpSessionAssigned {
+                        acp_session_id: "same-native-history".into(),
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                replay.sidebar_status(),
+                Status::Error,
+                "reattach is not a new successful operation"
+            );
+            assert_eq!(replay.operation_error, metadata);
+            replay
+                .apply_event(replay.last_seq + 1, prompt("next explicit request"))
+                .unwrap();
+            assert!(replay.turn_active && replay.operation_error.is_none());
+        }
+        for json in [
+            r#"{"PromptRuntimeError":{"message":"old failure"}}"#,
+            r#"{"PromptRuntimeError":{"message":"old failure","evidence":null}}"#,
+        ] {
+            assert!(matches!(
+                serde_json::from_str::<Event>(json).unwrap(),
+                Event::PromptRuntimeError { evidence: None, .. }
+            ));
+        }
     }
 
     /// The sidebar projection over event sequences, including the ones the old
@@ -1754,6 +1927,7 @@ mod tests {
             },
             Event::PromptRuntimeError {
                 message: "boom".into(),
+                evidence: None,
             },
             Event::PromptRejected {
                 reason: "agent_busy".into(),

@@ -201,6 +201,7 @@ impl Instance {
         self.idle_dormant_since = None;
         self.idle_entered_at = None;
         self.last_error = None;
+        self.last_error_evidence = None;
         self.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
         Ok(generation)
     }
@@ -702,6 +703,7 @@ impl Instance {
         } else {
             None
         };
+        self.last_error_evidence = None;
         self.last_error = Some(
             if let Some(refusal) = error.downcast_ref::<ManagedResumeRefused>() {
                 tracing::warn!(

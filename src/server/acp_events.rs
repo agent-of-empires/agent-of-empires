@@ -657,12 +657,8 @@ pub(crate) fn apply_status_intent(
         // A Stopped session must not be woken by a trailing worker event.
         StatusPolicy::Authoritative if inst.status == Status::Stopped => return,
         StatusPolicy::Authoritative => {}
-        // Background sub-agent events must not speak for the main turn: they
-        // preserve its Waiting (a pending approval/elicitation) and Error (a
-        // dead connection the supervisor is still respawning), and Stopped
-        // likewise stays until the main turn's own lifecycle moves it. The
-        // main turn's own events resolve Waiting and Error; Error also heals
-        // on a fresh worker attach.
+        // Background work cannot resolve main-turn Waiting, Error or Stopped.
+        // Error describes a failed operation or connection, not necessarily death.
         StatusPolicy::Background => {
             if matches!(
                 inst.status,
@@ -716,9 +712,8 @@ pub(crate) fn apply_status_intent(
 /// `ElicitationResolved`) before the turn's `Stopped`, so an answered-then-
 /// completed turn still ends on this edge and needs no case of its own. A
 /// direct `Waiting -> Idle` means the turn stopped while still blocked on the
-/// user, who is by construction present for it. Every `Stopped` reason maps to
-/// `Idle`, so a rate-limit park marks unread too; that is the same policy
-/// terminal sessions get, and a parked session does want attention.
+/// user, who is by construction present for it. Successful and parked stops
+/// project `Idle`; `prompt_failed` projects `Error` and does not drain queued work.
 pub(super) fn should_mark_acp_unread(
     inst: &Instance,
     old_status: Status,
@@ -997,6 +992,7 @@ pub(crate) fn status_policy(event: &crate::acp::Event) -> Option<StatusPolicy> {
         | Event::AgentMessageChunk { .. }
         | Event::ToolCallStarted { .. }
         | Event::Stopped { .. }
+        | Event::PromptRuntimeError { .. }
         | Event::AgentStartupError { .. }
         | Event::IncompatibleAgent { .. } => Some(StatusPolicy::Authoritative),
         Event::BackgroundAgentLaunched { .. }
@@ -2453,6 +2449,14 @@ mod tests {
             (chunk("x"), Some(Authoritative)),
             (Event::ThinkingStarted, Some(Authoritative)),
             (stopped("prompt_complete"), Some(Authoritative)),
+            (stopped("prompt_failed"), Some(Authoritative)),
+            (
+                Event::PromptRuntimeError {
+                    message: "request failed".into(),
+                    evidence: None,
+                },
+                Some(Authoritative),
+            ),
             (
                 Event::AgentStartupError {
                     message: "boom".into(),

@@ -544,6 +544,7 @@ pub(super) fn replace_committed_profiles<const N: usize>(
                 let status = row.status;
                 let idle_entered_at = row.idle_entered_at;
                 let committed_error = row.last_error.take();
+                let committed_error_evidence = row.last_error_evidence.take();
                 if previous.source_profile == *profile {
                     row.merge_runtime_from_reload(previous);
                 } else {
@@ -554,6 +555,7 @@ pub(super) fn replace_committed_profiles<const N: usize>(
                     row.idle_entered_at = idle_entered_at;
                     if matches!(commit, StatusCommit::Lifecycle) {
                         row.last_error = committed_error;
+                        row.last_error_evidence = committed_error_evidence;
                     }
                 }
                 row.last_accessed_at = row.last_accessed_at.max(previous.last_accessed_at);
@@ -1287,6 +1289,12 @@ fn merge_supplementary_cache(
         row.last_start_time = prior.last_start_time;
         if row.status == Status::Error {
             row.last_error = prior.last_error;
+            row.last_error_evidence = prior.last_error_evidence.filter(|evidence| {
+                evidence.generation
+                    == Some(crate::session::ErrorEvidenceGeneration::TerminalLifecycle(
+                        row.lifecycle_generation,
+                    ))
+            });
         }
         row.acp_load_session_capable = prior.acp_load_session_capable;
         row.plugin_revival_pending = prior.plugin_revival_pending;

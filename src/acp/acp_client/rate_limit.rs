@@ -11,7 +11,7 @@ pub(crate) fn classify_rate_limit_error(
 ) -> Option<RateLimitInfo> {
     let kind = err.data.as_ref()?.get("errorKind")?.as_str()?;
     (kind == "rate_limit").then(|| RateLimitInfo {
-        status: err.message.clone(),
+        status: super::errors::public_error_message(err),
         resets_at: captured_resets_at,
         kind: kind.to_string(),
     })

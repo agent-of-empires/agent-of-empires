@@ -1991,6 +1991,7 @@ fn admit_restart(
     row.idle_dormant_since = None;
     row.idle_entered_at = None;
     row.last_error = None;
+    row.last_error_evidence = None;
     row.last_error_check = None;
     row.status = Status::Starting;
     Ok(())
@@ -2716,6 +2717,7 @@ async fn prepare_agent_session_inner(
                 row.idle_dormant_since = None;
                 row.idle_entered_at = None;
                 row.last_error = None;
+                row.last_error_evidence = None;
                 if row.is_structured() {
                     row.status = Status::Idle;
                     row.release_lifecycle_reservation_if_owned(

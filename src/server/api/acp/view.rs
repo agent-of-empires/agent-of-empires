@@ -238,6 +238,7 @@ async fn commit_structured_view(
             slot.idle_dormant_since = None;
             slot.idle_entered_at = None;
             slot.last_error = None;
+            slot.last_error_evidence = None;
             slot.lifecycle_generation = generation;
             slot.acp_load_session_capable = None;
             Ok(slot.lifecycle_generation)

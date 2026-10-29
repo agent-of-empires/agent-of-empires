@@ -153,6 +153,81 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_prompt_errors_replay_without_rewriting_or_inventing_evidence() {
+        use crate::acp::state::test_support::{chunk, prompt, stopped};
+        use crate::acp::state::{AcpSessionId, AcpState, AgentName};
+        use crate::acp::transcript::{TranscriptModel, TranscriptRowKind};
+        let (_tmp, store) = open_store(1000);
+        for (id, json) in [
+            (
+                "missing",
+                r#"{"PromptRuntimeError":{"message":"request failed"}}"#,
+            ),
+            (
+                "null",
+                r#"{"PromptRuntimeError":{"message":"request failed","evidence":null}}"#,
+            ),
+        ] {
+            store
+                .record(
+                    id,
+                    1,
+                    &Event::AcpSessionAssigned {
+                        acp_session_id: "native-history".into(),
+                    },
+                )
+                .unwrap();
+            store.record(id, 2, &prompt("explicit request")).unwrap();
+            store
+                .record(id, 3, &chunk("partial output survives"))
+                .unwrap();
+            store.conn().execute(
+                "INSERT INTO acp_events (session_id, seq, event_json, created_at) VALUES (?1, 4, ?2, 0)",
+                rusqlite::params![id, json],
+            ).unwrap();
+            store.record(id, 5, &stopped("prompt_failed")).unwrap();
+            let replay = store.replay_page(id, 0, Some(10));
+            assert_eq!(replay.events.len(), 5);
+            assert!(matches!(
+                &replay.events[3].1,
+                Event::PromptRuntimeError { evidence: None, .. }
+            ));
+            let mut state =
+                AcpState::new(AcpSessionId(id.into()), AgentName("gemini".into()), None);
+            let mut transcript = TranscriptModel::new();
+            for (seq, event) in replay.events {
+                transcript.apply_event(seq, &event);
+                state.apply_event(seq, event).unwrap();
+            }
+            assert_eq!(state.sidebar_status(), crate::session::Status::Error);
+            assert!(!state.turn_active);
+            assert!(state.operation_error.is_none() && state.startup_error.is_none());
+            assert!(transcript
+                .rows()
+                .iter()
+                .any(|row| row.text == "partial output survives"));
+            assert!(transcript
+                .rows()
+                .iter()
+                .any(|row| row.kind == TranscriptRowKind::Notice
+                    && row.text.contains("request failed")));
+            assert!(!transcript
+                .rows()
+                .iter()
+                .any(|row| row.kind == TranscriptRowKind::EmptyOutput));
+            let retained: String = store
+                .conn()
+                .query_row(
+                    "SELECT event_json FROM acp_events WHERE session_id = ?1 AND seq = 4",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(retained, json);
+        }
+    }
+
+    #[test]
     fn forward_pages_reassemble_the_full_replay() {
         let (_tmp, store) = open_store(1000);
         record_from(&store, "s-1", 1, (1..=10).map(|_| Event::ThinkingStarted));

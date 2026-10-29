@@ -147,14 +147,13 @@ impl Session {
                             "session/cancel (no prompt in flight) notification failed; still emitting Stopped"
                         );
                     }
-                    // The UI thinks a turn is running but none is owned here;
-                    // a spurious Stopped while idle is a reducer no-op (#2237).
-                    self.stand_down_idle_completion();
-                    self.shared
-                        .emit(Event::Stopped {
-                            reason: "cancelled".into(),
-                        })
-                        .await;
+                    if self.stand_down_idle_completion() {
+                        self.shared
+                            .emit(Event::Stopped {
+                                reason: "cancelled".into(),
+                            })
+                            .await;
+                    }
                 }
                 Some(ClientCmd::ForceStop) => {
                     // The supervisor publishes the terminal here (#1100).
@@ -204,14 +203,14 @@ impl Session {
         Ok(())
     }
 
-    /// This path owns the turn's terminal, so the other idle-completion
-    /// paths must not add a duplicate (#2899).
-    fn stand_down_idle_completion(&self) {
-        self.shared.terminal_claim.claim();
+    /// Claim an idle terminal without overriding an already-completed turn.
+    fn stand_down_idle_completion(&self) -> bool {
+        let claimed = self.shared.terminal_claim.claim();
         self.shared
             .adopted_turn_active
             .store(false, Ordering::Relaxed);
         self.shared.between_prompt.deactivate();
+        claimed
     }
 
     /// Returns true when the turn ended on a rate limit: the connection must
@@ -275,7 +274,7 @@ impl Session {
         let label = self.shared.session_label.clone();
         let ingress = self.shared.ingress.clone();
         // No identity transition while an agent callback holds the fence.
-        let Ok(transition_guard) = tokio::time::timeout_at(deadline, ingress.fence.lock()).await
+        let Ok(transition_guard) = tokio::time::timeout_at(deadline, ingress.fence.write()).await
         else {
             let _ = respond_to.send(ResetSessionOutcome::Failed {
                 message: "reset deadline expired while agent callbacks were in flight".into(),
@@ -325,7 +324,7 @@ impl Session {
         .await;
         // A failed reset keeps the old session, so its buffered updates are
         // replayed onto it rather than dropped.
-        let commit_guard = ingress.fence.lock().await;
+        let commit_guard = ingress.fence.write().await;
         let retained_id = result
             .as_ref()
             .map(|resp| resp.session_id.clone())
@@ -350,6 +349,7 @@ impl Session {
                     new_id = %new_id.0,
                     "conversation reset: session/new succeeded, swapped acp_session_id"
                 );
+                self.shared.terminal_claim.clear_failed_outcome();
                 self.shared.emit(Event::SessionCleared).await;
                 self.shared
                     .emit(Event::SessionContextReset {
@@ -386,7 +386,13 @@ impl Session {
                  instead of creating a fresh one; restart the \
                  structured view worker to clear context"
                 .to_string(),
-            Err(ResetRequestError::Acp(e)) => format!("session/new failed: {e}"),
+            Err(ResetRequestError::Acp(e)) => {
+                warn!(target: "acp.protocol", error = ?e, "session/new request failed");
+                format!(
+                    "session/new failed: {}",
+                    super::super::errors::public_error_message(&e)
+                )
+            }
             Err(ResetRequestError::TimedOut) => {
                 "agent did not answer session/new before the reset deadline".to_string()
             }
@@ -395,6 +401,10 @@ impl Session {
         self.shared
             .emit(Event::PromptRuntimeError {
                 message: message.clone(),
+                evidence: Some(crate::session::OperationErrorEvidence::new(
+                    crate::session::ErrorEvidenceSource::LocalPromptResult,
+                    crate::session::ErrorOperation::ContextReset,
+                )),
             })
             .await;
         self.shared

@@ -1697,7 +1697,10 @@ impl SessionService {
                 || inst.is_archived()
                 || inst.is_snoozed()
                 || inst.is_trashed()
-                || inst.status != crate::session::Status::Idle
+                || !matches!(
+                    inst.status,
+                    crate::session::Status::Idle | crate::session::Status::Error
+                )
             {
                 return;
             }
@@ -1719,7 +1722,8 @@ impl SessionService {
         // `Status::Idle` above is a mirror the broadcast listener applies one serial task
         // behind every session's events, so it still reads Idle for as long as that task is
         // behind.
-        if self.fold_control_state(id).await.turn_active {
+        let control = self.fold_control_state(id).await;
+        if control.turn_active || control.sidebar_phase == crate::acp::state::SidebarPhase::Error {
             return;
         }
 

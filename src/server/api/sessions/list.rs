@@ -696,6 +696,7 @@ mod workspace_ordering_tests {
             last_accessed_at: None,
             idle_entered_at: None,
             last_error: None,
+            last_error_evidence: None,
             branch: branch.map(str::to_string),
             main_repo_path: None,
             base_branch: None,

@@ -2,7 +2,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
+import { applyEvent, emptyAcpState } from "../../../lib/acpTypes";
+import { reducer } from "../../../hooks/acpSession/reducer";
 import {
+  SessionBanners,
   ScheduledWakeupBanner,
   SnoozedWorkerStoppedBanner,
   StartupWaitLine,
@@ -13,6 +16,47 @@ import {
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
+});
+
+describe("operation and interaction error banners", () => {
+  it.each([
+    undefined,
+    null,
+    {
+      source: "local_prompt_result",
+      operation: "prompt",
+      runtime: "unknown",
+      observed_at_ms: 100,
+    },
+  ] as const)("reveals the retained operation failure after an interaction retry succeeds (%j)", (evidence) => {
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s",
+      seq: 1,
+      event: { PromptRuntimeError: { message: "canonical operation failure", evidence } },
+    });
+    state = reducer(state, {
+      kind: "error",
+      message: "approval HTTP request failed",
+      target: { kind: "approval", nonce: "pending-card" },
+    });
+    const props = {
+      sessionId: "s",
+      acpWorkerState: "running" as const,
+      startingAgent: null,
+      trashedAt: null,
+      archivedAt: null,
+      snoozedUntil: null,
+      dismissError: vi.fn(),
+    };
+    const { rerender } = render(<SessionBanners {...props} state={state} />);
+    expect(screen.getByText("approval HTTP request failed")).toBeTruthy();
+    expect(screen.queryByText("canonical operation failure")).toBeNull();
+    state = reducer(state, { kind: "approval_resolved_locally", nonce: "pending-card" });
+    rerender(<SessionBanners {...props} state={state} />);
+    expect(screen.getByText("canonical operation failure")).toBeTruthy();
+    expect(screen.queryByText("approval HTTP request failed")).toBeNull();
+    expect(state.lastErrorEvidence).toEqual(evidence ?? null);
+  });
 });
 
 describe("SnoozedWorkerStoppedBanner", () => {

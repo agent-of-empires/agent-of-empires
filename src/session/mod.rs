@@ -106,6 +106,10 @@ pub(crate) use instance::{
     ConversationState, LaunchReservation, ManagedResumeRefused, ResumeAttemptPolicy,
     ResumeLaunchOptions, TerminalContextResume,
 };
+pub use instance::{
+    ErrorBlockingScope, ErrorEvidenceGeneration, ErrorEvidenceSource, ErrorOperation, ErrorOrigin,
+    OperationErrorEvidence, RuntimeEvidence,
+};
 pub(crate) use instance::{Handoff, Held, Unserved};
 pub(crate) use instance::{
     TerminalHandoffContext, TerminalHandoffIntent, TerminalHandoffKey, TerminalHandoffStage,

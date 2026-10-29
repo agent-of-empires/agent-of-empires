@@ -157,9 +157,8 @@ impl BetweenPromptTracker {
         let mut state = self.state();
         let mut armed = false;
         if let Some(u) = between_prompt_signal_update(lifecycle, wakeup, now_ms, state.wake_at) {
-            if !state.active {
+            if !state.active && terminal_claim.begin_unowned_turn() {
                 state.active = true;
-                terminal_claim.begin_turn();
                 armed = true;
             }
             state.cost_seen = u.cost_seen;
@@ -488,6 +487,47 @@ mod tests {
             assert_eq!(between_prompt_stop_reason(false, true), "agent_idle");
             assert_eq!(between_prompt_stop_reason(true, true), "prompt_complete");
             assert_eq!(between_prompt_stop_reason(true, false), "reattach_idle");
+        }
+    }
+    #[test]
+    fn failed_main_outcome_fences_ambiguous_progress_but_keeps_background_bookkeeping() {
+        for explicit_prompt in [true, false] {
+            let tracker = BetweenPromptTracker::default();
+            let claim = TerminalClaim::new();
+            assert!(claim.claim_failed());
+            let failed_turn = claim.current_turn();
+            let tool = LifecycleSignal::ToolStarted {
+                id: "still-owned-background-tool".into(),
+                is_background_task: true,
+            };
+            assert!(!tracker.observe(Some(&tool), None, 1_000, false, &claim));
+            assert!(
+                tracker.work_state().tool_calls,
+                "native background work still flows"
+            );
+            assert!(!tracker.observe(Some(&LifecycleSignal::Progress), None, 2_000, false, &claim));
+            assert!(!tracker.observe(
+                Some(&LifecycleSignal::TerminalUsage),
+                None,
+                3_000,
+                false,
+                &claim
+            ));
+            assert_eq!(
+                tracker.take_idle_fire(10_000_000),
+                None,
+                "an already-failed operation cannot gain another synthetic terminal"
+            );
+            assert_eq!(claim.current_turn(), failed_turn);
+            if explicit_prompt {
+                claim.begin_turn();
+                tracker.reset_for_prompt();
+            } else {
+                claim.clear_failed_outcome();
+            }
+            assert!(!claim.failed());
+            assert!(tracker.observe(Some(&LifecycleSignal::Progress), None, 4_000, false, &claim));
+            assert!(claim.current_turn() > failed_turn);
         }
     }
 }

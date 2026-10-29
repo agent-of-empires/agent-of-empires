@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { reducer } from "../hooks/acpSession/reducer";
 
 import {
   appendElicitationAnswerRow,
@@ -436,5 +437,49 @@ describe("patchServerRow (Tier 4 delta Patch)", () => {
     expect(patched[0]!.text).toBe("Terminal");
     const appended = patchServerRow(existing, { id: "msg-9", kind: "message", text: "hi", at: "t" });
     expect(appended.map((r) => r.id)).toEqual(["start-a", "msg-9"]);
+  });
+});
+
+describe("operation failure evidence", () => {
+  it("keeps legacy provenance unknown and retains a failed turn without a startup failure", () => {
+    for (const evidence of [undefined, null] as const) {
+      let state = ev(emptyAcpState(), 1, { UserPromptSent: { text: "first", prompt_id: "p1" } });
+      state = ev(state, 2, { PromptRuntimeError: { message: "request failed", evidence } });
+      state = ev(state, 3, { Stopped: { reason: "prompt_failed" } });
+      expect(state.lastError).toBe("request failed");
+      expect(state.lastErrorEvidence).toBeNull();
+      expect(state.startupError).toBeNull();
+      expect(state.turnActive).toBe(false);
+      expect(state.workerStopped).toBe(false);
+    }
+  });
+
+  it("adopts typed metadata without duplicating the diagnostic and clears it on the next authoritative prompt", () => {
+    const evidence = {
+      source: "local_prompt_result",
+      operation: "prompt",
+      runtime: "unknown",
+      blocking_scope: "operation",
+      reported_code: -32603,
+      observed_at_ms: 100,
+      generation: { acp_worker: 7 },
+    } as const;
+    let state = ev(emptyAcpState(), 1, { PromptRuntimeError: { message: "request failed", evidence } });
+    state = ev(state, 2, { Stopped: { reason: "prompt_failed" } });
+    expect(state.lastErrorEvidence).toEqual(evidence);
+    state = applyReducedState(state, reducedState({ operation_error: evidence, turn_active: false }));
+    expect(state.lastError).toBe("request failed");
+    expect(state.lastErrorEvidence).toEqual(evidence);
+    state = ev(state, 3, { AcpSessionAssigned: { acp_session_id: "same-native-history" } });
+    expect(state.lastError).toBe("request failed");
+    expect(state.lastErrorEvidence).toEqual(evidence);
+    const retrying = reducer(state, { kind: "user_prompt", text: "second", id: "p2" });
+    expect(retrying.lastError).toBe("request failed");
+    expect(retrying.lastErrorEvidence).toEqual(evidence);
+    state = retrying;
+    state = ev(state, 4, { UserPromptSent: { text: "second", prompt_id: "p2" } });
+    expect(state.lastError).toBeNull();
+    expect(state.lastErrorEvidence).toBeNull();
+    expect(state.turnActive).toBe(true);
   });
 });
