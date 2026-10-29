@@ -22,6 +22,7 @@ import { useSidebarTriage } from "../hooks/useSidebarTriage";
 import { ProjectsSection } from "./ProjectsSection";
 import { FoldChevron, PlusIcon, StrokeIcon } from "./icons";
 import { usePersistedFlag } from "./usePersistedFlag";
+import { NAV_ITEM, ROWS, onSidebarArrowKey } from "./sidebar/keyboardNav";
 import { newDragClickGuard, useSuppressClickAfterDrag, type DragClickGuard } from "./sidebar/dnd";
 import {
   filterFlat,
@@ -39,6 +40,10 @@ import { TrashMenu } from "./sidebar/TrashMenu";
 import { useFacetFilter } from "./sidebar/useFacetFilter";
 import { useSidebarSelection } from "./sidebar/useSidebarSelection";
 import { useSidebarWidth } from "./sidebar/useSidebarWidth";
+
+/** Rows of the "Snoozed & archived" section. Outside `rowsId`'s "sidebar-rows-" namespace, so no Group,
+ *  whatever its name, can share it. */
+const SUNK_ROWS = "sidebar-sunk-rows";
 
 interface Props {
   observedById: Record<string, RuntimeCursor>;
@@ -324,9 +329,13 @@ export function WorkspaceSidebar(props: Props) {
             <div data-testid="sidebar-sunk-section">
               <button
                 onClick={toggleSunkExpanded}
+                onKeyDown={onSidebarArrowKey}
                 data-testid="sidebar-sunk-toggle"
                 aria-expanded={sunkExpanded}
-                className={`w-full flex items-center gap-2 py-1.5 text-[11px] font-mono uppercase text-text-muted hover:text-text-secondary hover:bg-surface-800/40 cursor-pointer transition-colors border-t border-surface-800/60 ${
+                // A header for the arrow keys like a Group's, so Left on one of its rows comes back here.
+                aria-controls={SUNK_ROWS}
+                {...{ [NAV_ITEM]: "" }}
+                className={`w-full flex items-center gap-2 py-1.5 text-[11px] font-mono uppercase text-text-muted hover:text-text-secondary hover:bg-surface-800/40 cursor-pointer transition-colors border-t border-surface-800/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500 ${
                   compact ? "px-2" : "px-3 tracking-widest"
                 }`}
               >
@@ -336,7 +345,9 @@ export function WorkspaceSidebar(props: Props) {
                 {/* The count and wide tracking do not fit the compact rail. */}
                 <span className="truncate">Snoozed &amp; archived{compact ? "" : ` (${sunk.length})`}</span>
               </button>
-              {sunkExpanded && sunk.map((v) => <SessionRow key={v.key} {...ctx.rowProps(v)} indented />)}
+              <div id={SUNK_ROWS} {...{ [ROWS]: "" }}>
+                {sunkExpanded && sunk.map((v) => <SessionRow key={v.key} {...ctx.rowProps(v)} indented />)}
+              </div>
             </div>
           )}
 

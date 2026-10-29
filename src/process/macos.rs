@@ -357,7 +357,8 @@ impl ProcessHandle {
             .context("incarnation-bound signalling unavailable on this macOS version")?;
         let mut token = self.0;
         let result = unsafe { function(&mut token, signal) };
-        if result != 0 && result != libc::ESRCH {
+        // The kernel reports EPERM when the target starts exiting during the call.
+        if result != 0 && result != libc::ESRCH && !(result == libc::EPERM && self.exited()?) {
             return Err(std::io::Error::from_raw_os_error(result))
                 .context("signalling owned audit token");
         }
