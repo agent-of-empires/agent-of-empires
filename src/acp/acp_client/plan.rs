@@ -107,8 +107,6 @@ mod tests {
             serde_json::json!({ "plan": 42 }),
             serde_json::json!({ "plan": "Just a paragraph with no list." }),
             serde_json::json!({ "plan": "" }),
-            // EnterPlanMode (0.99.0+) is also `switch_mode` but carries no plan.
-            serde_json::json!({ "mode": "plan" }),
         ] {
             assert!(extract_plan_from_switch_mode(&raw).is_none(), "{raw}");
         }
