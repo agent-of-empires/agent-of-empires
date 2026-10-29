@@ -81,7 +81,7 @@ pub async fn run(profile: &str, command: GroupCommands) -> Result<()> {
     }
 }
 
-async fn daemon_client() -> Result<(DaemonClient, String)> {
+pub(super) async fn daemon_client() -> Result<(DaemonClient, String)> {
     let client = require_daemon().await?.daemon_client()?;
     let info = client.runtime_info().await?;
     anyhow::ensure!(
