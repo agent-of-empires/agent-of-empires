@@ -44,6 +44,8 @@ export interface AcpContext {
   state: AcpState;
   status: Session["status"];
   hasEverOpened: boolean;
+  /** A replay delivered events while the socket was down. */
+  replayedWhileDown: boolean;
   /** The auto-reconnect backoff is armed between a close and the next dial. */
   reconnecting: boolean;
   retryCount: number;
@@ -226,6 +228,7 @@ export function AcpRuntime({
         state: acp.state,
         status: acp.status,
         hasEverOpened: acp.hasEverOpened,
+        replayedWhileDown: acp.replayedWhileDown,
         reconnecting: acp.reconnecting,
         retryCount: acp.retryCount,
         retryCountdown: acp.retryCountdown,

@@ -2,7 +2,16 @@
 
 import type { Page } from "@playwright/test";
 import { test, expect } from "./helpers/mockedTest";
-import { launch, mockWizardApis, openPanel, openWizard, sessionStub, startWizard, wizard } from "./helpers/wizard";
+import {
+  CLAUDE_AGENT,
+  launch,
+  mockWizardApis,
+  openPanel,
+  openWizard,
+  sessionStub,
+  startWizard,
+  wizard,
+} from "./helpers/wizard";
 
 const option = (page: Page, text: string) => page.getByRole("option").filter({ hasText: text });
 
@@ -75,6 +84,21 @@ test.describe("project tabs", () => {
   });
 });
 
+test.describe("project new session", () => {
+  test("a project with no sessions opens on the profile default agent (#5008)", async ({ page }) => {
+    const vibe = { ...CLAUDE_AGENT, name: "vibe", binary: "vibe" };
+    await startWizard(page, {
+      sessions: [],
+      projects: [{ name: "example", path: "/work/example", scope: "global", pinned: false }],
+      agents: [CLAUDE_AGENT, vibe],
+      settings: { session: { default_tool: "vibe" } },
+      project: false,
+    });
+    await page.getByRole("button", { name: "New session in example" }).click();
+    await expect(wizard(page).getByTestId("wizard-agent-row")).toContainText("vibe");
+  });
+});
+
 test.describe("extra repos", () => {
   async function openPicker(page: Page) {
     await startWizard(page, {
@@ -93,7 +117,7 @@ test.describe("extra repos", () => {
 
   test("saved projects render without the primary and toggle as chips", async ({ page }) => {
     const { picker, chip } = await openPicker(page);
-    await expect(picker.getByText("Saved projects")).toBeVisible();
+    await expect(picker.getByText("Projects", { exact: true })).toBeVisible();
     await expect(chip("primary")).toHaveCount(0);
     await expect(chip("docs")).toBeVisible();
     await chip("shared-lib").first().click();

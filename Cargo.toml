@@ -105,7 +105,10 @@ tokio-util = { version = "0.7", features = ["codec", "compat", "io-util"] }
 # Unicode width + normalization (NFKD used to fold accents in title-derived branch names)
 unicode-normalization = "0.1"
 unicode-segmentation = "1"
-unicode-width = "0.2"
+# 0.2.3 widens U+FF9E/U+FF9F to one cell, which ratatui-core 0.1.2's `CellWidth`
+# already adds, so every halfwidth dakuten counts twice. Lift once ratatui-core
+# stops compensating.
+unicode-width = "=0.2.2"
 
 # Terminal spinners
 rattles = "0.3"
@@ -195,7 +198,7 @@ schemars = { version = "1", features = ["chrono04"] }
 # Unix-only: O_NOFOLLOW for capability-safe filesystem operations.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-nix = { version = "0.31", features = ["signal", "process", "net", "fs", "resource", "dir", "user", "poll"] }
+nix = { version = "0.31", features = ["signal", "process", "net", "fs", "resource", "dir", "user", "poll", "hostname"] }
 
 [features]
 # The daemon (REST/WS API, auth, Web Push, ACP, structured view) is core: a
@@ -231,6 +234,8 @@ typescript = ["dep:ts-rs"]
 [dev-dependencies]
 serial_test = "4.0"
 jsonschema = { version = "0.59.0", default-features = false }
+syn = { version = "3.0", features = ["full", "visit"] }
+proc-macro2 = { version = "1.0", features = ["span-locations"] }
 # Test-only tokio clock control (`start_paused`), so the token-rotation
 # loop's grace deadline can be asserted without sleeping through it.
 # `cargo build` and released binaries never enable `test-util`.

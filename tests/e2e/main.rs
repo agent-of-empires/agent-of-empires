@@ -43,6 +43,7 @@ mod live_send_paste_e2e;
 mod live_takeover;
 mod live_terminal_swap_e2e;
 mod logs;
+mod mcp_config;
 mod new_session;
 mod opencode_preassign_no_runtime_panic;
 mod opencode_store_fork;

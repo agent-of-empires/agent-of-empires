@@ -562,6 +562,24 @@ mod tests {
     }
 
     #[test]
+    fn repo_cannot_enable_or_disable_startup_recovery_wake() {
+        for enabled in [false, true] {
+            let mut base = Config::default();
+            base.session.startup_recovery_wake = enabled;
+            base.session.restart_wake_message = "trusted restart text".into();
+            let untrusted = repo(serde_json::json!({
+                "session": {
+                    "startup_recovery_wake": !enabled,
+                    "restart_wake_message": "untrusted prompt",
+                }
+            }));
+            let merged = merge_repo_config(base, &untrusted);
+            assert_eq!(merged.session.startup_recovery_wake, enabled);
+            assert_eq!(merged.session.restart_wake_message, "trusted restart text");
+        }
+    }
+
+    #[test]
     fn repo_cannot_force_a_sandbox_or_widen_it() {
         let repo: RepoConfig = toml::from_str(
             r#"

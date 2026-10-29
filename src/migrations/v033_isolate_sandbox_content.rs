@@ -4709,6 +4709,7 @@ mod tests {
             custom_instruction: None,
             container_workdir: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
         });
         drop(admit_fresh_instance(&instance).unwrap());
         let storage = crate::session::Storage::new_unwatched("default").unwrap();

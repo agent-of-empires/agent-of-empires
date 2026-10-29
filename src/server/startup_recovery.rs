@@ -763,6 +763,77 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn recovery_refuses_structured_rows_without_mutation_or_launch() {
+        use crate::session::{Instance, Status, View};
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .unwrap();
+        let project = tempfile::tempdir().unwrap();
+        for status in [
+            Status::Running,
+            Status::Idle,
+            Status::Waiting,
+            Status::Stopped,
+        ] {
+            let mut row = Instance::new("structured recovery", project.path().to_str().unwrap());
+            row.source_profile = "test".into();
+            row.view = View::Structured;
+            row.status = status;
+            row.agent_session_id = Some(uuid::Uuid::new_v4().to_string());
+            test_support::seed_instances_on_disk_for_test("test", vec![row.clone()]);
+            let disk_before =
+                serde_json::to_value(test_support::load_instances_from_disk_for_test("test"))
+                    .unwrap();
+            let (launcher, launches) = test_support::counting_failing_launcher();
+            let state =
+                test_support::build_test_app_state_with_launcher(vec![row.clone()], launcher);
+            test_support::refresh_canonical_metadata_for_test(&state).await;
+            let before = serde_json::to_value(&*state.instances.read().await).unwrap();
+            let mut updates = state.status_tx.subscribe();
+            let response = crate::server::api::sessions::recovery_restart(
+                state.clone(),
+                row.id.clone(),
+                row.lifecycle_generation,
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::CONFLICT,
+                "{status:?}"
+            );
+            assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(updates.try_recv().is_err());
+            assert_eq!(
+                serde_json::to_value(&*state.instances.read().await).unwrap(),
+                before
+            );
+            assert_eq!(
+                serde_json::to_value(test_support::load_instances_from_disk_for_test("test"))
+                    .unwrap(),
+                disk_before
+            );
+            if status == Status::Running {
+                let _response = crate::server::api::sessions::restart_session(
+                    axum::extract::State(state),
+                    axum::extract::Path(row.id),
+                    Ok(Some(axum::Json(
+                        crate::daemon::RestartSessionBody::default(),
+                    ))),
+                )
+                .await;
+                assert_eq!(
+                    launches.load(std::sync::atomic::Ordering::SeqCst),
+                    1,
+                    "explicit restart still reaches the launcher"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn recovery_refuses_shelved_rows_after_the_candidate_snapshot() {
         use crate::session::{Instance, Status, View};
         let _home = crate::session::test_support::isolate_app_dir();

@@ -68,6 +68,9 @@ pub struct CreateSessionBody {
     pub sandbox_image: Option<String>,
     #[serde(default)]
     pub extra_env: Vec<String>,
+    /// Host-only env for `host_hooks.before_start`; never enters the container. Sandbox only.
+    #[serde(default)]
+    pub hook_env: Vec<String>,
     #[serde(default)]
     pub extra_repo_paths: Vec<String>,
     /// Repository names or paths override the shared base_branch.
@@ -502,6 +505,10 @@ pub enum TrashRelocationOutcome {
     Failed {
         reason: String,
     },
+    /// The session is trashed but its tmux sessions may still be running.
+    TeardownFailed {
+        reason: String,
+    },
 }
 
 fn default_kill_pane() -> bool {
@@ -534,6 +541,9 @@ pub struct DeleteSessionBody {
     /// Resolve resource cleanup policy on the daemon from the reserved row.
     #[serde(default)]
     pub use_cleanup_defaults: bool,
+    /// Resolve cleanup on the daemon from the reserved row, keeping this caller intent.
+    #[serde(default)]
+    pub cleanup_intent: Option<crate::session::deletion::CleanupIntent>,
     /// Consent is bound to the trash lifecycle selected by the client.
     #[serde(default)]
     pub expected_trashed_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -1079,6 +1089,10 @@ pub struct SessionResponse {
     /// sessions, or structured ones whose worker has not minted an id yet).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acp_session_id: Option<String>,
+    /// An imported session whose history arrives only once its agent loads it,
+    /// so `acp_session_id` is set before the session has ever run here.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub import_pending: bool,
     /// The session's resolved ACP registry key (`agent_name` when set, else
     /// `tool`), matching the `name` entries `/api/acp/agents` returns. The
     /// structured view's switch-agent modal reads this as the current-agent
@@ -1099,6 +1113,10 @@ pub struct SessionResponse {
     /// non-forkable agents.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub acp_can_fork: bool,
+    /// `acp.structured_view = off` for this session's profile and project: a
+    /// terminal session may not switch into the structured view.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub structured_view_off: bool,
     /// Whether switching this session between terminal and structured view
     /// preserves the conversation (only claude pairings share one
     /// CLI-resumable transcript). Server-owned via

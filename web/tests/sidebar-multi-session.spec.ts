@@ -233,13 +233,15 @@ test.describe("Sidebar multi-session (#956)", () => {
     await expect(projectHeader).toBeVisible();
 
     // The appearance menu opens from the keyboard too.
-    await projectHeader.focus();
+    await projectHeader.locator("button[aria-expanded]").focus();
     await page.keyboard.press("Shift+F10");
     const menu = page.locator("[data-testid='sidebar-group-context-menu']");
     await expect(menu).toBeVisible();
     await menu.locator("[data-testid='sidebar-group-context-menu-rename']").click();
 
     const input = page.locator("[data-testid='sidebar-group-rename-input']");
+    // Rename sends focus to its input rather than back to the header button.
+    await expect(input).toBeFocused();
     await input.fill("Client Alpha");
     await input.press("Enter");
     await expect(projectHeader.getByText("Client Alpha")).toBeVisible();
