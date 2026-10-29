@@ -1746,7 +1746,7 @@ fn tui_launch_isolates_daemon_endpoint_from_the_tmux_server() {
         ("AOE_DAEMON_URL", "http://127.0.0.1:2"),
         ("AOE_DAEMON_TOKEN", "explicit-token"),
     ];
-    // (server started with hostile values, set_env, what the main and peer panes see)
+    // (server started with hostile values, set_env, what every pane sees)
     let cases = [
         (true, None, "unset unset"),
         (true, Some(EXPLICIT), "http://127.0.0.1:2 explicit-token"),
@@ -1754,22 +1754,6 @@ fn tui_launch_isolates_daemon_endpoint_from_the_tmux_server() {
     ];
     for (hostile, explicit, expected) in cases {
         let mut harness = TuiTestHarness::new("daemon_env_policy");
-        // The first client fixes the server's environment.
-        if hostile {
-            let mut tmux = harness.tmux();
-            tmux.env("HOME", harness.home_path())
-                .env("XDG_CONFIG_HOME", harness.home_path().join(".config"))
-                .env("PATH", harness.env_path())
-                .envs(HOSTILE);
-            for (key, value) in &harness.extra_env {
-                tmux.env(key, value);
-            }
-            let output = tmux
-                .args(["new-session", "-d", "-s", "server", "sleep 600"])
-                .output()
-                .expect("start harness tmux server");
-            assert!(output.status.success(), "{output:?}");
-        }
         for (key, value) in explicit.into_iter().flatten() {
             harness.set_env(key, value);
         }
@@ -1787,13 +1771,37 @@ fn tui_launch_isolates_daemon_endpoint_from_the_tmux_server() {
             ),
         );
         harness.binary_path = probe;
+        // The first client fixes the server's environment, and its own pane
+        // is the fresh-server launch.
+        let mut panes = 2;
+        if hostile {
+            panes += 1;
+            let mut tmux = harness.tmux();
+            tmux.env("HOME", harness.home_path())
+                .env("XDG_CONFIG_HOME", harness.home_path().join(".config"))
+                .env("PATH", harness.env_path())
+                .envs(HOSTILE);
+            for (key, value) in &harness.extra_env {
+                tmux.env(key, value);
+            }
+            let output = tmux
+                .args(["new-session", "-d", "-s", "server"])
+                .arg(format!(
+                    "env {} {}",
+                    harness.pane_env_policy(),
+                    harness.binary_path.display()
+                ))
+                .output()
+                .expect("start harness tmux server");
+            assert!(output.status.success(), "{output:?}");
+        }
         harness.spawn_tui();
         harness.spawn_peer_tui("peer");
 
         let lines = wait_until(Duration::from_secs(10), Duration::from_millis(50), || {
             let text = std::fs::read_to_string(&report).map_err(|e| e.to_string())?;
             let lines: Vec<String> = text.lines().map(str::to_owned).collect();
-            if lines.len() == 2 {
+            if lines.len() == panes {
                 Ok(lines)
             } else {
                 Err(format!("reports so far: {lines:?}"))
@@ -1801,7 +1809,7 @@ fn tui_launch_isolates_daemon_endpoint_from_the_tmux_server() {
         });
         assert_eq!(
             lines,
-            [expected, expected],
+            vec![expected; panes],
             "server hostile {hostile}, set_env {explicit:?}"
         );
     }
