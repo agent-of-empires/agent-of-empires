@@ -275,22 +275,30 @@ impl TunnelHandle {
                      Or pass --no-tailscale to use Cloudflare instead."
                 ));
             }
-            res = tokio::time::timeout(STEP_TIMEOUT, child.wait()) => {
-                res
-                    .map_err(|_| {
-                        anyhow::anyhow!(
-                            "tailscale funnel timed out after {}s; your node may not have \
-                             HTTPS certs enabled or Funnel may not be enabled in your tailnet \
-                             ACL. Run `AGENT_OF_EMPIRES_DEBUG=1 aoe serve --remote` and \
-                             check debug.log for the live output, or try \
-                             `tailscale funnel --bg --yes {}` manually, or pass \
-                             --no-tailscale to skip.",
-                            STEP_TIMEOUT.as_secs(),
-                            local_port
-                        )
-                    })?
-                    .map_err(|e| anyhow::anyhow!("failed to wait on tailscale funnel: {}", e))?
-            }
+            // `--bg` may have applied the config before it failed, so these exits go through
+            // `fail()` too, and the error says what was left on.
+            res = tokio::time::timeout(STEP_TIMEOUT, child.wait()) => match res {
+                Ok(Ok(status)) => status,
+                Ok(Err(e)) => {
+                    let e = anyhow::anyhow!("failed to wait on tailscale funnel: {e}");
+                    return Err(guard.fail(e).await);
+                }
+                Err(_) => {
+                    // Stop it first, so it can't change :443 while the reset reads it.
+                    let _ = child.kill().await;
+                    let e = anyhow::anyhow!(
+                        "tailscale funnel timed out after {}s; your node may not have \
+                         HTTPS certs enabled or Funnel may not be enabled in your tailnet \
+                         ACL. Run `AGENT_OF_EMPIRES_DEBUG=1 aoe serve --remote` and \
+                         check debug.log for the live output, or try \
+                         `tailscale funnel --bg --yes {}` manually, or pass \
+                         --no-tailscale to skip.",
+                        STEP_TIMEOUT.as_secs(),
+                        local_port
+                    );
+                    return Err(guard.fail(e).await);
+                }
+            },
         };
 
         info!(
@@ -299,13 +307,14 @@ impl TunnelHandle {
             if status.success() { "ok" } else { "error" }
         );
         if !status.success() {
-            anyhow::bail!(
+            let e = anyhow::anyhow!(
                 "tailscale funnel exited with status {:?}. Confirm Funnel is enabled \
                  in your tailnet ACL (https://login.tailscale.com/admin/acls/file) \
                  and HTTPS is enabled on the node. Run with \
                  AGENT_OF_EMPIRES_DEBUG=1 to see the full stderr stream.",
                 status.code()
             );
+            return Err(guard.fail(e).await);
         }
 
         // Read the stable funnel URL from `tailscale status`.
@@ -1390,6 +1399,20 @@ esac
                     true,
                     1,
                     false,
+                    "",
+                )
+            },
+            // ... and when that `off` fails too, the error says how to finish it.
+            Row {
+                bg_exit: "exit 1",
+                off_body: "exit 1",
+                ..row(
+                    Some("{}"),
+                    "exit 1",
+                    Some("run `tailscale funnel --https=443 off`"),
+                    true,
+                    1,
+                    true,
                     "",
                 )
             },
