@@ -653,6 +653,7 @@ enter to select · esc to cancel"],
                 "file saved successfully",
                 "The approved plan remains:",
                 "the config will allow overrides",
+                "No permission required to run the tests.",
             ],
         );
         assert_all(

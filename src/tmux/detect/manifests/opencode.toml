@@ -19,7 +19,16 @@ state = "waiting"
 priority = 950
 region = "whole_recent"
 visible = true
-contains_any = ["(y/n)", "[y/n]", "permission required", "allow once", "allow always", "continue?", "proceed?", "enter to select", "esc to cancel"]
+contains_any = ["(y/n)", "[y/n]", "continue?", "proceed?", "enter to select", "esc to cancel"]
+
+# The permission dialog's option row, which prose does not reproduce.
+[[rules]]
+id = "permission_dialog"
+state = "waiting"
+priority = 955
+region = "whole_recent"
+visible = true
+line_regex = ['(?i)allow once\s+allow always']
 
 # A numbered menu row carrying the selection cursor.
 [[rules]]
