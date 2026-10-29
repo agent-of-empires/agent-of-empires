@@ -166,11 +166,152 @@ pub fn fixed_width(text: &str, max_width: usize) -> String {
     format!("{text}{}", " ".repeat(pad))
 }
 
+/// Rows ratatui word-wraps a styled line into at `width` columns. This is a
+/// faithful port of ratatui's `WordWrapper` with `trim: true` (the wrapping a
+/// `Paragraph::wrap(Wrap { trim: true })` applies), counting emitted lines
+/// instead of collecting them. Porting it keeps the dialog's scroll math in
+/// lock-step with the renderer, including the wide-grapheme and CJK cases that
+/// a greedy word-width model would get wrong.
+pub(crate) fn wrapped_line_count(line: &ratatui::text::Line, width: u16) -> usize {
+    use std::collections::VecDeque;
+    use unicode_segmentation::UnicodeSegmentation;
+
+    let max = width.max(1) as usize;
+    let mut lines = 0usize;
+    let mut pending_line_width = 0usize;
+    let mut word_width = 0usize;
+    let mut whitespace_width = 0usize;
+    let mut pending_whitespace: VecDeque<usize> = VecDeque::new();
+    let mut non_whitespace_previous = false;
+
+    for grapheme in line
+        .spans
+        .iter()
+        .flat_map(|span| span.content.graphemes(true))
+    {
+        let symbol_width = rendered_width(grapheme);
+        // Graphemes wider than the line are not painted (ratatui drops them).
+        if symbol_width > max {
+            continue;
+        }
+        let is_whitespace = grapheme.chars().all(char::is_whitespace);
+        let word_found = non_whitespace_previous && is_whitespace;
+        // Current word would overflow after removing whitespace.
+        let trimmed_overflow = pending_line_width == 0 && word_width + symbol_width > max;
+        // Separated whitespace would overflow on its own.
+        let whitespace_overflow = pending_line_width == 0 && whitespace_width + symbol_width > max;
+
+        if word_found || trimmed_overflow || whitespace_overflow {
+            if pending_line_width > 0 {
+                pending_line_width += whitespace_width;
+            }
+            pending_line_width += word_width;
+            whitespace_width = 0;
+            word_width = 0;
+            pending_whitespace.clear();
+        }
+
+        let line_full = pending_line_width >= max;
+        let pending_word_overflow =
+            symbol_width > 0 && pending_line_width + whitespace_width + word_width >= max;
+
+        if line_full || pending_word_overflow {
+            lines += 1;
+            pending_line_width = 0;
+            // Drop leading whitespace up to the end of the line.
+            let mut remaining = max;
+            while let Some(&width) = pending_whitespace.front() {
+                if width > remaining {
+                    break;
+                }
+                whitespace_width -= width;
+                remaining -= width;
+                pending_whitespace.pop_front();
+            }
+            if is_whitespace && pending_whitespace.is_empty() {
+                continue;
+            }
+        }
+
+        if is_whitespace {
+            whitespace_width += symbol_width;
+            pending_whitespace.push_back(symbol_width);
+        } else {
+            word_width += symbol_width;
+        }
+        non_whitespace_previous = !is_whitespace;
+    }
+
+    // Append the remaining text parts (trim drops a lone trailing run).
+    if pending_line_width == 0 && word_width == 0 && !pending_whitespace.is_empty() {
+        lines += 1;
+    }
+    if pending_line_width > 0 {
+        pending_line_width += whitespace_width;
+    }
+    pending_line_width += word_width;
+    if pending_line_width > 0 {
+        lines += 1;
+    }
+    lines.max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         fixed_width, line_columns, prefix_within_width, rendered_width, truncate_to_width,
+        wrapped_line_count,
     };
+
+    #[test]
+    fn wrapped_line_count_matches_the_rendered_paragraph_rows() {
+        use ratatui::{
+            backend::TestBackend,
+            text::{Line, Span},
+            widgets::{Paragraph, Wrap},
+            Terminal,
+        };
+
+        let cases = [
+            (Line::from("one two three"), 7, 2),
+            (Line::from("abcdefghij"), 4, 3),
+            (
+                Line::from(vec![Span::raw("one "), Span::raw("two three")]),
+                7,
+                2,
+            ),
+            // Wide CJK: each char is its own word, so a word wider than the
+            // line overflows rather than wrapping mid-character.
+            (Line::from("日本語 日本語"), 5, 2),
+        ];
+        for (line, width, expected) in cases {
+            assert_eq!(wrapped_line_count(&line, width), expected, "{line:?}");
+
+            let mut terminal = Terminal::new(TestBackend::new(width, 16)).unwrap();
+            terminal
+                .draw(|frame| {
+                    frame.render_widget(
+                        Paragraph::new(vec![line.clone()]).wrap(Wrap { trim: true }),
+                        frame.area(),
+                    );
+                })
+                .unwrap();
+            let rendered_rows = terminal
+                .backend()
+                .buffer()
+                .content()
+                .chunks(width as usize)
+                .filter(|row| row.iter().any(|cell| cell.symbol() != " "))
+                .count();
+            assert_eq!(rendered_rows, expected, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn wrapped_line_count_keeps_an_empty_line() {
+        use ratatui::text::Line;
+        assert_eq!(wrapped_line_count(&Line::raw(""), 10), 1);
+    }
 
     /// A wide grapheme occupies two columns and its continuation cell is reset
     /// by the renderer. Reading that back out of a buffer yields a phantom

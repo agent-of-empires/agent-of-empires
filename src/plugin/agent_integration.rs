@@ -89,6 +89,7 @@ fn unique_candidates<'a, 'b, 'c>(
         .collect()
 }
 
+/// Catalog unique plugin launch commands after built-in and custom agents take precedence.
 pub fn catalog<'a, 'b, 'c>(
     registry: &'a super::PluginRegistry,
     builtin_names: impl IntoIterator<Item = &'b str>,

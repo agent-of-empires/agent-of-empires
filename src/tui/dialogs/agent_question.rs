@@ -7,7 +7,7 @@ use ratatui::{
 use tui_input::{backend::crossterm::EventHandler, Input};
 
 use super::{dialog_block, render_dialog_frame, DialogResult};
-use crate::tui::components::text::rendered_width;
+use crate::tui::components::text::wrapped_line_count;
 use crate::tui::styles::Theme;
 
 /// Answer editor for a provider-native choice prompt.
@@ -22,6 +22,7 @@ pub struct AgentQuestionDialog {
     scroll_max: Vec<usize>,
     page_rows: usize,
     follow_focus: bool,
+    focus_visible: bool,
 }
 
 impl AgentQuestionDialog {
@@ -55,6 +56,7 @@ impl AgentQuestionDialog {
             scroll_max: vec![0; question_count],
             page_rows: 1,
             follow_focus: true,
+            focus_visible: true,
         }
     }
 
@@ -90,6 +92,12 @@ impl AgentQuestionDialog {
                     return DialogResult::Continue;
                 }
             }
+        }
+        if !self.focus_visible
+            && !current.options.is_empty()
+            && matches!(key.code, KeyCode::Char(' ') | KeyCode::Enter)
+        {
+            return DialogResult::Continue;
         }
         match key.code {
             KeyCode::Esc => DialogResult::Cancel,
@@ -308,18 +316,25 @@ impl AgentQuestionDialog {
         self.page_rows = visible_height.saturating_sub(1).max(1);
         let max_scroll = total_rows.saturating_sub(visible_height);
         self.scroll_max[self.question] = max_scroll;
+        let focus_start = row_starts[focus_line];
+        let focus_end = row_starts[focus_line + 1];
         let mut scroll = self.scroll_offsets[self.question].min(max_scroll);
         if visible_height > 0 && self.follow_focus {
-            let focus_start = row_starts[focus_line];
-            let focus_end = row_starts[focus_line + 1];
             if focus_start < scroll {
                 scroll = focus_start;
             }
             if focus_end > scroll.saturating_add(visible_height) {
-                scroll = focus_end.saturating_sub(visible_height);
+                scroll = if focus_end - focus_start > visible_height {
+                    focus_start
+                } else {
+                    focus_end.saturating_sub(visible_height)
+                };
             }
         }
         self.scroll_offsets[self.question] = scroll;
+        self.focus_visible = visible_height > 0
+            && focus_start >= scroll
+            && focus_start < scroll.saturating_add(visible_height);
         self.follow_focus = false;
 
         if visible_height > 0 {
@@ -351,61 +366,6 @@ impl AgentQuestionDialog {
             .style(Style::default().fg(theme.dimmed)),
             footer,
         );
-    }
-}
-
-fn wrapped_line_count(line: &Line<'_>, width: u16) -> usize {
-    use unicode_segmentation::UnicodeSegmentation;
-
-    let width = width.max(1) as usize;
-    let mut rows = 1;
-    let mut used = 0;
-    let mut spaces = 0;
-    let mut word = 0;
-    for grapheme in line
-        .spans
-        .iter()
-        .flat_map(|span| span.content.graphemes(true))
-    {
-        let cells = rendered_width(grapheme);
-        if cells > width {
-            continue;
-        }
-        if grapheme.chars().all(char::is_whitespace) {
-            if word > 0 {
-                add_wrapped_word(word, spaces, width, &mut rows, &mut used);
-                word = 0;
-                spaces = 0;
-            }
-            spaces += cells;
-        } else {
-            word += cells;
-        }
-    }
-    add_wrapped_word(word, spaces, width, &mut rows, &mut used);
-    rows
-}
-
-fn add_wrapped_word(word: usize, spaces: usize, width: usize, rows: &mut usize, used: &mut usize) {
-    if word == 0 {
-        return;
-    }
-    if *used > 0 {
-        if *used + spaces + word > width {
-            *rows += 1;
-            *used = 0;
-        } else {
-            *used += spaces;
-        }
-    }
-    if word > width {
-        if *used > 0 {
-            *rows += 1;
-        }
-        *rows += (word - 1) / width;
-        *used = (word - 1) % width + 1;
-    } else {
-        *used += word;
     }
 }
 
@@ -630,5 +590,76 @@ mod tests {
         let custom = format!("{}custom-answer-tail", "custom answer ".repeat(20));
         dialog.handle_paste(&custom);
         assert!(render(&mut dialog).contains("custom-answer-tail"));
+    }
+    #[test]
+    fn selection_requires_the_focused_option_to_be_visible() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let options = (0..24)
+            .map(|index| AgentIntegrationOption {
+                label: format!("option-{index:02}"),
+                description: None,
+            })
+            .collect::<Vec<_>>();
+        let prompt = |multi| AgentIntegrationPrompt::Question {
+            id: "prompt".into(),
+            title: "Configure".into(),
+            questions: vec![AgentIntegrationQuestion {
+                id: "question".into(),
+                question: "Choose an option".into(),
+                options: options.clone(),
+                multi,
+                recommended: (!multi).then_some(0),
+            }],
+        };
+        let key = |code| KeyEvent::new(code, crossterm::event::KeyModifiers::NONE);
+        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        let render = |dialog: &mut AgentQuestionDialog| {
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            terminal
+                .draw(|frame| dialog.render(frame, frame.area(), &theme))
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+
+        for multi in [false, true] {
+            let mut dialog = AgentQuestionDialog::new(prompt(multi));
+            render(&mut dialog);
+            dialog.handle_key(key(KeyCode::PageDown));
+            render(&mut dialog);
+            dialog.handle_key(key(KeyCode::PageDown));
+            let scrolled = render(&mut dialog);
+            assert!(!scrolled.contains("option-00"));
+
+            // Enter/Space on a hidden focus must not act on the off-screen
+            // option: it snaps the view back and does nothing this press.
+            let selection_key = if multi {
+                KeyCode::Char(' ')
+            } else {
+                KeyCode::Enter
+            };
+            assert!(matches!(
+                dialog.handle_key(key(selection_key)),
+                DialogResult::Continue
+            ));
+            assert!(render(&mut dialog).contains("option-00"));
+
+            if multi {
+                // The focused option is on screen now; a fresh Space selects it.
+                dialog.handle_key(key(KeyCode::Char(' ')));
+            }
+            assert!(matches!(
+                dialog.handle_key(key(KeyCode::Enter)),
+                DialogResult::Submit(answers)
+                    if answers[0].selected_options == ["option-00"]
+            ));
+        }
     }
 }
