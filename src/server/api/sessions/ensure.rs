@@ -390,7 +390,7 @@ pub(super) async fn prepared_agent_target_response(
         "profile": target.profile,
         "tmux_session": target.tmux_session,
         "physical": target.physical,
-        "status": if outcome.is_some() { "created" } else { "alive" },
+        "status": if outcome.is_some() { "restarted" } else { "alive" },
     });
     if let Some(outcome) = outcome {
         body["resume_outcome"] = match outcome {

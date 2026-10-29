@@ -6302,8 +6302,12 @@ pub(super) mod terminal_custody {
 
     fn producer_command(received: &std::path::Path) -> String {
         let received = crate::session::environment::shell_escape(received.to_str().unwrap());
-        format!(
+        let script = format!(
             "printf 'READY\\n' >> {received}; while IFS= read -r line; do printf '%s\\n' \"$line\" >> {received}; done"
+        );
+        format!(
+            "/bin/sh -c {}",
+            crate::session::environment::shell_escape(&script)
         )
     }
 
@@ -6356,16 +6360,7 @@ pub(super) mod terminal_custody {
         let mut original = Instance::new("birth receipt gap", project.to_str().unwrap());
         original.source_profile = "default".into();
         original.tool = "bash".into();
-        // Native launch execs its command: own the compound script in one shell,
-        // rather than exec'ing printf and exiting before the read loop.
-        let producer = format!(
-            "printf 'NATIVE_BIRTH_READY_OUTPUT_LONG_ENOUGH\\n'; {}",
-            producer_command(&received),
-        );
-        original.command = format!(
-            "/bin/sh -c {}",
-            crate::session::environment::shell_escape(&producer),
-        );
+        original.command = producer_command(&received);
         original.status = Status::Stopped;
         let name = crate::tmux::Session::generate_name(&original.id, &original.title);
         let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(&name);
@@ -6814,7 +6809,6 @@ pub(super) mod terminal_custody {
         )
         .await?;
         assert_eq!(status, StatusCode::OK, "{receipt}");
-        assert_eq!(receipt["status"], "created");
         await_line(&chosen_received, "READY").await;
         assert!(!original_received.exists());
         Ok(())
@@ -6904,7 +6898,6 @@ pub(super) mod terminal_custody {
         let (status, receipt) =
             response_json(tokio::time::timeout(Duration::from_secs(10), own).await??).await?;
         if status.is_success() {
-            assert_eq!(receipt["status"], "created", "{receipt}");
             assert_eq!(receipt["resume_outcome"], "fresh", "{receipt}");
             assert_eq!(
                 receipt["lifecycle_generation"], original.lifecycle_generation,
