@@ -31,16 +31,16 @@ describe("SendButton", () => {
 });
 
 describe("a running Worker whose connection is down", () => {
-  it("says it queues until connected, not until the session resumes", () => {
+  it("does not promise a queue or a resume", () => {
     const { unmount } = render(<SendButton connected={false} connecting onSend={() => {}} />);
-    expect(screen.getByRole("button", { name: "Queue message until connected" }).getAttribute("title")).toBe(
-      "Queue message until connected",
+    expect(screen.getByRole("button", { name: "Send message while disconnected" }).getAttribute("title")).toBe(
+      "Send message while disconnected",
     );
     unmount();
     render(<QueueSendButton connected={false} steering={false} connecting onSend={() => {}} />);
     expect(
-      screen.getByRole("button", { name: "Queue follow-up, will send once connected, Enter" }).getAttribute("title"),
-    ).toBe("Queue follow-up, will send once connected, Enter");
+      screen.getByRole("button", { name: "Queue follow-up while disconnected, Enter" }).getAttribute("title"),
+    ).toBe("Queue follow-up while disconnected, Enter");
   });
 });
 

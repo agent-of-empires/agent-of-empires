@@ -302,7 +302,7 @@ export function QueuedPromptsStrip({
               ? waitingFor
                 ? `Pending until ${waitingFor} is ready (${queued.length})`
                 : connecting
-                  ? `Pending until connected (${queued.length})`
+                  ? `${queued.some((q) => q.pending) ? "Pending until connected" : "Queued"} (${queued.length})`
                   : `Pending until session resumes (${queued.length})`
               : `Queued (${queued.length})`}
           </span>

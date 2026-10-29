@@ -85,7 +85,7 @@ test("a running Worker with no stored Agent session shows no startup line while 
   await openStructuredSession(page, mock);
   await replayRequested;
   await expect(page.getByTestId("startup-wait-line")).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Queue message until connected" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Send message while disconnected" })).toBeVisible();
   release();
   await expect(page.getByText("hello")).toBeVisible();
   await expect(page.getByTestId("startup-wait-line")).toHaveCount(0);

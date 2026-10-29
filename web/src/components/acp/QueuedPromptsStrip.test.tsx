@@ -75,14 +75,22 @@ describe("QueuedPromptsStrip", () => {
     expect(tooltip.textContent).not.toMatch(/tab stays open|other devices|Three closed chats/);
   });
 
-  it.each<[string, boolean, string | null, string]>([
+  it.each<[string, boolean, string | null, string, boolean?, boolean?]>([
     ["a new Session names the Agent it waits for", true, "Claude Code", "Pending until Claude Code is ready (1)"],
     ["a resumed Session waits to resume", true, null, "Pending until session resumes (1)"],
     ["a running Session just queues", false, "Claude Code", "Queued (1)"],
-    ["a running Worker waits for the connection", true, null, "Pending until connected (1)"],
-  ])("%s", (_label, pendingResume, waitingFor, header) => {
-    const connecting = header.startsWith("Pending until connected");
-    const { container } = renderWithProfile("claude", [mk("a", "hello")], { pendingResume, waitingFor, connecting });
+    ["a running Worker with the connection down keeps a confirmed row queued", true, null, "Queued (1)", true],
+    [
+      "a running Worker with the connection down holds an unconfirmed row",
+      true,
+      null,
+      "Pending until connected (1)",
+      true,
+      true,
+    ],
+  ])("%s", (_label, pendingResume, waitingFor, header, connecting = false, pending = false) => {
+    const row = { ...mk("a", "hello"), ...(pending ? { pending } : {}) };
+    const { container } = renderWithProfile("claude", [row], { pendingResume, waitingFor, connecting });
     expect(container.textContent).toContain(header);
     expect(container.textContent).not.toContain("Held in this tab");
   });
