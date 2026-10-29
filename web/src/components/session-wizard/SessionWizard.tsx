@@ -746,10 +746,13 @@ export function SessionWizard({
         if (unmountedRef.current) return;
         setRechecking(false);
         dispatch({ type: "SET_DOCKER", available: status.available, runtimeName: status.runtime_name ?? null });
+        if (!status.available) {
+          setRuntimeDown(true);
+          return;
+        }
         // Launch may be blocked now, or an edit made this closure's form stale; Retry stays offered.
         if (!canResendRef.current || dataRef.current !== state.data) return;
-        if (status.available) await handleSubmit({}, true);
-        else setRuntimeDown(true);
+        await handleSubmit({}, true);
         return;
       }
       case "launch_without_sandbox":

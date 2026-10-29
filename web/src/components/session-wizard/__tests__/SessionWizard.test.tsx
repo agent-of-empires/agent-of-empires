@@ -1370,17 +1370,23 @@ describe("SessionWizard create failures", () => {
     },
   );
 
-  it("Retry sends nothing when the form changed while it re-checked the runtime", async () => {
-    createSession.mockResolvedValueOnce(UNAVAILABLE);
-    sandboxed();
-    await launch();
-    let answer!: (v: DockerStatusResponse) => void;
-    vi.mocked(fetchDockerStatus).mockReturnValueOnce(new Promise((r) => (answer = r)));
-    fireEvent.click(await screen.findByTestId("create-failure-retry_runtime"));
-    fireEvent.click(screen.getByRole("switch", { name: "Yolo mode" }));
-    await act(async () => answer({ available: true, runtime: "docker", runtime_name: "Docker" }));
-    await act(async () => {});
-    expect(createSession).toHaveBeenCalledOnce();
-    expect(box()).toBeTruthy();
-  });
+  it.each([
+    ["up", true, "Retry"],
+    ["still down", false, "Launch without Sandbox"],
+  ])(
+    "Retry sends nothing when the form changed while it re-checked the runtime, which answered %s",
+    async (_label, available, primary) => {
+      createSession.mockResolvedValueOnce(UNAVAILABLE);
+      sandboxed();
+      await launch();
+      let answer!: (v: DockerStatusResponse) => void;
+      vi.mocked(fetchDockerStatus).mockReturnValueOnce(new Promise((r) => (answer = r)));
+      fireEvent.click(await screen.findByTestId("create-failure-retry_runtime"));
+      fireEvent.click(screen.getByRole("switch", { name: "Yolo mode" }));
+      await act(async () => answer({ available, runtime: "docker", runtime_name: "Docker" }));
+      await act(async () => {});
+      expect(createSession).toHaveBeenCalledOnce();
+      expect(box().querySelector("button")?.textContent).toBe(primary);
+    },
+  );
 });
