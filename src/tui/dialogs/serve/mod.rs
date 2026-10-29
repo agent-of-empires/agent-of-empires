@@ -45,6 +45,8 @@ pub enum DashboardLaunch {
     Failed {
         target: LaunchTarget,
         message: String,
+        /// The daemon log's last lines when it failed, not when the view opens.
+        log_tail: Vec<String>,
     },
 }
 
@@ -333,7 +335,15 @@ impl ServeViewState {
     /// A start that failed, with the likely cause and the daemon's last log lines, which hold
     /// the reason it gave.
     fn start_failed(mode: ServeMode, transport: Option<TunnelTransport>, headline: &str) -> Self {
-        let tail = initial_log_tail();
+        Self::start_failed_with(mode, transport, headline, initial_log_tail())
+    }
+
+    fn start_failed_with(
+        mode: ServeMode,
+        transport: Option<TunnelTransport>,
+        headline: &str,
+        tail: Vec<String>,
+    ) -> Self {
         let hint = diagnose_daemon_exit(&tail.join("\n"), mode);
         ServeViewState::Error {
             message: format!("{headline}{hint}{}", last_log_lines(&tail)),
@@ -705,8 +715,17 @@ impl ServeView {
                 view.launch_in_flight = true;
                 view
             }
-            DashboardLaunch::Failed { target, message } => Self::with_state(
-                ServeViewState::start_failed(target.mode, target.transport, &message),
+            DashboardLaunch::Failed {
+                target,
+                message,
+                log_tail,
+            } => Self::with_state(
+                ServeViewState::start_failed_with(
+                    target.mode,
+                    target.transport,
+                    &message,
+                    log_tail,
+                ),
                 probes,
             ),
         }

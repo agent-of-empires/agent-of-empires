@@ -2617,19 +2617,14 @@ impl App {
                     target, ..
                 }) = launch
                 {
-                    // Hidden with Esc; otherwise nothing on screen says the start failed.
+                    // Hidden with Esc: the offline takeover's "Didn't start" row reports it. The log
+                    // tail is read now, so a view opened later shows this failure's lines.
                     self.home.dashboard_launch =
                         Some(crate::tui::dialogs::DashboardLaunch::Failed {
                             target,
                             message: message.clone(),
+                            log_tail: crate::acp::client::autostart::initial_log_tail(),
                         });
-                    let what = if cfg!(feature = "web") {
-                        "Web dashboard"
-                    } else {
-                        "API server"
-                    };
-                    self.home
-                        .flash_status(format!("{what} didn't start. Press Enter for details."));
                 }
                 self.home.set_sidebar_source(
                     crate::tui::session_feed::SidebarSource::Disconnected,
@@ -4416,8 +4411,8 @@ mod tests {
         };
         // 30s or a little more on a loaded run.
         let elapsed = regex::Regex::new(r"Elapsed: 3\d+s").unwrap();
-        // (view open when the launch fails, flashed)
-        for (view_open, flashed) in [(false, true), (true, false)] {
+        // Whether a view is open when the launch fails.
+        for view_open in [false, true] {
             let started = std::time::Instant::now() - Duration::from_secs(30);
             app.home.dashboard_launch = Some(DashboardLaunch::tunnel_for_test(started));
             let (settle, launch) = tokio::sync::oneshot::channel();
@@ -4436,16 +4431,21 @@ mod tests {
                 assert!(app.home.serve_view.is_none());
             }
 
+            let log = crate::cli::serve::stdio_redirect_path().unwrap();
+            std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+            std::fs::write(&log, "[AOE_START_MARKER]\nbind failed on port 8081\n").unwrap();
             let reason = "Dashboard start failed. Check `aoe logs`.";
             assert!(settle.send(Err(reason.into())).is_ok());
             assert!(app.poll_dashboard_launch());
-            let flash = app.home.status_flash_text().unwrap_or_default().to_owned();
-            assert_eq!(
-                flash.ends_with("didn't start. Press Enter for details."),
-                flashed,
-                "{view_open}: {flash:?}"
-            );
             if !view_open {
+                // Later Daemon activity mustn't stand in for this failure's log lines.
+                std::fs::write(&log, "[AOE_START_MARKER]\nlater daemon activity\n").unwrap();
+                // A dashboard that came up some other way outranks the stored failure.
+                use crate::tui::dialogs::WebState;
+                assert_eq!(app.home.connections_web_state(None), WebState::Failed);
+                app.home.serve_running = true;
+                assert_ne!(app.home.connections_web_state(None), WebState::Failed);
+                app.home.serve_running = false;
                 // The offline takeover says it didn't start, and Enter, through the gate, shows why.
                 assert_eq!(app.home.sidebar_source, SidebarSource::Disconnected);
                 let takeover = home(&mut app);
@@ -4455,13 +4455,15 @@ mod tests {
                 );
                 assert!(!app.handle_runtime_gate_key(enter));
             }
+            let shown = screen(&app);
+            assert!(shown.contains("Dashboard start failed."), "{view_open}");
             assert!(
-                screen(&app).contains("Dashboard start failed."),
-                "{view_open}"
+                shown.contains("bind failed on port 8081")
+                    && !shown.contains("later daemon activity"),
+                "{view_open}: {shown}"
             );
             app.home.handle_key(KeyEvent::from(KeyCode::Esc), None);
             assert!(app.home.dashboard_launch.is_none(), "shown once");
-            app.home.status_flash = None;
         }
     }
 

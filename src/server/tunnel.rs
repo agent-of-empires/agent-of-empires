@@ -458,13 +458,44 @@ async fn restart_tunnel(kind: &TunnelKind, port: u16) -> anyhow::Result<Child> {
     }
 }
 
-/// True if `tailscale` is on PATH, the daemon is logged in, and Funnel is enabled for the
-/// tailnet.
-pub async fn tailscale_available() -> bool {
-    tailscale_available_with(std::ffi::OsStr::new("tailscale"), PROBE_TIMEOUT).await
+/// What probing the local `tailscale` found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TailscaleProbe {
+    /// On PATH, and the daemon is running and signed in.
+    Available,
+    /// Missing, or it answered that it isn't usable.
+    Unavailable,
+    /// A probe didn't answer in time, so it may still be a healthy but slow Tailscale.
+    TimedOut,
 }
 
-async fn tailscale_available_with(program: &std::ffi::OsStr, timeout: std::time::Duration) -> bool {
+impl TailscaleProbe {
+    /// Whether to start Tailscale Funnel. A timeout fails closed rather than silently picking a
+    /// Cloudflare quick tunnel, whose rotating URL breaks installed PWAs.
+    pub fn use_funnel(self) -> anyhow::Result<bool> {
+        match self {
+            Self::Available => Ok(true),
+            Self::Unavailable => Ok(false),
+            Self::TimedOut => anyhow::bail!(
+                "`tailscale` didn't answer within {}s, so aoe couldn't tell whether to use \
+                 Tailscale Funnel. Re-run `aoe serve --remote` once Tailscale responds, or pass \
+                 `--no-tailscale` to use Cloudflare intentionally (quick-tunnel URL rotates on \
+                 restart).",
+                PROBE_TIMEOUT.as_secs()
+            ),
+        }
+    }
+}
+
+/// Probe whether `tailscale` is on PATH and its daemon is running and signed in.
+pub async fn tailscale_probe() -> TailscaleProbe {
+    tailscale_probe_with(std::ffi::OsStr::new("tailscale"), PROBE_TIMEOUT).await
+}
+
+async fn tailscale_probe_with(
+    program: &std::ffi::OsStr,
+    timeout: std::time::Duration,
+) -> TailscaleProbe {
     // Each probe is bounded so a wedged `tailscale` falls back to Cloudflare at once instead of
     // holding tunnel selection until the startup deadline; dropping one kills its child.
     let probe = |arg: &'static str| async move {
@@ -492,11 +523,13 @@ async fn tailscale_available_with(program: &std::ffi::OsStr, timeout: std::time:
         ),
         Err(e) => debug!(error = %e, "tailscale_available: `tailscale --version` spawn failed"),
     }
-    let Ok(out) = version else {
-        return false;
+    let out = match version {
+        Ok(out) => out,
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return TailscaleProbe::TimedOut,
+        Err(_) => return TailscaleProbe::Unavailable,
     };
     if !out.status.success() {
-        return false;
+        return TailscaleProbe::Unavailable;
     }
     // Then confirm the daemon is running and signed in.
     let status = probe("status").await;
@@ -509,10 +542,11 @@ async fn tailscale_available_with(program: &std::ffi::OsStr, timeout: std::time:
         ),
         Err(e) => debug!(error = %e, "tailscale_available: `tailscale status` spawn failed"),
     }
-    let Ok(out) = status else {
-        return false;
-    };
-    out.status.success()
+    match status {
+        Ok(out) if out.status.success() => TailscaleProbe::Available,
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => TailscaleProbe::TimedOut,
+        _ => TailscaleProbe::Unavailable,
+    }
 }
 
 /// Probe `tailscale funnel status --json` to see if port 443 is already configured.
@@ -794,7 +828,7 @@ pub fn check_cloudflared() -> anyhow::Result<()> {
 /// opens the view, or hold the Daemon's tunnel selection until its startup deadline.
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Sync counterpart of `tailscale_available()` for use from the TUI (which avoids spinning
+/// Sync counterpart of `tailscale_probe()` for use from the TUI (which avoids spinning
 /// up a tokio runtime just to probe for a CLI).
 pub fn tailscale_available_sync() -> bool {
     tailscale_available_sync_with(std::ffi::OsStr::new("tailscale"), PROBE_TIMEOUT)
@@ -900,22 +934,52 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn only_a_timed_out_probe_refuses_to_pick_a_transport() {
+        // (probe, start Funnel, or the error names the way out)
+        for (probe, want) in [
+            (TailscaleProbe::Available, Some(true)),
+            (TailscaleProbe::Unavailable, Some(false)),
+            (TailscaleProbe::TimedOut, None),
+        ] {
+            match probe.use_funnel() {
+                Ok(funnel) => assert_eq!(Some(funnel), want, "{probe:?}"),
+                Err(e) => {
+                    assert_eq!(want, None, "{probe:?}");
+                    assert!(e.to_string().contains("--no-tailscale"), "{e}");
+                }
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[test]
-    fn a_wedged_tailscale_reads_as_unavailable_within_the_probe_bound() {
+    fn a_wedged_tailscale_times_out_within_the_probe_bound() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        // (script body, expected availability)
+        // (script body, sync availability, async probe)
         let cases = [
-            ("exit 0", true),
-            ("[ \"$1\" = status ] && exit 1; exit 0", false), // not logged in
-            ("[ \"$1\" = status ] && exec sleep 600; exit 0", false), // wedged tailscaled
+            ("exit 0", true, TailscaleProbe::Available),
+            // Not logged in.
+            (
+                "[ \"$1\" = status ] && exit 1; exit 0",
+                false,
+                TailscaleProbe::Unavailable,
+            ),
+            // Wedged tailscaled: the TUI just hides the option, but the Daemon must not take it
+            // for "unavailable" and fall back to Cloudflare.
+            (
+                "[ \"$1\" = status ] && exec sleep 600; exit 0",
+                false,
+                TailscaleProbe::TimedOut,
+            ),
+            ("exec sleep 600", false, TailscaleProbe::TimedOut),
         ];
-        for (i, (body, expected)) in cases.into_iter().enumerate() {
+        for (i, (body, expected, probe)) in cases.into_iter().enumerate() {
             let fake = tmp.path().join(format!("tailscale-{i}"));
             std::fs::write(&fake, format!("#!/bin/sh\n{body}\n")).unwrap();
             std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -934,8 +998,8 @@ mod tests {
             // The Daemon's async probe gets the same bound.
             let started = std::time::Instant::now();
             assert_eq!(
-                runtime.block_on(tailscale_available_with(fake.as_os_str(), timeout)),
-                expected,
+                runtime.block_on(tailscale_probe_with(fake.as_os_str(), timeout)),
+                probe,
                 "async: {body}"
             );
             assert!(

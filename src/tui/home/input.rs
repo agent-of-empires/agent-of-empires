@@ -3739,17 +3739,20 @@ impl HomeView {
 
     /// The hub's Web dashboard row. `known` keeps a transport already read, so a refresh
     /// reads `serve.mode` only until it names one.
-    pub(super) fn connections_web_state(
+    pub(crate) fn connections_web_state(
         &self,
         known: Option<&crate::tui::dialogs::WebState>,
     ) -> crate::tui::dialogs::WebState {
         use crate::tui::dialogs::{served_via, WebState};
         if web_plugin_disabled() {
             WebState::Disabled
-        } else if matches!(self.dashboard_launch, Some(DashboardLaunch::Failed { .. })) {
-            WebState::Failed
         } else if !self.serve_running {
-            WebState::Off
+            // A dashboard that came up another way since outranks a stored failure.
+            if matches!(self.dashboard_launch, Some(DashboardLaunch::Failed { .. })) {
+                WebState::Failed
+            } else {
+                WebState::Off
+            }
         } else if let Some(WebState::On(Some(via))) = known {
             WebState::On(Some(via))
         } else {
