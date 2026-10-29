@@ -870,6 +870,10 @@ pub async fn switch_acp_agent(
     if target.is_empty() {
         return (StatusCode::BAD_REQUEST, "target is required").into_response();
     }
+    let _switch_request = match state.acp_supervisor.begin_switch_request(&id) {
+        Ok(request) => request,
+        Err(error) => return supervisor_error_response("agent switch failed", &error),
+    };
     let exclusion =
         match crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &id, true).await {
             Ok(exclusion) => exclusion,
@@ -1085,6 +1089,10 @@ pub async fn switch_acp_provider(
             ),
         );
     }
+    let _switch_request = match state.acp_supervisor.begin_switch_request(&id) {
+        Ok(request) => request,
+        Err(error) => return supervisor_error_response("provider switch failed", &error),
+    };
     let exclusion =
         match crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &id, true).await {
             Ok(exclusion) => exclusion,
@@ -1913,6 +1921,75 @@ mod tests {
 
         drop(first);
         assert!(state.acp_supervisor.try_begin_restart(&id).await.is_some());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restart_claim_rejects_spawn_and_switches_without_mutating_session() {
+        use crate::session::{Instance, Storage, View};
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let mut row = Instance::new("restart claim", project.path().to_str().unwrap());
+        row.source_profile = "default".into();
+        row.view = View::Structured;
+        row.agent_name = Some("claude".into());
+        row.agent_provider = Some("anthropic".into());
+        let id = row.id.clone();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![row]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let claim = state.acp_supervisor.try_begin_restart(&id).await.unwrap();
+        let provider = crate::session::environment::AGENT_PROVIDERS
+            .iter()
+            .find(|provider| **provider != "anthropic")
+            .unwrap()
+            .to_string();
+        let spawn = spawn_acp(
+            State(state.clone()),
+            Path(id.clone()),
+            Ok(Json(SpawnAcpRequest {
+                agent: None,
+                model: None,
+                additional_dirs: Vec::new(),
+                provider_env: Vec::new(),
+            })),
+        )
+        .await
+        .into_response();
+        let switch = switch_acp_provider(
+            State(state.clone()),
+            Path(id.clone()),
+            Ok(Json(SwitchProviderRequest { provider })),
+        )
+        .await
+        .into_response();
+        let agent = switch_acp_agent(
+            State(state.clone()),
+            Path(id.clone()),
+            Ok(Json(SwitchAgentRequest {
+                target: "codex".into(),
+                model: None,
+                reason: None,
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(spawn.status(), StatusCode::CONFLICT);
+        assert_eq!(switch.status(), StatusCode::CONFLICT);
+        assert_eq!(agent.status(), StatusCode::CONFLICT);
+        let stored = Storage::open_unwatched("default")
+            .unwrap()
+            .load()
+            .unwrap()
+            .remove(0);
+        assert_eq!(stored.agent_provider.as_deref(), Some("anthropic"));
+        assert_eq!(stored.agent_name.as_deref(), Some("claude"));
+        assert_eq!(
+            state.acp_supervisor.worker_state(&id).await,
+            crate::daemon::AcpWorkerState::Absent
+        );
+        drop(claim);
     }
 
     #[tokio::test]

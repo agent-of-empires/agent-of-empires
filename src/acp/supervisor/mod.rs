@@ -73,6 +73,7 @@ struct SpawnRequestState {
     /// A stop fence remains held while the request owns its submission and
     /// instance guards, preventing a replacement from slipping through.
     stop_fences: HashMap<String, (u64, usize)>,
+    switches: HashMap<String, usize>,
 }
 
 #[derive(Debug, Error)]
@@ -245,6 +246,23 @@ pub(crate) struct PendingSpawnGuard {
     request_id: u64,
     cancellation: CancellationToken,
     requests: SpawnRequests,
+}
+
+pub(crate) struct SwitchRequestGuard {
+    session_id: String,
+    requests: SpawnRequests,
+}
+
+impl Drop for SwitchRequestGuard {
+    fn drop(&mut self) {
+        let mut requests = lock_recover(&self.requests);
+        if let Some(count) = requests.switches.get_mut(&self.session_id) {
+            *count -= 1;
+            if *count == 0 {
+                requests.switches.remove(&self.session_id);
+            }
+        }
+    }
 }
 
 /// A stop fence that outlives the HTTP request and cancels pending spawns.
@@ -648,6 +666,9 @@ impl<S: BroadcastSink> Supervisor<S> {
         if requests.stop_fences.contains_key(session_id) {
             return Err(SupervisorError::SpawnCancelled(session_id.to_string()));
         }
+        if lock_recover(&self.restart_requests).contains_key(session_id) {
+            return Err(SupervisorError::RestartInProgress(session_id.to_string()));
+        }
         let request_id = self.next_spawn_request_id.fetch_add(1, Ordering::Relaxed);
         let cancellation = CancellationToken::new();
         requests
@@ -659,6 +680,21 @@ impl<S: BroadcastSink> Supervisor<S> {
             session_id: session_id.to_string(),
             request_id,
             cancellation,
+            requests: Arc::clone(&self.spawn_requests),
+        })
+    }
+
+    pub(crate) fn begin_switch_request(
+        &self,
+        session_id: &str,
+    ) -> Result<SwitchRequestGuard, SupervisorError> {
+        let mut requests = lock_recover(&self.spawn_requests);
+        if lock_recover(&self.restart_requests).contains_key(session_id) {
+            return Err(SupervisorError::RestartInProgress(session_id.to_string()));
+        }
+        *requests.switches.entry(session_id.to_string()).or_default() += 1;
+        Ok(SwitchRequestGuard {
+            session_id: session_id.to_string(),
             requests: Arc::clone(&self.spawn_requests),
         })
     }
@@ -773,6 +809,10 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// `begin_resume`, so an explicit launch cannot slip past the claim.
     pub(crate) async fn try_begin_restart(&self, session_id: &str) -> Option<RestartRequestGuard> {
         let _workers = self.workers.lock().await;
+        let spawn_requests = lock_recover(&self.spawn_requests);
+        if spawn_requests.switches.contains_key(session_id) {
+            return None;
+        }
         let mut requests = lock_recover(&self.restart_requests);
         if requests.contains_key(session_id) {
             return None;
@@ -832,6 +872,27 @@ mod tests {
 
         drop(first);
         assert!(sup.try_begin_restart("s-restart").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn restart_and_switch_claims_exclude_each_other() {
+        let sup = Supervisor::new(VecSink::new());
+        let switching = sup.begin_switch_request("s").unwrap();
+        assert!(sup.try_begin_restart("s").await.is_none());
+        drop(switching);
+        let restart = sup.try_begin_restart("s").await.unwrap();
+        assert!(matches!(
+            sup.begin_switch_request("s"),
+            Err(SupervisorError::RestartInProgress(_))
+        ));
+        assert!(matches!(
+            sup.begin_spawn_request("s"),
+            Err(SupervisorError::RestartInProgress(_))
+        ));
+        assert!(sup.begin_switch_request("other").is_ok());
+        drop(restart);
+        assert!(sup.begin_switch_request("s").is_ok());
+        assert!(sup.begin_spawn_request("s").is_ok());
     }
 
     #[tokio::test]

@@ -316,7 +316,7 @@ impl NativeRead {
 
 /// Reads an agent's native config. A missing file or unknown agent yields nothing;
 /// an unparseable file is an error; malformed entries are skipped. Only the Claude
-/// reader honors `config_dir`.
+/// and Codex readers honor `config_dir`.
 fn read_native(agent_key: &str, home: &Path, config_dir: Option<&Path>) -> Result<NativeRead> {
     match native_config_for(agent_key) {
         None => Ok(NativeRead::default()),
@@ -328,7 +328,10 @@ fn read_native(agent_key: &str, home: &Path, config_dir: Option<&Path>) -> Resul
         Some(NativeMcpConfig::GeminiJson(rel)) => {
             read_json::<GeminiConfigFile, _>(&home.join(rel), |f| f.mcp_servers, convert_gemini)
         }
-        Some(NativeMcpConfig::CodexToml(rel)) => read_codex_toml(&home.join(rel)),
+        Some(NativeMcpConfig::CodexToml(rel)) => read_codex_toml(&match config_dir {
+            Some(dir) => dir.join("config.toml"),
+            None => home.join(rel),
+        }),
     }
 }
 
@@ -913,6 +916,25 @@ enabled = true
         assert_eq!(codex.servers[3].kind(), "http");
         let enabled = load_native_mcp_servers("codex", home.path()).unwrap();
         assert_eq!(names(&enabled), vec!["fs", "on", "remote"]);
+    }
+
+    #[test]
+    fn codex_reads_the_declared_config_dir_instead_of_home() {
+        let home = tempfile::tempdir().unwrap();
+        let declared = tempfile::tempdir().unwrap();
+        write(
+            home.path(),
+            ".codex/config.toml",
+            "[mcp_servers.home]\ncommand = \"h\"\n",
+        );
+        write(
+            declared.path(),
+            "config.toml",
+            "[mcp_servers.declared]\ncommand = \"d\"\n",
+        );
+        let read = |dir: Option<&Path>| read_native("codex", home.path(), dir).unwrap().servers;
+        assert_eq!(names(&read(Some(declared.path()))), vec!["declared"]);
+        assert_eq!(names(&read(None)), vec!["home"]);
     }
 
     #[test]
