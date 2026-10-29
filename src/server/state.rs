@@ -27,6 +27,44 @@ pub struct CleanupDefaultsCache {
 
 pub const CLEANUP_DEFAULTS_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// One dashboard window: the hashed browser identity plus the window id the
+/// page reports, so two windows of one browser keep separate presence.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct WebPresenceKey {
+    pub client: [u8; 32],
+    pub window: String,
+}
+
+/// Last foreground heartbeat of one dashboard window.
+#[derive(Clone, Debug)]
+pub struct WebPresence {
+    pub last_seen_ms: i64,
+    /// Set when the window is in focus mode: it only shows this session, so
+    /// it only stands in for notifications about this session.
+    pub focus_session: Option<String>,
+}
+
+/// What foregrounded dashboard windows are currently watching.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WebWatch {
+    Nothing,
+    /// At least one regular window is foregrounded.
+    Everything,
+    /// Only focus-mode windows are foregrounded, showing these sessions.
+    Sessions(std::collections::HashSet<String>),
+}
+
+impl WebWatch {
+    /// Returns true when a foregrounded window already shows `session_id`.
+    pub fn covers(&self, session_id: &str) -> bool {
+        match self {
+            WebWatch::Nothing => false,
+            WebWatch::Everything => true,
+            WebWatch::Sessions(ids) => ids.contains(session_id),
+        }
+    }
+}
+
 /// How long attachment bytes buffered for a queued prompt live before the
 /// hourly sweep reclaims them. A
 /// queued prompt normally drains within seconds; this only catches bytes
@@ -271,12 +309,12 @@ pub struct AppState {
     /// dashboard can tail their host-side log. In-memory; see
     /// `api::plugins::PluginJobRegistry`.
     pub plugin_jobs: Arc<crate::server::api::plugins::PluginJobRegistry>,
-    /// Per-browser foreground dashboard presence. Entries are keyed by a hash
-    /// of the device-binding secret and expire when the browser stops sending
-    /// its visibility heartbeat. Push suppression must not treat ordinary
-    /// polling or a backgrounded PWA as evidence that somebody is looking at
-    /// the dashboard.
-    pub web_presence: std::sync::Mutex<std::collections::HashMap<[u8; 32], i64>>,
+    /// Per-window foreground dashboard presence. Entries are keyed by a hash
+    /// of the device-binding secret plus the window's id and expire when the
+    /// window stops sending its visibility heartbeat. Push suppression must
+    /// not treat ordinary polling or a backgrounded PWA as evidence that
+    /// somebody is looking at the dashboard.
+    pub web_presence: std::sync::Mutex<std::collections::HashMap<WebPresenceKey, WebPresence>>,
     /// Packed sleep-inhibit reconciler snapshot for read-only status reporting:
     /// bit `SLEEP_INHIBIT_SNAPSHOT_ENABLED` is the
     /// `prevent_sleep_when_active` toggle as the reconciler last read it, bit
@@ -441,25 +479,51 @@ impl AppState {
             .clone()
     }
 
-    /// Record whether one browser is currently foregrounded. Browser identity
-    /// is derived from its device-binding secret, never retained in plaintext.
-    pub fn set_web_presence(&self, client: [u8; 32], active: bool) {
+    /// Record whether one dashboard window is currently foregrounded, and the
+    /// session it is focused on, if any. Browser identity is derived from its
+    /// device-binding secret, never retained in plaintext.
+    pub fn set_web_presence(
+        &self,
+        key: WebPresenceKey,
+        active: bool,
+        focus_session: Option<String>,
+    ) {
         let mut presence = self.web_presence.lock().expect("web_presence poisoned");
         if active {
-            presence.insert(client, crate::util::now_ms() as i64);
+            presence.insert(
+                key,
+                WebPresence {
+                    last_seen_ms: crate::util::now_ms() as i64,
+                    focus_session,
+                },
+            );
         } else {
-            presence.remove(&client);
+            presence.remove(&key);
         }
     }
 
-    /// Returns true if any dashboard recently reported itself visible and
-    /// focused. Stale entries are swept here, on the only read path.
-    pub fn web_active_within(&self, threshold: std::time::Duration) -> bool {
+    /// Returns what dashboard windows that recently reported themselves visible
+    /// and focused are watching. Stale entries are swept here, on the only read
+    /// path.
+    pub fn web_watch_within(&self, threshold: std::time::Duration) -> WebWatch {
         let now = crate::util::now_ms() as i64;
         let max_age = threshold.as_millis() as i64;
         let mut presence = self.web_presence.lock().expect("web_presence poisoned");
-        presence.retain(|_, last| now.saturating_sub(*last) < max_age);
-        !presence.is_empty()
+        presence.retain(|_, p| now.saturating_sub(p.last_seen_ms) < max_age);
+        let mut sessions = std::collections::HashSet::new();
+        for p in presence.values() {
+            match &p.focus_session {
+                Some(id) => {
+                    sessions.insert(id.clone());
+                }
+                None => return WebWatch::Everything,
+            }
+        }
+        if sessions.is_empty() {
+            WebWatch::Nothing
+        } else {
+            WebWatch::Sessions(sessions)
+        }
     }
 }
 
@@ -542,5 +606,44 @@ mod tests {
             entries: std::collections::HashMap::new(),
         };
         assert!(cache.stale());
+    }
+
+    #[test]
+    fn web_watch_follows_foreground_windows_and_their_focus() {
+        let state = test_support::build_test_app_state(vec![]);
+        let key = |client: u8, window: &str| WebPresenceKey {
+            client: [client; 32],
+            window: window.to_string(),
+        };
+        let watch = || state.web_watch_within(std::time::Duration::from_secs(30));
+        assert_eq!(watch(), WebWatch::Nothing);
+
+        state.set_web_presence(key(1, "a"), true, Some("s1".into()));
+        state.set_web_presence(key(1, "b"), true, Some("s2".into()));
+        let focused = watch();
+        assert!(focused.covers("s1") && focused.covers("s2"));
+        assert!(
+            !focused.covers("s3"),
+            "focus windows must not cover other sessions"
+        );
+
+        state.set_web_presence(key(2, "a"), true, None);
+        assert_eq!(watch(), WebWatch::Everything);
+
+        state.set_web_presence(key(2, "a"), false, None);
+        state.set_web_presence(key(1, "a"), false, None);
+        assert_eq!(
+            watch(),
+            WebWatch::Sessions(std::collections::HashSet::from(["s2".to_string()]))
+        );
+
+        state
+            .web_presence
+            .lock()
+            .unwrap()
+            .get_mut(&key(1, "b"))
+            .unwrap()
+            .last_seen_ms -= 30_000;
+        assert_eq!(watch(), WebWatch::Nothing, "stale windows must expire");
     }
 }

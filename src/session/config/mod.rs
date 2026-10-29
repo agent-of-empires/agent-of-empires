@@ -1643,6 +1643,16 @@ pub struct SessionConfig {
     )]
     pub show_session_colors: bool,
 
+    /// Offer focus mode in the web dashboard: a window limited to one session,
+    /// with no sidebar or session switching, that only notifies about that
+    /// session. Turning this off hides its top-bar button and commands; a
+    /// window already in focus mode can still exit it.
+    ///
+    /// `global_only`: for the same reason as `show_session_colors`.
+    #[serde(default = "default_true")]
+    #[setting(label = "Focus Mode", widget = "toggle", global_only)]
+    pub focus_mode: bool,
+
     /// Pin favorited sessions to the top of their sibling scope in every sort
     /// order of the TUI session list, not just Attention. A group holding a
     /// favorited session is pinned the same way. When on (default), favoriting
@@ -2047,6 +2057,7 @@ impl Default for SessionConfig {
             confirm_before_quit: true,
             unread_indicator: true,
             show_session_colors: true,
+            focus_mode: true,
             favorites_first: true,
             show_tips: true,
             show_shortcut_bar: true,
