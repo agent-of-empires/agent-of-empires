@@ -1,6 +1,33 @@
 //! Agent plans: parsing bullet text into steps and mapping ACP plan status.
 
+use crate::acp::agent_profiles::AgentProfile;
 use crate::acp::state::{Plan, PlanStep, PlanStepStatus};
+
+const MAX_APPROVAL_PLAN_BYTES: usize = 256 * 1024;
+
+/// The ExitPlanMode markdown for the approval's plan viewer. `args_preview`
+/// caps at 16 KiB and truncated JSON no longer parses, so the plan is read
+/// from the raw input instead. Cut on a char boundary at the cap.
+pub(super) fn approval_plan_text(
+    profile: &AgentProfile,
+    raw_input: Option<&serde_json::Value>,
+) -> Option<String> {
+    if !profile.supports_exit_plan_mode {
+        return None;
+    }
+    let plan = raw_input?.get("plan")?.as_str()?;
+    if plan.trim().is_empty() {
+        return None;
+    }
+    if plan.len() <= MAX_APPROVAL_PLAN_BYTES {
+        return Some(plan.to_string());
+    }
+    let cut = (0..=MAX_APPROVAL_PLAN_BYTES)
+        .rev()
+        .find(|&i| plan.is_char_boundary(i))
+        .unwrap_or(0);
+    Some(format!("{}\u{2026}[truncated]", &plan[..cut]))
+}
 
 /// ExitPlanMode ships its markdown in `raw_input.plan`, which has no ACP
 /// `SessionUpdate::Plan` of its own (#1059). `None` for a missing, non-string,
@@ -98,6 +125,31 @@ pub(super) fn plan_status_to_str(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::agent_profiles::{CLAUDE, GEMINI};
+
+    #[test]
+    fn approval_plan_text_cases() {
+        let plan = serde_json::json!({ "plan": "# Plan\n\nprose, no bullets" });
+        assert_eq!(
+            approval_plan_text(&CLAUDE, Some(&plan)).as_deref(),
+            Some("# Plan\n\nprose, no bullets")
+        );
+        assert!(approval_plan_text(&GEMINI, Some(&plan)).is_none());
+        for raw in [
+            serde_json::json!({}),
+            serde_json::json!({ "plan": 42 }),
+            serde_json::json!({ "plan": "  \n" }),
+        ] {
+            assert!(approval_plan_text(&CLAUDE, Some(&raw)).is_none(), "{raw}");
+        }
+        assert!(approval_plan_text(&CLAUDE, None).is_none());
+
+        // Past the cap the text is cut on a char boundary, not mid-codepoint.
+        let long = serde_json::json!({ "plan": "\u{e9}".repeat(MAX_APPROVAL_PLAN_BYTES) });
+        let cut = approval_plan_text(&CLAUDE, Some(&long)).expect("long plan kept");
+        assert!(cut.ends_with("[truncated]"));
+        assert!(cut.len() <= MAX_APPROVAL_PLAN_BYTES + 32);
+    }
 
     /// A plan needs bullets; anything else renders as a generic tool card.
     #[test]

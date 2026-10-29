@@ -22,6 +22,7 @@ use super::pending::{
     ApprovalResolutionMessage, ElicitationResolutionMessage, PendingResolver, PendingResponder,
     PendingResponders,
 };
+use super::plan::approval_plan_text;
 use super::tool_context::{permission_raw_input_with_context, ToolContextCache};
 use super::tool_output::{preview_optional_args, tool_kind_str};
 
@@ -203,7 +204,8 @@ pub(super) async fn handle_permission_request(
     // generic client rendered no labels and sent no option id, so by-kind
     // selection would answer the agent's first option for the user (#3741).
     let choice_list = is_choice_list(&offered);
-    let approval = build_approval(tool_call, offered);
+    let mut approval = build_approval(tool_call, offered);
+    approval.plan = approval_plan_text(profile, enriched_raw_input.as_ref());
     let nonce = approval.nonce.clone();
 
     let (resolve_tx, resolve_rx) = oneshot::channel::<ApprovalResolutionMessage>();

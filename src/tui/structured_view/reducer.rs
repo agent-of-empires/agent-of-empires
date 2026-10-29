@@ -519,6 +519,7 @@ mod tests {
             destructive: true,
             options: Vec::new(),
             choice: false,
+            plan: None,
             requested_at: Utc::now(),
             resolved: None,
         }
