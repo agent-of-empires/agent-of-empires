@@ -3,6 +3,33 @@
   "description": "Surface/flow coverage matrix for the agent-of-empires web dashboard. Every component file under web/src/components/** must appear in at least one entry's `components` list (covered, deferred, or out-of-scope), or in coverage-matrix.exempt.json. CI validates this on every PR via tests/validate-coverage-matrix.mjs.",
   "surfaces": [
     {
+      "id": "files.edit-eligibility-recovery",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/diff/__tests__/TextFileEditor.test.tsx",
+        "src/components/diff/__tests__/FileContentViewer.test.tsx"
+      ],
+      "components": ["web/src/components/diff/TextFileEditor.tsx", "web/src/components/diff/FileContentViewer.tsx"],
+      "notes": "Sandbox and unsupported-filesystem restrictions disable button and keyboard saves without latching a conflict; eligibility recovery preserves the draft. The viewer explains why atomic replacement is unavailable. Disabling editing hides the editor and restores the same draft and opened version when re-enabled. Pending saves and their results survive remounts without duplicate requests. Session-removal checks include parked drafts."
+    },
+    {
+      "id": "files.edit-existing-text",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/file-editing.spec.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/diff/TextFileEditor.tsx",
+        "web/src/components/diff/FileContentViewer.tsx",
+        "web/src/components/FilesPane.tsx",
+        "web/src/components/settings/PanelsSettings.tsx",
+        "web/src/components/MobileMainPane.tsx",
+        "web/src/components/acp/Composer.tsx"
+      ],
+      "notes": "Opt-in setting, exact saved bytes and mode, conflicts, dirty pane navigation, refusal of active-session Trash and permanent deletion when file discard is declined, read-only refusal, and mobile controls."
+    },
+    {
       "id": "settings.dialog-escape",
       "kind": "mocked-playwright",
       "risk": "high",

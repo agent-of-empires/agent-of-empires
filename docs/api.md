@@ -533,6 +533,20 @@ structured sessions). The receipt cursor is carried in `aoe-runtime-epoch` and
 attach only after applying a snapshot at or beyond that receipt in the same
 epoch, with matching lifecycle generation, profile, and live terminal identity.
 
+## GET and PUT /api/sessions/{id}/file
+
+GET accepts `?path=<relative-or-absolute-path>` and returns `content`, `is_binary`, `truncated`, `version`, and `edit_disabled_reason`. Add `editing=true` to request a version and edit-eligibility checks. `version_only=true` requests those checks without the content payload or an atomic-exchange probe. Reads may include out-of-project files proven by the Session's transcript; that provenance never grants writes.
+
+PUT accepts `{ "path", "version", "content" }` for an existing project UTF-8 text file up to 5 MB. Send the opened GET version. A successful verified atomic exchange returns 204.
+
+- The server rechecks the opened version before exchanging the complete stage with the target, then verifies the displaced file's full version against the original canonical path. Conflicts return 409 and retain the browser draft.
+- If the displaced version changed, the server checks that the target is still its staged inode before undoing the exchange. If another writer intervenes, displaced versions that cannot be safely removed are retained beside the file as `<filename>.aoe-conflict[.N]`, without replacing an existing recovery file. Unverified `.aoe-copy-*` staging entries can also remain; inspect recovery files before deleting them.
+- Filesystems without atomic exchange support are read-only in the editor, with an `edit_disabled_reason`; PUT returns 403. Support is probed with scratch files when opening the editor, never the real target. Successful probes are cached per filesystem for the process lifetime; polls and save checks do not probe. There is no optimistic-rename fallback.
+- A writer holding an old open file handle can still write after final verification. Path-level exchange does not cover that case.
+- A failure after publication, such as a directory-sync error, returns 500 with an uncertain-save message. The write may already be applied; check the disk file before retrying.
+
+Read-only and CityHall modes return 403. Escaping paths, binary files, and unverified or separate Sandbox volumes cannot be edited. The browser's opt-in setting and workflow are described in [Editing project files](guides/web/dashboard.md#editing-project-files).
+
 ## POST /api/sessions/{id}/send
 
 Type a message into the agent and press Enter, the same way the TUI's

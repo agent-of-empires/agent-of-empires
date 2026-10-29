@@ -15,6 +15,21 @@ The dashboard is the home screen of the web app: a workspace sidebar on the left
 
 Each sidebar row carries an animated braille glyph encoding the session's state: a spinner of dots while **Running**, an orbiting dot while **Waiting** or **Creating**, a slow breathe while **Starting** or freshly idle. Errors render in the error color. The frame is offset by each session's creation time so rows don't pulse in lockstep.
 
+## Editing project files
+
+Editing is off by default. Enable **Settings > Panels > Edit project text files** in the browser, then open an existing file in **Files** and select **Edit**.
+
+- Save or Cancel in the viewer. Ctrl/Cmd+S and Esc apply only while the text area has focus. Confirm before leaving unsaved changes. Unsaved text survives resizing or rotating across the phone layout. Resizing does not duplicate or cancel a pending save.
+- Existing UTF-8 text files up to 5 MB only. Read-only dashboards, out-of-project transcript files, and Sandbox folders backed by separate volumes and individual file bind mounts stay read-only with a reason. Files are unavailable in CityHall mode.
+- Saves retain consistent LF, CRLF or CR endings and the edited text's trailing newline. Mixed endings follow line position and can shift after lines are inserted or removed.
+- Saves retain ordinary file permissions and clear special permission bits.
+- Saves use a [verified atomic exchange](../../api.md#get-and-put-apisessionsidfile). A conflict keeps your draft; copy your edits or reload. If another writer prevents restoration, check the reported `<filename>.aoe-conflict[.N]` recovery file beside the original. The editor polls for external changes while open.
+- Filesystems without atomic exchange support disable editing with a reason. An uncertain-save error means the write may already be on disk; check the file before retrying.
+- Temporary Sandbox verification failures pause saving and show a reason. Saving resumes when verification succeeds, keeping the draft.
+- Turning editing off hides the editor and parks unsaved text. Turn it back on to resume the same draft and opened version.
+- Trash and permanent deletion ask before discarding unsaved drafts, including parked drafts.
+- After saving, optionally draft a note in Structured view without submitting it. Terminal view shows a reminder to tell the agent.
+
 ## Creating a session
 
 The **New session** wizard is one screen of one-line rows, like the TUI dialog; a row with a chevron opens its details in a panel:

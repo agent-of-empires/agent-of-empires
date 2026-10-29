@@ -468,6 +468,8 @@ pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     ("POST", "/api/sessions/{id}/terminal"),
     ("DELETE", "/api/sessions/{id}/terminal"),
     ("POST", "/api/sessions/{id}/container-terminal"),
+    // Files pane editor.
+    ("PUT", "/api/sessions/{id}/file"),
     // Git / project / profile management.
     ("POST", "/api/git/clone"),
     ("POST", "/api/projects"),

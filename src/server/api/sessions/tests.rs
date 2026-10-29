@@ -5957,6 +5957,8 @@ mod open_file {
         let (state, id) = (State(state.clone()), Path(id.to_string()));
         let query = Query(SessionFileQuery {
             path: path.to_string(),
+            version_only: false,
+            editing: false,
         });
         if raw {
             session_file_raw(state, id, query).await.into_response()

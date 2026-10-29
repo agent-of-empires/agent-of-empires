@@ -10,6 +10,14 @@ import {
   type ReactNode,
 } from "react";
 import { Puzzle } from "lucide-react";
+import {
+  confirmFileEditNavigation,
+  confirmFileEditRemoval,
+  hasUnsavedFileEdits,
+  isFileEditorOpen,
+  rememberFileEditLocation,
+} from "./lib/fileEditGuard";
+import type { NavigateOptions, To } from "react-router-dom";
 import { useLocation, useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS } from "./lib/session";
 import { diffSelectionStale } from "./lib/diffSelection";
@@ -354,7 +362,29 @@ function AppContent({
   }, []);
 
   const location = useLocation();
-  const navigate = useNavigate();
+  const rawNavigate = useNavigate();
+  const navigate = useCallback(
+    (to: To | number, options?: NavigateOptions) => {
+      if (!confirmFileEditNavigation()) return;
+      return typeof to === "number" ? rawNavigate(to) : rawNavigate(to, options);
+    },
+    [rawNavigate],
+  );
+  useEffect(() => {
+    const guardLink = (event: MouseEvent) => {
+      const link = event.target instanceof Element ? event.target.closest("a[href]") : null;
+      if (!link || !hasUnsavedFileEdits() || event.metaKey || event.ctrlKey || event.shiftKey || event.button !== 0)
+        return;
+      if (link.getAttribute("target") === "_blank" || (link as HTMLAnchorElement).href === window.location.href) return;
+      if (!confirmFileEditNavigation()) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    };
+    rememberFileEditLocation();
+    document.addEventListener("click", guardLink, true);
+    return () => document.removeEventListener("click", guardLink, true);
+  }, [location]);
   const [searchParams, setSearchParams] = useSearchParams();
   const { settings: webSettings } = useWebSettings();
   const sessionMatch = useMatch("/session/:sessionId");
@@ -365,7 +395,8 @@ function AppContent({
   // A plugin page's split pane shows `?session=` as the routed session, docks and all.
   const activeSessionId = sessionMatch?.params.sessionId ?? (pluginPageMatch ? searchParams.get("session") : null);
   const selectPluginPageSession = useCallback(
-    (id: string | null) =>
+    (id: string | null) => {
+      if (!confirmFileEditNavigation()) return;
       setSearchParams(
         (prev) => {
           const next = new URLSearchParams(prev);
@@ -374,7 +405,8 @@ function AppContent({
           return next;
         },
         { replace: true },
-      ),
+      );
+    },
     [setSearchParams],
   );
   // Off a removed session: back to the dashboard, or on a plugin page just out of its split pane.
@@ -752,6 +784,8 @@ function AppContent({
       if (isTerminalTabId(id)) {
         const idx = terminalIndexOf(id);
         if (idx >= 1) {
+          // Confirm before the kill, which cannot be undone; the later closeTab then passes.
+          if (!confirmFileEditNavigation()) return;
           // Remove the tab only once the shell is actually killed; if the
           // DELETE fails, keep the tab so the user can retry instead of
           // silently leaking the shell with no way to close it.
@@ -1237,9 +1271,15 @@ function AppContent({
     [sessions],
   );
 
+  const confirmRemovingSessions = useCallback(
+    (candidates: readonly SessionResponse[]) => confirmFileEditRemoval(candidates.map((session) => session.id)),
+    [],
+  );
+
   const handleConfirmDelete = async (options: DeleteSessionOptions) => {
     if (deletingSessions.length === 0) return;
     setDeletingSessions([]);
+    if (!confirmRemovingSessions(deletingSessions)) return;
     await deleteWorkspaceSessions(deletingSessions, options, activeSessionId, {
       setStatus: setSessionStatus,
       clearDeleting: clearDeletingStatus,
@@ -1259,6 +1299,7 @@ function AppContent({
   const handleEmptyTrash = useCallback(
     async (confirmed: Workspace[]) => {
       if (confirmed.length === 0 || emptyingTrashRef.current) return;
+      if (!confirmRemovingSessions(confirmed.flatMap((workspace) => workspace.sessions))) return;
       emptyingTrashRef.current = true;
       let anyFailed = false;
       let anyBusy = false;
@@ -1305,7 +1346,7 @@ function AppContent({
               : "Emptied trash",
       );
     },
-    [activeSessionId, setSessionStatus, clearDeletingStatus, leaveActiveSession],
+    [activeSessionId, setSessionStatus, clearDeletingStatus, leaveActiveSession, confirmRemovingSessions],
   );
 
   // Move-to-trash path (#2489): the safe default. Unlike permanent delete it
@@ -1318,6 +1359,7 @@ function AppContent({
     const wasActive = activeSessionId != null && ids.includes(activeSessionId);
 
     setDeletingSessions([]);
+    if (!confirmRemovingSessions(deletingSessions)) return;
     for (const id of ids) setSessionStatus(id, "Stopped");
     if (wasActive) {
       leaveActiveSession();
@@ -1574,6 +1616,7 @@ function AppContent({
 
   const handlePickView = useCallback(
     (view: RightPanelView) => {
+      if (!confirmFileEditNavigation()) return;
       transitionKeyboardProxy(activeSessionId, view);
       setRightPanelView(view);
       setPickerOpen(false);
@@ -1582,6 +1625,7 @@ function AppContent({
   );
 
   const handleSelectFile = useCallback((path: string, repoName?: string, line?: number) => {
+    if (!confirmFileEditNavigation()) return;
     setSelectedFile({ path, repoName, line });
   }, []);
 
@@ -1601,6 +1645,7 @@ function AppContent({
       // provenance-confined /file viewer, as does any out-of-repo absolute path
       // the agent touched this session (a plan in /tmp, ~/.claude, etc.). #3088.
       if (resolved && !activeSession.scratch) {
+        if (!confirmFileEditNavigation()) return;
         setSelectedFile({
           path: resolved.relativePath,
           repoName: resolved.repoName,
@@ -1610,6 +1655,7 @@ function AppContent({
         return;
       }
       if (resolved || isAbsolutePath(ref.path)) {
+        if (!confirmFileEditNavigation()) return;
         setSelectedFile({
           path: resolved?.relativePath ?? ref.path,
           line: ref.line,
@@ -1624,12 +1670,12 @@ function AppContent({
   );
 
   const handleCloseFile = useCallback(() => {
+    if (!confirmFileEditNavigation()) return;
     setSelectedFile(null);
   }, []);
 
   const handleGoDashboard = useCallback(() => {
     navigate("/");
-    setSelectedFile(null);
   }, [navigate]);
 
   const handleOpenSettings = useCallback(() => {
@@ -1734,6 +1780,7 @@ function AppContent({
       // a no-op. The paired shell mounts lazily on first activation, so its
       // PTY may not be ready when the dispatch fires; latch the intent too,
       // and PairedTerminal grabs focus once ready.
+      if (!confirmFileEditNavigation()) return;
       setRightPanelView(target);
       if (target === "paired") setPendingTerminalFocus("paired");
       requestAnimationFrame(() => dispatchFocusTerminal(target));
@@ -1767,6 +1814,7 @@ function AppContent({
       // Agent terminal is hidden under the diff viewer; close the diff first
       // so the wrapper un-hides, then dispatch on the next frame because
       // focus() on a display:none element is a no-op.
+      if (!confirmFileEditNavigation()) return;
       setSelectedFile(null);
       requestAnimationFrame(() => dispatchFocusTerminal("agent"));
       return;
@@ -1827,7 +1875,7 @@ function AppContent({
           // Settings dialogs handle Escape after this capture-phase shortcut.
           if (showSettings && !document.querySelector('[aria-modal="true"]')) handleCloseSettings();
           setShowAbout(false);
-          setSelectedFile(null);
+          if (!isFileEditorOpen()) setSelectedFile(null);
         },
         onHelp: () => setShowHelp((h) => !h),
         onSettings: () => (showSettings ? handleCloseSettings() : navigate("/settings")),
@@ -1944,7 +1992,13 @@ function AppContent({
         // Remount on session switch so the selected file (and any in-flight
         // read) resets instead of requesting the old path from the new
         // session. See #3088 review.
-        return <FilesPane key={activeSessionId ?? "none"} sessionId={activeSessionId} />;
+        return (
+          <FilesPane
+            key={activeSessionId ?? "none"}
+            sessionId={activeSessionId}
+            structured={activeSession?.view === "structured"}
+          />
+        );
       }
       if (id === "diff") {
         return (
@@ -2040,6 +2094,7 @@ function AppContent({
                   activeSessionId &&
                   (selectedFileExternal ? (
                     <FileContentViewer
+                      structured={activeSession?.view === "structured"}
                       sessionId={activeSessionId}
                       filePath={selectedFilePath}
                       onBack={handleCloseFile}
@@ -2242,6 +2297,7 @@ function AppContent({
           sessions={sessions}
           webSettings={webSettings}
           selectedFilePath={selectedFilePath}
+          selectedFileExternal={selectedFileExternal}
           selectedRepoName={selectedRepoName}
           selectedFileLine={selectedFileLine}
           revision={revision}
@@ -2261,7 +2317,7 @@ function AppContent({
           sendDialogOpen={sendDialogOpen}
           onOpenSendDialog={() => setSendDialogOpen(true)}
           onCloseSendDialog={() => setSendDialogOpen(false)}
-          onClearSelectedFile={() => setSelectedFile(null)}
+          onClearSelectedFile={handleCloseFile}
         />
       );
     }

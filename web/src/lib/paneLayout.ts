@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
+import { confirmFileEditNavigation } from "./fileEditGuard";
 import { useLatestRef } from "../hooks/useLatestRef";
 import { getWebSettingsSnapshot, useWebSettings } from "../hooks/useWebSettings";
 import { safeGetItem, safeSetItem } from "./safeStorage";
@@ -492,36 +493,54 @@ export function usePaneLayout(sessionId: string | null, outsideRepository: boole
   /* eslint-enable react-you-might-not-need-an-effect/no-event-handler, react-you-might-not-need-an-effect/no-derived-state, react-you-might-not-need-an-effect/no-chain-state-updates */
 
   const openTab = useCallback(
-    (tabId: TabId, dock: DockLocation) => mutate((l) => openOrRevealTab(l, tabId, dock)),
-    [mutate],
+    (tabId: TabId, dock: DockLocation) => {
+      if ((!isActiveTab(layout, tabId) || isDockCollapsed(layout, dock)) && !confirmFileEditNavigation()) return;
+      mutate((l) => openOrRevealTab(l, tabId, dock));
+    },
+    [mutate, layout],
   );
   const addTerminalCb = useCallback(
-    (dock: DockLocation) => mutate((l) => revealDock(addTerminal(l, dock).layout, dock)),
+    (dock: DockLocation) => {
+      if (confirmFileEditNavigation()) mutate((l) => revealDock(addTerminal(l, dock).layout, dock));
+    },
     [mutate],
   );
-  const closeTab = useCallback((tabId: TabId) => mutate((l) => removeTab(l, tabId)), [mutate]);
-  const activateTab = useCallback(
-    (dock: DockLocation, tabId: TabId) => mutate((l) => activateOrRevealTab(l, dock, tabId)),
+  const closeTab = useCallback(
+    (tabId: TabId) => {
+      if (confirmFileEditNavigation()) mutate((l) => removeTab(l, tabId));
+    },
     [mutate],
+  );
+  const activateTab = useCallback(
+    (dock: DockLocation, tabId: TabId) => {
+      if ((!isActiveTab(layout, tabId) || isDockCollapsed(layout, dock)) && !confirmFileEditNavigation()) return;
+      mutate((l) => activateOrRevealTab(l, dock, tabId));
+    },
+    [mutate, layout],
   );
   const moveTabCb = useCallback(
-    (tabId: TabId, toDock: DockLocation) =>
+    (tabId: TabId, toDock: DockLocation) => {
+      if (!confirmFileEditNavigation()) return;
       mutate((l) => {
         const next = moveTab(l, tabId, toDock);
         return dockOf(next, tabId) === toDock ? revealDock(next, toDock) : next;
-      }),
+      });
+    },
     [mutate],
   );
   const placeTabCb = useCallback(
-    (tabId: TabId, target: PlaceTarget) =>
+    (tabId: TabId, target: PlaceTarget) => {
+      if (!confirmFileEditNavigation()) return;
       mutate((l) => {
         const next = placeTab(l, tabId, target);
         return dockOf(next, tabId) === target.dock ? revealDock(next, target.dock) : next;
-      }),
+      });
+    },
     [mutate],
   );
   const toggleKind = useCallback(
-    (kind: "diff" | "terminal" | "agents" | "files", defaultDock: DockLocation) =>
+    (kind: "diff" | "terminal" | "agents" | "files", defaultDock: DockLocation) => {
+      if (!confirmFileEditNavigation()) return;
       mutate((l) => {
         // Single-instance panes toggle their tab; terminals toggle the whole group.
         if (kind === "diff" || kind === "agents" || kind === "files") {
@@ -535,16 +554,19 @@ export function usePaneLayout(sessionId: string | null, outsideRepository: boole
         if (visibleTerminal) return removeAllTerminals(l);
         const first = terminals[0]!;
         return activateOrRevealTab(l, first.dock, first.id);
-      }),
+      });
+    },
     [mutate],
   );
   const togglePlugin = useCallback(
-    (id: TabId, defaultDock: DockLocation) =>
+    (id: TabId, defaultDock: DockLocation) => {
+      if (!confirmFileEditNavigation()) return;
       mutate((l) => {
         const at = findTab(l, id);
         if (at) return isDockCollapsed(l, at.dock) ? openOrRevealTab(l, id, defaultDock) : removeTab(l, id);
         return openOrRevealTab(l, id, defaultDock);
-      }),
+      });
+    },
     [mutate],
   );
   const syncPlugins = useCallback(
@@ -552,8 +574,11 @@ export function usePaneLayout(sessionId: string | null, outsideRepository: boole
     [mutate],
   );
   const setDockCollapsedCb = useCallback(
-    (dock: DockLocation, collapsed: boolean) => mutate((l) => setDockCollapsed(l, dock, collapsed)),
-    [mutate],
+    (dock: DockLocation, collapsed: boolean) => {
+      if (isDockCollapsed(layout, dock) !== collapsed && !confirmFileEditNavigation()) return;
+      mutate((l) => setDockCollapsed(l, dock, collapsed));
+    },
+    [mutate, layout],
   );
 
   return {

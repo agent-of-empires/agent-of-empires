@@ -25,6 +25,7 @@ export interface WebSettings {
   diffViewMode: "flat" | "tree";
   diffViewLayout: "unified" | "split";
   markdownPreview: "rendered" | "raw";
+  fileEditing: boolean;
   collapsedDiffDirs: string[];
   sidebarSide: "left" | "right";
   sidebarCompact: boolean;
@@ -53,6 +54,7 @@ function getDefaults(): WebSettings {
     diffViewMode: window.innerWidth < 768 ? "flat" : "tree",
     diffViewLayout: "unified",
     markdownPreview: "rendered",
+    fileEditing: false,
     collapsedDiffDirs: [],
     sidebarSide: "left",
     sidebarCompact: false,
@@ -79,6 +81,7 @@ function normalizeSnapshot(settings: WebSettings): WebSettings {
     maxPersistentStructuredViews: normalizePersistentStructuredViewLimit(settings.maxPersistentStructuredViews),
     structuredMobileFontSize: normalizeConversationFontSize(settings.structuredMobileFontSize),
     structuredDesktopFontSize: normalizeConversationFontSize(settings.structuredDesktopFontSize),
+    fileEditing: normalizeBool(settings.fileEditing, defaults.fileEditing),
     sidebarCompact: normalizeBool(settings.sidebarCompact, defaults.sidebarCompact),
     autoOpenDiffPane: normalizeBool(settings.autoOpenDiffPane, defaults.autoOpenDiffPane),
     autoOpenTerminalPane: normalizeBool(settings.autoOpenTerminalPane, defaults.autoOpenTerminalPane),

@@ -6,15 +6,19 @@ use nix::errno::Errno;
 use nix::fcntl::{open, openat, renameat, AtFlags, OFlag};
 use nix::sys::stat::{fstat, fstatat, mkdirat, FileStat, Mode};
 use nix::unistd::{linkat, unlinkat, UnlinkatFlags};
-use std::ffi::OsString;
+use std::collections::HashSet;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 const CONFLICT_NAME_ATTEMPTS: u32 = 100;
+static FILE_EXCHANGE_DEVICES: LazyLock<parking_lot::Mutex<HashSet<libc::dev_t>>> =
+    LazyLock::new(parking_lot::Mutex::default);
 
 #[derive(Debug)]
 pub(crate) struct AnchoredDir {
@@ -27,11 +31,119 @@ pub(crate) struct FilePublication<'a> {
     pub(crate) validate: &'a dyn Fn() -> Result<()>,
 }
 
+pub(crate) struct FileExchange<'a> {
+    pub(crate) validate: &'a dyn Fn() -> Result<()>,
+    pub(crate) version: &'a dyn Fn(&mut File) -> Result<Option<String>>,
+    pub(crate) expected: &'a str,
+}
+
+#[derive(Debug)]
+pub(crate) enum FileExchangeResult {
+    Saved,
+    Conflict { preserved: Option<PathBuf> },
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0:#}")]
+pub(crate) struct FileExchangeUncertain(anyhow::Error);
+
+struct FileStage<'a> {
+    directory: &'a OwnedFd,
+    name: OsString,
+    file: File,
+    cleanup: bool,
+}
+
+impl<'a> FileStage<'a> {
+    fn new(directory: &'a OwnedFd, reader: &mut impl Read) -> Result<Self> {
+        let name = OsString::from(format!(".aoe-copy-{}", uuid::Uuid::new_v4()));
+        let fd = openat(
+            directory,
+            name.as_os_str(),
+            OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::S_IRUSR | Mode::S_IWUSR,
+        )
+        .context("creating anchored file stage")?;
+        let mut stage = Self {
+            directory,
+            name,
+            file: File::from(fd),
+            cleanup: true,
+        };
+        std::io::copy(reader, &mut stage.file).context("copying anchored file stage")?;
+        stage.file.sync_all()?;
+        Ok(stage)
+    }
+}
+
+impl Drop for FileStage<'_> {
+    fn drop(&mut self) {
+        if self.cleanup {
+            if let (Ok(held), Ok(entry)) = (
+                fstat(&self.file),
+                fstatat(
+                    self.directory,
+                    self.name.as_os_str(),
+                    AtFlags::AT_SYMLINK_NOFOLLOW,
+                ),
+            ) {
+                if same_inode(&held, &entry) {
+                    let _ = unlinkat(
+                        self.directory,
+                        self.name.as_os_str(),
+                        UnlinkatFlags::NoRemoveDir,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn same_inode(left: &FileStat, right: &FileStat) -> bool {
+    left.st_dev == right.st_dev && left.st_ino == right.st_ino
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FileExchangePhase {
+    Staged,
+    BeforeExchange,
+    AfterExchange,
+    BeforeUndo,
+    UndoExchange,
+}
+
+#[cfg(test)]
+type FileExchangeHook = Box<dyn Fn(FileExchangePhase, &Path, &Path)>;
+
+#[cfg(test)]
+fn file_exchange_hook(phase: FileExchangePhase, target: &Path, staged: &Path) {
+    FILE_EXCHANGE_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(phase, target, staged);
+        }
+    });
+}
+
 #[cfg(test)]
 thread_local! {
+    pub(crate) static FILE_EXCHANGE_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static FILE_EXCHANGE_HOOK: std::cell::RefCell<Option<FileExchangeHook>> = const { std::cell::RefCell::new(None) };
     /// Runs between the replace and its post-check in `publish_staged`.
     static AFTER_REPLACE: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
     pub(crate) static FAIL_SYNC_ONCE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct ResetExchangeHooks;
+
+#[cfg(test)]
+impl Drop for ResetExchangeHooks {
+    fn drop(&mut self) {
+        FILE_EXCHANGE_HOOK.set(None);
+        FAIL_SYNC_ONCE.set(None);
+        crate::process::EXCHANGE_ERROR.set(None);
+    }
 }
 
 /// A user-managed file link resolved once, without creating directories.
@@ -644,31 +756,8 @@ impl AnchoredDir {
                 self.remove_file(&prev)?;
                 return Ok(true);
             }
-            let mut preserved = None;
-            for attempt in 0..CONFLICT_NAME_ATTEMPTS {
-                let mut conflict = to_leaf.clone();
-                conflict.push(match attempt {
-                    0 => ".aoe-conflict".to_string(),
-                    n => format!(".aoe-conflict.{n}"),
-                });
-                match linkat(
-                    &to_parent,
-                    to_leaf.as_os_str(),
-                    &to_parent,
-                    conflict.as_os_str(),
-                    AtFlags::empty(),
-                ) {
-                    Ok(()) => {
-                        preserved = Some(conflict);
-                        break;
-                    }
-                    Err(Errno::EEXIST) => {}
-                    Err(error) => return Err(error).context("preserving the carried file"),
-                }
-            }
-            let Some(conflict) = preserved else {
-                bail!("no free name to preserve the carried file under");
-            };
+            let conflict =
+                Self::preserve_conflict(&to_parent, to_leaf.as_os_str(), to_leaf.as_os_str())?;
             renameat(
                 &prev_parent,
                 prev_leaf.as_os_str(),
@@ -736,48 +825,204 @@ impl AnchoredDir {
         let staging = publication
             .as_ref()
             .map_or(&parent, |publication| &publication.staging.fd);
-        let temporary = format!(".aoe-copy-{}", uuid::Uuid::new_v4());
-        let fd = openat(
-            staging,
-            temporary.as_str(),
-            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-            Mode::S_IRUSR | Mode::S_IWUSR,
-        )
-        .context("creating anchored file stage")?;
-        let mut file = File::from(fd);
-        let result = (|| -> Result<bool> {
-            std::io::copy(reader, &mut file).context("copying anchored file stage")?;
-            file.set_permissions(permissions)?;
-            file.sync_all()?;
-            if let Some(publication) = &publication {
-                (publication.validate)()?;
+        let stage = FileStage::new(staging, reader)?;
+        if let Some(publication) = &publication {
+            (publication.validate)()?;
+        }
+        stage.file.set_permissions(permissions)?;
+        stage.file.sync_all()?;
+        if replace {
+            nix::fcntl::renameat(staging, stage.name.as_os_str(), &parent, leaf.as_os_str())?;
+        } else {
+            match crate::process::rename_exclusive(
+                staging,
+                stage.name.as_os_str(),
+                &parent,
+                leaf.as_os_str(),
+            ) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Ok(false)
+                }
+                Err(error) => return Err(error).context("publishing anchored file seed"),
             }
-            if replace {
-                nix::fcntl::renameat(staging, temporary.as_str(), &parent, leaf.as_os_str())?;
-            } else {
-                match crate::process::rename_exclusive(
-                    staging,
-                    temporary.as_ref(),
-                    &parent,
-                    leaf.as_os_str(),
-                ) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+        }
+        if publication.is_some() {
+            nix::unistd::fsync(staging)?;
+        }
+        nix::unistd::fsync(&parent)?;
+        Ok(true)
+    }
+
+    fn preserve_conflict(parent: &OwnedFd, source: &OsStr, leaf: &OsStr) -> Result<OsString> {
+        for attempt in 0..CONFLICT_NAME_ATTEMPTS {
+            let mut conflict = leaf.to_os_string();
+            conflict.push(match attempt {
+                0 => ".aoe-conflict".to_string(),
+                n => format!(".aoe-conflict.{n}"),
+            });
+            match linkat(
+                parent,
+                source,
+                parent,
+                conflict.as_os_str(),
+                AtFlags::empty(),
+            ) {
+                Ok(()) => return Ok(conflict),
+                Err(Errno::EEXIST) => {}
+                Err(error) => return Err(error).context("preserving a conflicting file"),
+            }
+        }
+        bail!("no free name to preserve a conflicting file")
+    }
+
+    /// Cache supported devices; probe only scratch entries on a cache miss.
+    pub(crate) fn supports_file_exchange(&self) -> Result<bool> {
+        #[cfg(test)]
+        FILE_EXCHANGE_CHECKS.set(FILE_EXCHANGE_CHECKS.get() + 1);
+        self.supports_file_exchange_cached(&mut FILE_EXCHANGE_DEVICES.lock())
+    }
+
+    fn supports_file_exchange_cached(&self, supported: &mut HashSet<libc::dev_t>) -> Result<bool> {
+        let device = self.identity()?.0;
+        if supported.contains(&device) {
+            return Ok(true);
+        }
+        let mut first = FileStage::new(&self.fd, &mut std::io::empty())?;
+        let mut second = FileStage::new(&self.fd, &mut std::io::empty())?;
+        match crate::process::rename_exchange(&self.fd, &first.name, &self.fd, &second.name) {
+            Ok(()) => {
+                std::mem::swap(&mut first.name, &mut second.name);
+                supported.insert(device);
+                Ok(true)
+            }
+            Err(error) if crate::process::exchange_unsupported(&error) => Ok(false),
+            Err(error) => Err(error).context("probing atomic file exchange"),
+        }
+    }
+
+    /// Exchange first, verify the displaced version, and undo only our own publication.
+    /// Unverified entries remain reachable, including when a writer races the undo.
+    pub(crate) fn exchange_file(
+        &self,
+        relative: &Path,
+        reader: &mut impl Read,
+        permissions: std::fs::Permissions,
+        check: FileExchange<'_>,
+    ) -> Result<FileExchangeResult> {
+        let parent = self.child(relative.parent().unwrap_or(Path::new("")))?;
+        let leaf = Path::new(relative.file_name().context("file exchange needs a leaf")?);
+        #[cfg(test)]
+        let target_path = parent.path().join(leaf);
+        let mut stage = FileStage::new(&parent.fd, reader)?;
+        let staged_path = parent.path().join(&stage.name);
+        #[cfg(test)]
+        file_exchange_hook(FileExchangePhase::Staged, &target_path, &staged_path);
+        (check.validate)()?;
+        stage.file.set_permissions(permissions)?;
+        stage.file.sync_all()?;
+        let staged_stat = fstat(&stage.file)?;
+        let staged_version =
+            (check.version)(&mut stage.file)?.context("cannot verify staged file")?;
+        #[cfg(test)]
+        file_exchange_hook(
+            FileExchangePhase::BeforeExchange,
+            &target_path,
+            &staged_path,
+        );
+        stage.cleanup = false;
+        if let Err(error) =
+            crate::process::rename_exchange(&parent.fd, &stage.name, &parent.fd, leaf.as_os_str())
+        {
+            stage.cleanup = parent
+                .entry_matches(Path::new(&stage.name), &staged_stat)
+                .unwrap_or(false)
+                && (check.version)(&mut stage.file).ok().flatten().as_deref()
+                    == Some(staged_version.as_str());
+            return Err(error).context("exchanging project file");
+        }
+        let finish = || -> Result<FileExchangeResult> {
+            #[cfg(test)]
+            file_exchange_hook(FileExchangePhase::AfterExchange, &target_path, &staged_path);
+            let displaced_stat = parent.entry_stat(Path::new(&stage.name))?;
+            let read_version = |name: &Path| -> Result<Option<String>> {
+                match parent.open_regular(name, usize::MAX)? {
+                    Some(mut file) => (check.version)(&mut file),
+                    None => Ok(None),
+                }
+            };
+            let displaced_matches = read_version(Path::new(&stage.name))
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some(check.expected);
+            let target_is_ours = parent.entry_matches(leaf, &staged_stat)?;
+            let displaced_is_observed = displaced_stat.as_ref().is_some_and(|stat| {
+                parent
+                    .entry_matches(Path::new(&stage.name), stat)
+                    .unwrap_or(false)
+            });
+            if displaced_matches && target_is_ours && displaced_is_observed {
+                parent.remove_file(Path::new(&stage.name))?;
+                parent
+                    .sync()
+                    .context("file was saved, but directory sync failed")?;
+                return Ok(FileExchangeResult::Saved);
+            }
+            if target_is_ours && displaced_is_observed {
+                #[cfg(test)]
+                file_exchange_hook(FileExchangePhase::BeforeUndo, &target_path, &staged_path);
+                let undo = || -> Result<bool> {
+                    if !parent.entry_matches(leaf, &staged_stat)? {
                         return Ok(false);
                     }
-                    Err(error) => return Err(error).context("publishing anchored file seed"),
+                    #[cfg(test)]
+                    file_exchange_hook(FileExchangePhase::UndoExchange, &target_path, &staged_path);
+                    Ok(crate::process::rename_exchange(
+                        &parent.fd,
+                        &stage.name,
+                        &parent.fd,
+                        leaf.as_os_str(),
+                    )
+                    .is_ok()
+                        && parent.entry_matches(Path::new(&stage.name), &staged_stat)?
+                        && read_version(Path::new(&stage.name))
+                            .ok()
+                            .flatten()
+                            .as_deref()
+                            == Some(staged_version.as_str())
+                        && parent.entry_matches(Path::new(&stage.name), &staged_stat)?)
+                };
+                if undo()? {
+                    parent.remove_file(Path::new(&stage.name))?;
+                    parent
+                        .sync()
+                        .context("file was restored, but directory sync failed")?;
+                    return Ok(FileExchangeResult::Conflict { preserved: None });
                 }
             }
-            if publication.is_some() {
-                nix::unistd::fsync(staging)?;
-            }
-            nix::unistd::fsync(&parent)?;
-            Ok(true)
-        })();
-        if !matches!(result, Ok(true)) {
-            let _ = unlinkat(staging, temporary.as_str(), UnlinkatFlags::NoRemoveDir);
-        }
-        result
+            let preserved =
+                Self::preserve_conflict(&parent.fd, stage.name.as_os_str(), leaf.as_os_str())
+                    .with_context(|| {
+                        format!("displaced file remains at {}", staged_path.display())
+                    })?;
+            parent.sync().with_context(|| {
+                format!(
+                    "conflicting file remains at {}",
+                    parent.path().join(&preserved).display()
+                )
+            })?;
+            Ok(FileExchangeResult::Conflict {
+                preserved: Some(parent.path().join(preserved)),
+            })
+        };
+        finish().map_err(|error| FileExchangeUncertain(error).into())
+    }
+
+    fn entry_matches(&self, leaf: &Path, expected: &FileStat) -> Result<bool> {
+        Ok(self
+            .entry_stat(leaf)?
+            .is_some_and(|actual| same_inode(&actual, expected)))
     }
 
     /// The fully built stage remains available when another writer wins.
@@ -948,6 +1193,100 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_exchange_support_caches_only_successes_across_directories_on_a_device() {
+        let _hooks = ResetExchangeHooks;
+        let temporary = tempfile::tempdir().unwrap();
+        let root = AnchoredDir::open(temporary.path()).unwrap();
+        std::fs::create_dir(temporary.path().join("other")).unwrap();
+        let other = root.child(Path::new("other")).unwrap();
+        for errno in [libc::EINVAL, libc::EOPNOTSUPP, libc::ENOSYS, libc::EIO] {
+            let mut supported = HashSet::new();
+            crate::process::EXCHANGE_ERROR.set(Some(errno));
+            let result = root.supports_file_exchange_cached(&mut supported);
+            if errno == libc::EIO {
+                assert!(result.is_err());
+            } else {
+                assert!(!result.unwrap());
+            }
+            crate::process::EXCHANGE_ERROR.set(Some(libc::EIO));
+            assert!(root.supports_file_exchange_cached(&mut supported).is_err());
+            crate::process::EXCHANGE_ERROR.set(None);
+            assert!(root.supports_file_exchange_cached(&mut supported).unwrap());
+            crate::process::EXCHANGE_ERROR.set(Some(libc::EIO));
+            assert!(other.supports_file_exchange_cached(&mut supported).unwrap());
+            assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 1);
+            assert_eq!(std::fs::read_dir(other.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn failed_exchange_retains_its_error_when_cleanup_cannot_be_verified() {
+        use std::cell::Cell;
+        use std::os::unix::fs::PermissionsExt;
+
+        for fail_stat in [true, false] {
+            let _hooks = ResetExchangeHooks;
+            let temporary = tempfile::tempdir().unwrap();
+            let root = AnchoredDir::open(temporary.path()).unwrap();
+            std::fs::write(temporary.path().join("file"), b"original").unwrap();
+            let permissions = std::fs::metadata(temporary.path()).unwrap().permissions();
+            FILE_EXCHANGE_HOOK.set(Some(Box::new(move |phase, target, _| {
+                if fail_stat && phase == FileExchangePhase::BeforeExchange {
+                    std::fs::set_permissions(
+                        target.parent().unwrap(),
+                        std::fs::Permissions::from_mode(0o000),
+                    )
+                    .unwrap();
+                }
+            })));
+            let calls = Cell::new(0);
+            let version = |_: &mut File| {
+                calls.set(calls.get() + 1);
+                if !fail_stat && calls.get() == 2 {
+                    bail!("cannot read staged version");
+                }
+                Ok(Some("draft".into()))
+            };
+            crate::process::EXCHANGE_ERROR.set(Some(libc::EBUSY));
+            let result = root.exchange_file(
+                Path::new("file"),
+                &mut &b"draft"[..],
+                std::fs::Permissions::from_mode(0o600),
+                FileExchange {
+                    validate: &|| Ok(()),
+                    version: &version,
+                    expected: "original",
+                },
+            );
+            std::fs::set_permissions(temporary.path(), permissions).unwrap();
+            let error = result.unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(libc::EBUSY),
+                "{error:#}"
+            );
+            assert_eq!(calls.get(), if fail_stat { 1 } else { 2 });
+            assert_eq!(
+                std::fs::read(temporary.path().join("file")).unwrap(),
+                b"original"
+            );
+            let entries: Vec<_> = std::fs::read_dir(temporary.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            assert_eq!(entries.len(), 2);
+            let stage = entries
+                .iter()
+                .find(|entry| entry.file_name().unwrap() != "file")
+                .unwrap();
+            assert_eq!(std::fs::read(stage).unwrap(), b"draft");
+        }
+    }
 
     #[test]
     fn nested_directory_sync_failure_is_retryable() {
