@@ -5,35 +5,37 @@ import { fetchAgentInstallInfo, type AgentInstallInfo } from "../../lib/api";
 import { writeClipboard } from "../../lib/clipboard";
 import { splitInstallHint, startupErrorCause, useAdapterInstall } from "./adapterRecovery";
 import { RecoveryActionRow, type RecoveryAction } from "./RecoveryActionRow";
+import { signInSteps } from "./signInSteps";
 
 function Code({ children }: { children: React.ReactNode }) {
   return <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">{children}</code>;
 }
 
 /** Copy for the failures a reinstall won't fix, keyed off the message text. */
-function specificRemediation(message: string, agent: string | undefined, name: string): React.ReactNode {
+function specificRemediation(
+  message: string,
+  agent: string | undefined,
+  name: string,
+  sandboxed: boolean,
+): React.ReactNode {
   if (/authentic|login|api[_ -]?key/i.test(message)) {
-    if (agent === "claude" || agent === "claude-code") {
-      return (
-        <>
-          The adapter is installed but has no Claude credentials. Either set <Code>ANTHROPIC_API_KEY</Code> in the env
-          that runs <Code>aoe serve</Code>, or run <Code>claude /login</Code> in a terminal to write credentials to{" "}
-          <Code>~/.claude</Code>, then restart aoe.
-        </>
-      );
-    }
-    if (agent === "codex") {
-      return (
-        <>
-          The adapter is installed but has no Codex credentials. Either set <Code>OPENAI_API_KEY</Code> in the env that
-          runs <Code>aoe serve</Code>, or run <Code>codex login</Code> on the host, then restart aoe.
-        </>
-      );
-    }
+    const steps = signInSteps(agent, name, sandboxed);
+    // Retry respawns the Agent, which reads a new sign-in; the Daemon reads its env only at start.
     return (
       <>
-        The adapter is installed but {name} isn't signed in. Sign in to {name} or set its API key in the env that runs{" "}
-        <Code>aoe serve</Code>, then restart aoe.
+        The adapter is installed but {name} isn't signed in.{" "}
+        {steps.command ? (
+          <>
+            Run <Code>{steps.command}</Code> in a {sandboxed ? "Container" : "host"} terminal, then click{" "}
+            <strong>Retry</strong>. Or set <Code>{steps.apiKeyEnv}</Code> in the env that runs <Code>aoe serve</Code>{" "}
+            and restart <Code>aoe serve</Code>.
+          </>
+        ) : (
+          <>
+            Sign in to {name}, then click <strong>Retry</strong>. Or set its API key in the env that runs{" "}
+            <Code>aoe serve</Code> and restart <Code>aoe serve</Code>.
+          </>
+        )}
       </>
     );
   }
@@ -165,7 +167,12 @@ export function StartupErrorBanner({
   }, [sessionId, infoRequest]);
 
   const name = info?.display_name ?? AGENT_IN_MESSAGE.exec(message)?.[1] ?? "The agent";
-  const specific = specificRemediation(message, info?.agent ?? AGENT_IN_MESSAGE.exec(message)?.[1], name);
+  const specific = specificRemediation(
+    message,
+    info?.agent ?? AGENT_IN_MESSAGE.exec(message)?.[1],
+    name,
+    info?.sandboxed === true,
+  );
   const canInstall = !specific && info?.install_allowed === true && info.npm_installable;
   const busy = retryState === "retrying" || install.state === "installing";
 

@@ -1,11 +1,20 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+
+vi.mock("../../../lib/clipboard", () => ({ writeClipboard: vi.fn(() => Promise.resolve(true)) }));
+vi.mock("../../../lib/api", () => ({ restartSession: vi.fn() }));
 
 import { AuthStatusHint } from "../ComposerControls";
+import type { SignInContext } from "../SignInPopover";
 import type { AuthStatus } from "../../../lib/acpTypes";
+import { restartSession } from "../../../lib/api";
+import { writeClipboard } from "../../../lib/clipboard";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+});
 
 const chip = () => screen.queryByTestId("composer-auth-status");
 
@@ -29,16 +38,6 @@ describe("AuthStatusHint", () => {
     expect(el.className).not.toContain("status-error");
   });
 
-  it("gives the known logged-out state its own treatment", () => {
-    render(<AuthStatusHint authStatus={{ kind: "none", label: "Not logged in" }} />);
-    const el = chip()!;
-    expect(el.textContent).toContain("Not logged in");
-    expect(el.getAttribute("data-auth-kind")).toBe("none");
-    expect(el.className).toContain("status-error-text");
-    // It reports the identity, so it must not claim a credential failed.
-    expect(el.getAttribute("aria-label")).not.toMatch(/invalid|expired/i);
-  });
-
   it("keeps the account email out of the rendered text", () => {
     render(
       <AuthStatusHint
@@ -59,5 +58,123 @@ describe("AuthStatusHint", () => {
     expect(el.tabIndex).toBe(0);
     fireEvent.focus(el);
     expect(screen.getByRole("tooltip").textContent).toContain("someone@example.com");
+  });
+});
+
+describe("AuthStatusHint signed out", () => {
+  const signIn = (over: Partial<SignInContext> = {}): SignInContext => ({
+    sessionId: "s1",
+    agent: "claude",
+    agentName: "Claude Code",
+    sandboxed: false,
+    onOpenTerminal: vi.fn(),
+    canRestart: true,
+    ...over,
+  });
+  const renderSignedOut = (context?: SignInContext) =>
+    render(<AuthStatusHint authStatus={{ kind: "none", label: "Not logged in" }} signIn={context} />);
+  const trigger = () => screen.getByRole("button", { name: "Not logged in" });
+  const dialog = () => screen.queryByRole("dialog");
+
+  it("is a button that opens the Agent's sign-in steps", () => {
+    renderSignedOut(signIn());
+    const button = trigger();
+    // A native button, so Enter and Space open it too.
+    expect(button.tagName).toBe("BUTTON");
+    expect(button.getAttribute("type")).toBe("button");
+    expect(button.getAttribute("aria-haspopup")).toBe("dialog");
+    expect(button.getAttribute("aria-expanded")).toBe("false");
+    // It reports the identity, so it must not claim a credential failed.
+    expect(button.getAttribute("aria-describedby")).toBeTruthy();
+    expect(document.getElementById(button.getAttribute("aria-describedby")!)!.textContent).not.toMatch(
+      /invalid|expired/i,
+    );
+
+    fireEvent.click(button);
+    expect(button.getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByRole("dialog", { name: "Claude Code isn't signed in" })).toBeTruthy();
+    expect(screen.getByTestId("sign-in-command").textContent).toBe("claude auth login");
+    expect(dialog()!.textContent).toContain("host terminal");
+    expect(dialog()!.textContent).toContain("ANTHROPIC_API_KEY");
+  });
+
+  it("names no command for an Agent aoe has no steps for", () => {
+    renderSignedOut(signIn({ agent: "opencode", agentName: "OpenCode" }));
+    fireEvent.click(trigger());
+    expect(screen.queryByTestId("sign-in-command")).toBeNull();
+    expect(dialog()!.textContent).toContain("Sign in to OpenCode, then restart the Agent.");
+  });
+
+  it.each([
+    ["Escape", true],
+    ["an outside click", false],
+  ])("closes on %s; only Escape puts focus back on the button", (_how, refocus) => {
+    renderSignedOut(signIn());
+    fireEvent.click(trigger());
+    const copy = screen.getByRole("button", { name: "Copy command" });
+    copy.focus();
+    if (refocus) fireEvent.keyDown(copy, { key: "Escape" });
+    else fireEvent.mouseDown(document.body);
+    expect(dialog()).toBeNull();
+    expect(document.activeElement === trigger()).toBe(refocus);
+  });
+
+  it("copies exactly the command it shows", async () => {
+    renderSignedOut(signIn({ agent: "codex", agentName: "Codex", sandboxed: true }));
+    fireEvent.click(trigger());
+    const shown = screen.getByTestId("sign-in-command").textContent;
+    fireEvent.click(screen.getByRole("button", { name: "Copy command" }));
+    await screen.findByRole("button", { name: "Copied" });
+    expect(writeClipboard).toHaveBeenCalledWith(shown);
+    expect(shown).toBe("codex login --device-auth");
+  });
+
+  it.each([
+    [true, "container"],
+    [false, "host"],
+  ])("Open Terminal in a Session sandboxed: %s opens its %s shell", (sandboxed, mode) => {
+    const onOpenTerminal = vi.fn();
+    renderSignedOut(signIn({ sandboxed, onOpenTerminal }));
+    fireEvent.click(trigger());
+    fireEvent.click(screen.getByRole("button", { name: "Open Terminal" }));
+    expect(onOpenTerminal).toHaveBeenCalledWith(mode);
+    expect(dialog()).toBeNull();
+  });
+
+  it.each([
+    ["a server that allows both", signIn(), ["Open Terminal", "Restart Agent"]],
+    // App omits the terminal and restart where read-only or CityHall mode refuses them.
+    ["a read-only or CityHall server", signIn({ onOpenTerminal: undefined, canRestart: false }), []],
+    ["no Structured view context", undefined, []],
+  ])("offers the actions %s allows", (_label, context, actions) => {
+    renderSignedOut(context);
+    fireEvent.click(trigger());
+    for (const name of ["Open Terminal", "Restart Agent"]) {
+      expect(!!screen.queryByRole("button", { name })).toBe(actions.includes(name));
+    }
+  });
+
+  it("Restart Agent restarts the Session once and says why it failed", async () => {
+    let answer!: (r: { ok: boolean; message?: string }) => void;
+    vi.mocked(restartSession).mockReturnValueOnce(new Promise((r) => (answer = r)));
+    renderSignedOut(signIn());
+    fireEvent.click(trigger());
+    fireEvent.click(screen.getByRole("button", { name: "Restart Agent" }));
+    const busy = screen.getByRole("button", { name: "Restarting…" }) as HTMLButtonElement;
+    expect(busy.disabled).toBe(true);
+    fireEvent.click(busy);
+    expect(restartSession).toHaveBeenCalledTimes(1);
+    expect(restartSession).toHaveBeenCalledWith("s1");
+    await act(async () => answer({ ok: false, message: "session is busy" }));
+    expect(screen.getByRole("status").textContent).toBe("Couldn't restart the Agent: session is busy");
+    expect(screen.getByRole("button", { name: "Restart Agent" })).toBeTruthy();
+  });
+
+  it("closes once the restart is accepted", async () => {
+    vi.mocked(restartSession).mockResolvedValueOnce({ ok: true });
+    renderSignedOut(signIn());
+    fireEvent.click(trigger());
+    fireEvent.click(screen.getByRole("button", { name: "Restart Agent" }));
+    await waitFor(() => expect(dialog()).toBeNull());
   });
 });

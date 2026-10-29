@@ -241,20 +241,26 @@ describe("StartupErrorBanner auth remediation", () => {
     {
       agent: "claude",
       info: claude(),
-      present: ["claude /login", "ANTHROPIC_API_KEY"],
-      absent: ["codex login"],
+      present: ["claude auth login", "host terminal", "ANTHROPIC_API_KEY", "restart aoe serve"],
+      absent: ["codex login", "claude /login"],
     },
     {
       agent: "codex",
       info: claude({ agent: "codex", display_name: "Codex" }),
       present: ["codex login", "OPENAI_API_KEY"],
-      absent: ["claude /login", "ANTHROPIC_API_KEY"],
+      absent: ["claude auth login", "ANTHROPIC_API_KEY", "--device-auth"],
+    },
+    {
+      agent: "codex",
+      info: claude({ agent: "codex", display_name: "Codex", sandboxed: true }),
+      present: ["codex login --device-auth", "Container terminal"],
+      absent: ["host terminal"],
     },
     {
       agent: "opencode",
       info: opencode,
-      present: ["OpenCode isn't signed in"],
-      absent: ["claude /login", "codex login"],
+      present: ["OpenCode isn't signed in", "Sign in to OpenCode"],
+      absent: ["claude auth login", "codex login"],
     },
   ])("names the $agent login step, not another agent's", async ({ agent, info, present, absent }) => {
     stubApi({ info: json(info) });

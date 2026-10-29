@@ -33,6 +33,7 @@ import {
   AuthStatusHint,
   UsageHint,
 } from "./ComposerControls";
+import type { SignInContext } from "./SignInPopover";
 import {
   acceptForCaps,
   composerWrapperLayout,
@@ -77,6 +78,8 @@ interface Props {
   setConfigOption: (configId: string, value: string) => void | Promise<void>;
   sessionUsage: AcpState["sessionUsage"];
   authStatus: AcpState["authStatus"];
+  /** Feeds the Not logged in label's sign-in steps and actions. */
+  signIn?: SignInContext;
   availableCommands: AcpState["availableCommands"];
   /** WS open and worker healthy. Sends still work when false; they queue until resume. */
   connected: boolean;
@@ -357,7 +360,7 @@ export function Composer(props: Props) {
                   onSetProvider={provider.set}
                   providerLockedReason={turnActive ? "Switch providers once the turn finishes" : null}
                 />
-                <AuthStatusHint authStatus={props.authStatus} />
+                <AuthStatusHint authStatus={props.authStatus} signIn={props.signIn} />
                 <UsageHint usage={props.sessionUsage} />
               </div>
 

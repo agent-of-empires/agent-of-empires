@@ -2,7 +2,7 @@ import { lazy, Suspense } from "react";
 
 import { StructuredSessionStack } from "./StructuredSessionStack";
 import { TerminalSessionStack } from "./TerminalSessionStack";
-import { PairedShellPane } from "./PairedTerminal";
+import { PairedShellPane, type ShellMode } from "./PairedTerminal";
 import { BackgroundAgentsPanel } from "./acp/BackgroundAgentsPanel";
 import { hasStartedBefore } from "./acp/startupWait";
 import { FilesPane } from "./FilesPane";
@@ -30,6 +30,13 @@ interface Props {
   onOpenAgentsPane: () => void;
   /** Opens the switch-view confirmation for that Session; omitted where it can't switch. */
   onSwitchToTerminal?: (sessionId: string) => void;
+  /** Shows that Session's paired shell in `mode`; omitted where the terminal can't be used. */
+  onOpenTerminal?: (sessionId: string, mode: ShellMode) => void;
+  /** Whether this server lets the dashboard restart an Agent. */
+  canRestartAgent: boolean;
+  /** The active Session's mode for its primary paired shell. */
+  shellMode: ShellMode;
+  onShellModeChange: (mode: ShellMode) => void;
   pairedMounted: boolean;
   activeSession: SessionResponse | null;
   activeSessionId: string | null;
@@ -77,6 +84,10 @@ export function MobileMainPane({
   onBackToAgent,
   onOpenAgentsPane,
   onSwitchToTerminal,
+  onOpenTerminal,
+  canRestartAgent,
+  shellMode,
+  onShellModeChange,
   pairedMounted,
   activeSession,
   activeSessionId,
@@ -162,6 +173,8 @@ export function MobileMainPane({
                     onOpenAgentsPane={onOpenAgentsPane}
                     isSandboxed={session.is_sandboxed}
                     onSwitchToTerminal={onSwitchToTerminal ? () => onSwitchToTerminal(session.id) : undefined}
+                    onOpenTerminal={onOpenTerminal ? (mode) => onOpenTerminal(session.id, mode) : undefined}
+                    canRestartAgent={canRestartAgent}
                   />
                 </Suspense>
               )}
@@ -193,6 +206,8 @@ export function MobileMainPane({
               sessionId={activeSessionId}
               readOnly={readOnly}
               active={view === "paired"}
+              mode={shellMode}
+              onModeChange={onShellModeChange}
             />
           </div>
         )}

@@ -2,7 +2,7 @@ import { useState } from "react";
 import { LiveTerminalView } from "./LiveTerminalView";
 import type { SessionResponse } from "../lib/types";
 
-type ShellMode = "host" | "container";
+export type ShellMode = "host" | "container";
 
 /** Host/container shell shared by desktop docks and the mobile paired view. */
 export function PairedShellPane({
@@ -11,6 +11,8 @@ export function PairedShellPane({
   sessionId,
   active = true,
   terminalIndex = 0,
+  mode,
+  onModeChange,
 }: {
   readOnly: boolean;
   session: SessionResponse | null;
@@ -19,8 +21,13 @@ export function PairedShellPane({
   /** Which paired-terminal instance this tab renders (#2437). 0 is the
    *  primary shell shared with the native TUI. */
   terminalIndex?: number;
+  /** The owner's mode for this Session's shell; the pane keeps its own when omitted. */
+  mode?: ShellMode;
+  onModeChange?: (mode: ShellMode) => void;
 }) {
-  const [shellMode, setShellMode] = useState<ShellMode>("host");
+  const [ownMode, setOwnMode] = useState<ShellMode>("host");
+  const shellMode = mode ?? ownMode;
+  const setShellMode = onModeChange ?? setOwnMode;
   const isSandboxed = session?.is_sandboxed ?? false;
   // Container mode is only valid while the session is sandboxed; derive the
   // effective mode during render rather than resetting state in an effect, so

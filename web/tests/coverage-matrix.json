@@ -3745,9 +3745,10 @@
       "components": [
         "web/src/components/acp/StructuredView.tsx",
         "web/src/components/acp/StartupErrorBanner.tsx",
-        "web/src/components/acp/RecoveryActionRow.tsx"
+        "web/src/components/acp/RecoveryActionRow.tsx",
+        "web/src/components/acp/signInSteps.ts"
       ],
-      "notes": "Auth-required startup errors name the agent's own login step: Claude keeps claude /login and ANTHROPIC_API_KEY, Codex gets codex login and OPENAI_API_KEY, other agents get generic sign-in copy with no Claude or Codex commands."
+      "notes": "Auth-required startup errors name the agent's own sign-in step from signInSteps.ts: Claude gets claude auth login and ANTHROPIC_API_KEY, Codex gets codex login (codex login --device-auth in a Container) and OPENAI_API_KEY, other agents get generic sign-in copy with no Claude or Codex commands."
     },
     {
       "id": "acp.startup-error-banner-actions",
@@ -4543,7 +4544,26 @@
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/components/acp/__tests__/AuthStatusHint.test.tsx", "src/lib/acpTypes.test.ts"],
-      "components": ["web/src/components/acp/ComposerControls.tsx", "web/src/lib/acpTypes.ts"]
+      "components": [
+        "web/src/components/acp/ComposerControls.tsx",
+        "web/src/components/acp/SignInPopover.tsx",
+        "web/src/lib/acpTypes.ts"
+      ],
+      "notes": "A signed-out label is a button opening the Agent's sign-in steps; Open Terminal and Restart Agent follow the server's terminal and mutation gates."
+    },
+    {
+      "id": "acp.sign-in-steps",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/acp-sign-in-steps.spec.ts"],
+      "components": [
+        "web/src/components/acp/ComposerControls.tsx",
+        "web/src/components/acp/SignInPopover.tsx",
+        "web/src/components/acp/signInSteps.ts",
+        "web/src/components/PairedTerminal.tsx",
+        "web/src/hooks/usePairedShellModes.ts"
+      ],
+      "notes": "Keyboard open, Escape returns focus, Copy takes claude auth login, Open Terminal shows the host paired shell, Restart Agent posts once; read-only and CityHall servers show only the command."
     },
     {
       "id": "story.wizard-open-close",
