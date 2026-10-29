@@ -1512,6 +1512,14 @@ fn resolve_named_tool(tool: &str, config: &crate::session::Config) -> Result<Nam
     {
         return Ok(NamedToolSelection::Custom(name.to_string()));
     }
+    if config
+        .session
+        .custom_agents
+        .get(name)
+        .is_some_and(|command| command.trim().is_empty())
+    {
+        bail!("custom agent '{name}' has an empty command");
+    }
 
     let mut safe_names: Vec<String> = crate::agents::agent_names()
         .into_iter()
@@ -1554,7 +1562,7 @@ fn resolve_sandbox_image(
 mod tests {
     use super::{
         check_effort_request, hooks_when_trust_declined, override_launch_binary, parse_repo_base,
-        resolve_sandbox_image,
+        resolve_named_tool, resolve_sandbox_image,
     };
     use crate::session::config::repo_config::TrustSurface;
     use crate::session::config::SessionConfig;
@@ -1581,6 +1589,62 @@ mod tests {
             config.default_tool = configured.map(str::to_owned);
             assert_eq!(super::default_tool_for_add(&config, &available), expected);
         }
+    }
+    #[test]
+    #[serial_test::serial]
+    fn blank_custom_agent_can_fall_back_to_plugin() {
+        struct ReloadRegistryAfterEnv;
+        impl Drop for ReloadRegistryAfterEnv {
+            fn drop(&mut self) {
+                crate::plugin::reload_registry();
+            }
+        }
+
+        let _reload_registry = ReloadRegistryAfterEnv;
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let manifest = r#"
+id = "acme.agent"
+name = "Agent"
+version = "1.0.0"
+api_version = 19
+
+[[agent_integrations]]
+tool = "plugin-helper"
+command = "plugin-helper --safe"
+"#;
+        let plugin_dir = crate::plugin::plugins_dir().unwrap().join("acme.agent");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(plugin_dir.join("aoe-plugin.toml"), manifest).unwrap();
+
+        let mut stored_config = crate::session::Config::default();
+        stored_config.plugins.insert(
+            "acme.agent".into(),
+            crate::session::config::PluginConfig {
+                grant: Some(crate::session::CapabilityGrant {
+                    manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(manifest.as_bytes()),
+                    capabilities: Vec::new(),
+                    granted_at: chrono::Utc::now(),
+                }),
+                ..Default::default()
+            },
+        );
+        crate::session::update_config(|config| *config = stored_config).unwrap();
+        crate::plugin::reload_registry();
+
+        let mut config = crate::session::Config::default();
+        config
+            .session
+            .custom_agents
+            .insert("plugin-helper".into(), String::new());
+        let selection = resolve_named_tool("plugin-helper", &config).unwrap();
+        assert!(matches!(
+            selection,
+            super::NamedToolSelection::Custom(name) if name == "plugin-helper"
+        ));
+        assert_eq!(
+            config.session.resolve_tool_command("plugin-helper"),
+            "plugin-helper --safe"
+        );
     }
 
     #[test]
