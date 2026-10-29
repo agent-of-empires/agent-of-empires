@@ -227,25 +227,6 @@ describe("AskUserQuestionCard submission", () => {
     expect(onResolve).toHaveBeenCalledWith({ action });
   });
 
-  it("shows a rollback message when onResolve rejects", async () => {
-    const onResolve = vi.fn<(r: ElicitationResolution) => Promise<void>>().mockRejectedValue(new Error("boom"));
-    render(
-      <AskUserQuestionCard
-        elicitation={{
-          nonce: "n",
-          message: "m",
-          tool_call_id: null,
-          questions: [q({ field_key: "q", default: "x" })],
-          requested_at: "2026-01-01T00:00:00Z",
-          resolved: null,
-        }}
-        onResolve={onResolve}
-      />,
-    );
-    submit();
-    expect(await screen.findByText("Could not reach the server. Try again.")).toBeTruthy();
-  });
-
   it("disables controls and shows the offline banner when the server is down", () => {
     setServerDown(true);
     const onResolve = renderCard([q({ field_key: "q" })]);

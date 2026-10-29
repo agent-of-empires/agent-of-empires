@@ -118,6 +118,10 @@ including legacy errors without metadata. Reattach and optimistic submission do
 not retire the diagnostic; an accepted next prompt, explicit dismissal, or
 successful intentional clear/switch does. Transient request errors are not
 persisted in the browser cache.
+Approval and elicitation resolution hooks reject failed HTTP and network
+submissions so their cards restore controls for retry of the same nonce.
+HTTP failures retain HTTP diagnostics, not a network-error label. Retrying a
+destructive approval still requires a fresh complete hold.
 
 
 ## Terminal handoff

@@ -1,8 +1,14 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { applyEvent, emptyAcpState } from "../../../lib/acpTypes";
+import type { AcpState, Approval, Elicitation, ReducedState } from "../../../lib/acpTypes";
+import { setServerDown } from "../../../lib/connectionState";
+import { clearAcpCache, useAcpSession } from "../../../hooks/useAcpSession";
+import { flushAsync, installAcpFakes, json, lastSocket, profileWrapper } from "../../../hooks/__tests__/acpHarness";
+import { ApprovalCard } from "../ApprovalCard";
+import { AskUserQuestionCard } from "../AskUserQuestionCard";
 import { reducer } from "../../../hooks/acpSession/reducer";
 import {
   SessionBanners,
@@ -57,6 +63,203 @@ describe("operation and interaction error banners", () => {
     expect(screen.queryByText("approval HTTP request failed")).toBeNull();
     expect(state.lastErrorEvidence).toEqual(evidence ?? null);
   });
+});
+
+describe("interaction card retries through the session hook", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    clearAcpCache();
+    setServerDown(false);
+  });
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    clearAcpCache();
+    localStorage.clear();
+  });
+
+  for (const kind of ["approval", "elicitation"] as const) {
+    for (const failure of ["http", "network"] as const) {
+      it.each(["success", "already-resolved"] as const)(
+        `${kind} ${failure} failure enables retry and reveals the canonical error after %s`,
+        async (confirmation) => {
+          const sessionId = "interaction-retry";
+          const nonce = "pending-card";
+          const path = kind === "approval" ? "approvals" : "elicitations";
+          let attempts = 0;
+          const calls = installAcpFakes((call) => {
+            if (call.method !== "POST" || !call.url.endsWith(`/acp/${path}/${nonce}`)) return undefined;
+            attempts += 1;
+            if (attempts === 1) {
+              if (failure === "network") throw new TypeError("offline request");
+              return new Response("INTERACTION_HTTP_FAILURE", { status: 503 });
+            }
+            return confirmation === "success" ? json({}) : new Response(`No pending ${kind} ${nonce}`, { status: 404 });
+          });
+          let latest!: AcpState;
+          function InteractionSession() {
+            const acp = useAcpSession(sessionId);
+            latest = acp.state;
+            return (
+              <>
+                <SessionBanners
+                  sessionId={sessionId}
+                  state={acp.state}
+                  acpWorkerState="running"
+                  startingAgent={null}
+                  trashedAt={null}
+                  archivedAt={null}
+                  snoozedUntil={null}
+                  dismissError={acp.dismissError}
+                />
+                {acp.state.pendingApprovals.map((approval) => (
+                  <ApprovalCard
+                    key={approval.nonce}
+                    approval={approval}
+                    onResolve={(decision, optionId) => acp.resolveApproval(approval.nonce, decision, optionId)}
+                  />
+                ))}
+                {acp.state.pendingElicitations.map((elicitation) => (
+                  <AskUserQuestionCard
+                    key={elicitation.nonce}
+                    elicitation={elicitation}
+                    onResolve={(resolution) => acp.resolveElicitation(elicitation.nonce, resolution)}
+                  />
+                ))}
+              </>
+            );
+          }
+          render(<InteractionSession />, { wrapper: profileWrapper });
+          await flushAsync();
+          lastSocket().open();
+          await flushAsync();
+          const approval: Approval = {
+            nonce,
+            destructive: false,
+            requested_at: "2026-01-01T00:00:00Z",
+            tool_call: {
+              id: "pending-tool",
+              name: "Bash",
+              kind: "execute",
+              args_preview: "{}",
+              started_at: "2026-01-01T00:00:00Z",
+            },
+          };
+          const elicitation: Elicitation = {
+            nonce,
+            message: "Answer the question",
+            tool_call_id: null,
+            requested_at: "2026-01-01T00:00:00Z",
+            resolved: null,
+            questions: [
+              {
+                field_key: "answer",
+                title: null,
+                description: null,
+                required: true,
+                kind: "free_text",
+                options: [],
+                default: "yes",
+              },
+            ],
+          };
+          const canonical = "canonical operation failure";
+          const evidence = {
+            source: "local_prompt_result",
+            operation: "prompt",
+            runtime: "unknown",
+            observed_at_ms: 100,
+          } as const;
+          const requested: ReducedState = {
+            agent: "claude",
+            model: null,
+            mode: "Default",
+            current_plan: null,
+            in_flight_tool: null,
+            pending_approvals: kind === "approval" ? [approval] : [],
+            pending_elicitations: kind === "elicitation" ? [elicitation] : [],
+            thinking: null,
+            rate_limit: null,
+            available_commands: [],
+            available_modes: [],
+            current_mode_id: null,
+            turn_active: true,
+            cancelling: false,
+            compacting: false,
+            operation_error: null,
+          };
+          const buttonName = kind === "approval" ? "Allow" : "Submit";
+          lastSocket().message({ session_id: sessionId, seq: 1, event: { UserPromptSent: { text: "request A" } } });
+          lastSocket().message({
+            session_id: sessionId,
+            seq: 2,
+            event:
+              kind === "approval" ? { ApprovalRequested: { approval } } : { ElicitationRequested: { elicitation } },
+          });
+          // Pending cards are daemon-folded control state, not a client fold
+          // of the raw request event. Establish the actual card before failure.
+          lastSocket().message({ kind: "reduced_state", state: requested });
+          await flushAsync();
+          expect((screen.getByRole("button", { name: buttonName }) as HTMLButtonElement).disabled).toBe(false);
+          expect(latest.pendingApprovals.map((card) => card.nonce)).toEqual(kind === "approval" ? [nonce] : []);
+          expect(latest.pendingElicitations.map((card) => card.nonce)).toEqual(kind === "elicitation" ? [nonce] : []);
+          expect(attempts).toBe(0);
+          lastSocket().message({
+            session_id: sessionId,
+            seq: 3,
+            event: { PromptRuntimeError: { message: canonical, evidence } },
+          });
+          lastSocket().message({ session_id: sessionId, seq: 4, event: { Stopped: { reason: "prompt_failed" } } });
+          lastSocket().message({
+            kind: "reduced_state",
+            state: { ...requested, turn_active: false, operation_error: evidence },
+          });
+          await flushAsync();
+          expect(screen.getByText(canonical)).toBeTruthy();
+          if (kind === "elicitation") {
+            fireEvent.change(screen.getByPlaceholderText("Type your answer"), { target: { value: "retained answer" } });
+          }
+          fireEvent.click(screen.getByRole("button", { name: buttonName }));
+          const noun = kind === "approval" ? "approval" : "question";
+          const message =
+            failure === "http"
+              ? `Could not resolve ${noun} (503). INTERACTION_HTTP_FAILURE`
+              : `Network error resolving ${noun}: offline request`;
+          expect(await screen.findByText(message)).toBeTruthy();
+          await waitFor(() =>
+            expect((screen.getByRole("button", { name: buttonName }) as HTMLButtonElement).disabled).toBe(false),
+          );
+          if (kind === "approval") {
+            for (const name of ["Always", "Deny"]) {
+              expect((screen.getByRole("button", { name }) as HTMLButtonElement).disabled).toBe(false);
+            }
+          }
+          if (failure === "http") expect(screen.queryByText(/Network error resolving/)).toBeNull();
+          expect(screen.queryByText(canonical)).toBeNull();
+          expect(latest.lastError).toBe(canonical);
+          expect(latest.lastErrorEvidence).toEqual(evidence);
+          expect(latest.interactionError?.target).toEqual({ kind, nonce });
+          fireEvent.click(screen.getByRole("button", { name: buttonName }));
+          await waitFor(() => expect(screen.queryByRole("button", { name: buttonName })).toBeNull());
+          expect(screen.getByText(canonical)).toBeTruthy();
+          expect(screen.queryByText(message)).toBeNull();
+          expect(latest.lastError).toBe(canonical);
+          expect(latest.lastErrorEvidence).toEqual(evidence);
+          expect(latest.interactionError).toBeNull();
+          expect(latest.pendingApprovals).toHaveLength(0);
+          expect(latest.pendingElicitations).toHaveLength(0);
+          const resolutions = calls.filter(
+            (call) => call.method === "POST" && call.url.endsWith(`/acp/${path}/${nonce}`),
+          );
+          expect(resolutions).toHaveLength(2);
+          expect(resolutions[1]!.body).toBe(resolutions[0]!.body);
+          expect(JSON.parse(resolutions[1]!.body!)).toEqual(
+            kind === "approval" ? { decision: "Allow" } : { action: "accept", answers: { answer: "retained answer" } },
+          );
+        },
+      );
+    }
+  }
 });
 
 describe("SnoozedWorkerStoppedBanner", () => {
