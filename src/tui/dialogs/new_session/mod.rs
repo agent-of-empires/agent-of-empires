@@ -1052,8 +1052,7 @@ impl NewSessionDialog {
 
         self.env_list_expanded = false;
         self.env_editing_input = None;
-        self.hook_env.expanded = false;
-        self.hook_env.editing_input = None;
+        self.hook_env = HookEnvList::default();
         self.sandbox_config_mode = false;
         self.sandbox_focused_field = 0;
         self.worktree_config_mode = false;
@@ -2011,7 +2010,8 @@ impl NewSessionDialog {
             self.error_message = list
                 .entries
                 .get(list.selected_index)
-                .and_then(|entry| crate::session::validate_env_entry(entry));
+                .and_then(|entry| crate::session::validate_env_entry(entry))
+                .map(|w| w.replace("empty in the container", "skipped by the host hook"));
         }
         result
     }

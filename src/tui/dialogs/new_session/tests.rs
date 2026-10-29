@@ -870,6 +870,45 @@ fn hook_env_is_submitted_only_with_sandbox_and_stays_out_of_container_env() {
 }
 
 #[test]
+#[serial_test::serial]
+fn hook_env_does_not_survive_a_profile_switch() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let mut dialog = single_tool_dialog();
+    dialog.available_profiles = vec!["default".to_string(), "other".to_string()];
+    dialog.profile_descriptions = vec![None, None];
+    dialog.docker_available = true;
+    dialog.sandbox_enabled = true;
+    dialog.hook_env.entries = vec!["TOKEN=from-default".to_string()];
+
+    dialog.focused_field = 0;
+    dialog.handle_key(key(KeyCode::Right));
+    assert_eq!(dialog.selected_profile(), "other");
+
+    dialog.sandbox_enabled = true;
+    assert!(dialog.hook_env.entries.is_empty());
+    assert!(submitted(dialog.build_submit_result()).hook_env.is_empty());
+}
+
+#[test]
+fn an_unset_hook_env_variable_warns_about_the_host_hook_not_the_container() {
+    let mut dialog = single_tool_dialog();
+    dialog.sandbox_config_mode = true;
+    dialog.sandbox_focused_field = SANDBOX_HOOK_ENV_FIELD;
+    dialog.hook_env.expanded = true;
+
+    dialog.handle_hook_env_list_key(key(KeyCode::Char('a')));
+    for ch in "AOE_TEST_UNSET_HOOK_VAR".chars() {
+        dialog.handle_hook_env_list_key(key(KeyCode::Char(ch)));
+    }
+    dialog.handle_hook_env_list_key(key(KeyCode::Enter));
+
+    let warning = dialog.error_message.expect("warning for unset variable");
+    assert!(warning.contains("skipped by the host hook"), "{warning}");
+    assert!(!warning.contains("container"), "{warning}");
+}
+
+#[test]
 fn structured_view_setting_gates_the_offer_and_sets_the_default() {
     use crate::session::config::StructuredView;
     for (view, offered, starts_structured) in [
