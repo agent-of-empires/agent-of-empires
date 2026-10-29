@@ -150,6 +150,7 @@ impl SessionResponse {
                 builtin_acp_registry().get(resolved).is_some()
             },
             acp_session_id: inst.acp_session_id.clone(),
+            import_pending: inst.import_pending == Some(true),
             // Resolved like `acp_capable`: `agent_name` when non-empty, else
             // `tool`. This is the ACP registry key, so it matches the
             // `/api/acp/agents` names the switch-agent modal filters on (#2803).

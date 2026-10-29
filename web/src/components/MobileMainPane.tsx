@@ -4,6 +4,7 @@ import { StructuredSessionStack } from "./StructuredSessionStack";
 import { TerminalSessionStack } from "./TerminalSessionStack";
 import { PairedShellPane } from "./PairedTerminal";
 import { BackgroundAgentsPanel } from "./acp/BackgroundAgentsPanel";
+import { hasStartedBefore } from "./acp/startupWait";
 import { FilesPane } from "./FilesPane";
 import { DiffFileList } from "./diff/DiffFileList";
 import { DiffFileViewer } from "./diff/DiffFileViewer";
@@ -144,6 +145,7 @@ export function MobileMainPane({
                     rateLimitAutoResume={session.rate_limit_auto_resume}
                     tool={session.tool}
                     acpAgent={session.acp_agent ?? null}
+                    startedBefore={hasStartedBefore(session)}
                     acpProvider={session.acp_provider ?? null}
                     clearAliases={session.clear_aliases}
                     archivedAt={session.archived_at ?? null}

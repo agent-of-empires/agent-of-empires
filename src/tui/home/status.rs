@@ -1088,6 +1088,9 @@ impl HomeView {
                     crate::daemon::TrashRelocationOutcome::Failed { reason } => {
                         self.record_runtime_message(format!("{id}: Session is in Trash, but its worktree relocation is incomplete: {reason}"));
                     }
+                    crate::daemon::TrashRelocationOutcome::TeardownFailed { reason } => {
+                        self.record_runtime_message(format!("{id}: Session is in Trash, but its tmux sessions could not be stopped: {reason}"));
+                    }
                     crate::daemon::TrashRelocationOutcome::Relocated {
                         warning: Some(warning),
                     } => self.record_runtime_message(format!("{id}: {warning}")),

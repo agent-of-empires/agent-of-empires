@@ -1663,8 +1663,9 @@
       "id": "sidebar.drawer-swipe",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/hooks/useDrawerSwipe.test.ts"],
-      "components": ["web/src/hooks/useDrawerSwipe.ts"]
+      "specs": ["src/hooks/useDrawerSwipe.test.ts", "tests/mobile-panes.spec.ts"],
+      "components": ["web/src/hooks/useDrawerSwipe.ts"],
+      "notes": "Active chat text selection blocks both drawer swipe directions, including selection beginning mid-gesture. Cancellation lasts through touchend; a fresh swipe works after selection clears. Browser coverage preserves a DOM selection in the mobile chat while both drawers stay closed."
     },
     {
       "id": "sidebar.context-resume",
@@ -3556,6 +3557,14 @@
       "notes": "#4475: notice_timeout_secs is capped at 2147483 so its millisecond delay fits a browser setTimeout, and PromptStrips clamps the delay for older configs above the cap. SessionNoticesStrip.test.tsx covers the boundary: a timeout past the timer limit does not dismiss at once and fires only after the clamped delay."
     },
     {
+      "id": "acp.queued-strip-tooltip",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": ["tests/acp-queued-tooltip.spec.ts", "src/components/acp/QueuedPromptsStrip.test.tsx"],
+      "components": ["web/src/components/acp/PromptStrips.tsx", "web/src/components/acp/StructuredView.tsx"],
+      "reason": "The queued-messages header is a keyboard-reachable Tooltip trigger, not a title, and says the Daemon holds the queue; a strip with an unconfirmed row says it isn't sent yet."
+    },
+    {
       "id": "acp.queue-send-now",
       "kind": "vitest",
       "risk": "medium",
@@ -3715,7 +3724,7 @@
         "web/src/components/acp/PromptStrips.tsx",
         "web/src/components/acp/ComposerControls.tsx"
       ],
-      "notes": "A new Session shows one startup line naming the Agent with an elapsed count, switching to a neutral line at 15s with no duration or delivery promise; the queued strip and Send button say what they wait for. Reduced motion holds one breathe frame. First-dial backoff keeps the startup line; exhausted retries stop it and expose Reconnect even before the first successful connection. The disconnected new-Session Send and Queue follow-up labels and titles use Pending until the Agent is ready; connected Send and resumed-Session copy remain unchanged."
+      "notes": "A new Session shows one startup line naming the Agent with an elapsed count, switching to a neutral line at 15s with no duration or delivery promise; the queued strip and Send button say what they wait for. Reduced motion holds one breathe frame. First-dial backoff keeps the startup line; exhausted retries stop it and expose Reconnect even before the first successful connection. The disconnected new-Session Send and Queue follow-up labels and titles use Pending until the Agent is ready; connected Send and resumed-Session copy remain unchanged. A Session that already has an acp_session_id (an older one) never shows the startup line, including before its replay loads; an import still pending its history does show it."
     },
     {
       "id": "acp.startup-error-screen",
@@ -3985,7 +3994,8 @@
         "web/src/components/sidebar/SidebarGroupHeader.tsx",
         "web/src/components/sidebar/GroupLists.tsx",
         "web/src/components/sidebar/keyboardNav.ts"
-      ]
+      ],
+      "notes": "Arrow keys over headers and rows on every axis, including nested and org lists; Left on a collapsed nested header goes to its parent; the Snoozed & archived toggle is a header for its rows; Archive all that empties a Group moves focus to the nearest remaining Group header, never the toggle, and not after focus moved elsewhere."
     },
     {
       "id": "story.sidebar-plan-progress",
@@ -4566,6 +4576,19 @@
       ]
     },
     {
+      "id": "wizard.project-default-agent",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/wizard-project.spec.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/ProjectsSection.tsx",
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/profileDefaults.ts"
+      ],
+      "notes": "A saved project with no sessions opens the wizard on the profile default_tool (#5008)."
+    },
+    {
       "id": "story.wizard-browse-disk",
       "kind": "mocked-playwright",
       "risk": "low",
@@ -4679,7 +4702,8 @@
         "web/src/lib/registeredProjects.ts",
         "web/src/lib/sidebarGroups.ts",
         "web/src/hooks/useRepoGroups.ts",
-        "web/src/hooks/useProjects.ts"
+        "web/src/hooks/useProjects.ts",
+        "web/src/components/sidebar/SidebarGroupHeader.tsx"
       ]
     },
     {
@@ -4687,7 +4711,12 @@
       "kind": "mocked-playwright",
       "risk": "high",
       "specs": ["tests/sidebar-project-pin.spec.ts"],
-      "components": ["web/src/App.tsx", "web/src/lib/api.ts", "web/src/hooks/useProjects.ts"]
+      "components": [
+        "web/src/App.tsx",
+        "web/src/lib/api.ts",
+        "web/src/hooks/useProjects.ts",
+        "web/src/components/ProjectsSection.tsx"
+      ]
     },
     {
       "id": "sidebar.active-project-settings",
