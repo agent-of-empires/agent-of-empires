@@ -79,6 +79,7 @@ describe("QueuedPromptsStrip", () => {
     ["a new Session names the Agent it waits for", true, "Claude Code", "Pending until Claude Code is ready (1)"],
     ["a resumed Session waits to resume", true, null, "Pending until session resumes (1)"],
     ["a running Session just queues", false, "Claude Code", "Queued (1)"],
+    ["an open connection holds an unconfirmed row", false, null, "Queuing (1)", false, true],
     ["a running Worker with the connection down keeps a confirmed row queued", true, null, "Queued (1)", true],
     [
       "a running Worker with the connection down holds an unconfirmed row",

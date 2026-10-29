@@ -304,7 +304,7 @@ export function QueuedPromptsStrip({
                 : connecting
                   ? `${queued.some((q) => q.pending) ? "Pending until connected" : "Queued"} (${queued.length})`
                   : `Pending until session resumes (${queued.length})`
-              : `Queued (${queued.length})`}
+              : `${queued.some((q) => q.pending) ? "Queuing" : "Queued"} (${queued.length})`}
           </span>
         </Tooltip>
         {queued.length > 1 && (
