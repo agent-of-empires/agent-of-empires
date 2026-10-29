@@ -100,7 +100,7 @@ export function SidebarLegend() {
         type="button"
         onClick={toggle}
         aria-label="What do these symbols mean?"
-        aria-haspopup="dialog"
+        // A disclosure, not `aria-haspopup="dialog"`: only the phone sheet is a dialog.
         aria-expanded={!!menu}
         data-testid="sidebar-legend-toggle"
         className={`${TOOLBAR_BUTTON} ${TOOLBAR_TINT(!!menu)} text-sm font-semibold`}
@@ -145,6 +145,7 @@ export function SidebarLegend() {
               <Row mark={<Pin className="inline h-3 w-3 -rotate-45 text-brand-400" />} meaning={MARK_MEANING.pinned} />
               <Row mark={<span className="text-favorite">✦</span>} meaning={MARK_MEANING.favorite} />
               <Row mark={<span className="text-[10px] text-text-dim">◆</span>} meaning={MARK_MEANING.pinnedProject} />
+              <Row mark={<span className="text-[10px] text-text-dim">◇</span>} meaning={MARK_MEANING.project} />
               <Row
                 mark={<span className={`inline-block h-2 w-2 rounded-full ${STATUS_DOT_CLASS.Running}`} />}
                 meaning={MARK_MEANING.groupDot}
