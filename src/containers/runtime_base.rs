@@ -187,9 +187,13 @@ impl RuntimeBase {
         Err(DockerError::InspectFailed(sanitize_stderr(stderr)))
     }
 
+    fn is_podman(&self) -> bool {
+        std::path::Path::new(self.binary).file_name() == Some("podman".as_ref())
+    }
+
     pub fn command(&self) -> Command {
         let mut command = Command::new(self.binary);
-        if self.binary == "podman" {
+        if self.is_podman() {
             command.env_remove("INVOCATION_ID");
         }
         command
@@ -201,7 +205,7 @@ impl RuntimeBase {
     /// slice.
     fn command_in_slice(&self, slice: Option<&str>, container: &str) -> Command {
         let words = slice
-            .filter(|_| self.binary == "podman")
+            .filter(|_| self.is_podman())
             .and_then(|slice| crate::process::systemd::container_scope_prefix(slice, container));
         let Some(words) = words else {
             return self.command();
@@ -215,7 +219,7 @@ impl RuntimeBase {
     /// written at creation. `HostConfig.CgroupParent` is no substitute: Podman
     /// reports `user.slice` for containers created without a parent.
     fn recorded_cgroup_parent(&self, name: &str) -> Option<String> {
-        if self.binary != "podman"
+        if !self.is_podman()
             || self.cgroup_probe.is_none()
             || !crate::process::systemd::scopes_available()
         {
@@ -635,7 +639,7 @@ impl RuntimeBase {
     /// Only Podman reads the default from configuration; an unreadable answer
     /// leaves the flag off.
     fn default_cgroups_mode_allows_parent(&self, env: &[(String, String)]) -> bool {
-        if self.binary != "podman" {
+        if !self.is_podman() {
             return true;
         }
         let mut cmd = self.command();
@@ -1440,6 +1444,360 @@ mod tests {
                     "com.agent-of-empires.shared-credential-mounts=/root/.claude/.credentials.json",
                     "com.agent-of-empires.agent-tool=claude",
                 ]
+            );
+        }
+    }
+
+    /// A shell stand-in for `podman`/`docker` and `systemd-run`; both append
+    /// their argv to one log, and `systemd-run` then execs what follows `--`.
+    #[cfg(unix)]
+    struct Spec {
+        docker: bool,
+        info: Option<&'static str>,
+        label: Option<&'static str>,
+        mode: &'static str,
+        scopes: bool,
+    }
+
+    #[cfg(unix)]
+    struct Fake {
+        dir: tempfile::TempDir,
+        runtime: RuntimeBase,
+        _scope: Option<crate::process::systemd::container_scope_fixture::Installed>,
+    }
+
+    #[cfg(unix)]
+    const SLICE: &str = "background-aoe-main.slice";
+
+    #[cfg(unix)]
+    fn spec() -> Spec {
+        Spec {
+            docker: false,
+            info: Some("systemd true"),
+            label: Some(SLICE),
+            mode: "enabled",
+            scopes: true,
+        }
+    }
+
+    #[cfg(unix)]
+    impl Spec {
+        fn build(self) -> Fake {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("log");
+            let write = |name: &str, body: String| {
+                let path = dir.path().join(name);
+                let script = format!(
+                    "#!/bin/sh\necho \"$(basename \"$0\") $* AOE_X=$AOE_X\" >> '{}'\n{body}\n",
+                    log.display()
+                );
+                std::fs::write(&path, script).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+                path
+            };
+            let reply = |value: Option<&str>| match value {
+                Some(value) => format!("echo '{value}'"),
+                None => "exit 1".to_string(),
+            };
+            let name = if self.docker { "docker" } else { "podman" };
+            let binary = write(
+                name,
+                format!(
+                    "case \"$1\" in\n\
+                     info) {} ;;\n\
+                     inspect) {} ;;\n\
+                     run) if [ \"$2\" = --help ]; then echo '  --cgroups string  (default \"{}\")'; else echo fake-id; fi ;;\n\
+                     esac",
+                    reply(self.info),
+                    reply(self.label),
+                    self.mode,
+                ),
+            );
+            let systemd_run = write(
+                "systemd-run",
+                "while [ \"$1\" != -- ]; do shift; done; shift; exec \"$@\"".to_string(),
+            );
+            let base = if self.docker {
+                RuntimeBase::DOCKER
+            } else {
+                RuntimeBase::PODMAN
+            };
+            Fake {
+                runtime: RuntimeBase {
+                    binary: Box::leak(binary.to_string_lossy().into_owned().into_boxed_str()),
+                    ..base
+                },
+                _scope: self.scopes.then(|| {
+                    crate::process::systemd::container_scope_fixture::install(&systemd_run)
+                }),
+                dir,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Fake {
+        fn log(&self) -> Vec<String> {
+            std::fs::read_to_string(self.dir.path().join("log"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+
+        fn ran(&self, prefix: &str) -> bool {
+            self.log().iter().any(|line| line.starts_with(prefix))
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn can_join_user_slice_reads_the_runtime_probe() {
+        let cases = [
+            (false, Some("systemd true"), true),
+            (false, Some("systemd false"), false),
+            (false, Some("cgroupfs true"), false),
+            (false, None, false),
+            (true, Some("systemd [name=seccomp name=rootless]"), true),
+            (true, Some("systemd [name=seccomp]"), false),
+        ];
+        for (docker, info, expected) in cases {
+            let fake = Spec {
+                docker,
+                info,
+                ..spec()
+            }
+            .build();
+            let env = vec![("AOE_X".to_string(), "1".to_string())];
+            assert_eq!(
+                fake.runtime.can_join_user_slice(&env),
+                expected,
+                "{docker} {info:?}"
+            );
+            let (query, _) = fake.runtime.cgroup_probe.unwrap();
+            assert_eq!(
+                fake.log(),
+                [format!(
+                    "{} info --format {query} AOE_X=1",
+                    if docker { "docker" } else { "podman" }
+                )]
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorded_cgroup_parent_reads_the_label_back() {
+        let cases = [
+            (spec(), Some(SLICE)),
+            (
+                Spec {
+                    label: Some(""),
+                    ..spec()
+                },
+                None,
+            ),
+            (
+                Spec {
+                    label: Some("../x.slice"),
+                    ..spec()
+                },
+                None,
+            ),
+            (
+                Spec {
+                    label: None,
+                    ..spec()
+                },
+                None,
+            ),
+            (
+                Spec {
+                    docker: true,
+                    ..spec()
+                },
+                None,
+            ),
+            (
+                Spec {
+                    scopes: false,
+                    ..spec()
+                },
+                None,
+            ),
+        ];
+        for (spec, expected) in cases {
+            let (docker, scopes) = (spec.docker, spec.scopes);
+            let fake = spec.build();
+            assert_eq!(
+                fake.runtime.recorded_cgroup_parent("c1").as_deref(),
+                expected,
+                "docker={docker} scopes={scopes}"
+            );
+            let inspected = fake.ran("podman inspect --format");
+            assert_eq!(inspected, !docker && scopes);
+            if inspected {
+                assert!(fake.log()[0].contains(&format!(
+                    "index .Config.Labels \"{CGROUP_PARENT_LABEL}\"}}}} c1"
+                )));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_create_scopes_podman_into_the_session_slice() {
+        let config = ContainerConfig {
+            cgroup_parent: Some(SLICE.to_string()),
+            ..Default::default()
+        };
+        // (spec, `--cgroup-parent` passed); without scopes the parent is passed unwrapped
+        let cases = [
+            (spec(), true),
+            (
+                Spec {
+                    info: Some("systemd false"),
+                    ..spec()
+                },
+                false,
+            ),
+            (
+                Spec {
+                    info: Some("cgroupfs true"),
+                    ..spec()
+                },
+                false,
+            ),
+            (
+                Spec {
+                    info: None,
+                    ..spec()
+                },
+                false,
+            ),
+            (
+                Spec {
+                    mode: "disabled",
+                    ..spec()
+                },
+                false,
+            ),
+            (
+                Spec {
+                    scopes: false,
+                    ..spec()
+                },
+                true,
+            ),
+            (
+                Spec {
+                    docker: true,
+                    info: Some("systemd [name=rootless]"),
+                    ..spec()
+                },
+                true,
+            ),
+        ];
+        for (spec, placed) in cases {
+            let (docker, scopes) = (spec.docker, spec.scopes);
+            let fake = spec.build();
+            let id = fake
+                .runtime
+                .run_create("c1", "alpine:latest", &config)
+                .unwrap();
+            assert_eq!(id, "fake-id");
+            let log = fake.log();
+            let run = log
+                .iter()
+                .find(|line| {
+                    line.starts_with(if docker {
+                        "docker run -d"
+                    } else {
+                        "podman run -d"
+                    })
+                })
+                .unwrap_or_else(|| panic!("no create call: {log:?}"));
+            assert_eq!(
+                run.contains(&format!("--cgroup-parent {SLICE}")),
+                placed,
+                "{log:?}"
+            );
+            let wrapped = !docker && placed && scopes;
+            assert_eq!(fake.ran("systemd-run"), wrapped, "{log:?}");
+            if wrapped {
+                let scope = log.iter().find(|l| l.starts_with("systemd-run")).unwrap();
+                assert!(scope.contains("--user --scope"), "{scope}");
+                assert!(scope.contains(&format!("--slice={SLICE}")), "{scope}");
+                assert!(scope.contains("--unit=aoe-container-c1-"), "{scope}");
+                assert!(scope.contains("-u INVOCATION_ID"), "{scope}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn start_container_rejoins_the_recorded_slice() {
+        let cases = [
+            (spec(), true),
+            (
+                Spec {
+                    label: Some(""),
+                    ..spec()
+                },
+                false,
+            ),
+            (
+                Spec {
+                    scopes: false,
+                    ..spec()
+                },
+                false,
+            ),
+            (
+                Spec {
+                    docker: true,
+                    ..spec()
+                },
+                false,
+            ),
+        ];
+        for (spec, scoped) in cases {
+            let docker = spec.docker;
+            let fake = spec.build();
+            fake.runtime.start_container("c1").unwrap();
+            let log = fake.log();
+            assert_eq!(fake.ran("systemd-run"), scoped, "{log:?}");
+            let name = if docker { "docker" } else { "podman" };
+            assert_eq!(log.last().unwrap(), &format!("{name} start c1 AOE_X="));
+            if scoped {
+                assert!(log.iter().any(
+                    |l| l.starts_with("systemd-run") && l.contains(&format!("--slice={SLICE}"))
+                ));
+            }
+        }
+    }
+
+    /// Against a real daemon, when one is running; skipped otherwise.
+    #[test]
+    fn cgroup_probe_template_is_accepted_by_a_real_runtime() {
+        for base in [&DOCKER, &PODMAN] {
+            let Some((query, _)) = base.cgroup_probe else {
+                continue;
+            };
+            if !base.is_available() || !base.is_daemon_running() {
+                continue;
+            }
+            let mut cmd = base.command();
+            cmd.args(["info", "--format", query]);
+            let output = base.probe_output(&mut cmd).unwrap();
+            assert!(output.status.success(), "{}: {output:?}", base.name);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut words = stdout.split_whitespace();
+            assert!(
+                matches!(words.next(), Some("systemd" | "cgroupfs")) && words.next().is_some(),
+                "{}: {stdout}",
+                base.name
             );
         }
     }
