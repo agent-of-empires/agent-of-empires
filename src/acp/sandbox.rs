@@ -426,6 +426,34 @@ esac
     #[tokio::test]
     #[serial_test::serial]
     #[serial_test::serial(hook_base)]
+    async fn reusing_a_container_replaces_a_stale_stored_id() {
+        let _app = crate::session::test_support::isolate_app_dir();
+        crate::session::config::update_config(|config| {
+            config.sandbox.container_runtime = crate::session::ContainerRuntimeName::Docker;
+        })
+        .unwrap();
+        let (runtime, _path) = construction_runtime();
+        let project = runtime.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let mut instance = construction_instance(&project);
+        let _hooks = ConstructionHookCleanup(instance.id.clone());
+        let sandbox = instance.sandbox_info.as_mut().unwrap();
+        sandbox.container_id = Some("replaced-long-ago".into());
+        let name = sandbox.container_name.clone();
+        seed_running_resource(runtime.path(), "live-id", &name);
+        let (_state, store) = native(&instance).await;
+        let (built, _container, created) = construct_for_test(store, instance).await;
+        assert!(!created);
+        assert_eq!(
+            built.sandbox_info.unwrap().container_id.as_deref(),
+            Some("live-id")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
     async fn unpublished_sandbox_cleanup_preserves_resource_ownership() {
         for case in ["created", "reused", "replacement", "gone", "cleanup-fails"] {
             let _app = crate::session::test_support::isolate_app_dir();
