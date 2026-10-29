@@ -160,6 +160,22 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn accept_admits_a_same_uid_peer_as_owner() {
+        use axum::serve::Listener as _;
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("daemon/api.sock");
+        let (mut listener, _lease) = bind_private(&path).await.unwrap();
+        let _client = tokio::net::UnixStream::connect(&path).await.unwrap();
+        let (_stream, peer) = listener.accept().await;
+        let owner = nix::unistd::geteuid().as_raw();
+        assert!(matches!(peer, ConnectionPeer::UnixOwner { uid } if uid == owner));
+    }
+
+    #[tokio::test]
     async fn socket_replacement_preserves_live_and_newer_owners() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().canonicalize().unwrap();

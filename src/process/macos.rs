@@ -93,8 +93,20 @@ pub(super) fn rename_exclusive(
     result.map_err(std::io::Error::from)
 }
 
+/// tokio reads the peer through `LOCAL_PEERCRED`, the macOS counterpart of Linux `SO_PEERCRED`.
 pub(crate) fn unix_peer_uid(stream: &tokio::net::UnixStream) -> std::io::Result<u32> {
     Ok(stream.peer_cred()?.uid())
+}
+
+#[cfg(test)]
+mod peer_uid_tests {
+    #[tokio::test]
+    async fn connected_pair_reports_the_process_uid() {
+        let (a, b) = tokio::net::UnixStream::pair().unwrap();
+        let uid = nix::unistd::geteuid().as_raw();
+        assert_eq!(super::unix_peer_uid(&a).unwrap(), uid);
+        assert_eq!(super::unix_peer_uid(&b).unwrap(), uid);
+    }
 }
 /// Run the child at background priority so a mass file delete does not saturate
 /// `fseventsd` and stall the rest of the machine.
