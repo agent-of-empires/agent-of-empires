@@ -313,6 +313,69 @@ describe("SandboxImageBanner", () => {
     }
   });
 
+  it("polls fast from Update now even while its reply is held", async () => {
+    await mount(status());
+    pullSandboxImage.mockImplementationOnce(() => new Promise(() => {}));
+    const before = fetchSandboxImageStatus.mock.calls.length;
+    fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+    // No visibility change, reconnect or reply: the click alone starts the fast cadence.
+    await pollAfter(0);
+    await pollAfter(2000);
+    await pollAfter(2000);
+    expect(fetchSandboxImageStatus.mock.calls.length).toBe(before + 3);
+    expect(banner()?.getAttribute("aria-label")).toBe("Downloading sandbox image");
+  });
+
+  it("ignores a reply from a pull attempt that Retry superseded", async () => {
+    await mount(status());
+    type Reply = { ok: boolean; message?: string };
+    const replies: ((r: Reply) => void)[] = [];
+    pullSandboxImage.mockImplementation(() => new Promise<Reply>((resolve) => replies.push(resolve)));
+    const label = () => banner()?.getAttribute("aria-label");
+    // Attempt A runs and fails while its reply is still held.
+    fetchSandboxImageStatus.mockResolvedValue(status({ pull: { state: "running" } }));
+    fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+    await pollAfter(0);
+    fetchSandboxImageStatus.mockResolvedValue(status({ pull: { state: "failed", error: "A failed" } }));
+    await pollAfter(2000);
+    expect(label()).toBe("Couldn't download the sandbox image");
+
+    // Attempt B: A's late refusal must neither clear B's progress nor show A's message.
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(label()).toBe("Downloading sandbox image");
+    await act(async () => replies[0]!({ ok: false, message: "A was refused" }));
+    await pollAfter(0);
+    expect(label()).toBe("Downloading sandbox image");
+    expect(banner()?.textContent).not.toContain("A was refused");
+
+    fetchSandboxImageStatus.mockResolvedValue(status({ pull: { state: "running" } }));
+    await pollAfter(2000);
+    await act(async () => replies[1]!({ ok: true }));
+    fetchSandboxImageStatus.mockResolvedValue(status({ state: "current", pull: { state: "done" } } as never));
+    await pollAfter(2000);
+    expect(label()).toBe("Sandbox image updated");
+    pullSandboxImage.mockImplementation(() => Promise.resolve({ ok: true }));
+  });
+
+  it("after a watched pull, offers an image published since, but not the one it pulled", async () => {
+    // (status once the pull is done, banner)
+    const cases: [string, Partial<SandboxImageStatus>, string][] = [
+      ["now current", { state: "current" } as Partial<SandboxImageStatus>, "Sandbox image updated"],
+      ["the pulled digest still offered", {}, "Sandbox image updated"],
+      ["a newer digest", { remote_digest: "sha256:newer" }, "Sandbox image update available"],
+    ];
+    for (const [name, after, want] of cases) {
+      const { unmount } = await mount(status());
+      fetchSandboxImageStatus.mockResolvedValue(status({ pull: { state: "running" } }));
+      fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+      await pollAfter(0);
+      fetchSandboxImageStatus.mockResolvedValue(status({ ...after, pull: { state: "done" } }));
+      await pollAfter(2000);
+      expect(banner()?.getAttribute("aria-label"), name).toBe(want);
+      unmount();
+    }
+  });
+
   it("hides an earlier available update once a check fails", async () => {
     await mount(status());
     expect(banner()).not.toBeNull();
