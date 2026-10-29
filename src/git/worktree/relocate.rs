@@ -221,12 +221,12 @@ impl GitWorktree {
         if to.exists() {
             return Err(GitError::WorktreeAlreadyExists(to.to_path_buf()));
         }
+        let (from_str, to_str) = (path_str(from)?, path_str(to)?);
         if worktree_has_submodule_admin_state(from) {
             return self.relocate_worktree_with_submodules(from, to);
         }
         let observation_from = canonicalize_move_endpoint(from);
         let observation_to = canonicalize_move_endpoint(to);
-        let (from_str, to_str) = (path_str(from)?, path_str(to)?);
 
         tracing::info!(target: "git.worktree",
             from = %from.display(),
