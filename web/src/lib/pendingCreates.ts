@@ -14,6 +14,8 @@ export interface PendingCreate {
   since: number;
   /** `create_boot_id` of the daemon run the first attempt went to; null when unknown. */
   origin: string | null;
+  /** Set on the stored copy only: `hook_env` is held in memory, never written to storage. */
+  hookEnvRedacted?: boolean;
 }
 
 // Never a real boot id, so a retry whose origin was not captured is fenced on any
@@ -51,6 +53,8 @@ let registry: Map<string, PendingCreate> | null = null;
 const claimed = new Set<string>();
 const reconciling = new Set<string>();
 const reportedUnsaved = new Set<string>();
+// Stored creates that carried hook env: it did not survive the reload, so they are never resent.
+const lostHookEnv: PendingCreate[] = [];
 
 /** Past the server's replay window, a retry could re-run a create that already failed. */
 export const isPendingCreateExpired = (since: number) => Date.now() - since >= PENDING_CREATE_MAX_AGE_MS;
@@ -75,7 +79,11 @@ function entries(): Map<string, PendingCreate> {
   try {
     const parsed: unknown = JSON.parse(safeGetItem(STORAGE_KEY) ?? "[]");
     if (Array.isArray(parsed)) {
-      for (const p of parsed) if (isWellFormed(p)) registry.set(p.body.idempotency_key, p);
+      for (const p of parsed) {
+        if (!isWellFormed(p)) continue;
+        if (p.hookEnvRedacted) lostHookEnv.push(p);
+        else registry.set(p.body.idempotency_key, p);
+      }
     }
   } catch {
     // A corrupt mirror is dropped; nothing else can recover it.
@@ -85,7 +93,11 @@ function entries(): Map<string, PendingCreate> {
 
 function persist(): void {
   const list = [...entries().values()];
-  if (safeSetItem(STORAGE_KEY, JSON.stringify(list))) return;
+  // Host hooks are a documented use for secrets, so their env stays out of storage.
+  const stored = list.map((p) =>
+    p.body.hook_env?.length ? { ...p, body: { ...p.body, hook_env: undefined }, hookEnvRedacted: true } : p,
+  );
+  if (safeSetItem(STORAGE_KEY, JSON.stringify(stored))) return;
   for (const p of list) {
     if (reportedUnsaved.has(p.body.idempotency_key)) continue;
     reportedUnsaved.add(p.body.idempotency_key);
@@ -184,6 +196,16 @@ export function resolvePendingCreate(key: string): void {
 /** Register the app's outcome handlers and resume creates left unresolved by an earlier page. */
 export function startPendingCreates(next: PendingCreateHandlers): void {
   handlers = next;
+  entries();
+  if (lostHookEnv.length) {
+    persist();
+    for (const p of lostHookEnv.splice(0)) {
+      handlers.onUnknown(
+        "Host hook environment is not kept across reloads, so this session was not retried. Check the session list, then relaunch.",
+        p,
+      );
+    }
+  }
   // `reconcile` reports one that aged out while no page was open.
   for (const pending of entries().values()) void reconcile(pending);
 }

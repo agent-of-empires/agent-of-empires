@@ -456,13 +456,18 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
     /// Stop a worker, keeping its agent-side transcript resumable.
     pub async fn shutdown(&self, session_id: &str) -> Result<(), SupervisorError> {
-        self.shutdown_with_reason(session_id, "user_stopped", false, None)
+        self.shutdown_with_reason(session_id, "user_stopped", false, None, None)
             .await
     }
 
-    /// Stop a worker reclaimed for inactivity.
-    pub async fn shutdown_idle(&self, session_id: &str) -> Result<(), SupervisorError> {
-        self.shutdown_with_reason(session_id, "idle_auto_stop", false, None)
+    /// Stop a worker reclaimed for inactivity; with `observed`, only while
+    /// that epoch is still the running one.
+    pub(crate) async fn shutdown_idle(
+        &self,
+        session_id: &str,
+        observed: Option<&Lease>,
+    ) -> Result<(), SupervisorError> {
+        self.shutdown_with_reason(session_id, "idle_auto_stop", false, None, observed)
             .await
     }
 
@@ -505,7 +510,13 @@ impl<S: BroadcastSink> Supervisor<S> {
             .and_then(|target| target.identity)
             .or_else(|| record_before.as_ref().map(RunnerIdentity::from_record));
         let stopped = self
-            .shutdown_with_reason(session_id, "user_stopped", delete_adapter_state, expected)
+            .shutdown_with_reason(
+                session_id,
+                "user_stopped",
+                delete_adapter_state,
+                expected,
+                None,
+            )
             .await;
         // The existing synchronous teardown grace precedes the settlement wait.
         let deadline = tokio::time::Instant::now() + deadline;
@@ -572,12 +583,22 @@ impl<S: BroadcastSink> Supervisor<S> {
         stop_reason: &str,
         delete_adapter_state: bool,
         expected: Option<&RetirementTarget>,
+        observed: Option<&Lease>,
     ) -> Result<(), SupervisorError> {
         // Same lock order as `begin_resume`, so a resume cannot slip between
         // the decision and the handle removal.
         let mut workers = self.workers.lock().await;
         let decision = {
             let mut lifecycle = lock_recover(&self.lifecycle);
+            if observed.is_some_and(|observed| {
+                lifecycle
+                    .running(session_id)
+                    .map(|(lease, _)| lease)
+                    .as_ref()
+                    != Some(observed)
+            }) {
+                return Err(SupervisorError::Superseded(session_id.into()));
+            }
             if let Some(target) = expected {
                 if !lifecycle.prepare_captured_stop(session_id, target.lease.as_ref()) {
                     return Err(SupervisorError::TeardownPending(session_id.into()));
@@ -3037,7 +3058,13 @@ mod tests {
                 None
             };
             let result = sup
-                .shutdown_with_reason("s-delete-owned", "user_stopped", true, Some(&retirement))
+                .shutdown_with_reason(
+                    "s-delete-owned",
+                    "user_stopped",
+                    true,
+                    Some(&retirement),
+                    None,
+                )
                 .await;
             assert!(!deleted.load(std::sync::atomic::Ordering::SeqCst));
             if replace_lease {
@@ -3194,7 +3221,7 @@ mod tests {
         let close_response = closed
             .await
             .expect("original close entered after workers removal");
-        sup.shutdown_with_reason("s-escalate", "purged", true, None)
+        sup.shutdown_with_reason("s-escalate", "purged", true, None, None)
             .await
             .unwrap();
         close_response

@@ -37,6 +37,9 @@ pub struct AcpBroadcastFrame {
     /// Which installed worker produced this frame, for in-process
     /// consumers that must reject a replaced worker's queued frames. Never serialized.
     pub worker_generation: Option<u64>,
+    /// The sidebar status right after this frame's event was folded, when the
+    /// control cache was warm at publish. Never serialized.
+    pub sidebar_status: Option<crate::session::Status>,
 }
 
 impl Serialize for AcpBroadcastFrame {
@@ -65,6 +68,7 @@ impl<'de> Deserialize<'de> for AcpBroadcastFrame {
             seq: w.seq,
             event: Arc::new(w.event),
             worker_generation: None,
+            sidebar_status: None,
         })
     }
 }
@@ -321,6 +325,7 @@ mod tests {
                 started_at: chrono::Utc::now(),
             }),
             worker_generation: None,
+            sidebar_status: None,
         };
         let json = serde_json::to_string(&frame).unwrap();
         assert!(

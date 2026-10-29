@@ -1,6 +1,7 @@
 //! `AcpState`: the structured view session state, folded from `Event`s by a single writer.
 
 use crate::daemon::PromptAttachmentRef;
+use crate::session::Status;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -411,6 +412,17 @@ pub struct BackgroundAgentRecord {
     pub warning: Option<String>,
 }
 
+/// What the main turn is doing for the sidebar. Kept apart from `turn_active`,
+/// which dispatch reads and which must not follow display-only signals.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SidebarPhase {
+    #[default]
+    Idle,
+    Active,
+    Waiting,
+    Error,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AcpState {
     pub session_id: AcpSessionId,
@@ -466,6 +478,9 @@ pub struct AcpState {
     /// `has_active_background_agent()`.
     #[serde(default)]
     pub turn_active: bool,
+    /// Sidebar projection input; rebuilt from the log, so never serialized.
+    #[serde(skip)]
+    pub sidebar_phase: SidebarPhase,
     /// A mid-turn prompt is injected into the running turn rather than queued.
     #[serde(default)]
     pub steering: bool,
@@ -841,11 +856,26 @@ impl AcpState {
             || self.background_agents.iter().any(|a| a.ended_at.is_none())
     }
 
+    /// The sidebar status this state implies. A live background agent keeps
+    /// the row `Running` between main turns.
+    pub fn sidebar_status(&self) -> Status {
+        match self.sidebar_phase {
+            SidebarPhase::Error => Status::Error,
+            SidebarPhase::Waiting => Status::Waiting,
+            SidebarPhase::Active => Status::Running,
+            SidebarPhase::Idle if self.has_active_background_agent() => Status::Running,
+            SidebarPhase::Idle => Status::Idle,
+        }
+    }
+
     pub fn apply_event(&mut self, seq: u64, event: Event) -> Result<u64, StateError> {
         match event {
             Event::PlanUpdated { plan } => self.current_plan = Some(plan),
             Event::TodoListUpdated { todos } => self.todos = todos,
-            Event::ToolCallStarted { tool_call } => self.start_tool_call(tool_call),
+            Event::ToolCallStarted { tool_call } => {
+                self.sidebar_phase = SidebarPhase::Active;
+                self.start_tool_call(tool_call)
+            }
             Event::ToolCallCompleted { tool_call_id, .. } => {
                 if self
                     .in_flight_tool
@@ -885,7 +915,10 @@ impl AcpState {
                     }
                 }
             }
-            Event::ApprovalRequested { approval } => self.pending_approvals.push(approval),
+            Event::ApprovalRequested { approval } => {
+                self.sidebar_phase = SidebarPhase::Waiting;
+                self.pending_approvals.push(approval)
+            }
             Event::ApprovalResolved { nonce, .. } => {
                 let pos = self
                     .pending_approvals
@@ -895,6 +928,7 @@ impl AcpState {
                 if self.pending_approvals.remove(pos).resolved.is_some() {
                     return Err(StateError::ApprovalAlreadyResolved(nonce));
                 }
+                self.sidebar_phase = SidebarPhase::Active;
             }
             Event::ElicitationRequested { elicitation } => {
                 // The asking tool call is now waiting on the user, not running.
@@ -904,10 +938,12 @@ impl AcpState {
                 {
                     self.in_flight_tool = None;
                 }
+                self.sidebar_phase = SidebarPhase::Waiting;
                 self.pending_elicitations.push(elicitation)
             }
             Event::ElicitationResolved { nonce, .. } => {
                 self.pending_elicitations.retain(|e| e.nonce != nonce);
+                self.sidebar_phase = SidebarPhase::Active;
             }
             Event::DiffEmitted { diff } => {
                 self.recent_diffs.push(diff);
@@ -922,6 +958,7 @@ impl AcpState {
                     started_at: Utc::now(),
                 });
                 self.turn_active = true;
+                self.sidebar_phase = SidebarPhase::Active;
             }
             Event::ThinkingEnded => self.thinking = None,
             Event::RateLimit { info } => self.rate_limit = Some(info),
@@ -985,19 +1022,29 @@ impl AcpState {
                     reason,
                 });
             }
-            Event::PromptRuntimeError { .. } | Event::AgentStartupError { .. } => {
+            Event::PromptRuntimeError { .. } => {
                 self.turn_active = false;
                 self.cancelling = false;
             }
+            Event::AgentStartupError { .. } => {
+                self.turn_active = false;
+                self.cancelling = false;
+                self.sidebar_phase = SidebarPhase::Error;
+            }
             Event::CancelRequested { .. } => self.cancelling = true,
             Event::Stopped { reason } => self.end_turn(&reason),
-            Event::IncompatibleAgent { detail } => self.startup_error = Some(detail),
+            Event::IncompatibleAgent { detail } => {
+                self.startup_error = Some(detail);
+                self.sidebar_phase = SidebarPhase::Error;
+            }
             Event::UserPromptSent { .. } | Event::UserDiffCommentsPrompt { .. } => self.open_turn(),
             Event::PromptCapabilities { steering, .. } => self.steering = steering,
             Event::AcpSessionAssigned { .. } => {
                 self.startup_error = None;
                 self.rate_limit = None;
+                self.heal_sidebar_phase();
             }
+            Event::RateLimitAutoResumed { .. } => self.heal_sidebar_phase(),
             Event::SessionContextReset { .. } => self.usage = None,
             // Clears the conversation; adapter-scoped commands, modes and
             // selectors are never re-announced, so they stay.
@@ -1102,12 +1149,11 @@ impl AcpState {
                 self.background_tasks.retain(|id| *id != task_id);
             }
             // Titles live on `Instance`; wakeups and monitors are read from the log.
+            Event::AgentMessageChunk { .. } => self.sidebar_phase = SidebarPhase::Active,
             Event::SessionTitleSuggested { .. }
             | Event::ToolCallContent { .. }
-            | Event::RateLimitAutoResumed { .. }
             | Event::ModeSwitchFailed { .. }
             | Event::RawAgentUpdate { .. }
-            | Event::AgentMessageChunk { .. }
             | Event::ConversationSummary { .. }
             | Event::ConversationCompactionSummary { .. }
             | Event::WakeupScheduled { .. }
@@ -1141,6 +1187,7 @@ impl AcpState {
     fn open_turn(&mut self) {
         let steered = self.turn_active && self.steering;
         self.turn_active = true;
+        self.sidebar_phase = SidebarPhase::Active;
         if !steered {
             self.cancelling = false;
         }
@@ -1150,9 +1197,17 @@ impl AcpState {
         self.session_notices.clear();
     }
 
+    /// A fresh worker attached: a startup error no longer holds the row.
+    fn heal_sidebar_phase(&mut self) {
+        if self.sidebar_phase == SidebarPhase::Error {
+            self.sidebar_phase = SidebarPhase::Idle;
+        }
+    }
+
     /// The turn is over however it ended, so every in-turn phase clears.
     fn end_turn(&mut self, reason: &str) {
         self.turn_active = false;
+        self.sidebar_phase = SidebarPhase::Idle;
         self.cancelling = false;
         self.compacting = false;
         self.compaction_tool_id = None;
@@ -1258,6 +1313,211 @@ mod tests {
             s.apply_event(s.last_seq.saturating_add(1), event).unwrap();
         }
         s
+    }
+
+    /// The sidebar projection over event sequences, including the ones the old
+    /// per-event table got right only by reading outside activity flags.
+    #[test]
+    fn sidebar_status_projects_the_folded_events() {
+        use super::test_support::chunk;
+        use crate::acp::permissions::build_approval;
+        let tool = || ToolCall {
+            id: "t".into(),
+            name: "shell".into(),
+            kind: "execute".into(),
+            args_preview: "{}".into(),
+            started_at: Utc::now(),
+            parent_tool_call_id: None,
+            memory_recall: None,
+            diffs: Vec::new(),
+        };
+        let approval = build_approval(tool(), Vec::new());
+        let nonce = approval.nonce.clone();
+        let elicitation = Elicitation {
+            nonce: Nonce("e-1".into()),
+            message: "Pick".into(),
+            title: None,
+            description: None,
+            tool_call_id: None,
+            questions: Vec::new(),
+            requested_at: Utc::now(),
+            resolved: None,
+        };
+        let launched = || Event::BackgroundAgentLaunched {
+            agent_id: "bg-1".into(),
+            tool_call_id: "tc-1".into(),
+            description: "map backend".into(),
+            prompt: "do it".into(),
+            model: "claude-opus-4-8".into(),
+            wire_tracked: false,
+            output_file: "/tmp/bg-1.output".into(),
+            started_at: Utc::now(),
+        };
+        let completed = |status| Event::BackgroundAgentCompleted {
+            agent_id: "bg-1".into(),
+            status,
+            tools: Vec::new(),
+            result: None,
+            warning: None,
+            ended_at: Utc::now(),
+        };
+        let startup_error = || Event::AgentStartupError {
+            message: "boom".into(),
+        };
+        let assigned = || Event::AcpSessionAssigned {
+            acp_session_id: "a-1".into(),
+        };
+        let cases: Vec<(&str, Vec<Event>, Status)> = vec![
+            ("nothing yet", vec![], Status::Idle),
+            ("open turn", vec![prompt("go")], Status::Running),
+            (
+                "turn ended",
+                vec![prompt("go"), stopped("end_turn")],
+                Status::Idle,
+            ),
+            // A turn resumed agent-side (fired wakeup, background output) streams
+            // these without a UserPromptSent.
+            ("chunk without a prompt", vec![chunk("x")], Status::Running),
+            (
+                "thinking without a prompt",
+                vec![Event::ThinkingStarted],
+                Status::Running,
+            ),
+            (
+                "tool call without a prompt",
+                vec![Event::ToolCallStarted { tool_call: tool() }],
+                Status::Running,
+            ),
+            (
+                "pending approval",
+                vec![
+                    prompt("go"),
+                    Event::ApprovalRequested {
+                        approval: approval.clone(),
+                    },
+                ],
+                Status::Waiting,
+            ),
+            (
+                "approval answered",
+                vec![
+                    prompt("go"),
+                    Event::ApprovalRequested { approval },
+                    Event::ApprovalResolved {
+                        nonce,
+                        decision: ApprovalDecision::Allow,
+                    },
+                ],
+                Status::Running,
+            ),
+            (
+                "pending elicitation",
+                vec![
+                    prompt("go"),
+                    Event::ElicitationRequested {
+                        elicitation: elicitation.clone(),
+                    },
+                ],
+                Status::Waiting,
+            ),
+            (
+                "elicitation answered",
+                vec![
+                    prompt("go"),
+                    Event::ElicitationRequested { elicitation },
+                    Event::ElicitationResolved {
+                        nonce: Nonce("e-1".into()),
+                        outcome: ElicitationOutcome::Cancelled,
+                        answers: Vec::new(),
+                    },
+                ],
+                Status::Running,
+            ),
+            // The stop ends the turn even though the request was never answered.
+            (
+                "stopped while blocked",
+                vec![
+                    prompt("go"),
+                    Event::ApprovalRequested {
+                        approval: build_approval(tool(), Vec::new()),
+                    },
+                    stopped("cancelled"),
+                ],
+                Status::Idle,
+            ),
+            (
+                "background agent outlives the turn",
+                vec![prompt("go"), launched(), stopped("end_turn")],
+                Status::Running,
+            ),
+            // #4001: a detach closes the record like any terminal status.
+            (
+                "detached agent then stopped",
+                vec![
+                    prompt("go"),
+                    launched(),
+                    completed(BackgroundAgentStatus::Detached),
+                    stopped("user_stopped"),
+                ],
+                Status::Idle,
+            ),
+            (
+                "agent completes mid-turn",
+                vec![
+                    prompt("go"),
+                    launched(),
+                    completed(BackgroundAgentStatus::Completed),
+                ],
+                Status::Running,
+            ),
+            (
+                "background task outlives the turn",
+                vec![
+                    prompt("go"),
+                    Event::BackgroundTaskStarted {
+                        task_id: "task-1".into(),
+                        tool_call_id: None,
+                        description: "sleep".into(),
+                    },
+                    stopped("end_turn"),
+                ],
+                Status::Running,
+            ),
+            (
+                "startup error",
+                vec![prompt("go"), startup_error()],
+                Status::Error,
+            ),
+            (
+                "startup error then a new prompt",
+                vec![startup_error(), prompt("retry")],
+                Status::Running,
+            ),
+            (
+                "worker reattached",
+                vec![startup_error(), assigned()],
+                Status::Idle,
+            ),
+            (
+                "assignment mid-turn",
+                vec![prompt("go"), assigned()],
+                Status::Running,
+            ),
+            (
+                "incompatible agent",
+                vec![Event::IncompatibleAgent {
+                    detail: StartupErrorDetail::MissingAgentInfo {
+                        expected_package: "pkg".into(),
+                        install_command: "install".into(),
+                        auto_install: false,
+                    },
+                }],
+                Status::Error,
+            ),
+        ];
+        for (name, events, want) in cases {
+            assert_eq!(applied(events).sidebar_status(), want, "{name}");
+        }
     }
 
     fn notice(title: &str) -> Event {

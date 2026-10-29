@@ -14,6 +14,8 @@ vi.mock("../../hooks/useShikiTheme", () => ({
   useShikiTheme: () => ({ theme: "dark-plus", appearance: "dark" }),
 }));
 
+vi.mock("../../lib/clipboard", () => ({ writeClipboard: vi.fn().mockResolvedValue(true) }));
+
 const { skillIndexRef } = vi.hoisted(() => ({
   skillIndexRef: { current: { labelsByKey: new Map<string, Set<string>>() } as SkillIndex },
 }));
@@ -22,6 +24,7 @@ vi.mock("../../hooks/useSkillIndex", () => ({
 }));
 
 import type { ActivityRow, BackgroundAgent, ToolCall, ToolOutputBlock } from "../../lib/acpTypes";
+import { writeClipboard } from "../../lib/clipboard";
 import { highlightSnippet } from "../../lib/snippetHighlighter";
 import { AgentProfileProvider } from "../../lib/agentProfileContext";
 import type { FileRef, FileRefSession } from "../../lib/fileRef";
@@ -615,11 +618,17 @@ describe("TodoGroupCard", () => {
     expect(container.textContent).toContain("Step Charlie");
     expect(container.textContent).toContain("1 active");
     expect(container.textContent).not.toContain("Step Alpha");
-    fireEvent.click(getByRole("button"));
+    fireEvent.click(getByRole("button", { name: /updated 3 times/ }));
     const text = container.textContent ?? "";
     expect(text.indexOf("Step Alpha")).toBeGreaterThan(-1);
     expect(text.indexOf("Step Alpha")).toBeLessThan(text.indexOf("Step Bravo"));
     expect(text).toContain("1 items");
+  });
+
+  it("copies the previewed list as a markdown checklist", () => {
+    const { getByRole } = renderGroup(items);
+    fireEvent.click(getByRole("button", { name: "Copy todos" }));
+    expect(writeClipboard).toHaveBeenCalledWith("- [ ] Step Charlie (in progress)");
   });
 
   it.each([

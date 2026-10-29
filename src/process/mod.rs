@@ -72,10 +72,6 @@ mod platform {
         )
     }
 }
-#[cfg(target_os = "linux")]
-pub(crate) fn effective_uid() -> u32 {
-    platform::effective_uid()
-}
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn metadata_identity(metadata: &std::fs::Metadata) -> (u64, u64) {
     platform::metadata_identity(metadata)
@@ -91,8 +87,6 @@ pub(crate) fn open_read_nonblocking(path: &std::path::Path) -> std::io::Result<s
     }
 }
 
-#[cfg(target_os = "linux")]
-pub(crate) use linux::runtime_io;
 pub(crate) const LIVE_PANE_ENV_KEYS: [&str; 3] = ["TERM", "TMUX", "TMUX_PANE"];
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1064,10 +1058,13 @@ impl RunnerProcessGuard {
         }
         let mut identities = runner_group_identities(self.pid)?;
         if let Some(birth) = before.as_ref().filter(|_| root_attested) {
-            identities.push(PrimeProcessIdentity {
+            let root = PrimeProcessIdentity {
                 pid: self.pid,
                 start_id: birth.start_id.clone(),
-            });
+            };
+            if !identities.contains(&root) {
+                identities.push(root);
+            }
         }
         let mut added = Vec::new();
         for identity in identities {

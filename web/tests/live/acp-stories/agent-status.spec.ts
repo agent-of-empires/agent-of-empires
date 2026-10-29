@@ -160,8 +160,8 @@ test("startup banner: native-binary branch + agent-log disclosure", async ({ pag
   expect(msg).toContain("failed to launch");
 
   await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`);
-  // "Claude", not the message's "claude": the name comes from the daemon's install-info.
-  await expect(page.getByRole("heading", { name: "Claude couldn't start in Structured view" })).toBeVisible({
+  // "Claude Code", not the message's "claude": the name comes from the daemon's install-info.
+  await expect(page.getByRole("heading", { name: "Claude Code couldn't start in Structured view" })).toBeVisible({
     timeout: 15_000,
   });
   await expect(page.getByText(/Architecture mismatch/i)).toBeVisible();

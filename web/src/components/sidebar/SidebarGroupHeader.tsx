@@ -19,6 +19,7 @@ import { Tooltip } from "../Tooltip";
 import { useContextMenu } from "../useContextMenu";
 import { FoldChevron, PlusIcon } from "../icons";
 import { DISABLED_ICON_BUTTON } from "./styles";
+import { NAV_ITEM, onSidebarArrowKey, refocusNearbyWhenRemoved } from "./keyboardNav";
 import type { DragHandleProps } from "./types";
 
 interface Props {
@@ -36,10 +37,12 @@ interface Props {
   onEditProject?: (group: SidebarGroup) => void;
   offline: boolean;
   dragHandle?: DragHandleProps;
+  /** Id of the element wrapping this Group's rows, for `aria-controls`. */
+  rowsId: string;
 }
 
 export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props) {
-  const { group, hasActiveChild, onClick, onNewSession, offline, dragHandle } = props;
+  const { group, hasActiveChild, onClick, onNewSession, offline, dragHandle, rowsId } = props;
   const pluginAttention = usePluginAttention();
   // Appearance is repo-axis only; archive-all works on every axis.
   const canAppearance = group.capabilities.appearance;
@@ -53,6 +56,8 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(group.alias ?? group.displayName);
   const renameRef = useRef<HTMLInputElement>(null);
+  const rowRef = useRef<HTMLDivElement | null>(null);
+  const buttonRef = useRef<HTMLButtonElement>(null);
   const { menu, menuRef, openMenu, closeMenu } = useContextMenu<{ x: number; y: number }>();
   const compact = useSidebarCompact();
 
@@ -65,6 +70,9 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
     setRenaming(false);
     props.onUpdateAppearance(group.id, { alias: renameValue.trim() || null });
   };
+  // Enter and Escape unmount the focused input; send focus back to the header button once
+  // it renders again. A blur (Tab, a click) keeps its own destination.
+  const refocusHeader = () => requestAnimationFrame(() => buttonRef.current?.focus());
 
   if (renaming) {
     return (
@@ -82,8 +90,14 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
           onChange={(e) => setRenameValue(e.target.value)}
           onBlur={commitRename}
           onKeyDown={(e) => {
-            if (e.key === "Enter") commitRename();
-            if (e.key === "Escape") setRenaming(false);
+            if (e.key === "Enter") {
+              commitRename();
+              refocusHeader();
+            }
+            if (e.key === "Escape") {
+              setRenaming(false);
+              refocusHeader();
+            }
           }}
           data-testid="sidebar-group-rename-input"
           className="min-w-0 flex-1 rounded border border-brand-600 bg-surface-900 px-2 py-1 text-[13px] md:text-[14px] font-mono text-text-primary focus:outline-none"
@@ -105,11 +119,6 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
         data-testid="sidebar-group-header"
         data-group-id={group.id}
         data-draggable={dragHandle ? "true" : undefined}
-        tabIndex={hasMenu ? 0 : undefined}
-        aria-haspopup={hasMenu ? "menu" : undefined}
-        aria-label={
-          hasMenu ? `${group.kind === "repo" ? "Project" : "Group"} actions for ${group.displayName}` : undefined
-        }
         onContextMenu={
           hasMenu
             ? (e) => {
@@ -118,28 +127,42 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
               }
             : undefined
         }
-        onKeyDown={
-          hasMenu
-            ? (e) => {
-                if (e.target !== e.currentTarget) return;
-                if (!["Enter", " ", "ContextMenu"].includes(e.key) && !(e.shiftKey && e.key === "F10")) return;
-                e.preventDefault();
-                const rect = e.currentTarget.getBoundingClientRect();
-                openMenu({ x: rect.left + 12, y: rect.bottom + 4 });
-              }
-            : undefined
-        }
-        className={`group flex items-center gap-2 ${compact ? "px-2" : "px-3"} py-2 transition-colors duration-75 text-text-secondary focus:outline-none focus:ring-2 focus:ring-brand-600 ${rowClass}`}
+        className={`group flex items-center gap-2 ${compact ? "px-2" : "px-3"} py-2 transition-colors duration-75 text-text-secondary ${rowClass}`}
         style={headerStyle}
-        // The whole row activates the drag; `attributes` would collide with the menu's role and tabIndex.
-        ref={dragHandle?.setActivatorNodeRef}
+        // The whole row activates the drag; `attributes` would add a role and a second tab stop.
+        ref={(el) => {
+          rowRef.current = el;
+          dragHandle?.setActivatorNodeRef(el);
+        }}
         {...dragHandle?.listeners}
       >
         {dot}
         <button
+          ref={buttonRef}
           onClick={onClick}
+          onKeyDown={(e) => {
+            if (hasMenu && (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10"))) {
+              e.preventDefault();
+              const rect = (rowRef.current ?? e.currentTarget).getBoundingClientRect();
+              openMenu({ x: rect.left + 12, y: rect.bottom + 4 });
+              // The desktop menu isn't modal, so it takes focus only when the keyboard opened it.
+              requestAnimationFrame(() =>
+                menuRef.current?.querySelector<HTMLElement>("button:not([disabled])")?.focus({ preventScroll: true }),
+              );
+              return;
+            }
+            if (e.key === "Escape" && menu) {
+              e.preventDefault();
+              closeMenu();
+              return;
+            }
+            onSidebarArrowKey(e);
+          }}
+          {...{ [NAV_ITEM]: "" }}
           aria-expanded={!group.collapsed}
-          className="flex items-center gap-2 flex-1 min-w-0 text-left cursor-pointer"
+          aria-controls={rowsId}
+          aria-keyshortcuts={hasMenu ? "Shift+F10" : undefined}
+          className="flex items-center gap-2 flex-1 min-w-0 text-left cursor-pointer rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500"
         >
           <span className="relative h-4 w-4 shrink-0">
             <span
@@ -162,8 +185,9 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
               />
             </span>
           </span>
-          {group.pinned && (
+          {group.pinned ? (
             <span
+              role="img"
               className="shrink-0 text-[10px] leading-none text-text-dim"
               data-testid="sidebar-group-pinned-marker"
               title="Pinned project (persists without sessions)"
@@ -171,6 +195,18 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
             >
               ◆
             </span>
+          ) : (
+            group.registeredProjects.length > 0 && (
+              <span
+                role="img"
+                className="shrink-0 text-[10px] leading-none text-text-dim"
+                data-testid="sidebar-group-project-marker"
+                title="Project"
+                aria-label="Project"
+              >
+                ◇
+              </span>
+            )
           )}
           <span
             className="text-[13px] md:text-[14px] font-medium truncate flex-1"
@@ -211,18 +247,43 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
         )}
       </div>
       {hasMenu && menu && (
-        <ContextMenu menu={menu} menuRef={menuRef} testId="sidebar-group-context-menu">
+        <ContextMenu
+          menu={menu}
+          menuRef={menuRef}
+          testId="sidebar-group-context-menu"
+          onClose={() => {
+            closeMenu();
+            buttonRef.current?.focus();
+          }}
+        >
           <GroupMenuItems
             {...props}
+            // Archive all can empty the Group and unmount this header; focus then moves to a neighbour.
+            onArchiveAll={
+              props.onArchiveAll &&
+              (() => {
+                const header = buttonRef.current;
+                props.onArchiveAll?.();
+                if (header) refocusNearbyWhenRemoved(header);
+              })
+            }
             archivableCount={archivableCount}
             canPin={canPin}
             canUnpin={canUnpin}
             canEditProject={canEditProject}
             close={closeMenu}
+            closeToHeader={() => {
+              closeMenu();
+              buttonRef.current?.focus();
+            }}
             startRename={() => {
               setRenameValue(group.alias ?? group.defaultDisplayName);
               setRenaming(true);
-              requestAnimationFrame(() => renameRef.current?.select());
+              // select() alone doesn't move focus in every browser.
+              requestAnimationFrame(() => {
+                renameRef.current?.focus();
+                renameRef.current?.select();
+              });
             }}
           />
         </ContextMenu>
@@ -243,6 +304,7 @@ function GroupMenuItems({
   canUnpin,
   canEditProject,
   close,
+  closeToHeader,
   startRename,
 }: Props & {
   archivableCount: number;
@@ -250,13 +312,19 @@ function GroupMenuItems({
   canUnpin: boolean;
   canEditProject: boolean;
   close: () => void;
+  /** Close and return focus to the header button, for actions that leave the header in place. */
+  closeToHeader: () => void;
   startRename: () => void;
 }) {
   const canAppearance = group.capabilities.appearance;
-  const act = (fn: () => void) => () => {
-    close();
-    fn();
-  };
+  // Rename focuses its input and Project settings its dialog; every other action keeps the
+  // header, so focus goes back to it rather than to the menu item that just unmounted.
+  const act =
+    (fn: () => void, toHeader = true) =>
+    () => {
+      (toHeader ? closeToHeader : close)();
+      fn();
+    };
   return (
     <>
       {canPin && (
@@ -273,7 +341,7 @@ function GroupMenuItems({
         </MenuItem>
       )}
       {canEditProject && (
-        <MenuItem onClick={act(() => onEditProject?.(group))} testId="sidebar-group-context-menu-settings">
+        <MenuItem onClick={act(() => onEditProject?.(group), false)} testId="sidebar-group-context-menu-settings">
           Project settings
         </MenuItem>
       )}
@@ -286,7 +354,7 @@ function GroupMenuItems({
       {archivableCount > 0 && canAppearance && <MenuSeparator />}
       {canAppearance && (
         <>
-          <MenuItem onClick={act(startRename)} testId="sidebar-group-context-menu-rename">
+          <MenuItem onClick={act(startRename, false)} testId="sidebar-group-context-menu-rename">
             Rename
           </MenuItem>
           {group.alias && (

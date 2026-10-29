@@ -190,8 +190,15 @@ async fn list_profiles(client: &reqwest::Client, daemon: &ServeDaemon) -> Vec<St
 async fn permanent_scratch_delete_cancels_an_unanswered_initialize() {
     assert_scratch_delete_cancels_initialize(ServeDaemon::spawn()).await;
     #[cfg(target_os = "linux")]
-    if let Some(daemon) = ServeDaemon::spawn_with_scopes(true) {
-        assert_scratch_delete_cancels_initialize(daemon).await;
+    {
+        let daemon = ServeDaemon::spawn_with_scopes(true);
+        assert!(
+            daemon.is_some() || std::env::var_os("AOE_REQUIRE_SCOPED_TESTS").is_none(),
+            "Required scoped cancellation coverage unavailable"
+        );
+        if let Some(daemon) = daemon {
+            assert_scratch_delete_cancels_initialize(daemon).await;
+        }
     }
 }
 
@@ -545,10 +552,6 @@ fn scope_available(runtime: &std::path::Path, slice: &str) -> bool {
             let _ = manager_command("systemctl", runtime, true)
                 .args(["--user", "stop", slice])
                 .output();
-            assert!(
-                std::env::var_os("AOE_REQUIRE_SCOPED_TESTS").is_none(),
-                "Required scoped cancellation coverage unavailable: {result:?}"
-            );
             false
         }
     }

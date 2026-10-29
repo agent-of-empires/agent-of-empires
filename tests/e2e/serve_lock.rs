@@ -49,7 +49,7 @@ fn direct_serve_upgrades_legacy_policy_under_its_existing_transaction() {
             "serve_legacy_foreground"
         });
         h.stop_daemon_on_drop();
-        h.run_cli_ok(&["list"]);
+        h.run_cli_ok(&["migrate"]);
         let app = app_dir_in(h.home_path());
         std::fs::write(app.join(VERSION_FILE), "43").unwrap();
         std::fs::write(
@@ -112,6 +112,58 @@ fn direct_serve_upgrades_legacy_policy_under_its_existing_transaction() {
         assert!(status.contains(&format!(":{port}")), "{status}");
         h.run_cli_ok(&["serve", "--stop"]);
         drop(foreground);
+    }
+}
+
+#[test]
+#[parallel]
+fn explicit_profile_serve_preserves_bootstrap_and_config_recovery() {
+    for (core_only, empty) in [(false, false), (false, true), (true, false), (true, true)] {
+        for (config, valid) in [
+            ("default_profile = [\n", false),
+            ("default_profile = \"main\"\n", true),
+            ("default_profile = \"missing\"\n", true),
+        ] {
+            let mut h = TuiTestHarness::new_in_tmp("serve_profile_bootstrap");
+            h.stop_daemon_on_drop();
+            h.run_cli_ok(&["migrate"]);
+            let app = app_dir_in(h.home_path());
+            let profiles = app.join("profiles");
+            std::fs::remove_dir_all(&profiles).unwrap();
+            std::fs::create_dir(&profiles).unwrap();
+            if !empty {
+                std::fs::create_dir(profiles.join("main")).unwrap();
+            }
+            std::fs::write(app.join("config.toml"), config).unwrap();
+            if core_only {
+                h.run_cli_ok(&["-p", "main", "serve", "--daemon", "--core-only"]);
+            } else {
+                let port = crate::harness::pick_free_port().to_string();
+                h.run_cli_ok(&[
+                    "-p",
+                    "main",
+                    "serve",
+                    "--daemon",
+                    "--port",
+                    &port,
+                    "--no-auth",
+                ]);
+            }
+            assert!(
+                profiles.join("main").is_dir(),
+                "core={core_only}, empty={empty}, {config}"
+            );
+            let status = h.run_cli_ok(&["serve", "--status"]);
+            assert!(status.contains("Daemon: running (PID "), "{status}");
+            if valid {
+                let listed = h.run_cli_ok(&["-p", "main", "list", "--json"]);
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&listed).unwrap(),
+                    serde_json::json!([])
+                );
+            }
+            h.run_cli_ok(&["serve", "--stop"]);
+        }
     }
 }
 
@@ -342,8 +394,10 @@ fn tui_restart_failure_retains_predecessor_credential_for_rotation_and_removal()
             std::fs::write(app.join("serve.mode"), "tunnel").unwrap();
         }
         h.spawn_tui();
-        h.wait_for("Runtime ready");
+        h.wait_for_runtime_ready();
         h.send_keys("R");
+        h.wait_for("Connections");
+        h.send_keys("Enter");
         h.wait_for(if rotate { "tunnel" } else { "local" });
         let key = if rotate { "g" } else { "r" };
         h.send_keys(key);

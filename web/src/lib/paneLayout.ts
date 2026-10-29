@@ -35,6 +35,8 @@ interface LayoutStore {
   version: 2;
   template: DockLayout;
   sessions: Record<string, DockLayout>;
+  // Sessions seeded before their repository status was known; true once the user closed Diff there.
+  provisional: Record<string, boolean>;
 }
 
 const DOCKS: DockLocation[] = ["right", "bottom"];
@@ -340,13 +342,17 @@ function loadStore(): LayoutStore {
         for (const [id, layout] of Object.entries(sessionsRaw)) {
           sessions[id] = normalizeDock(layout);
         }
-        return { version: 2, template: normalizeDock(parsed.template), sessions };
+        const provisional: Record<string, boolean> = {};
+        for (const [id, closed] of Object.entries((parsed.provisional ?? {}) as Record<string, unknown>)) {
+          provisional[id] = closed === true;
+        }
+        return { version: 2, template: normalizeDock(parsed.template), sessions, provisional };
       }
     } catch {
       // Malformed JSON: fall through to migration and defaults.
     }
   }
-  return { version: 2, template: migrateTemplate(), sessions: {} };
+  return { version: 2, template: migrateTemplate(), sessions: {}, provisional: {} };
 }
 
 export interface PaneLayoutApi {
@@ -400,6 +406,19 @@ export function seedLayout(template: DockLayout, prefs: AutoOpenPanePrefs): Dock
   return l;
 }
 
+/** Re-adds the template's Diff at its template position, active only if the user left the dock's active tab as the Diff-less seed had it. */
+function restoreDiff(stored: DockLayout, template: DockLayout, terminal: boolean): DockLayout {
+  const at = findTab(template, "diff");
+  if (!at || findTab(stored, "diff")) return stored;
+  const bare = seedLayout(template, { diff: false, terminal });
+  const activate = isActiveTab(template, "diff") && stored[at.dock][0]?.active === bare[at.dock][0]?.active;
+  const next = addTab(stored, at.dock, "diff", activate);
+  const tabs = next[at.dock][0]!.tabs;
+  tabs.splice(tabs.indexOf("diff"), 1);
+  tabs.splice(Math.min(at.index, tabs.length), 0, "diff");
+  return next;
+}
+
 /** `outsideRepository` drops Diff from the seed only, so a Diff tab the user opened stays; `null` (not yet known) seeds no Diff. */
 export function usePaneLayout(sessionId: string | null, outsideRepository: boolean | null = false): PaneLayoutApi {
   const [store, setStore] = useState(loadStore);
@@ -436,11 +455,41 @@ export function usePaneLayout(sessionId: string | null, outsideRepository: boole
           });
         const updated = fn(current);
         if (updated === current && sessionId in s.sessions) return s;
-        return { ...s, sessions: { ...s.sessions, [sessionId]: updated } };
+        const tracked =
+          sessionId in s.provisional || (!(sessionId in s.sessions) && outsideRepositoryRef.current === null);
+        const provisional = tracked
+          ? {
+              ...s.provisional,
+              [sessionId]:
+                s.provisional[sessionId] === true || (!!findTab(current, "diff") && !findTab(updated, "diff")),
+            }
+          : s.provisional;
+        return { ...s, sessions: { ...s.sessions, [sessionId]: updated }, provisional };
       });
     },
     [sessionId, outsideRepositoryRef],
   );
+
+  // The seed lacked Diff while the status was unknown; add it back for a git Session unless the user closed it.
+  const isProvisional = sessionId !== null && sessionId in store.provisional;
+  /* eslint-disable react-you-might-not-need-an-effect/no-event-handler, react-you-might-not-need-an-effect/no-derived-state, react-you-might-not-need-an-effect/no-chain-state-updates -- one-shot reconcile when the status prop resolves */
+  useEffect(() => {
+    if (outsideRepository === null || !sessionId || !isProvisional) return;
+    setStore((s) => {
+      if (!(sessionId in s.provisional)) return s;
+      const { [sessionId]: closed, ...provisional } = s.provisional;
+      const stored = s.sessions[sessionId];
+      if (outsideRepository || closed || !stored || !getWebSettingsSnapshot().autoOpenDiffPane)
+        return { ...s, provisional };
+      const prefs = getWebSettingsSnapshot();
+      return {
+        ...s,
+        provisional,
+        sessions: { ...s.sessions, [sessionId]: restoreDiff(stored, s.template, prefs.autoOpenTerminalPane) },
+      };
+    });
+  }, [outsideRepository, sessionId, isProvisional]);
+  /* eslint-enable react-you-might-not-need-an-effect/no-event-handler, react-you-might-not-need-an-effect/no-derived-state, react-you-might-not-need-an-effect/no-chain-state-updates */
 
   const openTab = useCallback(
     (tabId: TabId, dock: DockLocation) => mutate((l) => openOrRevealTab(l, tabId, dock)),

@@ -118,40 +118,6 @@ impl EventStore {
         )
     }
 
-    /// Latest event the sidebar status derivation cares about.
-    pub fn latest_seed_status_event(&self, session_id: &str) -> Option<Event> {
-        let json: String = logged(
-            self.conn()
-                .query_row(
-                    "SELECT event_json FROM acp_events
-                     WHERE session_id = ?1
-                       AND (json_extract(event_json, '$.UserPromptSent') IS NOT NULL
-                         OR json_extract(event_json, '$.ApprovalRequested') IS NOT NULL
-                         OR json_extract(event_json, '$.ApprovalResolved') IS NOT NULL
-                         OR json_extract(event_json, '$.ElicitationRequested') IS NOT NULL
-                         OR json_extract(event_json, '$.ElicitationResolved') IS NOT NULL
-                         OR json_extract(event_json, '$.Stopped') IS NOT NULL
-                         OR json_extract(event_json, '$.RateLimitAutoResumed') IS NOT NULL
-                         OR json_extract(event_json, '$.AgentStartupError') IS NOT NULL
-                         OR json_extract(event_json, '$.AgentMessageChunk') IS NOT NULL
-                         OR json_extract(event_json, '$.ToolCallStarted') IS NOT NULL
-                         OR json_extract(event_json, '$.BackgroundTaskStarted') IS NOT NULL
-                         OR json_extract(event_json, '$.BackgroundTaskFinished') IS NOT NULL
-                         -- A unit variant serializes as a bare JSON string.
-                         OR event_json = '\"ThinkingStarted\"')
-                     ORDER BY seq DESC
-                     LIMIT 1",
-                    params![session_id],
-                    |row| row.get(0),
-                )
-                .optional(),
-            "latest_seed_status_event query",
-            session_id,
-        )
-        .flatten()?;
-        decode(&json)
-    }
-
     /// Text of the session's first `UserPromptSent`.
     pub fn first_user_prompt(&self, session_id: &str) -> Option<String> {
         let json: String = logged(
@@ -415,10 +381,6 @@ impl EventStore {
             session_id,
         )?;
         Some(terminator.is_none())
-    }
-
-    pub fn has_in_flight_main_turn(&self, session_id: &str) -> bool {
-        self.latest_prompt_state(session_id).unwrap_or(false)
     }
 
     /// True while a main turn, background task, or recently reporting background agent is open.
@@ -755,26 +717,6 @@ mod tests {
         assert!(matches!(
             store.latest_plan("s-1").expect("plan").steps[0].status,
             PlanStepStatus::Done
-        ));
-
-        record_from(
-            &store,
-            "s-2",
-            1,
-            [
-                user_prompt("go"),
-                stopped("prompt_complete"),
-                agent_chunk("build done"),
-            ],
-        );
-        assert!(matches!(
-            store.latest_seed_status_event("s-2"),
-            Some(Event::AgentMessageChunk { text, .. }) if text == "build done"
-        ));
-        store.record("s-3", 1, &Event::ThinkingStarted).unwrap();
-        assert!(matches!(
-            store.latest_seed_status_event("s-3"),
-            Some(Event::ThinkingStarted)
         ));
 
         record_from(

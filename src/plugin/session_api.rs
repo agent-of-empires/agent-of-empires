@@ -509,6 +509,7 @@ async fn admit_and_create(
         sandbox_image: None,
         yolo_mode: false,
         extra_env: Vec::new(),
+        before_start_hook_env: Vec::new(),
         extra_args: String::new(),
         command_override: String::new(),
         extra_repo_paths,

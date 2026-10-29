@@ -480,7 +480,7 @@ mod tests {
         // (query, id of the entry it should surface). "move" reaches the row-move
         // entries by title and the rename entry ("Rename or move to group") mid-title,
         // so the prefix match wins.
-        for (query, id) in [("ren", "rename"), ("move", "move row up")] {
+        for (query, id) in [("ren", "rename"), ("move", "move-row-up")] {
             let mut dialog = make_dialog();
             type_query(&mut dialog, query);
             assert!(!dialog.matches.is_empty(), "{query} matched nothing");
@@ -618,6 +618,19 @@ mod tests {
         ),
         (ActionId::SearchStart, "a modal trigger, not an action"),
         (ActionId::Update, "surfaced via the update banner"),
+        (ActionId::OpenCommandPalette, "opens the palette itself"),
+        (
+            ActionId::DismissUpdateBanner,
+            "only meaningful while a banner shows",
+        ),
+        (
+            ActionId::PreviewScrollUp,
+            "live-send relay key, not a list action",
+        ),
+        (
+            ActionId::PreviewScrollDown,
+            "live-send relay key, not a list action",
+        ),
         (
             ActionId::ToggleContainer,
             "only valid on a sandboxed session in Terminal view",

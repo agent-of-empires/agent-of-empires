@@ -83,7 +83,7 @@ export function AddProjectModal({
         <div className="px-4 py-3 flex flex-col gap-3">
           {projectsError && (
             <div role="alert" className="text-sm text-status-warning">
-              Saved projects could not be loaded. You can still enter a path.
+              Projects could not be loaded. You can still enter a path.
               <button type="button" onClick={retry} className="ml-2 text-brand-400 hover:underline cursor-pointer">
                 Retry
               </button>

@@ -615,13 +615,26 @@ impl DaemonClient {
         body: &DeleteSessionBody,
         epoch: &str,
     ) -> Result<MutationReceipt<PurgeOutcome>, DaemonClientError> {
+        self.request_mutation_with_outcome(self.purge_request(session_id, body)?, epoch)
+            .await
+    }
+
+    /// Purge runs user hooks, so it outlives the default RPC deadline.
+    fn purge_request(
+        &self,
+        session_id: &str,
+        body: &DeleteSessionBody,
+    ) -> Result<reqwest::RequestBuilder, DaemonClientError> {
         let url = format!(
             "{}/{}",
             self.sessions_url,
             transport::path_segment(session_id)?
         );
-        self.request_mutation_with_outcome(self.http.delete(url).json(body), epoch)
-            .await
+        Ok(self
+            .http
+            .delete(url)
+            .json(body)
+            .timeout(crate::session::deletion::PURGE_DEADLINE + DEFAULT_TIMEOUT))
     }
 
     pub async fn mutate_project(
@@ -1651,6 +1664,22 @@ mod tests {
             server.abort();
             let _ = server.await;
         }
+    }
+
+    #[test]
+    fn purge_waits_past_the_default_timeout_for_hooks() {
+        let client = DaemonClient::new("http://127.0.0.1:1", None).unwrap();
+        let request = client
+            .purge_request("sess-1", &DeleteSessionBody::default())
+            .unwrap()
+            .build()
+            .unwrap();
+        let timeout = request.timeout().copied().unwrap();
+        assert_eq!(
+            timeout,
+            crate::session::deletion::PURGE_DEADLINE + DEFAULT_TIMEOUT
+        );
+        assert!(timeout > DEFAULT_TIMEOUT);
     }
 
     #[tokio::test]
