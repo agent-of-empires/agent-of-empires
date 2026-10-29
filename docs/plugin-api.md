@@ -33,7 +33,7 @@ capabilities = ["runtime.worker"]
 | `api_version` | integer | yes | Manifest schema version, `1` to `19`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
-| `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). Static contributions need none. |
+| `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). A manifest with `[runtime]` must declare `runtime.worker`. Static contributions need none. |
 | `screenshots` | array | no | Up to 8. Requires `api_version >= 5`. See [Screenshots](#screenshots). |
 | `setting_defaults` | table | no | Overrides for core host settings, keyed by canonical path (e.g. `"theme.idle_decay_minutes"`). Resolution is user value, then plugin override, then core default. |
 
@@ -47,7 +47,7 @@ Capabilities gate runtime resource access. They are prompted once at install and
 
 | Capability | Grants |
 |---|---|
-| `runtime.worker` | Running any plugin code at all (host RPCs the worker initiates). Any worker needs this. |
+| `runtime.worker` | Launching a plugin worker and using its base host RPCs. Required for either runtime kind. |
 | `session.read` | Reading sessions of the host's profile: the attached session, `sessions.list`, and the `session.status.changed` (`api_version >= 14`) and `session.lifecycle.changed` (`api_version >= 19`) notifications. |
 | `session.write` | Mutating any session of the profile: `session.meta.set`/`cas`, and archive/trash from a plugin page. |
 | `config.read` | Reading host or other-plugin configuration (not the plugin's own settings). |
@@ -604,11 +604,15 @@ caption = "Live status in the pane."
 
 The worker the host spawns and supervises, in one of two kinds. Omit it for a static, metadata-only plugin.
 
+Both runtime kinds require `runtime.worker` in the manifest's top-level `capabilities`. Missing declarations are rejected before installation or build execution, even with `--yes`. Installed manifests missing the declaration are skipped with a load diagnostic after the daemon is upgraded and restarted. Correct the declaration and approve the changed manifest; an old grant does not authorize new manifest bytes.
+
 ### Command
 
 The host runs the build steps at install or update, then launches `command`.
 
 ```toml
+capabilities = ["runtime.worker"]
+
 [runtime]
 kind = "command"
 command = [".aoe-build/venv/bin/my-plugin-worker"]
@@ -638,6 +642,8 @@ Build into `.aoe-build/` (the host's build-output directory); the host excludes 
 The host downloads a release asset instead of building from source.
 
 ```toml
+capabilities = ["runtime.worker"]
+
 [runtime]
 kind = "release-binary"
 asset = "my-plugin-${target}.tar.gz"

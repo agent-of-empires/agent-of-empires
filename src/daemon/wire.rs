@@ -224,7 +224,7 @@ pub struct GroupSessionOutcome {
     pub outcome: PurgeOutcome,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GroupSessionFailureCode {
     LifecycleBusy,
@@ -237,6 +237,17 @@ pub struct GroupSessionFailure {
     pub id: String,
     pub code: GroupSessionFailureCode,
     pub message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EmptyTrashBody {
+    pub profile: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EmptyTrashOutcome {
+    pub sessions: Vec<GroupSessionOutcome>,
+    pub failures: Vec<GroupSessionFailure>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
