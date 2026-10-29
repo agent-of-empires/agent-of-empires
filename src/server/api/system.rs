@@ -76,8 +76,9 @@ pub struct AgentInfo {
     /// valid `agent_acp_cmd`. The web wizard reads this to decide
     /// whether a session created for the agent runs in acp or tmux.
     pub acp_capable: bool,
-    /// Whether a non-sandboxed structured create would find this agent's ACP adapter
-    /// (the create check, with no project to search relative PATH entries from, so they count).
+    /// Whether a non-sandboxed structured create in the served profile would find this agent's
+    /// ACP adapter. With no project, relative PATH entries and the profile's own hooks count;
+    /// the repository's hooks are left to the create.
     pub acp_installed: bool,
     /// True when `[acp] allowed_agents` permits this agent in the structured
     /// view. Deliberately separate from `acp_capable`, which states an intrinsic
