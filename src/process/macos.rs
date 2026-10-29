@@ -1304,4 +1304,51 @@ mod tests {
         assert!(!remaining.contains(&owned));
         assert!(child.0.wait().unwrap().success());
     }
+
+    #[test]
+    fn attested_runner_root_is_retained_once_across_refreshes() {
+        use std::os::unix::process::CommandExt as _;
+        struct Leader(std::process::Child);
+        impl Drop for Leader {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let leader = Leader(
+            Command::new("sleep")
+                .arg("60")
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        );
+        let pid = leader.0.id();
+        let birth = super::super::runner_birth_identity(pid)
+            .unwrap()
+            .expect("live leader has a birth identity");
+        let root = super::super::PrimeProcessIdentity {
+            pid,
+            start_id: birth.start_id.clone(),
+        };
+        assert!(
+            runner_group_identities(pid).unwrap().contains(&root),
+            "enumeration must include the live leader"
+        );
+
+        let guard =
+            super::super::RunnerProcessGuard::capture(pid, Some(birth.fingerprint())).unwrap();
+        let roots = |guard: &super::super::RunnerProcessGuard| {
+            guard
+                .members
+                .lock()
+                .iter()
+                .filter(|(identity, _)| identity.pid == pid)
+                .count()
+        };
+        assert_eq!(roots(&guard), 1, "root duplicated by capture");
+        for _ in 0..3 {
+            guard.refresh(&mut guard.members.lock()).unwrap();
+            assert_eq!(roots(&guard), 1, "root duplicated by refresh");
+        }
+    }
 }
