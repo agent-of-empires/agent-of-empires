@@ -277,7 +277,6 @@ pub(super) fn prepend_path_dirs(path: &std::ffi::OsStr, dirs: &[PathBuf]) -> std
     std::env::join_paths(&chain).unwrap_or_else(|_| path.to_os_string())
 }
 
-#[cfg(target_os = "macos")]
 pub(super) fn apply_host_codex_loopback_bypass(
     cmd: &mut std::process::Command,
     config: &SpawnConfig,
@@ -319,7 +318,6 @@ fn apply_stdio_env(
     if let Some(socket_path) = &config.socket_path {
         cmd.env("AOE_ACP_SOCKET", socket_path);
     }
-    #[cfg(target_os = "macos")]
     apply_host_codex_loopback_bypass(cmd.as_std_mut(), config, &[]);
     keys
 }

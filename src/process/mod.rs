@@ -20,8 +20,6 @@ mod linux;
 
 #[cfg(target_os = "macos")]
 mod macos;
-#[cfg(target_os = "macos")]
-pub(crate) use macos::apply_codex_loopback_bypass;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod unix;
 pub(crate) fn validate_recovery_file(file: &std::fs::File) -> anyhow::Result<()> {
@@ -259,6 +257,14 @@ pub fn exec_post_login_opencode_yolo() -> anyhow::Result<()> {
 pub(crate) use platform::unix_peer_uid;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use unix::detach_daemon_stdin;
+
+/// Apply macOS loopback proxy defaults without overriding explicit policy.
+pub(crate) fn apply_codex_loopback_bypass(cmd: &mut Command, overrides: &[(String, String)]) {
+    #[cfg(target_os = "macos")]
+    macos::apply_codex_loopback_bypass(cmd, overrides);
+    #[cfg(not(target_os = "macos"))]
+    let _ = (cmd, overrides);
+}
 
 /// Lower the child's scheduling and I/O priority where the OS supports it.
 pub(crate) fn throttle_child(cmd: &mut std::process::Command) {

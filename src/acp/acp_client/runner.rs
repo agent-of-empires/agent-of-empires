@@ -440,7 +440,6 @@ pub(super) async fn spawn_runner_detached(
         cmd.env("PATH", prepend_path_dirs(&current, &extra_path_dirs));
     }
 
-    #[cfg(target_os = "macos")]
     super::spawn::apply_host_codex_loopback_bypass(cmd.as_std_mut(), config, &host_environment);
 
     // Reads the runner env, so it runs before the scope wrapper adds its own.
