@@ -495,6 +495,25 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
     let Some(instance) = find_instance(&state, &id).await else {
         return session_not_found();
     };
+    if !instance.is_structured() {
+        return not_structured_response();
+    }
+    if instance.terminal_handoff.is_some() {
+        return (StatusCode::CONFLICT, "terminal handoff is pending").into_response();
+    }
+    if let Err(blocked) = instance.ensure_startable() {
+        return crate::server::api::start_blocked_response(blocked);
+    }
+    if !instance.launch_is_finalized() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "creation_not_finalized",
+                "message": "The structured session launch is not finalized",
+            })),
+        )
+            .into_response();
+    }
     let explicit = req.agent.clone().or_else(|| instance.agent_name.clone());
     let agent = pick_agent(&state, &instance, explicit.as_deref()).await;
     if instance.source_profile != preflight_instance.source_profile
@@ -2468,7 +2487,11 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn restart_rechecks_session_and_cancellation_after_waiting_for_exclusion() {
-        for cancel in [false, true] {
+        for (cancel, change_agent, change_view) in [
+            (false, true, false),
+            (true, false, false),
+            (false, false, true),
+        ] {
             let _home = crate::session::test_support::isolate_app_dir();
             let mut instance =
                 crate::session::Instance::new("restart-exclusion", "/tmp/aoe-restart-exclusion");
@@ -2523,11 +2546,13 @@ mod tests {
                 state.acp_supervisor.cancel_restart_request(&id).await;
             } else {
                 let mut instances = state.instances.write().await;
-                instances
-                    .iter_mut()
-                    .find(|row| row.id == id)
-                    .unwrap()
-                    .agent_name = Some("codex".into());
+                let row = instances.iter_mut().find(|row| row.id == id).unwrap();
+                if change_agent {
+                    row.agent_name = Some("codex".into());
+                }
+                if change_view {
+                    row.view = crate::session::View::Terminal;
+                }
                 drop(instances);
                 drop(guard);
             }
