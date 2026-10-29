@@ -968,7 +968,7 @@ async fn serve_connection(
             ),
         };
         match &outcome {
-            Ok(_) => tracing::debug!(
+            Ok(_) => tracing::trace!(
                 target: "plugin.host", plugin = %ctx.plugin_id, method = %method_log,
                 "worker rpc ok"
             ),

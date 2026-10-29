@@ -26,8 +26,10 @@ pub async fn rename_session(
         Ok(body) => body,
         Err(error) => return error.into_response(),
     };
+    let title = body.title.clone();
     match edit_session(&state, &id, SessionEdit::Rename(body)).await {
         Ok(warnings) => {
+            tracing::info!(target: "session.rename", session = %id, title = title.as_deref().unwrap_or_default(), "session renamed");
             crate::server::runtime::session_mutation_response(
                 &state,
                 &id,

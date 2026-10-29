@@ -656,6 +656,9 @@ pub async fn trash_session(
         })?;
         Ok((outcome, stopped.err().map(|error| error.to_string())))
     }).await.map_err(anyhow::Error::from).and_then(|result| result);
+    if result.is_ok() {
+        tracing::info!(target: "session.trash", session = %id, "session trashed");
+    }
     let relocation = match result {
         Ok((_, Some(reason))) => {
             tracing::warn!(target: "http.api.sessions", session = %id, %reason, "trash tmux teardown failed");
@@ -2276,6 +2279,7 @@ async fn finish_structured_restart(
     .await;
     match result {
         Ok((generation, profile)) => {
+            tracing::info!(target: "session.restart", session = %id, view = "structured", "session restarted");
             crate::server::runtime::session_mutation_response(
                 state,
                 id,
@@ -3011,6 +3015,7 @@ async fn prepare_agent_session_inner(
             }
         }
         drop(rows);
+        tracing::info!(target: "session.restart", session = %id, view = "terminal", "session restarted");
         return crate::server::runtime::session_mutation_response(
             &state,
             &id,

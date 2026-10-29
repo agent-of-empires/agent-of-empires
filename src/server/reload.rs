@@ -310,7 +310,7 @@ impl RuntimeReadCache {
         }
     }
 }
-use super::push::publish_status_change;
+use super::push::{publish, publish_status_change};
 
 use super::state::{AppState, StatusSource};
 use super::structured_repair::{
@@ -960,9 +960,9 @@ pub(super) fn observed_transitions(
 /// poller's view (#2690 / #2697). Disk therefore stays permanently out of step
 /// with live, and `status_poll_loop` compares exactly those two: `prev` comes
 /// from `state.instances` (overlaid, live), `fresh` from disk. Left alone, every
-/// tick reads that standing mismatch as a brand new transition, which logs a
-/// `session.status_change` line, broadcasts a `StatusChange`, and resets the
-/// push dwell timer in `server::push`. Forever, at the 2s tick, surviving daemon
+/// tick reads that standing mismatch as a brand new transition, which
+/// broadcasts a `StatusChange` (logged at publish time) and resets the push
+/// dwell timer in `server::push`. Forever, at the 2s tick, surviving daemon
 /// restarts because `seed_acp_statuses` re-derives the same live status from the
 /// stored event log on boot. One session whose worker died with
 /// `AgentStartupError` wrote 81k such lines into a single 43MB log file.
@@ -1235,7 +1235,7 @@ pub(super) async fn reload_state_instances_from_disk(
         .unwrap_or_else(std::sync::PoisonError::into_inner) = native_diagnostics;
     state.runtime.request_publish();
     for change in &changes {
-        let _ = state.status_tx.send(change.clone());
+        publish(&state.status_tx, change.clone());
     }
     changes
 }

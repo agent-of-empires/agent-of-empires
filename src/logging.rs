@@ -114,6 +114,12 @@ pub const DEFAULT_TARGET_ROOTS: &[&str] = &[
     "sound",
     "telemetry",
     "smart_rename",
+    "events",
+    "conversation_summary",
+    "shutdown",
+    "file_watch",
+    "push",
+    "task",
 ];
 
 pub const KNOWN_SUB_TARGETS: &[&str] = &[
@@ -125,14 +131,11 @@ pub const KNOWN_SUB_TARGETS: &[&str] = &[
     "acp.runner",
     "plugin.host",
     "terminal.ws",
-    "terminal.ws.bytes",
     "auth.token",
     "auth.middleware",
     "auth.rate_limit",
     "auth.passphrase",
     "auth.passkey",
-    "auth.device",
-    "auth.ip",
     "process.signal",
     "process.tree",
     "process.reap",
@@ -141,10 +144,10 @@ pub const KNOWN_SUB_TARGETS: &[&str] = &[
     "update.fetch",
     "update.cache",
     "update.parse",
-    "containers.docker",
     "containers.image",
     "containers.runtime",
     "git.command",
+    "git.worktree",
     "web.client",
     "log.runtime",
     "migrations.v036",
@@ -160,6 +163,7 @@ pub const KNOWN_SUB_TARGETS: &[&str] = &[
     "migrations.v047",
     "migrations.v048",
     "migrations.v052",
+    "migrations.v053",
     "server.file_watch",
     "server.lifecycle",
     "server.idle_reap",
@@ -170,8 +174,18 @@ pub const KNOWN_SUB_TARGETS: &[&str] = &[
     "server.maintenance",
     "server.status",
     "server.sessions",
-    "runtime.uds",
     "runtime.ws",
+    "file_watch.service",
+    "file_watch.subscriber",
+    "push.wake_fired",
+    "task.panic",
+    "session.status_change",
+    "session.create",
+    "session.delete",
+    "session.trash",
+    "session.restart",
+    "session.rename",
+    "http.api.telemetry",
 ];
 
 /// Only the filter hot-swaps; sink and rotation settings apply on restart.
@@ -324,13 +338,14 @@ impl LogConfig {
         Some(s)
     }
 
+    /// The `warn` catch-all keeps dependency crates to warn/error at any level.
     pub fn filter_for_level(level: LogLevel) -> String {
         let lvl = level.as_str();
-        DEFAULT_TARGET_ROOTS
-            .iter()
-            .map(|t| format!("{t}={lvl}"))
-            .collect::<Vec<_>>()
-            .join(",")
+        let mut s = String::from("warn");
+        for t in DEFAULT_TARGET_ROOTS {
+            s.push_str(&format!(",{t}={lvl}"));
+        }
+        s
     }
 }
 
@@ -949,6 +964,8 @@ fn apply_filter_file(path: &std::path::Path) {
 mod tests {
     use super::*;
 
+    use std::collections::BTreeSet;
+
     use crate::session::test_support::EnvGuard;
 
     #[test]
@@ -1047,6 +1064,123 @@ mod tests {
             .filter_string()
             .unwrap();
         assert!(terminal.ends_with(",terminal=trace"));
+    }
+
+    #[test]
+    fn default_filter_keeps_dependencies_at_warn_and_lets_overrides_win() {
+        let directive = format!(
+            "{},http.request=info",
+            LogConfig::filter_for_level(LogLevel::Trace)
+        );
+        let filter = EnvFilter::builder()
+            .with_regex(false)
+            .parse(&directive)
+            .unwrap();
+        // Consts keep these fixtures out of the source scan below.
+        const DEPENDENCY: &str = "hyper_util";
+        const OWN: &str = "session.create";
+        const OVERRIDDEN: &str = "http.request";
+        tracing::subscriber::with_default(Registry::default().with(filter), || {
+            assert!(tracing::enabled!(target: DEPENDENCY, tracing::Level::WARN));
+            assert!(!tracing::enabled!(target: DEPENDENCY, tracing::Level::INFO));
+            assert!(tracing::enabled!(target: OWN, tracing::Level::TRACE));
+            assert!(!tracing::enabled!(target: OVERRIDDEN, tracing::Level::DEBUG));
+        });
+    }
+
+    /// Every `target:` used in `src/` as `(file, target)`, excluding test-only targets.
+    fn source_targets() -> Vec<(PathBuf, String)> {
+        fn walk(dir: &Path, pattern: &regex::Regex, out: &mut Vec<(PathBuf, String)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, pattern, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    let src = std::fs::read_to_string(&path).unwrap();
+                    for captures in pattern.captures_iter(&src) {
+                        let target = captures.get(1).or(captures.get(2)).unwrap().as_str();
+                        if !target.starts_with("aoe_test_") {
+                            out.push((path.clone(), target.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        // The trailing comma excludes struct fields such as `target: "codex".to_string()`.
+        let pattern = regex::Regex::new(
+            r#"target: "([A-Za-z_][A-Za-z0-9_.]*)"\s*,|target = "([A-Za-z_][A-Za-z0-9_.]*)""#,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        walk(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &pattern,
+            &mut out,
+        );
+        out
+    }
+
+    #[test]
+    fn every_source_target_root_is_filtered_and_known_sub_targets_exist() {
+        let targets = source_targets();
+        assert!(!targets.is_empty(), "the source scan found no targets");
+        let unlisted: Vec<String> = targets
+            .iter()
+            .filter(|(_, target)| {
+                let root = target.split('.').next().unwrap();
+                !DEFAULT_TARGET_ROOTS.contains(&root) && !EXTERNAL_TARGET_ROOTS.contains(&root)
+            })
+            .map(|(file, target)| format!("{}: {target}", file.display()))
+            .collect();
+        assert!(
+            unlisted.is_empty(),
+            "targets whose root is missing from DEFAULT_TARGET_ROOTS (their events are dropped at every level):\n{}",
+            unlisted.join("\n")
+        );
+        let used: BTreeSet<&str> = targets.iter().map(|(_, t)| t.as_str()).collect();
+        let unused: Vec<&str> = KNOWN_SUB_TARGETS
+            .iter()
+            .copied()
+            .filter(|t| !used.contains(t))
+            .collect();
+        assert!(
+            unused.is_empty(),
+            "KNOWN_SUB_TARGETS entries no longer used in src/: {unused:?}"
+        );
+    }
+
+    #[test]
+    fn known_sub_targets_stay_synced_with_ts_mirror() {
+        let mirror_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("web/src/components/settings/customWidgets.tsx");
+        let Ok(mirror) = std::fs::read_to_string(&mirror_path) else {
+            // Nix-filtered sources omit web/.
+            eprintln!(
+                "skipping TS logging target mirror check: {} is absent",
+                mirror_path.display()
+            );
+            return;
+        };
+        let start = mirror
+            .find("const KNOWN_TARGETS")
+            .expect("customWidgets.tsx declares `const KNOWN_TARGETS`");
+        let body = &mirror[start..];
+        let body = &body[..body
+            .find("];")
+            .expect("KNOWN_TARGETS array closes with `];`")];
+        let mirrored: BTreeSet<&str> = body
+            .split("value: \"")
+            .skip(1)
+            .map(|rest| rest.split('"').next().unwrap())
+            .collect();
+        let known: BTreeSet<&str> = KNOWN_SUB_TARGETS.iter().copied().collect();
+        let missing_in_ts: Vec<_> = known.difference(&mirrored).collect();
+        let missing_in_rust: Vec<_> = mirrored.difference(&known).collect();
+        assert!(
+            missing_in_ts.is_empty() && missing_in_rust.is_empty(),
+            "KNOWN_TARGETS in customWidgets.tsx is out of sync with KNOWN_SUB_TARGETS: \
+             missing in TS {missing_in_ts:?}, missing in Rust {missing_in_rust:?}"
+        );
     }
 
     #[test]

@@ -42,14 +42,30 @@ pub fn publish_status_change(
     if inst.status == old {
         return;
     }
-    let _ = status_tx.send(StatusChange {
-        instance_id: inst.id.clone(),
-        instance_title: inst.title.clone(),
-        effective_profile: inst.effective_profile(),
-        old,
-        new: inst.status,
-        at: Utc::now(),
-    });
+    publish(
+        status_tx,
+        StatusChange {
+            instance_id: inst.id.clone(),
+            instance_title: inst.title.clone(),
+            effective_profile: inst.effective_profile(),
+            old,
+            new: inst.status,
+            at: Utc::now(),
+        },
+    );
+}
+
+/// Logs then broadcasts; the log must not depend on a subscriber existing.
+pub fn publish(status_tx: &tokio::sync::broadcast::Sender<StatusChange>, change: StatusChange) {
+    tracing::info!(
+        target: "session.status_change",
+        session = %change.instance_id,
+        title = %change.instance_title,
+        from = change.old.wire_str(),
+        to = change.new.wire_str(),
+        "session status changed"
+    );
+    let _ = status_tx.send(change);
 }
 
 /// Capacity of the broadcast channel. Every handler, the reload and the ACP events publish

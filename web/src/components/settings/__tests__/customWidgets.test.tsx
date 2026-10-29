@@ -78,7 +78,7 @@ function commitText(input: HTMLInputElement, value: string) {
 }
 
 it("LoggingTargetsWidget clears one area without losing unrelated overrides", () => {
-  const initial = { "runtime.uds": "warn", "plugin:external": "error" };
+  const initial = { "runtime.ws": "warn", "plugin:external": "error" };
   const { save, rerender } = mount(LoggingTargetsWidget, "Targets", initial);
   fireEvent.change(control("server.lifecycle", "select"), { target: { value: "debug" } });
   expect(save).toHaveBeenLastCalledWith({ ...initial, "server.lifecycle": "debug" });

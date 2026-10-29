@@ -283,7 +283,7 @@ impl Shared {
             // During replay only transcript events are dropped; ambient state
             // and lifecycle events still pass so pickers stay current.
             if suppressing && is_transcript_event(&event) {
-                debug!(
+                tracing::trace!(
                     target: "acp.protocol",
                     session = %self.session_label,
                     kind = transcript_event_kind(&event),

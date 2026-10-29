@@ -16,6 +16,31 @@ pub(crate) async fn purge_session_artifacts(
     additional_protection: Option<crate::session::path_identity::CleanupProtection>,
     selection: Option<crate::session::deletion::PurgeSelection>,
 ) -> anyhow::Result<PurgeOutcome> {
+    let outcome = purge_session_artifacts_inner(
+        state,
+        id,
+        instance,
+        body,
+        recent_entry,
+        additional_protection,
+        selection,
+    )
+    .await?;
+    if let PurgeOutcome::Deleted { cleanup_errors, .. } = &outcome {
+        tracing::info!(target: "session.delete", session = %id, cleanup_errors = cleanup_errors.len(), "session purged");
+    }
+    Ok(outcome)
+}
+
+async fn purge_session_artifacts_inner(
+    state: &Arc<AppState>,
+    id: &str,
+    instance: Instance,
+    body: &DeleteSessionBody,
+    recent_entry: Option<crate::session::RecentProjectEntry>,
+    additional_protection: Option<crate::session::path_identity::CleanupProtection>,
+    selection: Option<crate::session::deletion::PurgeSelection>,
+) -> anyhow::Result<PurgeOutcome> {
     use crate::session::deletion::{DeletionDisposition, PurgeTransaction};
     if state.cityhall_mode && !instance.is_structured() {
         anyhow::bail!(super::lifecycle::LifecycleTargetError::CityHall);
@@ -431,6 +456,7 @@ pub(crate) async fn recover_pending_purges(state: &Arc<AppState>) {
             tracing::warn!(target: "session.purge_recovery", session_id = %id, errors = ?result.errors, "purge cleanup incomplete; owner retained");
             continue;
         }
+        tracing::info!(target: "session.delete", session = %id, source = "recovery", "session purged");
     }
     drop(_namespace);
     if let Err(error) = state.runtime.publish(state).await {

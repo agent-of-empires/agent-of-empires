@@ -49,7 +49,7 @@ Updates use a locked read-modify-write operation, preserving concurrent changes.
 | Variable | Description |
 |----------|-------------|
 | `AGENT_OF_EMPIRES_PROFILE` | Default profile |
-| `AOE_LOG_LEVEL` | File log level: `trace`, `debug`, `info`, `warn`, `error` |
+| `AOE_LOG_LEVEL` | File log level for AoE's own targets: `trace`, `debug`, `info`, `warn`, `error`. Dependency crates stay at `warn` |
 | `AGENT_OF_EMPIRES_DEBUG` | Legacy alias for `AOE_LOG_LEVEL=debug` |
 | `AOE_DEFER_SANDBOX_MIGRATION` | Start without moving sandboxed sessions' agent stores; retried later or by `aoe migrate`. See [Per-session agent stores](sandbox.md#per-session-agent-stores) |
 
