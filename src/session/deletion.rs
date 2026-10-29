@@ -902,13 +902,6 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
             }
         }
     }
-    pub fn complete_with(
-        self,
-        after_teardown: impl FnOnce(&Instance) -> std::result::Result<(), String>,
-    ) -> DeletionResult {
-        self.complete_inner(|instance, _| after_teardown(instance))
-    }
-
     pub fn complete(self) -> DeletionResult {
         self.complete_inner(|_, _| Ok(()))
     }
@@ -3107,7 +3100,7 @@ mod tests {
                         }
                     });
                     if change == "group after teardown" {
-                        transaction.complete_with(|_| {
+                        transaction.complete_inner(|_, _| {
                             storage
                                 .update(|rows, _| {
                                     rows[0].group_path = "peer-group".into();
