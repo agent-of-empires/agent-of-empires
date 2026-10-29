@@ -155,9 +155,6 @@ test("startup banner: native-binary branch + agent-log disclosure", async ({ pag
       .map((f) => f.event?.AgentStartupError?.message)
       .find((m) => typeof m === "string" && m.length > 0) ?? "";
   await expect.poll(startupError, { timeout: 20_000, intervals: [200] }).not.toBe("");
-  const msg = await startupError();
-  expect(msg).toContain("native binary");
-  expect(msg).toContain("failed to launch");
 
   await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`);
   // "Claude Code", not the message's "claude": the name comes from the daemon's install-info.

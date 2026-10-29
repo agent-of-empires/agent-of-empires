@@ -102,11 +102,16 @@ completion marker already ordered into the SDK pipe. That marker still checks
 explicit local supersession and its captured terminal epoch before publishing
 the diagnostic and failed terminal ahead of fatal transport handling.
 
-Old events with missing or null evidence replay as unknown. The event's existing
-message remains the canonical public diagnostic; arbitrary ACP data is excluded,
-known secret shapes are scrubbed and messages are bounded. Detailed causes stay
-in private tracing. Instance `last_error` and its typed metadata are runtime-only
-(`serde(skip)`), not a durable audit trail. No registry migration is required.
+Old events with missing or null evidence replay as unknown. The SDK message is
+the primary public diagnostic. Only a direct string `data.details` may add a
+labelled human-diagnostic supplement; other fields, nested values and non-string
+details stay private. Both texts are scrubbed for known secret patterns and the
+combined diagnostic, label and truncation marker are capped at 2048 UTF-8 bytes.
+This allowlist is a human-diagnostic convention, not a guarantee that a string is
+safe: the scrubber does not detect arbitrary secrets. The supplement grants no
+origin, liveness or retry authority. Remaining causes stay in private tracing.
+Instance `last_error` and its typed metadata are runtime-only (`serde(skip)`), not
+a durable audit trail. No registry migration is required.
 Terminal evidence also travels through the existing session projection and
 runtime/HTTP response to TUI and web clients. Those optional response fields do
 not turn runtime observations into stored registry data or retry authority.

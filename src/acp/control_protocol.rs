@@ -34,7 +34,7 @@ pub const MAX_CONTROL_QUEUE_BYTES: usize = 128 * 1024 * 1024;
 pub struct SessionReplayed {}
 
 /// Daemon-minted completion barrier, ordered behind preceding SDK notifications.
-/// Adopted payloads contain only the bounded classified diagnostic, never ACP data.
+/// Adopted payloads contain the bounded public diagnostic, never raw error envelopes.
 #[derive(
     Debug, Clone, Default, Serialize, Deserialize, agent_client_protocol::JsonRpcNotification,
 )]
