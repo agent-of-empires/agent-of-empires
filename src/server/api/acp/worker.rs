@@ -1275,6 +1275,123 @@ mod tests {
         state
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn spawn_hook_can_reenter_rename_and_settles_after_cancellation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::{mpsc, Notify};
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let mut row = crate::session::Instance::new("Before", project.path().to_str().unwrap());
+        row.source_profile = "default".into();
+        row.view = crate::session::View::Structured;
+        let id = row.id.clone();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let launcher = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    Err(crate::acp::acp_client::AcpError::Spawn(
+                        "unexpected launch".into(),
+                    ))
+                }) as _
+            })
+        };
+        let state =
+            crate::server::test_support::build_test_app_state_with_launcher(vec![row], launcher);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (renamed_tx, mut renamed_rx) = mpsc::unbounded_channel();
+        let release = Arc::new(Notify::new());
+        let app = axum::Router::new().route(
+            "/hook",
+            axum::routing::get({
+                let state = Arc::clone(&state);
+                let id = id.clone();
+                let release = Arc::clone(&release);
+                move || {
+                    let state = Arc::clone(&state);
+                    let id = id.clone();
+                    let release = Arc::clone(&release);
+                    let renamed_tx = renamed_tx.clone();
+                    async move {
+                        let response = crate::server::api::sessions::rename_session(
+                            State(state),
+                            Path(id),
+                            Ok(Json(crate::daemon::RenameSessionBody {
+                                title: Some("After".into()),
+                                group: None,
+                                profile: None,
+                                rename_branch: false,
+                            })),
+                        )
+                        .await
+                        .into_response();
+                        renamed_tx.send(response.status()).unwrap();
+                        release.notified().await;
+                        StatusCode::OK
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = crate::session::get_app_dir().unwrap().join("config.toml");
+        std::fs::write(
+            config,
+            format!("[host_hooks]\nbefore_session = \"curl --max-time 10 -fsS http://{address}/hook\"\n"),
+        )
+        .unwrap();
+        let spawning = {
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            tokio::spawn(async move {
+                spawn_acp(
+                    State(state),
+                    Path(id),
+                    Ok(Json(SpawnAcpRequest {
+                        agent: None,
+                        model: None,
+                        additional_dirs: Vec::new(),
+                        provider_env: Vec::new(),
+                    })),
+                )
+                .await
+                .into_response()
+            })
+        };
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), renamed_rx.recv())
+            .await
+            .expect("hook's rename must finish without waiting for launch exclusion")
+            .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        let stop = state
+            .acp_supervisor
+            .begin_stop_request(&id, "user_stopped", None, false)
+            .await;
+        assert!(
+            !spawning.is_finished(),
+            "cancellation must wait for the running hook"
+        );
+        release.notify_one();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), spawning)
+            .await
+            .expect("cancelled launch must settle")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            state.acp_supervisor.worker_state(&id).await,
+            crate::daemon::AcpWorkerState::Absent
+        );
+        drop(stop);
+        server.abort();
+    }
+
     async fn assert_reconstructed_stop_does_not_resume(row: crate::session::Instance) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let starts = Arc::new(AtomicUsize::new(0));
