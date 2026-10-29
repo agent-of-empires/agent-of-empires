@@ -378,7 +378,7 @@ export function SendButton({
   const disconnectedLabel = waitingFor
     ? `Pending until ${waitingFor} is ready`
     : connecting
-      ? "Send message while disconnected"
+      ? "Send while disconnected"
       : "Queue message until session resumes";
   const title = disabled
     ? "Type a message to send"

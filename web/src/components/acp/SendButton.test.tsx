@@ -33,8 +33,8 @@ describe("SendButton", () => {
 describe("a running Worker whose connection is down", () => {
   it("does not promise a queue or a resume", () => {
     const { unmount } = render(<SendButton connected={false} connecting onSend={() => {}} />);
-    expect(screen.getByRole("button", { name: "Send message while disconnected" }).getAttribute("title")).toBe(
-      "Send message while disconnected",
+    expect(screen.getByRole("button", { name: "Send while disconnected" }).getAttribute("title")).toBe(
+      "Send while disconnected",
     );
     unmount();
     render(<QueueSendButton connected={false} steering={false} connecting onSend={() => {}} />);
