@@ -345,7 +345,14 @@ fn resolve_app_dir_with_fallback(xdg: PathBuf, legacy: PathBuf, xdg_env_set: boo
 pub fn get_app_dir() -> Result<PathBuf> {
     let dir = get_app_dir_path()?;
     if !dir.exists() {
-        fs::create_dir_all(&dir)?;
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o755);
+        }
+        builder.create(&dir)?;
     }
     Ok(dir)
 }
@@ -1216,6 +1223,74 @@ mod tests {
         let dir = root.join(APP_DIR_NAME_OTHER);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn app_dir_creation_does_not_introduce_group_writable_ancestors() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        const CHILD: &str = "AOE_TEST_APP_DIR_UMASK_CHILD";
+        const CASES: [(&str, u32); 2] = [("002", 0o755), ("077", 0o700)];
+        let thread = std::thread::current();
+        let test = thread.name().unwrap();
+        if let Ok(mask) = std::env::var(CHILD) {
+            let expected = CASES
+                .iter()
+                .find(|(value, _)| *value == mask.as_str())
+                .unwrap()
+                .1;
+            let mask = libc::mode_t::from_str_radix(&mask, 8).unwrap();
+            // This subprocess runs one test.
+            unsafe { libc::umask(mask) };
+            let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+            let config = PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap());
+            get_app_dir().unwrap();
+            for path in [
+                home.join("nested"),
+                config.clone(),
+                config.join(APP_DIR_NAME_XDG),
+            ] {
+                assert_eq!(
+                    fs::metadata(&path).unwrap().mode() & 0o777,
+                    expected,
+                    "{mask:o}: {}",
+                    path.display()
+                );
+            }
+            assert_eq!(fs::metadata(&home).unwrap().mode() & 0o777, 0o700);
+            fs::set_permissions(&config, fs::Permissions::from_mode(0o775)).unwrap();
+            get_app_dir().unwrap();
+            assert_eq!(fs::metadata(&config).unwrap().mode() & 0o777, 0o775);
+            fs::write(home.join("entered"), test).unwrap();
+            return;
+        }
+        for (mask, _) in CASES {
+            let home = tempfile::tempdir().unwrap();
+            fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let config = home.path().join("nested/config");
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", test, "--nocapture", "--test-threads=1"])
+                .env(CHILD, mask)
+                .env("HOME", home.path())
+                .env("XDG_CONFIG_HOME", &config);
+            let output = crate::process::run_with_timeout_process_group(
+                &mut command,
+                Duration::from_secs(60),
+            )
+            .unwrap()
+            .expect("isolated umask test timed out");
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                fs::read_to_string(home.path().join("entered")).unwrap(),
+                test
+            );
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
