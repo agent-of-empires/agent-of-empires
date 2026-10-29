@@ -27,7 +27,14 @@ function loadSw() {
     registration: { showNotification, getNotifications, pushManager: { getSubscription } },
   };
   vm.runInNewContext(swSource, { self, URL, caches: { keys: vi.fn(), delete: vi.fn() } });
-  return { handlers, showNotification, getNotifications, matchAll, getSubscription };
+  return {
+    handlers,
+    showNotification,
+    getNotifications,
+    matchAll,
+    getSubscription,
+    openWindow: self.clients.openWindow,
+  };
 }
 
 async function dispatchPush(handlers: Map<string, Handler[]>, payload: unknown) {
@@ -78,6 +85,21 @@ describe("service worker push handler (#2491)", () => {
     expect(postMessage.mock.calls).toEqual(shows ? [] : [[{ type: "aoe-push", payload }]]);
   });
 
+  it.each<[string, string, boolean]>([
+    ["its own session", "s1", false],
+    ["another session", "s2", true],
+  ])("a focused focus-mode window toasts only pushes about its session: %s", async (_label, sessionId, shows) => {
+    const { handlers, showNotification, matchAll } = loadSw();
+    const postMessage = vi.fn();
+    matchAll.mockResolvedValue([
+      { url: "https://aoe.test/session/s1?focus=1", visibilityState: "visible", focused: true, postMessage },
+    ]);
+    const payload = { kind: "notify", title: "t", tag: `session-${sessionId}`, session_id: sessionId };
+    await dispatchPush(handlers, payload);
+    expect(showNotification).toHaveBeenCalledTimes(shows ? 1 : 0);
+    expect(postMessage).toHaveBeenCalledTimes(shows ? 0 : 1);
+  });
+
   it("closes only notifications older than the clear's seq, for the cleared tag alone", async () => {
     const { handlers, showNotification, getNotifications, matchAll } = loadSw();
     const closes = [vi.fn(), vi.fn(), vi.fn()];
@@ -121,5 +143,44 @@ describe("service worker push handler (#2491)", () => {
     await dispatchPush(handlers, { kind: "clear", seq: 1 });
     expect(getNotifications).not.toHaveBeenCalled();
     expect(showNotification).not.toHaveBeenCalled();
+  });
+});
+
+describe("service worker notification click with focus-mode windows", () => {
+  type FakeClient = { url: string; focus: ReturnType<typeof vi.fn>; navigate: ReturnType<typeof vi.fn> };
+  const client = (path: string): FakeClient => ({
+    url: `https://aoe.test${path}`,
+    focus: vi.fn(),
+    navigate: vi.fn().mockResolvedValue(undefined),
+  });
+
+  async function click(handlers: Map<string, Handler[]>, url: string) {
+    const pending: Promise<unknown>[] = [];
+    const event = {
+      notification: { close: vi.fn(), data: { url } },
+      waitUntil: (p: Promise<unknown>) => pending.push(Promise.resolve(p)),
+    };
+    for (const fn of handlers.get("notificationclick") ?? []) fn(event);
+    await Promise.all(pending);
+  }
+
+  it.each<[string, string[], number | "open"]>([
+    ["focuses the focus window already showing the session", ["/session/s2?focus=1", "/session/s1?focus=1"], 1],
+    ["navigates a regular window, never another session's focus window", ["/session/s2?focus=1", "/"], 1],
+    ["opens a window when only other focus windows exist", ["/session/s2?focus=1"], "open"],
+  ])("%s", async (_label, paths, expected) => {
+    const { handlers, matchAll, openWindow } = loadSw();
+    const clients = paths.map(client);
+    matchAll.mockResolvedValue(clients);
+    await click(handlers, "https://aoe.test/session/s1");
+
+    expect(clients[0]!.navigate).not.toHaveBeenCalled();
+    expect(clients[0]!.focus).not.toHaveBeenCalled();
+    if (expected === "open") {
+      expect(openWindow).toHaveBeenCalledWith("https://aoe.test/session/s1");
+    } else {
+      expect(clients[expected]!.focus).toHaveBeenCalled();
+      expect(openWindow).not.toHaveBeenCalled();
+    }
   });
 });

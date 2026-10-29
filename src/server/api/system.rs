@@ -29,13 +29,19 @@ use crate::session::config::settings_schema::{
 #[derive(Deserialize)]
 pub struct DashboardPresenceBody {
     pub active: bool,
+    /// Per-window id, so several windows of one browser report independently.
+    #[serde(default)]
+    pub window: String,
+    /// The session a focus-mode window is limited to.
+    #[serde(default)]
+    pub focus_session: Option<String>,
 }
 
-/// `POST /api/presence`. Record or clear this browser's foreground presence.
-/// The device-binding header is already attached to authenticated dashboard
-/// requests. Hashing it gives each browser an ephemeral server-side key without
-/// retaining the secret itself. Older clients without that header fall back to
-/// their authenticated token owner.
+/// `POST /api/presence`. Record or clear one dashboard window's foreground
+/// presence. The device-binding header is already attached to authenticated
+/// dashboard requests. Hashing it gives each browser an ephemeral server-side
+/// key without retaining the secret itself. Older clients without that header
+/// fall back to their authenticated token owner.
 pub async fn post_dashboard_presence(
     State(state): State<Arc<AppState>>,
     owner: Option<Extension<AuthenticatedTokenHash>>,
@@ -50,7 +56,14 @@ pub async fn post_dashboard_presence(
         .and_then(|value| value.to_str().ok())
         .map(crate::server::push::sha256_token)
         .unwrap_or(owner.0);
-    state.set_web_presence(client, body.active);
+    state.set_web_presence(
+        crate::server::state::WebPresenceKey {
+            client,
+            window: body.window,
+        },
+        body.active,
+        body.focus_session,
+    );
     StatusCode::NO_CONTENT
 }
 
@@ -2695,6 +2708,44 @@ pub async fn serve_sound_file(
 
 #[cfg(test)]
 mod tests {
+    /// Each window keeps its own presence, a focus window only covers its
+    /// session, and a body from an older page without the window fields is
+    /// still accepted as a regular window.
+    #[tokio::test]
+    async fn presence_is_recorded_per_window_with_its_focus() {
+        use crate::server::state::WebWatch;
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let post = |body: serde_json::Value| {
+            let state = state.clone();
+            async move {
+                let body: super::DashboardPresenceBody = serde_json::from_value(body).unwrap();
+                super::post_dashboard_presence(
+                    axum::extract::State(state),
+                    Some(axum::Extension(super::AuthenticatedTokenHash([7; 32]))),
+                    axum::http::HeaderMap::new(),
+                    axum::Json(body),
+                )
+                .await
+            }
+        };
+        let watch = || state.web_watch_within(std::time::Duration::from_secs(30));
+
+        let focus = serde_json::json!({"active": true, "window": "a", "focus_session": "s1"});
+        assert_eq!(post(focus).await, axum::http::StatusCode::NO_CONTENT);
+        assert!(watch().covers("s1") && !watch().covers("s2"));
+
+        post(serde_json::json!({"active": true})).await;
+        assert_eq!(
+            watch(),
+            WebWatch::Everything,
+            "an older page counts as a regular window"
+        );
+
+        post(serde_json::json!({"active": false})).await;
+        let focus_only = WebWatch::Sessions(std::collections::HashSet::from(["s1".to_string()]));
+        assert_eq!(watch(), focus_only, "clearing one window keeps the other");
+    }
+
     /// A served profile deleted from disk lists no Groups, and listing doesn't recreate it.
     #[tokio::test]
     #[serial_test::serial]

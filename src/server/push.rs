@@ -629,51 +629,20 @@ fn notification_matches_live_instance(
     )
 }
 
-async fn fire_due_pushes(
-    app_state: std::sync::Arc<super::AppState>,
-    client: &reqwest::Client,
-    semaphore: &std::sync::Arc<tokio::sync::Semaphore>,
+/// Returns the `(instance_id, title, event)` notifications whose dwell has
+/// elapsed at `now`, and disarms those sessions. A session a foreground window
+/// already shows (`web_watch`) is skipped with its dwell still armed, so it
+/// fires once no window covers it.
+fn due_events(
     dwell: &mut HashMap<String, DwellState>,
-    last_suppress_reason: &mut Option<&'static str>,
-) {
-    let Some(push) = app_state.push.as_ref() else {
-        return; // feature disabled, nothing to do
-    };
-    let push = push.clone();
-
-    // Suppress pushes when the user is actively using aoe (TUI or web dashboard).
-    let suppress_reason = if crate::session::is_tui_active(std::time::Duration::from_secs(30)) {
-        Some("TUI is active")
-    } else if app_state.web_active_within(std::time::Duration::from_secs(30)) {
-        Some("web dashboard is active")
-    } else {
-        None
-    };
-    // Only log on transitions.
-    if suppress_reason != *last_suppress_reason {
-        match (*last_suppress_reason, suppress_reason) {
-            (None, Some(reason)) => {
-                tracing::debug!(target: "http.middleware", "push: suppressed, {}", reason)
-            }
-            (Some(_), Some(reason)) => {
-                tracing::debug!(target: "http.middleware", "push: suppression reason changed to {}", reason)
-            }
-            (Some(prev), None) => {
-                tracing::debug!(target: "http.middleware", "push: resumed (was suppressed: {})", prev)
-            }
-            (None, None) => {}
-        }
-        *last_suppress_reason = suppress_reason;
-    }
-    if suppress_reason.is_some() {
-        return;
-    }
-
-    let now = std::time::Instant::now();
-    // Collect (instance_id, title, event) tuples to fire.
-    let mut to_fire: Vec<(String, String, NotificationEvent)> = Vec::new();
-
+    web_watch: &super::state::WebWatch,
+    now: std::time::Instant,
+) -> Vec<(String, String, NotificationEvent)> {
+    let mut to_fire = Vec::new();
     for (id, state) in dwell.iter_mut() {
+        if web_watch.covers(id) {
+            continue;
+        }
         // Cooldown gates ALL event types for this session.
         if let Some(last) = state.last_notified {
             if now.duration_since(last).as_millis() < COOLDOWN_MS as u128 {
@@ -700,7 +669,52 @@ async fn fire_due_pushes(
             break;
         }
     }
+    to_fire
+}
 
+async fn fire_due_pushes(
+    app_state: std::sync::Arc<super::AppState>,
+    client: &reqwest::Client,
+    semaphore: &std::sync::Arc<tokio::sync::Semaphore>,
+    dwell: &mut HashMap<String, DwellState>,
+    last_suppress_reason: &mut Option<&'static str>,
+) {
+    let Some(push) = app_state.push.as_ref() else {
+        return; // feature disabled, nothing to do
+    };
+    let push = push.clone();
+
+    // Suppress pushes when the user is actively using aoe (TUI or web dashboard).
+    // Focus-mode windows only cover their own session; the others still fire.
+    let web_watch = app_state.web_watch_within(std::time::Duration::from_secs(30));
+    let suppress_reason = if crate::session::is_tui_active(std::time::Duration::from_secs(30)) {
+        Some("TUI is active")
+    } else if web_watch == super::state::WebWatch::Everything {
+        Some("web dashboard is active")
+    } else {
+        None
+    };
+    // Only log on transitions.
+    if suppress_reason != *last_suppress_reason {
+        match (*last_suppress_reason, suppress_reason) {
+            (None, Some(reason)) => {
+                tracing::debug!(target: "http.middleware", "push: suppressed, {}", reason)
+            }
+            (Some(_), Some(reason)) => {
+                tracing::debug!(target: "http.middleware", "push: suppression reason changed to {}", reason)
+            }
+            (Some(prev), None) => {
+                tracing::debug!(target: "http.middleware", "push: resumed (was suppressed: {})", prev)
+            }
+            (None, None) => {}
+        }
+        *last_suppress_reason = suppress_reason;
+    }
+    if suppress_reason.is_some() {
+        return;
+    }
+
+    let to_fire = due_events(dwell, &web_watch, std::time::Instant::now());
     if to_fire.is_empty() {
         return;
     }
@@ -794,7 +808,8 @@ async fn fire_due_pushes(
 /// the wake fire is already a discrete event, not a sticky state.
 ///
 /// Respects the same active-use suppression as `fire_due_pushes` (TUI
-/// open within the last 30s OR the web dashboard active within 30s),
+/// open within the last 30s OR a web window showing this session active
+/// within 30s),
 /// and the server-wide `web.notify_on_wake_fire` opt-out. See #1091.
 pub async fn fire_wake_fired_push(
     state: std::sync::Arc<super::AppState>,
@@ -817,7 +832,10 @@ pub async fn fire_wake_fired_push(
         );
         return;
     }
-    if state.web_active_within(std::time::Duration::from_secs(30)) {
+    if state
+        .web_watch_within(std::time::Duration::from_secs(30))
+        .covers(session_id)
+    {
         tracing::debug!(
             target: "push.wake_fired",
             session = %session_id,
@@ -1635,6 +1653,50 @@ mod tests {
             },
         );
         assert!(dwell.get(&id).unwrap().waiting_since.is_none());
+    }
+
+    #[test]
+    fn due_events_hold_sessions_a_window_shows_until_it_stops_showing_them() {
+        use crate::server::state::WebWatch;
+        let now = std::time::Instant::now();
+        let elapsed = now - std::time::Duration::from_millis(DWELL_WAITING_MS + 1);
+        let waiting = |title: &str| DwellState {
+            waiting_since: Some(elapsed),
+            title: title.to_string(),
+            ..DwellState::default()
+        };
+        let mut dwell = HashMap::from([
+            ("focused".to_string(), waiting("f")),
+            ("other".to_string(), waiting("o")),
+        ]);
+        let ids = |fired: Vec<(String, String, NotificationEvent)>| {
+            let mut ids: Vec<String> = fired.into_iter().map(|(id, ..)| id).collect();
+            ids.sort();
+            ids
+        };
+
+        let focus_window =
+            WebWatch::Sessions(std::collections::HashSet::from(["focused".to_string()]));
+        assert_eq!(
+            ids(due_events(&mut dwell, &focus_window, now)),
+            ["other"],
+            "a focus window must not hold back other sessions"
+        );
+        assert!(
+            dwell["focused"].waiting_since.is_some(),
+            "held dwell stays armed"
+        );
+        assert!(
+            dwell["other"].waiting_since.is_none(),
+            "fired dwell is disarmed"
+        );
+
+        assert_eq!(
+            ids(due_events(&mut dwell, &WebWatch::Nothing, now)),
+            ["focused"],
+            "the held session fires once no window shows it"
+        );
+        assert!(due_events(&mut dwell, &WebWatch::Nothing, now).is_empty());
     }
 
     #[test]

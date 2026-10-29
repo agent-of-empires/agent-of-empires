@@ -18,6 +18,9 @@ import { useAttentionCounts } from "./hooks/useAttentionCounts";
 import { useStatusSounds } from "./hooks/useStatusSounds";
 import { useSessionStatusStream } from "./hooks/useSessionStatusStream";
 import { useDashboardPresence } from "./hooks/useDashboardPresence";
+import { useFocusMode } from "./hooks/useFocusMode";
+import { focusNavigation, noticedSessions } from "./lib/focusMode";
+import { FocusSessionGone } from "./components/FocusSessionGone";
 import { clearAcpCache } from "./hooks/useAcpSession";
 import { clearDraft, sweepOrphanDrafts } from "./lib/acpDrafts";
 import { AcpPrefsProvider } from "./lib/acpPrefs";
@@ -105,6 +108,7 @@ import { IdleDecayWindowContext, parseIdleDecayWindowMs } from "./lib/idleDecay"
 import { parseUnreadIndicatorEnabled, UnreadIndicatorContext, useUnreadIndicatorEnabled } from "./lib/unreadIndicator";
 import { parseSessionRowTagMode, SessionRowTagContext, type SessionRowTagMode } from "./lib/sessionRowTag";
 import { parseSessionColorsEnabled, SessionColorsContext } from "./lib/sessionColors";
+import { FocusModeEnabledContext, parseFocusModeEnabled, useFocusModeEnabled } from "./lib/focusModeSetting";
 import { settleSettingsIntrosReadOnly } from "./lib/settingsIntros";
 import { onSettingsChanged } from "./lib/settingsEvents";
 import { parseSystemHealthEnabled, SystemHealthEnabledContext } from "./lib/systemHealth";
@@ -112,7 +116,7 @@ import { toastBus, reportError } from "./lib/toastBus";
 import { restartForUpdate } from "./lib/restartForUpdate";
 import { startPendingCreates } from "./lib/pendingCreates";
 import { isAbsolutePath, resolveToRepoRelative, type FileRef } from "./lib/fileRef";
-import { NAVIGATE_EVENT, OPEN_SESSION_EVENT } from "./lib/sessionRoute";
+import { NAVIGATE_EVENT, OPEN_SESSION_EVENT, openFocusWindow } from "./lib/sessionRoute";
 import { dispatchFocusTerminal, requestSessionInputFocus, setPendingTerminalFocus } from "./lib/terminalFocus";
 import {
   bindHiddenInput,
@@ -199,6 +203,7 @@ export default function App() {
   const [unreadIndicatorEnabled, setUnreadIndicatorEnabled] = useState(true);
   const [sessionRowTagMode, setSessionRowTagMode] = useState<SessionRowTagMode>("branch");
   const [sessionColorsEnabled, setSessionColorsEnabled] = useState(true);
+  const [focusModeEnabled, setFocusModeEnabled] = useState(true);
   const [systemHealthEnabled, setSystemHealthEnabled] = useState(false);
 
   const applyAppSettings = useCallback((settings: SettingsResponse | null | undefined) => {
@@ -206,6 +211,7 @@ export default function App() {
     setUnreadIndicatorEnabled(parseUnreadIndicatorEnabled(settings));
     setSessionRowTagMode(parseSessionRowTagMode(settings));
     setSessionColorsEnabled(parseSessionColorsEnabled(settings));
+    setFocusModeEnabled(parseFocusModeEnabled(settings));
     setSystemHealthEnabled(parseSystemHealthEnabled(settings));
   }, []);
 
@@ -299,13 +305,15 @@ export default function App() {
         <SessionRowTagContext.Provider value={sessionRowTagMode}>
           <SessionColorsContext.Provider value={sessionColorsEnabled}>
             <SystemHealthEnabledContext.Provider value={systemHealthEnabled}>
-              {/* PluginUiProvider must sit above AppContent: AppContent itself reads
-                the plugin UI snapshot (usePluginPanes), so the provider can't live
-                inside its own return. */}
-              <PluginUiProvider>
-                <AppContent loginRequired={loginRequired} onLogout={handleLogout} resolvedTheme={resolvedTheme} />
-              </PluginUiProvider>
-              <ElevationPrompt />
+              <FocusModeEnabledContext.Provider value={focusModeEnabled}>
+                {/* PluginUiProvider must sit above AppContent: AppContent itself reads
+                  the plugin UI snapshot (usePluginPanes), so the provider can't live
+                  inside its own return. */}
+                <PluginUiProvider>
+                  <AppContent loginRequired={loginRequired} onLogout={handleLogout} resolvedTheme={resolvedTheme} />
+                </PluginUiProvider>
+                <ElevationPrompt />
+              </FocusModeEnabledContext.Provider>
             </SystemHealthEnabledContext.Provider>
           </SessionColorsContext.Provider>
         </SessionRowTagContext.Provider>
@@ -330,6 +338,8 @@ function isInsideEditable(target: EventTarget | null): boolean {
   return false;
 }
 
+const noop = (): void => {};
+
 /** Composes the authenticated dashboard and synchronizes its user-scoped UI state. */
 function AppContent({
   loginRequired,
@@ -340,7 +350,6 @@ function AppContent({
   onLogout: () => void;
   resolvedTheme: ResolvedTheme | null;
 }) {
-  useDashboardPresence();
   // Wire the localStorage write chokepoint and pull the server-side UI-state
   // blob into localStorage. AppContent only mounts past auth, so this runs as
   // the authenticated user. Background (does NOT gate render): blocking first
@@ -362,6 +371,12 @@ function AppContent({
   const settingsTabMatch = useMatch("/settings/:tab");
   const profilesMatch = useMatch("/profiles");
   const pluginPageMatch = useMatch("/plugins/:pluginId/:pageId");
+  // A focus-mode window shows one session only: no sidebar, no switching, and notifications for that session alone.
+  const { focusSessionId, enterFocusMode, exitFocusMode } = useFocusMode(sessionMatch?.params.sessionId ?? null);
+  // `session.focus_mode` gates the ways in; a window already in focus mode can always leave.
+  const focusModeEnabled = useFocusModeEnabled();
+  const focusMode = focusSessionId !== null;
+  useDashboardPresence(focusSessionId);
   // A plugin page's split pane shows `?session=` as the routed session, docks and all.
   const activeSessionId = sessionMatch?.params.sessionId ?? (pluginPageMatch ? searchParams.get("session") : null);
   const selectPluginPageSession = useCallback(
@@ -377,12 +392,14 @@ function AppContent({
       ),
     [setSearchParams],
   );
-  // Off a removed session: back to the dashboard, or on a plugin page just out of its split pane.
+  // Off a removed session: back to the dashboard, or on a plugin page just out of its split pane. A focus window
+  // stays and reports that its session is gone.
   const onPluginPage = pluginPageMatch !== null;
-  const leaveActiveSession = useCallback(
-    () => (onPluginPage ? selectPluginPageSession(null) : navigate("/")),
-    [onPluginPage, selectPluginPageSession, navigate],
-  );
+  const leaveActiveSession = useCallback(() => {
+    if (focusMode) return;
+    if (onPluginPage) selectPluginPageSession(null);
+    else navigate("/");
+  }, [focusMode, onPluginPage, selectPluginPageSession, navigate]);
   const showSettings = settingsRootMatch !== null || settingsTabMatch !== null;
   // Settings and plugin pages take the full width, sidebar and session panels hidden.
   const fullPageView = showSettings || pluginPageMatch !== null;
@@ -429,8 +446,10 @@ function AppContent({
   // them. See #2533.
   const trashedWorkspaces = useMemo(() => workspaces.filter(workspaceIsTrashed), [workspaces]);
 
-  const { unreadCount, waitingCount } = useAttentionCounts(sessions, activeSessionId);
-  const { onSoundDue, cancelCue } = useStatusSounds(sessions, activeSessionId);
+  // What this window notices: a focus-mode window ignores every other session's attention and sounds.
+  const windowSessions = useMemo(() => noticedSessions(sessions, focusSessionId), [sessions, focusSessionId]);
+  const { unreadCount, waitingCount } = useAttentionCounts(windowSessions, activeSessionId);
+  const { onSoundDue, cancelCue } = useStatusSounds(windowSessions, activeSessionId);
   const onPushedStatus = useCallback(
     (id: string, status: SessionResponse["status"], cursor: RuntimeCursor) => {
       cancelCue(id);
@@ -441,8 +460,8 @@ function AppContent({
   useSessionStatusStream({ onStatus: onPushedStatus, onSoundDue, onResync: refreshSessions });
   const attentionBadgeColors = useMemo(() => getAttentionBadgeColors(resolvedTheme), [resolvedTheme]);
 
-  // Remember the active session and restore it on a PWA relaunch (#2103).
-  useLastSessionRestore({ activeSessionId, sessions, sessionsLoaded });
+  // Remember the active session and restore it on a PWA relaunch (#2103). A focus window is not the main window.
+  useLastSessionRestore({ activeSessionId: focusMode ? null : activeSessionId, sessions, sessionsLoaded });
 
   // One-shot orphan-draft sweep once useSessions has settled its first
   // fetch (success or null). Catches acp:draft:<id> keys left behind
@@ -1022,6 +1041,10 @@ function AppContent({
 
   const handleSelectSession = useCallback(
     (sessionId: string, path?: string) => {
+      // A focus window never switches; another session opens in a regular window instead.
+      const target = focusNavigation(focusSessionId, sessionId);
+      if (target === "new-window") window.open(path ?? `/session/${encodeURIComponent(sessionId)}`, "_blank");
+      if (target !== "here") return;
       const ws = workspaces.find((w) => w.sessions.some((s) => s.id === sessionId));
       if (ws) {
         const picked = ws.sessions.find((s) => s.id === sessionId);
@@ -1066,6 +1089,7 @@ function AppContent({
       activeSessionId,
       singlePane,
       rightPanelView,
+      focusSessionId,
     ],
   );
 
@@ -1118,13 +1142,17 @@ function AppContent({
     const onNavigate = (e: Event) => {
       const detail = (e as CustomEvent).detail as { path?: string } | undefined;
       if (!detail?.path) return;
+      if (focusNavigation(focusSessionId) === "new-window") {
+        window.open(detail.path, "_blank");
+        return;
+      }
       navigate(detail.path);
       // See handleSelectSession: a mobile sidebar left open would cover the destination.
       if (window.innerWidth < 768) setSidebarOpen(false);
     };
     window.addEventListener(NAVIGATE_EVENT, onNavigate);
     return () => window.removeEventListener(NAVIGATE_EVENT, onNavigate);
-  }, [navigate]);
+  }, [navigate, focusSessionId]);
 
   const [wizardPrefill, setWizardPrefill] = useState<WizardPrefill | undefined>(undefined);
   const [deletingSessions, setDeletingSessions] = useState<SessionResponse[]>([]);
@@ -1633,9 +1661,14 @@ function AppContent({
   }, [navigate]);
 
   const handleOpenSettings = useCallback(() => {
+    // A focus window stays on its session, so settings open beside it.
+    if (focusNavigation(focusSessionId) === "new-window") {
+      window.open("/settings", "_blank");
+      return;
+    }
     navigate("/settings");
     if (window.innerWidth < 768) setSidebarOpen(false);
-  }, [navigate]);
+  }, [navigate, focusSessionId]);
 
   // Profiles moved into Settings as a tab; redirect the retired standalone
   // route so old bookmarks and links still land somewhere valid.
@@ -1671,10 +1704,14 @@ function AppContent({
   }, []);
 
   const closePicker = useCallback(() => setPickerOpen(false), []);
-  const handleDrawerSwipe = useCallback((action: DrawerSwipeAction) => {
-    if (action === "open-sidebar" || action === "close-sidebar") setSidebarOpen(action === "open-sidebar");
-    else setPickerOpen(action === "open-panels");
-  }, []);
+  const handleDrawerSwipe = useCallback(
+    (action: DrawerSwipeAction) => {
+      if (action === "open-sidebar" || action === "close-sidebar") {
+        if (!focusMode) setSidebarOpen(action === "open-sidebar");
+      } else setPickerOpen(action === "open-panels");
+    },
+    [focusMode],
+  );
   useDrawerSwipe(
     {
       sidebarOpen,
@@ -1797,10 +1834,11 @@ function AppContent({
   useKeyboardShortcuts(
     useCallback(
       () => ({
-        onNew: handleNewSession,
-        onJumpToAttention: handleJumpToAttention,
-        onFocusSidebar: handleFocusSidebar,
-        onNewScratch: handleNewScratch,
+        // A focus window has no sidebar and never switches session.
+        onNew: focusMode ? noop : handleNewSession,
+        onJumpToAttention: focusMode ? noop : handleJumpToAttention,
+        onFocusSidebar: focusMode ? noop : handleFocusSidebar,
+        onNewScratch: focusMode ? noop : handleNewScratch,
         onDiff: () => toggleDiff(),
         // Escape closes local UI surfaces only (dialogs, palette,
         // wizard, settings, help, file viewer). Never wire this to
@@ -1830,12 +1868,12 @@ function AppContent({
           setSelectedFile(null);
         },
         onHelp: () => setShowHelp((h) => !h),
-        onSettings: () => (showSettings ? handleCloseSettings() : navigate("/settings")),
+        onSettings: () => (showSettings ? handleCloseSettings() : handleOpenSettings()),
         onPalette: () => {
           setPaletteQuery("");
           setShowPalette((p) => !p);
         },
-        onToggleSidebar: () => setSidebarOpen((o) => !o),
+        onToggleSidebar: focusMode ? noop : () => setSidebarOpen((o) => !o),
         onToggleRightPanel: () => toggleRightDock(),
         onToggleTerminalFocus: handleToggleTerminalFocus,
       }),
@@ -1847,12 +1885,13 @@ function AppContent({
         stoppingSessionId,
         showSettings,
         handleCloseSettings,
-        navigate,
+        handleOpenSettings,
         handleToggleTerminalFocus,
         handleNewSession,
         handleNewScratch,
         handleJumpToAttention,
         handleFocusSidebar,
+        focusMode,
       ],
     ),
   );
@@ -1903,9 +1942,20 @@ function AppContent({
     onGoDashboard: handleGoDashboard,
     onToggleSidebar: handleToggleSidebar,
     onLogout,
+    focusMode,
+    focusModeEnabled,
+    onEnterFocusMode: enterFocusMode,
+    onOpenFocusWindow: openFocusWindow,
+    onExitFocusMode: exitFocusMode,
   });
 
-  const openSettingsTab = useCallback((tab: string) => navigate(`/settings/${tab}`), [navigate]);
+  const openSettingsTab = useCallback(
+    (tab: string) =>
+      focusNavigation(focusSessionId) === "new-window"
+        ? window.open(`/settings/${tab}`, "_blank")
+        : navigate(`/settings/${tab}`),
+    [navigate, focusSessionId],
+  );
   const settingsCommands = useSettingsCommands({
     open: showPalette,
     readOnly: !!serverAbout?.read_only,
@@ -1922,11 +1972,13 @@ function AppContent({
   const { results: conversationHits, loading: conversationSearching } = useConversationSearch(paletteQuery);
   const conversationActions = useMemo(
     () =>
-      buildConversationActions(conversationHits, sessions, activeSessionId).map(({ sessionId, ...rest }) => ({
-        ...rest,
-        perform: () => handleSelectSession(sessionId),
-      })),
-    [conversationHits, sessions, activeSessionId, handleSelectSession],
+      focusMode
+        ? []
+        : buildConversationActions(conversationHits, sessions, activeSessionId).map(({ sessionId, ...rest }) => ({
+            ...rest,
+            perform: () => handleSelectSession(sessionId),
+          })),
+    [conversationHits, sessions, activeSessionId, handleSelectSession, focusMode],
   );
 
   /** The routed session with its docks: the session route, or a plugin page's split pane. */
@@ -2203,6 +2255,10 @@ function AppContent({
       // The shell (TopBar + sidebar) already renders around this; fill the main
       // pane with a skeleton rather than blanking it until the first fetch lands.
       return <MainPaneSkeleton />;
+    }
+
+    if (focusMode && (!activeWorkspace || !activeSession)) {
+      return <FocusSessionGone onExit={exitFocusMode} />;
     }
 
     if (!activeWorkspace || !activeSession) {
@@ -2487,7 +2543,13 @@ function AppContent({
               isDevBuild={isDebugBuild(serverAbout)}
               onOpenTips={tips.open}
               onGoDashboard={handleGoDashboard}
-              sidebarColumnVisible={!fullPageView && sidebarOpen}
+              onExitFocusMode={focusMode ? exitFocusMode : undefined}
+              onEnterFocusMode={
+                focusModeEnabled && !focusMode && sessionMatch && activeSession
+                  ? () => enterFocusMode(activeSession.id)
+                  : undefined
+              }
+              sidebarColumnVisible={!focusMode && !fullPageView && sidebarOpen}
               rightColumnVisible={
                 isMdUp && !fullPageView && !!activeWorkspace && !!activeSession && !rightDockCollapsed
               }
@@ -2513,7 +2575,7 @@ function AppContent({
           )}
 
           <div className="flex flex-1 min-h-0">
-            {!fullPageView && (
+            {!fullPageView && !focusMode && (
               <WorkspaceSidebar
                 observedById={observedById}
                 runtimeEpoch={runtimeEpoch}
