@@ -547,6 +547,7 @@ pub(crate) struct HeldAttachRunner {
     entered: Option<tokio::sync::oneshot::Receiver<()>>,
     disconnected: Option<tokio::sync::oneshot::Receiver<()>>,
     completion: Option<tokio::sync::oneshot::Sender<()>>,
+    resumed: mpsc::Receiver<String>,
     peer: tokio::task::JoinHandle<()>,
     child: std::process::Child,
     _socket_dir: tempfile::TempDir,
@@ -558,6 +559,26 @@ impl HeldAttachRunner {
         cwd: &std::path::Path,
         generation: u64,
         profile: Option<&str>,
+    ) -> Self {
+        Self::with_initialize_hold(session_id, cwd, generation, profile, true)
+    }
+
+    /// Complete both real attach handshakes without an outstanding native prompt.
+    pub(crate) fn ready(
+        session_id: &str,
+        cwd: &std::path::Path,
+        generation: u64,
+        profile: Option<&str>,
+    ) -> Self {
+        Self::with_initialize_hold(session_id, cwd, generation, profile, false)
+    }
+
+    fn with_initialize_hold(
+        session_id: &str,
+        cwd: &std::path::Path,
+        generation: u64,
+        profile: Option<&str>,
+        hold_first_initialize: bool,
     ) -> Self {
         use crate::acp::control_protocol::{self, ControlBody, PromptOutcome};
         use std::os::unix::process::CommandExt as _;
@@ -596,6 +617,7 @@ impl HeldAttachRunner {
         let (entered_tx, entered) = tokio::sync::oneshot::channel();
         let (disconnected_tx, disconnected) = tokio::sync::oneshot::channel();
         let (completion, completion_rx) = tokio::sync::oneshot::channel();
+        let (resumed_tx, resumed) = mpsc::channel(2);
         let id = session_id.to_owned();
         let peer = tokio::spawn(async move {
             let mut entered_tx = Some(entered_tx);
@@ -622,7 +644,7 @@ impl HeldAttachRunner {
                                 control_protocol::CONTROL_PROTOCOL_VERSION
                             );
                         }
-                        ControlBody::Initialize { .. } if attempt == 0 => {
+                        ControlBody::Initialize { .. } if attempt == 0 && hold_first_initialize => {
                             entered_tx.take().unwrap().send(()).unwrap();
                             // A failed observation may close only this connection.
                             assert_eq!(
@@ -656,6 +678,10 @@ impl HeldAttachRunner {
                             )
                             .await
                             .unwrap();
+                            resumed_tx.send(native_id.clone()).await.unwrap();
+                            if !hold_first_initialize {
+                                continue;
+                            }
                             completion_rx.take().unwrap().await.unwrap();
                             control_protocol::write_frame(
                                 &mut stream,
@@ -698,6 +724,7 @@ impl HeldAttachRunner {
             entered: Some(entered),
             disconnected: Some(disconnected),
             completion: Some(completion),
+            resumed,
             peer,
             child,
             _socket_dir: socket_dir,
@@ -710,6 +737,11 @@ impl HeldAttachRunner {
 
     pub(crate) async fn disconnected(&mut self) {
         self.disconnected.take().unwrap().await.unwrap();
+    }
+
+    /// Observe an actual ResumeSession request after its SessionReady was written.
+    pub(crate) async fn resumed_session(&mut self) -> String {
+        self.resumed.recv().await.unwrap()
     }
 
     pub(crate) fn complete_turn(&mut self) {

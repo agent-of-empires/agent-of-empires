@@ -832,7 +832,13 @@ fn record_retired_handoff_in(
         );
         if let Some(event) = final_context_event.as_ref() {
             let change = crate::server::acp_events::derive_acp_session_change(event);
-            crate::server::acp_events::apply_acp_session_change(row, session_id, change.as_ref());
+            // The matched handoff owns this final context from the original retired worker.
+            crate::server::acp_events::apply_acp_session_change(
+                row,
+                session_id,
+                change.as_ref(),
+                true,
+            );
         }
         let terminal = match &intent.context {
             TerminalHandoffContext::Keep { native_store } => {

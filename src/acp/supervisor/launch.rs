@@ -692,6 +692,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         )
         .await?;
         admit_durable_launch(admission.as_ref(), &session_id).await?;
+        reservation.lease().set_admission(admission.clone());
         let identity = RunnerIdentity::from_record(&record);
 
         let agent_key = if record.agent_key.is_empty() {
