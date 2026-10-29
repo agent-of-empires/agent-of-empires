@@ -170,7 +170,10 @@ mod tests {
             .join("daemon/api.sock");
         let (mut listener, _lease) = bind_private(&path).await.unwrap();
         let _client = tokio::net::UnixStream::connect(&path).await.unwrap();
-        let (_stream, peer) = listener.accept().await;
+        let (_stream, peer) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                .await
+                .expect("accept must admit a same-UID peer");
         let owner = nix::unistd::geteuid().as_raw();
         assert!(matches!(peer, ConnectionPeer::UnixOwner { uid } if uid == owner));
     }
