@@ -290,4 +290,37 @@ describe("ApprovalCard plan viewer", () => {
       cleanup();
     }
   });
+  it("shows text past the 16 KiB preview cap in both views", () => {
+    const tail = "TAIL-MARKER-PAST-THE-CAP";
+    const long = `${"line of plan\n".repeat(2000)}${tail}`;
+    expect(long.length).toBeGreaterThan(16 * 1024);
+    mount(
+      makeApproval({ plan: long }, `{"plan":"${"line of plan\\n".repeat(1500)}\u2026[truncated]`, "Ready to code?"),
+    );
+    fireEvent.click(screen.getByText("View plan"));
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByTestId("plan-rendered").textContent).toContain(tail);
+    fireEvent.click(within(dialog).getByRole("tab", { name: "Raw" }));
+    expect(within(dialog).getByText(/TAIL-MARKER-PAST-THE-CAP/).tagName).toBe("PRE");
+  });
+
+  it("moves focus into the modal, wraps Tab, closes on Escape and restores focus", () => {
+    mount(withPlan());
+    const opener = screen.getByText("View plan");
+    opener.focus();
+    fireEvent.click(opener);
+    const dialog = screen.getByRole("dialog");
+    const buttons = Array.from(dialog.querySelectorAll("button"));
+    expect(dialog.contains(document.activeElement)).toBe(true);
+
+    buttons[buttons.length - 1].focus();
+    fireEvent.keyDown(document, { key: "Tab" });
+    expect(document.activeElement).toBe(buttons[0]);
+    fireEvent.keyDown(document, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(buttons[buttons.length - 1]);
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(opener);
+  });
 });

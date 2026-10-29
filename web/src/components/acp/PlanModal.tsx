@@ -2,7 +2,7 @@
 // with the card's decisions in the footer. Holds no approval state, so the
 // card stays the single place a decision is submitted.
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { TextMessagePartProvider } from "@assistant-ui/react";
 
 import type { ApprovalDecision } from "../../lib/acpTypes";
@@ -19,10 +19,52 @@ interface Props {
   onClose: () => void;
 }
 
+const FOCUSABLE = "button:not([disabled])";
+
+// Dialog contains no focus itself, so the plan modal moves focus in, cycles Tab
+// inside the panel, closes on Escape and hands focus back to the opener.
+function useModalFocus(onClose: () => void) {
+  const onCloseRef = useRef(onClose);
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  });
+  useEffect(() => {
+    const opener = document.activeElement as HTMLElement | null;
+    const root = () => document.querySelector<HTMLElement>('[data-testid="plan-modal"]');
+    root()?.querySelector<HTMLElement>(FOCUSABLE)?.focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onCloseRef.current();
+        return;
+      }
+      if (e.key !== "Tab") return;
+      const items = Array.from(root()?.querySelectorAll<HTMLElement>(FOCUSABLE) ?? []);
+      const first = items.at(0);
+      const last = items.at(-1);
+      if (!first || !last) return;
+      const active = document.activeElement;
+      if (!root()?.contains(active) || (e.shiftKey && active === first)) {
+        e.preventDefault();
+        (e.shiftKey && active === first ? last : first).focus();
+      } else if (!e.shiftKey && active === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      opener?.focus();
+    };
+  }, []);
+}
+
 const FOOTER_BUTTON = "px-3 py-1.5 text-sm rounded-md cursor-pointer transition-colors disabled:opacity-50";
 
 export function PlanModal({ plan, submitting, offline, onDecide, onClose }: Props) {
   const [view, setView] = useState<"rendered" | "raw">("rendered");
+  useModalFocus(onClose);
   const blocked = offline || submitting;
   const decide = (label: string, decision: ApprovalDecision, className: string) => (
     <button
