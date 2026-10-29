@@ -1409,6 +1409,7 @@ mod tests {
                         model: "claude-opus-4-8".into(),
                         output_file: "/tmp/bg-1.output".into(),
                         started_at: chrono::Utc::now(),
+                        workflow: None,
                     },
                     stopped(),
                 ],
@@ -2038,6 +2039,7 @@ mod tests {
                     model: "claude-opus-4-8".into(),
                     output_file: "/tmp/bg-1.output".into(),
                     started_at: chrono::Utc::now(),
+                    workflow: None,
                 },
                 live_frame.clone(),
             ];
@@ -2698,6 +2700,7 @@ mod tests {
                     task_id: "task-1".into(),
                     tool_call_id: Some("toolu_1".into()),
                     description: "sleep".into(),
+                    workflow: None,
                 },
             ];
             if !main_running {

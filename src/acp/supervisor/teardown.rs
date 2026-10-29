@@ -1412,6 +1412,7 @@ mod tests {
                     task_id: "original-task".into(),
                     tool_call_id: None,
                     description: "work".into(),
+                    workflow: None,
                 },
             );
             sup.publish_next(
@@ -1424,6 +1425,7 @@ mod tests {
                     model: "test-model".into(),
                     output_file: String::new(),
                     started_at: chrono::Utc::now(),
+                    workflow: None,
                 },
             );
             sup.shutdown(id).await.unwrap();
@@ -1563,6 +1565,7 @@ mod tests {
                 model: "test-model".into(),
                 output_file: String::new(),
                 started_at: chrono::Utc::now(),
+                workflow: None,
             },
         );
         let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(16);
@@ -1580,6 +1583,7 @@ mod tests {
                 task_id: "original-task".into(),
                 tool_call_id: None,
                 description: "work".into(),
+                workflow: None,
             })
             .await
             .unwrap();
@@ -1695,6 +1699,7 @@ mod tests {
                 task_id: "replacement-task".into(),
                 tool_call_id: None,
                 description: "new work".into(),
+                workflow: None,
             },
         );
         let record_path = worker_registry::record_path(id).unwrap();
@@ -2113,6 +2118,7 @@ mod tests {
                     model: "claude-opus-4-8".into(),
                     output_file: "/tmp/bg-real.output".into(),
                     started_at: chrono::Utc::now(),
+                    workflow: None,
                 },
             )
             .unwrap();
@@ -2176,6 +2182,7 @@ mod tests {
                     task_id: "task-1".into(),
                     tool_call_id: None,
                     description: "sleep".into(),
+                    workflow: None,
                 },
             )
             .unwrap();
@@ -2191,6 +2198,7 @@ mod tests {
                     model: "claude-opus-4-8".into(),
                     output_file: String::new(),
                     started_at: chrono::Utc::now(),
+                    workflow: None,
                 },
             )
             .unwrap();
@@ -2269,6 +2277,7 @@ mod tests {
                     task_id: "task-1".into(),
                     tool_call_id: None,
                     description: "sleep".into(),
+                    workflow: None,
                 },
             )
             .unwrap();
@@ -2435,6 +2444,7 @@ mod tests {
                 task_id: "inflight".into(),
                 tool_call_id: None,
                 description: "sleep".into(),
+                workflow: None,
             })
             .await
             .unwrap();
@@ -2521,6 +2531,7 @@ mod tests {
                     task_id: "open".into(),
                     tool_call_id: None,
                     description: "sleep".into(),
+                    workflow: None,
                 },
             )
             .unwrap();
@@ -2655,6 +2666,7 @@ mod tests {
             idle: Arc::new(move || {
                 let _ = idle_tx.send(());
             }),
+            workflow: None,
         }
         .spawn(None)
         .await;

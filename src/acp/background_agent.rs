@@ -7,6 +7,7 @@ use std::time::Duration;
 use chrono::Utc;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tokio::sync::mpsc::Sender;
+use tokio_util::sync::CancellationToken;
 
 use crate::acp::state::{BackgroundAgentStatus, Event};
 
@@ -180,7 +181,41 @@ pub fn spawn_tailer(
             active,
             agent_id: agent_id.clone(),
         };
-        run_tailer(agent_id, output_file, source, event_tx, start).await;
+        run_tailer(agent_id, output_file, source, event_tx, start, None).await;
+    });
+}
+
+/// Like [`spawn_tailer`], for a sub-agent whose end someone else reports (a
+/// workflow agent, ended by its run's journal): only progress is emitted, and
+/// the tailer runs until `stop` fires or the session goes away.
+pub(crate) fn spawn_progress_tailer(
+    agent_id: String,
+    output_file: String,
+    event_tx: Sender<Event>,
+    active: Arc<Mutex<HashSet<String>>>,
+    stop: CancellationToken,
+) {
+    if !active
+        .lock()
+        .expect("bg-agent active set mutex poisoned")
+        .insert(agent_id.clone())
+    {
+        return;
+    }
+    tokio::spawn(async move {
+        let _guard = ActiveGuard {
+            active,
+            agent_id: agent_id.clone(),
+        };
+        run_tailer(
+            agent_id,
+            output_file,
+            TranscriptSource::Host,
+            event_tx,
+            TailerStart::Live,
+            Some(stop),
+        )
+        .await;
     });
 }
 
@@ -225,13 +260,20 @@ async fn run_tailer(
     source: TranscriptSource,
     event_tx: Sender<Event>,
     start: TailerStart,
+    stop: Option<CancellationToken>,
 ) {
+    let stopped = || async {
+        match &stop {
+            Some(stop) => stop.cancelled().await,
+            None => std::future::pending().await,
+        }
+    };
     // Wait for the transcript to appear (the SDK writes it shortly after
     // the launch event). For a sandboxed session this checks inside the
     // container, not the host.
     let mut waited = Duration::ZERO;
     while !source.exists(&output_file).await {
-        if waited >= WAIT_FILE_FOR {
+        if waited >= WAIT_FILE_FOR && stop.is_none() {
             let (status, warning) = missing_transcript_outcome(start);
             let _ = event_tx
                 .send(completed(
@@ -247,6 +289,7 @@ async fn run_tailer(
         tokio::select! {
             _ = tokio::time::sleep(POLL_INTERVAL) => waited += POLL_INTERVAL,
             _ = event_tx.closed() => return, // session gone
+            _ = stopped() => return,
         }
     }
 
@@ -266,7 +309,7 @@ async fn run_tailer(
             stalled_emitted = false;
         }
 
-        if snap.done {
+        if snap.done && stop.is_none() {
             // The explicit end_turn completion path.
             let warning = format_warning(&snap);
             let _ = event_tx
@@ -282,7 +325,7 @@ async fn run_tailer(
         }
 
         let idle = (now - last_growth).to_std().unwrap_or(Duration::ZERO);
-        if idle >= ABORT_AFTER {
+        if idle >= ABORT_AFTER && stop.is_none() {
             // Stopped tracking.
             let (status, result, warning) = infer_idle_outcome(&snap);
             let _ = event_tx
@@ -327,6 +370,7 @@ async fn run_tailer(
         tokio::select! {
             _ = tokio::time::sleep(POLL_INTERVAL) => {}
             _ = event_tx.closed() => return,
+            _ = stopped() => return,
         }
     }
 }
@@ -491,7 +535,7 @@ fn snapshot_tools(snap: &Snapshot) -> Vec<crate::acp::state::BackgroundAgentTool
 
 /// First `TEXT_PREVIEW_CHARS` characters of `text`, trimmed, with an
 /// ellipsis if truncated.
-fn preview(text: &str) -> String {
+pub(crate) fn preview(text: &str) -> String {
     let trimmed = text.trim();
     if trimmed.chars().count() <= TEXT_PREVIEW_CHARS {
         return trimmed.to_string();
@@ -592,6 +636,41 @@ mod tests {
              untrackable-path completion the empty output_file would otherwise emit"
         );
         assert!(active.lock().unwrap().contains("dup"));
+    }
+
+    #[tokio::test]
+    async fn progress_tailer_reports_progress_but_never_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.jsonl");
+        // A finished transcript: an ordinary tailer would complete on it.
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash"}]}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let active = Arc::new(Mutex::new(HashSet::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let stop = CancellationToken::new();
+        spawn_progress_tailer(
+            "wf-agent".into(),
+            path.to_string_lossy().into_owned(),
+            tx,
+            active.clone(),
+            stop.clone(),
+        );
+        match rx.recv().await {
+            Some(Event::BackgroundAgentProgress { tool_count, .. }) => assert_eq!(tool_count, 1),
+            other => panic!("expected progress, got {other:?}"),
+        }
+        stop.cancel();
+        // The tailer drops its sender on exit, so the channel closes with no
+        // completion in between.
+        assert!(rx.recv().await.is_none());
     }
 
     #[tokio::test]

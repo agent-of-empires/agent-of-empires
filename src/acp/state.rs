@@ -366,6 +366,38 @@ impl BackgroundAgentStatus {
 pub struct BackgroundTaskLaunch {
     pub task_id: String,
     pub tool_call_id: Option<String>,
+    pub workflow: Option<WorkflowLaunch>,
+    /// What the log already recorded for the workflow's agents, so a resumed
+    /// journal read neither repeats nor misses an event.
+    pub workflow_agents: WorkflowAgents,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkflowAgents {
+    pub launched: std::collections::HashSet<String>,
+    pub completed: std::collections::HashSet<String>,
+}
+
+/// A Claude `Workflow` run, from its launch result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowLaunch {
+    pub run_id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Host directory holding the run's journal and agent transcripts.
+    /// Stripped before any client-facing frame, like
+    /// `BackgroundAgentLaunched::output_file`.
+    #[serde(default)]
+    pub transcript_dir: String,
+}
+
+/// The workflow run and phase a background sub-agent belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowRef {
+    pub run_id: String,
+    pub name: String,
+    pub phase: String,
 }
 
 /// One tool call a background sub-agent made, parsed from its transcript.
@@ -389,6 +421,8 @@ pub struct BackgroundAgentRecord {
     pub description: String,
     pub prompt: String,
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<WorkflowRef>,
     pub status: BackgroundAgentStatus,
     pub started_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -670,6 +704,8 @@ pub enum Event {
         /// before any client-facing frame (`protocol::strip_transcript_path`).
         #[serde(default)]
         output_file: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workflow: Option<WorkflowRef>,
         started_at: DateTime<Utc>,
     },
     /// Throttled snapshot of a running background sub-agent.
@@ -697,14 +733,16 @@ pub enum Event {
         warning: Option<String>,
         ended_at: DateTime<Utc>,
     },
-    /// A background task that is not a sub-agent (Bash `run_in_background`)
-    /// started, from the tool result's `toolResponse.backgroundTaskId`. Its
+    /// A background task that is not a sub-agent (Bash `run_in_background`, or
+    /// a `Workflow` run) started, from the tool result's `toolResponse`. Its
     /// end is read from the session transcript (`acp::task_transcript`).
     BackgroundTaskStarted {
         task_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_call_id: Option<String>,
         description: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workflow: Option<WorkflowLaunch>,
     },
     /// A background task reached a terminal state.
     BackgroundTaskFinished {
@@ -1066,6 +1104,7 @@ impl AcpState {
                 prompt,
                 model,
                 output_file: _,
+                workflow,
                 started_at,
             } => self.launch_background_agent(BackgroundAgentRecord {
                 agent_id,
@@ -1073,6 +1112,7 @@ impl AcpState {
                 description,
                 prompt,
                 model,
+                workflow,
                 status: BackgroundAgentStatus::Running,
                 started_at,
                 ended_at: None,
@@ -1337,6 +1377,7 @@ mod tests {
             model: "claude-opus-4-8".into(),
             output_file: "/tmp/bg-1.output".into(),
             started_at: Utc::now(),
+            workflow: None,
         };
         let completed = |status| Event::BackgroundAgentCompleted {
             agent_id: "bg-1".into(),
@@ -1463,6 +1504,7 @@ mod tests {
                         task_id: "task-1".into(),
                         tool_call_id: None,
                         description: "sleep".into(),
+                        workflow: None,
                     },
                     stopped("end_turn"),
                 ],
@@ -2003,6 +2045,7 @@ mod tests {
                 model: "claude-opus-4-8".into(),
                 output_file: "/tmp/a1.output".into(),
                 started_at: Utc::now(),
+                workflow: None,
             },
             progress(
                 3,
@@ -2074,6 +2117,7 @@ mod tests {
             model: "claude-opus-4-8".into(),
             output_file: "/tmp/a1.output".into(),
             started_at: Utc::now(),
+            workflow: None,
         }
     }
 
@@ -2137,6 +2181,7 @@ mod tests {
             task_id: id.into(),
             tool_call_id: None,
             description: "sleep".into(),
+            workflow: None,
         };
         let finished = |id: &str| Event::BackgroundTaskFinished { task_id: id.into() };
         let mut s = applied([prompt("go"), started("t-1"), started("t-2"), stopped("end")]);

@@ -10,7 +10,7 @@
 //! The transcript is followed through the shared file watcher, so nothing
 //! polls while it is quiet.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
@@ -21,23 +21,24 @@ use tokio_util::sync::CancellationToken;
 
 use crate::acp::background_agent::TailerStart;
 use crate::acp::state::{BackgroundTaskLaunch, Event};
+use crate::acp::workflow_journal::WorkflowJournal;
 use crate::file_watch::{FileMatcher, FileWatchService, WatchSpec};
 
 /// Coalesces the burst of writes one transcript entry causes.
-const WATCH_DEBOUNCE: Duration = Duration::from_millis(50);
+pub(crate) const WATCH_DEBOUNCE: Duration = Duration::from_millis(50);
 /// A kernel watcher can drop events (queue overflow), so the transcript is
 /// also re-read this often. Rare enough not to be polling.
-const SAFETY_REREAD: Duration = Duration::from_secs(30);
+pub(crate) const SAFETY_REREAD: Duration = Duration::from_secs(30);
 /// Used only when no watcher is available (file watching off or failed).
-const FALLBACK_POLL: Duration = Duration::from_millis(500);
+pub(crate) const FALLBACK_POLL: Duration = Duration::from_millis(500);
 /// A live launch also reads this much of the transcript's tail, for a
 /// notification that landed before the tailer started.
 const LIVE_LOOKBACK_BYTES: u64 = 256 * 1024;
 /// The transcript is read and scanned in chunks of this size, so a long
 /// conversation is never held in memory.
-const READ_CHUNK_BYTES: usize = 256 * 1024;
+pub(crate) const READ_CHUNK_BYTES: usize = 256 * 1024;
 /// A single line longer than this is skipped, not buffered.
-const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 /// `<status>` values after which a task will not report again.
 const TERMINAL_STATUSES: &[&str] = &["completed", "failed", "stopped", "killed"];
 
@@ -187,11 +188,13 @@ pub(crate) struct TaskTailer {
     pub event_tx: WeakSender<Event>,
     pub start: TailerStart,
     pub idle: IdleHook,
+    /// Set for a `Workflow` run, whose agents are followed alongside.
+    pub workflow: Option<WorkflowJournal>,
 }
 
 impl TaskTailer {
     pub(crate) async fn spawn(
-        self,
+        mut self,
         start_event: Option<Event>,
     ) -> Option<tokio::task::JoinHandle<()>> {
         let publication = self.active.publication.lock().await;
@@ -224,9 +227,18 @@ impl TaskTailer {
         drop(publication);
         Some(tokio::spawn(async move {
             let _guard = guard;
+            // The run's agents are settled before the task reports its end.
+            let ended = CancellationToken::new();
+            let journal = self.workflow.take().map(|journal| {
+                tokio::spawn(journal.run(ended.clone(), owner.cancellation.clone()))
+            });
             tokio::select! {
                 () = owner.cancellation.cancelled() => return,
                 () = self.follow() => {}
+            }
+            ended.cancel();
+            if let Some(journal) = journal {
+                let _ = journal.await;
             }
             // Keep owner validation and enqueue ordered against replacement starts.
             let _publication = self.active.publication.lock().await;
@@ -244,15 +256,29 @@ impl TaskTailer {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn spawn_task_tailer(
     launch: BackgroundTaskLaunch,
     session_id: String,
     claude_home: Option<PathBuf>,
     active: Arc<ActiveTasks>,
+    bg_agents: Arc<Mutex<HashSet<String>>>,
     event_tx: WeakSender<Event>,
     start: TailerStart,
     start_event: Option<Event>,
 ) {
+    let workflow = match (launch.workflow, &launch.tool_call_id, &claude_home) {
+        (Some(workflow), Some(tool_call_id), Some(home)) => Some(WorkflowJournal {
+            launch: workflow,
+            tool_call_id: tool_call_id.clone(),
+            claude_home: home.clone(),
+            known: launch.workflow_agents,
+            event_tx: event_tx.clone(),
+            bg_agents,
+            watch: shared_watch(),
+        }),
+        _ => None,
+    };
     let _ = TaskTailer {
         claude_home,
         watch: shared_watch(),
@@ -263,6 +289,7 @@ pub(crate) async fn spawn_task_tailer(
         event_tx,
         start,
         idle: Arc::new(|| {}),
+        workflow,
     }
     .spawn(start_event)
     .await;
@@ -674,6 +701,7 @@ mod tests {
                 event_tx: self.tx.as_ref().expect("sender kept").downgrade(),
                 start,
                 idle: self.idle.clone(),
+                workflow: None,
             }
             .spawn(None)
             .await;
@@ -795,6 +823,7 @@ mod tests {
             event_tx: tx.downgrade(),
             start: TailerStart::Live,
             idle: Arc::new(|| {}),
+            workflow: None,
         }
         .spawn(None)
         .await;
@@ -820,6 +849,7 @@ mod tests {
             event_tx: tx.downgrade(),
             start: TailerStart::Live,
             idle: Arc::new(|| {}),
+            workflow: None,
         }
         .spawn(None)
         .await;
@@ -979,6 +1009,7 @@ mod tests {
             event_tx: fixture.tx.as_ref().unwrap().downgrade(),
             start: TailerStart::Live,
             idle: fixture.idle.clone(),
+            workflow: None,
         };
         let old_tailer = tailer("toolu_old");
         let new_tailer = tailer("toolu_1");
@@ -986,6 +1017,7 @@ mod tests {
             task_id: "t-1".into(),
             tool_call_id: Some(tool_call_id.into()),
             description: "sleep".into(),
+            workflow: None,
         };
         let old = old_tailer.spawn(Some(started("toolu_old"))).await.unwrap();
         assert!(matches!(

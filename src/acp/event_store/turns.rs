@@ -6,7 +6,7 @@ use rusqlite::{params, OptionalExtension};
 
 use super::{decode, logged, query_strings, EventStore, NON_SUBSTANTIVE_EVENT_DISCRIMINANTS};
 use crate::acp::approvals::{Approval, Nonce};
-use crate::acp::state::{BackgroundTaskLaunch, Event, Plan};
+use crate::acp::state::{BackgroundTaskLaunch, Event, Plan, WorkflowAgents};
 use crate::events;
 
 /// A background agent silent this long without completing no longer holds a turn open.
@@ -51,7 +51,8 @@ const UNRESOLVED_BACKGROUND_AGENT_WHERE: &str = "
 
 const UNRESOLVED_BACKGROUND_TASKS_SQL: &str =
     "SELECT json_extract(started.event_json, '$.BackgroundTaskStarted.task_id') AS task_id,
-            json_extract(started.event_json, '$.BackgroundTaskStarted.tool_call_id')
+            json_extract(started.event_json, '$.BackgroundTaskStarted.tool_call_id'),
+            json_extract(started.event_json, '$.BackgroundTaskStarted.workflow')
      FROM acp_events AS started
      WHERE started.session_id = ?1
        AND started.discriminant = 'BackgroundTaskStarted'
@@ -73,6 +74,36 @@ const UNRESOLVED_BACKGROUND_TASKS_SQL: &str =
                  json_extract(started.event_json, '$.BackgroundTaskStarted.task_id')
        )
      ORDER BY started.seq ASC";
+
+/// The agents of workflow run `run_id` the log has launched, and those of
+/// them it has completed.
+fn workflow_agents(conn: &rusqlite::Connection, session_id: &str, run_id: &str) -> WorkflowAgents {
+    let what = "workflow_agents";
+    let ids = |sql: &str| -> std::collections::HashSet<String> {
+        let Some(mut stmt) = logged(conn.prepare_cached(sql), what, session_id) else {
+            return Default::default();
+        };
+        let rows = stmt.query_map(params![session_id, run_id], |row| row.get::<_, String>(0));
+        logged(rows, what, session_id)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    };
+    const LAUNCHED: &str = "SELECT json_extract(event_json, '$.BackgroundAgentLaunched.agent_id')
+         FROM acp_events
+         WHERE session_id = ?1
+           AND discriminant = 'BackgroundAgentLaunched'
+           AND json_extract(event_json, '$.BackgroundAgentLaunched.workflow.run_id') = ?2";
+    WorkflowAgents {
+        launched: ids(LAUNCHED),
+        completed: ids(&format!(
+            "SELECT json_extract(event_json, '$.BackgroundAgentCompleted.agent_id')
+             FROM acp_events
+             WHERE session_id = ?1
+               AND discriminant = 'BackgroundAgentCompleted'
+               AND json_extract(event_json, '$.BackgroundAgentCompleted.agent_id') IN ({LAUNCHED})"
+        )),
+    }
+}
 
 impl EventStore {
     pub fn latest_plan(&self, session_id: &str) -> Option<Plan> {
@@ -263,14 +294,25 @@ impl EventStore {
             Ok(BackgroundTaskLaunch {
                 task_id: row.get(0)?,
                 tool_call_id: row.get(1)?,
+                workflow: row
+                    .get::<_, Option<String>>(2)?
+                    .and_then(|json| serde_json::from_str(&json).ok()),
+                workflow_agents: WorkflowAgents::default(),
             })
         });
-        logged(rows, what, session_id)
+        let mut launches: Vec<BackgroundTaskLaunch> = logged(rows, what, session_id)
             .map(|rows| {
                 rows.filter_map(|row| logged(row, what, session_id))
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        drop(statement);
+        for launch in &mut launches {
+            if let Some(workflow) = &launch.workflow {
+                launch.workflow_agents = workflow_agents(&conn, session_id, &workflow.run_id);
+            }
+        }
+        launches
     }
 
     /// The same rows as [`Self::unresolved_background_agent_ids`], carrying
@@ -285,20 +327,24 @@ impl EventStore {
         let what = "unresolved_background_agent_launches";
         let sql = format!(
             "SELECT json_extract(event_json, '$.BackgroundAgentLaunched.agent_id'),\
-                    json_extract(event_json, '$.BackgroundAgentLaunched.output_file')\
+                    json_extract(event_json, '$.BackgroundAgentLaunched.output_file'),\
+                    json_extract(event_json, '$.BackgroundAgentLaunched.workflow') IS NOT NULL\
              {UNRESOLVED_BACKGROUND_AGENT_WHERE}"
         );
         let Some(mut stmt) = logged(conn.prepare(&sql), what, session_id) else {
             return Vec::new();
         };
+        // A workflow's agents resume with their run's journal, which owns
+        // their completion (see `acp::workflow_journal`).
         let rows = stmt.query_map(params![session_id], |row| {
-            Ok(UnresolvedBackgroundAgentLaunch {
+            let launch = UnresolvedBackgroundAgentLaunch {
                 agent_id: row.get(0)?,
                 output_file: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-            })
+            };
+            Ok((!row.get::<_, bool>(2)?).then_some(launch))
         });
         logged(rows, what, session_id)
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .map(|rows| rows.filter_map(|r| r.ok().flatten()).collect())
             .unwrap_or_default()
     }
 
@@ -521,7 +567,7 @@ mod tests {
     use super::super::test_support::*;
     use super::*;
     use crate::acp::approvals::ApprovalDecision;
-    use crate::acp::state::BackgroundAgentStatus;
+    use crate::acp::state::{BackgroundAgentStatus, WorkflowLaunch, WorkflowRef};
 
     #[test]
     fn first_prompt_and_first_turn_context() {
@@ -892,6 +938,7 @@ mod tests {
             task_id: id.into(),
             tool_call_id: None,
             description: "sleep".into(),
+            workflow: None,
         };
         let chunk = || Event::AgentMessageChunk {
             text: "x".into(),
@@ -970,6 +1017,7 @@ mod tests {
             task_id: "t".into(),
             tool_call_id: Some(tool_call_id.into()),
             description: "sleep".into(),
+            workflow: None,
         };
         let finished = || Event::BackgroundTaskFinished {
             task_id: "t".into(),
@@ -987,6 +1035,8 @@ mod tests {
             [BackgroundTaskLaunch {
                 task_id: "t".into(),
                 tool_call_id: Some("toolu_latest".into()),
+                workflow: None,
+                workflow_agents: WorkflowAgents::default(),
             }]
         );
         assert!(store.has_in_flight_turn("s-1"));
@@ -1003,6 +1053,7 @@ mod tests {
             task_id: id.into(),
             tool_call_id: None,
             description: "sleep".into(),
+            workflow: None,
         };
         store.record("s-1", 1, &started("t-1")).unwrap();
         store.record("s-1", 2, &started("t-2")).unwrap();
@@ -1022,6 +1073,81 @@ mod tests {
         assert!(store.unresolved_background_task_ids("s-2").is_empty());
     }
 
+    /// A workflow run's resume carries its launch and what the log recorded
+    /// for its agents, and those agents stay out of the generic agent resume.
+    #[test]
+    fn an_open_workflow_resumes_with_its_recorded_agents() {
+        let (_tmp, store) = open_store(1000);
+        let launch = WorkflowLaunch {
+            run_id: "wf_1".into(),
+            name: "drafts".into(),
+            summary: Some("draft them".into()),
+            transcript_dir: "/home/u/.claude/wf_1".into(),
+        };
+        let workflow_agent = |agent_id: &str, run_id: &str| {
+            let mut event = bg_launched(
+                agent_id,
+                &format!("/home/u/.claude/wf_1/agent-{agent_id}.jsonl"),
+            );
+            if let Event::BackgroundAgentLaunched { workflow, .. } = &mut event {
+                *workflow = Some(WorkflowRef {
+                    run_id: run_id.into(),
+                    name: "drafts".into(),
+                    phase: "Draft".into(),
+                });
+            }
+            event
+        };
+        record_from(
+            &store,
+            "s-1",
+            1,
+            [
+                Event::BackgroundTaskStarted {
+                    task_id: "wfx".into(),
+                    tool_call_id: Some("toolu_wf".into()),
+                    description: "drafts".into(),
+                    workflow: Some(launch.clone()),
+                },
+                workflow_agent("a1", "wf_1"),
+                workflow_agent("a2", "wf_1"),
+                workflow_agent("other-run", "wf_2"),
+                bg_launched("plain", "/tmp/plain.jsonl"),
+                Event::BackgroundAgentCompleted {
+                    agent_id: "a1".into(),
+                    status: BackgroundAgentStatus::Completed,
+                    tools: Vec::new(),
+                    result: None,
+                    warning: None,
+                    ended_at: chrono::Utc::now(),
+                },
+            ],
+        );
+        assert_eq!(
+            store.unresolved_background_task_launches("s-1"),
+            [BackgroundTaskLaunch {
+                task_id: "wfx".into(),
+                tool_call_id: Some("toolu_wf".into()),
+                workflow: Some(launch),
+                workflow_agents: WorkflowAgents {
+                    launched: ["a1".to_string(), "a2".to_string()].into(),
+                    completed: ["a1".to_string()].into(),
+                },
+            }]
+        );
+        let generic: Vec<String> = store
+            .unresolved_background_agent_launches("s-1")
+            .into_iter()
+            .map(|l| l.agent_id)
+            .collect();
+        assert_eq!(generic, ["plain"]);
+        // Teardown still sees every open agent, workflow ones included.
+        assert_eq!(
+            store.unresolved_background_agent_ids("s-1"),
+            ["a2", "other-run", "plain"].map(String::from)
+        );
+    }
+
     fn bg_launched(agent_id: &str, output_file: &str) -> Event {
         Event::BackgroundAgentLaunched {
             agent_id: agent_id.into(),
@@ -1031,6 +1157,7 @@ mod tests {
             model: "claude-opus-4-8".into(),
             output_file: output_file.into(),
             started_at: chrono::Utc::now(),
+            workflow: None,
         }
     }
 }

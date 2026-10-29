@@ -714,6 +714,7 @@ mod tests {
             model: "claude-opus-4-8".into(),
             output_file: "/tmp/a1.output".into(),
             started_at: chrono::Utc::now(),
+            workflow: None,
         }]);
         assert!(!state.turn_active, "fixture invariant: no main turn opened");
         t.apply_reduced_state(1, state, &[]);
@@ -735,6 +736,7 @@ mod tests {
             model: "claude-opus-4-8".into(),
             output_file: "/tmp/a1.output".into(),
             started_at: chrono::Utc::now(),
+            workflow: None,
         }]);
         t.apply_reduced_state(1, launched, &[]);
         assert!(t.background_agent_active);
