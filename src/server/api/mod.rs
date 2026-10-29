@@ -472,6 +472,11 @@ mod tests {
             ],
         ),
         (
+            "sessions/file_edit.rs",
+            include_str!("sessions/file_edit.rs"),
+            &["save_session_file"],
+        ),
+        (
             "sessions/list.rs",
             include_str!("sessions/list.rs"),
             &["update_workspace_ordering"],
