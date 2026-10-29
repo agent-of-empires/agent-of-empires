@@ -1369,10 +1369,14 @@ mod tests {
             .expect("hook's rename must finish without waiting for launch exclusion")
             .unwrap();
         assert_eq!(status, StatusCode::OK);
-        let stop = state
-            .acp_supervisor
-            .begin_stop_request(&id, "user_stopped", None, false)
-            .await;
+        let stop = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state
+                .acp_supervisor
+                .begin_stop_request(&id, "user_stopped", None, false),
+        )
+        .await
+        .expect("stop request must acquire its fence while the hook is active");
         assert!(
             !spawning.is_finished(),
             "cancellation must wait for the running hook"

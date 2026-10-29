@@ -153,6 +153,17 @@ A worker that exits within ~10s (broken command, missing adapter, failed handsha
 
 ## Agent switching
 
+`POST /api/sessions/{id}/acp/restart` restarts the structured-view worker without
+changing the selected agent. It first validates the stored session and requested
+agent, then fences new launches, cancels or stops the current worker, waits for
+the worker to become absent, and starts a replacement with explicit resume
+authority. A concurrent restart returns `409 restart_in_progress`; if the old
+worker cannot settle before the bounded shutdown wait, the endpoint returns
+`409 worker_not_stopped` and leaves the replacement admission to a retry. The
+restart request is runtime-owned, so disconnecting the HTTP client does not
+leave the session half-restarted. The Web startup and Retry actions call this
+endpoint from a separate UI flow.
+
 `POST /api/sessions/{id}/acp/switch-agent` stops the current worker, spawns the target, persists `agent_name`, clears `acp_session_id` (the old id belongs to a different vendor), resolves the model from the request alone so the old backend's pick does not follow the session across vendors (as `Instance::swap_tool` does), and emits `AgentSwitched { from, to, reason }` so reducers drop backend-specific transient state and the transcript shows a divider. The composer is pre-filled with a context-primer recap, never auto-sent. CLI: `aoe acp switch-agent <session> <target> [--model <name>]`. `reason` is `manual` or `rate_limited`. Completion commits through the scoped native store under canonical exclusion. An automatic respawn retains the originating launch intent; an independent launch supersedes it and refuses the old completion.
 
 Claude-family provider changes restart the worker, preserve conversation and reasoning effort, and reset the model to the target provider default. Active turns and background work refuse the change. The web client keeps one pending request per session across route remounts; an observed canonical provider change invalidates a late response echo, including an away-and-back transition.
