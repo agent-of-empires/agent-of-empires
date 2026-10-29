@@ -346,7 +346,7 @@ pub(crate) fn migrate_sandbox_store_for_test(
 /// downcast to offer a restart.
 #[derive(Debug, thiserror::Error)]
 #[error("{0}; schema migration refused. Run `aoe serve --restart` with the new binary, or stop the daemon through its manager")]
-pub struct DaemonBlocksMigration(&'static str);
+pub struct DaemonBlocksMigration(pub(crate) &'static str);
 
 pub fn run_migrations() -> Result<()> {
     run_migrations_with(None)

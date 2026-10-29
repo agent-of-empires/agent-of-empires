@@ -272,14 +272,13 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(120));
         let mut frame = 0usize;
         let mut spinner = boot_spinner::BootSpinner::default();
-        loop {
+        let outcome = loop {
             tokio::select! {
                 result = &mut migration_handle => {
                     let mut console = console.lock().unwrap_or_else(|e| e.into_inner());
                     let _ = spinner.finish(&mut io::stdout(), &mut console);
                     drop(console);
-                    result??;
-                    break;
+                    break result?;
                 }
                 _ = tick.tick() => {
                     let width = crate::terminal::get_size().map_or(80, |(w, _)| w as usize);
@@ -288,6 +287,11 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
                     frame += 1;
                 }
             }
+        };
+        if let Err(error) = outcome {
+            let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
+            crate::cli::migrate::offer_restart(error, interactive).await?;
+            migrations::run_migrations_with(None)?;
         }
     }
 

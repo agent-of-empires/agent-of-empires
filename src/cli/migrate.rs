@@ -12,10 +12,21 @@ use crate::migrations::progress::{fit_width, ConsoleProgress, Event, Reporter};
 /// Run startup migrations. When a managed daemon blocks them and a person is
 /// at the terminal, offer `aoe serve --restart`, which also migrates.
 pub async fn run_offering_restart(reporter: Option<Reporter>, interactive: bool) -> Result<()> {
-    let error = match crate::migrations::run_migrations_with(reporter.clone()) {
-        Err(error) if error.is::<crate::migrations::DaemonBlocksMigration>() => error,
-        result => return result,
-    };
+    match crate::migrations::run_migrations_with(reporter.clone()) {
+        Err(error) => {
+            offer_restart(error, interactive).await?;
+            crate::migrations::run_migrations_with(reporter)
+        }
+        ok => ok,
+    }
+}
+
+/// `Ok` once the daemon was restarted and the migration is worth retrying;
+/// otherwise the original `error`.
+pub async fn offer_restart(error: anyhow::Error, interactive: bool) -> Result<()> {
+    if !error.is::<crate::migrations::DaemonBlocksMigration>() {
+        return Err(error);
+    }
     let managed =
         crate::cli::serve::daemon_pid().is_some_and(crate::cli::serve::serve_launch_matches);
     let autostart_disabled = crate::acp::client::daemon_manager::autostart_disabled();
@@ -24,7 +35,7 @@ pub async fn run_offering_restart(reporter: Option<Reporter>, interactive: bool)
     }
     eprintln!("Restarting the daemon...");
     crate::cli::serve::restart_daemon_with_receipt(None, false).await?;
-    crate::migrations::run_migrations_with(reporter)
+    Ok(())
 }
 
 fn should_offer_restart(interactive: bool, autostart_disabled: bool, managed: bool) -> bool {
@@ -213,6 +224,21 @@ pub async fn run(args: &MigrateArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn offer_restart_returns_the_original_error_unless_offered() {
+        use crate::migrations::DaemonBlocksMigration;
+        let blocked: anyhow::Error = DaemonBlocksMigration("blocked").into();
+        let message = blocked.to_string();
+        let error = super::offer_restart(blocked, false).await.unwrap_err();
+        assert!(error.is::<DaemonBlocksMigration>());
+        assert_eq!(error.to_string(), message);
+
+        let other = super::offer_restart(anyhow::anyhow!("boom"), true)
+            .await
+            .unwrap_err();
+        assert_eq!(other.to_string(), "boom");
+    }
+
     #[test]
     fn restart_is_offered_only_to_a_person_with_a_managed_daemon() {
         use super::should_offer_restart;
