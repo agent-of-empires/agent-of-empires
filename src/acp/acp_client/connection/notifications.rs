@@ -29,7 +29,9 @@ use crate::acp::acp_client::update_events::{
     map_update_to_events, qualify_compaction_id, restored_wake_tool_event, AgentMessageDedup,
     CompactionFold, CompactionTracker,
 };
-use crate::acp::acp_client::watchdog::classify_watchdog_notification_signals;
+use crate::acp::acp_client::watchdog::{
+    classify_watchdog_notification_signals, is_detached_omp_task_update,
+};
 
 pub(super) fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -45,7 +47,7 @@ pub(super) struct Shared {
     /// Set between a successful `session/load` and the first prompt, while
     /// the adapter replays history the event store already holds.
     pub(super) suppress_history_replay: AtomicBool,
-    /// Epoch-ms of foreground lifecycle activity, for resume-idle recovery.
+    /// Epoch-ms of notifications other than explicit detached omp updates.
     pub(super) last_event_at: AtomicI64,
     /// A lifecycle-bearing notification arrived after attach. Ambient
     /// updates do not prove turn progress.
@@ -231,6 +233,9 @@ impl Shared {
         local_prompt_signals: bool,
     ) {
         let suppressing = self.suppress_history_replay.load(Ordering::Relaxed);
+        if !is_detached_omp_task_update(&notification.update, self.profile) {
+            self.last_event_at.store(now_ms(), Ordering::Relaxed);
+        }
         // Drop the adapter's leaked restatement before anything sees it
         // (#2281). Replayed history resets rather than feeds the deduper.
         {
@@ -282,7 +287,6 @@ impl Shared {
             .is_some_and(|signal| !matches!(signal, LifecycleSignal::TaskSnapshotCompleted { .. }))
             || wakeup.is_some()
         {
-            self.last_event_at.store(now_ms(), Ordering::Relaxed);
             self.first_event_after_attach.store(true, Ordering::Relaxed);
         }
         let prompt_active = self.prompt_in_flight.load(Ordering::Relaxed);
@@ -524,7 +528,7 @@ mod tests {
                 let foreground = blocking_active == Some(true) && !replay;
                 assert_eq!(
                     shared.last_event_at.load(Ordering::Relaxed) != 123,
-                    foreground
+                    blocking_active == Some(true)
                 );
                 assert_eq!(
                     shared.first_event_after_attach.load(Ordering::Relaxed),
@@ -539,6 +543,74 @@ mod tests {
                 }
                 assert_eq!(child_updated, !replay);
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_notifications_refresh_idle_clock_before_filtering() {
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(32);
+        let shared = Shared::new(
+            event_tx,
+            "test".into(),
+            &OMP,
+            lifecycle_tx,
+            Arc::new(TerminalClaim::new()),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            Arc::new(SessionIngress::new(Some(SessionId::from("native")))),
+            None,
+            None,
+        );
+        let frames = [
+            (
+                json!({"sessionUpdate": "available_commands_update", "availableCommands": []}),
+                false,
+            ),
+            (
+                json!({"sessionUpdate": "agent_message_chunk", "messageId": "stream",
+                    "content": {"type": "text", "text": "answer"}}),
+                true,
+            ),
+            (
+                json!({"sessionUpdate": "agent_message_chunk", "messageId": "restatement",
+                    "content": {"type": "text", "text": "answer"}}),
+                false,
+            ),
+            (
+                json!({"sessionUpdate": "compaction_update", "compactionId": "c", "status": "completed"}),
+                true,
+            ),
+            (
+                json!({"sessionUpdate": "compaction_update", "compactionId": "c", "status": "completed"}),
+                false,
+            ),
+            (
+                json!({"sessionUpdate": "compaction_update", "compactionId": "c", "status": "completed",
+                    "summary": [{"type": "text", "text": "summary"}]}),
+                false,
+            ),
+        ];
+        for (frame, first_progress) in frames {
+            shared.last_event_at.store(123, Ordering::Relaxed);
+            shared
+                .first_event_after_attach
+                .store(false, Ordering::Relaxed);
+            shared
+                .handle_notification(
+                    serde_json::from_value(json!({
+                        "sessionId": "native", "update": frame
+                    }))
+                    .unwrap(),
+                    false,
+                )
+                .await;
+            assert_ne!(shared.last_event_at.load(Ordering::Relaxed), 123);
+            assert_eq!(
+                shared.first_event_after_attach.load(Ordering::Relaxed),
+                first_progress
+            );
+            while event_rx.try_recv().is_ok() {}
         }
     }
 

@@ -1184,7 +1184,6 @@ mod tests {
                 .agents,
             [
                 ("completed-sibling".to_string(), true),
-                ("pruned-launch".to_string(), true),
                 ("running-wire".to_string(), false),
             ]
         );
@@ -1193,10 +1192,7 @@ mod tests {
                 .background_agent_tracking_seed("s-other")
                 .unwrap()
                 .agents,
-            [
-                ("running-wire".to_string(), true),
-                ("other-wire".to_string(), false),
-            ]
+            [("other-wire".to_string(), false)]
         );
         assert!(store.background_agent_tracking_seed("s-missing").is_none());
     }

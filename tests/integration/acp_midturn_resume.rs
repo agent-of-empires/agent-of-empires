@@ -255,7 +255,7 @@ async fn adopted_task_snapshots_distinguish_detached_from_blocking_activity() {
             true,
             AcpSessionId(session.into()),
             None,
-            "claude".into(),
+            "omp".into(),
             None,
             None,
             None,

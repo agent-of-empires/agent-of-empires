@@ -97,26 +97,34 @@ pub(super) fn update(
         }
         return Ok(());
     }
-    let (agent_id, terminal) = match event {
+    match event {
         Event::BackgroundAgentLaunched {
             agent_id,
             wire_tracked: true,
             ..
-        } => (agent_id, false),
-        Event::BackgroundAgentCompleted { agent_id, .. } => (agent_id, true),
-        _ => return Ok(()),
-    };
-    conn.execute(
-        &format!(
-            "INSERT INTO {identities} (session_id, agent_id, terminal, first_seq)
-                  SELECT ?1, ?2, ?3, ?4 FROM {conversations}
-                  WHERE session_id = ?1 AND epoch_seq <= ?4
-                  ON CONFLICT(session_id, agent_id) DO UPDATE SET
-                  terminal = MAX(terminal, excluded.terminal),
-                  first_seq = MIN(first_seq, excluded.first_seq)"
-        ),
-        params![session_id, agent_id, terminal, seq],
-    )?;
+        } => {
+            conn.execute(
+                &format!(
+                    "INSERT INTO {identities} (session_id, agent_id, terminal, first_seq)
+                     SELECT ?1, ?2, 0, ?3 FROM {conversations}
+                     WHERE session_id = ?1 AND epoch_seq <= ?3
+                     ON CONFLICT(session_id, agent_id) DO UPDATE SET
+                     first_seq = MIN(first_seq, excluded.first_seq)"
+                ),
+                params![session_id, agent_id, seq],
+            )?;
+        }
+        Event::BackgroundAgentCompleted { agent_id, .. } => {
+            conn.execute(
+                &format!(
+                    "UPDATE {identities} SET terminal = 1
+                     WHERE session_id = ?1 AND agent_id = ?2 AND first_seq <= ?3"
+                ),
+                params![session_id, agent_id, seq],
+            )?;
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -282,6 +290,52 @@ mod tests {
         assert_eq!(
             store.background_agent_tracking_seed("s").unwrap().agents,
             vec![("child".into(), true)]
+        );
+    }
+
+    #[test]
+    fn background_tracking_requires_current_wire_launch_provenance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EventStore::open(&tmp.path().join("events.db"), 0).unwrap();
+        store.record("s", 1, &assigned("old")).unwrap();
+        store.record("s", 2, &launched("previous-epoch")).unwrap();
+        store.record("s", 3, &assigned("native")).unwrap();
+        let mut transcript = launched("transcript");
+        if let Event::BackgroundAgentLaunched {
+            wire_tracked,
+            output_file,
+            ..
+        } = &mut transcript
+        {
+            *wire_tracked = false;
+            *output_file = "/unused/transcript.jsonl".into();
+        }
+        store.record("s", 4, &transcript).unwrap();
+        for (seq, id) in [(5, "transcript"), (6, "orphan"), (7, "previous-epoch")] {
+            store
+                .record("s", seq, &completed(id, BackgroundAgentStatus::Completed))
+                .unwrap();
+        }
+        assert!(store
+            .background_agent_tracking_seed("s")
+            .unwrap()
+            .agents
+            .is_empty());
+        store.record("s", 8, &launched("orphan")).unwrap();
+        assert_eq!(
+            store.background_agent_tracking_seed("s").unwrap().agents,
+            vec![("orphan".into(), false)]
+        );
+        store
+            .record(
+                "s",
+                9,
+                &completed("orphan", BackgroundAgentStatus::Completed),
+            )
+            .unwrap();
+        assert_eq!(
+            store.background_agent_tracking_seed("s").unwrap().agents,
+            vec![("orphan".into(), true)]
         );
     }
 

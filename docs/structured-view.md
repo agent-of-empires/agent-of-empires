@@ -106,7 +106,7 @@ Capabilities depend on channels the adapter advertises; unavailable mode, slash-
 
 The background-agent panel consumes structured omp task details, not rendered tool text. An async batch contributes every task row, including mixed batches; rows do not need a `detached` flag. Rolling snapshots replace the previous preview rather than appending duplicate output. Previews show `recentOutput` in chronological order, not the full async final result, and a resolved model can appear in a later update. A later terminal status can correct a finished task, but late running snapshots do not reopen it.
 
-After a daemon restart, tracking identities retained outside event history prevent completed siblings from launching or completing again; unresolved tasks continue tracking only when the runner confirms the same native conversation. Changing that conversation clears the tracking identities. Upgrading cannot recover identities already removed by earlier history cleanup. The last-tool preview uses the current tool when present, otherwise the newest `recentTools` entry.
+Task tracking resumes after a daemon restart when the same native conversation is still running. See [background tracking internals](development/internals/structured-view.md#worker-lifecycle) for persistence and recovery details.
 
 Detached background task progress does not count as foreground prompt activity or postpone recovery of an orphaned resumed turn. Mixed task batches still count as foreground work while blocking siblings are active. The panel does not offer Stop for omp tasks because its ACP adapter does not expose background-task cancellation; cancelling the parent prompt does not stop those detached tasks.
 

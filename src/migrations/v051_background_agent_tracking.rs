@@ -50,19 +50,21 @@ fn run_in(app_dir: &Path) -> Result<()> {
          INSERT INTO acp_background_conversations (session_id, native_id, epoch_seq, assigned_seq)
          SELECT session_id, native_id, epoch_seq, assigned_seq FROM background_tracking_backfill;
          INSERT INTO acp_background_agent_identities (session_id, agent_id, terminal, first_seq)
-         SELECT session_id, agent_id, MAX(terminal), MIN(seq) FROM (
-             SELECT events.session_id, events.seq,
-                    CASE events.discriminant
-                        WHEN 'BackgroundAgentCompleted' THEN
-                            json_extract(event_json, '$.BackgroundAgentCompleted.agent_id')
-                        ELSE json_extract(event_json, '$.BackgroundAgentLaunched.agent_id') END AS agent_id,
-                    events.discriminant = 'BackgroundAgentCompleted' AS terminal
-             FROM acp_events AS events JOIN background_tracking_backfill AS current
-                  ON current.session_id = events.session_id AND events.seq >= current.epoch_seq
-             WHERE events.discriminant = 'BackgroundAgentCompleted'
-                OR (events.discriminant = 'BackgroundAgentLaunched'
-                    AND json_extract(event_json, '$.BackgroundAgentLaunched.wire_tracked') = 1)
-         ) WHERE agent_id IS NOT NULL GROUP BY session_id, agent_id;
+         SELECT launches.session_id,
+                json_extract(launches.event_json, '$.BackgroundAgentLaunched.agent_id') AS agent_id,
+                MAX(EXISTS (SELECT 1 FROM acp_events AS completed
+                        WHERE completed.session_id = launches.session_id
+                          AND completed.seq >= launches.seq
+                          AND completed.discriminant = 'BackgroundAgentCompleted'
+                          AND json_extract(completed.event_json, '$.BackgroundAgentCompleted.agent_id') =
+                              json_extract(launches.event_json, '$.BackgroundAgentLaunched.agent_id'))),
+                MIN(launches.seq)
+         FROM acp_events AS launches JOIN background_tracking_backfill AS current
+              ON current.session_id = launches.session_id AND launches.seq >= current.epoch_seq
+         WHERE launches.discriminant = 'BackgroundAgentLaunched'
+           AND json_extract(launches.event_json, '$.BackgroundAgentLaunched.wire_tracked') = 1
+           AND agent_id IS NOT NULL
+         GROUP BY launches.session_id, agent_id;
          DROP TABLE background_tracking_backfill;",
     )?;
     tx.commit()?;
@@ -119,6 +121,22 @@ mod tests {
                 r#"{"BackgroundAgentCompleted":{"agent_id":"finished"}}"#,
             ),
             ("ThinkingStarted", r#""ThinkingStarted""#),
+            (
+                "BackgroundAgentLaunched",
+                r#"{"BackgroundAgentLaunched":{"agent_id":"transcript","wire_tracked":false,"output_file":"/unused/transcript.jsonl"}}"#,
+            ),
+            (
+                "BackgroundAgentCompleted",
+                r#"{"BackgroundAgentCompleted":{"agent_id":"transcript"}}"#,
+            ),
+            (
+                "BackgroundAgentCompleted",
+                r#"{"BackgroundAgentCompleted":{"agent_id":"orphan"}}"#,
+            ),
+            (
+                "BackgroundAgentCompleted",
+                r#"{"BackgroundAgentCompleted":{"agent_id":"old-child"}}"#,
+            ),
         ];
         for (index, (_, json)) in events.iter().enumerate() {
             let seq = index as i64 + 1;
@@ -268,10 +286,7 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap()
         };
-        assert_eq!(
-            read(),
-            vec![("completion-only".into(), true), ("running".into(), false)]
-        );
+        assert_eq!(read(), vec![("running".into(), false)]);
         let native: String = conn
             .query_row(
                 "SELECT native_id FROM acp_background_conversations WHERE session_id = 's'",
@@ -284,9 +299,6 @@ mod tests {
             .unwrap();
         conn.execute("INSERT INTO acp_events VALUES ('s', 7, '{\"BackgroundAgentCompleted\":{\"agent_id\":\"not-replayed\"}}', 'BackgroundAgentCompleted')", []).unwrap();
         run_in(tmp.path()).unwrap();
-        assert_eq!(
-            read(),
-            vec![("completion-only".into(), true), ("running".into(), false)]
-        );
+        assert_eq!(read(), vec![("running".into(), false)]);
     }
 }
