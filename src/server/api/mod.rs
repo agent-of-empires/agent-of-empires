@@ -64,8 +64,8 @@ pub use sessions::{
     review_creation_trust, search_sessions, send_message, serve_session_artifact,
     session_diff_file, session_diff_file_raw, session_diff_files, session_file, session_file_raw,
     set_worktree_name, start_session, stop_auxiliary, stop_session, summarize_session,
-    touch_session_access, trash_session, update_session_archive, update_session_color,
-    update_session_diff_base, update_session_favorite, update_session_group,
+    touch_session_access, touch_session_input_recency, trash_session, update_session_archive,
+    update_session_color, update_session_diff_base, update_session_favorite, update_session_group,
     update_session_notifications, update_session_pin, update_session_snooze, update_session_unread,
     update_workspace_ordering, OutputQuery, SendMessageRequest,
 };
@@ -457,6 +457,7 @@ mod tests {
                 "stop_session",
                 "summarize_session",
                 "touch_session_access",
+                "touch_session_input_recency",
                 "trash_session",
                 "update_session_archive",
                 "update_session_color",

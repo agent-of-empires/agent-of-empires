@@ -121,6 +121,92 @@ impl LaunchIndeterminateCause {
     }
 }
 
+impl std::fmt::Display for LaunchIndeterminateCause {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message())
+    }
+}
+
+impl std::error::Error for LaunchIndeterminateCause {}
+
+/// Physical admission and selected context retained across pre-launch hooks.
+pub(crate) struct NativeStartAdmission {
+    pub(super) tmux_session: String,
+    pub(super) corpse: Option<LegacyToolObservation>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    selection: [u8; 32],
+}
+
+impl NativeStartAdmission {
+    fn capture(
+        instance: &Instance,
+        tmux_session: String,
+        corpse: Option<LegacyToolObservation>,
+    ) -> Result<Self> {
+        Ok(Self {
+            tmux_session,
+            corpse,
+            created_at: instance.created_at,
+            selection: instance.native_preparation_selection()?,
+        })
+    }
+
+    pub(crate) fn selection(&self) -> &[u8; 32] {
+        &self.selection
+    }
+
+    pub(crate) fn verify_context(&self, instance: &Instance) -> Result<()> {
+        anyhow::ensure!(
+            self.created_at == instance.created_at
+                && self.selection == instance.native_preparation_selection()?,
+            LifecycleReservationError::Superseded
+        );
+        Ok(())
+    }
+
+    pub(crate) fn verify(&self) -> Result<()> {
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        let unchanged = match self.corpse.as_ref() {
+            Some(pane) => matches!(
+                crate::tmux::utils::probe_owned_pane(&self.tmux_session, pane, &deadline)
+                    .map_err(|error| error.context(LaunchIndeterminateCause::ObservationFailed))?,
+                Some((
+                    crate::tmux::utils::PaneProbe::Dead | crate::tmux::utils::PaneProbe::Missing,
+                    _,
+                    _
+                ))
+            ),
+            None => crate::tmux::utils::observe_pane(&self.tmux_session, &deadline)
+                .map_err(|error| error.context(LaunchIndeterminateCause::ObservationFailed))?
+                .is_none(),
+        };
+        anyhow::ensure!(unchanged, LaunchIndeterminateCause::OwnershipUnproven);
+        Ok(())
+    }
+
+    pub(crate) fn remove_corpse(&self) -> Result<()> {
+        if let Some(pane) = self.corpse.as_ref() {
+            let deadline = crate::tmux::TmuxCommandDeadline::new();
+            match crate::tmux::utils::probe_owned_pane(&self.tmux_session, pane, &deadline)
+                .map_err(|error| error.context(LaunchIndeterminateCause::ObservationFailed))?
+            {
+                Some((crate::tmux::utils::PaneProbe::Dead, _, current_pid)) => {
+                    let mut corpse = pane.clone();
+                    corpse.identity.pane_pid = current_pid;
+                    crate::tmux::utils::remove_owned_dead_pane(&corpse).map_err(|error| {
+                        error.context(LaunchIndeterminateCause::OwnershipUnproven)
+                    })?;
+                }
+                Some((crate::tmux::utils::PaneProbe::Missing, _, _)) => {}
+                _ => return Err(LaunchIndeterminateCause::OwnershipUnproven.into()),
+            }
+        } else {
+            self.verify()?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeResult {
     Alive,
@@ -131,7 +217,7 @@ enum ProbeResult {
 /// Transient proof captured at physical launch, before publication can adopt peer state.
 pub(super) struct LaunchProbe {
     pub(super) tmux_session: String,
-    pub(super) pane: Option<LegacyToolObservation>,
+    pub(super) pane: Option<std::sync::Arc<LegacyToolObservation>>,
     pub(super) expected: ConversationState,
 }
 
@@ -139,6 +225,7 @@ pub(crate) struct ResumeLaunchOptions {
     pub(crate) resume_policy: ResumeAttemptPolicy,
     pub(crate) restart: bool,
     pub(crate) conversation_carry: Option<ConversationCarry>,
+    pub(crate) start_admission: Option<NativeStartAdmission>,
 }
 
 const RESUME_PROBE_MAX: std::time::Duration = std::time::Duration::from_millis(3000);
@@ -157,6 +244,47 @@ const RESUME_PROBE_POLL: std::time::Duration = std::time::Duration::from_millis(
 const RESUME_PROBE_POST_SHELL_GRACE: std::time::Duration = std::time::Duration::from_millis(2000);
 
 impl Instance {
+    pub(crate) fn observe_native_pane(
+        &self,
+    ) -> Result<(
+        String,
+        Option<LegacyToolObservation>,
+        crate::tmux::utils::PaneProbe,
+    )> {
+        let observed = (|| -> Result<_> {
+            let panes = crate::tmux::batch_pane_metadata()?;
+            let name = crate::tmux::agent_pane_metadata_in(&panes, &self.id, &self.title)?
+                .map(|(name, _)| name.to_owned())
+                .unwrap_or_else(|| crate::tmux::Session::generate_name(&self.id, &self.title));
+            let deadline = crate::tmux::TmuxCommandDeadline::new();
+            match crate::tmux::utils::observe_pane(&name, &deadline)? {
+                Some((pane, state, _)) => Ok((name, Some(pane), state)),
+                None => Ok((name, None, crate::tmux::utils::PaneProbe::Missing)),
+            }
+        })();
+        observed.map_err(|error| anyhow::Error::new(self.probe_failure_cause(error)))
+    }
+
+    /// Alive includes shells and Error/Stopped projections; none authorizes replacement.
+    pub(crate) fn admit_native_start(&self) -> Result<Option<NativeStartAdmission>> {
+        let (tmux_session, pane, state) = self.observe_native_pane()?;
+        match state {
+            crate::tmux::utils::PaneProbe::Alive => Ok(None),
+            crate::tmux::utils::PaneProbe::Dead => Ok(Some(NativeStartAdmission::capture(
+                self,
+                tmux_session,
+                Some(pane.ok_or(LaunchIndeterminateCause::OwnershipUnproven)?),
+            )?)),
+            crate::tmux::utils::PaneProbe::Missing => Ok(Some(NativeStartAdmission::capture(
+                self,
+                tmux_session,
+                None,
+            )?)),
+            crate::tmux::utils::PaneProbe::Unknown => {
+                Err(LaunchIndeterminateCause::ObservationFailed.into())
+            }
+        }
+    }
     pub fn restart_with_size(&mut self, size: Option<(u16, u16)>) -> Result<StartOutcome> {
         self.restart_with_size_opts(size, false)
     }
@@ -189,6 +317,7 @@ impl Instance {
                 resume_policy,
                 restart: true,
                 conversation_carry: None,
+                start_admission: None,
             },
         )
     }
@@ -213,6 +342,7 @@ impl Instance {
                 resume_policy: ResumeAttemptPolicy::HonorAutoResumeSetting,
                 restart: true,
                 conversation_carry,
+                start_admission: None,
             },
         )
     }
@@ -245,7 +375,7 @@ impl Instance {
         loop {
             let observation =
                 crate::tmux::utils::probe_owned_pane(session.name(), pane, &command_deadline);
-            let (state, shell) = match observation {
+            let (state, shell, _) = match observation {
                 Ok(Some(observation)) => observation,
                 Ok(None) => {
                     return ProbeResult::Indeterminate(LaunchIndeterminateCause::OwnershipUnproven)
@@ -370,6 +500,7 @@ impl Instance {
                 resume_policy,
                 restart: false,
                 conversation_carry: None,
+                start_admission: None,
             },
         )
     }
@@ -399,7 +530,7 @@ impl Instance {
         size: Option<(u16, u16)>,
         skip_on_launch: bool,
         discard_sandbox_container: bool,
-        options: ResumeLaunchOptions,
+        mut options: ResumeLaunchOptions,
     ) -> Result<StartOutcome> {
         crate::session::validate_instance_id(&self.id)
             .context("refusing to start: AOE_INSTANCE_ID failed validation")?;
@@ -419,10 +550,13 @@ impl Instance {
             return Ok(StartOutcome::Fresh);
         }
         self.ensure_startable()?;
-        if !options.restart && self.tmux_session()?.exists() {
-            return Ok(StartOutcome::Fresh);
+        if !options.restart {
+            let Some(admission) = self.admit_native_start()? else {
+                return Ok(StartOutcome::Fresh);
+            };
+            options.start_admission = Some(admission);
         }
-        if self.status == Status::Error {
+        if options.restart && self.status == Status::Error {
             self.status = Status::Idle;
             self.last_error = None;
             self.last_error_evidence = None;
@@ -553,7 +687,21 @@ impl Instance {
             resume_policy,
             restart,
             conversation_carry,
+            start_admission,
         } = options;
+        if !restart {
+            let admitted = start_admission
+                .as_ref()
+                .ok_or_else(|| anyhow::Error::new(LaunchIndeterminateCause::OwnershipUnproven))
+                .and_then(|admission| {
+                    admission.verify_context(self)?;
+                    admission.verify()
+                });
+            if let Err(error) = admitted {
+                self.fail_reserved_launch(storage, generation, &error, false);
+                return Err(error);
+            }
+        }
         // Capture may refresh memory, but publication must compare against durable prior state.
         let prior = self.conversation_state();
         self.capture_resume_launch_target_in(CaptureStorage::Scoped(storage));
@@ -567,15 +715,27 @@ impl Instance {
             self.resume_intent = ResumeIntent::Cleared;
         }
         let spawned = (|| {
-            let mut prepared =
-                self.stop_carry_and_prepare_in(storage, restart, conversation_carry, prior)?;
+            let mut prepared = self.stop_carry_and_prepare_in(
+                storage,
+                restart,
+                start_admission.as_ref(),
+                conversation_carry,
+                prior,
+            )?;
             prepared.require_conversation_publication |= skipped_failed_resume_sid.is_some();
             self.spawn_prepared_launch(size, storage, prepared)
         })();
         let (launch_outcome, probe) = match spawned {
             Ok(spawned) => spawned,
             Err(error) => {
-                self.fail_reserved_launch(storage, generation, &error, true);
+                self.fail_reserved_launch(
+                    storage,
+                    generation,
+                    &error,
+                    restart
+                        && !error.is::<LaunchIndeterminateCause>()
+                        && !error.is::<super::start::LaunchPublicationFailure>(),
+                );
                 return Err(error);
             }
         };
@@ -634,6 +794,7 @@ impl Instance {
         &mut self,
         storage: &dyn crate::session::SessionStore,
         restart: bool,
+        start_admission: Option<&NativeStartAdmission>,
         conversation_carry: Option<ConversationCarry>,
         expected: ConversationState,
     ) -> Result<PreparedLaunch> {
@@ -644,6 +805,14 @@ impl Instance {
         };
         if restart {
             self.kill_clean_locked()?;
+        } else {
+            start_admission
+                .ok_or(LaunchIndeterminateCause::OwnershipUnproven)?
+                .remove_corpse()?;
+            if start_admission.is_some_and(|admission| admission.corpse.is_some()) {
+                self.release_scope()
+                    .map_err(|error| error.context(LaunchIndeterminateCause::OwnershipUnproven))?;
+            }
         }
         if let Some(carry) = conversation_carry {
             self.absorb_published_prime_session(publication);
@@ -697,7 +866,18 @@ impl Instance {
     ) -> Result<PreparedLaunch> {
         let storage =
             crate::session::storage::Storage::new_unwatched(&self.effective_profile()).unwrap();
-        self.stop_carry_and_prepare_in(&storage, restart, conversation_carry, expected)
+        let admission = if restart {
+            None
+        } else {
+            self.admit_native_start()?
+        };
+        self.stop_carry_and_prepare_in(
+            &storage,
+            restart,
+            admission.as_ref(),
+            conversation_carry,
+            expected,
+        )
     }
 
     /// A failure fails the restart: relaunching into the old container would run the new tool
@@ -796,20 +976,21 @@ impl Instance {
         let deadline = crate::tmux::TmuxCommandDeadline::new();
         #[cfg(test)]
         let deadline = tests::probe_deadline(deadline);
-        let state = match crate::tmux::utils::probe_owned_pane(&probe.tmux_session, pane, &deadline)
-        {
-            Ok(Some((
-                state @ (crate::tmux::utils::PaneProbe::Dead
-                | crate::tmux::utils::PaneProbe::Missing),
-                _,
-            ))) => state,
-            Ok(_) => {
-                return Ok(ProbeResult::Indeterminate(
-                    LaunchIndeterminateCause::OwnershipUnproven,
-                ))
-            }
-            Err(error) => return Ok(self.indeterminate_probe(error)),
-        };
+        let (state, current_pid) =
+            match crate::tmux::utils::probe_owned_pane(&probe.tmux_session, pane, &deadline) {
+                Ok(Some((
+                    state @ (crate::tmux::utils::PaneProbe::Dead
+                    | crate::tmux::utils::PaneProbe::Missing),
+                    _,
+                    current_pid,
+                ))) => (state, current_pid),
+                Ok(_) => {
+                    return Ok(ProbeResult::Indeterminate(
+                        LaunchIndeterminateCause::OwnershipUnproven,
+                    ))
+                }
+                Err(error) => return Ok(self.indeterminate_probe(error)),
+            };
         if let Err(cause) = self.fence_launch_probe(storage, generation, probe) {
             return Ok(ProbeResult::Indeterminate(cause));
         }
@@ -828,7 +1009,9 @@ impl Instance {
             }
         }
         if state == crate::tmux::utils::PaneProbe::Dead {
-            if let Err(error) = crate::tmux::utils::remove_owned_dead_pane(pane) {
+            let mut corpse = pane.as_ref().clone();
+            corpse.identity.pane_pid = current_pid;
+            if let Err(error) = crate::tmux::utils::remove_owned_dead_pane(&corpse) {
                 return Ok(self.indeterminate_probe(error));
             }
         }
@@ -948,6 +1131,33 @@ mod tests {
     use crate::session::instance::test_helpers::{install_aliases, seed_claude_transcript};
     use serial_test::serial;
     use tempfile::tempdir;
+
+    #[test]
+    fn native_start_context_rejects_changed_selection_and_row_reuse() -> Result<()> {
+        let original = Instance::new("preparation context", "/tmp/preparation-context");
+        let admission = NativeStartAdmission::capture(&original, "unobserved".into(), None)?;
+        let mut current = original.clone();
+        current.lifecycle_generation += 1; // The admitted operation owns its reservation.
+        current.title = "renamed display".into();
+        current.status = Status::Error;
+        admission.verify_context(&current)?;
+
+        current.agent_session_id = Some("another-selected-conversation".into());
+        let changed = admission.verify_context(&current).unwrap_err();
+        assert_eq!(
+            changed.downcast_ref::<LifecycleReservationError>(),
+            Some(&LifecycleReservationError::Superseded)
+        );
+        let mut reused = original;
+        reused.created_at += chrono::Duration::seconds(1);
+        let changed = admission.verify_context(&reused).unwrap_err();
+        assert_eq!(
+            changed.downcast_ref::<LifecycleReservationError>(),
+            Some(&LifecycleReservationError::Superseded)
+        );
+        Ok(())
+    }
+
     #[test]
     #[serial]
     #[serial(hook_base)]
@@ -1013,6 +1223,7 @@ mod tests {
                     resume_policy: ResumeAttemptPolicy::Allow,
                     restart: true,
                     conversation_carry: None,
+                    start_admission: None,
                 },
                 generation,
                 Ok(()),
@@ -2513,12 +2724,6 @@ mod tests {
             assert_eq!(inst.agent_session_id.as_deref(), Some(stale_sid));
             assert_eq!(inst.resume_probe_failed_sid.as_deref(), Some(stale_sid));
             assert_eq!(inst.status, Status::Error);
-            assert_eq!(
-                inst.last_error,
-                Some(format!(
-                    "resume failed for sid {stale_sid}; preserved for explicit retry"
-                ))
-            );
             assert!(inst.last_error_check.is_some());
             let loaded = storage.load().unwrap();
             let row = loaded.iter().find(|i| i.id == inst.id).expect("instance");

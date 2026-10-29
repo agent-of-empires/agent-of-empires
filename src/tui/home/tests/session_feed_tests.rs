@@ -152,6 +152,24 @@ fn snapshot_of(sessions: Vec<crate::daemon::SessionResponse>) -> SessionFeedResu
     SessionFeedResult::Snapshot(Arc::new(fixture_snapshot(sessions, "test", "test", 1)))
 }
 
+fn native_physical_fixture() -> Arc<crate::session::LegacyToolObservation> {
+    let pid = std::process::id();
+    Arc::new(crate::session::LegacyToolObservation {
+        identity: crate::session::LegacyToolIdentity {
+            session_id: "$1".into(),
+            pane_id: "%1".into(),
+            pane_pid: Some(pid),
+        },
+        server: Arc::new(crate::session::TmuxServerIdentity {
+            socket: "/fixture-tmux.sock".into(),
+            pid,
+            birth: crate::process::process_birth_identity(pid)
+                .unwrap()
+                .unwrap(),
+        }),
+    })
+}
+
 #[test]
 #[serial]
 fn native_attachment_never_survives_a_cancelled_context() {
@@ -193,6 +211,7 @@ fn native_attachment_never_survives_a_cancelled_context() {
             .push(AuxiliaryObservation {
                 target: target.clone(),
                 pane: crate::session::PaneObservation {
+                    physical: Some(native_physical_fixture()),
                     state: PanePresence::Alive,
                     tmux_session: Some("daemon-owned-target".into()),
                     legacy_tool: None,
@@ -263,6 +282,7 @@ fn native_attachment_never_survives_a_cancelled_context() {
                     revision: 2,
                 },
                 outcome: TerminalTarget {
+                    physical: Some(native_physical_fixture()),
                     tmux_session: "daemon-owned-target".into(),
                     status: TerminalTargetStatus::Exists,
                     lifecycle_generation: 0,
@@ -320,6 +340,7 @@ fn tool_preview_enter_upgrades_one_canonical_preparation() {
                         tool_name: "probe".into(),
                     },
                     pane: PaneObservation {
+                        physical: None,
                         state,
                         ..Default::default()
                     },
@@ -360,6 +381,7 @@ fn tool_preview_enter_upgrades_one_canonical_preparation() {
                 revision: 2,
             },
             outcome: TerminalTarget {
+                physical: Some(native_physical_fixture()),
                 tmux_session: "canonical-tool".into(),
                 status: TerminalTargetStatus::Created,
                 lifecycle_generation: 0,
@@ -376,6 +398,7 @@ fn tool_preview_enter_upgrades_one_canonical_preparation() {
                 tool_name: "probe".into(),
             },
             pane: PaneObservation {
+                physical: Some(native_physical_fixture()),
                 state: PanePresence::Alive,
                 tmux_session: Some("canonical-tool".into()),
                 legacy_tool: None,
@@ -390,7 +413,7 @@ fn tool_preview_enter_upgrades_one_canonical_preparation() {
             .take_native_attachment()
             .expect("same preparation must enter attach after canonical publication");
         assert!(matches!(ready.intent, PaneIntent::Attach));
-        assert_eq!(ready.tmux_name, "canonical-tool");
+        assert_eq!(ready.terminal.tmux_session, "canonical-tool");
         assert!(ready.lease.is_valid());
         assert!(env.view.session_feed.can_submit(&id));
     }
@@ -422,6 +445,7 @@ fn deferred_tool_preview_keeps_its_live_upgrade_and_cancellation_context() {
             .push(AuxiliaryObservation {
                 target: target.clone(),
                 pane: PaneObservation {
+                    physical: None,
                     state: PanePresence::Absent,
                     ..Default::default()
                 },
@@ -475,6 +499,7 @@ fn deferred_tool_preview_keeps_its_live_upgrade_and_cancellation_context() {
             .publish_for_test(SessionFeedResult::Snapshot(snapshot.clone()));
         env.view.apply_session_feed();
         let prepared_target = || TerminalTarget {
+            physical: Some(native_physical_fixture()),
             tmux_session: "canonical-tool".into(),
             status: TerminalTargetStatus::Created,
             lifecycle_generation: 0,
@@ -502,6 +527,7 @@ fn deferred_tool_preview_keeps_its_live_upgrade_and_cancellation_context() {
         committed.contents.sessions[0].auxiliary = vec![AuxiliaryObservation {
             target,
             pane: PaneObservation {
+                physical: Some(native_physical_fixture()),
                 state: PanePresence::Alive,
                 tmux_session: Some("canonical-tool".into()),
                 legacy_tool: None,
@@ -518,7 +544,7 @@ fn deferred_tool_preview_keeps_its_live_upgrade_and_cancellation_context() {
         assert!(
             matches!(&ready.intent, PaneIntent::LiveSend(LiveSendTarget::Tool(tool)) if tool == "probe")
         );
-        assert_eq!(ready.tmux_name, "canonical-tool");
+        assert_eq!(ready.terminal.tmux_session, "canonical-tool");
         assert!(ready.lease.is_valid());
         assert!(
             respond(Ok(cursor(3)), Some(prepared_target())).is_none(),
@@ -546,6 +572,7 @@ fn auxiliary_receipt_never_outlives_its_row_generation_or_profile() {
             .push(AuxiliaryObservation {
                 target: AuxiliaryTarget::Host { index: 0 },
                 pane: PaneObservation {
+                    physical: Some(native_physical_fixture()),
                     state: PanePresence::Alive,
                     tmux_session: Some("same-name".into()),
                     legacy_tool: None,
@@ -569,6 +596,7 @@ fn auxiliary_receipt_never_outlives_its_row_generation_or_profile() {
                 revision: 2,
             },
             outcome: TerminalTarget {
+                physical: Some(native_physical_fixture()),
                 tmux_session: "same-name".into(),
                 status: TerminalTargetStatus::Exists,
                 lifecycle_generation: 0,
@@ -583,11 +611,741 @@ fn auxiliary_receipt_never_outlives_its_row_generation_or_profile() {
             .publish_for_test(SessionFeedResult::Snapshot(snapshot));
         env.view.apply_session_feed();
         assert!(env.view.take_native_attachment().is_none());
-        assert!(env.view.info_dialog.is_some());
+        assert!(
+            env.view.pending_native_attachment.is_none(),
+            "superseded continuation retired"
+        );
         assert!(
             env.view.session_feed.can_submit(&id),
             "a confirmed receipt settles the mutation but must not attach a replacement row"
         );
+    }
+}
+
+#[test]
+#[serial]
+fn queued_send_keeps_admitted_runtime_before_terminal_writer_dispatch() {
+    use crate::daemon::{MutationReceipt, TerminalTarget, TerminalTargetStatus};
+    use crate::session::{AuxiliaryObservation, AuxiliaryTarget, PaneObservation, PanePresence};
+    use crate::tui::home::live_send::LiveSendTarget;
+    use crate::tui::home::panes::PaneIntent;
+
+    let mut stale_continuations = Vec::new();
+    for agent in [true, false] {
+        for change in ["unchanged", "physical replacement", "same-PTY generation"] {
+            let mut env = create_test_env_with_sessions(1);
+            let id = env.view.instance_at(0).id.clone();
+            env.view.select_session_by_id(&id);
+            let mut respond = env.view.session_feed.terminal_driver_for_test();
+            let SessionFeedResult::Snapshot(mut snapshot) =
+                daemon_snapshot(&env.view, &id, "Stopped")
+            else {
+                unreachable!()
+            };
+            let physical = native_physical_fixture();
+            let pane = PaneObservation {
+                physical: Some(physical.clone()),
+                state: PanePresence::Alive,
+                tmux_session: Some("queued-original".into()),
+                legacy_tool: None,
+            };
+            let row = &mut Arc::make_mut(&mut snapshot).contents.sessions[0];
+            if agent {
+                row.agent_pane = pane;
+            } else {
+                row.auxiliary = vec![AuxiliaryObservation {
+                    target: AuxiliaryTarget::Host { index: 0 },
+                    pane,
+                }];
+            }
+            env.view
+                .session_feed
+                .publish_for_test(SessionFeedResult::Snapshot(snapshot.clone()));
+            env.view.apply_session_feed();
+            let target = if agent {
+                LiveSendTarget::Agent
+            } else {
+                LiveSendTarget::Terminal
+            };
+            env.view
+                .prepare_send_target(&id, target.clone(), "OLD".into(), None)
+                .unwrap();
+            assert!(env.view.session_feed.has_pending(&id));
+            assert!(env.view.take_native_attachment().is_none());
+
+            // This protocol fixture defers consuming the actual writer queue.
+            // Physical input fencing is covered by the native input tests.
+            let committed = Arc::make_mut(&mut snapshot);
+            committed.cursor.revision += 1;
+            let row = &mut committed.contents.sessions[0];
+            if change != "unchanged" {
+                row.lifecycle_generation += 1;
+            }
+            let pane = if agent {
+                &mut row.agent_pane
+            } else {
+                &mut row.auxiliary[0].pane
+            };
+            if change == "physical replacement" {
+                let mut replacement = (*physical).clone();
+                replacement.identity.pane_id = "%2".into();
+                pane.physical = Some(Arc::new(replacement));
+                pane.tmux_session = Some("queued-replacement".into());
+            }
+            let terminal_physical = pane.physical.clone();
+            let terminal_name = pane.tmux_session.clone().unwrap();
+            let terminal_generation = row.lifecycle_generation;
+            let terminal_profile = row.profile.clone();
+            let terminal = || TerminalTarget {
+                physical: terminal_physical.clone(),
+                tmux_session: terminal_name.clone(),
+                status: TerminalTargetStatus::Exists,
+                lifecycle_generation: terminal_generation,
+                profile: terminal_profile.clone(),
+            };
+            env.view
+                .session_feed
+                .publish_for_test(SessionFeedResult::Snapshot(snapshot.clone()));
+            env.view.apply_session_feed();
+            respond(Ok(MutationReceipt {
+                cursor: snapshot.cursor.clone(),
+                outcome: terminal(),
+            }));
+            env.view.apply_session_feed();
+            let old = env.view.take_native_attachment();
+            if change == "unchanged" {
+                let old = old.expect("unchanged admitted runtime must remain usable");
+                assert!(
+                    matches!(old.intent, PaneIntent::Send { ref message, .. } if message == "OLD")
+                );
+                assert!(old.lease.is_valid());
+            } else if let Some(old) = old {
+                assert!(
+                    matches!(old.intent, PaneIntent::Send { ref message, .. } if message == "OLD")
+                );
+                if old.lease.is_valid() {
+                    stale_continuations.push((agent, change));
+                }
+                old.lease.cancel_continuation();
+            }
+            assert!(env.view.session_feed.can_submit(&id));
+            env.view.info_dialog = None;
+
+            env.view
+                .prepare_send_target(&id, target, "FRESH".into(), None)
+                .unwrap();
+            respond(Ok(MutationReceipt {
+                cursor: snapshot.cursor.clone(),
+                outcome: terminal(),
+            }));
+            env.view.apply_session_feed();
+            let fresh = env
+                .view
+                .take_native_attachment()
+                .expect("a fresh explicit send may prepare the current runtime");
+            assert!(
+                matches!(fresh.intent, PaneIntent::Send { ref message, .. } if message == "FRESH")
+            );
+            assert_eq!(fresh.terminal.physical, terminal().physical);
+            assert!(fresh.lease.is_valid());
+        }
+    }
+    assert!(
+        stale_continuations.is_empty(),
+        "OLD acquired a continuation for a changed runtime: {stale_continuations:?}"
+    );
+}
+
+#[test]
+#[serial]
+fn queued_send_real_writer_rejects_changed_scope_before_ensure_and_preserves_fresh_input() {
+    use crate::session::{PaneObservation, PanePresence, SessionStore};
+    use crate::tmux::test_helpers::{require_tmux, TmuxTestSession};
+    use crate::tui::home::live_send::LiveSendTarget;
+    use crate::tui::home::panes::PaneIntent;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    require_tmux!();
+
+    fn await_line(path: &std::path::Path, expected: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let received = std::fs::read_to_string(path).unwrap_or_default();
+            if received.lines().any(|line| line == expected) {
+                return received;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "producer did not acknowledge {expected}"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    let mut violations = Vec::new();
+    for replace_physical in [true, false] {
+        let mut env = create_test_env_with_sessions(1);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let id = env.view.instance_at(0).id.clone();
+        let storage = Storage::open_unwatched("test").unwrap();
+        let row = storage
+            .update(|rows, _| {
+                let row = rows.iter_mut().find(|row| row.id == id).unwrap();
+                row.source_profile = "test".into();
+                row.tool = "bash".into();
+                row.command = "/bin/sh".into();
+                row.status = Status::Idle;
+                row.lifecycle_generation = 7;
+                Ok(row.clone())
+            })
+            .unwrap();
+        let received = crate::session::get_app_dir()
+            .unwrap()
+            .join("queued-writer-native-receipts");
+        let quoted = crate::session::environment::shell_escape(received.to_str().unwrap());
+        let command = format!(
+            "stty -echo; printf 'READY\\n' > {quoted}; while IFS= read -r line; do printf 'ACK:%s\\n' \"$line\" >> {quoted}; done"
+        );
+        let name = crate::tmux::Session::generate_name(&id, &row.title);
+        let _pane = TmuxTestSession::from_name(&name);
+        let session = crate::tmux::Session::from_name(&name);
+        session.create("/tmp", Some(&command), "test").unwrap();
+        await_line(&received, "READY");
+        let (original, probe, _) =
+            crate::tmux::utils::observe_pane(&name, &crate::tmux::TmuxCommandDeadline::new())
+                .unwrap()
+                .unwrap();
+        assert_eq!(probe, crate::tmux::utils::PaneProbe::Alive);
+        let original = Arc::new(original);
+        let state = runtime.block_on(native_state(&["test"]));
+        runtime.block_on(async {
+            state.instances.write().await[0].agent_pane = PaneObservation {
+                state: PanePresence::Alive,
+                tmux_session: Some(name.clone()),
+                physical: Some(original.clone()),
+                legacy_tool: None,
+            };
+            test_support::refresh_canonical_metadata_for_test(&state).await;
+        });
+        runtime.block_on(apply_published(&mut env.view, &state));
+        env.view.select_session_by_id(&id);
+        let epoch = env
+            .view
+            .session_feed
+            .applied_snapshot()
+            .unwrap()
+            .cursor
+            .epoch
+            .clone();
+
+        let ensure_calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = ensure_calls.clone();
+        let app =
+            test_support::build_router_for_test(state.clone()).layer(axum::middleware::from_fn(
+                move |mut request: axum::extract::Request, next: axum::middleware::Next| {
+                    let observed_calls = observed_calls.clone();
+                    async move {
+                        // Private loopback fixture transport uses the existing owner-peer
+                        // extension; the handler and native lifecycle are not substituted.
+                        request.extensions_mut().insert(axum::extract::ConnectInfo(
+                            crate::server::peer::ConnectionPeer::UnixOwner {
+                                uid: nix::unistd::geteuid().as_raw(),
+                            },
+                        ));
+                        if request.method() == axum::http::Method::POST
+                            && request.uri().path().ends_with("/ensure")
+                        {
+                            observed_calls.fetch_add(1, Ordering::SeqCst);
+                        }
+                        next.run(request).await
+                    }
+                },
+            ));
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = runtime.spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client =
+            crate::daemon::DaemonClient::new(&format!("http://localhost:{port}"), None).unwrap();
+        let write = env.view.session_feed.command_writer_for_test(client, epoch);
+        let (entered, at_gate) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let writer = runtime.spawn(async move {
+            entered.send(()).unwrap();
+            if tokio::time::timeout(Duration::from_secs(10), released)
+                .await
+                .expect("release the writer before dispatch")
+                .is_ok()
+            {
+                write.await;
+            }
+        });
+        env.view
+            .prepare_send_target(&id, LiveSendTarget::Agent, "OLD".into(), None)
+            .unwrap();
+        assert!(env.view.session_feed.has_pending(&id));
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), at_gate)
+                .await
+                .expect("the real writer reaches its pre-dispatch gate")
+                .unwrap();
+        });
+
+        // The actual command is queued, but the real writer has not yet polled it.
+        // Its NativeLease::is_valid check therefore runs after this native commit.
+        let current = {
+            let _runtime_context = runtime.enter();
+            let native =
+                crate::server::session_store::NativeSessionStore::open(state.clone(), "test", None)
+                    .unwrap();
+            let _lock = storage.acquire_instance_lifecycle_lock(&id).unwrap();
+            if replace_physical {
+                session.kill().unwrap();
+                session.create("/tmp", Some(&command), "test").unwrap();
+            }
+            let current = (&native as &dyn SessionStore)
+                .update(|rows, _| {
+                    let row = rows.iter_mut().find(|row| row.id == id).unwrap();
+                    row.lifecycle_generation += 1;
+                    row.status = Status::Running;
+                    Ok(row.clone())
+                })
+                .unwrap();
+            native.refresh_pane_observations(&current).unwrap();
+            current
+        };
+        await_line(&received, "READY");
+        let (physical, probe, _) =
+            crate::tmux::utils::observe_pane(&name, &crate::tmux::TmuxCommandDeadline::new())
+                .unwrap()
+                .unwrap();
+        assert_eq!(probe, crate::tmux::utils::PaneProbe::Alive);
+        let physical = Arc::new(physical);
+        assert_eq!(physical == original, !replace_physical);
+        runtime.block_on(apply_published(&mut env.view, &state));
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let old = loop {
+            runtime.block_on(apply_published(&mut env.view, &state));
+            if let Some(ready) = env.view.take_native_attachment() {
+                break Some(ready);
+            }
+            if !env.view.session_feed.has_pending(&id) {
+                break None;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "old writer request did not settle"
+            );
+            std::thread::yield_now();
+        };
+        let old_ensure_calls = ensure_calls.load(Ordering::SeqCst);
+        if let Some(ready) = old {
+            let PaneIntent::Send { message, target } = ready.intent else {
+                panic!("expected the actual queued OLD send");
+            };
+            env.view
+                .finish_send(&id, &ready.terminal, target, &message, &ready.lease);
+        }
+        while env.view.session_feed.has_pending(&id) {
+            runtime.block_on(apply_published(&mut env.view, &state));
+            assert!(
+                Instant::now() < deadline,
+                "post-send command did not settle"
+            );
+            std::thread::yield_now();
+        }
+        env.view.info_dialog = None;
+        env.view
+            .prepare_send_target(&id, LiveSendTarget::Agent, "FRESH".into(), None)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let fresh = loop {
+            runtime.block_on(apply_published(&mut env.view, &state));
+            if let Some(ready) = env.view.take_native_attachment() {
+                break ready;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fresh writer request did not prepare"
+            );
+            std::thread::yield_now();
+        };
+        assert_eq!(
+            fresh.terminal.lifecycle_generation,
+            current.lifecycle_generation
+        );
+        assert_eq!(fresh.terminal.physical, Some(physical));
+        let PaneIntent::Send { message, target } = fresh.intent else {
+            panic!("expected the explicit FRESH send");
+        };
+        env.view
+            .finish_send(&id, &fresh.terminal, target, &message, &fresh.lease);
+        let received = await_line(&received, "ACK:FRESH");
+        if old_ensure_calls != 0 || received.lines().any(|line| line == "ACK:OLD") {
+            violations.push((replace_physical, old_ensure_calls, received));
+        }
+        writer.abort();
+        server.abort();
+        let _ = runtime.block_on(writer);
+        let _ = runtime.block_on(server);
+    }
+    assert!(
+        violations.is_empty(),
+        "queued OLD crossed the native generation before real writer dispatch: {violations:?}"
+    );
+}
+
+#[test]
+#[serial]
+fn captured_live_lease_and_agent_readiness_survive_native_rename() {
+    use crate::session::{PaneObservation, PanePresence};
+    use crate::tmux::test_helpers::{require_tmux, TmuxTestSession};
+    use std::time::{Duration, Instant};
+
+    require_tmux!();
+    fn await_line(path: &std::path::Path, text: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if std::fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .any(|line| line == text)
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "native actor did not acknowledge {text}"
+            );
+            std::thread::yield_now();
+        }
+    }
+    let mut env = create_test_env_with_sessions(1);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let id = env.view.instance_at(0).id.clone();
+    let storage = Storage::open_unwatched("test").unwrap();
+    let row = storage
+        .update(|rows, _| {
+            let row = rows.iter_mut().find(|row| row.id == id).unwrap();
+            row.source_profile = "test".into();
+            row.tool = "bash".into();
+            row.command = "/bin/sh".into();
+            row.status = Status::Idle;
+            row.lifecycle_generation = 7;
+            Ok(row.clone())
+        })
+        .unwrap();
+    let received = crate::session::get_app_dir()
+        .unwrap()
+        .join("rename-native-receipts");
+    let quoted = crate::session::environment::shell_escape(received.to_str().unwrap());
+    let command = format!(
+        "stty -echo; printf 'NATIVE_RENAME_READY_OUTPUT_LONG_ENOUGH\\n'; printf 'READY\\n' > {quoted}; \
+         while IFS= read -r line; do printf 'ACK:%s\\n' \"$line\" >> {quoted}; done"
+    );
+    let name = crate::tmux::Session::generate_name(&id, &row.title);
+    let _pane = TmuxTestSession::from_name(&name);
+    crate::tmux::Session::from_name(&name)
+        .create("/tmp", Some(&command), "test")
+        .unwrap();
+    await_line(&received, "READY");
+    let (physical, probe, _) =
+        crate::tmux::utils::observe_pane(&name, &crate::tmux::TmuxCommandDeadline::new())
+            .unwrap()
+            .unwrap();
+    assert_eq!(probe, crate::tmux::utils::PaneProbe::Alive);
+    let physical = Arc::new(physical);
+    let state = runtime.block_on(native_state(&["test"]));
+    runtime.block_on(async {
+        state.instances.write().await[0].agent_pane = PaneObservation {
+            state: PanePresence::Alive,
+            tmux_session: Some(name.clone()),
+            physical: Some(physical.clone()),
+            legacy_tool: None,
+        };
+        test_support::refresh_canonical_metadata_for_test(&state).await;
+    });
+    // The isolated Home fixture has no daemon command lane until installed.
+    // Retain a live receiver, as a connected TUI does; use the normal physical lease.
+    let _commands = env.view.session_feed.terminal_driver_for_test();
+    runtime.block_on(apply_published(&mut env.view, &state));
+    assert!(env.view.session_feed.current_snapshot_applied());
+    assert!(env.view.session_feed.native_interaction_available());
+    let lease = env
+        .view
+        .session_feed
+        .preview_input_lease(&id, &name)
+        .unwrap();
+    let raw = lease.input_session().unwrap();
+
+    let (status, body) = runtime.block_on(request(
+        &state,
+        "PATCH",
+        &format!("/api/sessions/{id}"),
+        serde_json::json!({"title": "renamed native owner"}),
+    ));
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let renamed = runtime.block_on(async { state.instances.read().await[0].clone() });
+    let renamed_name = crate::tmux::Session::generate_name(&id, &renamed.title);
+    let _renamed_pane = TmuxTestSession::from_name(&renamed_name);
+    assert_ne!(renamed_name, name);
+    assert_eq!(renamed.lifecycle_generation, row.lifecycle_generation);
+    let observed =
+        crate::tmux::utils::observe_pane(&renamed_name, &crate::tmux::TmuxCommandDeadline::new())
+            .unwrap()
+            .unwrap()
+            .0;
+    assert_eq!(&observed, physical.as_ref());
+    runtime.block_on(async {
+        let worker_state = state.clone();
+        let owner = renamed.clone();
+        tokio::task::spawn_blocking(move || {
+            let native =
+                crate::server::session_store::NativeSessionStore::open(worker_state, "test", None)?;
+            native.refresh_pane_observations(&owner)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    });
+    runtime.block_on(apply_published(&mut env.view, &state));
+    assert!(
+        lease.is_valid(),
+        "display-name change revoked a living physical owner"
+    );
+    assert!(raw.capture_pane(5).unwrap().contains("NATIVE_RENAME_READY"));
+    raw.send_live_raw_bytes(b"RAW\n").unwrap();
+    await_line(&received, "ACK:RAW");
+    let programmatic = renamed
+        .agent_input_session(
+            &name,
+            physical.clone(),
+            true,
+            Some(lease.input_fence(true).unwrap()),
+        )
+        .unwrap();
+    programmatic.send_keys("PROGRAM").unwrap();
+    await_line(&received, "ACK:PROGRAM");
+    assert_eq!(
+        storage.load_instances_complete().unwrap()[0].lifecycle_generation,
+        7
+    );
+}
+
+#[test]
+#[serial]
+fn successful_native_send_preserves_shelving_committed_after_final_enter_ack() {
+    use crate::daemon::{MutationReceipt, TerminalTarget, TerminalTargetStatus};
+    use crate::session::{AuxiliaryObservation, AuxiliaryTarget, PaneObservation, PanePresence};
+    use crate::tmux::test_helpers::{require_tmux, TmuxTestSession};
+    use crate::tui::home::live_send::LiveSendTarget;
+    use crate::tui::home::panes::PaneIntent;
+
+    require_tmux!();
+    fn wait_for_text(target: &str, text: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let output = crate::tmux::tmux_command()
+                .args(["capture-pane", "-p", "-t", target])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            if String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line == text)
+            {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "missing {text:?}");
+            std::thread::yield_now();
+        }
+    }
+
+    let mut lost_shelving = Vec::new();
+    for shelving in ["archive", "snooze", "dormancy"] {
+        let mut env = create_test_env_with_sessions(1);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let id = env.view.instance_at(0).id.clone();
+        let storage = Storage::open_unwatched("test").unwrap();
+        storage
+            .update(|rows, _| {
+                let row = rows.iter_mut().find(|row| row.id == id).unwrap();
+                row.status = Status::Idle;
+                row.lifecycle_generation = 7;
+                row.last_accessed_at = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+                Ok(())
+            })
+            .unwrap();
+        let state = runtime.block_on(native_state(&["test"]));
+        runtime.block_on(apply_published(&mut env.view, &state));
+        env.view.select_session_by_id(&id);
+
+        let guard = TmuxTestSession::new("aoe_test_send_shelving");
+        crate::tmux::Session::from_name(guard.name())
+            .create(
+                "/tmp",
+                Some(
+                    "stty -echo; printf 'SEND-READY\\n'; while IFS= read -r line; do printf 'SEND-ACK:%s\\n' \"$line\"; done",
+                ),
+                "test",
+            )
+            .unwrap();
+        let (physical, presence, _) = crate::tmux::utils::observe_pane(
+            guard.name(),
+            &crate::tmux::TmuxCommandDeadline::new(),
+        )
+        .unwrap()
+        .expect("native send pane");
+        assert_eq!(presence, crate::tmux::utils::PaneProbe::Alive);
+        let physical = Arc::new(physical);
+        wait_for_text(&physical.identity.pane_id, "SEND-READY");
+
+        let mut prepare = env.view.session_feed.terminal_driver_for_test();
+        let mut snapshot = published_fixture_for_send(&env.view, &id);
+        Arc::make_mut(&mut snapshot).contents.sessions[0].auxiliary = vec![AuxiliaryObservation {
+            target: AuxiliaryTarget::Host { index: 0 },
+            pane: PaneObservation {
+                state: PanePresence::Alive,
+                tmux_session: Some(guard.name().into()),
+                physical: Some(physical.clone()),
+                legacy_tool: None,
+            },
+        }];
+        env.view
+            .session_feed
+            .publish_for_test(SessionFeedResult::Snapshot(snapshot.clone()));
+        env.view.apply_session_feed();
+        env.view
+            .prepare_send_target(&id, LiveSendTarget::Terminal, "COMPLETED".into(), None)
+            .unwrap();
+        prepare(Ok(MutationReceipt {
+            cursor: snapshot.cursor.clone(),
+            outcome: TerminalTarget {
+                tmux_session: guard.name().into(),
+                physical: Some(physical.clone()),
+                status: TerminalTargetStatus::Exists,
+                lifecycle_generation: 7,
+                profile: "test".into(),
+            },
+        }));
+        env.view.apply_session_feed();
+        let ready = env
+            .view
+            .take_native_attachment()
+            .expect("prepared real pane");
+        let PaneIntent::Send { message, target } = ready.intent else {
+            panic!("expected captured send intent");
+        };
+        let command_epoch = env
+            .view
+            .session_feed
+            .applied_snapshot()
+            .unwrap()
+            .cursor
+            .epoch
+            .clone();
+        let mut dispatch =
+            env.view
+                .session_feed
+                .command_dispatch_driver_for_test(|submitted, mutation| {
+                    use crate::daemon::SessionMutation;
+                    let method = match mutation {
+                        SessionMutation::Start(_)
+                        | SessionMutation::Restart(_)
+                        | SessionMutation::AbandonPurge(_)
+                        | SessionMutation::StopAuxiliary(_)
+                        | SessionMutation::Stop => "POST",
+                        _ => "PATCH",
+                    };
+                    let (status, headers, body) = runtime.block_on(request_with_headers_at_epoch(
+                        &state,
+                        method,
+                        &format!("/api/sessions/{submitted}/{}", mutation.route()),
+                        serde_json::to_value(mutation).unwrap(),
+                        &command_epoch,
+                    ));
+                    assert!(status.is_success(), "{shelving}: {status} {body}");
+                    Ok(super::pickers_groups_sort::receipt_cursor(&headers))
+                });
+        let (committed, ack) = std::sync::mpsc::sync_channel(1);
+        let handle = runtime.handle().clone();
+        let hook_state = state.clone();
+        let hook_id = id.clone();
+        // Run only after real native delivery, including the final Enter ACK.
+        // The hook commits metadata; it does not stand in for native input.
+        let _hook = super::super::send::post_send_test_hook::install(&id, move || {
+            let storage = Storage::open_unwatched("test").unwrap();
+            storage
+                .update(|rows, _| {
+                    let row = rows.iter_mut().find(|row| row.id == hook_id).unwrap();
+                    match shelving {
+                        "archive" => row.archive(),
+                        "snooze" => row.snooze(120),
+                        "dormancy" => row.idle_dormant_since = Some(chrono::Utc::now()),
+                        _ => unreachable!(),
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            let mut rows = storage.load().unwrap();
+            for row in &mut rows {
+                row.source_profile = "test".into();
+            }
+            let row = rows.iter().find(|row| row.id == hook_id).unwrap();
+            let expected = (row.archived_at, row.snoozed_until, row.idle_dormant_since);
+            handle.block_on(async {
+                *hook_state.instances.write().await = rows;
+                test_support::refresh_canonical_metadata_for_test(&hook_state).await;
+                hook_state.runtime.publish(&hook_state).await.unwrap();
+            });
+            committed.send(expected).unwrap();
+        });
+        env.view
+            .finish_send(&id, &ready.terminal, target, &message, &ready.lease);
+        assert!(
+            env.view.info_dialog.is_none(),
+            "{shelving}: native send failed"
+        );
+        let expected = ack
+            .try_recv()
+            .expect("post-Enter shelving commit acknowledged");
+        assert!(
+            expected.0.is_some() || expected.1.is_some() || expected.2.is_some(),
+            "{shelving}: shelving must commit before processing the old completion"
+        );
+        wait_for_text(&physical.identity.pane_id, "SEND-ACK:COMPLETED");
+
+        if env.view.session_feed.has_pending(&id) {
+            let submitted = dispatch().expect("process the actual queued post-send mutation");
+            assert_eq!(submitted, id);
+            runtime.block_on(apply_published(&mut env.view, &state));
+            assert!(env.view.session_feed.can_submit(&id));
+        }
+        let rows = storage.load().unwrap();
+        let row = rows.iter().find(|row| row.id == id).unwrap();
+        if (row.archived_at, row.snoozed_until, row.idle_dormant_since) != expected {
+            lost_shelving.push(shelving);
+        }
+    }
+    assert!(
+        lost_shelving.is_empty(),
+        "the old send completion erased newer shelving: {lost_shelving:?}"
+    );
+
+    fn published_fixture_for_send(
+        view: &HomeView,
+        id: &str,
+    ) -> Arc<crate::daemon::RuntimeSnapshot> {
+        let SessionFeedResult::Snapshot(snapshot) = daemon_snapshot(view, id, "Idle") else {
+            unreachable!()
+        };
+        let mut snapshot = (*snapshot).clone();
+        let applied = view.session_feed.applied_snapshot().unwrap();
+        snapshot.cursor.epoch = applied.cursor.epoch.clone();
+        Arc::new(snapshot)
     }
 }
 
@@ -843,6 +1601,7 @@ fn terminal_rows_take_status_and_observations_from_the_daemon_only() {
         let row = &mut snapshot.contents.sessions[0];
         row.view = crate::session::View::Terminal;
         row.agent_pane = PaneObservation {
+            physical: None,
             state: PanePresence::Alive,
             ..PaneObservation::default()
         };
@@ -1185,6 +1944,7 @@ fn terminal_status_converges_in_one_feed_apply_without_a_local_probe() {
         instance.last_error = Some("stale local probe error".into());
         instance.pane_dead_observed = false;
         instance.agent_pane = PaneObservation {
+            physical: None,
             state: PanePresence::Alive,
             ..PaneObservation::default()
         };
@@ -1210,6 +1970,7 @@ fn terminal_status_converges_in_one_feed_apply_without_a_local_probe() {
         row.last_error = Some("agent process exited".into());
         row.last_error_evidence = Some(evidence);
         row.agent_pane = PaneObservation {
+            physical: None,
             state: PanePresence::Dead,
             ..PaneObservation::default()
         };
@@ -1342,16 +2103,16 @@ fn daemon_unreachable_stop_fails_without_a_local_write() {
 
 #[test]
 #[serial]
-fn restart_attachment_waits_for_its_receipt_and_lifecycle_generation() {
-    use crate::daemon::{
-        MutationReceipt, RestartOutcome, RuntimeCursor, TerminalTarget, TerminalTargetStatus,
-    };
+fn native_preparation_waits_for_its_receipt_and_lifecycle_generation() {
+    use crate::daemon::{MutationReceipt, RuntimeCursor, TerminalTarget, TerminalTargetStatus};
     use crate::session::{PaneObservation, PanePresence};
+    use crate::tui::home::panes::{NativePane, PaneIntent};
 
-    for (reflected_generation, target_name) in [
-        (5, "restarted-agent"),
-        (6, "restarted-agent"),
-        (5, "renamed-agent"),
+    for (reflected_generation, target_name, changed_physical) in [
+        (4, "prepared-agent", false),
+        (5, "prepared-agent", false),
+        (4, "renamed-agent", false),
+        (4, "prepared-agent", true),
     ] {
         let mut env = create_test_env_with_sessions(1);
         let id = env.view.instance_at(0).id.clone();
@@ -1360,8 +2121,9 @@ fn restart_attachment_waits_for_its_receipt_and_lifecycle_generation() {
         row.view = crate::session::View::Terminal;
         row.lifecycle_generation = 4;
         row.agent_pane = PaneObservation {
+            physical: Some(native_physical_fixture()),
             state: PanePresence::Alive,
-            tmux_session: Some("restarted-agent".into()),
+            tmux_session: Some("prepared-agent".into()),
             legacy_tool: None,
         };
         let SessionFeedResult::Snapshot(mut snapshot) = snapshot_of(vec![row]) else {
@@ -1371,56 +2133,58 @@ fn restart_attachment_waits_for_its_receipt_and_lifecycle_generation() {
             .session_feed
             .publish_for_test(SessionFeedResult::Snapshot(snapshot.clone()));
         env.view.apply_session_feed();
-        let mut respond = env.view.session_feed.restart_driver_for_test();
-        env.view.restart_then_attach(&id, None, false);
+        let mut respond = env.view.session_feed.terminal_driver_for_test();
+        env.view
+            .prepare_native_attachment(&id, NativePane::Agent, None, PaneIntent::Attach)
+            .unwrap();
 
-        // A still-Running snapshot predating the receipt cannot settle a restart.
         std::sync::Arc::make_mut(&mut snapshot).cursor.revision = 2;
         env.view
             .session_feed
             .publish_for_test(SessionFeedResult::Snapshot(snapshot.clone()));
         env.view.apply_session_feed();
-        env.view.apply_restart_results();
-        assert!(env.view.restart_in_flight.contains(&id));
+        assert!(!env.view.session_feed.can_submit(&id));
         assert!(env.view.take_native_attachment().is_none());
 
-        assert!(respond(Ok(MutationReceipt {
+        respond(Ok(MutationReceipt {
             cursor: RuntimeCursor {
                 epoch: "test".into(),
-                revision: 3
+                revision: 3,
             },
-            outcome: RestartOutcome {
-                lifecycle_generation: 5,
+            outcome: TerminalTarget {
+                physical: Some(native_physical_fixture()),
+                tmux_session: "prepared-agent".into(),
+                status: TerminalTargetStatus::Alive,
+                lifecycle_generation: 4,
                 profile: "test".into(),
-                target: Some(TerminalTarget {
-                    tmux_session: "restarted-agent".into(),
-                    status: TerminalTargetStatus::Restarted,
-                    lifecycle_generation: 5,
-                    profile: "test".into(),
-                }),
             },
-        }))
-        .is_some_and(|(target, _)| target == id));
+        }));
         env.view.apply_session_feed();
-        env.view.apply_restart_results();
-        assert!(env.view.restart_in_flight.contains(&id));
+        assert!(!env.view.session_feed.can_submit(&id));
         assert!(env.view.take_native_attachment().is_none());
 
         let committed = std::sync::Arc::make_mut(&mut snapshot);
         committed.cursor.revision = 3;
         committed.contents.sessions[0].lifecycle_generation = reflected_generation;
         committed.contents.sessions[0].agent_pane.tmux_session = Some(target_name.into());
+        if changed_physical {
+            let physical = committed.contents.sessions[0]
+                .agent_pane
+                .physical
+                .as_mut()
+                .unwrap();
+            Arc::make_mut(physical).identity.pane_id = "%999999999".into();
+        }
         env.view
             .session_feed
             .publish_for_test(SessionFeedResult::Snapshot(snapshot));
         env.view.apply_session_feed();
-        env.view.apply_restart_results();
-        assert!(!env.view.restart_in_flight.contains(&id));
+        assert!(env.view.session_feed.can_submit(&id));
         let attachment = env.view.take_native_attachment();
-        if reflected_generation == 5 && target_name == "restarted-agent" {
-            let attachment = attachment.expect("committed restart is attachable");
+        if reflected_generation == 4 && !changed_physical {
+            let attachment = attachment.expect("committed preparation is attachable");
             assert_eq!(attachment.id, id);
-            assert_eq!(attachment.tmux_name, "restarted-agent");
+            assert_eq!(attachment.terminal.tmux_session, "prepared-agent");
         } else {
             assert!(
                 attachment.is_none(),
@@ -1913,6 +2677,7 @@ fn legacy_stop_confirmation_retains_the_original_exact_row_and_pane() {
         tool_name: "probe".into(),
     };
     let pane = PaneObservation {
+        physical: None,
         state: PanePresence::Unknown,
         tmux_session: Some("captured-tool".into()),
         legacy_tool: Some(observed_legacy_tool(LegacyToolIdentity {
@@ -1942,6 +2707,7 @@ fn legacy_stop_confirmation_retains_the_original_exact_row_and_pane() {
     assert_eq!(captured.adoption.as_ref().unwrap().profile, "test");
     assert_eq!(captured.adoption.as_ref().unwrap().lifecycle_generation, 7);
     let replacement = PaneObservation {
+        physical: None,
         state: PanePresence::Unknown,
         tmux_session: Some("replacement-tool".into()),
         legacy_tool: Some(observed_legacy_tool(LegacyToolIdentity {
@@ -1982,6 +2748,7 @@ fn legacy_attach_live_send_and_send_require_confirmation_and_keep_its_capture() 
                 tool_name: "probe".into(),
             };
             let pane = PaneObservation {
+                physical: None,
                 state: PanePresence::Unknown,
                 tmux_session: Some("captured-tool".into()),
                 legacy_tool: Some(observed_legacy_tool(LegacyToolIdentity {
@@ -2033,6 +2800,7 @@ fn legacy_attach_live_send_and_send_require_confirmation_and_keep_its_capture() 
                 continue;
             }
             let replacement = PaneObservation {
+                physical: None,
                 state: PanePresence::Unknown,
                 tmux_session: Some("replacement-tool".into()),
                 legacy_tool: Some(observed_legacy_tool(LegacyToolIdentity {
@@ -2083,6 +2851,7 @@ fn cancelled_attach_live_send_and_send_settle_without_a_continuation_in_either_r
                 vec![AuxiliaryObservation {
                     target: target.clone(),
                     pane: PaneObservation {
+                        physical: Some(native_physical_fixture()),
                         state: PanePresence::Alive,
                         tmux_session: Some("owned-pane".into()),
                         legacy_tool: None,
@@ -2111,6 +2880,7 @@ fn cancelled_attach_live_send_and_send_settle_without_a_continuation_in_either_r
                     revision: 2,
                 },
                 outcome: TerminalTarget {
+                    physical: Some(native_physical_fixture()),
                     tmux_session: "owned-pane".into(),
                     status: TerminalTargetStatus::Exists,
                     lifecycle_generation: 0,
@@ -2163,7 +2933,7 @@ fn absent_unconfigured_tool_remains_recoverable_without_native_preparation() {
         serde_json::json!({
             "auxiliary": [AuxiliaryObservation {
                 target: target.clone(),
-                pane: PaneObservation { state: PanePresence::Absent, tmux_session: None, legacy_tool: None },
+                pane: PaneObservation { state: PanePresence::Absent, tmux_session: None, legacy_tool: None, physical: None },
             }],
         }),
     );
@@ -2244,6 +3014,7 @@ fn recovery_only_stop_never_adopts_current_legacy_replacement() {
                         legacy_tool: Some(observed_legacy_tool(LegacyToolIdentity {
                             session_id: "$42".into(), pane_id: "%42".into(), pane_pid: Some(4242),
                         })),
+                        physical: None,
                     },
                 }],
             }),
@@ -2421,7 +3192,7 @@ fn persistent_metadata_lag_latches_across_revisions_without_focus_theft() {
 #[serial]
 fn managed_resume_refusal_keeps_recovery_visible_and_restart_available() {
     use crate::tui::home::panes::{NativePane, PaneIntent};
-    for action in ["mutation", "ensure", "start"] {
+    for action in ["mutation", "ensure"] {
         let mut env = create_test_env_with_sessions(1);
         let id = env.view.instance_at(0).id.clone();
         env.view.select_session_by_id(&id);
@@ -2435,7 +3206,6 @@ fn managed_resume_refusal_keeps_recovery_visible_and_restart_available() {
                 .view
                 .prepare_native_attachment(&id, NativePane::Agent, None, PaneIntent::Attach)
                 .unwrap(),
-            "start" => env.view.start_then_attach(&id, None),
             _ => env
                 .view
                 .session_feed
@@ -2456,12 +3226,7 @@ fn managed_resume_refusal_keeps_recovery_visible_and_restart_available() {
                 crate::session::ManagedResumeCause::WrapperContractRequired,
             ),
         };
-        let message = if action == "start" {
-            format!("Session started; pane preparation failed: {refusal}")
-        } else {
-            refusal.to_string()
-        };
-        assert_eq!(respond(Err(message)).unwrap().0, id);
+        assert_eq!(respond(Err(refusal.to_string())).unwrap().0, id);
         env.view.apply_session_feed();
         env.view.apply_restart_results();
         if action != "mutation" {

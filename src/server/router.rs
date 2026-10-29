@@ -152,6 +152,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             patch(api::touch_session_access).layer(read_only.clone()),
         )
         .route(
+            "/api/sessions/{id}/input-recency",
+            patch(api::touch_session_input_recency).layer(read_only.clone()),
+        )
+        .route(
             "/api/sessions/{id}/snooze",
             patch(api::update_session_snooze),
         )

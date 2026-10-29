@@ -40,6 +40,14 @@ For sandboxed sessions, the **Container** tab launches the container user's pref
 
 If the WebSocket drops (network blip, tunnel re-auth, daemon restart), the terminal reconnects on a fast-start retry ladder (200ms, 400ms, 800ms, 1.5s, 3s, 6s, 10s) so transient warm-up failures recover in well under five seconds. A disconnect banner shows the current state; a permanently dead pane surfaces a manual retry button instead of looping.
 
+Keystrokes and paste waiting for ownership confirmation belong only to that connection and target. Disconnect, reconnect, ownership loss, or a session/route change discards them; they never flush into a replacement connection. Compose drafts remain editable, and only fresh input can be submitted after the new connection confirms ownership. Native generation changes can invalidate input while the original Agent PTY still runs; a fresh connection can capture that surviving runtime without restarting it.
+
+Server-side preparation and programmatic sends keep their original row creation, native generation and physical profile across waits. A creation receipt describes the runtime that operation actually created; it cannot attach an old send to a later replacement. Input completion records recency only, without consuming newer shelving or diagnostic state. Reconnecting or opening a pane is not evidence that an earlier operation succeeded.
+
+Captured native IDs remain the owner across a label-only rename. Readiness and delivery do not reselect a target by its new name. A CLI replacement is checked against native storage even before the daemon cache reloads; it cannot inherit an earlier creation receipt.
+
+A required native conversation publication that is positively refused can retire only its own new birth, not a peer's selected conversation. Uncertain publication is not proof of process death: a possibly applied commit remains governed by exact reconciliation, without automatic replacement or input replay.
+
 ### Terminal WebSocket close codes
 
 When the browser fails to reach a working terminal, the disconnect banner shows the close code returned by the server:
@@ -48,6 +56,7 @@ When the browser fails to reach a working terminal, the disconnect banner shows 
 | ---- | ----------------- | ----------------------------------------------------------------------------------------- | -------------------------- |
 | 1001 | `server shutdown` | Daemon is shutting down (SIGINT/SIGTERM).                                                 | Retry with normal backoff. |
 | 1013 | `tmux_not_ready`  | Pane did not become capturable within 2s. Usually a benign warm-up on first session open. | Retry with normal backoff. |
+| 1013 | `input_unavailable` | The captured native input scope changed, or delivery could not be confirmed. This does not assert that the pane died. | Retry with normal backoff; discard pending input, never replay it. |
 | 4001 | `pty_dead`        | The live view was running but the pane permanently exited.                                | Show "Click retry" banner. |
 
 ## Read-only mode

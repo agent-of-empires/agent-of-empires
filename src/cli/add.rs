@@ -1105,8 +1105,18 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                     );
                 }
 
-                let tmux_session = crate::tmux::Session::new(&instance.id, &instance.title)?;
                 if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+                    let name = instance
+                        .agent_pane
+                        .tmux_session
+                        .as_deref()
+                        .ok_or(crate::session::NativeInputError::Ownership)?;
+                    let physical = instance
+                        .agent_pane
+                        .physical
+                        .clone()
+                        .ok_or(crate::session::NativeInputError::Ownership)?;
+                    let tmux_session = crate::tmux::Session::from_observation(name, physical);
                     tmux_session.attach()?;
                 } else {
                     println!(

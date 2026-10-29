@@ -59,9 +59,10 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
         conversation_carry,
     } = request;
 
-    let title = instance.title.clone();
-    let tool = instance.tool.clone();
     let before = instance.clone();
+    let wake_source = (!wake_message.is_empty())
+        .then(|| super::Storage::open_reference(&instance.effective_profile()).ok())
+        .flatten();
 
     // Recovery bounds hooks so a hanging command cannot wedge its worker.
     let outcome = {
@@ -85,7 +86,11 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
     // pane-readiness probe.
     let should_wake = launched_agent(&outcome);
     if should_wake && !wake_message.is_empty() {
-        spawn_wake_worker(session_id.clone(), title, tool, wake_message, None);
+        let profile_identity = wake_source
+            .as_ref()
+            .filter(|source| source.verify_bound_profile().is_ok())
+            .and_then(|source| source.bound_profile_identity().ok());
+        spawn_wake_worker(&instance, wake_message, profile_identity);
     }
 
     RestartResult {
@@ -116,65 +121,67 @@ pub(crate) fn wake_dispatches_for_test() -> u64 {
     WAKE_DISPATCHES.with(std::cell::Cell::get)
 }
 
-/// Wait for the restarted pane to become live and past its boot shell, then
-/// send the wake-up message. Best-effort: a failure to spawn or send is logged,
-/// never fatal.
+/// Send a restart wake through the captured launch pane, never a later name owner.
+/// Failure is logged without replaying the message or replacing a runtime.
 pub(crate) fn spawn_wake_worker(
-    session_id: String,
-    title: String,
-    tool: String,
+    instance: &Instance,
     wake_message: String,
-    identity: Option<(String, u64)>,
+    profile_identity: Option<(u64, u64)>,
 ) {
     #[cfg(test)]
     WAKE_DISPATCHES.with(|count| count.set(count.get() + 1));
+    let (Some(name), Some(physical)) = (
+        instance.agent_pane.tmux_session.as_ref(),
+        instance.agent_pane.physical.clone(),
+    ) else {
+        tracing::warn!(target: "session.restart", session = %instance.id,
+            "restart wake refused: physical launch receipt unavailable");
+        return;
+    };
+    let captured = (|| -> anyhow::Result<_> {
+        let expected = profile_identity.ok_or(crate::session::NativeInputError::Ownership)?;
+        let fence = crate::session::NativeInputFence::capture_route(
+            &instance.effective_profile(),
+            &instance.id,
+            instance.created_at,
+            instance.lifecycle_generation,
+            true,
+            Some(expected),
+        )?;
+        Ok(crate::tmux::Session::from_observation(name, physical).with_native_input_fence(fence))
+    })();
+    let mut session = match captured {
+        Ok(session) => session,
+        Err(error) => {
+            tracing::warn!(target: "session.restart", session = %instance.id, %error,
+                "restart wake refused before enqueue; no retry performed");
+            return;
+        }
+    };
+    let session_id = instance.id.clone();
+    let tool = instance.tool.clone();
+    let expects_shell = instance.expects_shell();
     let spawn_result = std::thread::Builder::new()
-        .name(format!("aoe-restart-wake/{}", session_id))
-        .stack_size(128 * 1024)
+        .name(format!("aoe-restart-wake/{session_id}"))
         .spawn(move || {
-            let Ok(tmux_session) = crate::tmux::Session::new(&session_id, &title) else {
-                return;
-            };
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3000);
-            loop {
-                if !tmux_session.exists() {
-                    return;
-                }
-                let pane_alive = !tmux_session.is_pane_dead();
-                let hook_active = crate::hooks::read_hook_status(&session_id).is_some();
-                if pane_alive && (hook_active || !tmux_session.is_pane_running_shell()) {
-                    break;
-                }
-                if std::time::Instant::now() >= deadline {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-
-            if !tmux_session.exists() {
-                return;
-            }
-            let delay = crate::agents::send_keys_enter_delay(&tool);
-            if let Some((profile, generation)) = identity {
-                let current = crate::session::Storage::new_unwatched(&profile)
-                    .and_then(|storage| storage.load())
-                    .ok()
-                    .is_some_and(|rows| rows.iter().any(|row| {
-                        row.id == session_id
-                            && row.lifecycle_generation == generation
-                            && row.title == title
-                            && row.tool == tool
-                    }));
-                if !current {
-                    return;
-                }
-            }
-            if let Err(e) = tmux_session.send_keys_with_delay(&wake_message, delay) {
-                tracing::warn!(target: "session.restart", "failed to send wake-up message after restart: {}", e);
+            session.wait_until_ready(
+                std::time::Duration::from_secs(5),
+                crate::agents::ready_marker(&tool),
+            );
+            let delivered = session.admit_agent_input(expects_shell).and_then(|()| {
+                session.send_keys_with_delay(
+                    &wake_message,
+                    crate::agents::send_keys_enter_delay(&tool),
+                )
+            });
+            if let Err(error) = delivered {
+                tracing::warn!(target: "session.restart", %error,
+                    "restart wake was not confirmed; no retry performed");
             }
         });
-    if let Err(err) = spawn_result {
-        tracing::warn!(target: "session.restart", ?err, "failed to spawn restart wake-up worker");
+    if let Err(error) = spawn_result {
+        tracing::warn!(target: "session.restart", ?error,
+            "failed to spawn restart wake-up worker");
     }
 }
 
