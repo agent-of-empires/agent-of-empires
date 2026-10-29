@@ -604,13 +604,15 @@ caption = "Live status in the pane."
 
 The worker the host spawns and supervises, in one of two kinds. Omit it for a static, metadata-only plugin.
 
-Both runtime kinds require `runtime.worker` in the manifest's top-level `capabilities`. Missing declarations are rejected before installation or build execution, even with `--yes`. Installed manifests missing the declaration are skipped with a load diagnostic after the Daemon is upgraded and restarted. Correct the declaration and approve the changed manifest; an old grant does not authorize new manifest bytes.
+Both runtime kinds require `runtime.worker` in the manifest's top-level `capabilities`. Missing declarations are rejected before installation or build execution, even with `--yes`. Installed manifests missing the declaration are skipped with a load diagnostic after the daemon is upgraded and restarted. Correct the declaration and approve the changed manifest; an old grant does not authorize new manifest bytes.
 
 ### Command
 
 The host runs the build steps at install or update, then launches `command`.
 
 ```toml
+capabilities = ["runtime.worker"]
+
 [runtime]
 kind = "command"
 command = [".aoe-build/venv/bin/my-plugin-worker"]
@@ -640,6 +642,8 @@ Build into `.aoe-build/` (the host's build-output directory); the host excludes 
 The host downloads a release asset instead of building from source.
 
 ```toml
+capabilities = ["runtime.worker"]
+
 [runtime]
 kind = "release-binary"
 asset = "my-plugin-${target}.tar.gz"
