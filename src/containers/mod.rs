@@ -180,18 +180,17 @@ impl DockerContainer {
     }
 
     /// Best effort: an unpinned container is left running by a structured stop, never failed.
-    pub(crate) fn pin(&self, id: &str) -> Option<crate::session::SandboxPin> {
-        match RuntimeExecutionSnapshot::capture(&self.runtime) {
-            Ok(runtime) => Some(crate::session::SandboxPin {
-                runtime,
-                container_id: id.to_owned(),
-            }),
-            Err(error) => {
-                tracing::warn!(target: "containers.runtime", name = %self.name, %error,
-                    "could not pin the sandbox runtime");
-                None
-            }
+    pub(crate) fn pin(
+        &self,
+        id: &str,
+        current: Option<&crate::session::SandboxPin>,
+    ) -> Option<crate::session::SandboxPin> {
+        let fresh = RuntimeExecutionSnapshot::capture(&self.runtime);
+        if let Err(error) = &fresh {
+            tracing::warn!(target: "containers.runtime", name = %self.name, %error,
+                "could not pin the sandbox runtime");
         }
+        reconcile_pin(current, fresh.ok(), id)
     }
 
     pub fn exists(&self) -> Result<bool> {
@@ -439,9 +438,82 @@ impl DockerContainer {
     }
 }
 
+/// A pin for `id` keeps its original endpoint: a fresh snapshot replaces its runtime only
+/// when it names the same kind and endpoint, and is otherwise ignored.
+fn reconcile_pin(
+    current: Option<&crate::session::SandboxPin>,
+    fresh: Option<RuntimeExecutionSnapshot>,
+    id: &str,
+) -> Option<crate::session::SandboxPin> {
+    let build = |runtime| crate::session::SandboxPin {
+        runtime,
+        container_id: id.to_owned(),
+    };
+    match (current.filter(|pin| pin.container_id == id), fresh) {
+        (Some(pin), Some(fresh))
+            if fresh.kind == pin.runtime.kind && fresh.endpoint == pin.runtime.endpoint =>
+        {
+            Some(build(fresh))
+        }
+        (Some(pin), _) => Some(pin.clone()),
+        (None, fresh) => fresh.map(build),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconcile_pin_refreshes_only_the_same_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pin, _) = crate::session::test_support::fake_sandbox_pin(dir.path(), "c1", 0, "");
+        let moved = |endpoint: &str| {
+            let mut runtime = pin.runtime.clone();
+            runtime.program = "/moved/docker".into();
+            runtime.endpoint = endpoint.into();
+            runtime
+        };
+        // (current, fresh, id, expected program, expected endpoint)
+        let kept = pin.runtime.clone();
+        let cases = [
+            (
+                Some(&pin),
+                Some(moved(&pin.runtime.endpoint)),
+                "c1",
+                "/moved/docker",
+                &kept.endpoint,
+            ),
+            (
+                Some(&pin),
+                Some(moved("tcp://other")),
+                "c1",
+                kept.program.to_str().unwrap(),
+                &kept.endpoint,
+            ),
+            (
+                Some(&pin),
+                None,
+                "c1",
+                kept.program.to_str().unwrap(),
+                &kept.endpoint,
+            ),
+            (
+                Some(&pin),
+                Some(moved("tcp://other")),
+                "c2",
+                "/moved/docker",
+                &"tcp://other".to_owned(),
+            ),
+        ];
+        for (current, fresh, id, program, endpoint) in cases {
+            let result = reconcile_pin(current, fresh, id).unwrap();
+            assert_eq!(result.container_id, id);
+            assert_eq!(result.runtime.program.to_str().unwrap(), program);
+            assert_eq!(&result.runtime.endpoint, endpoint);
+        }
+        assert!(reconcile_pin(None, None, "c1").is_none());
+    }
 
     #[test]
     fn classify_removal_separates_gone_from_failed() {
