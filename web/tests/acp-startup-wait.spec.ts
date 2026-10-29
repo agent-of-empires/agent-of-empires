@@ -66,6 +66,30 @@ test("an imported Session shows the startup line while its Agent loads the histo
   await expect(page.getByTestId("startup-wait-line")).toContainText("Starting Claude Code… You can type now.");
 });
 
+test("a running Worker with no stored Agent session shows no startup line while history loads", async ({ page }) => {
+  // A forwarded /new leaves the Worker running with no stored Agent session id.
+  const mock = await mockAcpSession(page, {
+    title: "story-running-cleared",
+    workerState: "running",
+    initialEvents: [{ UserPromptSent: { text: "hi", prompt_id: "p1" } }, agentMessageChunk("hello")],
+  });
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  let requested!: () => void;
+  const replayRequested = new Promise<void>((resolve) => (requested = resolve));
+  await page.route(/\/acp\/replay(\?|$)/, async (r) => {
+    requested();
+    await gate;
+    await r.fallback();
+  });
+  await openStructuredSession(page, mock);
+  await replayRequested;
+  await expect(page.getByTestId("startup-wait-line")).toHaveCount(0);
+  release();
+  await expect(page.getByText("hello")).toBeVisible();
+  await expect(page.getByTestId("startup-wait-line")).toHaveCount(0);
+});
+
 test.describe("at 375px", () => {
   test.use({ viewport: { width: 375, height: 812 } });
 
