@@ -779,7 +779,6 @@ impl<S: BroadcastSink> Supervisor<S> {
             Some(tokio::time::Instant::now() + std::time::Duration::from_secs(3)),
             Some(reservation.lease().clone()),
             claude_home,
-            self.sink.background_agent_tracking_seed(&session_id),
         )
         .await;
         let mut client = match client {

@@ -95,14 +95,6 @@ impl OmpTaskTracker {
         self.children.clear();
     }
 
-    pub(super) fn seed(&mut self, agent_id: String, terminal: bool) {
-        let child = self.children.entry(agent_id).or_insert(Child {
-            snapshot: None,
-            terminal: false,
-        });
-        child.terminal |= terminal;
-    }
-
     pub(super) fn observe(&mut self, update: &SessionUpdate, replay: bool) -> Vec<Event> {
         if !is_omp_task_snapshot(update) {
             return Vec::new();
@@ -297,77 +289,6 @@ mod tests {
     }
 
     #[test]
-    fn omp_tasks_seeded_terminal_snapshot_preserves_completion_identity() {
-        let mut tracker = OmpTaskTracker::default();
-        tracker.seed("A".into(), true);
-        let completed = update(json!([row("A", "completed")]), "completed");
-        assert!(tracker.observe(&completed, false).is_empty());
-        assert!(tracker.observe(&completed, false).is_empty());
-        let running = update(json!([row("A", "running")]), "in_progress");
-        assert!(tracker.observe(&running, false).is_empty());
-        let failed = update(json!([row("A", "failed")]), "completed");
-        let events = tracker.observe(&failed, false);
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(
-                    event,
-                    Event::BackgroundAgentCompleted {
-                        status: BackgroundAgentStatus::Error,
-                        ..
-                    }
-                ))
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn omp_tasks_clear_forgets_previous_conversation_identity() {
-        let mut tracker = OmpTaskTracker::default();
-        tracker.seed("A".into(), true);
-        let running = update(
-            json!([row("A", "running"), row("B", "running")]),
-            "in_progress",
-        );
-        let initial = tracker.observe(&running, false);
-        assert_eq!(
-            initial
-                .iter()
-                .filter(|event| matches!(event,
-                    Event::BackgroundAgentLaunched { agent_id, .. } if agent_id == "B"
-                ))
-                .count(),
-            1
-        );
-
-        tracker.clear();
-
-        let events = tracker.observe(&running, false);
-        let launched: Vec<_> = events
-            .iter()
-            .filter_map(|event| match event {
-                Event::BackgroundAgentLaunched { agent_id, .. } => Some(agent_id.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(launched, ["A", "B"]);
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(
-                    event,
-                    Event::BackgroundAgentProgress {
-                        status: BackgroundAgentStatus::Running,
-                        ..
-                    }
-                ))
-                .count(),
-            2
-        );
-    }
-
-    #[test]
     fn omp_tasks_recent_output_is_chronological_without_reordering_lines() {
         let mut tracker = OmpTaskTracker::default();
         let mut progress = row("A", "running");
@@ -527,37 +448,5 @@ mod tests {
         assert!(tracker.observe(&input, false).is_empty());
         let unrelated: SessionUpdate = serde_json::from_value(json!({"sessionUpdate":"tool_call_update", "toolCallId":"other", "rawOutput":{"details":{"progress":[row("D","running")]}}})).unwrap();
         assert!(tracker.observe(&unrelated, false).is_empty());
-    }
-
-    #[test]
-    fn omp_tasks_resume_and_suppressed_replay_do_not_relaunch() {
-        let mut tracker = OmpTaskTracker::default();
-        let history = update(
-            json!([row("A", "running"), row("B", "completed")]),
-            "completed",
-        );
-        assert!(tracker.observe(&history, true).is_empty());
-        tracker.seed("C".into(), false);
-        let live = update(
-            json!([
-                row("A", "completed"),
-                row("B", "running"),
-                row("C", "running")
-            ]),
-            "completed",
-        );
-        let events = tracker.observe(&live, false);
-        assert!(!events
-            .iter()
-            .any(|e| matches!(e, Event::BackgroundAgentLaunched { .. })));
-        assert_eq!(events.iter().filter(|e| matches!(e, Event::BackgroundAgentCompleted { agent_id, .. } if agent_id == "A")).count(), 1);
-        assert!(tracker.observe(&live, false).is_empty());
-        tracker.seed("A".into(), false);
-        assert!(tracker
-            .observe(&update(json!([row("C", "completed")]), "completed"), true)
-            .is_empty());
-        assert!(tracker
-            .observe(&update(json!([row("C", "running")]), "completed"), false)
-            .is_empty());
     }
 }

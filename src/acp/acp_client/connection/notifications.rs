@@ -3,7 +3,6 @@
 
 use crate::acp::agent_profiles::AgentProfile;
 use crate::acp::background_agent::{spawn_tailer, TailerStart, TranscriptSource};
-use crate::acp::event_store::BackgroundAgentTrackingSeed;
 use crate::acp::state::{BackgroundTaskLaunch, Event};
 use crate::acp::task_transcript::{spawn_task_tailer, ActiveTasks};
 use agent_client_protocol::schema::v1::{SessionId, SessionNotification, SessionUpdate};
@@ -15,7 +14,7 @@ use tracing::debug;
 
 use crate::acp::acp_client::between_prompt::BetweenPromptTracker;
 use crate::acp::acp_client::lifecycle::{
-    forward_lifecycle_signals, LifecycleEnvelope, LifecycleSignal, TerminalClaim,
+    forward_lifecycle_signals, LifecycleEnvelope, TerminalClaim,
 };
 use crate::acp::acp_client::omp_tasks::OmpTaskTracker;
 use crate::acp::acp_client::rate_limit::record_rate_limit_report;
@@ -29,9 +28,7 @@ use crate::acp::acp_client::update_events::{
     map_update_to_events, qualify_compaction_id, restored_wake_tool_event, AgentMessageDedup,
     CompactionFold, CompactionTracker,
 };
-use crate::acp::acp_client::watchdog::{
-    classify_watchdog_notification_signals, is_detached_omp_task_update,
-};
+use crate::acp::acp_client::watchdog::classify_watchdog_notification_signals;
 
 pub(super) fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -47,7 +44,7 @@ pub(super) struct Shared {
     /// Set between a successful `session/load` and the first prompt, while
     /// the adapter replays history the event store already holds.
     pub(super) suppress_history_replay: AtomicBool,
-    /// Epoch-ms of notifications other than explicit detached omp updates.
+    /// Epoch-ms of the last inbound notification, for resume-idle recovery.
     pub(super) last_event_at: AtomicI64,
     /// A lifecycle-bearing notification arrived after attach. Ambient
     /// updates do not prove turn progress.
@@ -74,7 +71,6 @@ pub(super) struct Shared {
     pub(super) agent_msg_dedup: std::sync::Mutex<AgentMessageDedup>,
     compaction: std::sync::Mutex<CompactionTracker>,
     omp_tasks: std::sync::Mutex<OmpTaskTracker>,
-    pending_background_seed: std::sync::Mutex<Option<BackgroundAgentTrackingSeed>>,
     pub(super) tool_context_cache: ToolContextCache,
     bg_transcript_source: TranscriptSource,
     pub(super) bg_tasks: Arc<ActiveTasks>,
@@ -93,7 +89,6 @@ impl Shared {
         sandbox: Option<&SessionSandbox>,
         ingress: Arc<SessionIngress>,
         claude_home: Option<std::path::PathBuf>,
-        background_agent_tracking_seed: Option<BackgroundAgentTrackingSeed>,
     ) -> Self {
         // A sandboxed session's sub-agent transcripts live in the container.
         let bg_transcript_source = match sandbox {
@@ -123,7 +118,6 @@ impl Shared {
             agent_msg_dedup: Default::default(),
             compaction: Default::default(),
             omp_tasks: Default::default(),
-            pending_background_seed: std::sync::Mutex::new(background_agent_tracking_seed),
             tool_context_cache: Arc::new(std::sync::Mutex::new(ToolCallContextCache::default())),
             bg_transcript_source,
             bg_tasks: Arc::default(),
@@ -173,47 +167,19 @@ impl Shared {
                 .expect("background agent mutex poisoned")
                 .clear();
         }
-        let seed = self
-            .pending_background_seed
-            .lock()
-            .expect("background seed mutex poisoned")
-            .take();
-        let Some(seed) = seed.filter(|seed| seed.acp_session_id == id.0.as_ref()) else {
-            return;
-        };
-        let mut tracker = self
-            .omp_tasks
-            .lock()
-            .expect("omp task tracker mutex poisoned");
-        let mut running = self
-            .between_prompt
-            .bg_agents
-            .lock()
-            .expect("background agent mutex poisoned");
-        for (agent_id, terminal) in seed.agents {
-            tracker.seed(agent_id.clone(), terminal);
-            if !terminal {
-                running.insert(agent_id);
-            }
-        }
     }
 
-    /// Resume transcript tailers or structured tracking for a surviving runner.
-    pub(super) fn resume_background_tailing(
-        &self,
-        launches: Vec<crate::acp::event_store::UnresolvedBackgroundAgentLaunch>,
-    ) {
-        for launch in launches {
-            if !launch.wire_tracked && !launch.output_file.is_empty() {
-                spawn_tailer(
-                    launch.agent_id,
-                    launch.output_file,
-                    self.bg_transcript_source.clone(),
-                    self.event_tx.clone(),
-                    self.between_prompt.bg_agents.clone(),
-                    TailerStart::Resumed,
-                );
-            }
+    /// Re-tail sub-agents a previous daemon launched and left unresolved.
+    pub(super) fn resume_background_tailing(&self, launches: Vec<(String, String)>) {
+        for (agent_id, output_file) in launches {
+            spawn_tailer(
+                agent_id,
+                output_file,
+                self.bg_transcript_source.clone(),
+                self.event_tx.clone(),
+                self.between_prompt.bg_agents.clone(),
+                TailerStart::Resumed,
+            );
         }
     }
 
@@ -233,9 +199,7 @@ impl Shared {
         local_prompt_signals: bool,
     ) {
         let suppressing = self.suppress_history_replay.load(Ordering::Relaxed);
-        if !is_detached_omp_task_update(&notification.update, self.profile) {
-            self.last_event_at.store(now_ms(), Ordering::Relaxed);
-        }
+        self.last_event_at.store(now_ms(), Ordering::Relaxed);
         // Drop the adapter's leaked restatement before anything sees it
         // (#2281). Replayed history resets rather than feeds the deduper.
         {
@@ -282,11 +246,7 @@ impl Shared {
             self.profile,
             suppressing,
         );
-        if lifecycle
-            .as_ref()
-            .is_some_and(|signal| !matches!(signal, LifecycleSignal::TaskSnapshotCompleted { .. }))
-            || wakeup.is_some()
-        {
+        if lifecycle.is_some() || wakeup.is_some() {
             self.first_event_after_attach.store(true, Ordering::Relaxed);
         }
         let prompt_active = self.prompt_in_flight.load(Ordering::Relaxed);
@@ -479,371 +439,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn omp_task_activity_clocks_require_explicit_blocking_work() {
-        for (blocking_active, replay) in [
-            (None, false),
-            (Some(false), false),
-            (Some(true), false),
-            (Some(true), true),
-        ] {
-            for status in ["in_progress", "completed"] {
-                let (event_tx, mut event_rx) = mpsc::channel(32);
-                let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(32);
-                let shared = Shared::new(
-                    event_tx,
-                    "test".into(),
-                    &OMP,
-                    lifecycle_tx,
-                    Arc::new(TerminalClaim::new()),
-                    Arc::new(AtomicBool::new(false)),
-                    None,
-                    Arc::new(SessionIngress::new(Some(SessionId::from("native")))),
-                    None,
-                    None,
-                );
-                shared.last_event_at.store(123, Ordering::Relaxed);
-                shared
-                    .suppress_history_replay
-                    .store(replay, Ordering::Relaxed);
-                let mut frame = json!({
-                    "sessionId": "native",
-                    "update": {
-                        "sessionUpdate": "tool_call_update", "toolCallId": "mixed",
-                        "status": status, "_meta": {"omp": {"taskLifecycle": "progress"}},
-                        "rawOutput": {"details": {
-                            "async": {"type": "task"}, "progress": [
-                                {"id": "Child", "agent": "task", "status": "running",
-                                 "recentOutput": ["Background preview"]},
-                                {"id": "Blocking", "agent": "task", "status": "running"}
-                            ]
-                        }}
-                    }
-                });
-                if let Some(active) = blocking_active {
-                    frame["update"]["rawOutput"]["details"]["blockingActive"] = json!(active);
-                }
-                shared
-                    .handle_notification(serde_json::from_value(frame).unwrap(), false)
-                    .await;
-                let foreground = blocking_active == Some(true) && !replay;
-                assert_eq!(
-                    shared.last_event_at.load(Ordering::Relaxed) != 123,
-                    blocking_active == Some(true)
-                );
-                assert_eq!(
-                    shared.first_event_after_attach.load(Ordering::Relaxed),
-                    foreground
-                );
-                assert_eq!(shared.between_prompt.work_state().tool_calls, foreground);
-                let mut child_updated = false;
-                while let Ok(event) = event_rx.try_recv() {
-                    child_updated |= matches!(event, Event::BackgroundAgentProgress {
-                        agent_id, last_text: Some(text), ..
-                    } if agent_id == "Child" && text == "Background preview");
-                }
-                assert_eq!(child_updated, !replay);
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn ordinary_notifications_refresh_idle_clock_before_filtering() {
-        let (event_tx, mut event_rx) = mpsc::channel(32);
-        let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(32);
-        let shared = Shared::new(
-            event_tx,
-            "test".into(),
-            &OMP,
-            lifecycle_tx,
-            Arc::new(TerminalClaim::new()),
-            Arc::new(AtomicBool::new(false)),
-            None,
-            Arc::new(SessionIngress::new(Some(SessionId::from("native")))),
-            None,
-            None,
-        );
-        let frames = [
-            (
-                json!({"sessionUpdate": "available_commands_update", "availableCommands": []}),
-                false,
-            ),
-            (
-                json!({"sessionUpdate": "agent_message_chunk", "messageId": "stream",
-                    "content": {"type": "text", "text": "answer"}}),
-                true,
-            ),
-            (
-                json!({"sessionUpdate": "agent_message_chunk", "messageId": "restatement",
-                    "content": {"type": "text", "text": "answer"}}),
-                false,
-            ),
-            (
-                json!({"sessionUpdate": "compaction_update", "compactionId": "c", "status": "completed"}),
-                true,
-            ),
-            (
-                json!({"sessionUpdate": "compaction_update", "compactionId": "c", "status": "completed"}),
-                false,
-            ),
-            (
-                json!({"sessionUpdate": "compaction_update", "compactionId": "c", "status": "completed",
-                    "summary": [{"type": "text", "text": "summary"}]}),
-                false,
-            ),
-        ];
-        for (frame, first_progress) in frames {
-            shared.last_event_at.store(123, Ordering::Relaxed);
-            shared
-                .first_event_after_attach
-                .store(false, Ordering::Relaxed);
-            shared
-                .handle_notification(
-                    serde_json::from_value(json!({
-                        "sessionId": "native", "update": frame
-                    }))
-                    .unwrap(),
-                    false,
-                )
-                .await;
-            assert_ne!(shared.last_event_at.load(Ordering::Relaxed), 123);
-            assert_eq!(
-                shared.first_event_after_attach.load(Ordering::Relaxed),
-                first_progress
-            );
-            while event_rx.try_recv().is_ok() {}
-        }
-    }
-
-    #[tokio::test]
-    async fn omp_tasks_resume_preserves_terminal_siblings_and_settles_unresolved() {
-        use crate::acp::state::{AcpState, BackgroundAgentStatus};
-
-        let ended_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        let mut state = AcpState::default();
-        let mut original = OmpTaskTracker::default();
-        let initial = task_notification("completed", "completed");
-        for mut event in original.observe(&initial.update, false) {
-            if let Event::BackgroundAgentCompleted { ended_at: at, .. } = &mut event {
-                *at = ended_at;
-            }
-            state
-                .apply_event(state.last_seq.saturating_add(1), event)
-                .unwrap();
-        }
-        let mut pending = serde_json::to_value(task_notification("completed", "running")).unwrap();
-        pending["update"]["rawOutput"]["details"]["progress"][0]["id"] = json!("Pending");
-        let pending: SessionNotification = serde_json::from_value(pending).unwrap();
-        for event in original.observe(&pending.update, false) {
-            state
-                .apply_event(state.last_seq.saturating_add(1), event)
-                .unwrap();
-        }
-
-        let (event_tx, mut event_rx) = mpsc::channel(32);
-        let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(32);
-        let shared = Shared::new(
-            event_tx,
-            "test".into(),
-            &OMP,
-            lifecycle_tx,
-            Arc::new(TerminalClaim::new()),
-            Arc::new(AtomicBool::new(false)),
-            None,
-            Arc::new(SessionIngress::new(Some(SessionId::from("native")))),
-            None,
-            Some(BackgroundAgentTrackingSeed {
-                acp_session_id: "native".into(),
-                agents: vec![("Child".into(), true), ("Pending".into(), false)],
-            }),
-        );
-        shared
-            .commit_session(SessionId::from("native"))
-            .await
-            .unwrap();
-        assert_eq!(
-            *shared.between_prompt.bg_agents.lock().unwrap(),
-            std::collections::HashSet::from(["Pending".to_string()])
-        );
-
-        let mut aggregate = serde_json::to_value(initial).unwrap();
-        let mut completed_pending = serde_json::to_value(pending).unwrap()["update"]["rawOutput"]
-            ["details"]["progress"][0]
-            .clone();
-        completed_pending["status"] = json!("completed");
-        aggregate["update"]["rawOutput"]["details"]["progress"]
-            .as_array_mut()
-            .unwrap()
-            .push(completed_pending);
-        let aggregate: SessionNotification = serde_json::from_value(aggregate).unwrap();
-        shared.handle_notification(aggregate.clone(), false).await;
-        let mut completions = 0;
-        while let Ok(event) = event_rx.try_recv() {
-            assert!(!matches!(&event, Event::BackgroundAgentLaunched { .. }));
-            if let Event::BackgroundAgentCompleted { agent_id, .. } = &event {
-                assert_eq!(agent_id, "Pending");
-                completions += 1;
-            }
-            state
-                .apply_event(state.last_seq.saturating_add(1), event)
-                .unwrap();
-        }
-        assert_eq!(completions, 1);
-        assert_eq!(state.background_agents.len(), 2);
-        assert_eq!(state.background_agents[0].ended_at, Some(ended_at));
-        assert!(state
-            .background_agents
-            .iter()
-            .all(|agent| agent.status == BackgroundAgentStatus::Completed));
-        assert!(shared.between_prompt.bg_agents.lock().unwrap().is_empty());
-
-        shared.handle_notification(aggregate, false).await;
-        while let Ok(event) = event_rx.try_recv() {
-            assert!(!matches!(
-                event,
-                Event::BackgroundAgentLaunched { .. }
-                    | Event::BackgroundAgentProgress { .. }
-                    | Event::BackgroundAgentCompleted { .. }
-            ));
-        }
-    }
-
-    #[tokio::test]
-    async fn omp_tasks_pending_seed_is_bound_to_committed_native_identity() {
-        for matching in [false, true] {
-            let (event_tx, mut event_rx) = mpsc::channel(32);
-            let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(32);
-            let ingress = Arc::new(SessionIngress::new(Some(SessionId::from("stored"))));
-            ingress.begin();
-            let shared = Shared::new(
-                event_tx,
-                "test".into(),
-                &OMP,
-                lifecycle_tx,
-                Arc::new(TerminalClaim::new()),
-                Arc::new(AtomicBool::new(false)),
-                None,
-                ingress.clone(),
-                None,
-                Some(BackgroundAgentTrackingSeed {
-                    acp_session_id: if matching { "native" } else { "stored" }.into(),
-                    agents: vec![("Child".into(), true), ("StaleRunning".into(), false)],
-                }),
-            );
-            assert!(shared.between_prompt.bg_agents.lock().unwrap().is_empty());
-            assert!(ingress
-                .notification(task_notification("completed", "running"), None)
-                .await
-                .unwrap()
-                .is_none());
-            assert!(event_rx.try_recv().is_err());
-            shared
-                .commit_session(SessionId::from("native"))
-                .await
-                .unwrap();
-            let mut launches = 0;
-            let mut progress = 0;
-            let mut tool_cards = 0;
-            while let Ok(event) = event_rx.try_recv() {
-                launches += usize::from(matches!(event, Event::BackgroundAgentLaunched { .. }));
-                progress += usize::from(matches!(event, Event::BackgroundAgentProgress { .. }));
-                tool_cards += usize::from(matches!(event, Event::ToolCallCompleted { .. }));
-            }
-            assert_eq!(launches, usize::from(!matching));
-            assert_eq!(progress, usize::from(!matching));
-            assert_eq!(tool_cards, 1);
-            let running = shared.between_prompt.bg_agents.lock().unwrap().clone();
-            assert_eq!(running.contains("Child"), !matching);
-            assert_eq!(running.contains("StaleRunning"), matching);
-
-            ingress.begin();
-            shared
-                .commit_session(SessionId::from("replacement"))
-                .await
-                .unwrap();
-            assert!(shared.between_prompt.bg_agents.lock().unwrap().is_empty());
-            shared
-                .handle_notification(task_notification("completed", "completed"), false)
-                .await;
-            let mut relaunched = false;
-            while let Ok(event) = event_rx.try_recv() {
-                relaunched |= matches!(event, Event::BackgroundAgentLaunched { .. });
-            }
-            assert!(relaunched, "changed identity must clear terminal tracking");
-        }
-    }
-
-    #[tokio::test]
-    async fn omp_tasks_terminal_snapshots_only_forward_conditional_cleanup() {
-        let (event_tx, mut event_rx) = mpsc::channel(32);
-        let (lifecycle_tx, mut lifecycle_rx) = mpsc::channel(32);
-        let shared = Shared::new(
-            event_tx,
-            "test".into(),
-            &OMP,
-            lifecycle_tx,
-            Arc::new(TerminalClaim::new()),
-            Arc::new(AtomicBool::new(false)),
-            None,
-            Arc::new(SessionIngress::new(Some(SessionId::from("native")))),
-            None,
-            None,
-        );
-        shared.last_event_at.store(123, Ordering::Relaxed);
-        shared
-            .handle_notification(task_notification("completed", "running"), true)
-            .await;
-        assert!(!shared.first_event_after_attach.load(Ordering::Relaxed));
-        assert_eq!(shared.last_event_at.load(Ordering::Relaxed), 123);
-        assert!(!shared.between_prompt.work_state().tool_calls);
-        assert_eq!(shared.between_prompt.take_idle_fire(i64::MAX), None);
-        assert!(lifecycle_rx.try_recv().is_err());
-        while event_rx.try_recv().is_ok() {}
-
-        shared.prompt_in_flight.store(true, Ordering::Relaxed);
-        shared.prompt_epoch.store(1, Ordering::Relaxed);
-        let initial = serde_json::from_value(json!({
-            "sessionId": "native",
-            "update": {"sessionUpdate": "tool_call", "toolCallId": "batch", "title": "Task"}
-        }))
-        .unwrap();
-        shared.handle_notification(initial, true).await;
-        assert!(matches!(
-            lifecycle_rx.try_recv().unwrap().signal,
-            LifecycleSignal::ToolStarted { id, .. } if id == "batch"
-        ));
-        assert!(shared.first_event_after_attach.load(Ordering::Relaxed));
-        let foreground_at = shared.last_event_at.load(Ordering::Relaxed);
-        for status in ["pending", "in_progress"] {
-            shared
-                .handle_notification(task_notification(status, "running"), true)
-                .await;
-            assert!(lifecycle_rx.try_recv().is_err());
-        }
-        let mut rolling = task_notification("completed", "running");
-        rolling.update = serde_json::from_value(json!({
-            "sessionUpdate": "tool_call_update", "toolCallId": "batch", "status": "completed",
-            "_meta": {"omp": {"taskLifecycle": "progress"}},
-            "rawOutput": {"details": {"async": {"type": "task"}, "progress": [
-                {"id": "Child", "agent": "task", "status": "completed"},
-                {"id": "Blocking", "agent": "task", "status": "running"}
-            ]}}
-        }))
-        .unwrap();
-        shared.handle_notification(rolling, true).await;
-        assert!(lifecycle_rx.try_recv().is_err());
-        assert_eq!(shared.last_event_at.load(Ordering::Relaxed), foreground_at);
-        shared
-            .handle_notification(task_notification("completed", "completed"), true)
-            .await;
-        let terminal = lifecycle_rx.try_recv().unwrap();
-        assert_eq!(terminal.epoch, 1);
-        assert!(
-            matches!(terminal.signal, LifecycleSignal::TaskSnapshotCompleted { id } if id == "batch")
-        );
-        assert_eq!(shared.last_event_at.load(Ordering::Relaxed), foreground_at);
-    }
-
-    #[tokio::test]
     async fn omp_tasks_preserve_tool_cards_without_transcript_tailing() {
         let (event_tx, mut event_rx) = mpsc::channel(32);
         let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(32);
@@ -856,7 +451,6 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             None,
             Arc::new(SessionIngress::new(Some(SessionId::from("native")))),
-            None,
             None,
         );
         shared

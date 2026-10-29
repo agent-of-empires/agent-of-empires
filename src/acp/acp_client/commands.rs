@@ -53,8 +53,11 @@ pub(super) enum ClientCmd {
         deadline: tokio::time::Instant,
         respond_to: oneshot::Sender<ResetSessionOutcome>,
     },
-    /// Resume background tracking for sub-agents on a surviving runner.
-    ResumeBackgroundTailing(Vec<crate::acp::event_store::UnresolvedBackgroundAgentLaunch>),
+    /// Spawn a tailer for each `(agent_id, output_file)` pair: sub-agents
+    /// launched by a previous daemon that survived the restart. Issued by
+    /// `Supervisor::attach` once, right after the connection is up, so
+    /// tracking resumes instead of the panel showing them as detached.
+    ResumeBackgroundTailing(Vec<(String, String)>),
     /// Re-tail the exact background task launches a previous daemon left open.
     ResumeTaskTailing(Vec<crate::acp::state::BackgroundTaskLaunch>),
     #[cfg(test)]

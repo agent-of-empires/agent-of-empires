@@ -130,7 +130,6 @@ async fn cancel_under_flood() {
         default_model: None,
         mcp_servers: Vec::new(),
         runner: None,
-        background_agent_tracking_seed: None,
     };
     let connection =
         tokio::spawn(SELECT_PROBE.scope(probe, run_connection_task(transport, params)));
@@ -266,7 +265,6 @@ async fn auth_events(mode: ConnectMode, reports: bool) -> Vec<bool> {
         default_model: None,
         mcp_servers: Vec::new(),
         runner: None,
-        background_agent_tracking_seed: None,
     };
     let transport = ByteStreams::new(daemon_write.compat_write(), daemon_read.compat());
     let connection = tokio::spawn(run_connection_task(transport, params));
@@ -368,7 +366,6 @@ async fn spawn_fake_connection(
         runner: None,
         cancellation: tokio_util::sync::CancellationToken::new(),
         shutdown: tokio_util::sync::CancellationToken::new(),
-        background_agent_tracking_seed: None,
     };
     let transport = ByteStreams::new(daemon_write.compat_write(), daemon_read.compat());
     let connection = tokio::spawn(run_connection_task(transport, params));

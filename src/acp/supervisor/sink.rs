@@ -5,9 +5,7 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use crate::acp::approvals::Nonce;
-use crate::acp::event_store::{
-    AttachmentBlob, BackgroundAgentTrackingSeed, EventStore, UnresolvedBackgroundAgentLaunch,
-};
+use crate::acp::event_store::{AttachmentBlob, EventStore, UnresolvedBackgroundAgentLaunch};
 use crate::acp::state::{BackgroundTaskLaunch, Event, RateLimitInfo};
 
 /// Destination for published events; test sinks override only what they observe.
@@ -53,13 +51,6 @@ pub trait BroadcastSink: Send + Sync + 'static {
         _session_id: &str,
     ) -> Vec<UnresolvedBackgroundAgentLaunch> {
         Vec::new()
-    }
-    /// Compact background identities bound to their native conversation.
-    fn background_agent_tracking_seed(
-        &self,
-        _session_id: &str,
-    ) -> Option<BackgroundAgentTrackingSeed> {
-        None
     }
     /// Persist a prompt attachment keyed to its `UserPromptSent` seq.
     fn record_attachment(&self, _session_id: &str, _seq: u64, _blob: &AttachmentBlob) -> bool {
@@ -122,13 +113,6 @@ impl BroadcastSink for ChannelSink {
     ) -> Vec<UnresolvedBackgroundAgentLaunch> {
         self.event_store
             .unresolved_background_agent_launches(session_id)
-    }
-
-    fn background_agent_tracking_seed(
-        &self,
-        session_id: &str,
-    ) -> Option<BackgroundAgentTrackingSeed> {
-        self.event_store.background_agent_tracking_seed(session_id)
     }
 
     fn record_attachment(&self, session_id: &str, seq: u64, blob: &AttachmentBlob) -> bool {

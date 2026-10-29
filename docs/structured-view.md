@@ -106,9 +106,7 @@ Capabilities depend on channels the adapter advertises; unavailable mode, slash-
 
 The background-agent panel consumes structured omp task details, not rendered tool text. An async batch contributes every task row, including mixed batches; rows do not need a `detached` flag. Rolling snapshots replace the previous preview rather than appending duplicate output. Previews show `recentOutput` in chronological order, not the full async final result, and a resolved model can appear in a later update. A later terminal status can correct a finished task, but late running snapshots do not reopen it.
 
-Task tracking resumes after a daemon restart when the same native conversation is still running. See [background tracking internals](development/internals/structured-view.md#worker-lifecycle) for persistence and recovery details.
-
-Detached background task progress does not count as foreground prompt activity or postpone recovery of an orphaned resumed turn. Mixed task batches still count as foreground work while blocking siblings are active. The panel does not offer Stop for omp tasks because its ACP adapter does not expose background-task cancellation; cancelling the parent prompt does not stop those detached tasks.
+The panel does not offer Stop for omp tasks because its ACP adapter does not expose background-task cancellation; cancelling the parent prompt does not stop those detached tasks.
 
 Live progress and completion after the parent prompt ends require the native `omp acp` adapter to forward task updates for the session's lifetime. AoE support alone does not guarantee those source updates: that bridge must be deployed in the installed omp adapter. See the [task update contract](development/internals/structured-view.md#omp-async-task-updates).
 
