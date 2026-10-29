@@ -16,7 +16,8 @@ pub async fn run_offering_restart(reporter: Option<Reporter>, interactive: bool)
         Err(error) if error.is::<crate::migrations::DaemonBlocksMigration>() => error,
         result => return result,
     };
-    let managed = crate::cli::serve::recorded_launch().is_some();
+    let managed =
+        crate::cli::serve::daemon_pid().is_some_and(crate::cli::serve::serve_launch_matches);
     let autostart_disabled = crate::acp::client::daemon_manager::autostart_disabled();
     if !should_offer_restart(interactive, autostart_disabled, managed) || !confirm_restart()? {
         return Err(error);
