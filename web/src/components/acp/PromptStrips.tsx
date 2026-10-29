@@ -254,6 +254,8 @@ interface QueuedPromptsStripProps {
   reason: QueuedReason;
   /** Start the Session, after which the Daemon sends the queue. */
   onStartAndSend?: () => void;
+  /** Stop the running turn, after which the Daemon drains the queue in order. */
+  onStopTurn?: () => void;
   /** Commands that run as their own turn: clear and compact aliases. */
   soloAliases?: readonly string[];
   /** The Session's Agent, by display name, for the header's tooltip. */
@@ -269,6 +271,7 @@ export function QueuedPromptsStrip({
   canSendNow,
   reason,
   onStartAndSend,
+  onStopTurn,
   soloAliases = NO_ALIASES,
   agent,
 }: QueuedPromptsStripProps) {
@@ -343,9 +346,12 @@ export function QueuedPromptsStrip({
                 onEdit={(text) => onEdit(q.id, text)}
                 onSendNow={() => onSendNow(q)}
                 onStartAndSend={onStartAndSend}
+                onStopTurn={onStopTurn}
                 canSendNow={canSendNow}
-                action={rowAction(reason.action, isClearAlias(q.text, soloAliases))}
-                disabledReason={reason.disabledReason}
+                action={isClearAlias(q.text, soloAliases) ? reason.soloAction : reason.action}
+                disabledReason={
+                  reason.disabledReason ?? (reason.reason ? `Waiting: this message ${reason.reason}` : undefined)
+                }
               />
             </Fragment>
           );
@@ -355,7 +361,7 @@ export function QueuedPromptsStrip({
         <button
           type="button"
           onClick={() => setExpanded((v) => !v)}
-          className="mt-1.5 w-full rounded-md border border-dashed border-status-unread/40 px-2 py-1 text-[11px] font-medium uppercase tracking-wider text-status-unread hover:bg-surface-800/60"
+          className="mt-1.5 w-full rounded-md border border-dashed border-status-unread/40 px-2 py-1 text-[11px] font-medium uppercase tracking-wider text-text-subtle hover:bg-surface-800/60 hover:text-text-primary"
         >
           {layout.toggleLabel}
         </button>
@@ -365,12 +371,6 @@ export function QueuedPromptsStrip({
 }
 
 const NO_ALIASES: readonly string[] = [];
-
-/** A row's own action: a solo command runs as its own turn, anything else sends. */
-function rowAction(action: QueuedAction, solo: boolean): QueuedAction {
-  if (action === "stopAndSend" || action === "stopAndRun") return solo ? "stopAndRun" : "stopAndSend";
-  return action;
-}
 
 const ACTION_TEXT: Partial<Record<QueuedAction, string>> = {
   stopAndSend: "Stop and send",
@@ -384,6 +384,7 @@ function QueuedPromptRow({
   onEdit,
   onSendNow,
   onStartAndSend,
+  onStopTurn,
   canSendNow,
   action,
   disabledReason,
@@ -393,6 +394,7 @@ function QueuedPromptRow({
   onEdit: (text: string) => void;
   onSendNow: () => void;
   onStartAndSend?: () => void;
+  onStopTurn?: () => void;
   canSendNow: boolean;
   action: QueuedAction;
   disabledReason?: string;
@@ -479,6 +481,7 @@ function QueuedPromptRow({
           canSendNow={canSendNow}
           onSendNow={onSendNow}
           onStartAndSend={onStartAndSend}
+          onStopTurn={onStopTurn}
         />
       )}
       <button
@@ -499,40 +502,44 @@ function QueuedRowAction({
   canSendNow,
   onSendNow,
   onStartAndSend,
+  onStopTurn,
 }: {
   action: QueuedAction;
   disabledReason?: string;
   canSendNow: boolean;
   onSendNow: () => void;
   onStartAndSend?: () => void;
+  onStopTurn?: () => void;
 }) {
   const text = ACTION_TEXT[action];
-  if (action === "disabled") {
+  const handler = action === "startAndSend" ? onStartAndSend : action === "stopAndRun" ? onStopTurn : onSendNow;
+  // Starting a Session doesn't need a live Worker; every other action does.
+  const available = action !== "disabled" && !!handler && (action === "startAndSend" || canSendNow);
+  if (!available) {
     // `aria-disabled`, not `disabled`: a disabled button gets no hover or focus, so its reason
     // couldn't show.
+    const why = disabledReason ?? "Send now needs this dashboard connected and the Agent running";
     return (
-      <Tooltip text={disabledReason ?? "Waiting"} multiline>
+      <Tooltip text={why} multiline>
         <button
           type="button"
           aria-disabled="true"
-          aria-label={disabledReason}
+          aria-label={why}
           data-testid="queued-send-now"
-          className="shrink-0 cursor-not-allowed rounded p-1 text-status-unread opacity-40"
+          className={`shrink-0 cursor-not-allowed rounded text-text-subtle opacity-60 ${text ? "px-1.5 py-0.5 text-[11px] font-medium" : "p-1"}`}
         >
-          <SendHorizontal className="h-3.5 w-3.5" />
+          {text ?? <SendHorizontal className="h-3.5 w-3.5" />}
         </button>
       </Tooltip>
     );
   }
   if (text) {
-    const start = action === "startAndSend";
     return (
       <button
         type="button"
-        onClick={start ? onStartAndSend : onSendNow}
-        disabled={start ? !onStartAndSend : !canSendNow}
+        onClick={handler}
         data-testid="queued-send-now"
-        className="shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium text-status-unread hover:bg-surface-800 hover:text-text-primary disabled:cursor-not-allowed disabled:opacity-40"
+        className="shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium text-text-primary hover:bg-surface-800"
       >
         {text}
       </button>
@@ -541,12 +548,11 @@ function QueuedRowAction({
   return (
     <button
       type="button"
-      onClick={onSendNow}
-      disabled={!canSendNow}
-      title={canSendNow ? "Send this message now" : "Send now needs this dashboard connected and the Agent running"}
+      onClick={handler}
+      title="Send this message now"
       aria-label="Send this queued message now"
       data-testid="queued-send-now"
-      className="shrink-0 rounded p-1 text-status-unread hover:bg-surface-800 hover:text-text-primary disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
+      className="shrink-0 rounded p-1 text-status-unread hover:bg-surface-800 hover:text-text-primary"
     >
       <SendHorizontal className="h-3.5 w-3.5" />
     </button>

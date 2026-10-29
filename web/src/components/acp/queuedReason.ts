@@ -5,9 +5,9 @@ import type { RateLimitInfo } from "../../lib/acpTypes";
 export type QueuedAction =
   /** Send now: the queue isn't held by anything this row can end. */
   | "send"
-  /** Stop the running turn so this message goes next. */
+  /** Stop the running turn (it can't be steered); the Daemon then drains the queue in order. */
   | "stopAndSend"
-  /** As stopAndSend, for a command that must run as its own turn. */
+  /** Stop the running turn so a command that must run as its own turn can run. */
   | "stopAndRun"
   /** Start the Session; the Daemon then sends the queue. */
   | "startAndSend"
@@ -21,7 +21,10 @@ export interface QueuedReason {
   label: "Queued" | "Not sent";
   /** Sentence-case reason after the label, or null when nothing holds the queue. */
   reason: string | null;
+  /** What a message row's action does. */
   action: QueuedAction;
+  /** What a solo command row's action does: one can't steer into a running turn. */
+  soloAction: QueuedAction;
   /** Why Send now is unavailable, for its tooltip and accessible name. */
   disabledReason?: string;
 }
@@ -37,6 +40,10 @@ export interface QueuedReasonInput {
   waitingFor: string | null;
   rateLimitParked: boolean;
   rateLimit: Pick<RateLimitInfo, "resets_at" | "status"> | null;
+  /** The profile's `rate_limit_auto_resume`; unknown until the Session reports it. */
+  rateLimitAutoResume: boolean | undefined;
+  /** Auto-resume gave up after re-sending the same prompt too many times. */
+  rateLimitRetriesExhausted: boolean;
   /** No live Worker, none starting, and nothing a send would wake. */
   workerDown: boolean;
   /** A Worker is starting or restarting; it sends the queue once it's up. */
@@ -59,43 +66,47 @@ function resetTime(resetsAt: string): string | null {
 /** Why the queue is waiting, in the order the states outrank each other. */
 export function queuedReason(input: QueuedReasonInput): QueuedReason {
   const { agent } = input;
+  const same = (label: QueuedReason["label"], reason: string | null, action: QueuedAction): QueuedReason => ({
+    label,
+    reason,
+    action,
+    soloAction: action,
+  });
+  const waiting = (reason: string): QueuedReason => ({
+    ...same("Queued", reason, "disabled"),
+    disabledReason: `Waiting: this message ${reason}`,
+  });
   if (!input.online && input.anyPending) {
-    return { label: "Not sent", reason: "sends when this dashboard reconnects", action: "dropOnly" };
+    return same("Not sent", "sends when this dashboard reconnects", "dropOnly");
   }
-  if (input.waitingFor) {
-    return { label: "Queued", reason: `sends when ${input.waitingFor} is ready`, action: "send" };
-  }
-  if (input.rateLimitParked) {
+  if (input.waitingFor) return same("Queued", `sends when ${input.waitingFor} is ready`, "send");
+  if (input.rateLimitParked || input.rateLimitRetriesExhausted) {
+    // Only an armed auto-resume sends by itself; otherwise the queue waits for the user.
+    if (input.rateLimitRetriesExhausted) return same("Queued", "held: auto-resume stopped retrying", "send");
+    if (input.rateLimitAutoResume === false) return same("Queued", "held until you resume: auto-resume is off", "send");
+    if (input.rateLimitAutoResume === undefined) return same("Queued", "held by the rate limit", "send");
     const at = input.rateLimit?.resets_at ? resetTime(input.rateLimit.resets_at) : null;
-    return {
-      label: "Queued",
-      reason: at ? `sends after the rate limit resets at ${at}` : "sends after the rate limit lifts",
-      action: "send",
-    };
+    return same(
+      "Queued",
+      at ? `sends after the rate limit resets at ${at}` : "sends after the rate limit lifts",
+      "send",
+    );
   }
-  if (input.workerStarting) {
-    const reason = `sends when ${agent} starts`;
-    return { label: "Queued", reason, action: "disabled", disabledReason: `Waiting: this message ${reason}` };
-  }
-  if (input.workerDown) {
-    return { label: "Queued", reason: `sends when ${agent} starts`, action: "startAndSend" };
-  }
-  if (input.cancelling) {
-    const reason = `sends once ${agent} stops`;
-    return { label: "Queued", reason, action: "disabled", disabledReason: `Waiting: this message ${reason}` };
-  }
-  if (input.compacting) {
-    const reason = "sends after compacting";
-    return { label: "Queued", reason, action: "disabled", disabledReason: `Waiting: this message ${reason}` };
-  }
+  if (input.workerStarting) return waiting(`sends when ${agent} starts`);
+  if (input.workerDown) return same("Queued", `sends when ${agent} starts`, "startAndSend");
+  if (input.cancelling) return waiting(`sends once ${agent} stops`);
+  if (input.compacting) return waiting("sends after compacting");
   if (input.turnActive) {
+    // A steerable turn takes a message now; a solo command always needs the turn stopped.
+    const action = input.steerable ? "send" : "stopAndSend";
     const first = input.firstText?.trim() ?? "";
-    if (first && isClearAlias(first, input.soloAliases)) {
-      return { label: "Queued", reason: `${first.split(/\s/)[0]} runs when this turn ends`, action: "stopAndRun" };
-    }
-    if (!input.steerable) {
-      return { label: "Queued", reason: `sends when ${agent} finishes`, action: "stopAndSend" };
-    }
+    const reason =
+      first && isClearAlias(first, input.soloAliases)
+        ? `${first.split(/\s/)[0]} runs when this turn ends`
+        : input.steerable
+          ? null
+          : `sends when ${agent} finishes`;
+    return { label: "Queued", reason, action, soloAction: "stopAndRun" };
   }
-  return { label: "Queued", reason: null, action: "send" };
+  return same("Queued", null, "send");
 }

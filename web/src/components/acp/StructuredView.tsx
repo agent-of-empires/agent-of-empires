@@ -438,6 +438,8 @@ function ComposerDock({
           waitingFor: startingAgent,
           rateLimitParked: state.rateLimitParked,
           rateLimit: state.rateLimit,
+          rateLimitAutoResume: view.rateLimitAutoResume,
+          rateLimitRetriesExhausted: state.rateLimitRetriesExhausted,
           // Idle-dormant and rate-limit-parked Workers wake on a send, so they aren't down.
           workerDown:
             (state.workerStopped || acpWorkerState === "absent") && !state.workerRestarting && !state.workerIdleStopped,
@@ -450,6 +452,7 @@ function ComposerDock({
           soloAliases,
         })}
         onStartAndSend={view.onStartSession}
+        onStopTurn={ctx.stopTurn}
         soloAliases={soloAliases}
         agent={agent}
       />

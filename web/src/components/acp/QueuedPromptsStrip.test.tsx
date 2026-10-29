@@ -23,7 +23,7 @@ const SERVER_CLEAR_ALIASES: Record<string, string[]> = {
 };
 const SERVER_COMPACT_ALIASES: Record<string, string[]> = { claude: ["/compact"] };
 
-const IDLE: QueuedReason = { label: "Queued", reason: null, action: "send" };
+const IDLE: QueuedReason = { label: "Queued", reason: null, action: "send", soloAction: "send" };
 
 function renderWithProfile(
   toolKey: string,
@@ -32,6 +32,7 @@ function renderWithProfile(
     onSendNow?: (prompt: QueuedPrompt) => void;
     canSendNow?: boolean;
     onStartAndSend?: () => void;
+    onStopTurn?: () => void;
     reason?: QueuedReason;
     agent?: string;
   } = {},
@@ -46,6 +47,7 @@ function renderWithProfile(
         onSendNow={opts.onSendNow ?? (() => {})}
         canSendNow={opts.canSendNow ?? true}
         onStartAndSend={opts.onStartAndSend}
+        onStopTurn={opts.onStopTurn}
         reason={opts.reason ?? IDLE}
         soloAliases={[...(SERVER_CLEAR_ALIASES[toolKey] ?? []), ...(SERVER_COMPACT_ALIASES[toolKey] ?? [])]}
         agent={opts.agent ?? "Claude Code"}
@@ -79,7 +81,7 @@ describe("QueuedPromptsStrip", () => {
   it.each<[string, QueuedReason, string, string | null]>([
     [
       "a held queue names why",
-      { label: "Queued", reason: "sends when Codex finishes", action: "stopAndSend" },
+      { label: "Queued", reason: "sends when Codex finishes", action: "stopAndSend", soloAction: "stopAndRun" },
       "Queued (1)",
       "· sends when Codex finishes",
     ],
@@ -87,7 +89,7 @@ describe("QueuedPromptsStrip", () => {
     // Offline with a row the Daemon never got: nothing has been sent yet.
     [
       "an offline pending row",
-      { label: "Not sent", reason: "sends when this dashboard reconnects", action: "dropOnly" },
+      { label: "Not sent", reason: "sends when this dashboard reconnects", action: "dropOnly", soloAction: "dropOnly" },
       "Not sent (1)",
       "· sends when this dashboard reconnects",
     ],
@@ -130,53 +132,88 @@ describe("QueuedPromptsStrip", () => {
     expect(queryByRole("button", { name: /clear all/i }) !== null).toBe(shown);
   });
 
-  it.each<[QueuedReason["action"], string, boolean, string | null]>([
-    ["send", "Send this queued message now", true, "Send this queued message now"],
-    ["stopAndSend", "Stop and send", true, null],
-    // The first row is a clear alias, so it runs as its own turn.
-    ["stopAndRun", "Stop and run", true, null],
-    ["startAndSend", "Start and send", false, null],
-  ])("the %s action renders %s", (action, text, viaSendNow, ariaLabel) => {
-    const sent: string[] = [];
-    const first = action === "stopAndRun" ? "/clear" : "go";
-    const btn = renderWithProfile("claude", [mk("a", first)], {
-      reason: { label: "Queued", reason: "why", action: action === "stopAndRun" ? "stopAndSend" : action },
-      onSendNow: (p) => sent.push(`send:${p.text}`),
-      onStartAndSend: () => sent.push("start"),
-    }).getByTestId("queued-send-now");
-    expect(btn.getAttribute("aria-label") ?? btn.textContent).toBe(ariaLabel ?? text);
-    fireEvent.click(btn);
-    expect(sent).toEqual([viaSendNow ? `send:${first}` : "start"]);
+  // A message row and a solo command row side by side, as the Daemon would queue them.
+  it.each<[string, QueuedReason["action"], QueuedReason["soloAction"], [string, string], [string, string]]>([
+    [
+      "idle",
+      "send",
+      "send",
+      ["Send this queued message now", "send:go"],
+      ["Send this queued message now", "send:/compact"],
+    ],
+    // A steerable turn takes the message now, but the command needs the turn stopped first.
+    ["a steerable turn", "send", "stopAndRun", ["Send this queued message now", "send:go"], ["Stop and run", "stop"]],
+    [
+      "a turn that can't be steered",
+      "stopAndSend",
+      "stopAndRun",
+      ["Stop and send", "send:go"],
+      ["Stop and run", "stop"],
+    ],
+    ["a stopped Worker", "startAndSend", "startAndSend", ["Start and send", "start"], ["Start and send", "start"]],
+  ])("during %s, rows offer %s and %s", (_label, action, soloAction, plain, solo) => {
+    const calls: string[] = [];
+    const buttons = renderWithProfile("claude", [mk("a", "go"), mk("b", "/compact")], {
+      reason: { label: "Queued", reason: "why", action, soloAction },
+      onSendNow: (p) => calls.push(`send:${p.text}`),
+      onStartAndSend: () => calls.push("start"),
+      onStopTurn: () => calls.push("stop"),
+    }).getAllByTestId("queued-send-now");
+    for (const [btn, [name, call]] of [
+      [buttons[0], plain],
+      [buttons[1], solo],
+    ] as const) {
+      expect(btn.getAttribute("aria-label") ?? btn.textContent).toBe(name);
+      expect(btn.getAttribute("aria-disabled")).toBeNull();
+      // Text labels read at a contrast-validated token; the unread hue stays on the row's outline.
+      if (!btn.getAttribute("aria-label")) {
+        expect(btn.className).toContain("text-text-primary");
+        expect(btn.className).not.toContain("text-status-unread");
+      }
+      calls.length = 0;
+      fireEvent.click(btn);
+      expect(calls).toEqual([call]);
+    }
   });
 
-  it("keeps a waiting row's action focusable, says why, and does nothing on click", () => {
+  it.each<[string, Partial<QueuedReason>, boolean, string | null]>([
+    [
+      "compacting",
+      {
+        reason: "sends after compacting",
+        action: "disabled",
+        disabledReason: "Waiting: this message sends after compacting",
+      },
+      true,
+      "Waiting: this message sends after compacting",
+    ],
+    // A new Session can't send yet: the strip's reason explains the wait instead of a generic hint.
+    [
+      "a starting Session",
+      { reason: "sends when Claude Code is ready" },
+      false,
+      "Waiting: this message sends when Claude Code is ready",
+    ],
+    ["no live connection", {}, false, "Send now needs this dashboard connected and the Agent running"],
+    ["a free Agent", {}, true, null],
+  ])("Send now during %s", (_label, over, canSendNow, waiting) => {
     const sent: QueuedPrompt[] = [];
-    const reason: QueuedReason = {
-      label: "Queued",
-      reason: "sends after compacting",
-      action: "disabled",
-      disabledReason: "Waiting: this message sends after compacting",
-    };
-    const btn = renderWithProfile("claude", [mk("a", "go")], { reason, onSendNow: (p) => sent.push(p) }).getByTestId(
-      "queued-send-now",
-    );
-    expect(btn.getAttribute("aria-disabled")).toBe("true");
-    expect(btn.getAttribute("aria-label")).toBe("Waiting: this message sends after compacting");
+    const reason = { ...IDLE, ...over, soloAction: over.action ?? IDLE.soloAction };
+    const btn = renderWithProfile("claude", [mk("a", "go")], {
+      reason,
+      canSendNow,
+      onSendNow: (p) => sent.push(p),
+    }).getByTestId("queued-send-now");
+    // `aria-disabled` keeps the button focusable, so its tooltip and name can say why.
     expect((btn as HTMLButtonElement).disabled).toBe(false);
+    expect(btn.getAttribute("aria-disabled")).toBe(waiting ? "true" : null);
+    expect(btn.getAttribute("aria-label")).toBe(waiting ?? "Send this queued message now");
     fireEvent.click(btn);
-    expect(sent).toEqual([]);
-  });
-
-  it.each([
-    [true, false],
-    [false, true],
-  ])("Send now with canSendNow=%s is disabled=%s", (canSendNow, disabled) => {
-    const btn = renderWithProfile("claude", [mk("a", "go")], { canSendNow }).getByTestId("queued-send-now");
-    expect((btn as HTMLButtonElement).disabled).toBe(disabled);
+    expect(sent).toHaveLength(waiting ? 0 : 1);
   });
 
   it("hides the row action when the row can only be dropped", () => {
-    const reason: QueuedReason = { label: "Not sent", reason: "x", action: "dropOnly" };
+    const reason: QueuedReason = { label: "Not sent", reason: "x", action: "dropOnly", soloAction: "dropOnly" };
     expect(renderWithProfile("claude", [mk("a", "go")], { reason }).queryByTestId("queued-send-now")).toBeNull();
   });
 

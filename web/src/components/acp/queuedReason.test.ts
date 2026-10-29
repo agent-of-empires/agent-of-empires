@@ -9,6 +9,8 @@ const BASE: QueuedReasonInput = {
   waitingFor: null,
   rateLimitParked: false,
   rateLimit: null,
+  rateLimitAutoResume: true,
+  rateLimitRetriesExhausted: false,
   workerDown: false,
   workerStarting: false,
   cancelling: false,
@@ -20,11 +22,13 @@ const BASE: QueuedReasonInput = {
 };
 
 describe("queuedReason", () => {
-  it("names the state that holds the queue, highest first", () => {
+  it("names the state that holds the queue, highest first, with each row kind's action", () => {
     const resetsAt = "2026-10-28T15:04:00.000Z";
     const at = new Date(resetsAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-    const cases: [string, Partial<QueuedReasonInput>, string, string | null, string][] = [
-      ["idle", {}, "Queued", null, "send"],
+    const parked = { rateLimitParked: true, rateLimit: { resets_at: resetsAt, status: "rejected" } };
+    // (name, input, label, reason, message row action, solo command row action)
+    const cases: [string, Partial<QueuedReasonInput>, string, string | null, string, string][] = [
+      ["idle", {}, "Queued", null, "send", "send"],
       // Offline only matters once a row never reached the Daemon; it outranks a running turn.
       [
         "offline pending",
@@ -32,38 +36,91 @@ describe("queuedReason", () => {
         "Not sent",
         "sends when this dashboard reconnects",
         "dropOnly",
+        "dropOnly",
       ],
-      ["offline, all confirmed", { online: false }, "Queued", null, "send"],
+      ["offline, all confirmed", { online: false }, "Queued", null, "send", "send"],
       [
         "new Session",
         { waitingFor: "Claude Code", workerDown: true },
         "Queued",
         "sends when Claude Code is ready",
         "send",
-      ],
-      [
-        "rate limit with a reset",
-        { rateLimitParked: true, rateLimit: { resets_at: resetsAt, status: "rejected" } },
-        "Queued",
-        `sends after the rate limit resets at ${at}`,
         "send",
       ],
+      // Only an armed auto-resume promises delivery; Send now stays in every case.
+      ["rate limit, auto-resume armed", parked, "Queued", `sends after the rate limit resets at ${at}`, "send", "send"],
       [
-        "rate limit, unknown reset",
-        { rateLimitParked: true, rateLimit: { resets_at: "nope", status: "rejected" } },
+        "rate limit, armed, unknown reset",
+        { ...parked, rateLimit: { resets_at: "nope", status: "rejected" } },
         "Queued",
         "sends after the rate limit lifts",
         "send",
+        "send",
       ],
-      ["Worker starting", { workerStarting: true, workerDown: true }, "Queued", "sends when Codex starts", "disabled"],
-      ["Worker down", { workerDown: true, turnActive: true }, "Queued", "sends when Codex starts", "startAndSend"],
-      ["cancelling", { cancelling: true, turnActive: true }, "Queued", "sends once Codex stops", "disabled"],
-      ["compacting", { compacting: true }, "Queued", "sends after compacting", "disabled"],
       [
-        "solo command behind a turn",
+        "rate limit, auto-resume off",
+        { ...parked, rateLimitAutoResume: false },
+        "Queued",
+        "held until you resume: auto-resume is off",
+        "send",
+        "send",
+      ],
+      [
+        "rate limit, auto-resume not reported",
+        { ...parked, rateLimitAutoResume: undefined },
+        "Queued",
+        "held by the rate limit",
+        "send",
+        "send",
+      ],
+      [
+        "rate limit, retries exhausted",
+        { ...parked, rateLimitRetriesExhausted: true },
+        "Queued",
+        "held: auto-resume stopped retrying",
+        "send",
+        "send",
+      ],
+      [
+        "Worker starting",
+        { workerStarting: true, workerDown: true },
+        "Queued",
+        "sends when Codex starts",
+        "disabled",
+        "disabled",
+      ],
+      [
+        "Worker down",
+        { workerDown: true, turnActive: true },
+        "Queued",
+        "sends when Codex starts",
+        "startAndSend",
+        "startAndSend",
+      ],
+      [
+        "cancelling",
+        { cancelling: true, turnActive: true },
+        "Queued",
+        "sends once Codex stops",
+        "disabled",
+        "disabled",
+      ],
+      ["compacting", { compacting: true }, "Queued", "sends after compacting", "disabled", "disabled"],
+      // A steerable turn takes a message now, but a solo command still needs the turn stopped.
+      [
+        "solo command behind a steerable turn",
         { turnActive: true, firstText: "  /compact keep tests" },
         "Queued",
         "/compact runs when this turn ends",
+        "send",
+        "stopAndRun",
+      ],
+      [
+        "solo command behind a turn that can't be steered",
+        { turnActive: true, steerable: false, firstText: "/new" },
+        "Queued",
+        "/new runs when this turn ends",
+        "stopAndSend",
         "stopAndRun",
       ],
       [
@@ -72,13 +129,13 @@ describe("queuedReason", () => {
         "Queued",
         "sends when Codex finishes",
         "stopAndSend",
+        "stopAndRun",
       ],
-      // A steerable Agent takes the message mid-turn, so nothing holds it.
-      ["a steerable turn", { turnActive: true }, "Queued", null, "send"],
+      ["a steerable turn", { turnActive: true }, "Queued", null, "send", "stopAndRun"],
     ];
-    for (const [name, over, label, reason, action] of cases) {
+    for (const [name, over, label, reason, action, soloAction] of cases) {
       const got = queuedReason({ ...BASE, ...over });
-      expect([got.label, got.reason, got.action], name).toEqual([label, reason, action]);
+      expect([got.label, got.reason, got.action, got.soloAction], name).toEqual([label, reason, action, soloAction]);
       expect(got.disabledReason !== undefined, name).toBe(action === "disabled");
       if (got.disabledReason) expect(got.disabledReason, name).toBe(`Waiting: this message ${reason}`);
     }

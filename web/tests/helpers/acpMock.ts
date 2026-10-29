@@ -35,6 +35,8 @@ export interface AcpSessionMockOptions {
   rateLimitAutoResume?: boolean;
   /** Daemon control state sent on connect, over idle defaults; the only way a rate limit reaches the client. */
   reducedState?: Record<string, unknown>;
+  /** Extra `SessionResponse` fields, such as the agent's `clear_aliases` and `compact_aliases`. */
+  sessionFields?: Record<string, unknown>;
 }
 
 export interface AcpSessionMock {
@@ -233,6 +235,7 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
             ...(opts.acpSessionId ? { acp_session_id: opts.acpSessionId } : {}),
             ...(opts.importPending ? { import_pending: true } : {}),
             ...(opts.rateLimitAutoResume === undefined ? {} : { rate_limit_auto_resume: opts.rateLimitAutoResume }),
+            ...opts.sessionFields,
             claude_fullscreen: false,
           },
         ],
