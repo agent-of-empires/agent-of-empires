@@ -22,7 +22,8 @@ pub async fn run_offering_restart(reporter: Option<Reporter>, interactive: bool)
     if !should_offer_restart(interactive, autostart_disabled, managed) || !confirm_restart()? {
         return Err(error);
     }
-    crate::cli::serve::restart_daemon().await?;
+    eprintln!("Restarting the daemon...");
+    crate::cli::serve::restart_daemon_with_receipt(None, false).await?;
     crate::migrations::run_migrations_with(reporter)
 }
 

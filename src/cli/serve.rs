@@ -538,7 +538,7 @@ pub async fn lock_for_startup(profile: &str, args: &mut ServeArgs) -> Result<Opt
             validate_launch_args(profile, args).await?;
             let passphrase = recall_serve_passphrase(&launch)?;
             retain_rollback_launch(&transaction, &launch, passphrase.as_deref())?;
-            stop_daemon_locked(&transaction).await?;
+            stop_daemon_locked(&transaction, true).await?;
         }
         DaemonStatus::Unverified => {
             bail!("Cannot verify the existing daemon; refusing replacement")
@@ -790,7 +790,7 @@ async fn rollback_daemon() -> Result<()> {
     match daemon_status() {
         DaemonStatus::Verified(pid) => {
             managed_launch(pid)?;
-            stop_daemon_locked(&transaction).await?;
+            stop_daemon_locked(&transaction, true).await?;
         }
         DaemonStatus::Unverified => bail!("Cannot verify the existing daemon; refusing rollback"),
         DaemonStatus::Absent => {}
@@ -1943,7 +1943,7 @@ pub(crate) async fn restart_daemon_with_receipt(
     if announce {
         println!("Restarting aoe serve daemon (PID {pid})…");
     }
-    stop_daemon_locked(&transaction).await?;
+    stop_daemon_locked(&transaction, announce).await?;
     let transaction = migrate_managed_launch(transaction, true).await?;
     complete_rollback_after(start_daemon(&launch.profile, &args, &transaction, announce).await)?;
     managed_launch(daemon_pid().context("Restart successor is unavailable")?)
@@ -1960,10 +1960,13 @@ fn report_stale_cleanup(pid: i32) {
 #[tracing::instrument(target = "serve.shutdown", skip_all)]
 pub(crate) async fn stop_daemon() -> Result<()> {
     let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
-    stop_daemon_locked(&transaction).await
+    stop_daemon_locked(&transaction, true).await
 }
 
-async fn stop_daemon_locked(transaction: &crate::daemon::lifecycle::Transaction) -> Result<()> {
+async fn stop_daemon_locked(
+    transaction: &crate::daemon::lifecycle::Transaction,
+    announce: bool,
+) -> Result<()> {
     let path = pid_file_path()?;
 
     if !path.exists() {
@@ -2054,7 +2057,9 @@ async fn stop_daemon_locked(transaction: &crate::daemon::lifecycle::Transaction)
         );
     }
     clear_serve_state(pid);
-    println!("Stopped aoe serve daemon (PID {})", pid);
+    if announce {
+        println!("Stopped aoe serve daemon (PID {})", pid);
+    }
     Ok(())
 }
 
