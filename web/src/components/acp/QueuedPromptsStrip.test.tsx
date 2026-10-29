@@ -21,6 +21,7 @@ const SERVER_CLEAR_ALIASES: Record<string, string[]> = {
   codex: ["/new"],
   gemini: [],
 };
+const SERVER_COMPACT_ALIASES: Record<string, string[]> = { claude: ["/compact"] };
 
 const IDLE: QueuedReason = { label: "Queued", reason: null, action: "send" };
 
@@ -46,7 +47,7 @@ function renderWithProfile(
         canSendNow={opts.canSendNow ?? true}
         onStartAndSend={opts.onStartAndSend}
         reason={opts.reason ?? IDLE}
-        soloAliases={SERVER_CLEAR_ALIASES[toolKey] ?? []}
+        soloAliases={[...(SERVER_CLEAR_ALIASES[toolKey] ?? []), ...(SERVER_COMPACT_ALIASES[toolKey] ?? [])]}
         agent={opts.agent ?? "Claude Code"}
       />
     </AgentProfileProvider>,
@@ -105,15 +106,17 @@ describe("QueuedPromptsStrip", () => {
     ["claude", ["/clear", "second"], 1],
     ["claude", ["first", "second"], 0],
     ["claude", ["first", "/clear --hard"], 1],
+    // The drain runs a compact command on its own, like a clear.
+    ["claude", ["first", "/compact"], 1],
     ["codex", ["first", "/new"], 1],
     // gemini has no clear aliases, so `/clear` text is not a boundary.
     ["gemini", ["first", "/clear"], 0],
-  ])("%s queue %o renders %i clear-boundary dividers", (tool, texts, dividers) => {
+  ])("%s queue %o renders %i solo-command dividers", (tool, texts, dividers) => {
     const { queryAllByTestId } = renderWithProfile(
       tool,
       texts.map((t, i) => mk(String(i), t)),
     );
-    expect(queryAllByTestId("queued-clear-boundary")).toHaveLength(dividers);
+    expect(queryAllByTestId("queued-solo-boundary")).toHaveLength(dividers);
   });
 
   it.each([

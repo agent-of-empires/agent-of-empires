@@ -4,7 +4,6 @@ import { AlertTriangle, Check, Clock, Info, Paperclip, RotateCcw, SendHorizontal
 import { useIsCoarsePointer } from "../../hooks/useIsCoarsePointer";
 import type { QueuedPrompt, RejectedPrompt, SessionNotice } from "../../lib/acpTypes";
 import { useAcpPrefs } from "../../lib/acpPrefs";
-import { useClearAliases } from "../../lib/agentProfileContext";
 import { isClearAlias } from "../../lib/agentProfiles";
 import { isQueuedPromptLong, queuedStripLayout } from "./queuedPromptsLayout";
 import type { QueuedAction, QueuedReason } from "./queuedReason";
@@ -275,7 +274,6 @@ export function QueuedPromptsStrip({
 }: QueuedPromptsStripProps) {
   const isMobile = useIsCoarsePointer();
   const [expanded, setExpanded] = useState(false);
-  const aliases = useClearAliases();
   if (queued.length === 0) return null;
   const layout = queuedStripLayout({ queuedCount: queued.length, isMobile, expanded });
   const visible = queued.slice(0, layout.visibleCount);
@@ -320,18 +318,18 @@ export function QueuedPromptsStrip({
       </div>
       <ul className="flex flex-col gap-1.5">
         {visible.map((q, i) => {
-          // A clear alias on either side means the drain posts these separately.
+          // A clear or compact command on either side means the drain posts these separately.
           const prev = i > 0 ? visible[i - 1] : undefined;
           const showDivider =
-            aliases.length > 0 &&
+            soloAliases.length > 0 &&
             prev !== undefined &&
-            (isClearAlias(prev.text, aliases) || isClearAlias(q.text, aliases));
+            (isClearAlias(prev.text, soloAliases) || isClearAlias(q.text, soloAliases));
           return (
             <Fragment key={q.id}>
               {showDivider && (
                 <li
                   aria-hidden="true"
-                  data-testid="queued-clear-boundary"
+                  data-testid="queued-solo-boundary"
                   className="flex items-center gap-2 px-1 text-[10px] uppercase tracking-wider text-amber-300/60"
                 >
                   <span className="h-px flex-1 bg-amber-500/20" />
