@@ -271,7 +271,7 @@ fn validate_bearer_realm(realm: &str) -> Result<reqwest::Url> {
         return Err(refuse("not https"));
     }
     let host = url.host_str().ok_or_else(|| refuse("no host"))?;
-    let host = host.to_ascii_lowercase();
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
     let local = host == "localhost"
         || host.ends_with(".localhost")
         || host
@@ -585,6 +585,8 @@ mod tests {
             ("https://localhost/token", false),
             ("https://LOCALHOST:8443/token", false),
             ("https://foo.localhost/token", false),
+            ("https://localhost./token", false),
+            ("https://foo.localhost./token", false),
             ("https://127.0.0.1/token", false),
             ("https://127.42.0.9:5000/token", false),
             ("https://0.0.0.0/token", false),
