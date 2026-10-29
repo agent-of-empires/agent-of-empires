@@ -190,8 +190,10 @@ pub(crate) fn wrapped_line_count(line: &ratatui::text::Line, width: u16) -> usiz
         .flat_map(|span| span.content.graphemes(true))
     {
         let symbol_width = rendered_width(grapheme);
-        // Graphemes wider than the line are not painted (ratatui drops them).
-        if symbol_width > max {
+        // Graphemes wider than the line are not painted (ratatui drops them),
+        // and control characters are filtered by `Span::styled_graphemes`
+        // before `WordWrapper` ever sees them.
+        if symbol_width > max || grapheme.contains(char::is_control) {
             continue;
         }
         let is_whitespace = grapheme.chars().all(char::is_whitespace);
@@ -293,6 +295,9 @@ mod tests {
             // trailing-whitespace trim budget (pre-flush line width), not the
             // full line width.
             (Line::from("abab\u{3000}cd"), 5, 2),
+            // Control characters (e.g. tab) are dropped before wrapping, the
+            // way Span::styled_graphemes filters them.
+            (Line::from("a\tb"), 4, 1),
         ];
         for (line, width, expected) in cases {
             assert_eq!(wrapped_line_count(&line, width), expected, "{line:?}");
