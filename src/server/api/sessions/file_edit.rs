@@ -172,7 +172,7 @@ fn opened_file_version(file: &mut std::fs::File, path: &FsPath) -> anyhow::Resul
 }
 
 fn publication_error(error: anyhow::Error) -> SaveError {
-    tracing::warn!(target: "http.api.sessions", %error, "file save could not be confirmed");
+    tracing::warn!(target: "http.api.sessions", %error, "file save failed");
     if error.downcast_ref::<FileExchangeUncertain>().is_none() {
         if let Some(error) = error.downcast_ref::<std::io::Error>() {
             if crate::process::exchange_unsupported(error) {
@@ -185,12 +185,16 @@ fn publication_error(error: anyhow::Error) -> SaveError {
                 return io_error(std::io::Error::from(error.kind())).into();
             }
         }
+        return match error.downcast::<SaveError>() {
+            Ok(error) => error,
+            Err(error) => SaveError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("File save failed: {error:#}"),
+            ),
+        };
     }
-    match error.downcast::<SaveError>() {
-        Ok(error) => error,
-        Err(error) => SaveError(StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Could not confirm file save: {error:#}. Your edits are kept; check the file before retrying.")),
-    }
+    SaveError(StatusCode::INTERNAL_SERVER_ERROR,
+        format!("Could not confirm file save: {error:#}. Your edits are kept; check the file before retrying."))
 }
 
 /// A confined file's content, edit version, and why editing is refused, if it is.
@@ -205,6 +209,7 @@ fn snapshot(
     confined: &Confined,
     instance: Option<&Instance>,
     read_only: bool,
+    probe_exchange: bool,
 ) -> Result<Snapshot, FileError> {
     let read = file_provenance::read_confined(confined, MAX_CONTENTS_BYTES)?;
     let disabled = if read_only {
@@ -222,7 +227,7 @@ fn snapshot(
     } else {
         instance
             .and_then(|inst| sandbox_reason(inst, &confined.canonical))
-            .or_else(|| exchange_reason(confined))
+            .or_else(|| probe_exchange.then(|| exchange_reason(confined)).flatten())
     };
     let version = (!read.truncated && !read.is_binary && read.valid_utf8)
         .then(|| version(read.content.as_bytes(), &confined.canonical, &read.metadata));
@@ -239,20 +244,25 @@ pub(super) fn read_file_snapshot(
     instance: Option<&Instance>,
     read_only: bool,
     editing: bool,
+    version_only: bool,
 ) -> Result<SessionFileResponse, FileError> {
     let (read, version, disabled) = if editing {
         let Snapshot {
             read,
             version,
             disabled,
-        } = snapshot(roots, confined, instance, read_only)?;
+        } = snapshot(roots, confined, instance, read_only, !version_only)?;
         (read, version, disabled)
     } else {
         let read = file_provenance::read_confined(confined, MAX_CONTENTS_BYTES)?;
         (read, None, None)
     };
     Ok(SessionFileResponse {
-        content: read.content,
+        content: if version_only {
+            String::new()
+        } else {
+            read.content
+        },
         is_binary: read.is_binary,
         truncated: read.truncated,
         version,
@@ -292,7 +302,7 @@ fn save_file(
         if current.canonical != confined.canonical {
             return Err(CHANGED);
         }
-        let current = snapshot(roots, &current, None, false).map_err(|_| CHANGED)?;
+        let current = snapshot(roots, &current, None, false, false).map_err(|_| CHANGED)?;
         if current.version.as_deref() != Some(request.version.as_str()) {
             return Err(CHANGED);
         }
@@ -342,7 +352,7 @@ fn save_file(
         FileExchangeResult::Conflict { preserved: None } => Err(CHANGED.into()),
         FileExchangeResult::Conflict { preserved: Some(path) } => Err(SaveError(
             StatusCode::CONFLICT,
-            format!("File changed during save. A displaced version was preserved at {}. Copy your edits or reload.", path.display()),
+            format!("File changed during save. A displaced version was preserved at {}. The .aoe-copy-* alias can be deleted after inspecting the conflict file. Copy your edits or reload.", path.display()),
         )),
     }
 }
@@ -390,6 +400,7 @@ pub async fn save_session_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::anchored_fs::ResetExchangeHooks;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
@@ -402,7 +413,7 @@ mod tests {
 
     fn snapshot(roots: &[PathBuf], instance: &Instance, path: &str) -> SessionFileResponse {
         let confined = project_file(roots, FsPath::new(path)).unwrap();
-        read_file_snapshot(roots, &confined, Some(instance), false, true).unwrap()
+        read_file_snapshot(roots, &confined, Some(instance), false, true, false).unwrap()
     }
 
     fn request(path: &str, version: &str, content: &str) -> SaveSessionFileRequest {
@@ -530,7 +541,8 @@ mod tests {
         let confined =
             file_provenance::confine_path(&roots, || [path.clone()].into_iter().collect(), &path)
                 .unwrap();
-        let opened = read_file_snapshot(&roots, &confined, Some(&instance), false, true).unwrap();
+        let opened =
+            read_file_snapshot(&roots, &confined, Some(&instance), false, true, false).unwrap();
         assert_eq!(
             opened.edit_disabled_reason.as_deref(),
             Some("Files outside the Session's project are read-only")
@@ -611,14 +623,48 @@ mod tests {
         assert_eq!(fs::read_dir(&roots[0]).unwrap().count(), 1);
     }
 
-    struct ResetExchangeHooks;
+    #[test]
+    fn version_only_reads_and_save_checks_never_probe_file_exchange() {
+        use crate::session::anchored_fs::{
+            FileExchangePhase, FILE_EXCHANGE_CHECKS, FILE_EXCHANGE_HOOK,
+        };
+        use std::cell::Cell;
+        use std::rc::Rc;
 
-    impl Drop for ResetExchangeHooks {
-        fn drop(&mut self) {
-            crate::session::anchored_fs::FILE_EXCHANGE_HOOK.set(None);
-            crate::session::anchored_fs::FAIL_SYNC_ONCE.set(None);
-            crate::process::EXCHANGE_ERROR.set(None);
-        }
+        let _hooks = ResetExchangeHooks;
+        let (_dir, roots, instance) = fixture();
+        fs::write(roots[0].join("a.txt"), "original").unwrap();
+        let confined = project_file(&roots, FsPath::new("a.txt")).unwrap();
+        let checks = FILE_EXCHANGE_CHECKS.get();
+        crate::process::EXCHANGE_ERROR.set(Some(libc::EOPNOTSUPP));
+        let poll =
+            read_file_snapshot(&roots, &confined, Some(&instance), false, true, true).unwrap();
+        assert!(poll.content.is_empty());
+        assert!(poll.edit_disabled_reason.is_none());
+        let opened = poll.version;
+        assert_eq!(FILE_EXCHANGE_CHECKS.get(), checks);
+        let reached_exchange = Rc::new(Cell::new(false));
+        let observed = reached_exchange.clone();
+        FILE_EXCHANGE_HOOK.set(Some(Box::new(move |phase, _, _| {
+            if phase == FileExchangePhase::BeforeExchange {
+                observed.set(true);
+            }
+        })));
+        let error = save_file(
+            &roots,
+            &instance,
+            request("a.txt", opened.as_deref().unwrap(), "browser"),
+        )
+        .unwrap_err();
+        assert!(reached_exchange.get(), "both save checks must complete");
+        assert_eq!(FILE_EXCHANGE_CHECKS.get(), checks);
+        assert_eq!(error.0, StatusCode::FORBIDDEN);
+        assert_eq!(error.1, EXCHANGE_UNSUPPORTED);
+        assert_eq!(
+            fs::read_to_string(roots[0].join("a.txt")).unwrap(),
+            "original"
+        );
+        assert_eq!(fs::read_dir(&roots[0]).unwrap().count(), 1);
     }
 
     #[test]
@@ -797,6 +843,13 @@ mod tests {
         let recovery = roots[0].join("a.txt.aoe-conflict");
         assert_eq!(fs::read_to_string(&recovery).unwrap(), "external");
         assert!(error.1.contains(recovery.to_str().unwrap()), "{}", error.1);
+        assert!(
+            error.1.contains(
+                "The .aoe-copy-* alias can be deleted after inspecting the conflict file."
+            ),
+            "{}",
+            error.1
+        );
         assert_eq!(
             fs::read_to_string(roots[0].join("a.txt")).unwrap(),
             "browser"
@@ -848,22 +901,38 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_exchange_disables_editing_and_leaves_the_target_untouched() {
-        for errno in [libc::EINVAL, libc::EOPNOTSUPP, libc::ENOSYS] {
+    fn cached_support_does_not_mask_publication_failures() {
+        for errno in [
+            libc::EINVAL,
+            libc::EOPNOTSUPP,
+            libc::ENOSYS,
+            libc::EXDEV,
+            libc::EBUSY,
+        ] {
             let _hooks = ResetExchangeHooks;
             let (_dir, roots, instance) = fixture();
             fs::write(roots[0].join("a.txt"), "original").unwrap();
             let opened = snapshot(&roots, &instance, "a.txt").version.unwrap();
             crate::process::EXCHANGE_ERROR.set(Some(errno));
-            let disabled = snapshot(&roots, &instance, "a.txt");
-            assert_eq!(
-                disabled.edit_disabled_reason.as_deref(),
-                Some(EXCHANGE_UNSUPPORTED)
-            );
-            assert_eq!(disabled.version.as_deref(), Some(opened.as_str()));
+            let cached = snapshot(&roots, &instance, "a.txt");
+            assert!(cached.edit_disabled_reason.is_none());
+            assert_eq!(cached.version.as_deref(), Some(opened.as_str()));
             let error =
                 save_file(&roots, &instance, request("a.txt", &opened, "browser")).unwrap_err();
-            assert_eq!(error.0, StatusCode::FORBIDDEN);
+            if [libc::EXDEV, libc::EBUSY].contains(&errno) {
+                assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+                assert!(
+                    error
+                        .1
+                        .starts_with("File save failed: exchanging project file:"),
+                    "{}",
+                    error.1
+                );
+                assert!(!error.1.contains("check the file before retrying"));
+            } else {
+                assert_eq!(error.0, StatusCode::FORBIDDEN);
+                assert_eq!(error.1, EXCHANGE_UNSUPPORTED);
+            }
             assert_eq!(
                 fs::read_to_string(roots[0].join("a.txt")).unwrap(),
                 "original"
