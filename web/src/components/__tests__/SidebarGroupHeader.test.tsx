@@ -205,6 +205,29 @@ describe("SidebarGroupHeader", () => {
     }
   });
 
+  it("marks a header that is a registered Project, and a pinned one more strongly", () => {
+    const project = { name: "my-project", path: "/p", scope: "global" as const };
+    // (group, marker shown, its accessible name)
+    const cases: [Partial<SidebarGroup>, string | null, string | null][] = [
+      [{}, null, null],
+      [{ registeredProjects: [project] }, "sidebar-group-project-marker", "Project"],
+      [
+        { registeredProjects: [{ ...project, pinned: true }], pinned: true },
+        "sidebar-group-pinned-marker",
+        "Pinned project",
+      ],
+    ];
+    for (const [over, testId, name] of cases) {
+      renderHeader({ group: group(over) });
+      const markers = ["sidebar-group-project-marker", "sidebar-group-pinned-marker"].filter((id) =>
+        screen.queryByTestId(id),
+      );
+      expect(markers, JSON.stringify(over)).toEqual(testId ? [testId] : []);
+      if (name) expect(screen.getByRole("img", { name }).getAttribute("title")).toMatch(new RegExp(`^${name}`));
+      cleanup();
+    }
+  });
+
   it("marks the header draggable only with a drag handle", () => {
     const { rerender } = renderHeader({ dragHandle: dragHandle() });
     expect(screen.getByTestId("sidebar-group-header").getAttribute("data-draggable")).toBe("true");
