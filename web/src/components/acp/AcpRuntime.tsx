@@ -21,13 +21,7 @@ import {
 } from "../../lib/acpDrafts";
 import { MAX_ATTACHMENTS } from "./composerInput";
 import { isVisiblyBusy } from "../../lib/acpTypes";
-import type {
-  AcpState,
-  ActivityRow,
-  ApprovalDecision,
-  ElicitationResolution,
-  PromptAttachmentInput,
-} from "../../lib/acpTypes";
+import type { AcpState, ApprovalDecision, ElicitationResolution, PromptAttachmentInput } from "../../lib/acpTypes";
 import { useAgentProfile } from "../../lib/agentProfileContext";
 import { canOfferEarlier, earlierAction } from "../../lib/historyScroll";
 import { activityToThreadMessages, clearFoldGeneration } from "./activityMessages";
@@ -84,7 +78,6 @@ export interface AcpContext {
   /** Reveal loaded older rows first, then fetch the next page. */
   loadEarlierHistory: () => void;
   loadingEarlierHistory: boolean;
-  visibleHistory: readonly ActivityRow[];
 }
 
 /** Owns the external store so a new `key` builds a fresh runtime. A `/clear`
@@ -265,7 +258,6 @@ export function AcpRuntime({
         canLoadEarlierHistory: canOfferEarlier(canLoadEarlier, hasMoreOlder),
         loadEarlierHistory,
         loadingEarlierHistory: loadingOlder,
-        visibleHistory: windowedActivity,
       })}
     </RuntimeHost>
   );

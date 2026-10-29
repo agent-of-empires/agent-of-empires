@@ -34,7 +34,7 @@ export function StructuredViewDisplaySettings() {
 
       <NumberField
         label="Initial visible history"
-        description="Activity rows shown when opening a conversation (50–1000). Higher values show more history but use more browser resources. Whole turns may exceed this count. Lowering it does not hide rows already shown; Load earlier messages still reveals 150 rows at a time."
+        description={`Activity rows shown when opening a conversation (${MIN_HISTORY_WINDOW}–${MAX_HISTORY_WINDOW}).`}
         value={settings.structuredHistoryWindow}
         min={MIN_HISTORY_WINDOW}
         max={MAX_HISTORY_WINDOW}

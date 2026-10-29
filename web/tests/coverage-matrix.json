@@ -2544,7 +2544,7 @@
         "web/src/components/acp/AcpRuntime.tsx",
         "web/src/components/acp/StructuredView.tsx"
       ],
-      "notes": "Independent mocked stories cover persists the default history window changed to 500 through synced settings, opens 200 history rows from synced settings and reveals a fixed 150 more, and opens 500 history rows from synced settings and reveals the remaining 140. The persistence story uses 300 activity rows; the reveal stories use 640 rows and assert exact counts and turn boundaries."
+      "notes": "Initial history preference coverage is tracked by settings.structured-history-window."
     },
     {
       "id": "acp.clear-fold-remount",
@@ -2681,7 +2681,6 @@
         "src/components/settings/__tests__/StructuredViewDisplaySettings.test.tsx",
         "src/hooks/__tests__/useHistoryWindow.test.tsx",
         "src/lib/acpHistoryWindow.test.ts",
-        "src/components/acp/useTranscriptScroll.test.tsx",
         "src/lib/__tests__/webUiSync.test.ts"
       ],
       "components": [
@@ -2690,11 +2689,9 @@
         "web/src/hooks/useWebSettings.ts",
         "web/src/hooks/useHistoryWindow.ts",
         "web/src/lib/acpHistoryWindow.ts",
-        "web/src/components/acp/AcpRuntime.tsx",
-        "web/src/components/acp/StructuredView.tsx",
-        "web/src/components/acp/useTranscriptScroll.ts"
+        "web/src/components/acp/AcpRuntime.tsx"
       ],
-      "notes": "persists the default history window changed to 500 through synced settings saves 500 through the actual settings field, awaits the server PATCH, removes the local preference, reloads to restore and persist it from server state, and reopens all 300 transcript rows. Separate stories seed the synced preference to verify initial 200 and 500 windows without repeating settings navigation."
+      "notes": "Verifies synced persistence and fresh-open counts (default 150, configured 200/500), unchanged open windows on preference changes, and fixed 150-row reveals."
     },
     {
       "id": "settings.persistent-structured-views",

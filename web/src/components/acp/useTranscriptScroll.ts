@@ -3,7 +3,6 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import { useIsCoarsePointer } from "../../hooks/useIsCoarsePointer";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import { loadScrollState, restoredScrollTop, saveScrollState } from "../../lib/acpScrollState";
-import type { ActivityRow } from "../../lib/acpTypes";
 import { anchorIsStale, autoLoadDecision, isPinnedToBottom, scrollRestoreDelta } from "../../lib/historyScroll";
 import { promptRepinDecision } from "../../lib/promptRepin";
 import { repinOnResize } from "../../lib/repinOnResize";
@@ -17,7 +16,6 @@ export function useTranscriptScroll({
   canLoadEarlierHistory,
   loadEarlierHistory,
   loadingEarlierHistory,
-  historyRows,
   composerCollapsed,
   promptSeq,
   hasEverOpened,
@@ -28,7 +26,6 @@ export function useTranscriptScroll({
   loadEarlierHistory: () => void;
   loadingEarlierHistory: boolean;
   composerCollapsed: boolean;
-  historyRows?: readonly ActivityRow[];
   /** Counts every prompt once, from any path or device; keys the submit re-pin. */
   promptSeq: number;
   hasEverOpened: boolean;
@@ -130,36 +127,6 @@ export function useTranscriptScroll({
     }
   }, [loadingEarlierHistory]);
 
-  const previousHistoryRef = useRef<{ sessionId: string; firstRowId: string | null }>({
-    sessionId,
-    firstRowId: null,
-  });
-  useLayoutEffect(() => {
-    const previous = previousHistoryRef.current;
-    if (
-      previous.sessionId === sessionId &&
-      previous.firstRowId !== null &&
-      historyRows &&
-      historyRows[0]?.id !== previous.firstRowId &&
-      historyRows.some((row) => row.id === previous.firstRowId) &&
-      !wasAtBottomRef.current &&
-      pendingScrollAnchorRef.current === null
-    ) {
-      const stamped = lastScrollHeightRef.current;
-      pendingScrollAnchorRef.current = stamped;
-      requestAnimationFrame(() => {
-        const vp = viewportRef.current;
-        if (
-          vp &&
-          pendingScrollAnchorRef.current === stamped &&
-          anchorIsStale(loadingEarlierRef.current, stamped, vp.scrollHeight)
-        ) {
-          pendingScrollAnchorRef.current = null;
-        }
-      });
-    }
-    previousHistoryRef.current = { sessionId, firstRowId: historyRows?.[0]?.id ?? null };
-  }, [sessionId, historyRows]);
   useLayoutEffect(() => {
     const vp = viewportRef.current;
     const below = belowViewportRef.current;
@@ -195,7 +162,7 @@ export function useTranscriptScroll({
           markGesture();
       }
     };
-    const sample = (force = false, updatePinned = true, allowAutoLoad = false) => {
+    const sample = (force = false, updatePinned = true) => {
       if (force || !isCoarse || gestureActive) {
         const pinned = isPinnedToBottom(vp.scrollTop, vp.clientHeight, vp.scrollHeight);
         if (updatePinned) {
@@ -217,7 +184,7 @@ export function useTranscriptScroll({
         clientHeight: vp.clientHeight,
         scrollHeight: vp.scrollHeight,
         armed: autoLoadArmedRef.current,
-        canLoadEarlier: allowAutoLoad && canLoadEarlierRef.current,
+        canLoadEarlier: canLoadEarlierRef.current,
         now: performance.now(),
         lastLoadAt: lastAutoLoadAtRef.current,
       });
@@ -248,7 +215,7 @@ export function useTranscriptScroll({
           }
         }
       }
-      sample(readerMoved, !layoutChanged || readerMoved || gestureActive, readerMoved);
+      sample(readerMoved, !layoutChanged || readerMoved || gestureActive);
       if (!folding) {
         toolAnchorsRef.current = resampleToolAnchors(vp, previous);
       }
@@ -323,8 +290,6 @@ export function useTranscriptScroll({
         anchorIntentRef.current = wasAtBottomRef.current;
         pendingFoldAnchorMissRef.current = false;
         pendingFoldCorrectionStableRef.current = false;
-        lastScrollHeightRef.current = vp.scrollHeight;
-        lastClientHeightRef.current = vp.clientHeight;
       };
       const anchor = pendingScrollAnchorRef.current;
       if (anchor != null) {
@@ -334,7 +299,6 @@ export function useTranscriptScroll({
           lastScrollTopRef.current = vp.scrollTop;
         }
         pendingScrollAnchorRef.current = null;
-        sample(false, false);
         resample();
         return;
       }
