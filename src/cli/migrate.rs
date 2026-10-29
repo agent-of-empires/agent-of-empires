@@ -30,7 +30,10 @@ pub async fn offer_restart(error: anyhow::Error, interactive: bool) -> Result<()
     let managed =
         crate::cli::serve::daemon_pid().is_some_and(crate::cli::serve::serve_launch_matches);
     let autostart_disabled = crate::acp::client::daemon_manager::autostart_disabled();
-    if !should_offer_restart(interactive, autostart_disabled, managed) || !confirm_restart()? {
+    let remote = crate::acp::client::discovery::discover_env().is_some();
+    if !should_offer_restart(interactive, autostart_disabled, remote, managed)
+        || !confirm_restart()?
+    {
         return Err(error);
     }
     eprintln!("Restarting the daemon...");
@@ -38,8 +41,13 @@ pub async fn offer_restart(error: anyhow::Error, interactive: bool) -> Result<()
     Ok(())
 }
 
-fn should_offer_restart(interactive: bool, autostart_disabled: bool, managed: bool) -> bool {
-    interactive && !autostart_disabled && managed
+fn should_offer_restart(
+    interactive: bool,
+    autostart_disabled: bool,
+    remote: bool,
+    managed: bool,
+) -> bool {
+    interactive && !autostart_disabled && !remote && managed
 }
 
 fn confirm_restart() -> Result<bool> {
@@ -240,18 +248,19 @@ mod tests {
     }
 
     #[test]
-    fn restart_is_offered_only_to_a_person_with_a_managed_daemon() {
+    fn restart_is_offered_only_to_a_person_with_a_local_managed_daemon() {
         use super::should_offer_restart;
-        for (interactive, autostart_disabled, managed, offered) in [
-            (true, false, true, true),
-            (false, false, true, false),
-            (true, true, true, false),
-            (true, false, false, false),
+        for (interactive, autostart_disabled, remote, managed, offered) in [
+            (true, false, false, true, true),
+            (false, false, false, true, false),
+            (true, true, false, true, false),
+            (true, false, true, true, false),
+            (true, false, false, false, false),
         ] {
             assert_eq!(
-                should_offer_restart(interactive, autostart_disabled, managed),
+                should_offer_restart(interactive, autostart_disabled, remote, managed),
                 offered,
-                "{interactive} {autostart_disabled} {managed}"
+                "{interactive} {autostart_disabled} {remote} {managed}"
             );
         }
     }
