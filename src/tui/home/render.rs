@@ -5522,6 +5522,15 @@ mod plugin_status_plan_tests {
     use super::plan_plugin_statuses;
     use crate::plugin::ui_state::Tone;
 
+    /// (name, budget, count, expected span list, expected width).
+    type StatusPlanCase = (
+        &'static str,
+        usize,
+        usize,
+        Vec<(&'static str, Option<Tone>, usize)>,
+        usize,
+    );
+
     #[test]
     fn status_plan_respects_width_budgets() {
         let statuses = [
@@ -5529,7 +5538,7 @@ mod plugin_status_plan_tests {
             ("CI", Some(Tone::Info)),
             ("WIP", Some(Tone::Warn)),
         ];
-        let cases: &[(&str, usize, usize, Vec<(&str, Option<Tone>, usize)>, usize)] = &[
+        let cases: &[StatusPlanCase] = &[
             ("empty", 32, 0, vec![], 0),
             ("separator only", 2, 3, vec![], 0),
             ("narrow", 3, 1, vec![("Open", Some(Tone::Success), 1)], 3),
