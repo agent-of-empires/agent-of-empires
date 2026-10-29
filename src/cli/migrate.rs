@@ -9,6 +9,34 @@ use anyhow::{bail, Result};
 use crate::cli::serve::{daemon_status, try_lock_serve, DaemonStatus};
 use crate::migrations::progress::{fit_width, ConsoleProgress, Event, Reporter};
 
+/// Run startup migrations. When a managed daemon blocks them and a person is
+/// at the terminal, offer `aoe serve --restart`, which also migrates.
+pub async fn run_offering_restart(reporter: Option<Reporter>, interactive: bool) -> Result<()> {
+    let error = match crate::migrations::run_migrations_with(reporter.clone()) {
+        Err(error) if error.is::<crate::migrations::DaemonBlocksMigration>() => error,
+        result => return result,
+    };
+    let managed = crate::cli::serve::recorded_launch().is_some();
+    let autostart_disabled = crate::acp::client::daemon_manager::autostart_disabled();
+    if !should_offer_restart(interactive, autostart_disabled, managed) || !confirm_restart()? {
+        return Err(error);
+    }
+    crate::cli::serve::restart_daemon().await?;
+    crate::migrations::run_migrations_with(reporter)
+}
+
+fn should_offer_restart(interactive: bool, autostart_disabled: bool, managed: bool) -> bool {
+    interactive && !autostart_disabled && managed
+}
+
+fn confirm_restart() -> Result<bool> {
+    eprint!("Restart the daemon now? [y/N] ");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
+}
+
 const QUIET_FOR: Duration = Duration::from_millis(1500);
 
 const FALLBACK_WIDTH: usize = 80;
@@ -183,6 +211,23 @@ pub async fn run(args: &MigrateArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn restart_is_offered_only_to_a_person_with_a_managed_daemon() {
+        use super::should_offer_restart;
+        for (interactive, autostart_disabled, managed, offered) in [
+            (true, false, true, true),
+            (false, false, true, false),
+            (true, true, true, false),
+            (true, false, false, false),
+        ] {
+            assert_eq!(
+                should_offer_restart(interactive, autostart_disabled, managed),
+                offered,
+                "{interactive} {autostart_disabled} {managed}"
+            );
+        }
+    }
+
     use super::*;
 
     fn started() -> Event {
