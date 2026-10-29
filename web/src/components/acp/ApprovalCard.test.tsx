@@ -323,4 +323,42 @@ describe("ApprovalCard plan viewer", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(document.activeElement).toBe(opener);
   });
+  it("moves between the view tabs with the arrow keys and labels the panel", () => {
+    mount(withPlan());
+    fireEvent.click(screen.getByText("View plan"));
+    const dialog = screen.getByRole("dialog");
+    const rendered = within(dialog).getByRole("tab", { name: "Rendered" });
+    const raw = within(dialog).getByRole("tab", { name: "Raw" });
+    expect(rendered.getAttribute("tabindex")).toBe("0");
+    expect(raw.getAttribute("tabindex")).toBe("-1");
+
+    rendered.focus();
+    fireEvent.keyDown(rendered, { key: "ArrowRight" });
+    expect(raw.getAttribute("aria-selected")).toBe("true");
+    expect(document.activeElement).toBe(raw);
+    expect(within(dialog).getByRole("tabpanel").getAttribute("aria-labelledby")).toBe(raw.id);
+
+    fireEvent.keyDown(raw, { key: "Home" });
+    expect(rendered.getAttribute("aria-selected")).toBe("true");
+    expect(document.activeElement).toBe(rendered);
+  });
+
+  it("answers a choice approval with its option id from the modal", () => {
+    const options: ApprovalOption[] = [
+      { option_id: "a", name: "Plan A", kind: "allow_once" },
+      { option_id: "b", name: "Plan B", kind: "allow_once" },
+    ];
+    for (const [label, decision, optionId] of [
+      ["Plan B", "Allow", "b"],
+      ["Dismiss", "Cancelled", undefined],
+    ] as const) {
+      const onResolve = mount(makeApproval({ plan: PLAN, choice: true, options }, "{}", "Ready to code?"));
+      fireEvent.click(screen.getByText("View plan"));
+      const dialog = screen.getByRole("dialog");
+      expect(within(dialog).queryByText("Deny")).toBeNull();
+      fireEvent.click(within(dialog).getByText(label));
+      expect(onResolve).toHaveBeenCalledExactlyOnceWith(decision, optionId);
+      cleanup();
+    }
+  });
 });

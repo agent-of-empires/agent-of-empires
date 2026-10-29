@@ -210,7 +210,8 @@ export function ApprovalCard({ approval, onResolve }: Props) {
           plan={approval.plan}
           submitting={phase === "submitting"}
           offline={offline}
-          onDecide={(decision) => void submit(decision)}
+          options={isChoice ? options : undefined}
+          onDecide={(decision, optionId) => void submit(decision, optionId)}
           onClose={() => setPlanOpen(false)}
         />
       )}

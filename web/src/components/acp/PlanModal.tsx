@@ -5,7 +5,7 @@
 import { useEffect, useRef, useState } from "react";
 import { TextMessagePartProvider } from "@assistant-ui/react";
 
-import type { ApprovalDecision } from "../../lib/acpTypes";
+import type { ApprovalDecision, ApprovalOption } from "../../lib/acpTypes";
 import { OFFLINE_TITLE } from "../../lib/connectionState";
 import { BRAND_BUTTON, Dialog } from "../Dialog";
 import { CopyMarkdownButton } from "./CopyMarkdownButton";
@@ -15,11 +15,13 @@ interface Props {
   plan: string;
   submitting: boolean;
   offline: boolean;
-  onDecide: (decision: ApprovalDecision) => void;
+  /** An answer list: its options are offered instead of the Allow/Always/Deny trio. */
+  options?: ApprovalOption[];
+  onDecide: (decision: ApprovalDecision, optionId?: string) => void;
   onClose: () => void;
 }
 
-const FOCUSABLE = "button:not([disabled])";
+const FOCUSABLE = 'button:not([disabled]):not([tabindex="-1"])';
 
 // Dialog contains no focus itself, so the plan modal moves focus in, cycles Tab
 // inside the panel, closes on Escape and hands focus back to the opener.
@@ -60,19 +62,41 @@ function useModalFocus(onClose: () => void) {
   }, []);
 }
 
+const SECONDARY_BUTTON = "border border-surface-700 text-text-secondary hover:bg-surface-700";
 const FOOTER_BUTTON = "px-3 py-1.5 text-sm rounded-md cursor-pointer transition-colors disabled:opacity-50";
 
-export function PlanModal({ plan, submitting, offline, onDecide, onClose }: Props) {
-  const [view, setView] = useState<"rendered" | "raw">("rendered");
+const VIEWS = ["rendered", "raw"] as const;
+type View = (typeof VIEWS)[number];
+
+export function PlanModal({ plan, submitting, offline, options, onDecide, onClose }: Props) {
+  const [view, setView] = useState<View>("rendered");
   useModalFocus(onClose);
+  const onTabKey = (e: React.KeyboardEvent, v: View) => {
+    const at = VIEWS.indexOf(v);
+    const next =
+      e.key === "ArrowRight"
+        ? VIEWS[(at + 1) % VIEWS.length]
+        : e.key === "ArrowLeft"
+          ? VIEWS[(at + VIEWS.length - 1) % VIEWS.length]
+          : e.key === "Home"
+            ? VIEWS[0]
+            : e.key === "End"
+              ? VIEWS[VIEWS.length - 1]
+              : undefined;
+    if (!next) return;
+    e.preventDefault();
+    setView(next);
+    document.getElementById(`plan-tab-${next}`)?.focus();
+  };
   const blocked = offline || submitting;
-  const decide = (label: string, decision: ApprovalDecision, className: string) => (
+  const decide = (label: string, decision: ApprovalDecision, className: string, optionId?: string) => (
     <button
+      key={optionId ?? decision}
       type="button"
       className={`${FOOTER_BUTTON} ${className}`}
       disabled={blocked}
       title={offline ? OFFLINE_TITLE : undefined}
-      onClick={() => onDecide(decision)}
+      onClick={() => onDecide(decision, optionId)}
     >
       {label}
     </button>
@@ -95,19 +119,32 @@ export function PlanModal({ plan, submitting, offline, onDecide, onClose }: Prop
           >
             Close
           </button>
-          {decide("Deny", "Deny", "border border-surface-700 text-text-secondary hover:bg-surface-700")}
-          {decide("Always", "AllowAlways", "border border-surface-700 text-text-secondary hover:bg-surface-700")}
-          {decide("Allow", "Allow", BRAND_BUTTON)}
+          {options ? (
+            <>
+              {decide("Dismiss", "Cancelled", SECONDARY_BUTTON)}
+              {options.map((o) => decide(o.name, "Allow", BRAND_BUTTON, o.option_id))}
+            </>
+          ) : (
+            <>
+              {decide("Deny", "Deny", SECONDARY_BUTTON)}
+              {decide("Always", "AllowAlways", SECONDARY_BUTTON)}
+              {decide("Allow", "Allow", BRAND_BUTTON)}
+            </>
+          )}
         </>
       }
     >
       <div className="mb-3 flex items-center gap-1" role="tablist" aria-label="Plan view">
-        {(["rendered", "raw"] as const).map((v) => (
+        {VIEWS.map((v) => (
           <button
             key={v}
+            id={`plan-tab-${v}`}
             type="button"
             role="tab"
             aria-selected={view === v}
+            aria-controls="plan-panel"
+            tabIndex={view === v ? 0 : -1}
+            onKeyDown={(e) => onTabKey(e, v)}
             className={[
               "rounded px-2 py-1 text-xs",
               view === v ? "bg-surface-700 text-text-primary" : "text-text-dim hover:text-text-secondary",
@@ -119,13 +156,15 @@ export function PlanModal({ plan, submitting, offline, onDecide, onClose }: Prop
         ))}
         <CopyMarkdownButton source={plan} label="Copy plan" className="ml-auto" />
       </div>
-      {view === "rendered" ? (
-        <TextMessagePartProvider text={plan}>
-          <Markdown text={plan} />
-        </TextMessagePartProvider>
-      ) : (
-        <pre className="whitespace-pre-wrap break-words font-mono text-xs text-text-secondary">{plan}</pre>
-      )}
+      <div id="plan-panel" role="tabpanel" aria-labelledby={`plan-tab-${view}`}>
+        {view === "rendered" ? (
+          <TextMessagePartProvider text={plan}>
+            <Markdown text={plan} />
+          </TextMessagePartProvider>
+        ) : (
+          <pre className="whitespace-pre-wrap break-words font-mono text-xs text-text-secondary">{plan}</pre>
+        )}
+      </div>
     </Dialog>
   );
 }
