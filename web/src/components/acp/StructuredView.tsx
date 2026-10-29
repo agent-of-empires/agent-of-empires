@@ -393,6 +393,8 @@ function ComposerDock({
 }) {
   const { sessionId, acpWorkerState, acpAgent, acpProvider } = view;
   const { state, status } = ctx;
+  const connecting =
+    acpWorkerState === "running" && status !== "open" && !state.workerStopped && !state.workerRestarting;
   return (
     <>
       <UsageLimitSection
@@ -417,6 +419,7 @@ function ComposerDock({
           status !== "open" || acpWorkerState !== "running" || state.workerStopped || state.workerRestarting
         }
         waitingFor={startingAgent}
+        connecting={connecting}
         agent={agent}
       />
 
@@ -471,6 +474,7 @@ function ComposerDock({
           currentAgent={state.agent ?? acpAgent}
           currentProvider={acpProvider}
           waitingFor={startingAgent}
+          connecting={connecting}
           availableModes={state.availableModes}
           currentModeId={state.currentModeId}
           legacyMode={state.mode}
