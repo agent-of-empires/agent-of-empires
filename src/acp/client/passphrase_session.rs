@@ -70,6 +70,54 @@ impl PassphraseSessionCache {
     }
 }
 
+/// What a request to `endpoint` should carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Credential {
+    /// The endpoint's bearer token.
+    Bearer,
+    /// The cached passphrase session, or a fresh login when none is cached.
+    Session,
+    None,
+}
+
+/// A passphrase can be used: never over a Unix socket, whose peer owner already
+/// authorizes the request, and never without one resolving (`--auth=none`).
+/// `resolved_passphrase` also refuses a plaintext `http://` non-loopback URL.
+pub(crate) fn can_login(endpoint: &DaemonEndpoint) -> bool {
+    endpoint.unix_path().is_none() && endpoint.resolved_passphrase().is_some()
+}
+
+/// A cached session wins, then a bearer token (`--auth=token`), then a fresh
+/// login (`--auth=passphrase`). `force_session` skips the bearer.
+pub(crate) fn select_credential(
+    endpoint: &DaemonEndpoint,
+    cache: &PassphraseSessionCache,
+    force_session: bool,
+) -> Credential {
+    let can_login = can_login(endpoint);
+    if force_session && can_login || can_login && cache.get(endpoint).is_some() {
+        Credential::Session
+    } else if endpoint.bearer_token().is_some() {
+        Credential::Bearer
+    } else if can_login {
+        Credential::Session
+    } else {
+        Credential::None
+    }
+}
+
+/// Whether a 401 deserves one retry on a fresh login: a *cached* session was
+/// rejected (rotated passphrase, expired or evicted), or a bearer alone was
+/// refused by a daemon that also requires the second factor. A first-ever login
+/// failure is not retried: the credential itself is wrong, not merely stale.
+/// Call before the first send; a login in between changes the cache.
+pub(crate) fn may_retry_with_login(
+    endpoint: &DaemonEndpoint,
+    cache: &PassphraseSessionCache,
+) -> bool {
+    can_login(endpoint) && (cache.get(endpoint).is_some() || endpoint.bearer_token().is_some())
+}
+
 /// Perform the passphrase login handshake and cache the resulting session.
 pub(crate) async fn login(
     endpoint: &DaemonEndpoint,
@@ -269,6 +317,51 @@ mod tests {
         let cache_dir = endpoint.session_cache_dir().unwrap();
         std::fs::create_dir_all(&cache_dir).unwrap();
         (app, env, endpoint, cache_dir)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn credential_selection_and_login_retry_rules() {
+        let _app = crate::session::test_support::isolate_app_dir();
+        let _env = crate::session::test_support::EnvGuard::set(&[(
+            "AOE_DAEMON_PASSPHRASE",
+            "cache-fixture",
+        )]);
+        let session = PassphraseSession {
+            cookie: "aoe_session=abc".into(),
+            binding_secret: "secret".into(),
+        };
+        let at = |url: &str, token: Option<&str>| {
+            DaemonEndpoint::new(url.into(), token.map(str::to_string), Source::Env)
+        };
+        let loopback = "http://127.0.0.1:8080";
+        // A plaintext non-loopback URL refuses the passphrase, so no login is possible.
+        let no_login = "http://example.com:8080";
+
+        // (url, token, cached, force_session, credential, may_retry_with_login)
+        let cases = [
+            (loopback, None, false, false, Credential::Session, false),
+            (loopback, None, true, false, Credential::Session, true),
+            (loopback, Some("t"), false, false, Credential::Bearer, true),
+            (loopback, Some("t"), false, true, Credential::Session, true),
+            (loopback, Some("t"), true, false, Credential::Session, true),
+            (no_login, Some("t"), false, true, Credential::Bearer, false),
+            (no_login, None, false, false, Credential::None, false),
+        ];
+        for (url, token, cached, force, credential, retry) in cases {
+            let endpoint = at(url, token);
+            let cache = PassphraseSessionCache::default();
+            if cached {
+                cache.set_for_test(session.clone());
+            }
+            let label = format!("{url} token={token:?} cached={cached} force={force}");
+            assert_eq!(
+                select_credential(&endpoint, &cache, force),
+                credential,
+                "{label}"
+            );
+            assert_eq!(may_retry_with_login(&endpoint, &cache), retry, "{label}");
+        }
     }
 
     #[tokio::test]

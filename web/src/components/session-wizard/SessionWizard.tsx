@@ -7,6 +7,7 @@ import type {
   CreationTrustFingerprint,
   GroupInfo,
 } from "../../lib/types";
+import { setAgentNames } from "../../lib/agentDisplayName";
 import {
   fetchAgents,
   fetchGroups,
@@ -284,7 +285,10 @@ export function SessionWizard({
   useEffect(() => {
     const generations = defaultsGeneration;
     const switches = profileSwitchRef;
-    fetchAgents().then((a) => dispatch({ type: "SET_AGENTS", agents: a }));
+    fetchAgents().then((a) => {
+      setAgentNames(a);
+      dispatch({ type: "SET_AGENTS", agents: a });
+    });
     fetchDockerStatus().then((d) => dispatch({ type: "SET_DOCKER", available: d.available }));
     fetchProfiles()
       .then((profiles) => dispatch({ type: "SET_PROFILES", profiles }))
@@ -818,24 +822,26 @@ export function SessionWizard({
       </RowGroup>
 
       <RowGroup>
-        <SwitchRow
-          label="Structured"
-          switchLabel="Use structured view"
-          checked={acpCapable && d.useStructuredView}
-          onChange={(v) => handleChange("useStructuredView", v)}
-          disabled={!acpCapable}
-          summary={
-            !acpCapable
-              ? selectedAgent?.acp_allowed === false
-                ? "not on the allowed agents list"
-                : selectedAgent?.kind === "custom"
-                  ? "needs agent_acp_cmd"
-                  : "no ACP adapter, terminal only"
-              : d.useStructuredView
-                ? "plan, tool calls and diffs"
-                : "raw terminal"
-          }
-        />
+        {d.structuredViewOffered && (
+          <SwitchRow
+            label="Structured"
+            switchLabel="Use structured view"
+            checked={acpCapable && d.useStructuredView}
+            onChange={(v) => handleChange("useStructuredView", v)}
+            disabled={!acpCapable}
+            summary={
+              !acpCapable
+                ? selectedAgent?.acp_allowed === false
+                  ? "not on the allowed agents list"
+                  : selectedAgent?.kind === "custom"
+                    ? "needs agent_acp_cmd"
+                    : "no ACP adapter, terminal only"
+                : d.useStructuredView
+                  ? "plan, tool calls and diffs"
+                  : "raw terminal"
+            }
+          />
+        )}
         <SwitchRow
           label="Auto-approve"
           switchLabel="Auto-approve actions"

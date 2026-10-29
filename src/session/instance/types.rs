@@ -224,6 +224,10 @@ pub struct SandboxInfo {
     /// next container come-up. See `Instance::ensure_before_start_env`.
     #[serde(skip)]
     pub before_start_env: Vec<(String, String)>,
+    /// Host-only input for `host_hooks.before_start`; never reaches the container.
+    /// Same grammar as `extra_env`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub before_start_hook_env: Vec<String>,
     /// The provider the container was built for, which decides whether it
     /// carries the GCP ADC mount. Distinct from `Instance::agent_provider`,
     /// which is what the session wants: a difference between the two is what

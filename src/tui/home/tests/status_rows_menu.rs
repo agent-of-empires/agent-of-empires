@@ -171,12 +171,12 @@ fn update_bar_renders_status_toast_without_update_info() {
          Full buffer:\n{out}"
     );
     assert!(
-        out.contains("[Ctrl+x] dismiss"),
+        out.contains("[Ctrl+X] dismiss"),
         "expected the dismiss hint alongside the toast.\nFull buffer:\n{out}"
     );
 }
 
-/// The sandbox-image banner renders with its `[u] pull` / `[Ctrl+x] dismiss` hints in the lowest
+/// The sandbox-image banner renders with its `[u] pull` / `[Ctrl+X] dismiss` hints in the lowest
 /// slot of `render_update_bar`, and an app update wins the shared row over it so the `u` and
 /// Ctrl+x keys stay unambiguous.
 #[test]
@@ -221,7 +221,7 @@ fn update_bar_renders_sandbox_image_banner() {
             "expected the sandbox image banner to render.\nFull buffer:\n{out}"
         );
         assert!(
-            out.contains("[u] pull") && out.contains("[Ctrl+x] dismiss"),
+            out.contains("[u] pull") && out.contains("[Ctrl+X] dismiss"),
             "expected the pull/dismiss hints alongside the image banner.\nFull buffer:\n{out}"
         );
     }
@@ -1931,6 +1931,8 @@ fn confirm_delete_dialog_cancel_leaves_session() {
 fn serve_status_renders_from_the_probe_worker() {
     let what = if cfg!(feature = "web") { "Web" } else { "API" };
     let mut env = create_test_env_with_sessions(1);
+    // A healthy runtime, so the R entry carries the Web dashboard rather than a Daemon limit.
+    let _runtime = env.view.session_feed.terminal_driver_for_test();
     let idle = render_home_to_string(&mut env.view, 160, 40);
     assert!(idle.contains(&format!("R {what}")), "{idle}");
 

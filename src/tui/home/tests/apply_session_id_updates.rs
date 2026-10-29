@@ -34,7 +34,8 @@ async fn canonical_identity_updates_never_install_a_tui_poller_or_write_payloads
     assert!(view
         .get_instance(&row.id)
         .unwrap()
-        .session_id_poller
+        .capture_poller
+        .handle()
         .is_none());
     view.reload().unwrap();
     assert_eq!(payload_bytes("test"), bytes);

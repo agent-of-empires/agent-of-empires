@@ -36,6 +36,8 @@ export interface WebSettings {
   /** Ordered key row above the soft keyboard in the live terminal. */
   mobileToolbarKeys: ToolbarKeyId[];
   showArrowJoystick: boolean;
+  /** Scroll control beside a full-screen mouse app, which has no scrollbar of its own. */
+  showForwardScrollbar: boolean;
 }
 
 function getDefaults(): WebSettings {
@@ -62,6 +64,7 @@ function getDefaults(): WebSettings {
     autoOpenPluginPanes: false,
     mobileToolbarKeys: [...DEFAULT_TOOLBAR_KEYS],
     showArrowJoystick: true,
+    showForwardScrollbar: false,
   };
 }
 
@@ -86,6 +89,7 @@ function normalizeSnapshot(settings: WebSettings): WebSettings {
     autoOpenPluginPanes: normalizeBool(settings.autoOpenPluginPanes, defaults.autoOpenPluginPanes),
     mobileToolbarKeys: normalizeToolbarKeys(settings.mobileToolbarKeys),
     showArrowJoystick: normalizeBool(settings.showArrowJoystick, defaults.showArrowJoystick),
+    showForwardScrollbar: normalizeBool(settings.showForwardScrollbar, defaults.showForwardScrollbar),
     markdownPreview:
       settings.markdownPreview === "rendered" || settings.markdownPreview === "raw"
         ? settings.markdownPreview

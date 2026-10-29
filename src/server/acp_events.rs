@@ -30,9 +30,8 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                 );
                 let recovered = recover_structured_unread_after_lag(
                     &state.instances,
-                    &state.acp_event_store,
+                    &state.session_service,
                     &state.instance_locks,
-                    &state.acp_control_cache,
                     state.file_watch.clone(),
                     &state.status_tx,
                 )
@@ -302,31 +301,38 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                 });
         }
 
-        // Gated on `reads_activity_flags`: a cold cache (nothing has
-        // hydrated this session since the daemon started, e.g. right after a
-        // restart with a reattached worker) must not cost every other arm a
-        // full log replay on this serial listener task. The replay picks up
-        // this frame's own event too, since it is persisted to the store
-        // before being broadcast, and `fold_control_state` hydrates through
-        // the cache's per-session lock, so a second frame for the same cold
-        // session waits for the first rather than double-hydrating (#4001).
-        if reads_activity_flags(frame.event.as_ref())
-            && !state.acp_control_cache.is_hydrated(&frame.session_id)
-        {
-            state
-                .session_service
-                .fold_control_state(&frame.session_id)
-                .await;
-        }
-        let turn_active_after = state.acp_control_cache.turn_active(&frame.session_id);
-        let background_agent_active_after = state
-            .acp_control_cache
-            .has_active_background_agent(&frame.session_id);
-        let status_intent = derive_acp_status(
-            frame.event.as_ref(),
-            turn_active_after,
-            background_agent_active_after,
-        );
+        // The sink folds before broadcasting, so a frame published to a warm
+        // cache carries its own status and no later reader depends on how far
+        // the fold has run. A frame published cold (right after a restart with
+        // a reattached worker) carries none and is rebuilt from the log. A
+        // startup error whose write failed is substituted by the sink and
+        // never reaches the log, so the frame itself says Error.
+        let status_policy = status_policy(frame.event.as_ref());
+        let status_update = match (status_policy, frame.event.as_ref()) {
+            (Some(policy), crate::acp::state::Event::AgentStartupError { .. }) => {
+                Some((policy, Status::Error))
+            }
+            (Some(policy), _) => match frame.sidebar_status {
+                Some(projected) => Some((policy, projected)),
+                None => {
+                    // Hydrates once; frames published after it carry a status.
+                    let fold = state
+                        .session_service
+                        .fold_control_state(&frame.session_id)
+                        .await;
+                    if fold.last_seq == frame.seq {
+                        Some(fold.sidebar_status())
+                    } else {
+                        state
+                            .session_service
+                            .sidebar_status_at(&frame.session_id, frame.seq)
+                            .await
+                    }
+                    .map(|projected| (policy, projected))
+                }
+            },
+            (None, _) => None,
+        };
         let acp_change = derive_acp_session_change(frame.event.as_ref());
         let load_session_capability = match (frame.event.as_ref(), frame.worker_generation) {
             (
@@ -338,7 +344,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             ) => Some((*capable, generation)),
             _ => None,
         };
-        if status_intent.is_none() && acp_change.is_none() && load_session_capability.is_none() {
+        if status_update.is_none() && acp_change.is_none() && load_session_capability.is_none() {
             continue;
         }
         // Identity events share the per-session mutation lock with pollers and
@@ -413,7 +419,9 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             // between. A future refactor that makes `apply_status_intent`
             // assign `status` more than once has to revisit this.
             let old_status = inst.status;
-            apply_status_intent(inst, status_intent, &state.status_tx);
+            if let Some((policy, projected)) = status_update {
+                apply_status_intent(inst, policy, projected, &state.status_tx);
+            }
             canonical_changed |= old_status != inst.status;
             let unread_profile =
                 should_mark_acp_unread(inst, old_status, crate::session::unread_enabled())
@@ -481,9 +489,10 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             let profile_for_save = profile.clone();
             let acp_change_for_save = acp_change.clone();
             let file_watch = state.file_watch.clone();
-            let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
                 let storage = crate::session::Storage::new(&profile_for_save, file_watch)?;
                 storage.update(|all, _groups| {
+                    let found = all.iter().any(|i| i.id == session_id_for_save);
                     if let Some(inst) = all.iter_mut().find(|i| i.id == session_id_for_save) {
                         inst.attest_launch_default_store(observed_for_save.as_ref());
                         apply_acp_session_change(
@@ -491,20 +500,31 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                             &session_id_for_save,
                             acp_change_for_save.as_ref(),
                         );
+                        if let Some(AcpSessionChange::Assigned(new_id)) =
+                            acp_change_for_save.as_ref()
+                        {
+                            inst.record_observed_acp_store(new_id, observed_for_save.as_ref());
+                        }
                     }
-                    Ok(())
-                })?;
-                Ok(())
+                    Ok(found)
+                })
             })
             .await;
             match save_result {
-                Ok(Ok(())) => {
+                Ok(Ok(row_saved)) => {
                     // The saved row is the durable one; the mirror may only
                     // attest what has actually been written, never a marker the
                     // next reload would drop.
                     let mut instances = state.instances.write().await;
                     if let Some(inst) = instances.iter_mut().find(|i| i.id == frame.session_id) {
                         inst.attest_launch_default_store(observed_mirror.as_ref());
+                        // A row that moved out of this profile was not written, and
+                        // the next reload would drop what the mirror recorded.
+                        if let (true, Some(AcpSessionChange::Assigned(new_id))) =
+                            (row_saved, acp_change.as_ref())
+                        {
+                            inst.record_observed_acp_store(new_id, observed_mirror.as_ref());
+                        }
                     }
                 }
                 Ok(Err(e)) => {
@@ -569,40 +589,35 @@ pub(crate) async fn seed_acp_statuses(state: Arc<AppState>) {
         .filter(|i| i.is_structured())
         .map(|i| i.id.clone())
         .collect();
-    if acp_ids.is_empty() {
-        return;
-    }
     for id in acp_ids {
-        let Some(event) = state.acp_event_store.latest_seed_status_event(&id) else {
-            continue;
-        };
-        let tasks_active = state.acp_event_store.has_unresolved_background_tasks(&id);
-        let main_active = state.acp_event_store.has_in_flight_main_turn(&id);
-        let Some(intent) = derive_acp_status(&event, main_active, tasks_active) else {
+        let Some(projected) = folded_sidebar_status(&state.session_service, &id).await else {
             continue;
         };
         let mut instances = state.instances.write().await;
         if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            apply_status_seed(inst, intent, &state.status_tx);
+            apply_status_seed(inst, projected, &state.status_tx);
         }
     }
 }
 
+/// The folded sidebar status, or `None` for a session with no events yet.
+pub(crate) async fn folded_sidebar_status(
+    service: &crate::server::session_service::SessionService,
+    id: &str,
+) -> Option<Status> {
+    let fold = service.fold_control_state(id).await;
+    (fold.last_seq > 0).then(|| fold.sidebar_status())
+}
+
 pub(crate) fn apply_status_seed(
     inst: &mut Instance,
-    intent: StatusIntent,
+    projected: Status,
     status_tx: &broadcast::Sender<StatusChange>,
 ) {
-    if inst.status == Status::Stopped
-        && matches!(
-            intent,
-            StatusIntent::Set(Status::Running | Status::Waiting)
-                | StatusIntent::SetUnlessHeld(Status::Running)
-        )
-    {
+    if inst.status == Status::Stopped && matches!(projected, Status::Running | Status::Waiting) {
         inst.status = Status::Idle;
     }
-    apply_status_intent(inst, Some(intent), status_tx);
+    apply_status_intent(inst, StatusPolicy::Authoritative, projected, status_tx);
 }
 
 /// Whether reaching `status` should release a plugin's `sessions.turn.send` pending mark:
@@ -624,52 +639,46 @@ fn revival_pending_clears_on(status: Status) -> bool {
     )
 }
 
-/// Fold a derived `StatusIntent` into an `Instance`. Pure mutation;
+/// Fold a projected status into an `Instance` under `policy`. Pure mutation;
 /// callers hold the write lock. Sends a `StatusChange` on
 /// `status_tx` so push notifications and the dashboard see the
 /// transition like any tmux-driven one.
 pub(crate) fn apply_status_intent(
     inst: &mut Instance,
-    intent: Option<StatusIntent>,
+    policy: StatusPolicy,
+    target: Status,
     status_tx: &broadcast::Sender<StatusChange>,
 ) {
-    let Some(intent) = intent else { return };
     // Genuine in-flight terminal states: never fight them.
     if inst.is_trashed() || matches!(inst.status, Status::Deleting | Status::Creating) {
         return;
     }
-    let target = match intent {
-        StatusIntent::Set(s) => {
-            // A Stopped session must not be woken by a trailing worker event.
-            if inst.status == Status::Stopped {
-                return;
-            }
-            s
-        }
+    match policy {
+        // A Stopped session must not be woken by a trailing worker event.
+        StatusPolicy::Authoritative if inst.status == Status::Stopped => return,
+        StatusPolicy::Authoritative => {}
         // Background sub-agent events must not speak for the main turn: they
         // preserve its Waiting (a pending approval/elicitation) and Error (a
         // dead connection the supervisor is still respawning), and Stopped
         // likewise stays until the main turn's own lifecycle moves it. The
-        // main turn's own events (plain `Set`) resolve Waiting and Error;
-        // Error also heals on a fresh worker attach.
-        StatusIntent::SetUnlessHeld(s) => {
+        // main turn's own events resolve Waiting and Error; Error also heals
+        // on a fresh worker attach.
+        StatusPolicy::Background => {
             if matches!(
                 inst.status,
                 Status::Stopped | Status::Waiting | Status::Error
             ) {
                 return;
             }
-            s
         }
-        // HealError comes only from AcpSessionAssigned / RateLimitAuto Resumed, both
-        // emitted when a fresh worker attaches and never as trailing post-stop events.
-        StatusIntent::HealError => {
+        // Only from AcpSessionAssigned / RateLimitAutoResumed, both emitted
+        // when a fresh worker attaches and never as trailing post-stop events.
+        StatusPolicy::Heal => {
             if !matches!(inst.status, Status::Error | Status::Stopped) {
                 return;
             }
-            Status::Idle
         }
-    };
+    }
     // A plugin's sessions.turn.send marks a resting session pending right before waking it, so
     // the active-session cap counts it before this, its first real status report, lands.
     // Checked against `target` ahead of the no-op return below (not gated by it): a redundant
@@ -779,9 +788,8 @@ pub(super) async fn persist_and_mirror_unread(
 /// it permanently, and nothing else would ever produce it.
 ///
 /// The events themselves are durable (recorded before broadcast), so the log is
-/// the recovery source. `latest_seed_status_event` is the same query
-/// `seed_acp_statuses` uses at boot, and for the same reason: it returns the
-/// most recent *lifecycle* event, which is exactly the frame whose loss matters.
+/// the recovery source: it hydrates the same fold `seed_acp_statuses` reads at
+/// boot.
 ///
 /// This deliberately does NOT reuse `seed_acp_statuses`, despite the shared
 /// shape, because the two differ on both points that matter:
@@ -796,9 +804,8 @@ pub(super) async fn persist_and_mirror_unread(
 ///   should keep it.
 pub(super) async fn recover_structured_unread_after_lag(
     instances: &RwLock<Vec<Instance>>,
-    event_store: &crate::acp::event_store::EventStore,
+    service: &crate::server::session_service::SessionService,
     instance_locks: &RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    control_cache: &crate::acp::control_cache::ControlStateCache,
     file_watch: Arc<crate::file_watch::FileWatchService>,
     status_tx: &broadcast::Sender<StatusChange>,
 ) -> usize {
@@ -812,16 +819,7 @@ pub(super) async fn recover_structured_unread_after_lag(
     let unread_enabled = crate::session::unread_enabled();
     let mut marked = 0usize;
     for id in ids {
-        let Some(event) = event_store.latest_seed_status_event(&id) else {
-            continue;
-        };
-        // Lag recovery uses live activity without lifting deliberate stops.
-        // An unhydrated cache conservatively reports no active work.
-        let turn_active_after = control_cache.turn_active(&id);
-        let background_agent_active_after = control_cache.has_active_background_agent(&id);
-        let Some(intent) =
-            derive_acp_status(&event, turn_active_after, background_agent_active_after)
-        else {
+        let Some(projected) = folded_sidebar_status(service, &id).await else {
             continue;
         };
         // Same snapshot-around-apply as the live path, so "the transition that
@@ -835,7 +833,7 @@ pub(super) async fn recover_structured_unread_after_lag(
                 continue;
             }
             let old_status = inst.status;
-            apply_status_intent(inst, Some(intent), status_tx);
+            apply_status_intent(inst, StatusPolicy::Authoritative, projected, status_tx);
             should_mark_acp_unread(inst, old_status, unread_enabled)
                 .then(|| inst.source_profile.clone())
         };
@@ -933,6 +931,18 @@ pub(super) fn apply_acp_session_change(
             inst.import_pending = None;
         }
     }
+    if let Some(stale) = inst.resume_binding.as_ref().filter(|binding| {
+        binding.provenance == crate::session::ConversationProvenance::Asserted
+            && inst.acp_session_id.as_deref() != Some(binding.session_id.as_str())
+    }) {
+        tracing::info!(
+            target: "acp.event_listener",
+            session = %session_id,
+            stale_id = %stale.session_id,
+            "dropping asserted conversation binding that no longer matches the ACP id"
+        );
+        inst.resume_binding = None;
+    }
     Some(inst.source_profile.clone())
 }
 
@@ -961,102 +971,45 @@ pub(super) fn derive_acp_session_change(event: &crate::acp::Event) -> Option<Acp
     }
 }
 
-/// What an acp event implies for the sidebar status. `Set` is an
-/// unconditional transition; `HealError` only takes effect if the
-/// current status is `Error` (used to recover the sidebar from a
-/// sticky `AgentStartupError` banner after a successful respawn
-/// without clobbering an in-progress Running/Waiting turn).
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum StatusIntent {
-    Set(Status),
-    /// Like `Set`, but a no-op while the sidebar sits on a status only the
-    /// main turn may resolve: `Waiting` (a pending approval/elicitation),
-    /// `Stopped` (a deliberate stop), or `Error` (a dead connection awaiting
-    /// respawn). Background sub-agent lifecycle events must not speak for
-    /// the main turn; its own events (plain `Set`) and `HealError` resolve
-    /// those. Used only by the `BackgroundAgent*` arms (#4001).
-    SetUnlessHeld(Status),
-    HealError,
+/// How an event's projected sidebar status may overwrite the row's current
+/// one. The value itself always comes from the folded `AcpState`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatusPolicy {
+    Authoritative,
+    /// A no-op while the sidebar sits on a status only the main turn may
+    /// resolve: `Waiting`, `Stopped` or `Error`. Used only by the
+    /// `Background*` arms (#4001).
+    Background,
+    /// Only takes effect from `Error` or `Stopped`: a fresh worker attached.
+    Heal,
 }
 
-/// Lifecycle events that need post-event activity flags.
-/// Callers must hydrate a cold control cache before deriving their status.
-pub(super) fn reads_activity_flags(event: &crate::acp::Event) -> bool {
-    matches!(
-        event,
-        crate::acp::Event::Stopped { .. }
-            | crate::acp::Event::BackgroundAgentCompleted { .. }
-            | crate::acp::Event::BackgroundTaskFinished { .. }
-    )
-}
-
-/// Open main turns, sub-agents and Bash tasks prevent terminal events from
-/// reporting Idle. Callers supply post-event activity from live or durable state.
-/// Keep `reads_activity_flags` in sync with every flag-reading arm.
-pub(crate) fn derive_acp_status(
-    event: &crate::acp::Event,
-    turn_active_after: bool,
-    background_agent_active_after: bool,
-) -> Option<StatusIntent> {
+/// The events that move the sidebar status, and how.
+pub(crate) fn status_policy(event: &crate::acp::Event) -> Option<StatusPolicy> {
     use crate::acp::Event;
     match event {
         Event::UserPromptSent { .. }
+        | Event::ApprovalRequested { .. }
         | Event::ApprovalResolved { .. }
-        | Event::ElicitationResolved { .. } => Some(StatusIntent::Set(Status::Running)),
-        // Agent transcript output means a turn is live even when no UserPromptSent preceded
-        // it.
-        Event::ThinkingStarted
+        | Event::ElicitationRequested { .. }
+        | Event::ElicitationResolved { .. }
+        | Event::ThinkingStarted
         | Event::AgentMessageChunk { .. }
-        | Event::ToolCallStarted { .. } => Some(StatusIntent::Set(Status::Running)),
-        // A launched or still-working background sub-agent keeps the sidebar
-        // dot lit even while the main turn is between its own events. Must
-        // not override a pending approval/elicitation's Waiting dot, which
-        // speaks to the main turn, not the sub-agent (#4001).
-        Event::BackgroundAgentLaunched { .. } | Event::BackgroundTaskStarted { .. } => {
-            Some(StatusIntent::SetUnlessHeld(Status::Running))
-        }
-        Event::BackgroundAgentProgress {
+        | Event::ToolCallStarted { .. }
+        | Event::Stopped { .. }
+        | Event::AgentStartupError { .. }
+        | Event::IncompatibleAgent { .. } => Some(StatusPolicy::Authoritative),
+        Event::BackgroundAgentLaunched { .. }
+        | Event::BackgroundTaskStarted { .. }
+        | Event::BackgroundAgentProgress {
             status: crate::acp::state::BackgroundAgentStatus::Running,
             ..
-        } => Some(StatusIntent::SetUnlessHeld(Status::Running)),
-        // A pending approval or elicitation both block the turn on the
-        // user, so the sidebar dot goes yellow either way.
-        Event::ApprovalRequested { .. } | Event::ElicitationRequested { .. } => {
-            Some(StatusIntent::Set(Status::Waiting))
         }
-        // All Stopped reasons surface as Idle, including the rate-limit park.
-        //
-        // Unless something is still busy after this `Stopped`: a background
-        // sub-agent keeps working past its parent (#4001), and the cache can
-        // be ahead of a lagged frame (a newer turn already opened), so the
-        // arm consults both activity flags. Live, the event itself folds
-        // `turn_active` false, so ahead-ness is the only source of `true`.
-        Event::Stopped { .. } => Some(StatusIntent::Set(
-            if turn_active_after || background_agent_active_after {
-                Status::Running
-            } else {
-                Status::Idle
-            },
-        )),
-        // The last outstanding background agent finished. Only drops to Idle
-        // once neither the main turn nor a sibling agent is still active
-        // (`turn_active_after` covers a sub-agent launched mid-turn that
-        // outlives its own completion event's ordering; the `Stopped` arm
-        // consults the same flags). `SetUnlessHeld`
-        // because a sibling agent finishing must not clobber a pending
-        // approval/elicitation on the main turn (#4001).
-        Event::BackgroundAgentCompleted { .. } | Event::BackgroundTaskFinished { .. } => Some(
-            StatusIntent::SetUnlessHeld(if turn_active_after || background_agent_active_after {
-                Status::Running
-            } else {
-                Status::Idle
-            }),
-        ),
-        Event::AgentStartupError { .. } => Some(StatusIntent::Set(Status::Error)),
-        // A successful session/new or session/load means the agent is alive.
-        Event::AcpSessionAssigned { .. } => Some(StatusIntent::HealError),
-        // Auto-resume after a rate-limit park.
-        Event::RateLimitAutoResumed { .. } => Some(StatusIntent::HealError),
+        | Event::BackgroundAgentCompleted { .. }
+        | Event::BackgroundTaskFinished { .. } => Some(StatusPolicy::Background),
+        Event::AcpSessionAssigned { .. } | Event::RateLimitAutoResumed { .. } => {
+            Some(StatusPolicy::Heal)
+        }
         _ => None,
     }
 }
@@ -1370,10 +1323,10 @@ mod tests {
         let rows = vec![missed.clone(), already.clone(), terminal.clone()];
         seed_profile_store(profile, rows.clone());
 
-        let db = temp.path().join("acp-events.db");
-        let store = crate::acp::event_store::EventStore::open(&db, 1000).expect("event store");
+        let state = test_support::build_test_app_state(vec![]);
         for id in [&missed_id, &already_id, &terminal_id] {
-            store
+            state
+                .acp_event_store
                 .record(
                     id,
                     1,
@@ -1383,21 +1336,14 @@ mod tests {
                 )
                 .expect("record stopped");
         }
-        // A cold control cache for these sessions: lag recovery never
-        // hydrates it, so the reads miss and degrade to boot's conservative
-        // `(false, false)` verdict, the Idle+unread behavior this test pins
-        // (#4001).
-        let control_cache = crate::acp::control_cache::ControlStateCache::new();
-
         let instances = RwLock::new(rows);
         let locks = RwLock::new(std::collections::HashMap::new());
         let (status_tx, _rx) = broadcast::channel(16);
 
         let marked = recover_structured_unread_after_lag(
             &instances,
-            &store,
+            &state.session_service,
             &locks,
-            &control_cache,
             crate::file_watch::FileWatchService::noop(),
             &status_tx,
         )
@@ -1432,15 +1378,13 @@ mod tests {
         assert!(!row(&terminal_id).unread);
     }
 
-    /// #4001: the lag-recovery replay must consult the live control cache. The
-    /// seed query excludes background events and `UserDiffCommentsPrompt`, so its
-    /// latest status event can be a `Stopped` while a background sub-agent is
-    /// still running or a newer turn is open; deriving from hardcoded inactivity
-    /// would resolve Idle under the live `Running` status and mark an unfinished
-    /// turn unread.
+    /// #4001: lag recovery projects the whole fold, so a background sub-agent
+    /// still running or a newer turn already open keeps the row `Running` even
+    /// when the latest lifecycle event is a `Stopped`; resolving Idle there
+    /// would mark an unfinished turn unread.
     #[tokio::test]
     #[serial_test::serial]
-    async fn recover_structured_unread_after_lag_keeps_running_for_work_past_the_seed() {
+    async fn recover_structured_unread_after_lag_keeps_running_for_work_past_the_stopped() {
         use crate::acp::Event;
         let prompt = || Event::UserPromptSent {
             text: "go".into(),
@@ -1452,8 +1396,7 @@ mod tests {
         let stopped = || Event::Stopped {
             reason: "prompt_complete".into(),
         };
-        type StillActive = fn(&crate::acp::control_cache::ControlStateCache, &str) -> bool;
-        let cases: [(&str, Vec<Event>, StillActive); 2] = [
+        let cases: [(&str, Vec<Event>); 2] = [
             (
                 "live background agent",
                 vec![
@@ -1469,10 +1412,9 @@ mod tests {
                     },
                     stopped(),
                 ],
-                |cache, id| cache.has_active_background_agent(id),
             ),
             (
-                "newer turn past the seed",
+                "newer turn past the stopped",
                 vec![
                     prompt(),
                     stopped(),
@@ -1484,10 +1426,9 @@ mod tests {
                         assembled_markdown: "diff".into(),
                     },
                 ],
-                |cache, id| cache.turn_active(id),
             ),
         ];
-        for (name, log, still_active) in cases {
+        for (name, log) in cases {
             let temp = tempfile::tempdir().expect("tempdir");
             let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
             crate::session::set_unread_enabled(true);
@@ -1501,31 +1442,13 @@ mod tests {
             let rows = vec![live];
             seed_profile_store(profile, rows.clone());
 
-            let db = temp.path().join("acp-events.db");
-            let store = crate::acp::event_store::EventStore::open(&db, 1000).expect("event store");
+            let state = test_support::build_test_app_state(vec![]);
             for (seq, event) in (1..).zip(&log) {
-                store.record(&live_id, seq, event).expect("record");
+                state
+                    .acp_event_store
+                    .record(&live_id, seq, event)
+                    .expect("record");
             }
-
-            // The daemon's control cache folded the same log.
-            let control_cache = crate::acp::control_cache::ControlStateCache::new();
-            control_cache.get_or_hydrate(&live_id, || {
-                let mut reduced = crate::acp::state::AcpState::new(
-                    crate::acp::state::AcpSessionId(live_id.clone()),
-                    crate::acp::state::AgentName("claude".into()),
-                    None,
-                );
-                let mut last_seq = 0;
-                for (seq, event) in store.replay_from(&live_id, 0) {
-                    let _ = reduced.apply_event(seq, event);
-                    last_seq = seq;
-                }
-                (reduced, last_seq)
-            });
-            assert!(
-                still_active(&control_cache, &live_id),
-                "{name}: precondition: the folded cache still sees the live work"
-            );
 
             let instances = RwLock::new(rows);
             let locks = RwLock::new(std::collections::HashMap::new());
@@ -1533,9 +1456,8 @@ mod tests {
 
             let marked = recover_structured_unread_after_lag(
                 &instances,
-                &store,
+                &state.session_service,
                 &locks,
-                &control_cache,
                 crate::file_watch::FileWatchService::noop(),
                 &status_tx,
             )
@@ -1547,7 +1469,7 @@ mod tests {
             assert_eq!(
                 inst.status,
                 Status::Running,
-                "{name}: the seed's Stopped must not resolve Idle under live work"
+                "{name}: the Stopped must not resolve Idle under live work"
             );
             assert!(
                 !inst.unread,
@@ -1597,6 +1519,7 @@ mod tests {
                         steering: false,
                     }),
                     worker_generation: Some(worker_generation),
+                    sidebar_status: None,
                 })
                 .expect("listener is subscribed");
         };
@@ -1648,6 +1571,7 @@ mod tests {
                     acp_session_id: "replacement-acp-id".to_string(),
                 }),
                 worker_generation: None,
+                sidebar_status: None,
             })
             .expect("listener is subscribed");
         for _ in 0..500 {
@@ -1732,6 +1656,14 @@ mod tests {
         seed_profile_store(profile, vec![inst.clone()]);
 
         let state = test_support::build_test_app_state(vec![inst]);
+        // Events are persisted before they are broadcast.
+        let stopped = crate::acp::Event::Stopped {
+            reason: "prompt_complete".into(),
+        };
+        state
+            .acp_event_store
+            .record(&id, 1, &stopped)
+            .expect("record");
         let listener = tokio::spawn(acp_event_listener(state.clone()));
 
         // A broadcast only reaches receivers that subscribed before the send,
@@ -1755,10 +1687,9 @@ mod tests {
             .send(AcpBroadcastFrame {
                 session_id: id.clone(),
                 seq: 1,
-                event: Arc::new(crate::acp::Event::Stopped {
-                    reason: "prompt_complete".into(),
-                }),
+                event: Arc::new(stopped),
                 worker_generation: None,
+                sidebar_status: None,
             })
             .expect("listener is subscribed");
 
@@ -1797,17 +1728,266 @@ mod tests {
         assert_eq!(row.status, Status::Idle, "the Stopped applied");
     }
 
-    /// #4001: after a daemon restart the control cache is cold, and the live
-    /// listener's own reads of it never hydrate. A reattached worker's first
-    /// live frame is either its sub-agent's completion with the main turn still
-    /// open, or the main turn's `Stopped` with the sub-agent still running.
-    /// Both arms read the activity flags; without hydrating first, both flags
-    /// read false, the frame wrongly derives Idle, and the still-open work is
-    /// marked unread. Hydrating must pick up the whole log and keep the row
-    /// Running.
+    /// The fold runs ahead of the listener, so a burst already folded to its
+    /// end must still replay each frame's own transition: Waiting -> Running on
+    /// the answer, then Running -> Idle on the stop, which is the edge the
+    /// unread mark needs.
     #[tokio::test]
     #[serial_test::serial]
-    async fn acp_event_listener_hydrates_a_cold_cache_before_deriving_a_flag_reading_frame() {
+    async fn acp_event_listener_keeps_the_running_to_idle_edge_across_a_folded_burst() {
+        use crate::acp::approvals::ApprovalDecision;
+        use crate::acp::permissions::build_approval;
+        use crate::acp::state::ToolCall;
+        use crate::acp::Event;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+        crate::session::set_unread_enabled(true);
+
+        let profile = "acp-listener-burst";
+        let mut inst = Instance::new("acp-burst", "/tmp/acp");
+        inst.view = crate::session::View::Structured;
+        inst.source_profile = profile.to_string();
+        inst.status = Status::Waiting;
+        let id = inst.id.clone();
+        seed_profile_store(profile, vec![inst.clone()]);
+        let state = test_support::build_test_app_state(vec![inst]);
+
+        let approval = build_approval(
+            ToolCall {
+                id: "t".into(),
+                name: "shell".into(),
+                kind: "execute".into(),
+                args_preview: "{}".into(),
+                started_at: chrono::Utc::now(),
+                parent_tool_call_id: None,
+                memory_recall: None,
+                diffs: Vec::new(),
+            },
+            Vec::new(),
+        );
+        let answered = Event::ApprovalResolved {
+            nonce: approval.nonce.clone(),
+            decision: ApprovalDecision::Allow,
+        };
+        let stopped = Event::Stopped {
+            reason: "prompt_complete".into(),
+        };
+        let log = [
+            crate::acp::state::test_support::prompt("go"),
+            Event::ApprovalRequested { approval },
+            answered.clone(),
+            stopped.clone(),
+        ];
+        for (seq, event) in (1..).zip(&log) {
+            state
+                .acp_event_store
+                .record(&id, seq, event)
+                .expect("record");
+        }
+
+        let listener = tokio::spawn(acp_event_listener(state.clone()));
+        await_subscribed(&state).await;
+        // Both frames are queued behind a log that already holds the stop.
+        for (seq, event) in [(3, answered), (4, stopped)] {
+            state
+                .acp_events_tx
+                .send(AcpBroadcastFrame {
+                    session_id: id.clone(),
+                    seq,
+                    event: Arc::new(event),
+                    worker_generation: None,
+                    sidebar_status: None,
+                })
+                .expect("listener is subscribed");
+        }
+
+        let row = await_row(
+            &state,
+            &id,
+            |i| i.unread,
+            "the burst's turn end must mark the row unread",
+        )
+        .await;
+        listener.abort();
+        let _ = listener.await;
+        assert_eq!(row.status, Status::Idle);
+        assert!(load_profile_row(profile, &id).is_some_and(|i| i.unread));
+    }
+
+    /// A frame far behind the fold keeps its own transition: ApprovalResolved
+    /// at N is consumed after the content frames and the stop are already
+    /// folded, and must not read a later level. The status rides on the frame,
+    /// so it holds even when a finite retention cap has pruned the answer out
+    /// of the journal.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn acp_event_listener_keeps_the_edge_for_a_frame_far_behind_the_fold() {
+        use crate::acp::approvals::ApprovalDecision;
+        use crate::acp::permissions::build_approval;
+        use crate::acp::state::test_support::prompt;
+        use crate::acp::state::ToolCall;
+        use crate::acp::Event;
+        for (retained, content_frames) in [(2000usize, 255usize), (2000, 600), (42, 600)] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+            crate::session::set_unread_enabled(true);
+
+            let profile = "acp-listener-window";
+            let mut inst = Instance::new("acp-window", "/tmp/acp");
+            inst.view = crate::session::View::Structured;
+            inst.source_profile = profile.to_string();
+            inst.status = Status::Waiting;
+            let id = inst.id.clone();
+            seed_profile_store(profile, vec![inst.clone()]);
+            let store = Arc::new(
+                crate::acp::event_store::EventStore::open(&temp.path().join("acp.db"), retained)
+                    .expect("event store"),
+            );
+            let state = test_support::build_test_app_state_impl_with_event_store(
+                vec![inst],
+                Vec::new(),
+                Vec::new(),
+                None,
+                Some(store),
+                |_| {},
+                std::convert::identity,
+            );
+
+            let tool_call = ToolCall {
+                id: "t".into(),
+                name: "shell".into(),
+                kind: "execute".into(),
+                args_preview: "{}".into(),
+                started_at: chrono::Utc::now(),
+                parent_tool_call_id: None,
+                memory_recall: None,
+                diffs: Vec::new(),
+            };
+            let approval = build_approval(tool_call, Vec::new());
+            let answered = Event::ApprovalResolved {
+                nonce: approval.nonce.clone(),
+                decision: ApprovalDecision::Allow,
+            };
+            let stopped = Event::Stopped {
+                reason: "prompt_complete".into(),
+            };
+            // Hydrate, then fold the whole window ahead of the listener: the answer
+            // at seq 3, `content_frames` content frames, then the stop.
+            let mut log = vec![prompt("go"), Event::ApprovalRequested { approval }];
+            log.push(answered.clone());
+            log.extend((0..content_frames).map(|i| Event::ToolCallContent {
+                tool_call_id: "t".into(),
+                content: format!("out {i}"),
+            }));
+            log.push(stopped.clone());
+            for (seq, event) in (1..).zip(&log[..2]) {
+                state
+                    .acp_event_store
+                    .record(&id, seq, event)
+                    .expect("record");
+            }
+            state.session_service.fold_control_state(&id).await;
+            // What the sink does: record, fold, and keep the status after each seq.
+            let mut folded = Vec::new();
+            for (seq, event) in (3..).zip(&log[2..]) {
+                state
+                    .acp_event_store
+                    .record(&id, seq, event)
+                    .expect("record");
+                folded.push(state.acp_control_cache.apply_if_cached(&id, seq, event));
+            }
+            let last = log.len() as u64;
+            let answered_status = folded[0];
+            let stopped_status = *folded.last().expect("folded");
+            assert_eq!(answered_status, Some(Status::Running));
+            assert_eq!(stopped_status, Some(Status::Idle));
+
+            let listener = tokio::spawn(acp_event_listener(state.clone()));
+            await_subscribed(&state).await;
+            for (seq, event, sidebar_status) in [
+                (3, answered, answered_status),
+                (last, stopped, stopped_status),
+            ] {
+                state
+                    .acp_events_tx
+                    .send(AcpBroadcastFrame {
+                        session_id: id.clone(),
+                        seq,
+                        event: Arc::new(event),
+                        worker_generation: None,
+                        sidebar_status,
+                    })
+                    .expect("listener is subscribed");
+            }
+
+            let row = await_row(
+                &state,
+                &id,
+                |i| i.unread,
+                "the stop behind the fold must mark the row unread",
+            )
+            .await;
+            listener.abort();
+            let _ = listener.await;
+            assert_eq!(
+                row.status,
+                Status::Idle,
+                "{content_frames} frames, retention {retained}"
+            );
+            assert!(load_profile_row(profile, &id).is_some_and(|i| i.unread));
+        }
+    }
+
+    /// A startup error whose event-store write failed is substituted by the
+    /// sink and never reaches the log or the fold; the frame alone must still
+    /// move the row to Error.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn acp_event_listener_applies_a_startup_error_that_never_reached_the_log() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let mut inst = Instance::new("acp-unpersisted", "/tmp/acp");
+        inst.view = crate::session::View::Structured;
+        inst.status = Status::Idle;
+        let id = inst.id.clone();
+        let state = test_support::build_test_app_state(vec![inst]);
+
+        let listener = tokio::spawn(acp_event_listener(state.clone()));
+        await_subscribed(&state).await;
+        state
+            .acp_events_tx
+            .send(AcpBroadcastFrame {
+                session_id: id.clone(),
+                seq: 7,
+                event: Arc::new(crate::acp::Event::AgentStartupError {
+                    message: "event store write failed at seq 7".into(),
+                }),
+                worker_generation: None,
+                sidebar_status: None,
+            })
+            .expect("listener is subscribed");
+
+        let row = await_row(
+            &state,
+            &id,
+            |i| i.status == Status::Error,
+            "a non-persisted startup error must turn the row Error",
+        )
+        .await;
+        listener.abort();
+        let _ = listener.await;
+        assert_eq!(row.status, Status::Error);
+    }
+
+    /// #4001: after a daemon restart the control cache is cold. A reattached
+    /// worker's first live frame is either its sub-agent's completion with the
+    /// main turn still open, or the main turn's `Stopped` with the sub-agent
+    /// still running. Projecting a cold fold would resolve Idle and mark the
+    /// still-open work unread, so the listener hydrates the whole log first
+    /// and the row stays Running.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn acp_event_listener_rebuilds_a_frame_published_to_a_cold_cache() {
         use crate::acp::Event;
         let completed = Event::BackgroundAgentCompleted {
             agent_id: "bg-1".into(),
@@ -1820,16 +2000,11 @@ mod tests {
         let stopped = Event::Stopped {
             reason: "prompt_complete".into(),
         };
-        type StillActive = fn(&crate::acp::control_cache::ControlStateCache, &str) -> bool;
-        let cases: [(&str, Event, StillActive); 2] = [
-            ("mid-turn completion", completed, |cache, id| {
-                cache.turn_active(id)
-            }),
-            ("stopped with an outstanding agent", stopped, |cache, id| {
-                cache.has_active_background_agent(id)
-            }),
+        let cases: [(&str, Event); 2] = [
+            ("mid-turn completion", completed),
+            ("stopped with an outstanding agent", stopped),
         ];
-        for (name, live_frame, still_active) in cases {
+        for (name, live_frame) in cases {
             let temp = tempfile::tempdir().expect("tempdir");
             let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
             crate::session::set_unread_enabled(true);
@@ -1899,6 +2074,7 @@ mod tests {
                     seq: 3,
                     event: Arc::new(live_frame),
                     worker_generation: None,
+                    sidebar_status: None,
                 })
                 .expect("listener is subscribed");
 
@@ -1927,7 +2103,11 @@ mod tests {
                 "{name}: a resolved live turn must not be unread"
             );
             assert!(state.acp_control_cache.is_hydrated(&id), "{name}");
-            assert!(still_active(&state.acp_control_cache, &id), "{name}");
+            assert_eq!(
+                state.acp_control_cache.sidebar_status(&id),
+                Some(Status::Running),
+                "{name}"
+            );
         }
     }
 
@@ -2139,6 +2319,28 @@ mod tests {
         assert!(profile.is_some(), "the clear must persist");
     }
 
+    #[test]
+    fn a_new_acp_id_drops_only_a_stale_asserted_binding() {
+        let binding = |provenance| crate::session::ConversationBinding {
+            session_id: "old-id".into(),
+            execution: None,
+            provenance,
+            transcript_path: None,
+        };
+        let new_id = AcpSessionChange::Assigned("new-id".into());
+        for (provenance, kept) in [
+            (crate::session::ConversationProvenance::Asserted, false),
+            (crate::session::ConversationProvenance::Observed, true),
+        ] {
+            let mut inst = Instance::new("seed", "/tmp/seed");
+            inst.view = crate::session::View::Structured;
+            inst.acp_session_id = Some("old-id".into());
+            inst.resume_binding = Some(binding(provenance));
+            apply_acp_session_change(&mut inst, "sess-1", Some(&new_id));
+            assert_eq!(inst.resume_binding.is_some(), kept);
+        }
+    }
+
     // Regression for the event-ordering the listener sees: an id assigned at
     // connect followed by a later /clear must end with no stored id. See #3080.
     #[test]
@@ -2175,376 +2377,6 @@ mod tests {
         );
         assert!(expected.matches(&inst));
         assert_eq!(inst.acp_session_id, None);
-    }
-
-    #[test]
-    fn derive_acp_status_maps_terminal_events() {
-        use crate::acp::approvals::{ApprovalDecision, Nonce};
-        use crate::acp::permissions::build_approval;
-        use crate::acp::state::ToolCall;
-        use crate::acp::Event;
-        let tool_call = ToolCall {
-            id: "t".into(),
-            name: "shell".into(),
-            kind: "execute".into(),
-            args_preview: "{}".into(),
-            started_at: chrono::Utc::now(),
-            parent_tool_call_id: None,
-            memory_recall: None,
-            diffs: Vec::new(),
-        };
-        assert_eq!(
-            derive_acp_status(
-                &Event::UserPromptSent {
-                    prompt_id: None,
-                    text: "hi".into(),
-                    attachments: Vec::new(),
-                    synthesized: false,
-                    origin_plugin: None,
-                },
-                false,
-                false
-            ),
-            Some(StatusIntent::Set(Status::Running))
-        );
-        assert_eq!(
-            derive_acp_status(
-                &Event::ApprovalRequested {
-                    approval: build_approval(tool_call.clone(), Vec::new()),
-                },
-                false,
-                false
-            ),
-            Some(StatusIntent::Set(Status::Waiting))
-        );
-        assert_eq!(
-            derive_acp_status(
-                &Event::ApprovalResolved {
-                    nonce: Nonce("x".into()),
-                    decision: ApprovalDecision::Allow,
-                },
-                false,
-                false
-            ),
-            Some(StatusIntent::Set(Status::Running))
-        );
-        // A pending elicitation blocks the turn on the user just like an
-        // approval, so the sidebar dot must go yellow (Waiting) and recover
-        // to Running on resolution.
-        let elicitation = crate::acp::elicitations::Elicitation {
-            nonce: Nonce("e-1".into()),
-            message: "Pick".into(),
-            title: None,
-            description: None,
-            tool_call_id: None,
-            questions: Vec::new(),
-            requested_at: chrono::Utc::now(),
-            resolved: None,
-        };
-        assert_eq!(
-            derive_acp_status(&Event::ElicitationRequested { elicitation }, false, false),
-            Some(StatusIntent::Set(Status::Waiting))
-        );
-        assert_eq!(
-            derive_acp_status(
-                &Event::ElicitationResolved {
-                    nonce: Nonce("e-1".into()),
-                    outcome: crate::acp::elicitations::ElicitationOutcome::Accepted,
-                    answers: Vec::new(),
-                },
-                false,
-                false
-            ),
-            Some(StatusIntent::Set(Status::Running))
-        );
-        assert_eq!(
-            derive_acp_status(
-                &Event::Stopped {
-                    reason: "prompt_complete".into()
-                },
-                false,
-                false
-            ),
-            Some(StatusIntent::Set(Status::Idle))
-        );
-        // A background sub-agent the main turn spawned is still running
-        // (the caller's `background_agent_active_after` reads true): the dot
-        // must stay lit rather than drop to Idle with the main turn's
-        // Stopped. #4001. `turn_active_after` is false here: live, the
-        // Stopped itself folds it; ahead-of-frame is covered by another test.
-        assert_eq!(
-            derive_acp_status(
-                &Event::Stopped {
-                    reason: "prompt_complete".into()
-                },
-                false,
-                true
-            ),
-            Some(StatusIntent::Set(Status::Running))
-        );
-        assert_eq!(
-            derive_acp_status(
-                &Event::BackgroundAgentCompleted {
-                    agent_id: "a-1".into(),
-                    status: crate::acp::state::BackgroundAgentStatus::Completed,
-                    tools: Vec::new(),
-                    result: None,
-                    warning: None,
-                    ended_at: chrono::Utc::now(),
-                },
-                false,
-                true,
-            ),
-            Some(StatusIntent::SetUnlessHeld(Status::Running)),
-            "a sibling background agent is still active"
-        );
-        // The main turn that launched this agent is still going (it landed
-        // mid-turn, ahead of the eventual Stopped): must not drop to Idle
-        // under a live turn even with no sibling agents left. See #4001.
-        assert_eq!(
-            derive_acp_status(
-                &Event::BackgroundAgentCompleted {
-                    agent_id: "a-1".into(),
-                    status: crate::acp::state::BackgroundAgentStatus::Completed,
-                    tools: Vec::new(),
-                    result: None,
-                    warning: None,
-                    ended_at: chrono::Utc::now(),
-                },
-                true,
-                false,
-            ),
-            Some(StatusIntent::SetUnlessHeld(Status::Running)),
-            "the main turn is still active"
-        );
-        assert_eq!(
-            derive_acp_status(
-                &Event::BackgroundAgentCompleted {
-                    agent_id: "a-1".into(),
-                    status: crate::acp::state::BackgroundAgentStatus::Completed,
-                    tools: Vec::new(),
-                    result: None,
-                    warning: None,
-                    ended_at: chrono::Utc::now(),
-                },
-                false,
-                false,
-            ),
-            Some(StatusIntent::SetUnlessHeld(Status::Idle)),
-            "the last background agent finished and the main turn already stopped"
-        );
-        assert_eq!(
-            derive_acp_status(
-                &Event::BackgroundAgentLaunched {
-                    agent_id: "a-1".into(),
-                    tool_call_id: "t".into(),
-                    description: "desc".into(),
-                    prompt: "p".into(),
-                    model: "m".into(),
-                    output_file: "f".into(),
-                    started_at: chrono::Utc::now(),
-                },
-                false,
-                false,
-            ),
-            Some(StatusIntent::SetUnlessHeld(Status::Running))
-        );
-        assert_eq!(
-            derive_acp_status(
-                &Event::BackgroundAgentProgress {
-                    agent_id: "a-1".into(),
-                    status: crate::acp::state::BackgroundAgentStatus::Running,
-                    tool_count: 1,
-                    tools: Vec::new(),
-                    last_tool: None,
-                    last_text: None,
-                    at: chrono::Utc::now(),
-                },
-                false,
-                false,
-            ),
-            Some(StatusIntent::SetUnlessHeld(Status::Running))
-        );
-        // Rate-limit park: NOT an error; sidebar stays grey, the
-        // dedicated RateLimit banner carries the reset time. See #1281.
-        assert_eq!(
-            derive_acp_status(
-                &Event::Stopped {
-                    reason: "rate_limited".into()
-                },
-                false,
-                false
-            ),
-            Some(StatusIntent::Set(Status::Idle))
-        );
-        assert_eq!(
-            derive_acp_status(
-                &Event::AgentStartupError {
-                    message: "boom".into()
-                },
-                false,
-                false
-            ),
-            Some(StatusIntent::Set(Status::Error))
-        );
-        // AcpSessionAssigned heals an Error banner only; never
-        // clobbers an in-progress Running/Waiting turn.
-        assert_eq!(
-            derive_acp_status(
-                &Event::AcpSessionAssigned {
-                    acp_session_id: "uuid".into()
-                },
-                false,
-                false
-            ),
-            Some(StatusIntent::HealError)
-        );
-        // Rate-limit auto-resume breadcrumb heals like AcpSessionAssigned:
-        // the worker is coming back, so clear a sticky error without
-        // clobbering an in-progress turn. See #1722.
-        assert_eq!(
-            derive_acp_status(
-                &Event::RateLimitAutoResumed {
-                    resets_at: chrono::Utc::now(),
-                    manual: false,
-                },
-                false,
-                false
-            ),
-            Some(StatusIntent::HealError)
-        );
-        for (event, turn_active, background_active, status, reads_flags) in [
-            (
-                Event::BackgroundTaskStarted {
-                    task_id: "t-1".into(),
-                    tool_call_id: None,
-                    description: "sleep".into(),
-                },
-                false,
-                false,
-                Status::Running,
-                false,
-            ),
-            (
-                Event::BackgroundTaskFinished {
-                    task_id: "t-1".into(),
-                },
-                false,
-                false,
-                Status::Idle,
-                true,
-            ),
-            (
-                Event::BackgroundTaskFinished {
-                    task_id: "t-1".into(),
-                },
-                false,
-                true,
-                Status::Running,
-                true,
-            ),
-            (
-                Event::BackgroundTaskFinished {
-                    task_id: "t-1".into(),
-                },
-                true,
-                false,
-                Status::Running,
-                true,
-            ),
-        ] {
-            assert_eq!(reads_activity_flags(&event), reads_flags);
-            assert_eq!(
-                derive_acp_status(&event, turn_active, background_active),
-                Some(StatusIntent::SetUnlessHeld(status)),
-            );
-        }
-    }
-
-    /// #4001: stopping a session mid-sub-agent must not leave it reading
-    /// Running forever. `Supervisor::shutdown_with_reason`'s teardown path
-    /// now publishes a synthetic `BackgroundAgentCompleted { Detached }` for
-    /// every outstanding agent before its own `Stopped`; replay this exact
-    /// sequence through a real `AcpState` (not hand-fed booleans) to prove
-    /// the fold actually clears `has_active_background_agent`, and that the
-    /// resumed session's terminating `Stopped` derives Idle off it.
-    #[test]
-    fn derive_acp_status_resolves_idle_once_teardown_detaches_the_last_agent() {
-        use crate::acp::state::{AcpSessionId, AcpState, AgentName, BackgroundAgentStatus};
-        use crate::acp::Event;
-
-        let mut state = AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None);
-        state
-            .apply_event(
-                state.last_seq.saturating_add(1),
-                Event::UserPromptSent {
-                    prompt_id: None,
-                    text: "spawn and go".into(),
-                    attachments: Vec::new(),
-                    synthesized: false,
-                    origin_plugin: None,
-                },
-            )
-            .unwrap();
-        state
-            .apply_event(
-                state.last_seq.saturating_add(1),
-                Event::BackgroundAgentLaunched {
-                    agent_id: "bg-1".into(),
-                    tool_call_id: "tc-1".into(),
-                    description: "map backend".into(),
-                    prompt: "do it".into(),
-                    model: "claude-opus-4-8".into(),
-                    output_file: "/tmp/bg-1.output".into(),
-                    started_at: chrono::Utc::now(),
-                },
-            )
-            .unwrap();
-        assert!(
-            state.has_active_background_agent(),
-            "precondition: the launch is still outstanding"
-        );
-
-        // Without this event the fold below would still see the agent as
-        // outstanding and the final Stopped would derive Running: this is
-        // the bug (#4001), not a hypothetical.
-        state
-            .apply_event(
-                state.last_seq.saturating_add(1),
-                Event::BackgroundAgentCompleted {
-                    agent_id: "bg-1".into(),
-                    status: BackgroundAgentStatus::Detached,
-                    tools: Vec::new(),
-                    result: None,
-                    warning: None,
-                    ended_at: chrono::Utc::now(),
-                },
-            )
-            .unwrap();
-        assert!(
-            !state.has_active_background_agent(),
-            "a Detached completion closes the record like any other terminal status"
-        );
-
-        state
-            .apply_event(
-                state.last_seq.saturating_add(1),
-                Event::Stopped {
-                    reason: "user_stopped".into(),
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            derive_acp_status(
-                &Event::Stopped {
-                    reason: "user_stopped".into()
-                },
-                state.turn_active,
-                state.has_active_background_agent(),
-            ),
-            Some(StatusIntent::Set(Status::Idle)),
-            "the resumed session's turn-end must not read Running forever"
-        );
     }
 
     #[test]
@@ -2593,192 +2425,66 @@ mod tests {
     }
 
     #[test]
-    fn derive_acp_status_running_on_agent_activity() {
-        use crate::acp::state::ToolCall;
-        use crate::acp::Event;
-        // A turn that resumes agent-side (fired ScheduleWakeup, background
-        // TaskOutput notification) streams only these events, never a
-        // UserPromptSent. They must drive Running so the sidebar dot recovers.
-        assert_eq!(
-            derive_acp_status(
-                &Event::AgentMessageChunk {
-                    text: "x".into(),
-                    message_id: None
-                },
-                false,
-                false
-            ),
-            Some(StatusIntent::Set(Status::Running))
-        );
-        assert_eq!(
-            derive_acp_status(&Event::ThinkingStarted, false, false),
-            Some(StatusIntent::Set(Status::Running))
-        );
-        assert_eq!(
-            derive_acp_status(
-                &Event::ToolCallStarted {
-                    tool_call: ToolCall {
-                        id: "t".into(),
-                        name: "shell".into(),
-                        kind: "execute".into(),
-                        args_preview: "{}".into(),
-                        started_at: chrono::Utc::now(),
-                        parent_tool_call_id: None,
-                        memory_recall: None,
-                        diffs: Vec::new(),
-                    },
-                },
-                false,
-                false
-            ),
-            Some(StatusIntent::Set(Status::Running))
-        );
-        // ThinkingEnded is a sub-phase terminator, not a work signal; leaving
-        // it None avoids needless intents (ThinkingStarted already set Running).
-        assert_eq!(derive_acp_status(&Event::ThinkingEnded, false, false), None);
-    }
-
-    #[test]
-    fn derive_acp_status_ignores_the_flags_off_the_two_reading_arms() {
+    fn status_policy_classifies_the_events_that_move_the_sidebar() {
         use crate::acp::approvals::{ApprovalDecision, Nonce};
-        use crate::acp::state::ToolCall;
+        use crate::acp::state::test_support::{chunk, prompt, stopped};
+        use crate::acp::state::BackgroundAgentStatus;
         use crate::acp::Event;
-        // Every arm `derive_acp_status` currently gives a name to, other than
-        // `Stopped` and `BackgroundAgentCompleted`. If one of these starts
-        // reading `turn_active_after` / `background_agent_active_after`
-        // without extending `reads_activity_flags`, this table still calls it
-        // with `(false, false)` and `(true, true)` below, and a flag-sensitive
-        // result makes them differ: this fails. A brand-new `Event` variant
-        // with its own flag-reading arm is in neither this table nor the
-        // predicate, so it passes silently; extending both stays a
-        // reviewer-caught convention, not something this test can enforce.
-        let tool_call = ToolCall {
-            id: "t".into(),
-            name: "shell".into(),
-            kind: "execute".into(),
-            args_preview: "{}".into(),
-            started_at: chrono::Utc::now(),
-            parent_tool_call_id: None,
-            memory_recall: None,
-            diffs: Vec::new(),
+        use StatusPolicy::{Authoritative, Background, Heal};
+        let completed = Event::BackgroundAgentCompleted {
+            agent_id: "bg-1".into(),
+            status: BackgroundAgentStatus::Completed,
+            tools: Vec::new(),
+            result: None,
+            warning: None,
+            ended_at: chrono::Utc::now(),
         };
-        let elicitation = crate::acp::elicitations::Elicitation {
-            nonce: Nonce("e-1".into()),
-            message: "Pick".into(),
-            title: None,
-            description: None,
-            tool_call_id: None,
-            questions: Vec::new(),
-            requested_at: chrono::Utc::now(),
-            resolved: None,
+        let progress = |status| Event::BackgroundAgentProgress {
+            agent_id: "bg-1".into(),
+            status,
+            tool_count: 0,
+            tools: Vec::new(),
+            last_tool: None,
+            last_text: None,
+            at: chrono::Utc::now(),
         };
-        let events: Vec<(&str, Event)> = vec![
+        let cases = [
+            (prompt("hi"), Some(Authoritative)),
+            (chunk("x"), Some(Authoritative)),
+            (Event::ThinkingStarted, Some(Authoritative)),
+            (stopped("prompt_complete"), Some(Authoritative)),
             (
-                "UserPromptSent",
-                Event::UserPromptSent {
-                    prompt_id: None,
-                    text: "hi".into(),
-                    attachments: Vec::new(),
-                    synthesized: false,
-                    origin_plugin: None,
+                Event::AgentStartupError {
+                    message: "boom".into(),
                 },
+                Some(Authoritative),
             ),
             (
-                "ApprovalResolved",
                 Event::ApprovalResolved {
                     nonce: Nonce("x".into()),
                     decision: ApprovalDecision::Allow,
                 },
+                Some(Authoritative),
             ),
+            (completed, Some(Background)),
             (
-                "ElicitationResolved",
-                Event::ElicitationResolved {
-                    nonce: Nonce("e-1".into()),
-                    outcome: crate::acp::elicitations::ElicitationOutcome::Accepted,
-                    answers: Vec::new(),
+                Event::BackgroundTaskFinished {
+                    task_id: "t".into(),
                 },
+                Some(Background),
             ),
-            ("ThinkingStarted", Event::ThinkingStarted),
+            (progress(BackgroundAgentStatus::Running), Some(Background)),
+            (progress(BackgroundAgentStatus::Completed), None),
             (
-                "AgentMessageChunk",
-                Event::AgentMessageChunk {
-                    text: "x".into(),
-                    message_id: None,
-                },
-            ),
-            (
-                "ToolCallStarted",
-                Event::ToolCallStarted {
-                    tool_call: tool_call.clone(),
-                },
-            ),
-            (
-                "BackgroundAgentLaunched",
-                Event::BackgroundAgentLaunched {
-                    agent_id: "a-1".into(),
-                    tool_call_id: "t".into(),
-                    description: "desc".into(),
-                    prompt: "p".into(),
-                    model: "m".into(),
-                    output_file: "f".into(),
-                    started_at: chrono::Utc::now(),
-                },
-            ),
-            (
-                "BackgroundAgentProgress(Running)",
-                Event::BackgroundAgentProgress {
-                    agent_id: "a-1".into(),
-                    status: crate::acp::state::BackgroundAgentStatus::Running,
-                    tool_count: 1,
-                    tools: Vec::new(),
-                    last_tool: None,
-                    last_text: None,
-                    at: chrono::Utc::now(),
-                },
-            ),
-            (
-                "ApprovalRequested",
-                Event::ApprovalRequested {
-                    approval: crate::acp::permissions::build_approval(
-                        tool_call.clone(),
-                        Vec::new(),
-                    ),
-                },
-            ),
-            (
-                "ElicitationRequested",
-                Event::ElicitationRequested { elicitation },
-            ),
-            (
-                "AgentStartupError",
-                Event::AgentStartupError {
-                    message: "boom".into(),
-                },
-            ),
-            (
-                "AcpSessionAssigned",
                 Event::AcpSessionAssigned {
-                    acp_session_id: "uuid".into(),
+                    acp_session_id: "a".into(),
                 },
+                Some(Heal),
             ),
-            (
-                "RateLimitAutoResumed",
-                Event::RateLimitAutoResumed {
-                    resets_at: chrono::Utc::now(),
-                    manual: false,
-                },
-            ),
+            (Event::ThinkingEnded, None),
         ];
-        for (name, event) in &events {
-            assert!(
-                !reads_activity_flags(event),
-                "{name} must not be in this table if it reads the flags"
-            );
-            assert_eq!(
-                derive_acp_status(event, false, false),
-                derive_acp_status(event, true, true),
-                "{name} must ignore turn_active_after/background_agent_active_after"
-            );
+        for (event, want) in cases {
+            assert_eq!(status_policy(&event), want, "{event:?}");
         }
     }
 
@@ -2791,9 +2497,9 @@ mod tests {
         inst
     }
 
-    fn apply(inst: &mut Instance, intent: StatusIntent) {
+    fn apply(inst: &mut Instance, policy: StatusPolicy, target: Status) {
         let tx = broadcast::channel(8).0;
-        apply_status_intent(inst, Some(intent), &tx);
+        apply_status_intent(inst, policy, target, &tx);
     }
 
     /// Consumers scope a change by profile after the row may be gone, so the published change
@@ -2804,7 +2510,7 @@ mod tests {
         inst.source_profile = "work".to_string();
         inst.status = Status::Idle;
         let (tx, mut rx) = broadcast::channel(8);
-        apply_status_intent(&mut inst, Some(StatusIntent::Set(Status::Running)), &tx);
+        apply_status_intent(&mut inst, StatusPolicy::Authoritative, Status::Running, &tx);
         assert_eq!(rx.try_recv().unwrap().effective_profile, "work");
     }
 
@@ -2816,14 +2522,14 @@ mod tests {
         let mut inst = stopped_structured_instance();
         inst.plugin_revival_pending = true;
 
-        apply(&mut inst, StatusIntent::HealError);
+        apply(&mut inst, StatusPolicy::Heal, Status::Idle);
         assert_eq!(inst.status, Status::Idle);
         assert!(
             inst.plugin_revival_pending,
             "the heal's Idle hop must not release the mark early"
         );
 
-        apply(&mut inst, StatusIntent::Set(Status::Running));
+        apply(&mut inst, StatusPolicy::Authoritative, Status::Running);
         assert_eq!(inst.status, Status::Running);
         assert!(
             !inst.plugin_revival_pending,
@@ -2841,7 +2547,7 @@ mod tests {
         inst.status = Status::Running;
         inst.plugin_revival_pending = true;
 
-        apply(&mut inst, StatusIntent::Set(Status::Running));
+        apply(&mut inst, StatusPolicy::Authoritative, Status::Running);
 
         assert_eq!(inst.status, Status::Running);
         assert!(
@@ -2858,7 +2564,11 @@ mod tests {
         let mut daemon_row = stopped_structured_instance();
         daemon_row.status = Status::Idle;
         daemon_row.last_accessed_at = Some(user_touch);
-        apply(&mut daemon_row, StatusIntent::Set(Status::Running));
+        apply(
+            &mut daemon_row,
+            StatusPolicy::Authoritative,
+            Status::Running,
+        );
 
         let mut disk = stopped_structured_instance();
         disk.status = Status::Idle;
@@ -2877,48 +2587,48 @@ mod tests {
         );
     }
 
-    /// Which intents may move which statuses. Background sub-agent intents
-    /// (`SetUnlessHeld`) must not speak for the main turn's Waiting, Error, or
+    /// Which policies may move which statuses. Background sub-agent events
+    /// (`Background`) must not speak for the main turn's Waiting, Error, or
     /// Stopped (#4001); trailing events never wake a Stopped or trashed row;
     /// and no transition stamps `last_accessed_at` (#3465).
     #[test]
     fn apply_status_intent_matrix() {
         use Status::{Creating, Deleting, Error, Idle, Running, Stopped, Waiting};
-        use StatusIntent::{HealError, Set, SetUnlessHeld};
+        use StatusPolicy::{Authoritative, Background, Heal};
         let user_touch = chrono::Utc::now() - chrono::Duration::seconds(60);
-        // (from, trashed, intent, want)
+        // (from, trashed, policy, target, want)
         let cases = [
-            (Stopped, false, HealError, Idle),
-            (Error, false, HealError, Idle),
-            (Running, false, HealError, Running),
-            (Idle, false, Set(Running), Running),
-            (Running, false, Set(Idle), Idle),
-            (Waiting, false, Set(Running), Running),
-            (Stopped, false, Set(Running), Stopped),
-            (Stopped, false, Set(Waiting), Stopped),
-            (Stopped, false, Set(Idle), Stopped),
-            (Running, true, Set(Error), Running),
-            (Idle, false, SetUnlessHeld(Running), Running),
-            (Running, false, SetUnlessHeld(Idle), Idle),
-            (Waiting, false, SetUnlessHeld(Running), Waiting),
-            (Waiting, false, SetUnlessHeld(Idle), Waiting),
-            (Error, false, SetUnlessHeld(Running), Error),
-            (Error, false, SetUnlessHeld(Idle), Error),
-            (Stopped, false, SetUnlessHeld(Running), Stopped),
-            (Deleting, false, Set(Running), Deleting),
-            (Deleting, false, HealError, Deleting),
-            (Creating, false, Set(Running), Creating),
-            (Creating, false, HealError, Creating),
+            (Stopped, false, Heal, Idle, Idle),
+            (Error, false, Heal, Idle, Idle),
+            (Running, false, Heal, Idle, Running),
+            (Idle, false, Authoritative, Running, Running),
+            (Running, false, Authoritative, Idle, Idle),
+            (Waiting, false, Authoritative, Running, Running),
+            (Stopped, false, Authoritative, Running, Stopped),
+            (Stopped, false, Authoritative, Waiting, Stopped),
+            (Stopped, false, Authoritative, Idle, Stopped),
+            (Running, true, Authoritative, Error, Running),
+            (Idle, false, Background, Running, Running),
+            (Running, false, Background, Idle, Idle),
+            (Waiting, false, Background, Running, Waiting),
+            (Waiting, false, Background, Idle, Waiting),
+            (Error, false, Background, Running, Error),
+            (Error, false, Background, Idle, Error),
+            (Stopped, false, Background, Running, Stopped),
+            (Deleting, false, Authoritative, Running, Deleting),
+            (Deleting, false, Heal, Idle, Deleting),
+            (Creating, false, Authoritative, Running, Creating),
+            (Creating, false, Heal, Idle, Creating),
         ];
-        for (from, trashed, intent, want) in cases {
-            let case = format!("{from:?} trashed={trashed} {intent:?}");
+        for (from, trashed, policy, target, want) in cases {
+            let case = format!("{from:?} trashed={trashed} {policy:?} {target:?}");
             let mut inst = stopped_structured_instance();
             inst.status = from;
             inst.last_accessed_at = Some(user_touch);
             if trashed {
                 inst.trash();
             }
-            apply(&mut inst, intent);
+            apply(&mut inst, policy, target);
             assert_eq!(inst.status, want, "{case}");
             assert_eq!(inst.last_accessed_at, Some(user_touch), "{case}");
             if want != from {
@@ -2930,7 +2640,7 @@ mod tests {
     /// Daemon restart: an in-flight turn unblocks a persisted Stopped, a
     /// deliberate stop stays Stopped.
     #[tokio::test]
-    async fn seed_acp_statuses_follows_the_latest_status_event() {
+    async fn seed_acp_statuses_follows_the_folded_status() {
         use crate::acp::Event;
         let cases = [
             (
@@ -2961,6 +2671,13 @@ mod tests {
             seed_acp_statuses(state.clone()).await;
             assert_eq!(state.instances.read().await[0].status, want, "{event:?}");
         }
+
+        // A session with no events has nothing to project and keeps its row.
+        let mut fresh = stopped_structured_instance();
+        fresh.status = Status::Starting;
+        let state = test_support::build_test_app_state(vec![fresh]);
+        seed_acp_statuses(state.clone()).await;
+        assert_eq!(state.instances.read().await[0].status, Status::Starting);
     }
 
     #[tokio::test]
@@ -2996,6 +2713,8 @@ mod tests {
             }
             seed_acp_statuses(state.clone()).await;
             assert_eq!(state.instances.read().await[0].status, Status::Running);
+            // The store write bypasses the cache; a reboot starts cold.
+            state.acp_control_cache.forget(&id);
             state
                 .acp_event_store
                 .record(
@@ -3086,6 +2805,7 @@ mod tests {
                     acp_session_id: "attested-acp-id".to_string(),
                 }),
                 worker_generation: None,
+                sidebar_status: None,
             })
             .expect("listener is subscribed");
 
