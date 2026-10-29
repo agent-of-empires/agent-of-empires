@@ -48,7 +48,7 @@ fn row_column_cells(state: &RemoteHomeState, session_id: &str) -> MeasuredCells 
     let mut budget = ROW_COLUMN_MAX_WIDTH;
     let mut width = 0;
     let mut cells = Vec::new();
-    for (text, tone) in plugin_ui::row_column_cells(&state.plugin_ui, session_id) {
+    for (text, tone) in plugin_ui::session_row_statuses(&state.plugin_ui, session_id) {
         let gap = if cells.is_empty() {
             0
         } else {
@@ -59,7 +59,7 @@ fn row_column_cells(state: &RemoteHomeState, session_id: &str) -> MeasuredCells 
         if budget <= gap {
             break;
         }
-        let text = truncate_to_width(&text, budget - gap);
+        let text = truncate_to_width(text, budget - gap);
         // Clamp rather than trust the helper: if it ever hands back more cells
         // than it was given, `budget -= gap + len` would underflow (panic in a
         // debug build) or wrap the budget wide open, voiding the cap this loop

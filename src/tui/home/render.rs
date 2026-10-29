@@ -889,13 +889,10 @@ fn title_width_for_column(
     (title_width.min(budget), false)
 }
 
-#[cfg(feature = "web")]
 const MAX_PLUGIN_STATUS_WIDTH: usize = 32;
 
-#[cfg(feature = "web")]
 const MAX_PLUGIN_STATUS_COUNT: usize = 16;
 
-#[cfg(feature = "web")]
 #[derive(Clone, Copy)]
 struct PluginStatusSpan<'a> {
     text: &'a str,
@@ -903,21 +900,18 @@ struct PluginStatusSpan<'a> {
     width: usize,
 }
 
-#[cfg(feature = "web")]
 struct PluginStatusPlan<'a> {
     spans: [Option<PluginStatusSpan<'a>>; MAX_PLUGIN_STATUS_COUNT],
     len: usize,
     width: usize,
 }
 
-#[cfg(feature = "web")]
 impl<'a> PluginStatusPlan<'a> {
     fn iter(&self) -> impl Iterator<Item = PluginStatusSpan<'a>> + '_ {
         self.spans[..self.len].iter().flatten().copied()
     }
 }
 
-#[cfg(feature = "web")]
 fn plan_plugin_statuses<'a>(
     statuses: impl Iterator<Item = (&'a str, Option<crate::plugin::ui_state::Tone>)>,
     budget: usize,
@@ -2098,19 +2092,16 @@ impl HomeView {
 
         let tag_width = tag_span.as_ref().map_or(0, |span| span.width());
         let fixed_trailing = slot_width + badge_width + LAST_ACTIVITY_RIGHT_MARGIN;
-        #[cfg(feature = "web")]
+
         let status_budget = room
             .saturating_sub(tag_width + fixed_trailing + text_width.min(MIN_TITLE_CELLS))
             .min(MAX_PLUGIN_STATUS_WIDTH);
-        #[cfg(feature = "web")]
+
         let plugin_status_plan = plan_plugin_statuses(
             crate::tui::plugin_ui::session_row_statuses(&self.plugin_ui.snapshot, id),
             status_budget,
         );
-        #[cfg(feature = "web")]
         let plugin_status_width = plugin_status_plan.width;
-        #[cfg(not(feature = "web"))]
-        let plugin_status_width = 0;
 
         let (title_width, keep_tag) = if plugin_status_width > 0 {
             (
@@ -2127,7 +2118,6 @@ impl HomeView {
         ));
         line_spans.extend(tag_span.filter(|_| keep_tag));
 
-        #[cfg(feature = "web")]
         for status in plugin_status_plan.iter() {
             line_spans.push(Span::raw("  "));
             let status_style = crate::tui::plugin_ui::tone_style(status.tone, theme);

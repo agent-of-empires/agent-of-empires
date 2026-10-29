@@ -229,7 +229,6 @@ impl HomeView {
             search_matches: Vec::new(),
             search_match_index: 0,
             available_tools,
-            #[cfg(feature = "web")]
             plugin_ui: crate::tui::plugin_ui_poller::PluginUiState::default(),
             show_diagnostics: resolved.session.show_diagnostics_pane,
             show_shortcut_bar: resolved.session.show_shortcut_bar,

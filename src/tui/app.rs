@@ -1322,7 +1322,6 @@ impl App {
                 needs_full_refresh = true;
             }
 
-            #[cfg(feature = "web")]
             self.home.request_plugin_ui_refresh();
 
             if last_metrics_sample.elapsed() >= METRICS_SAMPLE_INTERVAL {
@@ -1334,7 +1333,6 @@ impl App {
                 refresh_needed = true;
             }
 
-            #[cfg(feature = "web")]
             if self.home.apply_plugin_ui_updates() {
                 needs_full_refresh = true;
             }
