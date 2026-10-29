@@ -738,6 +738,7 @@ mod workspace_ordering_tests {
             rate_limit_auto_resume: None,
             acp_capable: false,
             acp_session_id: None,
+            import_pending: false,
             acp_agent: None,
             acp_can_fork: false,
             structured_view_off: false,

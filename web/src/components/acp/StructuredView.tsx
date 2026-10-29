@@ -54,6 +54,8 @@ interface Props {
   tool: string | null | undefined;
   /** Resolved ACP agent key; the switch-agent modal's fallback before any `AgentSwitched`. */
   acpAgent: string | null;
+  /** `hasStartedBefore(session)`. */
+  startedBefore?: boolean;
   acpProvider: string | null;
   /** Server-owned conversation-reset slash aliases (`/clear`, `/new`). */
   clearAliases?: readonly string[];
@@ -166,7 +168,9 @@ function AcpChrome({
   const { sessionId, acpWorkerState, acpAgent } = view;
   const { state, status } = ctx;
   const agentName = useAgentDisplayNames();
-  const startingAgent = isNewSessionStarting(state, ctx, acpWorkerState) ? agentName(state.agent ?? acpAgent) : null;
+  const startingAgent = isNewSessionStarting(state, ctx, acpWorkerState, !!view.startedBefore)
+    ? agentName(state.agent ?? acpAgent)
+    : null;
   // Neither can start until restored or unarchived, so nothing here may send (#4116).
   const readOnly = !!view.trashedAt || !!view.archivedAt;
   // Rows before the latest `/clear` divider are the hidden history.
@@ -372,6 +376,7 @@ function AcpChrome({
               collapsed={composerCollapsed}
               onToggleCollapsed={() => setComposerCollapsed((v) => !v)}
               startingAgent={startingAgent}
+              agent={agentName(state.agent ?? acpAgent)}
             />
           )}
         </div>
@@ -391,6 +396,7 @@ function ComposerDock({
   collapsed,
   onToggleCollapsed,
   startingAgent,
+  agent,
 }: {
   view: Props;
   ctx: AcpContext;
@@ -401,6 +407,8 @@ function ComposerDock({
   onToggleCollapsed: () => void;
   /** Set while a new Session starts, as for the startup line. */
   startingAgent: string | null;
+  /** The Session's Agent by display name. */
+  agent: string;
 }) {
   const { sessionId, acpWorkerState, acpAgent, acpProvider } = view;
   const { state, status } = ctx;
@@ -418,6 +426,7 @@ function ComposerDock({
           status !== "open" || acpWorkerState !== "running" || state.workerStopped || state.workerRestarting
         }
         waitingFor={startingAgent}
+        agent={agent}
       />
 
       <RejectedPromptsStrip

@@ -505,6 +505,10 @@ pub enum TrashRelocationOutcome {
     Failed {
         reason: String,
     },
+    /// The session is trashed but its tmux sessions may still be running.
+    TeardownFailed {
+        reason: String,
+    },
 }
 
 fn default_kill_pane() -> bool {
@@ -537,6 +541,9 @@ pub struct DeleteSessionBody {
     /// Resolve resource cleanup policy on the daemon from the reserved row.
     #[serde(default)]
     pub use_cleanup_defaults: bool,
+    /// Resolve cleanup on the daemon from the reserved row, keeping this caller intent.
+    #[serde(default)]
+    pub cleanup_intent: Option<crate::session::deletion::CleanupIntent>,
     /// Consent is bound to the trash lifecycle selected by the client.
     #[serde(default)]
     pub expected_trashed_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -1082,6 +1089,10 @@ pub struct SessionResponse {
     /// sessions, or structured ones whose worker has not minted an id yet).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acp_session_id: Option<String>,
+    /// An imported session whose history arrives only once its agent loads it,
+    /// so `acp_session_id` is set before the session has ever run here.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub import_pending: bool,
     /// The session's resolved ACP registry key (`agent_name` when set, else
     /// `tool`), matching the `name` entries `/api/acp/agents` returns. The
     /// structured view's switch-agent modal reads this as the current-agent

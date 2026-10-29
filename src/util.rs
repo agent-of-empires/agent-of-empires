@@ -122,6 +122,73 @@ pub(crate) fn now_ms() -> u64 {
     system_time_to_ms(SystemTime::now())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimePathRemedy {
+    Advice(&'static str),
+    Command {
+        template: &'static str,
+        manual: &'static str,
+    },
+}
+
+/// Format a refused directory without terminal controls or lossy shell commands.
+pub(crate) fn runtime_path_refusal(
+    path: &std::path::Path,
+    mode: u32,
+    cause: &str,
+    remedy: RuntimePathRemedy,
+) -> String {
+    fn append_path(output: &mut String, template: &str, path: impl std::fmt::Display) {
+        use std::fmt::Write;
+        let mut parts = template.split("{path}");
+        output.push_str(parts.next().unwrap_or_default());
+        for part in parts {
+            write!(output, "{path}{part}").unwrap();
+        }
+    }
+
+    let mut message = format!(
+        "Unsafe runtime directory: {path:?} is {cause} (mode {:04o}). ",
+        mode & 0o7777
+    );
+    match remedy {
+        RuntimePathRemedy::Advice(advice) => {
+            message.push_str("Resolve this by: ");
+            append_path(&mut message, advice, format_args!("{path:?}"));
+        }
+        RuntimePathRemedy::Command { template, manual } => {
+            let text = path.to_str().filter(|text| {
+                !text.contains(|c: char| {
+                    // Bidi_Control characters are not covered by is_control().
+                    c.is_control()
+                        || matches!(
+                            c,
+                            '`' | '\u{061c}'
+                                | '\u{200e}'..='\u{200f}'
+                                | '\u{202a}'..='\u{202e}'
+                                | '\u{2066}'..='\u{2069}'
+                        )
+                })
+            });
+            if let Some(text) = text {
+                message.push_str("Resolve this by: `");
+                append_path(
+                    &mut message,
+                    template,
+                    crate::session::environment::shell_escape(text),
+                );
+                message.push_str("`, then retry.");
+            } else {
+                message.push_str(manual);
+                message.push_str(
+                    " manually, then retry. No copyable shell command is available for this path.",
+                );
+            }
+        }
+    }
+    message
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

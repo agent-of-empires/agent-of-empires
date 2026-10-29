@@ -20,7 +20,7 @@ import { GROUP_DOT_STATE, MARK_MEANING, meaningText } from "../../lib/sidebarMar
 import { useContextMenu } from "../useContextMenu";
 import { FoldChevron, PlusIcon } from "../icons";
 import { DISABLED_ICON_BUTTON } from "./styles";
-import { NAV_ITEM, onSidebarArrowKey } from "./keyboardNav";
+import { NAV_ITEM, onSidebarArrowKey, refocusNearbyWhenRemoved } from "./keyboardNav";
 import type { DragHandleProps } from "./types";
 
 interface Props {
@@ -205,9 +205,10 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
               />
             </span>
           </span>
-          {group.pinned && (
+          {group.pinned ? (
             <Tooltip text={meaningText(MARK_MEANING.pinnedProject)}>
               <span
+                role="img"
                 className="shrink-0 text-[10px] leading-none text-text-dim"
                 data-testid="sidebar-group-pinned-marker"
                 aria-label="Pinned project"
@@ -215,6 +216,19 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
                 ◆
               </span>
             </Tooltip>
+          ) : (
+            group.registeredProjects.length > 0 && (
+              <Tooltip text={meaningText(MARK_MEANING.project)}>
+                <span
+                  role="img"
+                  className="shrink-0 text-[10px] leading-none text-text-dim"
+                  data-testid="sidebar-group-project-marker"
+                  aria-label="Project"
+                >
+                  ◇
+                </span>
+              </Tooltip>
+            )
           )}
           <span
             className="text-[13px] md:text-[14px] font-medium truncate flex-1"
@@ -266,6 +280,15 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
         >
           <GroupMenuItems
             {...props}
+            // Archive all can empty the Group and unmount this header; focus then moves to a neighbour.
+            onArchiveAll={
+              props.onArchiveAll &&
+              (() => {
+                const header = buttonRef.current;
+                props.onArchiveAll?.();
+                if (header) refocusNearbyWhenRemoved(header);
+              })
+            }
             archivableCount={archivableCount}
             canPin={canPin}
             canUnpin={canUnpin}
