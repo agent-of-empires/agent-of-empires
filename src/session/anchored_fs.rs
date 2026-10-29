@@ -6,15 +6,19 @@ use nix::errno::Errno;
 use nix::fcntl::{open, openat, renameat, AtFlags, OFlag};
 use nix::sys::stat::{fstat, fstatat, mkdirat, FileStat, Mode};
 use nix::unistd::{linkat, unlinkat, UnlinkatFlags};
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 const CONFLICT_NAME_ATTEMPTS: u32 = 100;
+static FILE_EXCHANGE_DEVICES: LazyLock<parking_lot::Mutex<HashSet<libc::dev_t>>> =
+    LazyLock::new(parking_lot::Mutex::default);
 
 #[derive(Debug)]
 pub(crate) struct AnchoredDir {
@@ -123,10 +127,23 @@ fn file_exchange_hook(phase: FileExchangePhase, target: &Path, staged: &Path) {
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static FILE_EXCHANGE_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static FILE_EXCHANGE_HOOK: std::cell::RefCell<Option<FileExchangeHook>> = const { std::cell::RefCell::new(None) };
     /// Runs between the replace and its post-check in `publish_staged`.
     static AFTER_REPLACE: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
     pub(crate) static FAIL_SYNC_ONCE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct ResetExchangeHooks;
+
+#[cfg(test)]
+impl Drop for ResetExchangeHooks {
+    fn drop(&mut self) {
+        FILE_EXCHANGE_HOOK.set(None);
+        FAIL_SYNC_ONCE.set(None);
+        crate::process::EXCHANGE_ERROR.set(None);
+    }
 }
 
 /// A user-managed file link resolved once, without creating directories.
@@ -859,13 +876,24 @@ impl AnchoredDir {
         bail!("no free name to preserve a conflicting file")
     }
 
-    /// Probe only scratch entries. Unsupported exchanges never touch a project file.
+    /// Cache supported devices; probe only scratch entries on a cache miss.
     pub(crate) fn supports_file_exchange(&self) -> Result<bool> {
+        #[cfg(test)]
+        FILE_EXCHANGE_CHECKS.set(FILE_EXCHANGE_CHECKS.get() + 1);
+        self.supports_file_exchange_cached(&mut FILE_EXCHANGE_DEVICES.lock())
+    }
+
+    fn supports_file_exchange_cached(&self, supported: &mut HashSet<libc::dev_t>) -> Result<bool> {
+        let device = self.identity()?.0;
+        if supported.contains(&device) {
+            return Ok(true);
+        }
         let mut first = FileStage::new(&self.fd, &mut std::io::empty())?;
         let mut second = FileStage::new(&self.fd, &mut std::io::empty())?;
         match crate::process::rename_exchange(&self.fd, &first.name, &self.fd, &second.name) {
             Ok(()) => {
                 std::mem::swap(&mut first.name, &mut second.name);
+                supported.insert(device);
                 Ok(true)
             }
             Err(error) if crate::process::exchange_unsupported(&error) => Ok(false),
@@ -906,8 +934,11 @@ impl AnchoredDir {
         if let Err(error) =
             crate::process::rename_exchange(&parent.fd, &stage.name, &parent.fd, leaf.as_os_str())
         {
-            stage.cleanup = parent.entry_matches(Path::new(&stage.name), &staged_stat)?
-                && (check.version)(&mut stage.file)?.as_deref() == Some(staged_version.as_str());
+            stage.cleanup = parent
+                .entry_matches(Path::new(&stage.name), &staged_stat)
+                .unwrap_or(false)
+                && (check.version)(&mut stage.file).ok().flatten().as_deref()
+                    == Some(staged_version.as_str());
             return Err(error).context("exchanging project file");
         }
         let finish = || -> Result<FileExchangeResult> {
@@ -1162,6 +1193,100 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_exchange_support_caches_only_successes_across_directories_on_a_device() {
+        let _hooks = ResetExchangeHooks;
+        let temporary = tempfile::tempdir().unwrap();
+        let root = AnchoredDir::open(temporary.path()).unwrap();
+        std::fs::create_dir(temporary.path().join("other")).unwrap();
+        let other = root.child(Path::new("other")).unwrap();
+        for errno in [libc::EINVAL, libc::EOPNOTSUPP, libc::ENOSYS, libc::EIO] {
+            let mut supported = HashSet::new();
+            crate::process::EXCHANGE_ERROR.set(Some(errno));
+            let result = root.supports_file_exchange_cached(&mut supported);
+            if errno == libc::EIO {
+                assert!(result.is_err());
+            } else {
+                assert!(!result.unwrap());
+            }
+            crate::process::EXCHANGE_ERROR.set(Some(libc::EIO));
+            assert!(root.supports_file_exchange_cached(&mut supported).is_err());
+            crate::process::EXCHANGE_ERROR.set(None);
+            assert!(root.supports_file_exchange_cached(&mut supported).unwrap());
+            crate::process::EXCHANGE_ERROR.set(Some(libc::EIO));
+            assert!(other.supports_file_exchange_cached(&mut supported).unwrap());
+            assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 1);
+            assert_eq!(std::fs::read_dir(other.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn failed_exchange_retains_its_error_when_cleanup_cannot_be_verified() {
+        use std::cell::Cell;
+        use std::os::unix::fs::PermissionsExt;
+
+        for fail_stat in [true, false] {
+            let _hooks = ResetExchangeHooks;
+            let temporary = tempfile::tempdir().unwrap();
+            let root = AnchoredDir::open(temporary.path()).unwrap();
+            std::fs::write(temporary.path().join("file"), b"original").unwrap();
+            let permissions = std::fs::metadata(temporary.path()).unwrap().permissions();
+            FILE_EXCHANGE_HOOK.set(Some(Box::new(move |phase, target, _| {
+                if fail_stat && phase == FileExchangePhase::BeforeExchange {
+                    std::fs::set_permissions(
+                        target.parent().unwrap(),
+                        std::fs::Permissions::from_mode(0o000),
+                    )
+                    .unwrap();
+                }
+            })));
+            let calls = Cell::new(0);
+            let version = |_: &mut File| {
+                calls.set(calls.get() + 1);
+                if !fail_stat && calls.get() == 2 {
+                    bail!("cannot read staged version");
+                }
+                Ok(Some("draft".into()))
+            };
+            crate::process::EXCHANGE_ERROR.set(Some(libc::EBUSY));
+            let result = root.exchange_file(
+                Path::new("file"),
+                &mut &b"draft"[..],
+                std::fs::Permissions::from_mode(0o600),
+                FileExchange {
+                    validate: &|| Ok(()),
+                    version: &version,
+                    expected: "original",
+                },
+            );
+            std::fs::set_permissions(temporary.path(), permissions).unwrap();
+            let error = result.unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(libc::EBUSY),
+                "{error:#}"
+            );
+            assert_eq!(calls.get(), if fail_stat { 1 } else { 2 });
+            assert_eq!(
+                std::fs::read(temporary.path().join("file")).unwrap(),
+                b"original"
+            );
+            let entries: Vec<_> = std::fs::read_dir(temporary.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            assert_eq!(entries.len(), 2);
+            let stage = entries
+                .iter()
+                .find(|entry| entry.file_name().unwrap() != "file")
+                .unwrap();
+            assert_eq!(std::fs::read(stage).unwrap(), b"draft");
+        }
+    }
 
     #[test]
     fn nested_directory_sync_failure_is_retryable() {

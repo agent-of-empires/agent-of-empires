@@ -749,16 +749,14 @@ pub async fn session_file(
     let read_only = state.read_only;
     let result = tokio::task::spawn_blocking(move || {
         let confined = scope.confine(std::path::Path::new(&query.path))?;
-        let mut snapshot = super::file_edit::read_file_snapshot(
+        let snapshot = super::file_edit::read_file_snapshot(
             &scope.roots,
             &confined,
             inst.as_ref(),
             read_only,
             editing,
+            query.version_only,
         )?;
-        if query.version_only {
-            snapshot.content.clear();
-        }
         Ok::<_, (StatusCode, &'static str)>(snapshot)
     })
     .await;
