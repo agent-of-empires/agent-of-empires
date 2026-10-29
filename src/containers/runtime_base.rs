@@ -1553,7 +1553,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial_test::parallel]
     fn can_join_user_slice_reads_the_runtime_probe() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         let cases = [
             (false, Some("systemd true"), true),
             (false, Some("systemd false"), false),
@@ -1588,7 +1590,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial_test::parallel]
     fn recorded_cgroup_parent_reads_the_label_back() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         let cases = [
             (spec(), Some(SLICE)),
             (
@@ -1647,7 +1651,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial_test::parallel]
     fn run_create_scopes_podman_into_the_session_slice() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         let config = ContainerConfig {
             cgroup_parent: Some(SLICE.to_string()),
             ..Default::default()
@@ -1737,7 +1743,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial_test::parallel]
     fn start_container_rejoins_the_recorded_slice() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         let cases = [
             (spec(), true),
             (
@@ -1780,7 +1788,9 @@ mod tests {
 
     /// Against a real daemon, when one is running; skipped otherwise.
     #[test]
+    #[serial_test::parallel]
     fn cgroup_probe_template_is_accepted_by_a_real_runtime() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         for base in [&DOCKER, &PODMAN] {
             let Some((query, _)) = base.cgroup_probe else {
                 continue;
