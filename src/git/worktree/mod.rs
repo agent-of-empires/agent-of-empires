@@ -28,6 +28,17 @@ const MUTATION_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// intentional remove or move.
 const WORKTREE_LOCK_REASON: &str = "aoe-managed worktree (prevents cross-boundary prune)";
 
+/// File in a worktree's admin directory marking a purge in progress. Listings skip a marked
+/// worktree so no session can adopt it; its lock and git's dirty refusal are untouched.
+const PURGE_MARKER: &str = "aoe-purge";
+const PURGE_CLAIM: &str = "aoe-purge.claim";
+
+/// An `flock` on a marked worktree's claim file, held by whoever is finishing its purge. A marked
+/// worktree whose claim is free was abandoned.
+pub struct PurgeClaim {
+    _lock: std::fs::File,
+}
+
 #[derive(Default)]
 pub(crate) struct WorktreeCreation {
     pub branch_created: bool,
@@ -195,6 +206,72 @@ impl GitWorktree {
         .map(drop)
     }
 
+    fn purge_marker(path: &Path) -> Result<PathBuf> {
+        crate::git::cleanup::read_linked_worktree_gitdir(path)
+            .map(|admin| admin.join(PURGE_MARKER))
+            .ok_or_else(|| GitError::WorktreeNotFound(path.to_path_buf()))
+    }
+
+    /// Hide `path` from `list_worktrees` while its purge runs, owned by the returned claim.
+    pub fn mark_purging(path: &Path) -> Result<PurgeClaim> {
+        let claim = Self::claim_purge(path)?;
+        std::fs::write(Self::purge_marker(path)?, "")?;
+        Ok(claim)
+    }
+
+    fn claim_purge(path: &Path) -> Result<PurgeClaim> {
+        use fs2::FileExt;
+        let claim_path = Self::purge_marker(path)?.with_file_name(PURGE_CLAIM);
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(claim_path)?;
+        lock.try_lock_exclusive().map_err(|_| {
+            GitError::WorktreeCommandFailed(format!(
+                "{} is being purged by another process",
+                path.display()
+            ))
+        })?;
+        Ok(PurgeClaim { _lock: lock })
+    }
+
+    /// A child forked by a concurrent test can hold a dropped claim's descriptor until it execs.
+    #[cfg(test)]
+    pub(crate) fn await_purge_released(path: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while Self::claim_purge(path).is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "purge claim never released"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// Claims a marked worktree whose purge was abandoned, or `None` if its purge is live or it is
+    /// no longer marked.
+    pub fn claim_abandoned_purge(path: &Path) -> Option<PurgeClaim> {
+        let claim = Self::claim_purge(path).ok()?;
+        Self::is_purging(path).then_some(claim)
+    }
+
+    pub fn unmark_purging(path: &Path) -> Result<()> {
+        match std::fs::remove_file(Self::purge_marker(path)?) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether `path` is in or under a checkout marked for purging, including through a nested repo.
+    pub(crate) fn is_within_purging(path: &Path) -> bool {
+        path.ancestors().any(Self::is_purging)
+    }
+
+    pub(crate) fn is_purging(path: &Path) -> bool {
+        Self::purge_marker(path).is_ok_and(|marker| marker.exists())
+    }
+
     /// Unlock `path`'s admin entry, best-effort and idempotent. Must precede
     /// `git worktree remove`/`move` (both refuse a locked tree) and any prune
     /// meant to reap the entry. Works from the admin side even when the
@@ -280,6 +357,15 @@ impl GitWorktree {
     }
 
     pub fn list_worktrees(&self) -> Result<Vec<WorktreeEntry>> {
+        self.worktree_entries(false)
+    }
+
+    /// Also lists marked worktrees whose purge was abandoned, for cleanup to finish.
+    pub fn list_worktrees_with_abandoned_purges(&self) -> Result<Vec<WorktreeEntry>> {
+        self.worktree_entries(true)
+    }
+
+    fn worktree_entries(&self, include_abandoned: bool) -> Result<Vec<WorktreeEntry>> {
         let repo = open_repo_at(&self.repo_path)?;
         let mut entries = vec![];
         // Bare repos have no main worktree, only linked ones.
@@ -297,6 +383,9 @@ impl GitWorktree {
             let Ok(path) = wt.path().canonicalize() else {
                 continue;
             };
+            if Self::is_purging(&path) && !(include_abandoned && Self::claim_purge(&path).is_ok()) {
+                continue;
+            }
             entries.push(WorktreeEntry {
                 branch: Self::get_current_branch(&path).ok(),
                 path,
@@ -677,6 +766,44 @@ mod tests {
             .create_worktree("locked", &wt_path, false, None)
             .unwrap();
         assert!(wt_path.join(".git").is_file());
+    }
+
+    #[test]
+    fn only_cleanup_lists_an_abandoned_purge() {
+        let (dir, _repo) = init_repo();
+        let git_wt = GitWorktree::new(dir.path().to_path_buf()).unwrap();
+        let parent = TempDir::new().unwrap();
+        let wt_path = parent.path().join("purging");
+        git_wt
+            .create_worktree("purging", &wt_path, true, None)
+            .unwrap();
+        let live = GitWorktree::mark_purging(&wt_path).unwrap();
+        let listed = |abandoned: bool| {
+            let entries = match abandoned {
+                true => git_wt.list_worktrees_with_abandoned_purges(),
+                false => git_wt.list_worktrees(),
+            };
+            entries
+                .unwrap()
+                .iter()
+                .any(|entry| entry.branch.as_deref() == Some("purging"))
+        };
+        assert!(!listed(false) && !listed(true), "a live purge was listed");
+        assert!(GitWorktree::claim_abandoned_purge(&wt_path).is_none());
+
+        drop(live);
+        GitWorktree::await_purge_released(&wt_path);
+        assert!(
+            !listed(false) && listed(true),
+            "an abandoned purge was not listed"
+        );
+        let claimed = GitWorktree::claim_abandoned_purge(&wt_path);
+        assert!(claimed.is_some());
+        assert!(!listed(true), "a claimed purge was listed");
+        drop(claimed);
+
+        GitWorktree::unmark_purging(&wt_path).unwrap();
+        assert!(GitWorktree::claim_abandoned_purge(&wt_path).is_none());
     }
 
     /// Every git subprocess reachable from a worktree move or edit is bounded:

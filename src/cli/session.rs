@@ -1034,6 +1034,10 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
             if already_imported(all_instances, &s.session_id) {
                 continue;
             }
+            if crate::git::GitWorktree::is_within_purging(std::path::Path::new(&s.cwd)) {
+                eprintln!("Skipping {}: its project path is being purged", s.cwd);
+                continue;
+            }
             let inst = build_import_instance(s, structured, &group, session_config);
             ids.push(inst.id.clone());
             all_instances.push(inst.clone());
