@@ -2,7 +2,7 @@
 // The card is the only UI gate before a destructive tool runs, so hold semantics are pinned closely.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 
 import { ApprovalCard } from "./ApprovalCard";
 import type { Approval, ApprovalOption } from "../../lib/acpTypes";
@@ -10,6 +10,11 @@ import type { Approval, ApprovalOption } from "../../lib/acpTypes";
 vi.mock("../../lib/connectionState", () => ({
   useServerDown: () => false,
   OFFLINE_TITLE: "Disconnected",
+}));
+
+// The primitive needs a message context; the plan modal's own wiring is under test.
+vi.mock("./Markdown", () => ({
+  Markdown: ({ text }: { text: string }) => <div data-testid="plan-rendered">{text}</div>,
 }));
 
 function makeApproval(over: Partial<Approval> = {}, args: unknown = { command: "ls -al" }, name = "Bash"): Approval {
@@ -242,5 +247,47 @@ describe("ApprovalCard option lists", () => {
       fireEvent.click(screen.getByText("Dismiss"));
       expect(onResolve).toHaveBeenCalledWith("Cancelled", undefined);
     });
+  });
+});
+
+describe("ApprovalCard plan viewer", () => {
+  const PLAN = "# Plan\n\nProse with no bullets";
+  const withPlan = () => makeApproval({ plan: PLAN }, "{ truncated json", "Ready to code?");
+
+  it("offers the plan only when the approval carries one, even if the args preview is unparsable", () => {
+    mount(makeApproval());
+    expect(screen.queryByText("View plan")).toBeNull();
+    cleanup();
+    mount(withPlan());
+    expect(screen.getByText("View plan")).toBeTruthy();
+  });
+
+  it("switches between the rendered and raw plan, and closing resolves nothing", () => {
+    const onResolve = mount(withPlan());
+    fireEvent.click(screen.getByText("View plan"));
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByTestId("plan-rendered").textContent).toBe(PLAN);
+
+    fireEvent.click(within(dialog).getByRole("tab", { name: "Raw" }));
+    expect(within(dialog).queryByTestId("plan-rendered")).toBeNull();
+    expect(within(dialog).getByText(/Prose with no bullets/).tagName).toBe("PRE");
+
+    fireEvent.click(within(dialog).getByText("Close"));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(onResolve).not.toHaveBeenCalled();
+  });
+
+  it("resolves from the modal footer with the card's decisions", () => {
+    for (const [label, decision] of [
+      ["Allow", "Allow"],
+      ["Always", "AllowAlways"],
+      ["Deny", "Deny"],
+    ] as const) {
+      const onResolve = mount(withPlan());
+      fireEvent.click(screen.getByText("View plan"));
+      fireEvent.click(within(screen.getByRole("dialog")).getByText(label));
+      expect(onResolve).toHaveBeenCalledExactlyOnceWith(decision, undefined);
+      cleanup();
+    }
   });
 });

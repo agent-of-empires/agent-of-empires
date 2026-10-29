@@ -22,6 +22,7 @@ import { AlertTriangle, Check, ChevronDown, MessageCircleQuestion, Shield, X } f
 import type { Approval, ApprovalDecision, ApprovalOptionKind } from "../../lib/acpTypes";
 import { useServerDown, OFFLINE_TITLE } from "../../lib/connectionState";
 import { hasArgsBody, humanizePermissionTitle, parseJsonObject, previewFromArgs } from "../../lib/acpArgs";
+import { PlanModal } from "./PlanModal";
 
 interface Props {
   approval: Approval;
@@ -35,6 +36,7 @@ export function ApprovalCard({ approval, onResolve }: Props) {
   const [phase, setPhase] = useState<"pending" | "submitting" | "rolled-back">("pending");
   const [progress, setProgress] = useState(0);
   const [held, setHeld] = useState<string | null>(null);
+  const [planOpen, setPlanOpen] = useState(false);
   const pressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const progressTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const holdGeneration = useRef(0);
@@ -191,6 +193,27 @@ export function ApprovalCard({ approval, onResolve }: Props) {
         <p className="px-3 pt-2 text-rose-400 text-xs">Could not reach the server. Tap to retry.</p>
       )}
       {offline && <p className="px-3 pt-2 text-status-error text-xs">{OFFLINE_TITLE}</p>}
+
+      {approval.plan && (
+        <div className="px-2 pt-2">
+          <button
+            type="button"
+            className="w-full rounded-md border border-surface-700 bg-surface-800 px-3 py-1.5 text-xs font-medium text-text-secondary hover:bg-surface-700"
+            onClick={() => setPlanOpen(true)}
+          >
+            View plan
+          </button>
+        </div>
+      )}
+      {planOpen && approval.plan && (
+        <PlanModal
+          plan={approval.plan}
+          submitting={phase === "submitting"}
+          offline={offline}
+          onDecide={(decision) => void submit(decision)}
+          onClose={() => setPlanOpen(false)}
+        />
+      )}
 
       {isChoice && (
         <div className="flex flex-col gap-1.5 p-2">

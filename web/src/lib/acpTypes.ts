@@ -137,6 +137,8 @@ export interface Approval {
   options?: ApprovalOption[];
   /** The options are answers rather than a permission vocabulary; post back the picked `option_id`. */
   choice?: boolean;
+  /** Full ExitPlanMode markdown; `tool_call.args_preview` may truncate it. */
+  plan?: string;
   requested_at: string;
   resolved?: {
     decision: ApprovalDecision;
