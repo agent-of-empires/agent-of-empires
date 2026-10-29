@@ -179,6 +179,21 @@ impl DockerContainer {
         &self.runtime
     }
 
+    /// Best effort: an unpinned container is left running by a structured stop, never failed.
+    pub(crate) fn pin(&self, id: &str) -> Option<crate::session::SandboxPin> {
+        match RuntimeExecutionSnapshot::capture(&self.runtime) {
+            Ok(runtime) => Some(crate::session::SandboxPin {
+                runtime,
+                container_id: id.to_owned(),
+            }),
+            Err(error) => {
+                tracing::warn!(target: "containers.runtime", name = %self.name, %error,
+                    "could not pin the sandbox runtime");
+                None
+            }
+        }
+    }
+
     pub fn exists(&self) -> Result<bool> {
         self.runtime.does_container_exist(&self.name)
     }

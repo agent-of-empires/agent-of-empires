@@ -125,6 +125,17 @@ impl Instance {
             && identity_publisher_dependencies_available(container)
             && self.hook_session_publisher_allowed_by_argv();
         self.refresh_container_id(container)?;
+        let id = self
+            .sandbox_info
+            .as_ref()
+            .and_then(|s| s.container_id.clone());
+        if let Some(id) = id.filter(|id| {
+            self.sandbox_pin
+                .as_ref()
+                .is_none_or(|pin| pin.container_id != *id)
+        }) {
+            self.sandbox_pin = container.pin(&id);
+        }
         self.reconcile_container_workdir(container);
         container_config::ensure_folder_trust_config_for_active_agent(
             &self.tool,
@@ -383,6 +394,7 @@ impl Instance {
             && identity_publisher_dependencies_available(&container)
             && self.hook_session_publisher_allowed_by_argv();
 
+        self.sandbox_pin = container.pin(&container_id);
         if let Some(ref mut sandbox) = self.sandbox_info {
             sandbox.container_id = Some(container_id);
             // Pin the workdir to exactly what the container was built with, so

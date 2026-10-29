@@ -1352,9 +1352,7 @@ async fn finish_structured_user_stop(
                 .find(|row| row.id == release_id && row.lifecycle_generation == generation)
             {
                 crate::hooks::cleanup_hook_status_dir(&release_id);
-                if let Err(error) =
-                    crate::session::worktree_edit::stop_sandbox_container(&release_id, row.is_sandboxed())
-                {
+                if let Err(error) = crate::session::worktree_edit::stop_pinned_sandbox_container(row) {
                     tracing::warn!(target: "containers.runtime", session = %release_id, %error, "sandbox container stop after structured stop failed");
                 }
             }
@@ -3180,6 +3178,60 @@ mod durable_stop_tests {
         assert_eq!(retained.lifecycle_generation, stop.lifecycle_generation);
         assert_eq!(retained.status, Status::Stopped);
         assert!(retained.is_idle_dormant());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn structured_stop_stops_the_pinned_container_only_for_the_committed_generation() {
+        for superseded in [false, true] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let project = tempfile::tempdir().unwrap();
+            let runtime = tempfile::tempdir().unwrap();
+            let (pin, calls) =
+                crate::session::test_support::fake_sandbox_pin(runtime.path(), "c1", 0, "");
+            let mut row = Instance::new("sandboxed stop", project.path().to_str().unwrap());
+            row.source_profile = "default".into();
+            row.view = crate::session::View::Structured;
+            row.status = Status::Running;
+            row.tool = "claude".into();
+            row.sandbox_info = Some(crate::session::SandboxInfo {
+                provider: None,
+                enabled: true,
+                container_id: Some("c1".into()),
+                image: "img".into(),
+                container_name: "aoe-sandboxed-stop".into(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
+                container_workdir: None,
+            });
+            row.sandbox_pin = Some(pin);
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![row.clone()],
+            );
+            let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            let worker_state = state.clone();
+            let id = row.id.clone();
+            let mut committed = tokio::task::spawn_blocking(move || {
+                commit_structured_user_stop(worker_state, "default", &id)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            if superseded {
+                committed.generation += 1;
+            }
+            let _ = finish_structured_user_stop(&state, &row.id, committed).await;
+            let log = std::fs::read_to_string(&calls).unwrap_or_default();
+            assert_eq!(
+                log.trim(),
+                if superseded { "" } else { "stop c1" },
+                "superseded={superseded}"
+            );
+        }
     }
 
     #[tokio::test]

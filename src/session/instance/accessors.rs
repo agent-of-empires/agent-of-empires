@@ -54,6 +54,7 @@ impl Instance {
             worktree_info: None,
             workspace_info: None,
             sandbox_info: None,
+            sandbox_pin: None,
             sandbox_store_generation:
                 crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION,
             sandbox_store_transition_paths: Vec::new(),

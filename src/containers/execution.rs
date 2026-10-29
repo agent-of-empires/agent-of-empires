@@ -84,6 +84,21 @@ impl RuntimeExecutionSnapshot {
         command
     }
 
+    /// Stops container `id` on this endpoint; an absent container is already stopped.
+    pub(crate) fn stop_container(&self, id: &str) -> anyhow::Result<()> {
+        let runtime = self.runtime();
+        let output = runtime
+            .base
+            .probe_output(&mut self.command(&["stop".to_owned(), id.to_owned()]))?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::ensure!(
+            output.status.success() || runtime.base.is_not_found(&stderr),
+            "stop failed: {}",
+            stderr.trim()
+        );
+        Ok(())
+    }
+
     pub(crate) fn container_exists(&self, id: &str) -> anyhow::Result<bool> {
         Ok(self
             .runtime()
