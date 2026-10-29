@@ -468,8 +468,8 @@ fn the_sandbox_config_overlay_opens_on_ctrl_p_and_edits_the_image() {
     assert!(dialog.sandbox_config_mode);
     assert_eq!(dialog.sandbox_focused_field, 0);
 
-    // Tab wraps the two rows; Esc and Enter both return to the main form.
-    for expected in [1, 0] {
+    // Tab wraps the three rows; Esc and Enter both return to the main form.
+    for expected in [1, 2, 0] {
         dialog.handle_key(key(KeyCode::Tab));
         assert_eq!(dialog.sandbox_focused_field, expected);
     }
@@ -845,6 +845,28 @@ fn editing_the_env_list_does_submit_a_session_override() {
         submitted(dialog.build_submit_result()).extra_env,
         vec!["THING=$NEW_THING".to_string(), "EXTRA=1".to_string()]
     );
+}
+
+#[test]
+fn hook_env_is_submitted_only_with_sandbox_and_stays_out_of_container_env() {
+    for (sandbox, expected) in [(true, vec!["TOKEN=abc".to_string()]), (false, Vec::new())] {
+        let mut dialog = single_tool_dialog();
+        dialog.docker_available = true;
+        dialog.sandbox_enabled = sandbox;
+        dialog.sandbox_config_mode = true;
+        dialog.sandbox_focused_field = SANDBOX_HOOK_ENV_FIELD;
+        dialog.hook_env.expanded = true;
+
+        dialog.handle_hook_env_list_key(key(KeyCode::Char('a')));
+        for ch in "TOKEN=abc".chars() {
+            dialog.handle_hook_env_list_key(key(KeyCode::Char(ch)));
+        }
+        dialog.handle_hook_env_list_key(key(KeyCode::Enter));
+
+        let data = submitted(dialog.build_submit_result());
+        assert_eq!(data.hook_env, expected);
+        assert!(data.extra_env.is_empty());
+    }
 }
 
 #[test]

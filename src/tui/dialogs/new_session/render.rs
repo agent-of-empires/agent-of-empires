@@ -693,13 +693,19 @@ impl NewSessionDialog {
         } else {
             2
         };
+        let hook_env_list_height: u16 = if self.hook_env.expanded {
+            (2 + self.hook_env.entries.len() as u16).clamp(4, 8)
+        } else {
+            2
+        };
         let inherited_height: u16 = 2 + self.inherited_settings.len().max(1) as u16;
 
         let constraints = vec![
-            Constraint::Length(2),                // Image
-            Constraint::Length(env_list_height),  // Environment
-            Constraint::Length(inherited_height), // Inherited settings
-            Constraint::Min(1),                   // Hints
+            Constraint::Length(2),                    // Image
+            Constraint::Length(env_list_height),      // Environment
+            Constraint::Length(hook_env_list_height), // Host hook env
+            Constraint::Length(inherited_height),     // Inherited settings
+            Constraint::Min(1),                       // Hints
         ];
 
         let fields_height: u16 = constraints
@@ -764,6 +770,31 @@ impl NewSessionDialog {
         self.sandbox_config_rects.push((1, chunks[ci]));
         ci += 1;
 
+        // Host hook env; at most one list is expanded, so at most one has entry rects.
+        let hook_entry_rects = self.render_list_field(
+            frame,
+            chunks[ci],
+            theme,
+            ListField {
+                label: "Host hook env",
+                unit: "items",
+                hint: " before_start hook only (a)dd (d)el (Enter)edit (Esc)close",
+                empty_hint: "    (press 'a' to add KEY or KEY=VALUE)",
+                entries: &self.hook_env.entries,
+                selected: self.hook_env.selected_index,
+                expanded: self.hook_env.expanded,
+                editing: self.hook_env.editing_input.as_ref(),
+                adding_new: self.hook_env.adding_new,
+                ghost: None,
+                focused: self.sandbox_focused_field == 2,
+            },
+        );
+        if !hook_entry_rects.is_empty() {
+            self.list_entry_rects = hook_entry_rects;
+        }
+        self.sandbox_config_rects.push((2, chunks[ci]));
+        ci += 1;
+
         // Inherited settings (always visible, not focusable)
         self.render_inherited_field(frame, chunks[ci], theme);
         ci += 1;
@@ -779,7 +810,7 @@ impl NewSessionDialog {
         ];
         frame.render_widget(Paragraph::new(Line::from(hint_spans)), chunks[ci]);
 
-        let rects = if self.env_editing_input.is_some() {
+        let rects = if self.env_editing_input.is_some() || self.hook_env.editing_input.is_some() {
             Vec::new()
         } else {
             overlay_hover_rects(&self.list_entry_rects, &self.sandbox_config_rects)
@@ -1214,7 +1245,7 @@ impl NewSessionDialog {
                 "Tool" => has_tool_selection,
                 "YOLO Mode" => !self.selected_tool_always_yolo(),
                 "Sandbox" => has_sandbox,
-                "Image" | "Environment" => show_sandbox_options_help,
+                "Image" | "Environment" | "Host hook env" => show_sandbox_options_help,
                 _ => true,
             };
             if !show {

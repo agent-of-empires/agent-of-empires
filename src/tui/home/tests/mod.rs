@@ -904,6 +904,7 @@ fn creation_data(project_dir: &std::path::Path, title: &str, group: &str) -> New
         sandbox_image: String::new(),
         yolo_mode: false,
         extra_env: Vec::new(),
+        hook_env: Vec::new(),
         extra_args: String::new(),
         command_override: String::new(),
         scratch: false,

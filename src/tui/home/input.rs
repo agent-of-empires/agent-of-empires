@@ -7428,6 +7428,7 @@ mod tests {
             sandbox_image: "ubuntu:latest".to_string(),
             yolo_mode: false,
             extra_env: Vec::new(),
+            hook_env: Vec::new(),
             extra_args: String::new(),
             command_override: String::new(),
             scratch: false,
