@@ -2806,12 +2806,13 @@
         "web/src/hooks/useHistoryWindow.ts",
         "web/src/lib/acpHistoryWindow.ts",
         "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/components/acp/AcpLoadingFallback.tsx",
         "web/src/components/MobileMainPane.tsx",
         "web/src/lib/webUiSync.ts",
         "web/src/lib/api.ts",
         "web/src/App.tsx"
       ],
-      "notes": "Verifies synced persistence and fresh-open counts (default 150, configured 200/500), delayed desktop/mobile and auth-remount hydration, stalled headers/body cache fallback, unchanged open windows on preference changes, and fixed 150-row reveals."
+      "notes": "Verifies synced persistence and fresh-open counts (default 150, configured 200/500), delayed desktop/mobile hydration without AbortSignal.any, auth-remount hydration, caller cancellation and stalled headers/body cache fallback, same-session empty-history repopulation, unchanged open windows on preference changes, and fixed 150-row reveals."
     },
     {
       "id": "settings.persistent-structured-views",

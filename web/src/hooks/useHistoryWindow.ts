@@ -36,6 +36,9 @@ export function useHistoryWindow(
       setAnchorLen(activity.length);
       setVisibleRows(initialHistoryWindow(activity, defaultWindow));
     }
+  } else if (activity.length === 0) {
+    setAnchorLen(null);
+    setVisibleRows(defaultWindow);
   } else if (activity.length !== anchorLen) {
     if (activity.length > anchorLen) {
       setVisibleRows((v) => v + (activity.length - anchorLen));

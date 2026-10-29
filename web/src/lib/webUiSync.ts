@@ -87,12 +87,15 @@ const HYDRATION_DEADLINE_MS = 15_000;
 /** Pull server values into localStorage (server wins), without echoing writes back. */
 export async function hydrateWebUiStateFromServer(signal?: AbortSignal): Promise<void> {
   const controller = new AbortController();
-  const requestSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+  const abort = () => controller.abort(signal?.reason);
+  if (signal?.aborted) abort();
+  else signal?.addEventListener("abort", abort, { once: true });
   const deadline = setTimeout(() => controller.abort(), HYDRATION_DEADLINE_MS);
   try {
-    await applyServerState(requestSignal);
+    await applyServerState(controller.signal);
   } finally {
     clearTimeout(deadline);
+    signal?.removeEventListener("abort", abort);
     // Cancelled mounts must not settle a later mount's hydration.
     if (!signal?.aborted) markWebUiStateHydrated();
   }

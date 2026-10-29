@@ -171,6 +171,9 @@ test("persists the default history window changed to 500 through synced settings
 for (const width of [1280, 390]) {
   test(`waits for delayed settings hydration before opening history at width ${width}`, async ({ page }) => {
     await page.setViewportSize({ width, height: 844 });
+    await page.addInitScript(() => {
+      Object.defineProperty(AbortSignal, "any", { configurable: true, value: undefined });
+    });
     const { mock } = await mockHistoryPreference(page, {
       title: "story-history-delayed-settings",
       turns: 320,
