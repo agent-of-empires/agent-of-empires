@@ -3251,9 +3251,11 @@
       "specs": [
         "src/lib/acpTypes.test.ts",
         "src/hooks/useRespawnSession.test.tsx",
-        "src/components/acp/SystemNotices.test.tsx",
+        "src/components/acp/UsageLimitBanner.test.tsx",
         "src/components/acp/SwitchAgentModal.test.tsx",
-        "src/hooks/useAcpSession.test.ts"
+        "src/hooks/useAcpSession.test.ts",
+        "src/lib/__tests__/autoResumeSettingsHref.test.ts",
+        "tests/acp-usage-limit.spec.ts"
       ],
       "components": [
         "src/server/api/acp.rs",
@@ -3262,7 +3264,8 @@
         "web/src/hooks/useAcpSession.ts",
         "web/src/hooks/useRespawnSession.ts",
         "web/src/lib/acpTypes.ts",
-        "web/src/components/acp/SystemNotices.tsx"
+        "web/src/components/acp/UsageLimitBanner.tsx",
+        "web/src/lib/autoResumeSettingsHref.ts"
       ]
     },
     {
