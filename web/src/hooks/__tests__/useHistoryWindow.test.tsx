@@ -30,10 +30,12 @@ const followUp: ActivityRow[] = [
   { id: "m-1-0", kind: "message", text: "short answer" },
 ];
 
-const render = (a: ActivityRow[], sid = "s1") =>
-  renderHook(({ sid, a }: { sid: string; a: ActivityRow[] }) => useHistoryWindow(sid, a, false), {
-    initialProps: { sid, a },
-  });
+const render = (a: ActivityRow[], sid = "s1", window = DEFAULT_HISTORY_WINDOW) =>
+  renderHook(
+    ({ sid, a, window = DEFAULT_HISTORY_WINDOW }: { sid: string; a: ActivityRow[]; window?: number }) =>
+      useHistoryWindow(sid, a, false, window),
+    { initialProps: { sid, a, window } },
+  );
 
 describe("useHistoryWindow", () => {
   it("renders a short transcript whole, and windows a long one until loadEarlier shows it all", () => {
@@ -126,5 +128,50 @@ describe("useHistoryWindow", () => {
     expect(result.current.windowedActivity[0]!.id).toBe("u-0");
     expect(result.current.windowedActivity).toHaveLength(long.length);
     expect(result.current.canLoadEarlier).toBe(false);
+  });
+
+  it("uses the preference on initial population and session changes, with a fixed load-earlier step", () => {
+    const activity = transcript(400, 1);
+    const { result, rerender } = render([], "s1", 300);
+    rerender({ sid: "s1", a: activity, window: 300 });
+    expect(result.current.windowedActivity[0]!.id).toBe("u-250");
+    act(() => result.current.loadEarlier());
+    expect(result.current.windowedActivity).toHaveLength(450);
+    rerender({ sid: "s2", a: activity, window: 100 });
+    expect(result.current.windowedActivity[0]!.id).toBe("u-350");
+    expect(result.current.windowedActivity).toHaveLength(100);
+  });
+
+  it.each([DEFAULT_HISTORY_WINDOW, 300])("resets emptied same-session history to the %i-row preference", (window) => {
+    const activity = transcript(400, 1);
+    const { result, rerender } = render(activity, "s1", window);
+    act(() => result.current.loadEarlier());
+    expect(result.current.windowedActivity).toEqual(activity.slice(-(window + 150)));
+
+    rerender({ sid: "s1", a: [], window });
+    expect(result.current.windowedActivity).toEqual([]);
+    expect(result.current.canLoadEarlier).toBe(false);
+
+    rerender({ sid: "s1", a: activity, window });
+    expect(result.current.windowedActivity).toEqual(activity.slice(-window));
+    expect(result.current.canLoadEarlier).toBe(true);
+  });
+
+  it("leaves open history unchanged on preference changes and uses the new value on a fresh open", () => {
+    const activity = transcript(400, 1);
+    const { result, rerender, unmount } = render(activity, "s1", 100);
+    const initial = activity.slice(-100);
+    expect(result.current.windowedActivity).toEqual(initial);
+    rerender({ sid: "s1", a: activity, window: 300 });
+    expect(result.current.windowedActivity).toEqual(initial);
+    act(() => result.current.loadEarlier());
+    const expanded = activity.slice(-250);
+    expect(result.current.windowedActivity).toEqual(expanded);
+    rerender({ sid: "s1", a: activity, window: 50 });
+    expect(result.current.windowedActivity).toEqual(expanded);
+    rerender({ sid: "s1", a: activity, window: 500 });
+    expect(result.current.windowedActivity).toEqual(expanded);
+    unmount();
+    expect(render(activity, "s1", 500).result.current.windowedActivity).toEqual(activity.slice(-500));
   });
 });

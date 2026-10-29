@@ -76,6 +76,7 @@ function setup(overrides: Partial<Parameters<typeof MobileMainPane>[0]> = {}) {
     activeSessionId: "s1",
     sessions: [session()],
     serverAbout: null,
+    webUiReady: true,
     webSettings: {
       persistentTerminals: false,
       maxPersistentTerminals: 3,

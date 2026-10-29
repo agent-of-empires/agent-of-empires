@@ -2659,7 +2659,8 @@
         "web/src/lib/acpTypes.ts",
         "web/src/components/acp/AcpRuntime.tsx",
         "web/src/components/acp/StructuredView.tsx"
-      ]
+      ],
+      "notes": "Initial history preference coverage is tracked by settings.structured-history-window."
     },
     {
       "id": "acp.clear-fold-remount",
@@ -2786,6 +2787,33 @@
         "web/src/lib/fontSizeRange.ts",
         "web/src/components/SettingsView.tsx"
       ]
+    },
+    {
+      "id": "settings.structured-history-window",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/acp-history-window.spec.ts",
+        "src/components/settings/__tests__/StructuredViewDisplaySettings.test.tsx",
+        "src/hooks/__tests__/useHistoryWindow.test.tsx",
+        "src/lib/acpHistoryWindow.test.ts",
+        "src/lib/__tests__/webUiSync.test.ts",
+        "src/lib/__tests__/webUiHydration.test.ts"
+      ],
+      "components": [
+        "web/src/components/settings/StructuredViewDisplaySettings.tsx",
+        "web/src/components/settings/FormFields.tsx",
+        "web/src/hooks/useWebSettings.ts",
+        "web/src/hooks/useHistoryWindow.ts",
+        "web/src/lib/acpHistoryWindow.ts",
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/components/acp/AcpLoadingFallback.tsx",
+        "web/src/components/MobileMainPane.tsx",
+        "web/src/lib/webUiSync.ts",
+        "web/src/lib/api.ts",
+        "web/src/App.tsx"
+      ],
+      "notes": "Verifies synced persistence and fresh-open counts (default 150, configured 200/500), delayed desktop/mobile hydration without AbortSignal.any, auth-remount hydration, caller cancellation and stalled headers/body cache fallback, same-session empty-history repopulation, unchanged open windows on preference changes, and fixed 150-row reveals."
     },
     {
       "id": "settings.persistent-structured-views",

@@ -120,6 +120,7 @@ import {
   deliverMobileKeyboardProxyInput,
 } from "./lib/mobileKeyboardProxy";
 import { hydrateWebUiStateFromServer, initWebUiSync } from "./lib/webUiSync";
+import { AcpLoadingFallback } from "./components/acp/AcpLoadingFallback";
 import { WorkspaceSidebar } from "./components/WorkspaceSidebar";
 import { SnoozeModal } from "./components/sidebar/SnoozeModal";
 import { DeleteSessionDialog } from "./components/DeleteSessionDialog";
@@ -341,16 +342,16 @@ function AppContent({
   resolvedTheme: ResolvedTheme | null;
 }) {
   useDashboardPresence();
-  // Wire the localStorage write chokepoint and pull the server-side UI-state
-  // blob into localStorage. AppContent only mounts past auth, so this runs as
-  // the authenticated user. Background (does NOT gate render): blocking first
-  // paint on this fetch raced immediate interactions and could flash a blank
-  // screen if the endpoint were slow. A brand-new browser paints local defaults
-  // for the first session; hydration writes the synced values for the next
-  // mount/reload. Same-device loads (populated cache) are unaffected.
+  // Hydrate after auth without blocking the shell. ACP waits for synced settings
+  // so its initial history window uses the saved preference.
+  const [webUiReady, setWebUiReady] = useState(false);
   useEffect(() => {
+    const controller = new AbortController();
     initWebUiSync();
-    void hydrateWebUiStateFromServer();
+    void hydrateWebUiStateFromServer(controller.signal).then(() => {
+      if (!controller.signal.aborted) setWebUiReady(true);
+    });
+    return () => controller.abort();
   }, []);
 
   const location = useLocation();
@@ -1995,33 +1996,37 @@ function AppContent({
                       maxPersistentViews={webSettings.maxPersistentStructuredViews}
                       renderSession={(session, active, selected) => (
                         <Suspense fallback={<AcpLoadingFallback />}>
-                          <StructuredView
-                            active={active}
-                            selected={selected}
-                            sessionId={session.id}
-                            acpWorkerState={session.acp_worker_state ?? "absent"}
-                            rateLimitAutoResume={session.rate_limit_auto_resume}
-                            tool={session.tool}
-                            acpAgent={session.acp_agent ?? null}
-                            startedBefore={hasStartedBefore(session)}
-                            acpProvider={session.acp_provider ?? null}
-                            clearAliases={session.clear_aliases}
-                            archivedAt={session.archived_at ?? null}
-                            snoozedUntil={session.snoozed_until ?? null}
-                            trashedAt={session.trashed_at ?? null}
-                            onRestore={
-                              session.trashed_at
-                                ? () => handleRestoreSession(trashedWorkspaceRestoreIds(workspaces, session.id))
-                                : undefined
-                            }
-                            onOpenFileRef={handleOpenFileRef}
-                            fileRefSession={session}
-                            onOpenAgentsPane={openAgentsPane}
-                            isSandboxed={session.is_sandboxed}
-                            onSwitchToTerminal={
-                              canSwitchToTerminal ? () => handleSwitchView(session.id, false) : undefined
-                            }
-                          />
+                          {webUiReady ? (
+                            <StructuredView
+                              active={active}
+                              selected={selected}
+                              sessionId={session.id}
+                              acpWorkerState={session.acp_worker_state ?? "absent"}
+                              rateLimitAutoResume={session.rate_limit_auto_resume}
+                              tool={session.tool}
+                              acpAgent={session.acp_agent ?? null}
+                              startedBefore={hasStartedBefore(session)}
+                              acpProvider={session.acp_provider ?? null}
+                              clearAliases={session.clear_aliases}
+                              archivedAt={session.archived_at ?? null}
+                              snoozedUntil={session.snoozed_until ?? null}
+                              trashedAt={session.trashed_at ?? null}
+                              onRestore={
+                                session.trashed_at
+                                  ? () => handleRestoreSession(trashedWorkspaceRestoreIds(workspaces, session.id))
+                                  : undefined
+                              }
+                              onOpenFileRef={handleOpenFileRef}
+                              fileRefSession={session}
+                              onOpenAgentsPane={openAgentsPane}
+                              isSandboxed={session.is_sandboxed}
+                              onSwitchToTerminal={
+                                canSwitchToTerminal ? () => handleSwitchView(session.id, false) : undefined
+                              }
+                            />
+                          ) : (
+                            <AcpLoadingFallback />
+                          )}
                         </Suspense>
                       )}
                     />
@@ -2241,6 +2246,7 @@ function AppContent({
           activeSessionId={activeSessionId}
           sessions={sessions}
           webSettings={webSettings}
+          webUiReady={webUiReady}
           selectedFilePath={selectedFilePath}
           selectedRepoName={selectedRepoName}
           selectedFileLine={selectedFileLine}
@@ -2750,13 +2756,5 @@ function AppContent({
         </div>
       </SessionActionProvider>
     </AcpPrefsProvider>
-  );
-}
-
-function AcpLoadingFallback() {
-  return (
-    <div className="flex h-full items-center justify-center bg-surface-900 text-text-dim">
-      <div className="text-xs font-mono uppercase tracking-wide">Loading acp…</div>
-    </div>
   );
 }

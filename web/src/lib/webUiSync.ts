@@ -82,19 +82,28 @@ function enumerateLocalSyncedKeys(): string[] {
   return out;
 }
 
-/** Pull server values into localStorage before first paint (server wins). Raw writes avoid echoing back through the sync chokepoint. */
-export async function hydrateWebUiStateFromServer(): Promise<void> {
+const HYDRATION_DEADLINE_MS = 15_000;
+
+/** Pull server values into localStorage (server wins), without echoing writes back. */
+export async function hydrateWebUiStateFromServer(signal?: AbortSignal): Promise<void> {
+  const controller = new AbortController();
+  const abort = () => controller.abort(signal?.reason);
+  if (signal?.aborted) abort();
+  else signal?.addEventListener("abort", abort, { once: true });
+  const deadline = setTimeout(() => controller.abort(), HYDRATION_DEADLINE_MS);
   try {
-    await applyServerState();
+    await applyServerState(controller.signal);
   } finally {
-    // Settled even when the Daemon is unreachable, so nothing waits on it forever.
-    markWebUiStateHydrated();
+    clearTimeout(deadline);
+    signal?.removeEventListener("abort", abort);
+    // Cancelled mounts must not settle a later mount's hydration.
+    if (!signal?.aborted) markWebUiStateHydrated();
   }
 }
 
-async function applyServerState(): Promise<void> {
-  const server = await getWebUiState();
-  if (!server) return;
+async function applyServerState(signal: AbortSignal): Promise<void> {
+  const server = await getWebUiState(signal);
+  if (!server || signal.aborted) return;
 
   // Seed the server only when it has never stored anything; later a missing key may mean deleted elsewhere.
   if (Object.keys(server).length === 0) {

@@ -85,4 +85,63 @@ describe("StructuredViewDisplaySettings localStorage contract", () => {
       cleanup();
     }
   });
+
+  it("drafts the history count, commits on blur or Enter, and persists the normalized count", () => {
+    window.localStorage.setItem(KEY, JSON.stringify({ desktopFontSize: 18, sidebarCompact: true }));
+    const first = render(<StructuredViewDisplaySettings />);
+    const input = first.getByRole("spinbutton", { name: "Initial visible history" });
+    expect((input as HTMLInputElement).value).toBe("150");
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: "" } });
+    expect(readStored().structuredHistoryWindow).toBeUndefined();
+    fireEvent.change(input, { target: { value: "300.6" } });
+    expect(readStored().structuredHistoryWindow).toBeUndefined();
+    fireEvent.blur(input);
+    expect(readStored().structuredHistoryWindow).toBe(301);
+    expect((input as HTMLInputElement).value).toBe("301");
+
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: "2000" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(readStored().structuredHistoryWindow).toBe(1000);
+    expect((input as HTMLInputElement).value).toBe("1000");
+    expect(readStored().desktopFontSize).toBe(18);
+    expect(readStored().sidebarCompact).toBe(true);
+    first.unmount();
+    expect(getWebSettingsSnapshot().structuredHistoryWindow).toBe(1000);
+    const second = render(<StructuredViewDisplaySettings />);
+    expect((second.getByRole("spinbutton", { name: "Initial visible history" }) as HTMLInputElement).value).toBe(
+      "1000",
+    );
+  });
+
+  it("clamps a blank history draft on commit without preventing replacement typing", () => {
+    const { getByRole } = render(<StructuredViewDisplaySettings />);
+    const input = getByRole("spinbutton", { name: "Initial visible history" });
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: "" } });
+    fireEvent.blur(input);
+    expect(readStored().structuredHistoryWindow).toBe(50);
+    expect((input as HTMLInputElement).value).toBe("50");
+  });
+
+  it("normalizes old and malformed history preferences when read from storage", () => {
+    for (const [stored, expected] of [
+      [undefined, 150],
+      [null, 150],
+      ["300", 150],
+      [false, 150],
+      [0, 50],
+      [5000, 1000],
+      [300.6, 301],
+    ] as Array<[unknown, number]>) {
+      window.localStorage.setItem(KEY, JSON.stringify({ structuredHistoryWindow: stored }));
+      expect(getWebSettingsSnapshot().structuredHistoryWindow).toBe(expected);
+      const { getByRole } = render(<StructuredViewDisplaySettings />);
+      expect((getByRole("spinbutton", { name: "Initial visible history" }) as HTMLInputElement).value).toBe(
+        String(expected),
+      );
+      cleanup();
+    }
+  });
 });

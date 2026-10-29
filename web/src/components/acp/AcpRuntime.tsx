@@ -11,6 +11,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type
 
 import { useAcpSession } from "../../hooks/useAcpSession";
 import { useHistoryWindow } from "../../hooks/useHistoryWindow";
+import { useWebSettings } from "../../hooks/useWebSettings";
 import {
   clearDraft,
   exclusiveRestore,
@@ -149,6 +150,7 @@ export function AcpRuntime({
 }: Props) {
   const acp = useAcpSession(sessionId, acpWorkerState, archivedAt, snoozedUntil);
   const agentProfile = useAgentProfile();
+  const { settings } = useWebSettings();
   const { pendingAttachments, setPendingAttachments, pendingAttachmentsRef } = usePendingAttachments(sessionId);
   const onCancel = useCancelEscalation(
     sessionId,
@@ -162,6 +164,7 @@ export function AcpRuntime({
     sessionId,
     acp.state.activity,
     showClearedTurns,
+    settings.structuredHistoryWindow,
   );
   const { loadOlder, hasMoreOlder, loadingOlder } = acp;
   const loadEarlierHistory = useCallback(() => {

@@ -2,6 +2,13 @@ import type { ActivityRow } from "./acpTypes";
 
 // Recent rows painted on open; older rows stay in state until "Load earlier".
 export const DEFAULT_HISTORY_WINDOW = 150;
+export const MIN_HISTORY_WINDOW = 50;
+export const MAX_HISTORY_WINDOW = 1000;
+
+export function normalizeHistoryWindow(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return DEFAULT_HISTORY_WINDOW;
+  return Math.max(MIN_HISTORY_WINDOW, Math.min(MAX_HISTORY_WINDOW, Math.round(value)));
+}
 
 export const HISTORY_WINDOW_STEP = 150;
 

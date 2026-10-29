@@ -7,6 +7,7 @@ import {
   historyWindowStart,
   initialHistoryWindow,
   lastUserBoundaryIndex,
+  normalizeHistoryWindow,
 } from "./acpHistoryWindow";
 
 function row(kind: ActivityRow["kind"], i: number): ActivityRow {
@@ -48,6 +49,26 @@ function subagentTranscript(lead: number, children: number, parentChain: string[
   for (let c = 0; c < children; c += 1) rows.push(toolRow(`child-${c}`, leafParent));
   return rows;
 }
+
+describe("normalizeHistoryWindow", () => {
+  it.each<[unknown, number]>([
+    [undefined, 150],
+    [null, 150],
+    ["300", 150],
+    [true, 150],
+    [NaN, 150],
+    [Infinity, 150],
+    [-Infinity, 150],
+    [{}, 150],
+    [0, 50],
+    [-100, 50],
+    [1001, 1000],
+    [299.4, 299],
+    [299.6, 300],
+  ])("normalizes %j to %i", (value, expected) => {
+    expect(normalizeHistoryWindow(value)).toBe(expected);
+  });
+});
 
 describe("historyWindowStart", () => {
   const hugeTurn = () => [row("user_prompt", 0), ...Array.from({ length: 500 }, (_, i) => row("tool_complete", i))];
@@ -103,6 +124,7 @@ describe("initialHistoryWindow", () => {
   it("keeps the default when the last turn fits inside it", () => {
     const rows = transcript(100, 1); // 200 rows, last turn = 2 rows
     expect(initialHistoryWindow(rows)).toBe(DEFAULT_HISTORY_WINDOW);
+    expect(initialHistoryWindow(rows, 300)).toBe(300);
   });
 
   it("widens to the whole last turn when that turn alone is longer than the default", () => {
@@ -114,6 +136,7 @@ describe("initialHistoryWindow", () => {
     const visible = initialHistoryWindow(rows);
     expect(visible).toBe(401);
     expect(historyWindowStart(rows, visible)).toBe(promptIdx);
+    expect(initialHistoryWindow(rows, 50)).toBe(401);
   });
 
   it("counts typed diff comments as the last turn's boundary", () => {
@@ -129,5 +152,7 @@ describe("initialHistoryWindow", () => {
     expect(lastUserBoundaryIndex(rows)).toBe(-1);
     expect(initialHistoryWindow(rows)).toBe(DEFAULT_HISTORY_WINDOW);
     expect(initialHistoryWindow([])).toBe(DEFAULT_HISTORY_WINDOW);
+    expect(initialHistoryWindow(rows, 300)).toBe(300);
+    expect(initialHistoryWindow([], 50)).toBe(50);
   });
 });

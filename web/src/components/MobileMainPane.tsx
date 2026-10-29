@@ -4,6 +4,7 @@ import { StructuredSessionStack } from "./StructuredSessionStack";
 import { TerminalSessionStack } from "./TerminalSessionStack";
 import { PairedShellPane } from "./PairedTerminal";
 import { BackgroundAgentsPanel } from "./acp/BackgroundAgentsPanel";
+import { AcpLoadingFallback } from "./acp/AcpLoadingFallback";
 import { hasStartedBefore } from "./acp/startupWait";
 import { FilesPane } from "./FilesPane";
 import { DiffFileList } from "./diff/DiffFileList";
@@ -36,6 +37,7 @@ interface Props {
     WebSettings,
     "persistentTerminals" | "maxPersistentTerminals" | "persistentStructuredViews" | "maxPersistentStructuredViews"
   >;
+  webUiReady: boolean;
   selectedFilePath: string | null;
   selectedRepoName: string | undefined;
   selectedFileLine: number | undefined;
@@ -78,6 +80,7 @@ export function MobileMainPane({
   activeSessionId,
   sessions,
   webSettings,
+  webUiReady,
   selectedFilePath,
   selectedRepoName,
   selectedFileLine,
@@ -136,27 +139,31 @@ export function MobileMainPane({
               persistent={webSettings.persistentStructuredViews}
               maxPersistentViews={webSettings.maxPersistentStructuredViews}
               renderSession={(session, active, selected) => (
-                <Suspense fallback={null}>
-                  <StructuredView
-                    active={active}
-                    selected={selected}
-                    sessionId={session.id}
-                    acpWorkerState={session.acp_worker_state ?? "absent"}
-                    rateLimitAutoResume={session.rate_limit_auto_resume}
-                    tool={session.tool}
-                    acpAgent={session.acp_agent ?? null}
-                    startedBefore={hasStartedBefore(session)}
-                    acpProvider={session.acp_provider ?? null}
-                    clearAliases={session.clear_aliases}
-                    archivedAt={session.archived_at ?? null}
-                    snoozedUntil={session.snoozed_until ?? null}
-                    trashedAt={session.trashed_at ?? null}
-                    onOpenFileRef={onOpenFileRef}
-                    fileRefSession={session}
-                    onOpenAgentsPane={onOpenAgentsPane}
-                    isSandboxed={session.is_sandboxed}
-                    onSwitchToTerminal={onSwitchToTerminal ? () => onSwitchToTerminal(session.id) : undefined}
-                  />
+                <Suspense fallback={<AcpLoadingFallback />}>
+                  {webUiReady ? (
+                    <StructuredView
+                      active={active}
+                      selected={selected}
+                      sessionId={session.id}
+                      acpWorkerState={session.acp_worker_state ?? "absent"}
+                      rateLimitAutoResume={session.rate_limit_auto_resume}
+                      tool={session.tool}
+                      acpAgent={session.acp_agent ?? null}
+                      startedBefore={hasStartedBefore(session)}
+                      acpProvider={session.acp_provider ?? null}
+                      clearAliases={session.clear_aliases}
+                      archivedAt={session.archived_at ?? null}
+                      snoozedUntil={session.snoozed_until ?? null}
+                      trashedAt={session.trashed_at ?? null}
+                      onOpenFileRef={onOpenFileRef}
+                      fileRefSession={session}
+                      onOpenAgentsPane={onOpenAgentsPane}
+                      isSandboxed={session.is_sandboxed}
+                      onSwitchToTerminal={onSwitchToTerminal ? () => onSwitchToTerminal(session.id) : undefined}
+                    />
+                  ) : (
+                    <AcpLoadingFallback />
+                  )}
                 </Suspense>
               )}
             />

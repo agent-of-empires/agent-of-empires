@@ -1207,8 +1207,8 @@ export async function setShowTips(enabled: boolean): Promise<boolean> {
 /** Fetch the server-side UI-state blob: a flat map of localStorage key ->
  *  stored string value. Null on failure so the caller falls back to its local
  *  cache. Single-tenant: this is the one user's synced preferences. */
-export async function getWebUiState(): Promise<Record<string, string> | null> {
-  return fetchJson<Record<string, string>>("/api/app-state/web-ui-state");
+export async function getWebUiState(signal?: AbortSignal): Promise<Record<string, string> | null> {
+  return fetchJson<Record<string, string>>("/api/app-state/web-ui-state", { signal });
 }
 
 /** Merge a partial update into the server UI-state blob. Values are strings to
