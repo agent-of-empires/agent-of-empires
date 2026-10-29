@@ -25,8 +25,8 @@ fn seed_cityhall_env(cli: &Cli) {
     }
 }
 
-/// Hot-path and app-data-free commands never open the log file on their own;
-/// `AOE_LOG_LEVEL` still can.
+/// Hot-path, app-data-free and log-reading commands never open the log file
+/// on their own; `AOE_LOG_LEVEL` still can.
 fn skips_cli_sink(cli: &Cli) -> bool {
     matches!(
         cli.command,
@@ -34,6 +34,7 @@ fn skips_cli_sink(cli: &Cli) -> bool {
             | Some(Commands::Init(_))
             | Some(Commands::ExtractSessionId(_))
             | Some(Commands::Tmux { .. })
+            | Some(Commands::Logs(_))
     )
 }
 
