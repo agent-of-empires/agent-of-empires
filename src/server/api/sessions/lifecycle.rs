@@ -1346,13 +1346,17 @@ async fn finish_structured_user_stop(
                 .acquire_instance_lifecycle_lock(&release_id)?;
             native.storage().verify_bound_profile()?;
             // A newer stop or explicit resume owns its own hook status files.
-            if native
-                .storage()
-                .load()?
+            let rows = native.storage().load()?;
+            if let Some(row) = rows
                 .iter()
-                .any(|row| row.id == release_id && row.lifecycle_generation == generation)
+                .find(|row| row.id == release_id && row.lifecycle_generation == generation)
             {
                 crate::hooks::cleanup_hook_status_dir(&release_id);
+                if let Err(error) =
+                    crate::session::worktree_edit::stop_sandbox_container(&release_id, row.is_sandboxed())
+                {
+                    tracing::warn!(target: "containers.runtime", session = %release_id, %error, "sandbox container stop after structured stop failed");
+                }
             }
             native.release_lifecycle_reservation(
                 &release_id,
