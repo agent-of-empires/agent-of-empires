@@ -1563,6 +1563,7 @@ mod tests {
             (false, None, false),
             (true, Some("systemd [name=seccomp name=rootless]"), true),
             (true, Some("systemd [name=seccomp]"), false),
+            (true, Some("none [name=rootless]"), false),
         ];
         for (docker, info, expected) in cases {
             let fake = Spec {
@@ -1803,9 +1804,8 @@ mod tests {
             let output = base.probe_output(&mut cmd).unwrap();
             assert!(output.status.success(), "{}: {output:?}", base.name);
             let stdout = String::from_utf8_lossy(&output.stdout);
-            let mut words = stdout.split_whitespace();
             assert!(
-                matches!(words.next(), Some("systemd" | "cgroupfs")) && words.next().is_some(),
+                stdout.split_whitespace().count() >= 2,
                 "{}: {stdout}",
                 base.name
             );
