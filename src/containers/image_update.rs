@@ -339,11 +339,17 @@ fn parse_bearer_challenge(header: &str) -> Option<BearerChallenge> {
 
 /// The digest for the entry naming this image's repository; none when only other repos match.
 pub fn pick_repo_digest(image: &str, repo_digests: &str) -> Option<String> {
-    let wanted = RegistryRef::parse(image)?.repository;
+    let parsed = RegistryRef::parse(image)?;
+    let wanted = parsed.repository;
+    // Docker lists official Hub images as `ubuntu@...`, without `docker.io/library/`.
+    let official = (parsed.host == "registry-1.docker.io")
+        .then(|| wanted.strip_prefix("library/"))
+        .flatten();
     repo_digests.lines().find_map(|line| {
         let (repo, digest) = line.trim().split_once('@')?;
         // Suffix match so a registry-qualified entry still matches `owner/img`.
-        let matches = repo == wanted || repo.ends_with(&format!("/{wanted}"));
+        let matches =
+            repo == wanted || official == Some(repo) || repo.ends_with(&format!("/{wanted}"));
         (matches && !digest.is_empty()).then(|| digest.to_string())
     })
 }
@@ -547,6 +553,19 @@ mod tests {
         for (repo_digests, expected) in cases {
             assert_eq!(
                 pick_repo_digest(image, repo_digests).as_deref(),
+                expected,
+                "{repo_digests:?}"
+            );
+        }
+
+        let hub_cases = [
+            ("ubuntu@sha256:aaa\n", Some("sha256:aaa")),
+            ("docker.io/library/ubuntu@sha256:aaa\n", Some("sha256:aaa")),
+            ("someone/ubuntu@sha256:bbb\n", None),
+        ];
+        for (repo_digests, expected) in hub_cases {
+            assert_eq!(
+                pick_repo_digest("ubuntu:22.04", repo_digests).as_deref(),
                 expected,
                 "{repo_digests:?}"
             );
