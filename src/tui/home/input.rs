@@ -46,7 +46,8 @@ pub(super) enum SidebarSection {
     Archived,
 }
 
-/// The `aoe.web` plugin serves the dashboard; with it disabled, `R` explains why instead.
+/// The `aoe.web` plugin serves the dashboard; with it disabled, the Connections row says so
+/// and Enter on it explains why.
 pub(super) fn web_plugin_disabled() -> bool {
     crate::plugin::registry()
         .get("aoe.web")
@@ -1560,6 +1561,13 @@ impl HomeView {
             }
             return true;
         }
+        if let Some(view) = &mut self.connections_view {
+            if let Some(DialogResult::Submit(())) = view.handle_click(col, row) {
+                self.connections_view = None;
+                self.open_serve();
+            }
+            return true;
+        }
         if let Some(dialog) = &self.update_confirm_dialog {
             if let Some(result) = dialog.handle_click(col, row) {
                 match result {
@@ -2096,6 +2104,18 @@ impl HomeView {
                 }
                 return None;
             }
+        }
+
+        if let Some(view) = &mut self.connections_view {
+            match view.handle_key(key) {
+                DialogResult::Continue => {}
+                DialogResult::Cancel => self.connections_view = None,
+                DialogResult::Submit(()) => {
+                    self.connections_view = None;
+                    self.open_serve();
+                }
+            }
+            return None;
         }
 
         // Command palette captures input ahead of the help overlay so its own
@@ -3011,7 +3031,7 @@ impl HomeView {
             ActionId::SetWorktreeName => self.open_worktree_name_for_selected(),
             ActionId::AddProject => self.open_add_project_for_selected(),
             ActionId::Diff => self.open_diff_for_selected(),
-            ActionId::Serve => self.open_serve(),
+            ActionId::Serve => self.open_connections(),
             ActionId::Settings => self.open_settings(),
             ActionId::Profiles => self.show_profile_picker(),
             ActionId::Projects => {
@@ -3210,7 +3230,7 @@ impl HomeView {
     /// Whether the session's persisted view can be switched, and which it renders now:
     /// `Some(is_structured)` when the context menu should offer a switch. A structured
     /// session can always go back to a terminal; a terminal one can go structured only
-    /// when its tool is ACP-capable and `offer_structured_in_new_session` is on, the same
+    /// when its tool is ACP-capable and `acp.structured_view` is not `off`, the same
     /// gate as the new-session toggle. Archived, trashed and mid-lifecycle rows are
     /// excluded: their agent is deliberately stopped and the swap would boot a worker
     /// behind the parked state.
@@ -3229,10 +3249,8 @@ impl HomeView {
             &inst.source_profile,
             std::path::Path::new(&inst.project_path),
         );
-        // Switching a terminal session into structured view is gated on the same opt-in
-        // as the new-session toggle; the reverse direction stays available regardless, so
-        // a session can always get out.
-        (config.acp.offer_structured_in_new_session
+        // The reverse direction stays available regardless, so a session can always get out.
+        (config.acp.structured_view.is_offered()
             && crate::session::builder::structured::tool_acp_capable(&inst.tool, &config))
         .then_some(false)
     }
@@ -3710,6 +3728,33 @@ impl HomeView {
         Some(Action::SmartRenameNow(id))
     }
 
+    /// R: the Connections hub. Its Web dashboard row reaches [`Self::open_serve`].
+    fn open_connections(&mut self) {
+        let web = self.connections_web_state(None);
+        self.connections_view = Some(crate::tui::dialogs::ConnectionsView::new(
+            self.daemon_attention(),
+            web,
+        ));
+    }
+
+    /// The hub's Web dashboard row. `known` keeps a transport already read, so a refresh
+    /// reads `serve.mode` only until it names one.
+    pub(super) fn connections_web_state(
+        &self,
+        known: Option<&crate::tui::dialogs::WebState>,
+    ) -> crate::tui::dialogs::WebState {
+        use crate::tui::dialogs::{served_via, WebState};
+        if web_plugin_disabled() {
+            WebState::Disabled
+        } else if !self.serve_running {
+            WebState::Off
+        } else if let Some(WebState::On(Some(via))) = known {
+            WebState::On(Some(via))
+        } else {
+            WebState::On(served_via())
+        }
+    }
+
     fn open_serve(&mut self) {
         if web_plugin_disabled() {
             self.info_dialog = Some(InfoDialog::new(
@@ -3717,7 +3762,7 @@ impl HomeView {
                 "The aoe.web plugin is disabled, so the web dashboard cannot \
                      be served.\n\n\
                      Re-enable it in Settings > Plugins (or run \
-                     `aoe plugin enable aoe.web`), then press R again.",
+                     `aoe plugin enable aoe.web`), then open it again from R.",
             ));
             return;
         }

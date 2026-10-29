@@ -48,6 +48,13 @@ const PAGES = [
       "Forward configured MCP servers to structured-view agents via mcp.json.",
   },
   {
+    source: "docs/guides/mcp-control.md",
+    dest: "guides/mcp-control.md",
+    title: "Controlling AoE over MCP",
+    description:
+      "Connect an agent to Agent of Empires sessions through the daemon's MCP server.",
+  },
+  {
     source: "docs/guides/sandbox.md",
     dest: "guides/sandbox.md",
     title: "Container Sandbox",

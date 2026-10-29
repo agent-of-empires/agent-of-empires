@@ -1872,6 +1872,32 @@ impl Storage {
         )
     }
 
+    /// [`Self::acquire_instance_lifecycle_lock`] without the wait; `None` while another holder has it.
+    pub(crate) fn try_acquire_instance_lifecycle_lock(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<StorageFlock>> {
+        super::validate_instance_id(instance_id)
+            .context("refusing lifecycle lock for invalid instance id")?;
+        let profile_dir = self
+            .sessions_path
+            .parent()
+            .ok_or_else(|| anyhow!("sessions path has no profile directory"))?;
+        try_acquire_storage_flock(
+            profile_dir,
+            &format!("{INSTANCE_LIFECYCLE_LOCK_PREFIX}{instance_id}.lock"),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn save_locks_are_free_for_test(&self) -> bool {
+        let profile_dir = self.sessions_path.parent().expect("profile directory");
+        self.save_lock.try_lock().is_ok()
+            && try_acquire_storage_flock(profile_dir, STORAGE_LOCK_FILENAME)
+                .expect("probe storage lock")
+                .is_some()
+    }
+
     /// Whether some holder currently has `instance_id`'s lifecycle lock.
     #[cfg(test)]
     pub(crate) fn instance_lifecycle_lock_is_held_for_test(&self, instance_id: &str) -> bool {
@@ -2190,6 +2216,20 @@ impl Storage {
         Ok(bundle)
     }
 
+    /// Read every session row without taking the storage flock, failing on any
+    /// row that cannot be decoded instead of skipping it.
+    pub(crate) fn load_instances_complete(&self) -> Result<Vec<Instance>> {
+        let opened;
+        let files = match self.files.as_deref() {
+            Some(files) => files,
+            None => {
+                opened = ProfileFiles::open(&self.sessions_path, ProfileRootPolicy::Canonical)?;
+                &opened
+            }
+        };
+        self.load_instances(ReadPolicy::Complete(files))
+    }
+
     pub(crate) fn verify_bound_profile(&self) -> Result<()> {
         self.files
             .as_deref()
@@ -2293,6 +2333,14 @@ impl Storage {
     {
         self.update_with_policy(ReadPolicy::Recover, f)
             .map(|(result, _, _)| result)
+    }
+
+    /// Like [`Self::update`], but refuses to rewrite a store holding an undecodable row.
+    pub(crate) fn update_complete<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
+    {
+        self.update_with_snapshot(f).map(|(result, _, _)| result)
     }
 
     /// Return the committed rows and groups without rereading after releasing the flock.

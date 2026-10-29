@@ -47,6 +47,18 @@ A daemon from an older build may not expose the local Unix runtime transport, ev
 
 If you installed shell completions as a static file, regenerate it afterwards so it picks up new commands and flags; see [Shell completions](guides/shell-completions.md) for the always-fresh setup that avoids this.
 
+Local Unix transport requires a current-user-owned `daemon/` directory with mode
+`0700` and trusted ancestors. AoE creates missing application ancestors without
+group-write bits, including under umask `002`; it does not change existing
+`~/.config` permissions. On each daemon start, AoE removes group and other write
+permissions from an existing application directory owned by the current user.
+Follow the recovery advice for the refused directory:
+set `daemon/` to mode `0700`, or remove both group and other write permissions from
+another refused ancestor, then retry. A directory owned by another user also
+requires ownership recovery; changing its mode alone is not sufficient.
+
+Daemon directory refusals report escaped paths and recovery guidance. Paths containing non-UTF-8 bytes, control characters, bidirectional formatting characters, or backticks receive an escaped path and manual repair instructions instead of a shell command.
+
 ## Downgrading
 
 Downgrades are unsupported. An older build refuses a newer `.schema_version`; preserve that refusal. Never lower or delete the marker to force startup. Older commands and clients are not safe readability probes against current application data.

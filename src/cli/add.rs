@@ -127,6 +127,11 @@ pub struct AddArgs {
     #[arg(long = "sandbox-image")]
     sandbox_image: Option<String>,
 
+    /// Env var for the host `before_start` hook only, never the container
+    /// (`KEY=VALUE` or `KEY`; repeatable; requires --sandbox)
+    #[arg(long = "hook-env", value_name = "KEY[=VALUE]")]
+    hook_env: Vec<String>,
+
     /// Enable YOLO mode (skip permission prompts)
     #[arg(short = 'y', long)]
     yolo: bool,
@@ -199,6 +204,10 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         bail!("--effort cannot be empty");
     }
 
+    if !args.hook_env.is_empty() && !(args.sandbox || args.sandbox_image.is_some()) {
+        bail!("--hook-env requires --sandbox; host_hooks.before_start only runs for sandboxed sessions");
+    }
+
     if args.scratch && args.path.is_some() {
         bail!(
             "Cannot specify a project path with --scratch\nTip: drop the path argument, the session runs in a fresh scratch directory"
@@ -222,6 +231,9 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
 
     if !args.scratch && !path.is_dir() {
         bail!("Path is not a directory: {}", path.display());
+    }
+    if !args.scratch {
+        crate::session::builder::ensure_not_purging(&path)?;
     }
 
     if (!args.extra_repos.is_empty() || !args.projects.is_empty())
@@ -777,7 +789,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 );
             }
         } else {
-            for w in crate::session::validate_env_entries(&config.sandbox.environment) {
+            for w in sandbox_env_warnings(&config.sandbox.environment, &args.hook_env) {
                 eprintln!("⚠ {}", w);
             }
 
@@ -795,6 +807,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 extra_env: None,
                 custom_instruction: config.sandbox.custom_instruction.clone(),
                 before_start_env: Vec::new(),
+                before_start_hook_env: args.hook_env.clone(),
                 provider: None,
                 container_workdir: None,
             });
@@ -1577,6 +1590,10 @@ fn resolve_named_tool(tool: &str, config: &crate::session::Config) -> Result<Nam
     )
 }
 
+fn sandbox_env_warnings(sandbox_env: &[String], hook_env: &[String]) -> Vec<String> {
+    crate::session::validate_env_entries(sandbox_env.iter().chain(hook_env))
+}
+
 fn resolve_sandbox_image(
     flag: Option<&str>,
     merged_default: &str,
@@ -1647,6 +1664,34 @@ mod tests {
                     .unwrap();
             assert_eq!(trusted.hooks().on_create, vec!["repo-create".to_string()]);
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn hook_env_requires_sandbox() {
+        use clap::Parser;
+        let _app = crate::session::test_support::isolate_app_dir();
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["aoe", "add", "--hook-env", "MINT_REPO=a/b"];
+            argv.extend_from_slice(extra);
+            match crate::cli::Cli::try_parse_from(argv).unwrap().command {
+                Some(crate::cli::Commands::Add(args)) => *args,
+                _ => panic!("expected an add invocation"),
+            }
+        };
+        let err = super::run("default", parse(&[])).await.unwrap_err();
+        assert!(err.to_string().contains("--hook-env requires --sandbox"));
+        assert_eq!(parse(&["-s"]).hook_env, ["MINT_REPO=a/b"]);
+    }
+
+    #[test]
+    fn sandbox_env_warnings_cover_hook_env() {
+        let unset = "AOE_TEST_HOOK_ENV_UNSET_9f3a";
+        let hook = vec![format!("GH_TOKEN=${unset}")];
+        let warnings = super::sandbox_env_warnings(&[], &hook);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains(unset));
+        assert!(super::sandbox_env_warnings(&[], &[]).is_empty());
     }
 
     #[test]

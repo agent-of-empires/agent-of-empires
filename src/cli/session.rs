@@ -5,9 +5,13 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 use std::collections::HashSet;
 
+use crate::session::rename_transaction::{
+    apply_worktree_edit, ensure_unique, rekey_tmux, rekey_warning, worktree_edit_gate,
+    RenameRefusal, WorktreeChange,
+};
 use crate::session::{
-    acquire_session_identity_lock, duplicate_session_error, is_duplicate_session, GroupTree,
-    Instance, LifecycleOperation, ResumeIntent, StartOutcome, Status, Storage,
+    acquire_session_identity_lock, GroupTree, Instance, LifecycleOperation, ResumeIntent,
+    StartOutcome, Status, Storage,
 };
 
 #[derive(Subcommand)]
@@ -605,158 +609,102 @@ fn release_restore_reservation(storage: &Storage, restore_id: &str, generation: 
 }
 
 async fn empty_trash(profile: &str) -> Result<()> {
-    let storage = Storage::open_unwatched(profile)?;
+    use crate::daemon::{EmptyTrashBody, GroupSessionFailureCode, PurgeOutcome};
 
-    let (instances, _groups) = storage.load_with_groups()?;
-    let mut trashed: Vec<_> = instances
-        .iter()
-        .filter(|i| i.is_trashed())
-        .cloned()
-        .collect();
-    for instance in &mut trashed {
-        instance.source_profile = storage.profile().to_string();
-    }
-    trashed.sort_by(|left, right| left.id.cmp(&right.id));
-    if trashed.is_empty() {
+    let (client, epoch) = super::group::daemon_client().await?;
+    let profile = if profile.is_empty() {
+        client.default_profile().await?
+    } else {
+        profile.to_string()
+    };
+    let outcome = client
+        .empty_trash(
+            &EmptyTrashBody {
+                profile: profile.clone(),
+            },
+            &epoch,
+        )
+        .await?
+        .outcome;
+    if outcome.sessions.is_empty() && outcome.failures.is_empty() {
         println!("Trash is empty.");
         return Ok(());
     }
 
     let mut removed = 0usize;
     let mut restored_after_teardown = 0usize;
-    let mut kept_for_retry = 0usize;
     let mut being_restored_elsewhere = 0usize;
-    let mut being_purged_elsewhere = 0usize;
-    let mut busy = Vec::new();
-    for inst in &trashed {
-        let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
-            profile,
-            std::path::Path::new(&inst.project_path),
-        );
-        let delete_worktree =
-            config.worktree.auto_cleanup && inst.has_managed_worktree_or_workspace();
-        let delete_branch = delete_worktree && config.worktree.delete_branch_on_cleanup;
-        let delete_sandbox =
-            inst.sandbox_info.as_ref().is_some_and(|s| s.enabled) && config.sandbox.auto_cleanup;
-        let row_storage = Storage::open_unwatched(profile)?;
-        let reservation = crate::session::deletion::PurgeTransaction::reserve(
-            row_storage,
-            crate::session::deletion::DeletionRequest {
-                session_id: inst.id.clone(),
-                instance: inst.clone(),
-                delete_worktree,
-                delete_branch,
-                delete_sandbox,
-                force_delete: true,
-                detach_hooks: false,
-                keep_scratch: false,
-            },
-            None,
-        )?;
-        let transaction = match reservation {
-            Ok(transaction) => transaction,
-            Err(result) => {
-                match result.disposition {
-                    crate::session::deletion::DeletionDisposition::KeptRestored => {
-                        being_restored_elsewhere += 1;
-                    }
-                    crate::session::deletion::DeletionDisposition::Busy => {
-                        busy.push(busy_line(inst, &result));
-                    }
-                    crate::session::deletion::DeletionDisposition::Superseded => {
-                        being_purged_elsewhere += 1;
-                    }
-                    _ => {}
-                }
-                continue;
-            }
-        };
-        let result = transaction.run_hooks()?.complete_with(|instance| {
-            super::purge_acp_transcript(instance).map_err(|error| {
-                format!("transcript not purged, keeping session in trash: {error}")
-            })
-        });
-        for err in &result.errors {
-            eprintln!("Warning ({}): {}", inst.title, err);
-        }
-        match result.disposition {
-            crate::session::deletion::DeletionDisposition::Removed => removed += 1,
-            crate::session::deletion::DeletionDisposition::KeptRestored => {
-                if result.teardown_started {
-                    restored_after_teardown += 1;
-                } else {
-                    being_restored_elsewhere += 1;
+    for session in &outcome.sessions {
+        match &session.outcome {
+            PurgeOutcome::Deleted { cleanup_errors, .. } => {
+                removed += 1;
+                for err in cleanup_errors {
+                    eprintln!("Warning ({}): {}", session.id, err);
                 }
             }
-            crate::session::deletion::DeletionDisposition::Busy => {
-                busy.push(busy_line(inst, &result));
-            }
-            crate::session::deletion::DeletionDisposition::Superseded => {
-                being_purged_elsewhere += 1;
-            }
-            crate::session::deletion::DeletionDisposition::Failed => kept_for_retry += 1,
-            crate::session::deletion::DeletionDisposition::AlreadyGone => {}
+            PurgeOutcome::Kept {
+                teardown_started: true,
+                ..
+            } => restored_after_teardown += 1,
+            PurgeOutcome::Kept { .. } => being_restored_elsewhere += 1,
         }
     }
-    let outcome = super::EmptyTrashOutcome {
-        removed,
-        restored_after_teardown,
-        kept_for_retry,
+    let count = |code: GroupSessionFailureCode| {
+        outcome
+            .failures
+            .iter()
+            .filter(|failure| failure.code == code)
+            .count()
     };
-    if outcome.restored_after_teardown > 0 {
+    let kept_for_retry = count(GroupSessionFailureCode::PurgeFailed);
+    let being_purged_elsewhere = count(GroupSessionFailureCode::Superseded);
+    let busy = count(GroupSessionFailureCode::LifecycleBusy);
+
+    if restored_after_teardown > 0 {
         eprintln!(
-            "Warning: {} session(s) were restored mid-purge after teardown began; kept the \
-             restored records, but their worktree, branch, container, or transcript may already \
-             have been removed. Inspect and repair them.",
-            outcome.restored_after_teardown
+            "Warning: {restored_after_teardown} session(s) were restored mid-purge after teardown \
+             began; kept the restored records, but their worktree, branch, container, or \
+             transcript may already have been removed. Inspect and repair them."
         );
     }
-    let mut parts = vec![format!("purged {} session(s)", outcome.removed)];
-    if outcome.kept_for_retry > 0 {
-        parts.push(format!("kept {} for retry", outcome.kept_for_retry));
+    let mut parts = vec![format!("purged {removed} session(s)")];
+    if kept_for_retry > 0 {
+        parts.push(format!("kept {kept_for_retry} for retry"));
     }
     if being_restored_elsewhere > 0 {
         parts.push(format!(
             "{being_restored_elsewhere} being restored by another process"
         ));
     }
-    if !busy.is_empty() {
-        parts.push(format!("skipped {} busy", busy.len()));
+    if busy > 0 {
+        parts.push(format!("skipped {busy} busy"));
     }
     if being_purged_elsewhere > 0 {
         parts.push(format!(
             "{being_purged_elsewhere} changed during purge, rerun to retry"
         ));
     }
-    if outcome.restored_after_teardown > 0 {
-        parts.push(format!(
-            "{} restored mid-purge",
-            outcome.restored_after_teardown
-        ));
+    if restored_after_teardown > 0 {
+        parts.push(format!("{restored_after_teardown} restored mid-purge"));
     }
-    println!(
-        "Emptied trash: {} (profile '{}').",
-        parts.join(", "),
-        storage.profile()
-    );
-    if !busy.is_empty() {
-        for line in &busy {
-            eprintln!("{line}");
+    println!("Emptied trash: {} (profile '{profile}').", parts.join(", "));
+    for failure in &outcome.failures {
+        if failure.code == GroupSessionFailureCode::PurgeFailed {
+            eprintln!("  Kept for retry: {} ({})", failure.id, failure.message);
+        }
+    }
+    if busy > 0 {
+        for failure in &outcome.failures {
+            if failure.code == GroupSessionFailureCode::LifecycleBusy {
+                eprintln!("  Busy: {} ({})", failure.id, failure.message);
+            }
         }
         anyhow::bail!(
-            "{} session(s) were skipped because another operation holds them; nothing changed \
-             for those, retry once the operation finishes",
-            busy.len()
+            "{busy} session(s) were skipped because another operation holds them; nothing changed \
+             for those, retry once the operation finishes"
         );
     }
     Ok(())
-}
-
-fn busy_line(inst: &Instance, result: &crate::session::deletion::DeletionResult) -> String {
-    let reason = result
-        .conflict()
-        .map_or_else(|| "busy".to_owned(), |error| error.to_string());
-    format!("  Busy: {}  {} ({reason})", inst.id, inst.title)
 }
 
 async fn snooze_session(profile: &str, args: SnoozeArgs) -> Result<()> {
@@ -1028,6 +976,10 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
         let mut ids = Vec::new();
         for (s, session_config) in to_import.iter().zip(&session_configs) {
             if already_imported(all_instances, &s.session_id) {
+                continue;
+            }
+            if crate::git::GitWorktree::is_within_purging(std::path::Path::new(&s.cwd)) {
+                eprintln!("Skipping {}: its project path is being purged", s.cwd);
                 continue;
             }
             let inst = build_import_instance(s, structured, &group, session_config);
@@ -1805,7 +1757,6 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         .trim()
         .to_string();
     let new_group = args.group.as_ref().map(|g| g.trim().to_string());
-    let title_changed = old_title != effective_title;
 
     let config = crate::session::config::profile_config::resolve_config_or_warn(profile);
     let tied = inst.tie_workdir_applies(config.session.tie_workdir_to_name);
@@ -1818,18 +1769,10 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     } else {
         inst.project_path.clone()
     };
-    let pair_changed = title_changed
-        || duplicate_path.trim_end_matches('/') != inst.project_path.trim_end_matches('/');
-    if pair_changed
-        && is_duplicate_session(
-            authoritative_instances.iter(),
-            &effective_title,
-            &duplicate_path,
-            Some(&id),
-        )
-    {
-        return Err(duplicate_session_error(&effective_title));
-    }
+    let mut renamed = inst.clone();
+    renamed.title = effective_title.clone();
+    renamed.project_path = duplicate_path;
+    ensure_unique(&authoritative_instances, &inst, &renamed)?;
 
     let mut new_path: Option<String> = None;
     let mut new_branch: Option<String> = None;
@@ -1899,31 +1842,28 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
             live.source_profile = profile.to_string();
             crate::tmux::refresh_session_cache();
             live.update_status_with_metadata(None, None);
-            let container_holds = !live.status.blocks_worktree_edit()
-                && moves_worktree
-                && crate::session::worktree_edit::ensure_sandbox_container_released(
-                    &id,
-                    is_sandboxed,
-                );
-            if live.status.blocks_worktree_edit() || container_holds {
-                bail!("Stop the session before renaming its worktree directory or branch. Disable session.tie_workdir_to_name to relabel a running session.");
-            }
+            worktree_edit_gate(
+                &id,
+                is_sandboxed,
+                live.status.blocks_worktree_edit(),
+                WorktreeChange {
+                    moves_dir: moves_worktree,
+                    renames_branch,
+                },
+                false,
+            )?;
         }
-        match crate::session::worktree_edit::edit_worktree_workdir(
+        match apply_worktree_edit(
             crate::session::worktree_edit::WorktreeEditRequest {
                 worktree_info: &worktree_info,
                 current_path: std::path::Path::new(&current_path),
                 new_name: &leaf,
                 rename_branch: args.rename_branch,
             },
+            &id,
+            is_sandboxed,
         ) {
             Ok(outcome) => {
-                if outcome.new_path != std::path::Path::new(&current_path) {
-                    crate::session::worktree_edit::discard_sandbox_container_after_move(
-                        &id,
-                        is_sandboxed,
-                    );
-                }
                 if let Some(warning) = &outcome.warning {
                     eprintln!("Warning: {warning}");
                 }
@@ -2009,14 +1949,16 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         let rekey_id = id.clone();
         let rekey_old_title = persisted_old_title.clone();
         let rekey_new_title = committed_title.clone();
-        match tokio::task::spawn_blocking(move || {
-            crate::tmux::rekey_session(&rekey_id, &rekey_old_title, &rekey_new_title)
+        let warning = match tokio::task::spawn_blocking(move || {
+            rekey_tmux(&rekey_id, &rekey_old_title, &rekey_new_title)
         })
         .await
         {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => eprintln!("Warning: failed to rename tmux session: {error}"),
-            Err(error) => eprintln!("Warning: tmux rename task failed: {error}"),
+            Ok(warning) => warning,
+            Err(error) => Some(rekey_warning(&error)),
+        };
+        if let Some(warning) = warning {
+            eprintln!("Warning: {warning}");
         }
     }
 
@@ -2520,7 +2462,10 @@ mod rename_tests {
         .await
         .unwrap_err();
         assert!(
-            error.to_string().contains("while the session is active"),
+            matches!(
+                error.downcast_ref::<crate::session::rename_transaction::RenameRefusal>(),
+                Some(crate::session::rename_transaction::RenameRefusal::Running)
+            ),
             "{error}"
         );
         assert!(worktree.is_dir());
@@ -2587,7 +2532,7 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
             .session
             .tie_workdir_to_name,
     ) {
-        bail!("Renaming is unified while session.tie_workdir_to_name is on; use 'aoe session rename --title <name>' instead, and the worktree directory follows. Disable the setting to edit the directory independently.");
+        return Err(RenameRefusal::Tied.into());
     }
     let duplicate_path = crate::session::worktree_edit::target_worktree_path(
         std::path::Path::new(&current_path),
@@ -2596,16 +2541,9 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     .unwrap_or_else(|| std::path::PathBuf::from(&current_path))
     .to_string_lossy()
     .into_owned();
-    if duplicate_path.trim_end_matches('/') != current_path.trim_end_matches('/')
-        && is_duplicate_session(
-            authoritative_instances.iter(),
-            &inst.title,
-            &duplicate_path,
-            Some(&id),
-        )
-    {
-        return Err(duplicate_session_error(&inst.title));
-    }
+    let mut moved = inst.clone();
+    moved.project_path = duplicate_path;
+    ensure_unique(&authoritative_instances, &inst, &moved)?;
     let mut live = inst.clone();
     live.source_profile = profile.to_string();
     crate::tmux::refresh_session_cache();
@@ -2614,30 +2552,31 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
         std::path::Path::new(&current_path),
         args.name.trim(),
     );
-    if live.status.blocks_worktree_edit()
-        || (moves_worktree
-            && crate::session::worktree_edit::ensure_sandbox_container_released(
-                &id,
-                live.is_sandboxed(),
-            ))
-    {
-        bail!("Cannot edit the workdir name while the session is active; stop it first");
-    }
+    worktree_edit_gate(
+        &id,
+        live.is_sandboxed(),
+        live.status.blocks_worktree_edit(),
+        WorktreeChange {
+            moves_dir: moves_worktree,
+            renames_branch: crate::session::worktree_edit::worktree_branch_rename_required(
+                &worktree_info,
+                args.name.trim(),
+                args.rename_branch,
+            ),
+        },
+        true,
+    )?;
 
-    let outcome = crate::session::worktree_edit::edit_worktree_workdir(
+    let outcome = apply_worktree_edit(
         crate::session::worktree_edit::WorktreeEditRequest {
             worktree_info: &worktree_info,
             current_path: std::path::Path::new(&current_path),
             new_name: args.name.trim(),
             rename_branch: args.rename_branch,
         },
+        &id,
+        live.is_sandboxed(),
     )?;
-    if outcome.new_path != std::path::Path::new(&current_path) {
-        crate::session::worktree_edit::discard_sandbox_container_after_move(
-            &id,
-            live.is_sandboxed(),
-        );
-    }
     let new_path = outcome.new_path.to_string_lossy().to_string();
     let new_branch = outcome.new_branch.clone();
     if let Some(warning) = &outcome.warning {
@@ -3066,14 +3005,14 @@ mod restart_args_tests {
         let first = "01a053b6-c470-78de-9d8f-bc00ef05332a";
         supervise_attach_capture(&mut inst, |live| {
             assert!(
-                live.session_id_poller_is_running(),
+                live.capture_poller.is_running(),
                 "capture must be supervised before the blocking attach call"
             );
             crate::session::publish_host_pi_transcript(&live.id, first, home.path());
             Ok(())
         })
         .unwrap();
-        assert!(inst.session_id_poller.is_none());
+        assert!(inst.capture_poller.handle().is_none());
         assert_eq!(
             storage.load().unwrap()[0].agent_session_id.as_deref(),
             Some(first)
@@ -3087,7 +3026,7 @@ mod restart_args_tests {
 
         assert_eq!(result.unwrap_err().to_string(), "fake attach failure");
         assert!(
-            inst.session_id_poller.is_none(),
+            inst.capture_poller.handle().is_none(),
             "an immediate nested attach return must not orphan its poller"
         );
         assert_eq!(
@@ -3824,65 +3763,5 @@ mod wait_decision_tests {
         let mut converted = adopted;
         converted.view = crate::session::View::Structured;
         assert!(adopt_stored(&live, converted).is_err());
-    }
-}
-
-#[cfg(test)]
-mod empty_trash_busy_tests {
-    use super::empty_trash;
-    use crate::session::{Instance, LifecycleOperation, Storage};
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn empty_trash_purges_the_rest_then_fails_for_a_busy_session() {
-        let _home = crate::session::test_support::isolate_app_dir();
-        let root = crate::session::get_app_dir().unwrap();
-        crate::session::purge_owners::initialize(&root).unwrap();
-        crate::tmux::tool_retirement::initialize(&root).unwrap();
-        let profile = "empty-trash-busy";
-        let storage = Storage::new_unwatched(profile).unwrap();
-        let mut busy = Instance::new("busy", "/tmp/empty-trash-busy-a");
-        let mut free = Instance::new("free", "/tmp/empty-trash-busy-b");
-        for row in [&mut busy, &mut free] {
-            row.source_profile = profile.into();
-            row.trash();
-        }
-        let busy_id = busy.id.clone();
-        storage
-            .update(|rows, _| {
-                rows.extend([busy, free]);
-                Ok(())
-            })
-            .unwrap();
-        let generation = storage
-            .update(|rows, _| {
-                let row = rows.iter_mut().find(|row| row.id == busy_id).unwrap();
-                Ok(row
-                    .try_acquire_lifecycle_reservation(
-                        LifecycleOperation::Restore,
-                        Instance::LIFECYCLE_RESERVATION_TTL,
-                        chrono::Utc::now(),
-                    )
-                    .unwrap())
-            })
-            .unwrap();
-
-        let error = empty_trash(profile).await.unwrap_err().to_string();
-        assert!(error.contains("1 session(s) were skipped"), "{error}");
-        let left = storage.load().unwrap();
-        assert_eq!(left.len(), 1);
-        assert_eq!(left[0].id, busy_id);
-
-        storage
-            .update(|rows, _| {
-                rows[0].release_lifecycle_reservation_if_owned(
-                    LifecycleOperation::Restore,
-                    generation,
-                );
-                Ok(())
-            })
-            .unwrap();
-        empty_trash(profile).await.unwrap();
-        assert!(storage.load().unwrap().is_empty());
     }
 }

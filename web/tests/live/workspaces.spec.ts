@@ -123,6 +123,8 @@ test("saved-unpinned hidden; pin POSTs; unpin keeps the saved project", async ({
   expect(unpinRes.ok()).toBe(true);
   expect(unpinRes.request().postDataJSON()).toMatchObject({ pinned: false });
   await expect(marker).toHaveCount(0, { timeout: 5_000 });
+  // Still a registered Project, so ◆ gives way to ◇.
+  await expect(headerA.locator("[data-testid='sidebar-group-project-marker']")).toBeVisible();
   expect((await savedProjects()).some((p) => p.path === repoA)).toBe(true);
 });
 
