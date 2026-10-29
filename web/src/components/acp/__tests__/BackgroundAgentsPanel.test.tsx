@@ -37,6 +37,32 @@ function agent(over: Partial<BackgroundAgent> = {}): BackgroundAgent {
 }
 
 describe("BackgroundAgentsPanel", () => {
+  it("groups a workflow's agents under the run and its phases", () => {
+    const wf = (phase: string) => ({ run_id: "wf_1", name: "issue-drafts", phase });
+    const ended = new Date().toISOString();
+    agentsMock.mockReturnValue([
+      agent({ agentId: "p1", description: "plain task", status: "completed", endedAt: ended }),
+      agent({ agentId: "d1", description: "draft:one", workflow: wf("Draft"), status: "completed", endedAt: ended }),
+      agent({ agentId: "d2", description: "draft:two", workflow: wf("Draft"), status: "completed", endedAt: ended }),
+      agent({ agentId: "v1", description: "verify:one", workflow: wf("Verify") }),
+    ]);
+    const { container } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    const text = container.textContent ?? "";
+    expect(text).toContain("Background agents · 4");
+    expect(text).toContain("issue-drafts");
+    expect(text).toContain("2 of 3 done");
+    expect(text).toContain("Draft · 2/2");
+    expect(text).toContain("Verify · 0/1");
+    // The active run sorts first; its phases keep start order; plain agents stay ungrouped.
+    const order = ["issue-drafts", "draft:one", "draft:two", "verify:one", "plain task"].map((s) => text.indexOf(s));
+    expect(order).toEqual([...order].sort((a, b) => a - b));
+    // Collapsing the run hides its agents only.
+    const runHeader = [...container.querySelectorAll("button")].find((b) => b.textContent?.includes("issue-drafts"));
+    fireEvent.click(runHeader!);
+    expect(container.textContent).not.toContain("draft:one");
+    expect(container.textContent).toContain("plain task");
+  });
+
   it("lists a running agent with description, tool count, and last activity", () => {
     agentsMock.mockReturnValue([agent()]);
     const { container } = render(<BackgroundAgentsPanel sessionId="s-1" />);

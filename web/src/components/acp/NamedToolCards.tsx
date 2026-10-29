@@ -1,6 +1,6 @@
 /* eslint-disable react-refresh/only-export-components */
 // Cards for tools recognised by name or payload rather than ACP kind: MCP,
-// memory, skills, and Claude's scheduling and harness tools.
+// memory, skills, workflows, and Claude's scheduling and harness tools.
 
 import { useMemo } from "react";
 import DOMPurify from "dompurify";
@@ -16,6 +16,7 @@ import {
   Search,
   Sparkles,
   Square,
+  Workflow,
 } from "lucide-react";
 
 import { useSkillIndex } from "../../hooks/useSkillIndex";
@@ -28,6 +29,13 @@ import { cleanRecalledMemory, parseMemoryFrontmatter, type MemoryHit } from "../
 import { badgeLabel, badgeTone, resolveSkillSource } from "../../lib/skillProvenance";
 import { StringDiff } from "../diff/StringDiff";
 import { ProvenanceBadge } from "../ProvenanceBadge";
+import {
+  isActiveAgent,
+  useBackgroundAgentsFor,
+  useOpenBackgroundAgentsPane,
+  useWorkflowRun,
+  workflowPhases,
+} from "./backgroundAgentsContext";
 import { GenericToolCard } from "./CoreToolCards";
 import {
   CardChrome,
@@ -146,6 +154,81 @@ export function SkillToolCard({ tool, result, skillName }: ToolCardProps & { ski
       primary={skillName}
       meta={skillSource && <ProvenanceBadge label={badgeLabel(skillSource)} tone={badgeTone(skillSource)} />}
       outputMaxLines={16}
+    />
+  );
+}
+
+export function classifyWorkflow(tool: ToolCall, profile: AgentProfile): boolean {
+  if (tool.kind !== "other") return false;
+  const title = (pickStr(parseJsonObject(tool.args_preview), "_aoe_title") ?? tool.name ?? "").trim();
+  return profile.specialTitles.workflowNames.includes(title);
+}
+
+function lastEnd(agents: { endedAt: string | null }[]): string | undefined {
+  return agents.reduce<string | undefined>(
+    (last, a) => (a.endedAt && (!last || a.endedAt > last) ? a.endedAt : last),
+    undefined,
+  );
+}
+
+/** Claude's `Workflow` returns at once while its agents keep running, so the
+ *  card follows the agents (from the Sub agents pane's store), not the call. */
+export function WorkflowToolCard({ tool, result }: ToolCardProps) {
+  const callStatus = statusFor(result);
+  const run = useWorkflowRun(tool.id);
+  const agents = useBackgroundAgentsFor(tool.id);
+  const openPane = useOpenBackgroundAgentsPane();
+  const args = useToolArgs(tool);
+  const script = pickStr(args, "script");
+  const running = agents.filter(isActiveAgent).length;
+  const status = callStatus === "ok" && running > 0 ? "running" : callStatus;
+  const [open, setOpen] = useToolCardExpansion(status);
+  return (
+    <CardChrome
+      status={status}
+      startedAt={tool.started_at}
+      endedAt={running > 0 ? undefined : (lastEnd(agents) ?? result?.at)}
+      icon={<Workflow className={ICON} />}
+      label="workflow"
+      primary={run?.name ?? agents[0]?.workflow?.name ?? "Workflow"}
+      meta={
+        agents.length > 0 && (
+          <span className={TABULAR_META}>
+            {agents.length - running} of {agents.length} agents done
+          </span>
+        )
+      }
+      expanded={open}
+      onToggle={() => setOpen((v) => !v)}
+      body={
+        <ToolErrorBody status={callStatus} errorText={result?.text}>
+          {run?.summary && (
+            <p className="border-t border-surface-800 px-3 py-2 text-xs text-text-secondary">{run.summary}</p>
+          )}
+          {agents.length > 0 && (
+            <div className="border-t border-surface-800 px-3 py-2 text-xs">
+              {workflowPhases(agents).map(({ phase, agents: phaseAgents }) => {
+                const active = phaseAgents.filter(isActiveAgent).length;
+                return (
+                  <div key={phase} className="flex items-center gap-2 text-text-secondary">
+                    <span className="min-w-0 flex-1 truncate">{phase || "Agents"}</span>
+                    <span className="tabular-nums text-text-dim">
+                      {active > 0 && `${active} running · `}
+                      {phaseAgents.length - active} done
+                    </span>
+                  </div>
+                );
+              })}
+              {openPane && (
+                <button type="button" onClick={openPane} className="mt-1.5 text-accent-500 hover:underline">
+                  Open Sub agents
+                </button>
+              )}
+            </div>
+          )}
+          {script && <RawBlock label="input" text={script} />}
+        </ToolErrorBody>
+      }
     />
   );
 }

@@ -822,6 +822,66 @@ describe("AsyncSubagentCard", () => {
   });
 });
 
+describe("WorkflowToolCard", () => {
+  const script = "export const meta = { name: 'drafts' }\nawait agent('x')";
+  const tool = makeToolCall({ id: "toolu_wf", name: "Workflow", kind: "other", args_preview: args({ script }) });
+  const launched = makeCompletion({ text: "Workflow launched in background. Task ID: wfx" });
+  const member = (agentId: string, phase: string, status: BackgroundAgent["status"]): BackgroundAgent => ({
+    agentId,
+    toolCallId: "toolu_wf",
+    workflow: { run_id: "wf_1", name: "drafts", phase },
+    description: agentId,
+    prompt: "",
+    model: "",
+    status,
+    startedAt: new Date().toISOString(),
+    endedAt: status === "running" ? null : new Date().toISOString(),
+    toolCount: 0,
+    tools: [],
+    lastTool: null,
+    lastText: null,
+    result: null,
+    warning: null,
+  });
+
+  it("follows the run's agents per phase, keeping the script folded", () => {
+    const openPane = vi.fn();
+    const value = {
+      agents: [member("d1", "Draft", "completed"), member("v1", "Verify", "running")],
+      workflowRuns: { toolu_wf: { name: "issue-drafts", summary: "Draft five issues" } },
+      openPane,
+    };
+    const { container, getByText } = render(
+      wrap(
+        <BackgroundAgentsContext.Provider value={value}>
+          <ToolCard tool={tool} result={launched} />
+        </BackgroundAgentsContext.Provider>,
+        { toolKey: "claude" },
+      ),
+    );
+    const text = () => container.textContent ?? "";
+    expect(text()).toContain("issue-drafts");
+    expect(text()).toContain("1 of 2 agents done");
+    // The call returned at launch, but an agent still runs.
+    expect(text()).toContain("running");
+    expect(text()).not.toContain("Draft five issues");
+    fireEvent.click(container.querySelector("button")!);
+    expect(text()).toContain("Draft five issues");
+    expect(text()).toContain("Draft1 done");
+    expect(text()).toContain("Verify1 running · 0 done");
+    expect(text()).toContain("await agent");
+    fireEvent.click(getByText("Open Sub agents"));
+    expect(openPane).toHaveBeenCalledTimes(1);
+  });
+
+  it("names a run with no agents yet, and is the generic card for other agents", () => {
+    // The "workflow" label, then the fallback run name.
+    expect(renderCard(tool, launched, { toolKey: "claude" }).text()).toContain("workflowWorkflow");
+    cleanup();
+    expect(renderCard(tool, launched, { toolKey: "codex" }).text()).not.toContain("workflowWorkflow");
+  });
+});
+
 describe("duration formatting", () => {
   it.each([
     [0, "0 ms"],

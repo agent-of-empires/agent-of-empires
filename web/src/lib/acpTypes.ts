@@ -375,6 +375,7 @@ export type AcpEvent =
         description: string;
         prompt: string;
         model: string;
+        workflow?: WorkflowRef | null;
         started_at: string;
       };
     }
@@ -435,7 +436,14 @@ export type AcpEvent =
   | { SessionContextReset: { reason: string } }
   | { WakeupScheduled: { at: string; reason: string | null } }
   | { MonitorArmed: { description: string | null } }
-  | { BackgroundTaskStarted: { task_id: string; tool_call_id?: string; description: string } }
+  | {
+      BackgroundTaskStarted: {
+        task_id: string;
+        tool_call_id?: string;
+        description: string;
+        workflow?: { run_id: string; name: string; summary?: string | null } | null;
+      };
+    }
   | { BackgroundTaskFinished: { task_id: string } }
   | { PromptRejected: { reason: string; text: string } }
   | { AgentSwitched: { from: string; to: string; reason: string } }
@@ -614,8 +622,10 @@ export interface AcpState {
   agentOrphaned: boolean;
   /** Async sub-agents launched this session, oldest first. */
   backgroundAgents: BackgroundAgent[];
-  /** Ids of running background tasks that are not sub-agents (backgrounded commands). */
+  /** Ids of running background tasks that are not sub-agents (backgrounded commands, workflow runs). */
   backgroundTasks: string[];
+  /** Workflow runs by the `Workflow` tool call that launched them. */
+  workflowRuns: Record<string, WorkflowRun>;
   /** Agent-pushed advisories for the current turn, oldest first. */
   sessionNotices: SessionNotice[];
   /** Ids dismissed in this tab. Local, so it never clears another client. */
@@ -640,10 +650,23 @@ export interface BackgroundAgentTool {
   ok?: boolean | null;
 }
 
+/** The workflow run and phase a background sub-agent belongs to. */
+export interface WorkflowRef {
+  run_id: string;
+  name: string;
+  phase: string;
+}
+
+export interface WorkflowRun {
+  name: string;
+  summary: string | null;
+}
+
 export interface BackgroundAgent {
   agentId: string;
-  /** The parent `Task` call that launched this agent. */
+  /** The parent `Task` (or `Workflow`) call that launched this agent. */
   toolCallId: string;
+  workflow?: WorkflowRef | null;
   description: string;
   prompt: string;
   model: string;
@@ -894,6 +917,7 @@ export function emptyAcpState(): AcpState {
     agentOrphaned: false,
     backgroundAgents: [],
     backgroundTasks: [],
+    workflowRuns: {},
     modeSwitchFailed: null,
     lastAgentSwitch: null,
     configOptions: [],
@@ -1242,6 +1266,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       description: e.description,
       prompt: e.prompt,
       model: e.model,
+      workflow: e.workflow ?? null,
       status: "running",
       startedAt: e.started_at,
       endedAt: null,
@@ -1298,8 +1323,14 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     return next;
   }
   if ("BackgroundTaskStarted" in event) {
-    const id = event.BackgroundTaskStarted.task_id;
+    const { task_id: id, tool_call_id: toolCallId, workflow } = event.BackgroundTaskStarted;
     if (!next.backgroundTasks.includes(id)) next.backgroundTasks = [...next.backgroundTasks, id];
+    if (workflow && toolCallId) {
+      next.workflowRuns = {
+        ...next.workflowRuns,
+        [toolCallId]: { name: workflow.name, summary: workflow.summary ?? null },
+      };
+    }
     return next;
   }
   if ("BackgroundTaskFinished" in event) {

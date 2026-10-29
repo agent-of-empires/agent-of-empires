@@ -312,6 +312,40 @@ describe("applyEvent / background agents", () => {
   });
 });
 
+describe("applyEvent / workflow runs", () => {
+  it("records a workflow run by its tool call and tags its agents", () => {
+    const events: AcpEvent[] = [
+      {
+        BackgroundTaskStarted: {
+          task_id: "wfx",
+          tool_call_id: "toolu_wf",
+          description: "drafts",
+          workflow: { run_id: "wf_1", name: "drafts", summary: "Draft five issues" },
+        },
+      },
+      {
+        BackgroundAgentLaunched: {
+          agent_id: "a1",
+          tool_call_id: "toolu_wf",
+          description: "draft:one",
+          prompt: "",
+          model: "",
+          workflow: { run_id: "wf_1", name: "drafts", phase: "Draft" },
+          started_at: "2026-10-29T19:42:10Z",
+        },
+      },
+      { BackgroundTaskStarted: { task_id: "bash1", tool_call_id: "toolu_bash", description: "" } },
+    ];
+    const state = events.reduce((s, e, i) => ev(s, i + 1, e), emptyAcpState());
+    expect(state.workflowRuns).toEqual({ toolu_wf: { name: "drafts", summary: "Draft five issues" } });
+    expect(state.backgroundTasks).toEqual(["wfx", "bash1"]);
+    expect(state.backgroundAgents[0]).toMatchObject({
+      toolCallId: "toolu_wf",
+      workflow: { run_id: "wf_1", name: "drafts", phase: "Draft" },
+    });
+  });
+});
+
 describe("transcriptRowToActivity (Tier 4 wire mapping)", () => {
   it("maps snake_case wire fields to the camelCase ActivityRow shape", () => {
     const row = transcriptRowToActivity(
