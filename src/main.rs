@@ -25,6 +25,18 @@ fn seed_cityhall_env(cli: &Cli) {
     }
 }
 
+/// Hot-path and app-data-free commands never open the log file on their own;
+/// `AOE_LOG_LEVEL` still can.
+fn skips_cli_sink(cli: &Cli) -> bool {
+    matches!(
+        cli.command,
+        Some(Commands::Completion { .. })
+            | Some(Commands::Init(_))
+            | Some(Commands::ExtractSessionId(_))
+            | Some(Commands::Tmux { .. })
+    )
+}
+
 /// The child's stdio is redirected to the log file, so tracing writes there too.
 fn is_serve_daemon_child(cli: &Cli) -> bool {
     matches!(cli.command, Some(Commands::Serve(ref args)) if args.daemon_child)
@@ -143,13 +155,19 @@ async fn run_cli(mut cli: Cli, read_source: cli::runtime_read::ReadRequestSource
         ProcessContext::OneShotCli
     };
 
-    // One-shot CLI runs get no subscriber unless `AOE_LOG_LEVEL` is set.
+    // `should_init` also decides which config warnings stay on stderr (see `run`).
     let should_init = matches!(
         ctx,
         ProcessContext::Tui | ProcessContext::ServeForeground | ProcessContext::ServeDaemonChild
     ) || env_filter.is_some();
+    // One-shot commands log to the file too, but never create the app dir
+    // (`aoe completion`, `aoe init` on read-only installs).
+    let init_sink = should_init
+        || (ctx == ProcessContext::OneShotCli
+            && !skips_cli_sink(&cli)
+            && agent_of_empires::session::app_dir_exists());
 
-    let (init, log_path_for_msg) = if should_init {
+    let (init, log_path_for_msg) = if init_sink {
         let filter = env_filter
             .clone()
             .or_else(logging::load_persisted_filter)
@@ -186,6 +204,7 @@ async fn run_cli(mut cli: Cli, read_source: cli::runtime_read::ReadRequestSource
                     filter,
                     log_cfg.show_spans,
                     session_tee,
+                    ctx != ProcessContext::OneShotCli,
                 );
                 if let Some(w) = resolution.warning {
                     tracing::warn!(target: "log.runtime", "{}", w);

@@ -136,7 +136,7 @@ impl VapidKeypair {
         // Re-check.
         if path.exists() {
             if let Err(e) = FileExt::unlock(&lock_file) {
-                tracing::debug!(target: "http.middleware", "Failed to release lock file: {e}");
+                tracing::debug!(target: "push", "Failed to release lock file: {e}");
             }
             return Self::load(path);
         }
@@ -144,7 +144,7 @@ impl VapidKeypair {
         let kp = Self::generate()?;
         kp.persist(path)?;
         if let Err(e) = FileExt::unlock(&lock_file) {
-            tracing::debug!(target: "http.middleware", "Failed to release lock file: {e}");
+            tracing::debug!(target: "push", "Failed to release lock file: {e}");
         }
         Ok(kp)
     }
@@ -538,7 +538,7 @@ pub async fn spawn_consumer(state: std::sync::Arc<super::AppState>) {
         let client = match super::push_send::build_client() {
             Ok(c) => c,
             Err(e) => {
-                tracing::error!(target: "http.middleware", error = %e, "push: consumer failed to build reqwest client");
+                tracing::error!(target: "push", error = %e, "push: consumer failed to build reqwest client");
                 return;
             }
         };
@@ -567,11 +567,11 @@ pub async fn spawn_consumer(state: std::sync::Arc<super::AppState>) {
                     match recv {
                         Ok(change) => handle_status_change(&mut dwell, change),
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!(target: "http.middleware", lagged = n, "push: consumer lagged, skipped events");
+                            tracing::warn!(target: "push", lagged = n, "push: consumer lagged, skipped events");
                             continue;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            tracing::info!(target: "http.middleware", "push: status channel closed, consumer exiting");
+                            tracing::info!(target: "push", "push: status channel closed, consumer exiting");
                             return;
                         }
                     }
@@ -669,13 +669,13 @@ async fn fire_due_pushes(
     if suppress_reason != *last_suppress_reason {
         match (*last_suppress_reason, suppress_reason) {
             (None, Some(reason)) => {
-                tracing::debug!(target: "http.middleware", "push: suppressed, {}", reason)
+                tracing::debug!(target: "push", "push: suppressed, {}", reason)
             }
             (Some(_), Some(reason)) => {
-                tracing::debug!(target: "http.middleware", "push: suppression reason changed to {}", reason)
+                tracing::debug!(target: "push", "push: suppression reason changed to {}", reason)
             }
             (Some(prev), None) => {
-                tracing::debug!(target: "http.middleware", "push: resumed (was suppressed: {})", prev)
+                tracing::debug!(target: "push", "push: resumed (was suppressed: {})", prev)
             }
             (None, None) => {}
         }
@@ -761,6 +761,13 @@ async fn fire_due_pushes(
         if subs.is_empty() {
             continue;
         }
+        tracing::info!(
+            target: "push",
+            session = %instance_id,
+            event = ?event,
+            subs = subs.len(),
+            "status push fired"
+        );
 
         let (title, body_prefix) = match event {
             NotificationEvent::Waiting => ("Claude is waiting", "Waiting for input"),
@@ -904,7 +911,6 @@ pub fn build_push_url(sub: &Subscription, path: &str) -> Option<String> {
     if sub.origin.is_empty() {
         tracing::info!(
             target: "push",
-            endpoint = %sub.endpoint,
             "skipping push: subscription has no origin, ask user to re-subscribe (#1188)"
         );
         return None;
@@ -946,10 +952,15 @@ pub async fn deliver<T: Serialize>(
     ttl_secs: u32,
 ) -> super::push_send::SendOutcome {
     let outcome = super::push_send::send_one(client, push, sub, payload, ttl_secs).await;
+    tracing::debug!(target: "push", status = outcome.as_str(), "push delivered");
     push.store.record_delivery(&sub.endpoint, outcome);
     if outcome.is_dead() {
-        if let Err(e) = push.store.gc_stale(&sub.endpoint, sub.generation).await {
-            tracing::warn!(target: "http.middleware", "Failed to GC stale push subscription: {e}");
+        match push.store.gc_stale(&sub.endpoint, sub.generation).await {
+            Ok(true) => tracing::info!(target: "push", "dead push subscription removed"),
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(target: "push", "Failed to GC stale push subscription: {e}")
+            }
         }
     }
     outcome
@@ -1118,6 +1129,8 @@ pub async fn subscribe(
 
     let externally_secure = state.ingress(peer, &headers).externally_secure;
     let origin = extract_request_origin(&headers, externally_secure).unwrap_or_default();
+    // The endpoint path is a capability; only its host may be logged.
+    let endpoint_host = endpoint_url.host_str().unwrap_or_default().to_string();
 
     let sub = Subscription {
         endpoint: body.endpoint,
@@ -1133,6 +1146,7 @@ pub async fn subscribe(
         .upsert(sub)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+    tracing::info!(target: "push", origin = %endpoint_host, "push subscription added");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1187,6 +1201,7 @@ pub async fn unsubscribe(
         .remove_if_owner(&body.endpoint, &auth.0)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+    tracing::info!(target: "push", removed, "push subscription removed");
     if removed {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -1240,7 +1255,7 @@ pub async fn test(
     let client = match super::push_send::build_client() {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!(target: "http.middleware", error = %e, "push: failed to build reqwest client");
+            tracing::error!(target: "push", error = %e, "push: failed to build reqwest client");
             return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
         }
     };
@@ -1249,7 +1264,7 @@ pub async fn test(
         // Stale subscription with no recorded origin.
         tracing::info!(
             target: "push",
-            endpoint = %subscription.endpoint,
+            endpoint = %super::push_send::endpoint_origin(&subscription.endpoint).unwrap_or_default(),
             "test push skipped: subscription has no origin, ask user to re-subscribe (#1188)"
         );
         return Err(StatusCode::CONFLICT.into_response());

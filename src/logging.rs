@@ -42,7 +42,10 @@ pub fn resolve_sink(cfg: &LoggingConfig, app_dir: &Path, ctx: ProcessContext) ->
 
     let force_file = matches!(
         ctx,
-        ProcessContext::Tui | ProcessContext::ServeDaemonChild | ProcessContext::Runner
+        ProcessContext::Tui
+            | ProcessContext::ServeDaemonChild
+            | ProcessContext::Runner
+            | ProcessContext::OneShotCli
     );
     let want_stdout = matches!(cfg.output, SinkKind::Stdout);
 
@@ -120,6 +123,7 @@ pub const DEFAULT_TARGET_ROOTS: &[&str] = &[
     "file_watch",
     "push",
     "task",
+    "daemon",
 ];
 
 pub const KNOWN_SUB_TARGETS: &[&str] = &[
@@ -184,8 +188,17 @@ pub const KNOWN_SUB_TARGETS: &[&str] = &[
     "session.delete",
     "session.trash",
     "session.restart",
+    "session.start",
+    "session.restore",
     "session.rename",
+    "session.sync",
+    "serve.lifecycle",
+    "serve.shutdown",
+    "daemon.client",
+    "acp.queue",
+    "plugin.install",
     "http.api.telemetry",
+    "http.api.system",
 ];
 
 /// Only the filter hot-swaps; sink and rotation settings apply on restart.
@@ -449,10 +462,11 @@ impl std::error::Error for LogFilterError {}
 pub type TeeLayer = crate::acp::session_tee::SessionTeeLayer;
 
 pub fn init_subscriber(target: SubscriberTarget, filter: String) -> InitResult {
-    init_subscriber_with_options(target, filter, false, None)
+    init_subscriber_with_options(target, filter, false, None, true)
 }
 
-/// Default Full output without the span chain prefix.
+/// Default Full output without the span chain prefix. The enclosing
+/// `acp_session` label is added unless the event declares its own `session`.
 pub(crate) struct NoSpanFormat;
 
 impl<S, N> tracing_subscriber::fmt::FormatEvent<S, N> for NoSpanFormat
@@ -474,16 +488,49 @@ where
             meta.level(),
             meta.target(),
         )?;
+        if meta.fields().field("session").is_none() {
+            if let Some(session) = acp_session_label(ctx) {
+                write!(writer, "session={session} ")?;
+            }
+        }
         ctx.field_format().format_fields(writer.by_ref(), event)?;
         writeln!(writer)
     }
 }
 
+/// The `session` field of the enclosing `acp_session` span, which the span
+/// chain would otherwise carry.
+fn acp_session_label<S, N>(ctx: &tracing_subscriber::fmt::FmtContext<'_, S, N>) -> Option<String>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> tracing_subscriber::fmt::FormatFields<'a> + 'static,
+{
+    let span = ctx
+        .event_scope()?
+        .find(|span| span.name() == "acp_session")?;
+    let extensions = span.extensions();
+    let fields = extensions
+        .get::<tracing_subscriber::fmt::FormattedFields<N>>()?
+        .fields
+        .as_str();
+    let start = if fields.starts_with("session=") {
+        0
+    } else {
+        fields.find(" session=")? + 1
+    };
+    let value = fields[start + "session=".len()..].split(' ').next()?;
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+/// `start_marker` writes the filter-immune `[AOE_START_MARKER]` line that
+/// delimits daemon and TUI runs; one-shot CLI commands skip it so the last
+/// marker in the shared file stays the daemon's.
 pub fn init_subscriber_with_options(
     target: SubscriberTarget,
     filter: String,
     show_spans: bool,
     session_tee: Option<TeeLayer>,
+    start_marker: bool,
 ) -> InitResult {
     let parsed = match EnvFilter::builder().with_regex(false).parse(&filter) {
         Ok(f) => f,
@@ -505,8 +552,9 @@ pub fn init_subscriber_with_options(
         SubscriberTarget::File(path, policy) => match SizeRotatingWriter::new(path.clone(), policy)
         {
             Ok(mut writer) => {
-                // Filter-immune boundary between process runs.
-                write_raw_startup_marker(&mut writer);
+                if start_marker {
+                    write_raw_startup_marker(&mut writer);
+                }
                 let mw = std::sync::Mutex::new(writer);
                 if show_spans {
                     let fmt_layer = tracing_subscriber::fmt::layer()
@@ -534,7 +582,9 @@ pub fn init_subscriber_with_options(
             Err(e) => Err(format!("open log file {}: {e}", path.display())),
         },
         SubscriberTarget::Stdout => {
-            write_raw_startup_marker(&mut std::io::stdout());
+            if start_marker {
+                write_raw_startup_marker(&mut std::io::stdout());
+            }
             if show_spans {
                 let fmt_layer = tracing_subscriber::fmt::layer().with_ansi(false);
                 Registry::default()
@@ -1318,6 +1368,7 @@ mod tests {
             "aoe=notalevel".into(),
             false,
             None,
+            true,
         );
         assert!(init.controller.is_none());
         assert_eq!(active_sink(), None);
@@ -1340,6 +1391,56 @@ mod tests {
                 "coercion surfaces a warning"
             );
         }
+    }
+
+    struct TestBufWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for TestBufWriter {
+        fn write(&mut self, src: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(src);
+            Ok(src.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn no_span_format_prefixes_the_acp_session_label() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer_buf = buf.clone();
+        let layer = tracing_subscriber::fmt::layer()
+            .with_writer(move || TestBufWriter(writer_buf.clone()))
+            .with_ansi(false)
+            .event_format(NoSpanFormat);
+        tracing::subscriber::with_default(Registry::default().with(layer), || {
+            tracing::info!(target: "acp.protocol", "outside");
+            let span = tracing::info_span!("acp_session", session = %"abc123", turn = 7);
+            span.in_scope(|| {
+                tracing::info!(target: "acp.protocol", "inside");
+                tracing::info_span!("inner")
+                    .in_scope(|| tracing::warn!(target: "acp.protocol", "nested"));
+                tracing::info!(target: "acp.protocol", session = "x", "own");
+            });
+        });
+        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 4, "{out}");
+        assert!(lines[0].ends_with(" INFO acp.protocol: outside"), "{out}");
+        assert!(
+            lines[1].ends_with(" INFO acp.protocol: session=abc123 inside"),
+            "{out}"
+        );
+        assert!(
+            lines[2].ends_with(" WARN acp.protocol: session=abc123 nested"),
+            "{out}"
+        );
+        assert!(
+            lines[3].ends_with(" INFO acp.protocol: own session=\"x\""),
+            "{out}"
+        );
+        assert_eq!(lines[3].matches("session=").count(), 1, "{out}");
     }
 
     #[test]

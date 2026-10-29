@@ -47,17 +47,29 @@ fn catalog_path() -> anyhow::Result<PathBuf> {
 /// a different schema version (a version bump discards the old cache; it
 /// repopulates as agents run).
 pub fn load() -> OptionCatalog {
+    let unreadable = |error: &dyn std::fmt::Display| {
+        tracing::debug!(
+            target: "acp.option_catalog",
+            %error,
+            "option catalog unreadable, starting empty"
+        );
+        OptionCatalog::default()
+    };
     let path = match catalog_path() {
         Ok(p) => p,
-        Err(_) => return OptionCatalog::default(),
+        Err(error) => return unreadable(&error),
     };
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
-        Err(_) => return OptionCatalog::default(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return OptionCatalog::default()
+        }
+        Err(error) => return unreadable(&error),
     };
     match serde_json::from_slice::<OptionCatalog>(&bytes) {
         Ok(catalog) if catalog.version == CATALOG_VERSION => catalog,
-        _ => OptionCatalog::default(),
+        Ok(_) => OptionCatalog::default(),
+        Err(error) => unreadable(&error),
     }
 }
 

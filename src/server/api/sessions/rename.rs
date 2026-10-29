@@ -27,9 +27,10 @@ pub async fn rename_session(
         Err(error) => return error.into_response(),
     };
     let title = body.title.clone();
+    let (group, profile) = (body.group.clone(), body.profile.clone());
     match edit_session(&state, &id, SessionEdit::Rename(body)).await {
         Ok(warnings) => {
-            tracing::info!(target: "session.rename", session = %id, title = title.as_deref().unwrap_or_default(), "session renamed");
+            tracing::info!(target: "session.rename", session = %id, title = title.as_deref().unwrap_or_default(), ?group, ?profile, "session renamed");
             crate::server::runtime::session_mutation_response(
                 &state,
                 &id,
@@ -56,8 +57,10 @@ pub async fn set_worktree_name(
         Ok(body) => body,
         Err(error) => return error.into_response(),
     };
+    let name = body.name.clone();
     match edit_session(&state, &id, SessionEdit::Worktree(body)).await {
         Ok(warnings) => {
+            tracing::info!(target: "session.rename", session = %id, %name, "worktree renamed");
             crate::server::runtime::session_mutation_response(
                 &state,
                 &id,
@@ -671,6 +674,7 @@ pub async fn attach_session_project(
     match result {
         Ok((outcome, worker)) => {
             use crate::server::attach_project::WorkerOutcome;
+            tracing::info!(target: "session.attach", session = %id, repo = %repo.display(), "project attached");
             let worker = match worker {
                 WorkerOutcome::Restarted => AttachedWorkerOutcome::Restarted,
                 WorkerOutcome::NotRunning => AttachedWorkerOutcome::NotRunning,

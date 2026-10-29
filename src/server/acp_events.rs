@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 
 use super::state::{instance_lock_in, AppState};
+use crate::acp::state::Event;
 use crate::server::{acp_ws, api};
 
 /// Applies live status, unread and session-id observations.
@@ -54,6 +55,96 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                 return;
             }
         };
+
+        match frame.event.as_ref() {
+            Event::ApprovalRequested { approval } => tracing::info!(
+                target: "acp.event_listener",
+                session = %frame.session_id,
+                tool = %approval.tool_call.name,
+                kind = %approval.tool_call.kind,
+                destructive = approval.destructive,
+                nonce = %approval.nonce.0,
+                "approval requested"
+            ),
+            Event::ApprovalResolved { nonce, decision } => tracing::info!(
+                target: "acp.event_listener",
+                session = %frame.session_id,
+                nonce = %nonce.0,
+                ?decision,
+                "approval resolved"
+            ),
+            Event::ElicitationRequested { elicitation } => tracing::info!(
+                target: "acp.event_listener",
+                session = %frame.session_id,
+                nonce = %elicitation.nonce.0,
+                questions = elicitation.questions.len(),
+                "question asked"
+            ),
+            Event::ElicitationResolved { nonce, outcome, .. } => tracing::info!(
+                target: "acp.event_listener",
+                session = %frame.session_id,
+                nonce = %nonce.0,
+                ?outcome,
+                "question answered"
+            ),
+            Event::ConversationCompactionStarted => tracing::info!(
+                target: "acp.event_listener",
+                session = %frame.session_id,
+                "compaction started"
+            ),
+            Event::ConversationCompacted => tracing::info!(
+                target: "acp.event_listener",
+                session = %frame.session_id,
+                "compaction completed"
+            ),
+            Event::ConversationCompactionFailed => tracing::warn!(
+                target: "acp.event_listener",
+                session = %frame.session_id,
+                "compaction failed"
+            ),
+            Event::ConversationCompactionSummary {
+                compaction_id,
+                text,
+            } => tracing::debug!(
+                target: "acp.event_listener",
+                session = %frame.session_id,
+                compaction_id,
+                summary_len = text.len(),
+                "compaction summary recorded"
+            ),
+            Event::PromptRejected { reason, .. } => tracing::warn!(
+                target: "acp.event_listener",
+                session = %frame.session_id,
+                reason,
+                "prompt rejected"
+            ),
+            Event::CancelRequested { escalates_at } => tracing::debug!(
+                target: "acp.event_listener",
+                session = %frame.session_id,
+                escalates_at = %escalates_at,
+                "turn cancel requested"
+            ),
+            Event::ModeSwitchFailed { mode_id, reason } => tracing::warn!(
+                target: "acp.event_listener",
+                session = %frame.session_id,
+                mode_id,
+                reason,
+                "mode switch failed"
+            ),
+            Event::ConfigOptionSwitchFailed {
+                config_id,
+                value,
+                reason,
+            } => tracing::warn!(
+                target: "acp.event_listener",
+                session = %frame.session_id,
+                config_id,
+                value,
+                reason,
+                "config option switch failed"
+            ),
+            _ => {}
+        }
 
         // Detect wake-fire.
         if matches!(
@@ -249,16 +340,32 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                     .runtime
                     .work
                     .spawn("server.acp_event_effect", async move {
-                        let _ = crate::session::smart_rename::try_smart_rename(
+                        use crate::session::smart_rename::SmartRenameError;
+                        match crate::session::smart_rename::try_smart_rename(
                             state_for_rename,
-                            session_id,
+                            session_id.clone(),
                             crate::session::smart_rename::SmartRenameInput {
                                 first_user_prompt,
                                 context,
                             },
                             false,
                         )
-                        .await;
+                        .await
+                        {
+                            Ok(()) => {}
+                            Err(SmartRenameError::Skipped(reason)) => tracing::debug!(
+                                target: "smart_rename",
+                                session = %session_id,
+                                reason,
+                                "smart rename skipped"
+                            ),
+                            Err(error) => tracing::warn!(
+                                target: "smart_rename",
+                                session = %session_id,
+                                %error,
+                                "smart rename failed"
+                            ),
+                        }
                     });
             } else {
                 // The first prompt must be durable before its turn completes.

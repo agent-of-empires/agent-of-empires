@@ -199,14 +199,23 @@ pub async fn acp_prompt(
         )
         .await
         {
-            Ok(entry) => (
-                StatusCode::ACCEPTED,
-                Json(PromptDispatchResponse {
-                    dispatch,
-                    queued_id: Some(entry.id),
-                }),
-            )
-                .into_response(),
+            Ok(entry) => {
+                tracing::debug!(
+                    target: "acp.queue",
+                    session = %id,
+                    ?reason,
+                    queued_id = %entry.id,
+                    "prompt queued"
+                );
+                (
+                    StatusCode::ACCEPTED,
+                    Json(PromptDispatchResponse {
+                        dispatch,
+                        queued_id: Some(entry.id),
+                    }),
+                )
+                    .into_response()
+            }
             Err((status, msg)) => {
                 tracing::warn!(
                     target: "http.api.acp",
@@ -235,8 +244,10 @@ pub async fn acp_prompt(
         }
         None => attachments,
     };
-    let caller = match origin_plugin {
-        Some(plugin_id) => SessionCaller::PluginMessage { plugin_id },
+    let caller = match &origin_plugin {
+        Some(plugin_id) => SessionCaller::PluginMessage {
+            plugin_id: plugin_id.clone(),
+        },
         None => SessionCaller::User,
     };
     let outcome = state
@@ -263,6 +274,16 @@ pub async fn acp_prompt(
     }
     match outcome {
         Ok(()) => {
+            tracing::info!(
+                target: "acp.queue",
+                session = %id,
+                ?dispatch,
+                text_len = req.text.len(),
+                attachments = attachments.len(),
+                send_now = queued_row.is_some(),
+                ?origin_plugin,
+                "prompt sent"
+            );
             if let Some(row) = &queued_row {
                 state
                     .session_service
@@ -458,8 +479,19 @@ pub async fn acp_cancel(
         );
     }
     match state.acp_supervisor.cancel_prompt(&id).await {
-        Ok(()) => StatusCode::ACCEPTED.into_response(),
-        Err(e) => supervisor_error_response("cancel failed", &e),
+        Ok(()) => {
+            tracing::info!(
+                target: "acp.supervisor",
+                session = %id,
+                waited_ms = waited.as_millis(),
+                "turn cancelled"
+            );
+            StatusCode::ACCEPTED.into_response()
+        }
+        Err(e) => {
+            tracing::warn!(target: "acp.supervisor", session = %id, error = %e, "turn cancel failed");
+            supervisor_error_response("cancel failed", &e)
+        }
     }
 }
 
@@ -475,6 +507,7 @@ pub async fn acp_force_end_turn(
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
+    tracing::info!(target: "acp.supervisor", session = %id, "turn force-ended");
     state.acp_supervisor.force_end_turn(&id).await;
     StatusCode::ACCEPTED.into_response()
 }

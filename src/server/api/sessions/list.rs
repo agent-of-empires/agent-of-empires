@@ -469,7 +469,10 @@ pub async fn list_sessions(
     .await
     {
         Ok(view) => view,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(error) => {
+            tracing::debug!(target: "server.runtime", %error, "runtime snapshot failed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
     };
     crate::server::runtime::mutation_response(&view.snapshot.value.cursor, Json(&view))
 }

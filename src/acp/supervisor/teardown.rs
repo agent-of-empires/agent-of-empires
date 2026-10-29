@@ -620,12 +620,21 @@ impl<S: BroadcastSink> Supervisor<S> {
                     for scope in &target.scopes {
                         lease.record_scope(scope.clone());
                     }
-                } else if let Ok(Some(record)) = worker_registry::load_strict(session_id) {
-                    if identity.is_some_and(|identity| identity.owns_record(&record)) {
-                        if lease.prime() == PrimeOwnership::Unresolved {
-                            lease.record_prime(PrimeOwnership::from_record(&record));
+                } else {
+                    match worker_registry::load_strict(session_id) {
+                        Ok(Some(record)) => {
+                            if identity.is_some_and(|identity| identity.owns_record(&record)) {
+                                if lease.prime() == PrimeOwnership::Unresolved {
+                                    lease.record_prime(PrimeOwnership::from_record(&record));
+                                }
+                                lease.record_scope(record.scope);
+                            }
                         }
-                        lease.record_scope(record.scope);
+                        Ok(None) => {}
+                        Err(error) => {
+                            warn!(target: "acp.supervisor", session = %session_id, %error,
+                            "stop could not read worker record; retirement scope unknown")
+                        }
                     }
                 }
                 if let Some(handle) = workers.get(session_id) {
@@ -678,10 +687,19 @@ impl<S: BroadcastSink> Supervisor<S> {
                             for scope in &target.scopes {
                                 lease.record_scope(scope.clone());
                             }
-                        } else if let Ok(Some(record)) = worker_registry::load_strict(session_id) {
-                            if identity.owns_record(&record) {
-                                lease.record_prime(PrimeOwnership::from_record(&record));
-                                lease.record_scope(record.scope);
+                        } else {
+                            match worker_registry::load_strict(session_id) {
+                                Ok(Some(record)) => {
+                                    if identity.owns_record(&record) {
+                                        lease.record_prime(PrimeOwnership::from_record(&record));
+                                        lease.record_scope(record.scope);
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    warn!(target: "acp.supervisor", session = %session_id, %error,
+                                    "stop could not read worker record; retirement scope unknown")
+                                }
                             }
                         }
                         // Adopt first, then record the same stop reason/deletion debt.
