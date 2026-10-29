@@ -93,10 +93,7 @@ impl AgentQuestionDialog {
                 }
             }
         }
-        if !self.focus_visible
-            && !current.options.is_empty()
-            && matches!(key.code, KeyCode::Char(' ') | KeyCode::Enter)
-        {
+        if !self.focus_visible && matches!(key.code, KeyCode::Char(' ') | KeyCode::Enter) {
             return DialogResult::Continue;
         }
         match key.code {

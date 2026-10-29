@@ -217,9 +217,12 @@ pub(crate) fn wrapped_line_count(line: &ratatui::text::Line, width: u16) -> usiz
 
         if line_full || pending_word_overflow {
             lines += 1;
+            // Remaining budget is the pre-flush line width, as ratatui computes
+            // it before resetting the line (keeps trailing whitespace that
+            // still fits so it carries into the next line).
+            let mut remaining = max.saturating_sub(pending_line_width);
             pending_line_width = 0;
             // Drop leading whitespace up to the end of the line.
-            let mut remaining = max;
             while let Some(&width) = pending_whitespace.front() {
                 if width > remaining {
                     break;
@@ -283,6 +286,13 @@ mod tests {
             // Wide CJK: each char is its own word, so a word wider than the
             // line overflows rather than wrapping mid-character.
             (Line::from("日本語 日本語"), 5, 2),
+            // A wide grapheme wider than the row is dropped; a trailing fit
+            // char still paints.
+            (Line::from("あa"), 1, 1),
+            // A wide ideographic space at an exactly-partial boundary hits the
+            // trailing-whitespace trim budget (pre-flush line width), not the
+            // full line width.
+            (Line::from("abab\u{3000}cd"), 5, 2),
         ];
         for (line, width, expected) in cases {
             assert_eq!(wrapped_line_count(&line, width), expected, "{line:?}");
