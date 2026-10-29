@@ -2689,9 +2689,10 @@
         "web/src/hooks/useWebSettings.ts",
         "web/src/hooks/useHistoryWindow.ts",
         "web/src/lib/acpHistoryWindow.ts",
-        "web/src/components/acp/AcpRuntime.tsx"
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/App.tsx"
       ],
-      "notes": "Verifies synced persistence and fresh-open counts (default 150, configured 200/500), unchanged open windows on preference changes, and fixed 150-row reveals."
+      "notes": "Verifies synced persistence and fresh-open counts (default 150, configured 200/500), delayed hydration before first history population, unchanged open windows on preference changes, and fixed 150-row reveals."
     },
     {
       "id": "settings.persistent-structured-views",

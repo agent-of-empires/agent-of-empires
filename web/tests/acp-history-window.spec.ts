@@ -2,7 +2,7 @@
 
 import type { Page } from "@playwright/test";
 
-import { test, expect } from "./helpers/mockedTest";
+import { test, expect, observeFor } from "./helpers/mockedTest";
 import { mockSettingsApis } from "./helpers/apiMocks";
 import {
   mockAcpSession,
@@ -166,6 +166,41 @@ test("persists the default history window changed to 500 through synced settings
   await expect(prompts).toHaveCount(150);
   await expect(page.getByText("prompt number 0", { exact: true })).toHaveCount(1);
   await expect(page.getByTestId("acp-load-earlier")).toHaveCount(0);
+});
+
+test("waits for delayed settings hydration before opening the initial history window", async ({ page }) => {
+  const { mock } = await mockHistoryPreference(page, {
+    title: "story-history-delayed-settings",
+    turns: 320,
+  });
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  let started!: () => void;
+  const requested = new Promise<void>((resolve) => (started = resolve));
+  await page.route("**/api/app-state/web-ui-state", async (route) => {
+    started();
+    await held;
+    await route.fulfill({ json: { "aoe-web-settings": JSON.stringify({ structuredHistoryWindow: 500 }) } });
+  });
+
+  await openStructuredSession(page, mock);
+  await requested;
+  await expect(page.getByText("Loading acp…", { exact: true })).toBeVisible();
+  await observeFor(page, 500, async () => {
+    await expect(page.getByTestId("acp-viewport")).toHaveCount(0);
+    await expect(page.getByText("Loading acp…", { exact: true })).toBeVisible();
+  });
+  release();
+
+  await waitForComposerConnected(page);
+  await expect(page.getByText("reply number 319", { exact: true })).toBeVisible();
+  const prompts = page
+    .getByTestId("acp-viewport")
+    .locator("p")
+    .filter({ hasText: /^prompt number \d+$/ });
+  await expect(prompts).toHaveCount(250);
+  await expect(page.getByText("prompt number 69", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("prompt number 70", { exact: true })).toHaveCount(1);
 });
 
 test("opens 200 history rows from synced settings and reveals a fixed 150 more", async ({ page }) => {
