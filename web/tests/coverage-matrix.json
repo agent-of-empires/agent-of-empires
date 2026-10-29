@@ -2911,6 +2911,7 @@
       "id": "acp.background-agents",
       "kind": "vitest",
       "risk": "medium",
+      "notes": "Includes Claude Workflow runs: agents grouped by run and phase in the pane, and the Workflow tool card.",
       "specs": [
         "src/components/acp/__tests__/BackgroundAgentsPanel.test.tsx",
         "src/lib/acpTypes.reducer.test.ts",
