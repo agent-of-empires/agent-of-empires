@@ -99,6 +99,7 @@ import {
   fetchPlugins,
 } from "./lib/api";
 import type { DeleteSessionOptions, RuntimeCursor, ServerAbout, SettingsResponse } from "./lib/api";
+import { autoResumeSettingsHref } from "./lib/autoResumeSettingsHref";
 import { getClientCapabilities } from "./lib/clientCapabilities";
 import { normalizeProjectPathKey } from "./lib/registeredProjects";
 import { IdleDecayWindowContext, parseIdleDecayWindowMs } from "./lib/idleDecay";
@@ -146,6 +147,7 @@ import { BottomDock } from "./components/BottomDock";
 import { PaneDndController } from "./components/PaneDndController";
 import { visibleToFullIndex, type DropTarget } from "./components/paneDnd";
 import { BackgroundAgentsPanel } from "./components/acp/BackgroundAgentsPanel";
+import { hasStartedBefore } from "./components/acp/startupWait";
 import { DiffPane } from "./components/DiffPane";
 import { FilesPane } from "./components/FilesPane";
 import { FileContentViewer } from "./components/diff/FileContentViewer";
@@ -1426,7 +1428,7 @@ function AppContent({
 
       setWizardPrefill({
         path: repoPath,
-        tool: latest?.tool ?? "claude",
+        tool: latest?.tool,
         yoloMode: latest?.yolo_mode ?? false,
         sandboxEnabled: latest?.is_sandboxed ?? false,
         profile,
@@ -2000,8 +2002,10 @@ function AppContent({
                             sessionId={session.id}
                             acpWorkerState={session.acp_worker_state ?? "absent"}
                             rateLimitAutoResume={session.rate_limit_auto_resume}
+                            settingsHref={autoResumeSettingsHref(session.profile, serverAbout)}
                             tool={session.tool}
                             acpAgent={session.acp_agent ?? null}
+                            startedBefore={hasStartedBefore(session)}
                             acpProvider={session.acp_provider ?? null}
                             clearAliases={session.clear_aliases}
                             archivedAt={session.archived_at ?? null}
@@ -2260,6 +2264,7 @@ function AppContent({
           onOpenSendDialog={() => setSendDialogOpen(true)}
           onCloseSendDialog={() => setSendDialogOpen(false)}
           onClearSelectedFile={() => setSelectedFile(null)}
+          serverAbout={serverAbout}
         />
       );
     }

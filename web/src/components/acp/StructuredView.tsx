@@ -7,7 +7,6 @@ import { ChevronDown } from "lucide-react";
 
 import { useIsWideViewport } from "../../hooks/useIsWideViewport";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
-import { useRespawnSession } from "../../hooks/useRespawnSession";
 import { useWebSettings } from "../../hooks/useWebSettings";
 import { lastClearIndex } from "../../lib/acpHistoryWindow";
 import { visibleSessionNotices } from "../../lib/acpTypes";
@@ -31,8 +30,9 @@ import { ModeSwitchFailedNotice, QueuedPromptsStrip, RejectedPromptsStrip, Sessi
 import { SessionBanners } from "./SessionBanners";
 import { ConfigOptionSwitchFailedNotice } from "./SessionConfigControls";
 import { StartupErrorScreen } from "./StartupErrorScreen";
-import { RateLimitRecoverySection, SystemNotices } from "./SystemNotices";
+import { SystemNotices } from "./SystemNotices";
 import { AssistantMessage, UserMessage } from "./ThreadMessages";
+import { UsageLimitSection } from "./UsageLimitBanner";
 import { ToolExpansionProvider } from "./ToolExpansion";
 import { ToolDensityToggle, ToolDisplayModeProvider, useToolDensityPref } from "./ToolDisplayMode";
 import { useTranscriptScroll } from "./useTranscriptScroll";
@@ -50,10 +50,14 @@ interface Props {
   acpWorkerState: WorkerState;
   /** Whether rate-limit auto-resume is on for this session's profile. */
   rateLimitAutoResume?: boolean;
+  /** The profile's Structured view settings; null where Settings can't be edited. */
+  settingsHref?: string | null;
   /** Session `tool` registry key; selects the AgentProfile. */
   tool: string | null | undefined;
   /** Resolved ACP agent key; the switch-agent modal's fallback before any `AgentSwitched`. */
   acpAgent: string | null;
+  /** `hasStartedBefore(session)`. */
+  startedBefore?: boolean;
   acpProvider: string | null;
   /** Server-owned conversation-reset slash aliases (`/clear`, `/new`). */
   clearAliases?: readonly string[];
@@ -166,17 +170,16 @@ function AcpChrome({
   const { sessionId, acpWorkerState, acpAgent } = view;
   const { state, status } = ctx;
   const agentName = useAgentDisplayNames();
-  const startingAgent = isNewSessionStarting(state, ctx, acpWorkerState) ? agentName(state.agent ?? acpAgent) : null;
+  const startingAgent = isNewSessionStarting(state, ctx, acpWorkerState, !!view.startedBefore)
+    ? agentName(state.agent ?? acpAgent)
+    : null;
   // Neither can start until restored or unarchived, so nothing here may send (#4116).
   const readOnly = !!view.trashedAt || !!view.archivedAt;
   // Rows before the latest `/clear` divider are the hidden history.
   const hiddenCount = lastClearIndex(state.activity);
   const [primerPrefill, setPrimerPrefill] = useState<Prefill>(null);
-  // A rate limit with no reported reset still needs a key to scope resume status by.
-  const rateLimitResume = useRespawnSession(
-    sessionId,
-    state.rateLimit ? (state.rateLimit.resets_at ?? "unknown") : null,
-  );
+  // The usage-limit banner covers a cap park while the limit is still known.
+  const exhaustedWithoutLimit = state.rateLimitRetriesExhausted && !state.rateLimit;
   // Phone-width only: fold the composer away for reading.
   const composerCollapsible = !useIsWideViewport();
   const [composerCollapsed, setComposerCollapsed] = useState(false);
@@ -218,39 +221,21 @@ function AcpChrome({
       )}
       <PlanStrip plan={state.plan} />
 
-      <RateLimitRecoverySection
-        sessionId={sessionId}
-        currentAgent={state.agent ?? acpAgent}
-        onPrefill={(text) => setPrimerPrefill({ id: `rate-limit-recovery-${Date.now()}`, text })}
-      >
-        {({ onSwitchAgent }) =>
-          status !== "open" ||
-          state.lagged ||
-          state.rateLimit ||
-          state.rateLimitRetriesExhausted ||
-          ctx.reconnecting ? (
-            <SystemNotices
-              status={status}
-              lagged={state.lagged}
-              rateLimit={state.rateLimit}
-              rateLimitAutoResume={view.rateLimitAutoResume}
-              rateLimitRetriesExhausted={state.rateLimitRetriesExhausted}
-              hasEverOpened={ctx.hasEverOpened}
-              replayedWhileDown={ctx.replayedWhileDown}
-              reconnecting={ctx.reconnecting}
-              retryCount={ctx.retryCount}
-              retryCountdown={ctx.retryCountdown}
-              maxRetries={ctx.maxRetries}
-              manualReconnect={ctx.manualReconnect}
-              onSwitchAgent={onSwitchAgent}
-              onResumeRateLimit={() => void rateLimitResume.respawn()}
-              rateLimitResumeState={rateLimitResume.state}
-              rateLimitResumeError={rateLimitResume.error}
-              newSessionStarting={startingAgent !== null}
-            />
-          ) : null
-        }
-      </RateLimitRecoverySection>
+      {(status !== "open" || state.lagged || exhaustedWithoutLimit || ctx.reconnecting) && (
+        <SystemNotices
+          status={status}
+          lagged={state.lagged}
+          rateLimitRetriesExhausted={exhaustedWithoutLimit}
+          hasEverOpened={ctx.hasEverOpened}
+          replayedWhileDown={ctx.replayedWhileDown}
+          reconnecting={ctx.reconnecting}
+          retryCount={ctx.retryCount}
+          retryCountdown={ctx.retryCountdown}
+          maxRetries={ctx.maxRetries}
+          manualReconnect={ctx.manualReconnect}
+          newSessionStarting={startingAgent !== null}
+        />
+      )}
 
       <SessionBanners
         sessionId={sessionId}
@@ -372,6 +357,7 @@ function AcpChrome({
               collapsed={composerCollapsed}
               onToggleCollapsed={() => setComposerCollapsed((v) => !v)}
               startingAgent={startingAgent}
+              agent={agentName(state.agent ?? acpAgent)}
             />
           )}
         </div>
@@ -391,6 +377,7 @@ function ComposerDock({
   collapsed,
   onToggleCollapsed,
   startingAgent,
+  agent,
 }: {
   view: Props;
   ctx: AcpContext;
@@ -401,11 +388,23 @@ function ComposerDock({
   onToggleCollapsed: () => void;
   /** Set while a new Session starts, as for the startup line. */
   startingAgent: string | null;
+  /** The Session's Agent by display name. */
+  agent: string;
 }) {
   const { sessionId, acpWorkerState, acpAgent, acpProvider } = view;
   const { state, status } = ctx;
   return (
     <>
+      <UsageLimitSection
+        sessionId={sessionId}
+        agent={state.agent ?? acpAgent}
+        rateLimit={state.rateLimit}
+        autoResume={view.rateLimitAutoResume}
+        retriesExhausted={state.rateLimitRetriesExhausted}
+        settingsHref={view.settingsHref ?? null}
+        onPrefill={(text) => setPrimerPrefill({ id: `rate-limit-recovery-${Date.now()}`, text })}
+      />
+
       <QueuedPromptsStrip
         queued={state.queuedPrompts}
         onRemove={ctx.removeQueuedPrompt}
@@ -418,6 +417,7 @@ function ComposerDock({
           status !== "open" || acpWorkerState !== "running" || state.workerStopped || state.workerRestarting
         }
         waitingFor={startingAgent}
+        agent={agent}
       />
 
       <RejectedPromptsStrip

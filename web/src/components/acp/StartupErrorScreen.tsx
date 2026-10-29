@@ -238,7 +238,8 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
               {sandboxed && (
                 <p>
                   Refreshing the Sandbox image fixes new Sessions only: this Session's container keeps the image it
-                  started with. The TUI's "sandbox image update available" banner pulls it with your Container runtime.
+                  started with. When a newer image is published and update checks are on, the dashboard's "Sandbox image
+                  update available" banner pulls it.
                 </p>
               )}
               <p>

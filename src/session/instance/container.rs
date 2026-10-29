@@ -104,6 +104,15 @@ impl Instance {
         Ok(true)
     }
 
+    /// The name is the stable handle; a stored ID goes stale when the
+    /// container is recreated outside this session's launch path.
+    fn refresh_container_id(&mut self, container: &containers::DockerContainer) -> Result<()> {
+        if let Some(sandbox) = self.sandbox_info.as_mut() {
+            sandbox.container_id = Some(container.id()?);
+        }
+        Ok(())
+    }
+
     fn finish_container_reuse(
         &mut self,
         container: &containers::DockerContainer,
@@ -115,11 +124,7 @@ impl Instance {
             && identity_publisher_mount_matches(container, config)?
             && identity_publisher_dependencies_available(container)
             && self.hook_session_publisher_allowed_by_argv();
-        if let Some(sandbox) = self.sandbox_info.as_mut() {
-            if sandbox.container_id.is_none() {
-                sandbox.container_id = Some(container.id()?);
-            }
-        }
+        self.refresh_container_id(container)?;
         self.reconcile_container_workdir(container);
         container_config::ensure_folder_trust_config_for_active_agent(
             &self.tool,
@@ -263,6 +268,7 @@ impl Instance {
             // fresh process attached to a running container with no values yet.
             self.ensure_before_start_env(false, &launch_config, &mut scoped_hook)?;
             if self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION {
+                self.refresh_container_id(&container)?;
                 self.reconcile_container_workdir(&container);
                 return Ok((container, false));
             }

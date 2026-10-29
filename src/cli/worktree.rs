@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::git::{GitWorktree, WorktreeEntry};
-use crate::session::Storage;
+use crate::session::{Instance, Storage};
 
 #[derive(Subcommand)]
 pub enum WorktreeCommands {
@@ -170,45 +170,146 @@ fn partition_orphaned_worktrees(
         })
 }
 
+/// Where a purge moves `inst`'s worktree. A row whose checkout is there is mid-purge or awaiting
+/// its retry, so neither is orphaned.
+fn purge_aside(inst: &Instance) -> Option<PathBuf> {
+    let path = Path::new(&inst.project_path);
+    path.parent()?
+        .join(format!(".aoe-purge-{}", inst.id))
+        .canonicalize()
+        .ok()
+}
+
+/// A row is orphaned once its checkout is gone and no lifecycle operation, such as a purge that
+/// may restore it, has it reserved.
+fn is_orphaned_session(inst: &Instance, now: chrono::DateTime<chrono::Utc>) -> bool {
+    if inst.has_fresh_lifecycle_reservation(now) {
+        return false;
+    }
+    if inst.worktree_info.is_some() {
+        !Path::new(&inst.project_path).exists() && purge_aside(inst).is_none()
+    } else if let Some(ws_info) = &inst.workspace_info {
+        !Path::new(&ws_info.workspace_dir).exists()
+    } else {
+        false
+    }
+}
+
+pub(crate) fn find_orphaned_sessions(instances: &[Instance]) -> Vec<Instance> {
+    let now = chrono::Utc::now();
+    instances
+        .iter()
+        .filter(|inst| is_orphaned_session(inst, now))
+        .cloned()
+        .collect()
+}
+
+/// Removes the listed rows that are still orphaned, judged again under each row's lifecycle lock
+/// and the store lock. Returns how many were removed.
+pub(crate) fn remove_orphaned_sessions(storage: &Storage, orphans: &[Instance]) -> Result<usize> {
+    let mut held = Vec::new();
+    let mut ids = HashSet::new();
+    for orphan in orphans {
+        match storage.try_acquire_instance_lifecycle_lock(&orphan.id)? {
+            Some(lock) => {
+                held.push(lock);
+                ids.insert(orphan.id.clone());
+            }
+            None => eprintln!("✗ Skipped session {}: it is busy", orphan.id),
+        }
+    }
+    let mut removed = 0;
+    storage.update(|instances, _groups| {
+        let now = chrono::Utc::now();
+        let before = instances.len();
+        instances.retain(|inst| !(ids.contains(&inst.id) && is_orphaned_session(inst, now)));
+        removed = before - instances.len();
+        Ok(())
+    })?;
+    Ok(removed)
+}
+
+/// The removable and the protected orphaned worktrees of `git_wt`'s repository.
+pub(crate) fn find_orphaned_worktrees(
+    instances: &[Instance],
+    git_wt: &GitWorktree,
+) -> Result<(Vec<WorktreeEntry>, Vec<WorktreeEntry>)> {
+    let tracked: HashSet<String> = instances
+        .iter()
+        .flat_map(|inst| {
+            let aside = purge_aside(inst).map(|aside| aside.to_string_lossy().into_owned());
+            std::iter::once(inst.project_path.clone()).chain(aside)
+        })
+        .collect();
+    Ok(partition_orphaned_worktrees(
+        git_wt.list_worktrees_with_abandoned_purges()?,
+        &git_wt.repo_path,
+        &tracked,
+        &git_wt.protected_default_branch_names()?,
+    ))
+}
+
+/// The listed worktrees that are abandoned purges, which keep that classification until removal.
+pub(crate) fn purging_paths(orphans: &[WorktreeEntry]) -> HashSet<PathBuf> {
+    orphans
+        .iter()
+        .filter(|wt| GitWorktree::is_purging(&wt.path))
+        .map(|wt| wt.path.clone())
+        .collect()
+}
+
+/// Removes the listed orphaned worktrees and returns how many were removed. An abandoned purge is
+/// removed only while it is still marked and its claim held: recovery may since have kept it for
+/// a session to adopt.
+pub(crate) fn remove_orphaned_worktrees(
+    git_wt: &GitWorktree,
+    orphans: &[WorktreeEntry],
+    purging: &HashSet<PathBuf>,
+) -> usize {
+    let mut removed = 0;
+    for wt in orphans {
+        let _claim = if purging.contains(&wt.path) {
+            let Some(claim) = GitWorktree::claim_abandoned_purge(&wt.path) else {
+                eprintln!(
+                    "✗ Skipped {}: its purge was resumed or kept",
+                    wt.path.display()
+                );
+                continue;
+            };
+            Some(claim)
+        } else if GitWorktree::is_purging(&wt.path) {
+            eprintln!("✗ Skipped {}: its purge is in progress", wt.path.display());
+            continue;
+        } else {
+            None
+        };
+        match git_wt.remove_worktree(&wt.path, true) {
+            Ok(_) => {
+                println!("✓ Removed worktree: {}", wt.path.display());
+                removed += 1;
+            }
+            Err(e) => {
+                eprintln!("✗ Failed to remove {}: {}", wt.path.display(), e);
+            }
+        }
+    }
+    removed
+}
+
 async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
     let (instances, _groups) = storage.load_with_groups()?;
 
-    let mut orphaned_sessions = Vec::new();
+    let orphaned_sessions = find_orphaned_sessions(&instances);
     let mut orphaned_worktrees = Vec::new();
-
-    for inst in &instances {
-        if let Some(_wt_info) = &inst.worktree_info {
-            let worktree_path = PathBuf::from(&inst.project_path);
-            if !worktree_path.exists() {
-                orphaned_sessions.push(inst.clone());
-            }
-        } else if let Some(ws_info) = &inst.workspace_info {
-            let ws_path = PathBuf::from(&ws_info.workspace_dir);
-            if !ws_path.exists() {
-                orphaned_sessions.push(inst.clone());
-            }
-        }
-    }
-
     let mut protected_worktrees = Vec::new();
     let current_dir = std::env::current_dir()?;
     if GitWorktree::is_git_repo(&current_dir) {
         let main_repo = GitWorktree::find_main_repo(&current_dir)?;
         let git_wt = GitWorktree::new(main_repo)?;
-        let worktrees = git_wt.list_worktrees()?;
-        let tracked: HashSet<String> = instances
-            .iter()
-            .map(|inst| inst.project_path.clone())
-            .collect();
-
-        (orphaned_worktrees, protected_worktrees) = partition_orphaned_worktrees(
-            worktrees,
-            &git_wt.repo_path,
-            &tracked,
-            &git_wt.protected_default_branch_names()?,
-        );
+        (orphaned_worktrees, protected_worktrees) = find_orphaned_worktrees(&instances, &git_wt)?;
     }
+    let purging = purging_paths(&orphaned_worktrees);
 
     if !protected_worktrees.is_empty() {
         println!("Skipped (default-branch checkouts, never removed):\n");
@@ -278,14 +379,9 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
     let mut removed_count = 0;
 
     if !orphaned_sessions.is_empty() {
-        let orphan_ids: HashSet<String> = orphaned_sessions.iter().map(|o| o.id.clone()).collect();
-        storage.update(|all_instances, _groups| {
-            all_instances.retain(|inst| !orphan_ids.contains(&inst.id));
-            Ok(())
-        })?;
-
-        removed_count += orphaned_sessions.len();
-        println!("✓ Removed {} orphaned sessions", orphaned_sessions.len());
+        let removed = remove_orphaned_sessions(&storage, &orphaned_sessions)?;
+        removed_count += removed;
+        println!("✓ Removed {removed} orphaned sessions");
     }
 
     if !orphaned_worktrees.is_empty() {
@@ -293,17 +389,7 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
         let main_repo = GitWorktree::find_main_repo(&current_dir)?;
         let git_wt = GitWorktree::new(main_repo)?;
 
-        for wt in &orphaned_worktrees {
-            match git_wt.remove_worktree(&wt.path, true) {
-                Ok(_) => {
-                    println!("✓ Removed worktree: {}", wt.path.display());
-                    removed_count += 1;
-                }
-                Err(e) => {
-                    eprintln!("✗ Failed to remove {}: {}", wt.path.display(), e);
-                }
-            }
-        }
+        removed_count += remove_orphaned_worktrees(&git_wt, &orphaned_worktrees, &purging);
     }
 
     println!("\n✓ Cleanup complete: {} items removed", removed_count);
@@ -321,6 +407,112 @@ mod tests {
             branch: branch.map(str::to_string),
             is_detached: branch.is_none(),
         }
+    }
+
+    /// An abandoned purge listed by cleanup cannot host a new session, and if recovery keeps and
+    /// unhides it before cleanup is confirmed, cleanup spares it for whoever adopts it.
+    #[test]
+    fn cleanup_removes_an_abandoned_purge_only_while_still_marked() {
+        for kept in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let repo = tmp.path().join("repo");
+            std::fs::create_dir(&repo).unwrap();
+            let git = |args: &[&str]| {
+                let status = std::process::Command::new("git")
+                    .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                    .args(args)
+                    .current_dir(&repo)
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "git {args:?}");
+            };
+            git(&["init", "-q"]);
+            git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+            let git_wt = GitWorktree::new(repo.clone()).unwrap();
+            let aside = tmp.path().join(".aoe-purge-x");
+            git_wt.create_worktree("feat", &aside, true, None).unwrap();
+            drop(GitWorktree::mark_purging(&aside).unwrap());
+            GitWorktree::await_purge_released(&aside);
+            let aside = aside.canonicalize().unwrap();
+
+            let (orphans, _) = find_orphaned_worktrees(&[], &git_wt).unwrap();
+            let purging = purging_paths(&orphans);
+            assert!(
+                purging.contains(&aside),
+                "kept {kept}: abandoned purge not listed"
+            );
+            let inside = aside.join("src");
+            std::fs::create_dir(&inside).unwrap();
+            let nested = aside.join("nested");
+            std::fs::create_dir(&nested).unwrap();
+            assert!(std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&nested)
+                .status()
+                .unwrap()
+                .success());
+            for path in [&aside, &inside, &nested] {
+                assert!(
+                    crate::session::builder::ensure_not_purging(path).is_err(),
+                    "kept {kept}: a session could take {}",
+                    path.display()
+                );
+            }
+            if kept {
+                GitWorktree::unmark_purging(&aside).unwrap();
+            }
+
+            let removed = remove_orphaned_worktrees(&git_wt, &orphans, &purging);
+            assert_eq!(removed, usize::from(!kept), "kept {kept}");
+            assert_eq!(aside.exists(), kept, "kept {kept}");
+        }
+    }
+
+    /// Cleanup lists rows, then removes them only if they are still orphaned: a purge may restore a
+    /// checkout in between, or hold the row while it runs.
+    #[test]
+    #[serial_test::serial]
+    fn cleanup_removes_only_rows_still_orphaned() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("home"));
+        let storage = Storage::new_unwatched("cleanup").unwrap();
+        let row = |name: &str| {
+            let mut inst = Instance::new(name, tmp.path().join(name).to_str().unwrap());
+            inst.worktree_info = Some(crate::session::WorktreeInfo {
+                branch: name.to_string(),
+                main_repo_path: tmp.path().join("main").to_string_lossy().into_owned(),
+                managed_by_aoe: true,
+                created_at: chrono::Utc::now(),
+                base_branch: None,
+            });
+            inst
+        };
+        let (gone, restored, locked, mut reserved) =
+            (row("gone"), row("restored"), row("locked"), row("reserved"));
+        reserved
+            .try_acquire_lifecycle_reservation(
+                crate::session::LifecycleOperation::Purge,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        let rows = vec![gone.clone(), restored.clone(), locked.clone(), reserved];
+        storage
+            .update(|instances, _groups| {
+                instances.extend(rows.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        let orphans = find_orphaned_sessions(&rows);
+        let ids = |rows: &[Instance]| rows.iter().map(|r| r.title.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&orphans), ["gone", "restored", "locked"]);
+
+        std::fs::create_dir(&restored.project_path).unwrap();
+        let _purging = storage.acquire_instance_lifecycle_lock(&locked.id).unwrap();
+        assert_eq!(remove_orphaned_sessions(&storage, &orphans).unwrap(), 1);
+        let left = storage.load().unwrap();
+        assert_eq!(ids(&left), ["restored", "locked", "reserved"]);
     }
 
     #[test]

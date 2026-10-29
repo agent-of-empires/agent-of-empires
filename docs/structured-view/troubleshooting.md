@@ -76,11 +76,11 @@ Approvals expire after `approval_timeout_secs` (default 300). The agent receives
 
 ## Rate limits and agent hand-off
 
-When the active backend hits its rate limit, aoe parks the session rather than respawning into the same limit. The banner shows the reset time, or the agent's own wording when it reported no clock, and a **Continue in another agent** CTA. That opens a picker over the ACP registry, preselects `codex` when installed, switches on confirm, and pre-fills the composer with a recap of the prior conversation (including the prompt that triggered the limit). Review and send it yourself; nothing is auto-sent.
+When the active backend hits its rate limit, aoe parks the session rather than respawning into the same limit. A banner above the composer shows the reset time, or the agent's own wording when it reported no clock, and whether auto-resume is on. **Try again** respawns the same agent now, for when you've added usage; once the reset has passed with auto-resume off, it reads **Resume now**. **Switch Agent** appears when another installed agent is allowed to take over. It opens a picker over those agents only, switches on confirm, and pre-fills the composer with a recap of the prior conversation (including the prompt that triggered the limit). Review and send it yourself; nothing is auto-sent.
 
 ### Auto-resume after reset
 
-To stay on the same backend instead, opt in:
+To stay on the same backend instead, opt in. The banner's **Turn on** link opens this setting for the session's profile:
 
 ```toml
 [acp]
@@ -89,7 +89,7 @@ rate_limit_auto_resume = true
 
 Resume fires once the reported reset plus a 15-second cushion passes, and the reset time survives an `aoe serve` restart. With no reported reset, the first retry is an hour after the park and each further attempt waits twice as long (1h, 2h, 4h, 8h, 16h), so a quota exhausted for days is retried on a matching schedule. The park survives a resume that fails to start.
 
-Each resume re-sends the interrupted prompt, so it gives up after five re-sends that all come back rate-limited, spanning 31 hours. The banner then reads "Auto-resume stopped" and the session stays put. Recovering from the park resets the count, as do a completed turn and an agent switch; manual "Resume now" retries never count against it.
+Each resume re-sends the interrupted prompt, so it gives up after five re-sends that all come back rate-limited, spanning 31 hours. The banner then reads "Auto-resume stopped" and the session stays put. Recovering from the park resets the count, as do a completed turn and an agent switch; manual **Try again** and **Resume now** retries never count against it.
 
 ### Switching agents manually
 
