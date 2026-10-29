@@ -389,12 +389,15 @@ fn compare(image: &str, local: &str, remote: String) -> ImageCheck {
     })
 }
 
-fn registry_client() -> Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
+fn client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
         .user_agent(crate::github::DEFAULT_USER_AGENT)
         .timeout(std::time::Duration::from_secs(8))
         .redirect(reqwest::redirect::Policy::none())
-        .build()?)
+}
+
+fn registry_client() -> Result<reqwest::Client> {
+    Ok(client_builder().build()?)
 }
 
 /// `Err` means the registry couldn't be asked (network, auth, timeout), not that the image is
@@ -647,6 +650,11 @@ mod tests {
         );
     }
 
+    /// The production policy without ambient proxy settings, which would bypass loopback fixtures.
+    fn test_client() -> reqwest::Client {
+        client_builder().no_proxy().build().unwrap()
+    }
+
     /// Serves one canned response per connection and reports each request line.
     async fn serve(
         responses: Vec<String>,
@@ -682,7 +690,7 @@ mod tests {
         )])
         .await;
 
-        let client = registry_client().unwrap();
+        let client = test_client();
         let resp = send(client.get(format!("{origin}/v2/x/manifests/latest")))
             .await
             .unwrap();
@@ -699,7 +707,7 @@ mod tests {
 
     #[tokio::test]
     async fn statuses_and_transport_failures_map_to_codes() {
-        let client = registry_client().unwrap();
+        let client = test_client();
         for (status, code) in [
             ("401 Unauthorized", "registry_auth"),
             ("403 Forbidden", "registry_auth"),
@@ -718,15 +726,16 @@ mod tests {
             );
         }
 
-        // Nothing listens on a port that was just released.
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let error = send(client.get(format!("http://127.0.0.1:{port}")))
+        // The listener stays bound until the connection is accepted and dropped unanswered.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let closer = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let error = send(client.get(format!("http://{addr}")))
             .await
             .unwrap_err();
+        closer.await.unwrap();
         assert_eq!(error_code(&error), "registry_unreachable");
     }
 }
