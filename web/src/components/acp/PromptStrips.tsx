@@ -350,7 +350,9 @@ export function QueuedPromptsStrip({
                 canSendNow={canSendNow}
                 action={isClearAlias(q.text, soloAliases) ? reason.soloAction : reason.action}
                 disabledReason={
-                  reason.disabledReason ?? (reason.reason ? `Waiting: this message ${reason.reason}` : undefined)
+                  // Only a "sends …" reason reads as a sentence after "this message".
+                  reason.disabledReason ??
+                  (reason.reason?.startsWith("sends ") ? `Waiting: this message ${reason.reason}` : undefined)
                 }
               />
             </Fragment>

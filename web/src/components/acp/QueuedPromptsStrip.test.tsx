@@ -195,6 +195,13 @@ describe("QueuedPromptsStrip", () => {
       "Waiting: this message sends when Claude Code is ready",
     ],
     ["no live connection", {}, false, "Send now needs this dashboard connected and the Agent running"],
+    // A "held …" reason isn't a sentence after "this message", so the connection hint stands.
+    [
+      "a held rate limit",
+      { reason: "held until you resume: auto-resume is off" },
+      false,
+      "Send now needs this dashboard connected and the Agent running",
+    ],
     ["a free Agent", {}, true, null],
   ])("Send now during %s", (_label, over, canSendNow, waiting) => {
     const sent: QueuedPrompt[] = [];
