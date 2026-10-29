@@ -126,9 +126,9 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
               </>
             )}
             <p className="mt-2 text-xs text-text-subtle">
-              This updates the running container only. To keep new sessions from hitting this, refresh the sandbox
-              image: the aoe TUI shows a "sandbox image update available" banner that pulls the right image with your
-              configured container runtime.
+              This updates the running container only. To keep new sessions from hitting this, update the sandbox image:
+              when a newer one is published and update checks are on, the dashboard shows a "Sandbox image update
+              available" banner at the top to pull it (or the command to run).
             </p>
           </div>
         )}

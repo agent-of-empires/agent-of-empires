@@ -457,6 +457,7 @@ pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     ("POST", "/api/sandbox/image-pull"),
     ("POST", "/api/sandbox/image-dismiss"),
     ("POST", "/api/sessions/creation-trust"),
+    ("POST", "/api/sessions/empty-trash"),
     ("POST", "/api/sessions/{id}/restart"),
     ("POST", "/api/sessions/{id}/recreate-container"),
     ("POST", "/api/sessions/{id}/tools/ensure"),

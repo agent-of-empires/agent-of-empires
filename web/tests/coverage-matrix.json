@@ -1689,8 +1689,9 @@
       "id": "sidebar.drawer-swipe",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/hooks/useDrawerSwipe.test.ts"],
-      "components": ["web/src/hooks/useDrawerSwipe.ts"]
+      "specs": ["src/hooks/useDrawerSwipe.test.ts", "tests/mobile-panes.spec.ts"],
+      "components": ["web/src/hooks/useDrawerSwipe.ts"],
+      "notes": "Active chat text selection blocks both drawer swipe directions, including selection beginning mid-gesture. Cancellation lasts through touchend; a fresh swipe works after selection clears. Browser coverage preserves a DOM selection in the mobile chat while both drawers stay closed."
     },
     {
       "id": "sidebar.context-resume",
@@ -2874,7 +2875,24 @@
         "web/src/components/DashboardUpdateBanner.tsx",
         "web/src/components/PushHealthBanner.tsx",
         "web/src/hooks/useConnectionBanner.ts",
-        "web/src/hooks/useUpdateBanner.ts"
+        "web/src/hooks/useUpdateBanner.ts",
+        "web/src/components/SandboxImageBanner.tsx"
+      ]
+    },
+    {
+      "id": "connectivity.sandbox-image-banner",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/__tests__/SandboxImageBanner.test.tsx",
+        "src/components/__tests__/BannerStack.test.tsx",
+        "src/components/acp/__tests__/StartupErrorScreen.test.tsx",
+        "src/lib/api.test.ts"
+      ],
+      "components": [
+        "web/src/components/SandboxImageBanner.tsx",
+        "web/src/hooks/useSandboxImageBanner.ts",
+        "web/src/components/acp/StartupErrorScreen.tsx"
       ]
     },
     {

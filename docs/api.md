@@ -703,6 +703,11 @@ reports `partial`; when nothing else completed it answers `409 lifecycle_busy`.
 empty-trash` purges the rest, lists each skipped session on stderr, then exits
 non-zero.
 
+`POST /api/sessions/empty-trash` with `{"profile"}` is the bulk purge behind it: the
+daemon selects the profile's trashed rows, purges each with its configured cleanup,
+and returns per-session outcomes plus `failures` (`lifecycle_busy`, `superseded`,
+`purge_failed`).
+
 Selected-trash actions include `expected_trashed_at`, `expected_generation` and
 `expected_trash_lifecycle_id`. The durable identity distinguishes restore/retrash
 even when timestamps coincide.

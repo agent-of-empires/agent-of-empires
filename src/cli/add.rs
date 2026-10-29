@@ -232,6 +232,9 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     if !args.scratch && !path.is_dir() {
         bail!("Path is not a directory: {}", path.display());
     }
+    if !args.scratch {
+        crate::session::builder::ensure_not_purging(&path)?;
+    }
 
     if (!args.extra_repos.is_empty() || !args.projects.is_empty())
         && explicit_worktree_branch(&args).is_none()
