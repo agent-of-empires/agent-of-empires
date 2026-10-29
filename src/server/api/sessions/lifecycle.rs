@@ -3236,6 +3236,51 @@ mod durable_stop_tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn structured_stop_leaves_the_pinned_container_when_retirement_is_unproven() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let (pin, calls) =
+            crate::session::test_support::fake_sandbox_pin(runtime.path(), "c1", 0, "");
+        let mut row = Instance::new("unproven retirement", project.path().to_str().unwrap());
+        row.source_profile = "default".into();
+        row.view = crate::session::View::Structured;
+        row.status = Status::Running;
+        row.tool = "claude".into();
+        row.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: Some("c1".into()),
+            image: "img".into(),
+            container_name: "aoe-unproven".into(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            container_workdir: None,
+        });
+        row.sandbox_pin = Some(pin);
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        // An unattested live runner cannot be proven retired.
+        let (_runner, mut record) = live_runner(&row).await;
+        record.runner_identity = None;
+        worker_registry::save(&record).unwrap();
+        let response = stop_structured_with_commit(&state, "default".into(), &row.id)
+            .await
+            .expect_err("unproven retirement must not report success");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(
+            std::fs::read_to_string(&calls)
+                .unwrap_or_default()
+                .is_empty(),
+            "the container must not be stopped before retirement is proven"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn native_stop_keeps_commit_failure_and_adoption_failure_distinct() {
         for adoption_failure in [false, true] {
             let _home = crate::session::test_support::isolate_app_dir();
