@@ -2,7 +2,7 @@
 
 import { StrictMode, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
 
 import { SessionWizard, type WizardPrefill } from "../SessionWizard";
 import {
@@ -18,6 +18,7 @@ import {
 } from "../../../lib/api";
 import { agent } from "./fixtures";
 import { toastBus } from "../../../lib/toastBus";
+import { useAgentDisplayNames } from "../../../lib/agentDisplayName";
 import { startPendingCreates } from "../../../lib/pendingCreates";
 import type { AgentInfo, DockerStatusResponse } from "../../../lib/types";
 
@@ -1106,7 +1107,10 @@ describe("SessionWizard Yolo mode", () => {
       { name: "beta", is_default: false },
     ]);
     // Alpha's `wrapper` runs Pi and Beta's runs Claude. Beta's first answer is held.
-    const wrapper = (always_yolo: boolean) => [agent("claude"), agent("wrapper", { kind: "custom", always_yolo })];
+    const wrapper = (always_yolo: boolean) => [
+      agent("claude"),
+      agent("wrapper", { kind: "custom", always_yolo, display_name: always_yolo ? "Pi wrapper" : "Claude wrapper" }),
+    ];
     let answerBeta: (agents: AgentInfo[]) => void = () => {};
     let betaCalls = 0;
     vi.mocked(fetchAgents).mockImplementation((profile) => {
@@ -1135,6 +1139,8 @@ describe("SessionWizard Yolo mode", () => {
     await launch();
     await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
     expect(payload()).toMatchObject({ profile: "beta", tool: "wrapper", yolo_mode: false });
+    // The app-wide names stay the served profile's; read before the hook's own load answers.
+    expect(renderHook(() => useAgentDisplayNames()).result.current("wrapper")).toBe("Pi wrapper");
   });
 
   it("waits for the agent list before promising prompts or launching", async () => {

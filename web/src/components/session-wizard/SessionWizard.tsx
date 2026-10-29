@@ -296,7 +296,8 @@ export function SessionWizard({
       void fetchAgents(agentsProfile || undefined).then((agents) => {
         if (!alive) return;
         if (agents) {
-          setAgentNames(agents);
+          // The app-wide names describe the served profile, not the one being created in.
+          if (agentsProfile === servedProfile) setAgentNames(agents);
           return dispatch({ type: "SET_AGENTS", agents });
         }
         dispatch({ type: "AGENTS_FAILED" });
@@ -307,7 +308,7 @@ export function SessionWizard({
       alive = false;
       clearTimeout(retry);
     };
-  }, [agentsProfile]);
+  }, [agentsProfile, servedProfile]);
 
   useEffect(() => {
     const generations = defaultsGeneration;
