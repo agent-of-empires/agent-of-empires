@@ -42,8 +42,6 @@ export interface QueuedReasonInput {
   rateLimit: Pick<RateLimitInfo, "resets_at" | "status"> | null;
   /** The profile's `rate_limit_auto_resume`; unknown until the Session reports it. */
   rateLimitAutoResume: boolean | undefined;
-  /** Auto-resume gave up after re-sending the same prompt too many times. */
-  rateLimitRetriesExhausted: boolean;
   /** No live Worker, none starting, and nothing a send would wake. */
   workerDown: boolean;
   /** A Worker is starting or restarting; it sends the queue once it's up. */
@@ -80,9 +78,10 @@ export function queuedReason(input: QueuedReasonInput): QueuedReason {
     return same("Not sent", "sends when this dashboard reconnects", "dropOnly");
   }
   if (input.waitingFor) return same("Queued", `sends when ${input.waitingFor} is ready`, "send");
-  if (input.rateLimitParked || input.rateLimitRetriesExhausted) {
-    // Only an armed auto-resume sends by itself; otherwise the queue waits for the user.
-    if (input.rateLimitRetriesExhausted) return same("Queued", "held: auto-resume stopped retrying", "send");
+  if (input.rateLimitParked) {
+    // Only an armed auto-resume sends by itself; otherwise the queue waits for the user. Running
+    // out of retries stops re-sending the interrupted prompt, not queued messages: the Daemon
+    // still releases the park for them, so it doesn't change this.
     if (input.rateLimitAutoResume === false) return same("Queued", "held until you resume: auto-resume is off", "send");
     if (input.rateLimitAutoResume === undefined) return same("Queued", "held by the rate limit", "send");
     const at = input.rateLimit?.resets_at ? resetTime(input.rateLimit.resets_at) : null;

@@ -439,7 +439,6 @@ function ComposerDock({
           rateLimitParked: state.rateLimitParked,
           rateLimit: state.rateLimit,
           rateLimitAutoResume: view.rateLimitAutoResume,
-          rateLimitRetriesExhausted: state.rateLimitRetriesExhausted,
           // Idle-dormant and rate-limit-parked Workers wake on a send, so they aren't down.
           workerDown:
             (state.workerStopped || acpWorkerState === "absent") && !state.workerRestarting && !state.workerIdleStopped,
