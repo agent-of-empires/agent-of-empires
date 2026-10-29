@@ -2681,7 +2681,8 @@
         "src/components/settings/__tests__/StructuredViewDisplaySettings.test.tsx",
         "src/hooks/__tests__/useHistoryWindow.test.tsx",
         "src/lib/acpHistoryWindow.test.ts",
-        "src/lib/__tests__/webUiSync.test.ts"
+        "src/lib/__tests__/webUiSync.test.ts",
+        "src/lib/__tests__/webUiHydration.test.ts"
       ],
       "components": [
         "web/src/components/settings/StructuredViewDisplaySettings.tsx",
@@ -2690,9 +2691,12 @@
         "web/src/hooks/useHistoryWindow.ts",
         "web/src/lib/acpHistoryWindow.ts",
         "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/components/MobileMainPane.tsx",
+        "web/src/lib/webUiSync.ts",
+        "web/src/lib/api.ts",
         "web/src/App.tsx"
       ],
-      "notes": "Verifies synced persistence and fresh-open counts (default 150, configured 200/500), delayed hydration before first history population, unchanged open windows on preference changes, and fixed 150-row reveals."
+      "notes": "Verifies synced persistence and fresh-open counts (default 150, configured 200/500), delayed desktop/mobile and auth-remount hydration, stalled headers/body cache fallback, unchanged open windows on preference changes, and fixed 150-row reveals."
     },
     {
       "id": "settings.persistent-structured-views",

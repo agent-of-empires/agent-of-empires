@@ -2,7 +2,7 @@
 
 import type { Page } from "@playwright/test";
 
-import { test, expect, observeFor } from "./helpers/mockedTest";
+import { test, expect, observeFor, waitForResponseBody } from "./helpers/mockedTest";
 import { mockSettingsApis } from "./helpers/apiMocks";
 import {
   mockAcpSession,
@@ -168,11 +168,65 @@ test("persists the default history window changed to 500 through synced settings
   await expect(page.getByTestId("acp-load-earlier")).toHaveCount(0);
 });
 
-test("waits for delayed settings hydration before opening the initial history window", async ({ page }) => {
-  const { mock } = await mockHistoryPreference(page, {
-    title: "story-history-delayed-settings",
-    turns: 320,
+for (const width of [1280, 390]) {
+  test(`waits for delayed settings hydration before opening history at width ${width}`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 844 });
+    const { mock } = await mockHistoryPreference(page, {
+      title: "story-history-delayed-settings",
+      turns: 320,
+    });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    let started!: () => void;
+    const requested = new Promise<void>((resolve) => (started = resolve));
+    await page.route("**/api/app-state/web-ui-state", async (route) => {
+      started();
+      await held;
+      await route.fulfill({ json: { "aoe-web-settings": JSON.stringify({ structuredHistoryWindow: 500 }) } });
+    });
+
+    await openStructuredSession(page, mock);
+    await requested;
+    await expect(page.getByText("Loading acp…", { exact: true })).toBeVisible();
+    await observeFor(page, 500, async () => {
+      await expect(page.getByTestId("acp-viewport")).toHaveCount(0);
+      await expect(page.getByText("Loading acp…", { exact: true })).toBeVisible();
+    });
+    release();
+
+    await waitForComposerConnected(page);
+    await expect(page.getByText("reply number 319", { exact: true })).toBeVisible();
+    const prompts = page
+      .getByTestId("acp-viewport")
+      .locator("p")
+      .filter({ hasText: /^prompt number \d+$/ });
+    await expect(prompts).toHaveCount(250);
+    await expect(page.getByText("prompt number 69", { exact: true })).toHaveCount(0);
+    await expect(page.getByText("prompt number 70", { exact: true })).toHaveCount(1);
   });
+}
+
+test("waits for fresh hydration after signing out and back in without reloading", async ({ page }) => {
+  const { mock, synced } = await mockHistoryPreference(page, {
+    title: "story-history-auth-remount",
+    turns: 320,
+    initialHistoryWindow: 200,
+  });
+  await page.route("**/api/login/status*", (route) => route.fulfill({ json: { required: true, authenticated: true } }));
+  await page.route("**/api/logout", (route) => route.fulfill({ json: { ok: true } }));
+  await page.route("**/api/login", (route) => route.fulfill({ json: { ok: true } }));
+  await page.goto("/");
+  await waitForResponseBody(page, "/api/app-state/web-ui-state");
+  await expect(page.getByTestId("sidebar-session-row")).toBeVisible();
+  const prompts = page
+    .getByTestId("acp-viewport")
+    .locator("p")
+    .filter({ hasText: /^prompt number \d+$/ });
+
+  await page.getByRole("button", { name: "More options" }).click();
+  await page.getByRole("menuitem", { name: "Sign out" }).click();
+  await expect(page.locator("input#passphrase")).toBeVisible();
+  synced["aoe-web-settings"] = JSON.stringify({ structuredHistoryWindow: 500 });
   let release!: () => void;
   const held = new Promise<void>((resolve) => (release = resolve));
   let started!: () => void;
@@ -180,27 +234,46 @@ test("waits for delayed settings hydration before opening the initial history wi
   await page.route("**/api/app-state/web-ui-state", async (route) => {
     started();
     await held;
-    await route.fulfill({ json: { "aoe-web-settings": JSON.stringify({ structuredHistoryWindow: 500 }) } });
+    await route.fulfill({ json: synced });
   });
-
-  await openStructuredSession(page, mock);
+  await page.locator("input#passphrase").fill("fixture");
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
   await requested;
+  await page.getByTestId("sidebar-session-row").click();
+  await expect(page).toHaveURL(new RegExp(`/session/${mock.sessionId}$`));
   await expect(page.getByText("Loading acp…", { exact: true })).toBeVisible();
   await observeFor(page, 500, async () => {
     await expect(page.getByTestId("acp-viewport")).toHaveCount(0);
-    await expect(page.getByText("Loading acp…", { exact: true })).toBeVisible();
   });
   release();
-
   await waitForComposerConnected(page);
-  await expect(page.getByText("reply number 319", { exact: true })).toBeVisible();
+  await expect(prompts).toHaveCount(250);
+  await expect(page.getByText("prompt number 70", { exact: true })).toHaveCount(1);
+});
+
+test("falls back to cached history when settings hydration stalls", async ({ page }) => {
+  const { mock } = await mockHistoryPreference(page, {
+    title: "story-history-stalled-settings",
+    turns: 320,
+    initialHistoryWindow: 200,
+  });
+  let started!: () => void;
+  const requested = new Promise<void>((resolve) => (started = resolve));
+  await page.route("**/api/app-state/web-ui-state", () => {
+    started();
+  });
+  await page.clock.install();
+  await openStructuredSession(page, mock);
+  await requested;
+  await expect(page.getByText("Loading acp…", { exact: true })).toBeVisible();
+  await page.clock.fastForward(15_000);
+  await waitForComposerConnected(page);
   const prompts = page
     .getByTestId("acp-viewport")
     .locator("p")
     .filter({ hasText: /^prompt number \d+$/ });
-  await expect(prompts).toHaveCount(250);
-  await expect(page.getByText("prompt number 69", { exact: true })).toHaveCount(0);
-  await expect(page.getByText("prompt number 70", { exact: true })).toHaveCount(1);
+  await expect(prompts).toHaveCount(100);
+  await expect(page.getByText("prompt number 220", { exact: true })).toHaveCount(1);
 });
 
 test("opens 200 history rows from synced settings and reveals a fixed 150 more", async ({ page }) => {

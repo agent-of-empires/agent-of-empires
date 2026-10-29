@@ -7,7 +7,6 @@ import {
   useMemo,
   useRef,
   useState,
-  useSyncExternalStore,
   type ReactNode,
 } from "react";
 import { Puzzle } from "lucide-react";
@@ -121,7 +120,7 @@ import {
   deliverMobileKeyboardProxyInput,
 } from "./lib/mobileKeyboardProxy";
 import { hydrateWebUiStateFromServer, initWebUiSync } from "./lib/webUiSync";
-import { isWebUiStateHydrated, onWebUiStateHydrated } from "./lib/webUiHydration";
+import { AcpLoadingFallback } from "./components/acp/AcpLoadingFallback";
 import { WorkspaceSidebar } from "./components/WorkspaceSidebar";
 import { SnoozeModal } from "./components/sidebar/SnoozeModal";
 import { DeleteSessionDialog } from "./components/DeleteSessionDialog";
@@ -344,15 +343,19 @@ function AppContent({
   useDashboardPresence();
   // Hydrate after auth without blocking the shell. ACP waits for synced settings
   // so its initial history window uses the saved preference.
+  const [webUiReady, setWebUiReady] = useState(false);
   useEffect(() => {
+    const controller = new AbortController();
     initWebUiSync();
-    void hydrateWebUiStateFromServer();
+    void hydrateWebUiStateFromServer(controller.signal).then(() => {
+      if (!controller.signal.aborted) setWebUiReady(true);
+    });
+    return () => controller.abort();
   }, []);
 
   const location = useLocation();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
-  const webUiReady = useSyncExternalStore(onWebUiStateHydrated, isWebUiStateHydrated);
   const { settings: webSettings } = useWebSettings();
   const sessionMatch = useMatch("/session/:sessionId");
   const settingsRootMatch = useMatch("/settings");
@@ -2241,6 +2244,7 @@ function AppContent({
           activeSessionId={activeSessionId}
           sessions={sessions}
           webSettings={webSettings}
+          webUiReady={webUiReady}
           selectedFilePath={selectedFilePath}
           selectedRepoName={selectedRepoName}
           selectedFileLine={selectedFileLine}
@@ -2750,13 +2754,5 @@ function AppContent({
         </div>
       </SessionActionProvider>
     </AcpPrefsProvider>
-  );
-}
-
-function AcpLoadingFallback() {
-  return (
-    <div className="flex h-full items-center justify-center bg-surface-900 text-text-dim">
-      <div className="text-xs font-mono uppercase tracking-wide">Loading acp…</div>
-    </div>
   );
 }
