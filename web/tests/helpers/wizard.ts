@@ -99,6 +99,8 @@ export function sessionStub(overrides: Record<string, unknown> = {}) {
 export interface WizardMockOptions {
   servedProfile?: string;
   agents?: unknown[];
+  /** Per-profile agent lists keyed by the `?profile=` query param. */
+  profileAgents?: Record<string, unknown[]>;
   profiles?: unknown[];
   /** Default `/api/settings` body; `worktree.enabled` drives the "Create a worktree" default (#2423). */
   settings?: Record<string, unknown>;
@@ -140,7 +142,10 @@ export async function mockWizardApis(page: Page, opts: WizardMockOptions = {}) {
   await page.route("**/api/groups**", (r) => r.fulfill({ json: opts.groups ?? [] }));
   await page.route(
     (url) => url.pathname === "/api/agents",
-    (r) => r.fulfill({ json: opts.agents ?? [CLAUDE_AGENT] }),
+    (r) => {
+      const profile = new URL(r.request().url()).searchParams.get("profile");
+      return r.fulfill({ json: (profile && opts.profileAgents?.[profile]) || opts.agents || [CLAUDE_AGENT] });
+    },
   );
   await page.route("**/api/sessions/creation-trust", (r) =>
     r.fulfill({ json: opts.creationTrustReview ?? DEFAULT_CREATION_TRUST_REVIEW }),

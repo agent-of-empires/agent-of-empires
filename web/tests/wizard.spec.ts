@@ -317,6 +317,40 @@ test.describe("agents and presets", () => {
     await expect(wizard(page).getByTestId("wizard-sandbox-row")).toContainText("Docker is not running");
   });
 
+  test("a custom agent's locked Yolo mode follows the profile the session is created in", async ({ page }) => {
+    // Alpha's wrapper runs an always-Yolo base; Beta's runs one that asks first.
+    const wrapper = (always_yolo: boolean) => ({ ...CLAUDE_AGENT, name: "wrapper", kind: "custom", always_yolo });
+    const agentsProfiles: string[] = [];
+    page.on("request", (req) => {
+      const url = new URL(req.url());
+      if (url.pathname === "/api/agents") agentsProfiles.push(url.searchParams.get("profile") ?? "");
+    });
+    const created = await startWizard(page, {
+      servedProfile: "Alpha",
+      profiles: [
+        { name: "Alpha", is_default: true },
+        { name: "Beta", is_default: false },
+      ],
+      profileSettings: {
+        Alpha: { session: { yolo_mode_default: false, default_tool: "wrapper" } },
+        Beta: { session: { yolo_mode_default: false, default_tool: "wrapper" } },
+      },
+      profileAgents: { Alpha: [CLAUDE_AGENT, wrapper(true)], Beta: [CLAUDE_AGENT, wrapper(false)] },
+    });
+    const yoloRow = wizard(page).getByTestId("wizard-yolo-row");
+    await expect(yoloRow).toContainText("always on for wrapper");
+    await expect(switchNamed(page, "Yolo mode")).toBeDisabled();
+
+    await openPanel(page, "Profile");
+    await wizard(page).getByRole("radio", { name: /Beta/ }).click();
+    await expect.poll(() => agentsProfiles).toContain("Beta");
+    await expect(yoloRow).toContainText("asks before running commands");
+    await expect(switchNamed(page, "Yolo mode")).toBeEnabled();
+    await expect(switchNamed(page, "Yolo mode")).toHaveAttribute("aria-checked", "false");
+    await launch(page);
+    await expect.poll(() => created[0]).toMatchObject({ profile: "Beta", tool: "wrapper", yolo_mode: false });
+  });
+
   test("shows and launches a configured custom agent without exposing sensitive fields", async ({ page }) => {
     const hidden = [
       "/opt/private/bin/remote-helper",
