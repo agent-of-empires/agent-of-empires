@@ -426,6 +426,7 @@ function ComposerDock({
           status !== "open" || acpWorkerState !== "running" || state.workerStopped || state.workerRestarting
         }
         waitingFor={startingAgent}
+        connecting={acpWorkerState === "running"}
         agent={agent}
       />
 
@@ -480,6 +481,7 @@ function ComposerDock({
           currentAgent={state.agent ?? acpAgent}
           currentProvider={acpProvider}
           waitingFor={startingAgent}
+          connecting={acpWorkerState === "running"}
           availableModes={state.availableModes}
           currentModeId={state.currentModeId}
           legacyMode={state.mode}

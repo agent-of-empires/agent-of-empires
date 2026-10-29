@@ -255,6 +255,8 @@ interface QueuedPromptsStripProps {
   pendingResume: boolean;
   /** For a Session that has never started: the Agent it waits for. */
   waitingFor?: string | null;
+  /** The Worker is running; only the connection is down. */
+  connecting?: boolean;
   /** The Session's Agent, by display name, for the header's tooltip. */
   agent: string;
 }
@@ -269,6 +271,7 @@ export function QueuedPromptsStrip({
   sendNowInterrupts,
   pendingResume,
   waitingFor = null,
+  connecting = false,
   agent,
 }: QueuedPromptsStripProps) {
   const isMobile = useIsCoarsePointer();
@@ -298,7 +301,9 @@ export function QueuedPromptsStrip({
             {pendingResume
               ? waitingFor
                 ? `Pending until ${waitingFor} is ready (${queued.length})`
-                : `Pending until session resumes (${queued.length})`
+                : connecting
+                  ? `Pending until connected (${queued.length})`
+                  : `Pending until session resumes (${queued.length})`
               : `Queued (${queued.length})`}
           </span>
         </Tooltip>

@@ -30,6 +30,7 @@ function renderWithProfile(
     sendNowInterrupts?: boolean;
     pendingResume?: boolean;
     waitingFor?: string | null;
+    connecting?: boolean;
     agent?: string;
   } = {},
 ) {
@@ -45,6 +46,7 @@ function renderWithProfile(
         sendNowInterrupts={opts.sendNowInterrupts ?? false}
         pendingResume={opts.pendingResume ?? false}
         waitingFor={opts.waitingFor}
+        connecting={opts.connecting}
         agent={opts.agent ?? "Claude Code"}
       />
     </AgentProfileProvider>,
@@ -77,8 +79,10 @@ describe("QueuedPromptsStrip", () => {
     ["a new Session names the Agent it waits for", true, "Claude Code", "Pending until Claude Code is ready (1)"],
     ["a resumed Session waits to resume", true, null, "Pending until session resumes (1)"],
     ["a running Session just queues", false, "Claude Code", "Queued (1)"],
+    ["a running Worker waits for the connection", true, null, "Pending until connected (1)"],
   ])("%s", (_label, pendingResume, waitingFor, header) => {
-    const { container } = renderWithProfile("claude", [mk("a", "hello")], { pendingResume, waitingFor });
+    const connecting = header.startsWith("Pending until connected");
+    const { container } = renderWithProfile("claude", [mk("a", "hello")], { pendingResume, waitingFor, connecting });
     expect(container.textContent).toContain(header);
     expect(container.textContent).not.toContain("Held in this tab");
   });
