@@ -21,8 +21,12 @@
       "id": "terminal.paired-shell",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/components/__tests__/PairedShellPane.test.tsx"],
-      "components": ["web/src/components/PairedTerminal.tsx"]
+      "specs": [
+        "src/components/__tests__/PairedShellPane.test.tsx",
+        "src/hooks/__tests__/usePairedTerminalReveal.test.ts"
+      ],
+      "components": ["web/src/components/PairedTerminal.tsx", "web/src/hooks/usePairedTerminalReveal.ts"],
+      "notes": "The shell's Host/Container mode is per Session and terminal tab. Revealing it focuses at once only when it is shown and stays mounted; otherwise focus is latched and activateTab reveals the tab, opening a collapsed dock."
     },
     {
       "id": "app-shell.docks",
@@ -4561,9 +4565,10 @@
         "web/src/components/acp/SignInPopover.tsx",
         "web/src/components/acp/signInSteps.ts",
         "web/src/components/PairedTerminal.tsx",
-        "web/src/hooks/usePairedShellModes.ts"
+        "web/src/hooks/usePairedShellModes.ts",
+        "web/src/hooks/usePairedTerminalReveal.ts"
       ],
-      "notes": "Keyboard open, Escape returns focus, Copy takes claude auth login, Open Terminal shows the host paired shell, Restart Agent posts once; read-only and CityHall servers show only the command."
+      "notes": "Keyboard open, Escape returns focus, Copy takes claude auth login, Open Terminal shows the host paired shell, Restart Agent posts once; read-only and CityHall servers show only the command. A sandboxed Session's open Host shell switches to a focused Container shell, and a collapsed dock whose active tab is the terminal is revealed."
     },
     {
       "id": "story.wizard-open-close",
