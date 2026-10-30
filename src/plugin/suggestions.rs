@@ -18,6 +18,7 @@ use super::host_api::DispatchError;
 use crate::session::config::profile_config::resolve_config_or_warn;
 use crate::session::config::repo_config::resolve_config_with_repo_or_warn;
 use crate::session::projects::{self, Project};
+use crate::session::Instance;
 use std::path::Path;
 
 const MAX_ITEMS: usize = 500;
@@ -564,6 +565,61 @@ pub(crate) fn snapshot(
         }
     }
     Ok(json!({ "providers": out_providers, "items": out_items }))
+}
+
+/// The oldest live Session of `profile` started from each item, as snapshot
+/// JSON keyed by `(provider_id, id)`. Trashed Sessions do not count; a tie
+/// on `created_at` goes to the smaller id.
+pub(crate) fn started_sessions(
+    instances: &[Instance],
+    profile: &str,
+) -> HashMap<(String, String), Value> {
+    let mut oldest: HashMap<(&str, &str), &Instance> = HashMap::new();
+    for inst in instances {
+        let Some(origin) = &inst.suggestion else {
+            continue;
+        };
+        if inst.is_trashed() || inst.source_profile != profile {
+            continue;
+        }
+        let slot = oldest
+            .entry((origin.provider_id.as_str(), origin.id.as_str()))
+            .or_insert(inst);
+        if (inst.created_at, &inst.id) < (slot.created_at, &slot.id) {
+            *slot = inst;
+        }
+    }
+    oldest
+        .into_iter()
+        .map(|((provider_id, id), inst)| {
+            (
+                (provider_id.to_string(), id.to_string()),
+                json!({
+                    "id": inst.id,
+                    "title": inst.title,
+                    "status": inst.status.wire_str(),
+                    "archived": inst.is_archived(),
+                    "created_at": inst.created_at,
+                }),
+            )
+        })
+        .collect()
+}
+
+/// Sets `started_session` on the snapshot items that have one.
+pub(crate) fn attach_started(snapshot: &mut Value, started: &HashMap<(String, String), Value>) {
+    let Some(items) = snapshot["items"].as_array_mut() else {
+        return;
+    };
+    for item in items {
+        let key = (
+            item["provider_id"].as_str().unwrap_or_default().to_string(),
+            item["id"].as_str().unwrap_or_default().to_string(),
+        );
+        if let Some(session) = started.get(&key) {
+            item["started_session"] = session.clone();
+        }
+    }
 }
 
 /// Returns the items of enabled criteria, or the first contract violation.
@@ -1585,6 +1641,46 @@ mod tests {
         let bomb = "{repo}".repeat(MAX_PROMPT_BYTES / "{repo}".len());
         assert!(bomb.len() <= MAX_PROMPT_BYTES);
         assert_eq!(prompt(Some(&bomb)), Err(PromptTooLong));
+    }
+
+    #[test]
+    fn started_session_is_the_oldest_live_one_of_the_profile() {
+        let linked = |id: &str, age: i64, profile: &str| {
+            let mut i = Instance::new(id, "/tmp/x");
+            i.id = id.to_string();
+            i.created_at = chrono::Utc::now() - chrono::Duration::seconds(age);
+            i.source_profile = profile.to_string();
+            i.suggestion = Some(crate::session::SuggestionOrigin {
+                provider_id: "acme.github".into(),
+                id: "a".into(),
+            });
+            i
+        };
+        let mut trashed = linked("trashed", 300, "p");
+        trashed.trash();
+        let mut archived = linked("archived", 200, "p");
+        archived.archived_at = Some(chrono::Utc::now());
+        let instances = [
+            linked("newest", 10, "p"),
+            archived,
+            trashed,
+            linked("other-profile", 400, "q"),
+            Instance::new("unlinked", "/tmp/x"),
+        ];
+        let key = ("acme.github".to_string(), "a".to_string());
+        let started = started_sessions(&instances, "p");
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[&key]["id"], "archived");
+        assert_eq!(started[&key]["archived"], true);
+
+        let mut snapshot = json!({ "items": [
+            { "provider_id": "acme.github", "id": "a" },
+            { "provider_id": "acme.github", "id": "b" },
+        ]});
+        attach_started(&mut snapshot, &started);
+        assert_eq!(snapshot["items"][0]["started_session"]["id"], "archived");
+        assert!(snapshot["items"][1].get("started_session").is_none());
+        assert!(started_sessions(&instances[2..3], "p").is_empty());
     }
 
     #[test]

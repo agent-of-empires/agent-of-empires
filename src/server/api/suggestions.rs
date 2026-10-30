@@ -106,13 +106,18 @@ pub async fn get_suggestions(State(state): State<Arc<AppState>>) -> impl IntoRes
     let Some(host) = state.plugin_host.clone() else {
         return Json(json!({ "providers": [], "items": [] })).into_response();
     };
+    let profile = host.suggestions_profile();
+    let started = suggestions::started_sessions(&state.instances.read().await, &profile);
     let result = tokio::task::spawn_blocking(move || {
         let providers = suggestions::providers();
         host.with_suggestions_db(|conn, profile| suggestions::snapshot(conn, profile, &providers))
     })
     .await;
     match result {
-        Ok(Ok(snapshot)) => Json(snapshot).into_response(),
+        Ok(Ok(mut snapshot)) => {
+            suggestions::attach_started(&mut snapshot, &started);
+            Json(snapshot).into_response()
+        }
         Ok(Err(error)) => internal(error),
         Err(error) => internal(error),
     }

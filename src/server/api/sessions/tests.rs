@@ -8586,6 +8586,7 @@ async fn create_persists_initial_prompt_as_pending_turn() {
         serde_json::json!({
             "title": "with-prompt", "path": "", "tool": "claude",
             "scratch": true, "view": "structured", "initial_prompt": "fix the bug",
+            "suggestion": { "provider_id": "acme.github", "id": "42" },
         }),
     )
     .await;
@@ -8594,6 +8595,41 @@ async fn create_persists_initial_prompt_as_pending_turn() {
     let turn = instances[0].pending_initial_turn.as_ref().expect("queued");
     assert_eq!(turn.text, "fix the bug");
     assert!(!turn.synthesized);
+    let origin = instances[0].suggestion.as_ref().expect("linked");
+    assert_eq!(
+        (origin.provider_id.as_str(), origin.id.as_str()),
+        ("acme.github", "42")
+    );
+}
+
+#[tokio::test]
+async fn create_rejects_a_blank_or_oversized_suggestion_reference() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let state = crate::server::test_support::build_test_app_state_impl(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        |_| {},
+        |supervisor| supervisor,
+    );
+    for suggestion in [
+        serde_json::json!({ "provider_id": " ", "id": "42" }),
+        serde_json::json!({ "provider_id": "acme.github", "id": "x".repeat(257) }),
+    ] {
+        let (status, body) = post_create(
+            &state,
+            serde_json::json!({
+                "title": "bad-ref", "path": "", "tool": "claude",
+                "scratch": true, "view": "structured", "suggestion": suggestion,
+            }),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "validation_failed");
+    }
+    assert!(state.instances.read().await.is_empty());
 }
 
 #[tokio::test]

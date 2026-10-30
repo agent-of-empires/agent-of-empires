@@ -45,6 +45,17 @@ struct Item {
     #[serde(default)]
     dismissed: bool,
     draft: Draft,
+    #[serde(default)]
+    started_session: Option<Started>,
+}
+
+/// The live Session an item was started as.
+#[derive(Debug, Clone, Deserialize)]
+struct Started {
+    id: String,
+    status: String,
+    #[serde(default)]
+    archived: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -76,6 +87,8 @@ pub(super) struct Start {
     pub title: String,
     pub initial_prompt: String,
     pub tool: String,
+    /// Links the created Session to the suggestion; `None` for "Start another".
+    pub suggestion: Option<crate::session::SuggestionOrigin>,
 }
 
 enum Req {
@@ -222,6 +235,10 @@ fn start_for(snapshot: Option<&Snapshot>, key: &ItemKey, prepared: Prepared) -> 
         title: prepared.title,
         initial_prompt: prepared.initial_prompt,
         tool: prepared.tool,
+        suggestion: Some(crate::session::SuggestionOrigin {
+            provider_id: key.0.clone(),
+            id: key.1.clone(),
+        }),
     })
 }
 
@@ -229,7 +246,9 @@ pub(super) enum SuggestionsAction {
     Continue,
     Close,
     /// The user confirmed a prepared suggestion.
-    Start(Start),
+    Start(Box<Start>),
+    /// Jump to the Session an item was started as.
+    OpenSession(String),
 }
 
 type ItemKey = (String, String);
@@ -243,6 +262,8 @@ pub(super) struct SuggestionsView {
     notice: Option<String>,
     /// The item whose `prepare` is in flight.
     prepare_key: Option<ItemKey>,
+    /// The in-flight `prepare` is for "Start another", which does not claim the link.
+    prepare_another: bool,
     /// The resolved prefill, shown before the second Enter confirms it.
     prepared: Option<(ItemKey, Start)>,
     selected: usize,
@@ -266,6 +287,7 @@ impl SuggestionsView {
             error: None,
             notice: None,
             prepare_key: None,
+            prepare_another: false,
             prepared: None,
             selected: 0,
             detail_scroll: 0,
@@ -370,16 +392,27 @@ impl SuggestionsView {
             KeyCode::Char('r' | 'x') => {
                 self.error = Some("The daemon is read-only or unavailable".into());
             }
-            KeyCode::Enter => {
+            KeyCode::Enter | KeyCode::Char('N') => {
+                let another = key.code == KeyCode::Char('N');
                 let Some(key) = self.selected_key() else {
                     return SuggestionsAction::Continue;
                 };
-                if self.prepared.as_ref().is_some_and(|(k, _)| *k == key) {
+                if let Some(started) = self
+                    .item_at(self.selected)
+                    .and_then(|i| i.started_session.as_ref())
+                    .filter(|_| !another)
+                {
+                    return SuggestionsAction::OpenSession(started.id.clone());
+                }
+                if self.prepare_another == another
+                    && self.prepared.as_ref().is_some_and(|(k, _)| *k == key)
+                {
                     if let Some((_, start)) = self.prepared.take() {
-                        return SuggestionsAction::Start(start);
+                        return SuggestionsAction::Start(Box::new(start));
                     }
                 }
                 self.prepare_key = Some(key.clone());
+                self.prepare_another = another;
                 self.send(Req::Prepare {
                     provider_id: key.0,
                     id: key.1,
@@ -417,7 +450,12 @@ impl SuggestionsView {
                         self.error = Some(NO_PROJECT.into());
                     }
                     (true, Some(key)) => {
-                        let start = start_for(self.snapshot.as_ref(), &key, prepared);
+                        let mut start = start_for(self.snapshot.as_ref(), &key, prepared);
+                        if self.prepare_another {
+                            if let Some(start) = &mut start {
+                                start.suggestion = None;
+                            }
+                        }
                         self.notice =
                             Some("Review the prompt below, then press Enter to start.".into());
                         self.prepared = start.map(|start| (key, start));
@@ -462,7 +500,7 @@ impl SuggestionsView {
             }
         }
         footer.push(Line::from(Span::styled(
-            "j/k select · Enter review/start · x dismiss/restore · d dismissed · r refresh · l reload · PgUp/PgDn prompt · Esc back",
+            "j/k select · Enter review/start/open · N start another · x dismiss/restore · d dismissed · r refresh · l reload · PgUp/PgDn prompt · Esc back",
             Style::default().fg(theme.dimmed),
         )));
         let width = (inner.width as usize).max(1);
@@ -515,9 +553,17 @@ impl SuggestionsView {
             ]));
             lines.push(Line::from(Span::styled(
                 plain(&format!(
-                    "    {} · {}",
+                    "    {} · {}{}",
                     item.reason,
-                    item.project.as_deref().unwrap_or("no project")
+                    item.project.as_deref().unwrap_or("no project"),
+                    item.started_session
+                        .as_ref()
+                        .map(|s| if s.archived {
+                            " · Archived: Enter opens".to_string()
+                        } else {
+                            format!(" · Session {}: Enter opens", s.status.to_lowercase())
+                        })
+                        .unwrap_or_default()
                 )),
                 Style::default().fg(theme.dimmed),
             )));
@@ -883,6 +929,7 @@ mod tests {
             draft: Draft {
                 prompt: "do the thing".into(),
             },
+            started_session: None,
         }
     }
 
@@ -1012,6 +1059,46 @@ mod tests {
         assert_eq!(start.path, "/repo");
         assert_eq!(start.initial_prompt, "final prompt");
         assert!(view.prepared.is_none());
+    }
+
+    #[test]
+    fn a_started_item_opens_its_session_and_start_another_does_not_link() {
+        let mut started = item("a", Some("repo"), false);
+        started.started_session = Some(Started {
+            id: "sess-1".into(),
+            status: "Running".into(),
+            archived: false,
+        });
+        let worker = Worker::seeded_for_test("t", Res::Prepared(Ok(prepared(Some("/repo")))));
+        let mut view = view_with(vec![started], worker);
+        assert!(render_text(&view).contains("Session running"));
+        let SuggestionsAction::OpenSession(id) = press(&mut view, KeyCode::Enter, true) else {
+            panic!("expected the linked session to open");
+        };
+        assert_eq!(id, "sess-1");
+
+        press(&mut view, KeyCode::Char('N'), true);
+        assert!(poll_until_settled(&mut view));
+        let SuggestionsAction::Start(start) = press(&mut view, KeyCode::Char('N'), true) else {
+            panic!("expected a start");
+        };
+        assert!(start.suggestion.is_none());
+    }
+
+    #[test]
+    fn a_plain_start_carries_the_suggestion_reference() {
+        let worker = Worker::seeded_for_test("t", Res::Prepared(Ok(prepared(Some("/repo")))));
+        let mut view = view_with(vec![item("a", Some("repo"), false)], worker);
+        press(&mut view, KeyCode::Enter, true);
+        assert!(poll_until_settled(&mut view));
+        let SuggestionsAction::Start(start) = press(&mut view, KeyCode::Enter, true) else {
+            panic!("expected a start");
+        };
+        let origin = start.suggestion.unwrap();
+        assert_eq!(
+            (origin.provider_id.as_str(), origin.id.as_str()),
+            ("p", "a")
+        );
     }
 
     #[test]

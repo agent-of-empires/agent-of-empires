@@ -1911,7 +1911,12 @@ impl HomeView {
                     self.suggestions_view = None;
                     self.suggestions_feed.reload();
                 }
-                SuggestionsAction::Start(start) => self.start_suggestion(start),
+                SuggestionsAction::Start(start) => self.start_suggestion(*start),
+                SuggestionsAction::OpenSession(id) => {
+                    self.suggestions_view = None;
+                    self.suggestions_feed.reload();
+                    self.jump_to_session_id(&id);
+                }
             }
             return None;
         }
@@ -7526,6 +7531,7 @@ mod tests {
             fork_seed: None,
             structured: false,
             initial_prompt: None,
+            suggestion: None,
         }
     }
 
