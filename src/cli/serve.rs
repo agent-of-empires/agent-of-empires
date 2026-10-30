@@ -1949,12 +1949,13 @@ pub(crate) async fn restart_daemon_with_receipt(
     managed_launch(daemon_pid().context("Restart successor is unavailable")?)
 }
 
-fn report_stale_cleanup(pid: i32) {
-    if clear_serve_state(pid) {
-        println!("Daemon was not running (stale PID file cleaned up)");
+fn stale_cleanup_notice(pid: i32, announce: bool) -> Option<&'static str> {
+    let cleared = clear_serve_state(pid);
+    announce.then_some(if cleared {
+        "Daemon was not running (stale PID file cleaned up)"
     } else {
-        println!("Daemon was not running; serve state changed meanwhile and was preserved");
-    }
+        "Daemon was not running; serve state changed meanwhile and was preserved"
+    })
 }
 
 #[tracing::instrument(target = "serve.shutdown", skip_all)]
@@ -1987,7 +1988,9 @@ async fn stop_daemon_locked(
         )),
         DaemonProbeDisposition::Stale
     ) {
-        report_stale_cleanup(pid);
+        if let Some(notice) = stale_cleanup_notice(pid, announce) {
+            println!("{notice}");
+        }
         return Ok(());
     }
 
@@ -2929,6 +2932,24 @@ mod tests {
             assert!(cleared);
             worker.join().unwrap();
             drop(lifetime);
+        }
+
+        #[test]
+        #[serial]
+        fn stale_cleanup_is_silent_unless_announced() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let dir = crate::session::get_app_dir().unwrap();
+
+            publish(&dir, 4242);
+            assert_eq!(stale_cleanup_notice(4242, false), None);
+            assert!(!dir.join("serve.pid").exists());
+
+            publish(&dir, 4242);
+            assert_eq!(
+                stale_cleanup_notice(4242, true),
+                Some("Daemon was not running (stale PID file cleaned up)")
+            );
+            assert!(!dir.join("serve.pid").exists());
         }
 
         #[test]
