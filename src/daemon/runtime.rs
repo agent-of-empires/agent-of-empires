@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use super::SessionResponse;
 
-pub const RUNTIME_PROTOCOL_VERSION: u16 = 3;
+pub const RUNTIME_PROTOCOL_VERSION: u16 = 4;
 pub const RUNTIME_EPOCH_HEADER: &str = "aoe-runtime-epoch";
 pub const RUNTIME_REVISION_HEADER: &str = "aoe-runtime-revision";
 

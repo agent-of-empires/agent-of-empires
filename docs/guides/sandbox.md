@@ -213,7 +213,8 @@ changes throughout isolation, that session remains pending; `aoe migrate`
 continues with other sessions and retries later. A running sandbox whose mounts
 AoE cannot prove clear of `.aoe-sandbox-recovery` holds back moving any original
 there, and `aoe migrate` names it; launches that retire no original proceed.
-`AOE_DEFER_SANDBOX_MIGRATION=1` skips the move for that launch. A running sandbox
+In the Daemon's environment, `AOE_DEFER_SANDBOX_MIGRATION=1` skips the move for
+that launch. A running sandbox
 carries on on the shared store; a stopped one cannot start until its store has
 moved, so drop the variable or run `aoe migrate` before launching it.
 
