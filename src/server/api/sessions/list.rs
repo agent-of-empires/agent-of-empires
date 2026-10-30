@@ -744,6 +744,7 @@ mod workspace_ordering_tests {
             structured_view_off: false,
             keeps_context: false,
             clear_aliases: Vec::new(),
+            compact_aliases: Vec::new(),
             claude_fullscreen: false,
             workspace_repos: Vec::new(),
             workspace_dir: None,

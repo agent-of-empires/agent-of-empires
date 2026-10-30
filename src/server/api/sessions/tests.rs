@@ -3832,6 +3832,27 @@ fn fork_seed_and_structured_fork_guard_agree_per_agent() {
     }
 }
 
+#[test]
+fn session_response_carries_the_agents_solo_commands() {
+    let cases: [(&str, &[&str], &[&str]); 2] = [
+        ("claude", &["/clear"], &["/compact"]),
+        ("definitely-not-an-acp-agent", &[], &[]),
+    ];
+    for (tool, clear, compact) in cases {
+        let mut inst = make_test_instance();
+        inst.tool = tool.to_string();
+        let response = SessionResponse::from_instance(&inst, false);
+        assert_eq!(
+            (response.clear_aliases, response.compact_aliases),
+            (
+                clear.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                compact.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+            ),
+            "{tool}"
+        );
+    }
+}
+
 /// A binding migration left unattributed is enough to fork, because the row's
 /// own agent decides the capability, while a row with no binding at all names
 /// no agent and stays refused.

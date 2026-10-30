@@ -1,7 +1,7 @@
 // Structured view conversation surface. assistant-ui renders the thread shell;
 // state lives in AcpRuntime and is only fed to assistant-ui, never owned by it.
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { ThreadPrimitive } from "@assistant-ui/react";
 import { ChevronDown } from "lucide-react";
 
@@ -12,7 +12,8 @@ import { lastClearIndex } from "../../lib/acpHistoryWindow";
 import { visibleSessionNotices } from "../../lib/acpTypes";
 import { useAgentDisplayNames } from "../../lib/agentDisplayName";
 import { isNewSessionStarting } from "./startupWait";
-import { AgentProfileProvider } from "../../lib/agentProfileContext";
+import { AgentProfileProvider, useClearAliases, useCompactAliases } from "../../lib/agentProfileContext";
+import { queuedReason } from "./queuedReason";
 import { conversationFontSizeRem } from "../../lib/conversationFontSize";
 import type { FileRef, FileRefSession } from "../../lib/fileRef";
 import { ChromeCollapseHandle, CollapsibleRegion } from "../CollapsibleChrome";
@@ -61,6 +62,9 @@ interface Props {
   acpProvider: string | null;
   /** Server-owned conversation-reset slash aliases (`/clear`, `/new`). */
   clearAliases?: readonly string[];
+  compactAliases?: readonly string[];
+  /** Start this Session, for a queued row's "Start and send". */
+  onStartSession?: () => void;
   archivedAt: string | null;
   snoozedUntil: string | null;
   /** Trashed sessions are read-only: no composer or queue strips. */
@@ -82,13 +86,22 @@ const STARTER_PROMPTS = [
 ];
 
 export function StructuredView(props: Props) {
-  const { sessionId, acpWorkerState, tool, clearAliases, archivedAt, snoozedUntil, onOpenFileRef, fileRefSession } =
-    props;
+  const {
+    sessionId,
+    acpWorkerState,
+    tool,
+    clearAliases,
+    compactAliases,
+    archivedAt,
+    snoozedUntil,
+    onOpenFileRef,
+    fileRefSession,
+  } = props;
   const [showClearedTurns, setShowClearedTurns] = useState(false);
   const [toolDensity, toggleToolDensity] = useToolDensityPref();
   return (
     <AcpFileRefContext.Provider value={{ onOpenFileRef, fileRefSession }}>
-      <AgentProfileProvider toolKey={tool} clearAliases={clearAliases}>
+      <AgentProfileProvider toolKey={tool} clearAliases={clearAliases} compactAliases={compactAliases}>
         <ToolDisplayModeProvider density={toolDensity}>
           <ToolExpansionProvider>
             <AcpRuntime
@@ -395,6 +408,10 @@ function ComposerDock({
   const { state, status } = ctx;
   const connecting =
     acpWorkerState === "running" && status !== "open" && !state.workerStopped && !state.workerRestarting;
+  const clearAliases = useClearAliases();
+  const compactAliases = useCompactAliases();
+  // The Daemon's solo commands: they run as their own turn, never steered into one.
+  const soloAliases = useMemo(() => [...clearAliases, ...compactAliases], [clearAliases, compactAliases]);
   return (
     <>
       <UsageLimitSection
@@ -414,12 +431,28 @@ function ComposerDock({
         onClear={ctx.clearQueue}
         onSendNow={ctx.sendQueuedNow}
         canSendNow={ctx.canSendQueuedNow}
-        sendNowInterrupts={ctx.sendNowInterruptsTurn}
-        pendingResume={
-          status !== "open" || acpWorkerState !== "running" || state.workerStopped || state.workerRestarting
-        }
-        waitingFor={startingAgent}
-        connecting={connecting}
+        reason={queuedReason({
+          agent,
+          online: status === "open",
+          anyPending: state.queuedPrompts.some((q) => q.pending),
+          waitingFor: startingAgent,
+          rateLimitParked: state.rateLimitParked,
+          rateLimit: state.rateLimit,
+          rateLimitAutoResume: view.rateLimitAutoResume,
+          // Idle-dormant and rate-limit-parked Workers wake on a send, so they aren't down.
+          workerDown:
+            (state.workerStopped || acpWorkerState === "absent") && !state.workerRestarting && !state.workerIdleStopped,
+          workerStarting: state.workerRestarting || acpWorkerState === "resuming",
+          cancelling: state.cancelling,
+          compacting: state.compacting,
+          turnActive: state.turnActive,
+          steerable: !ctx.sendNowInterruptsTurn,
+          firstText: state.queuedPrompts[0]?.text,
+          soloAliases,
+        })}
+        onStartAndSend={view.onStartSession}
+        onStopTurn={ctx.stopTurn}
+        soloAliases={soloAliases}
         agent={agent}
       />
 
