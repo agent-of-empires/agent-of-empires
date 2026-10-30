@@ -239,7 +239,7 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
                 <p>
                   Refreshing the Sandbox image fixes new Sessions only: this Session's container keeps the image it
                   started with. When a newer image is published and update checks are on, the dashboard's "Sandbox image
-                  update available" banner pulls it.
+                  update available" banner pulls it, or shows the command to run.
                 </p>
               )}
               <p>
