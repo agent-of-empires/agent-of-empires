@@ -876,13 +876,14 @@ describe("WorkflowToolCard", () => {
   });
 
   it.each([
-    ["before its first agent", [], ["wfx"], true],
-    ["between phases", [member("d1", "Draft", "completed")], ["wfx"], true],
-    ["once its task ends", [member("d1", "Draft", "completed")], [], false],
-  ] as const)("follows the run's task %s", (_label, agents, backgroundTasks, running) => {
+    ["before its first agent", [], ["wfx"], false, true],
+    ["between phases", [member("d1", "Draft", "completed")], ["wfx"], false, true],
+    ["once its task ends", [member("d1", "Draft", "completed")], [], false, false],
+    ["after it finished, while a later task reuses its id", [], ["wfx"], true, false],
+  ] as const)("follows the run's task %s", (_label, agents, backgroundTasks, finished, running) => {
     const value = {
       agents: [...agents],
-      workflowRuns: { toolu_wf: { taskId: "wfx", name: "issue-drafts", summary: null } },
+      workflowRuns: { toolu_wf: { taskId: "wfx", name: "issue-drafts", summary: null, finished } },
       backgroundTasks: [...backgroundTasks],
     };
     const { container } = render(

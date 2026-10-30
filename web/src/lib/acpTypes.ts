@@ -662,6 +662,8 @@ export interface WorkflowRun {
   taskId: string;
   name: string;
   summary: string | null;
+  /** Set by its task's finish, or by a later start reusing the task id. */
+  finished?: boolean;
   endedAt?: string | null;
 }
 
@@ -1328,6 +1330,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   if ("BackgroundTaskStarted" in event) {
     const { task_id: id, tool_call_id: toolCallId, workflow } = event.BackgroundTaskStarted;
     if (!next.backgroundTasks.includes(id)) next.backgroundTasks = [...next.backgroundTasks, id];
+    next.workflowRuns = closeWorkflowRun(next.workflowRuns, id, null);
     if (workflow && toolCallId) {
       next.workflowRuns = {
         ...next.workflowRuns,
@@ -1339,14 +1342,21 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   if ("BackgroundTaskFinished" in event) {
     const { task_id: id, ended_at: endedAt } = event.BackgroundTaskFinished;
     next.backgroundTasks = next.backgroundTasks.filter((t) => t !== id);
-    const runKey = Object.keys(next.workflowRuns).find((k) => next.workflowRuns[k]!.taskId === id);
-    if (runKey && endedAt) {
-      next.workflowRuns = { ...next.workflowRuns, [runKey]: { ...next.workflowRuns[runKey]!, endedAt } };
-    }
+    next.workflowRuns = closeWorkflowRun(next.workflowRuns, id, endedAt ?? null);
     return next;
   }
   // Remaining events carry no client control state.
   return next;
+}
+
+/** Task ids can be reused, so only the run still open on `taskId` is closed. */
+function closeWorkflowRun(
+  runs: Record<string, WorkflowRun>,
+  taskId: string,
+  endedAt: string | null,
+): Record<string, WorkflowRun> {
+  const key = Object.keys(runs).find((k) => runs[k]!.taskId === taskId && !runs[k]!.finished);
+  return key ? { ...runs, [key]: { ...runs[key]!, finished: true, endedAt } } : runs;
 }
 
 /** Fold a self-contained run of frames from an empty state, e.g. an older history page. */

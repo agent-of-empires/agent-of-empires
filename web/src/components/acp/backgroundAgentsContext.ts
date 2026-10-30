@@ -43,7 +43,7 @@ export function workflowRunning(
   backgroundTasks: string[],
   agents: BackgroundAgent[],
 ): boolean {
-  return run ? backgroundTasks.includes(run.taskId) : agents.some(isActiveAgent);
+  return run ? !run.finished && backgroundTasks.includes(run.taskId) : agents.some(isActiveAgent);
 }
 
 export function useOpenBackgroundAgentsPane(): (() => void) | undefined {

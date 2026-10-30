@@ -361,6 +361,31 @@ describe("applyEvent / workflow runs", () => {
     expect(state.backgroundTasks).toEqual([]);
     expect(state.workflowRuns.toolu_wf).toMatchObject({ taskId: "wfx", endedAt: "2026-10-30T10:01:00Z" });
   });
+
+  it("attributes a reused task id to the run still open on it", () => {
+    const run = (toolCallId: string, name: string): AcpEvent => ({
+      BackgroundTaskStarted: {
+        task_id: "wfx",
+        tool_call_id: toolCallId,
+        description: name,
+        workflow: { run_id: name, name },
+      },
+    });
+    const events: AcpEvent[] = [
+      run("toolu_a", "a"),
+      { BackgroundTaskFinished: { task_id: "wfx", ended_at: "2026-10-30T10:01:00Z" } },
+      run("toolu_b", "b"),
+      { BackgroundTaskFinished: { task_id: "wfx", ended_at: "2026-10-30T10:05:00Z" } },
+      run("toolu_c", "c"),
+      { BackgroundTaskStarted: { task_id: "wfx", tool_call_id: "toolu_bash", description: "sleep" } },
+    ];
+    const state = events.reduce((s, e, i) => ev(s, i + 1, e), emptyAcpState());
+    expect(state.workflowRuns.toolu_a).toMatchObject({ finished: true, endedAt: "2026-10-30T10:01:00Z" });
+    expect(state.workflowRuns.toolu_b).toMatchObject({ finished: true, endedAt: "2026-10-30T10:05:00Z" });
+    // A command reusing the id replaces the run, which never reported an end.
+    expect(state.workflowRuns.toolu_c).toMatchObject({ finished: true, endedAt: null });
+    expect(state.backgroundTasks).toEqual(["wfx"]);
+  });
 });
 
 describe("transcriptRowToActivity (Tier 4 wire mapping)", () => {
