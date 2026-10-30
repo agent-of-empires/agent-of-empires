@@ -190,6 +190,24 @@ pub(super) fn set(
     Ok(json!({ "ok": true, "accepted": accepted.len(), "dropped": total - accepted.len() }))
 }
 
+/// Drops what a provider's worker published, in every profile, so a
+/// reinstalled or changed plugin starts `pending`. Sources, dismissals,
+/// templates and mappings are user state and stay.
+pub(super) fn forget_publication(conn: &Connection, provider_id: &str) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    for table in [
+        "suggestion_checks",
+        "suggestion_items",
+        "suggestion_providers",
+    ] {
+        tx.execute(
+            &format!("DELETE FROM {table} WHERE provider_id = ?1"),
+            [provider_id],
+        )?;
+    }
+    tx.commit()
+}
+
 pub(super) fn error(
     conn: &Connection,
     profile: &str,
@@ -490,13 +508,20 @@ pub(crate) fn set_dismissed(
     Ok(true)
 }
 
+/// Driven from the items table, capped per provider, so the read tracks live
+/// items, not historical dismissals, which are never pruned.
+const LIVE_DISMISSALS_SQL: &str = "SELECT i.provider_id, i.item_id FROM suggestion_items i
+     WHERE i.profile = ?1 AND EXISTS (
+         SELECT 1 FROM suggestion_dismissals d
+         WHERE d.profile = i.profile AND d.provider_id = i.provider_id AND d.item_id = i.item_id)";
+
 pub(crate) fn snapshot(
     conn: &Connection,
     profile: &str,
     providers: &[Provider],
 ) -> anyhow::Result<Value> {
     let dismissed: HashSet<(String, String)> = conn
-        .prepare("SELECT provider_id, item_id FROM suggestion_dismissals WHERE profile = ?1")?
+        .prepare(LIVE_DISMISSALS_SQL)?
         .query_map([profile], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<Result<_, _>>()?;
     let mut out_providers = Vec::with_capacity(providers.len());
@@ -627,11 +652,21 @@ fn validate_item(spec: &SuggestionsSpec, item: &Suggestion) -> Result<(), String
     Ok(())
 }
 
+/// An http(s) URL whose displayed host is the host a browser opens: ASCII
+/// only, and an authority that is non-empty, has no userinfo and no
+/// percent-encoding (browsers decode it before IDNA), and names a host.
 fn is_http_url(url: &str) -> bool {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"));
-    rest.is_some_and(|r| !r.is_empty() && !r.chars().any(|c| c.is_whitespace() || c.is_control()))
+    if !url.is_ascii() || url.contains(|c: char| c.is_whitespace() || c.is_control() || c == '\\') {
+        return false;
+    }
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    !authority.is_empty() && !authority.contains(['@', '%']) && !authority.starts_with(':')
 }
 
 fn check_mapping_key(key: &str) -> Result<(), String> {
@@ -907,11 +942,32 @@ mod tests {
     #[test]
     fn contract_violations_are_rejected() {
         type Mutate = fn(&mut Suggestion);
-        let cases: [(&str, Mutate); 11] = [
+        let cases: [(&str, Mutate); 22] = [
             ("undeclared", |i| i.criterion = "nope".into()),
             ("must not be empty", |i| i.title = " ".into()),
             ("http(s)", |i| i.source_url = "javascript:alert(1)".into()),
             ("http(s)", |i| i.source_url = "https://".into()),
+            ("http(s)", |i| i.source_url = "https:///x".into()),
+            ("http(s)", |i| i.source_url = "https://#f".into()),
+            ("http(s)", |i| i.source_url = "https://:80/x".into()),
+            ("http(s)", |i| {
+                i.source_url = "https://real.com@evil.com/".into()
+            }),
+            ("http(s)", |i| {
+                i.source_url = "https://exam\u{200b}ple.com/".into()
+            }),
+            ("http(s)", |i| {
+                i.source_url = "https://%65xample.com/".into()
+            }),
+            ("http(s)", |i| {
+                i.source_url = "https://exam%E2%80%8Bple.com/".into()
+            }),
+            ("http(s)", |i| i.source_url = "data:text/html,x".into()),
+            ("http(s)", |i| i.source_url = "file:///etc/passwd".into()),
+            ("http(s)", |i| i.source_url = "ftp://h/".into()),
+            ("limited to 2048", |i| {
+                i.source_url = format!("https://h/{}", "x".repeat(2040))
+            }),
             ("limited to 256", |i| i.id = "x".repeat(257)),
             ("limited to 16384", |i| {
                 i.preview = "x".repeat(16 * 1024 + 1)
@@ -935,6 +991,11 @@ mod tests {
             mutate(&mut bad);
             let err = validate_items(&spec(), &HashMap::new(), vec![bad]).unwrap_err();
             assert!(err.contains(expected), "{expected:?} not in {err:?}");
+        }
+        for url in ["HTTPS://example.com/x", "http://host:8080/p?q#f"] {
+            let mut ok = item("a", "assigned");
+            ok.source_url = url.into();
+            assert!(validate_items(&spec(), &HashMap::new(), vec![ok]).is_ok());
         }
         let dup = validate_items(
             &spec(),
@@ -1058,11 +1119,112 @@ mod tests {
         assert!(!set_dismissed(&conn, "p", &p, "a", true).unwrap());
         publish(&conn, "p", &[item("a", "assigned")]);
         assert!(set_dismissed(&conn, "p", &p, "a", true).unwrap());
+        publish(&conn, "p", &[]);
         publish(&conn, "p", &[item("a", "assigned")]);
         assert_eq!(snap(&conn, "p")["items"][0]["dismissed"], true);
         assert_eq!(snap(&conn, "other")["items"], json!([]));
         assert!(set_dismissed(&conn, "p", &p, "a", false).unwrap());
         assert_eq!(snap(&conn, "p")["items"][0]["dismissed"], false);
+    }
+
+    #[test]
+    fn forgetting_a_publication_keeps_user_state() {
+        let conn = store();
+        let p = provider();
+        for profile in ["p", "q"] {
+            publish(&conn, profile, &[item("a", "assigned")]);
+            set_source(&conn, profile, "acme.github", "quiet", true).unwrap();
+            assert!(set_dismissed(&conn, profile, &p, "a", true).unwrap());
+            for (table, columns, values) in [
+                ("suggestion_checks", "checks_json", "'[]'"),
+                (
+                    "suggestion_templates",
+                    "criterion, template",
+                    "'assigned', 't'",
+                ),
+                (
+                    "suggestion_mappings",
+                    "mapping_key, projects_json",
+                    "'k', '[]'",
+                ),
+            ] {
+                conn.execute(
+                    &format!(
+                        "INSERT INTO {table} (profile, provider_id, {columns}) VALUES ('{profile}', 'acme.github', {values})"
+                    ),
+                    [],
+                )
+                .unwrap();
+            }
+        }
+        publish(&conn, "p", &[item("a", "assigned")]);
+        conn.execute(
+            "INSERT INTO suggestion_providers (profile, provider_id, updated_at) VALUES ('p', 'other', 0)",
+            [],
+        )
+        .unwrap();
+
+        forget_publication(&conn, "acme.github").unwrap();
+
+        let count = |table: &str| -> i64 {
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE provider_id = 'acme.github'"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        for table in [
+            "suggestion_providers",
+            "suggestion_items",
+            "suggestion_checks",
+        ] {
+            assert_eq!(count(table), 0, "{table}");
+        }
+        for table in [
+            "suggestion_sources",
+            "suggestion_dismissals",
+            "suggestion_templates",
+            "suggestion_mappings",
+        ] {
+            assert_eq!(count(table), 2, "{table}");
+        }
+        let other: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM suggestion_providers WHERE provider_id = 'other'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(other, 1);
+        let after = snap(&conn, "p");
+        assert_eq!(after["providers"][0]["status"], "pending");
+        assert!(ids(&after).is_empty());
+        publish(&conn, "p", &[item("a", "assigned")]);
+        assert_eq!(snap(&conn, "p")["items"][0]["dismissed"], true);
+    }
+
+    #[test]
+    fn dismissal_read_searches_dismissals_by_full_key() {
+        let conn = store();
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {LIVE_DISMISSALS_SQL}"))
+            .unwrap()
+            .query_map(["p"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let dismissals: Vec<&String> = plan
+            .iter()
+            .filter(|step| step.contains("suggestion_dismissals"))
+            .collect();
+        assert!(
+            !dismissals.is_empty()
+                && dismissals
+                    .iter()
+                    .all(|s| s.starts_with("SEARCH") && s.contains("item_id=?")),
+            "{plan:?}"
+        );
     }
 
     #[test]

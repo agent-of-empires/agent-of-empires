@@ -347,7 +347,7 @@ An item is `{ id, title, reason, source_url, source_ref, preview, project?, mapp
 `suggestions.set` fails with invalid-params, and publishes nothing, when:
 
 - an item names an undeclared `criterion`, or its `variables` differ from the source's declaration;
-- `source_url` is not an http(s) URL;
+- `source_url` is not an http(s) URL, or has an empty host, userinfo, percent-encoding in the host, or non-ASCII characters;
 - `id`, `title` or `source_ref` is empty, `mapping_key` is present but empty, or an `id` repeats;
 - there are more than 500 items, or a string exceeds its bound (`id` and `mapping_key` 256 bytes, `title` and `draft.title` 512, `reason`, `source_url`, `source_ref` and each variable value 2 KiB, `preview` 16 KiB, `draft.prompt` 64 KiB, `project` 4 KiB).
 
@@ -381,7 +381,7 @@ Suggestions are stored per profile. The routes below list and act on them; none 
 | `PUT /api/suggestions/mappings` | `{ provider_id, mapping_key, projects }` | `{ provider_id, mapping_key, projects }` |
 | `DELETE /api/suggestions/mappings?provider_id=&mapping_key=` | none | `{ ok, deleted }` |
 
-A provider's `status` is `pending` before its first publish, `ok`, or `error`. Each item is the published item plus `provider_id` and `dismissed`; dismissed items are still returned. Items of a disabled source are hidden. `refresh` and a `sources` change send `suggestions.refresh` to the affected workers.
+A provider's `status` is `pending` before its first publish, `ok`, or `error`. Uninstalling a plugin, or updating it to a build whose `[suggestions]` block differs, clears its items, checks and status so it is `pending` again until its next publish; source switches, dismissals, templates and mappings are kept. Each item is the published item plus `provider_id` and `dismissed`; dismissed items are still returned. Items of a disabled source are hidden. `refresh` and a `sources` change send `suggestions.refresh` to the affected workers.
 
 `prepare` resolves settings through the normal repo and profile config. `project` is `{ name, path }` or `null`, resolved in this order: the user's mapping for the item's `mapping_key`, then the item's `project` hint (exactly one registered project by name or exact path), else `null`; an item is never given a scratch project.
 
