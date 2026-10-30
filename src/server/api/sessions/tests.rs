@@ -3824,7 +3824,7 @@ fn fork_seed_and_structured_fork_guard_agree_per_agent() {
             let mut inst = make_test_instance();
             inst.tool = tool.to_string();
             assert_eq!(
-                SessionResponse::from_instance(&inst, false).acp_can_fork,
+                session_response_from_instance(&inst, false).acp_can_fork,
                 crate::session::fork::structured_fork_capable(tool, None),
                 "acp_can_fork and the create guard disagree for '{tool}'"
             );
@@ -4259,7 +4259,7 @@ fn from_instance_reports_managed_worktree_for_workspace_session() {
         cleanup_on_delete: true,
     });
 
-    let resp = SessionResponse::from_instance(&inst, false);
+    let resp = session_response_from_instance(&inst, false);
     assert!(
         resp.has_cleanable_worktree,
         "workspace session must report a cleanable worktree so the delete checkbox shows"
@@ -4286,11 +4286,11 @@ fn from_instance_surfaces_hook_urgent_flag() {
     )
     .unwrap();
 
-    let urgent_resp = SessionResponse::from_instance(&inst, false);
+    let urgent_resp = session_response_from_instance(&inst, false);
     assert!(urgent_resp.urgent, "hook-flagged session must be urgent");
 
     crate::hooks::cleanup_hook_status_dir(&inst.id);
-    let plain_resp = SessionResponse::from_instance(&inst, false);
+    let plain_resp = session_response_from_instance(&inst, false);
     assert!(
         !plain_resp.urgent,
         "session with no hook file must not be urgent"
@@ -4381,15 +4381,15 @@ fn session_response_dormant_reflects_shown_dormant() {
 
     // Live idle: not dormant.
     inst.status = Status::Idle;
-    assert!(!SessionResponse::from_instance(&inst, false).dormant);
+    assert!(!session_response_from_instance(&inst, false).dormant);
 
     // Idle-reaped (marker set, status left Idle): dormant.
     inst.mark_idle_dormant();
-    assert!(SessionResponse::from_instance(&inst, false).dormant);
+    assert!(session_response_from_instance(&inst, false).dormant);
 
     // A deliberate stop keeps the neutral Stopped dot rather than dormant (#2250).
     inst.status = Status::Stopped;
-    assert!(!SessionResponse::from_instance(&inst, false).dormant);
+    assert!(!session_response_from_instance(&inst, false).dormant);
 }
 
 #[test]
@@ -4605,7 +4605,7 @@ fn session_response_flags_a_working_directory_outside_any_repository() {
     ];
     for (label, inst, outside) in cases {
         assert_eq!(
-            SessionResponse::from_instance(&inst, false).outside_repository,
+            session_response_from_instance(&inst, false).outside_repository,
             outside,
             "{label}"
         );
@@ -4669,12 +4669,12 @@ fn session_response_gates_snoozed_until_on_active_snooze() {
     let mut inst = make_test_instance();
 
     // Not snoozed -> field omitted.
-    let resp = SessionResponse::from_instance(&inst, false);
+    let resp = session_response_from_instance(&inst, false);
     assert!(resp.snoozed_until.is_none());
 
     // Active snooze -> field surfaced.
     inst.snooze(30);
-    let resp = SessionResponse::from_instance(&inst, false);
+    let resp = session_response_from_instance(&inst, false);
     assert!(resp.snoozed_until.is_some());
 
     // Expired snooze -> stays on disk for the next mutation to rewrite,
@@ -4682,7 +4682,7 @@ fn session_response_gates_snoozed_until_on_active_snooze() {
     // This prevents the web from rendering "snoozed 0m" on rows that
     // have already woken on the server.
     inst.snoozed_until = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
-    let resp = SessionResponse::from_instance(&inst, false);
+    let resp = session_response_from_instance(&inst, false);
     assert!(
         resp.snoozed_until.is_none(),
         "expired snooze must be filtered out on the wire even though the persisted field stays set"
@@ -8167,7 +8167,7 @@ fn native_runtime_frame_stays_readable_with_a_valid_full_text_queue() {
                 native_interaction: true,
             },
             default_profile: "default".into(),
-            sessions: vec![SessionResponse::from_instance(&instance, false)],
+            sessions: vec![session_response_from_instance(&instance, false)],
             profiles: Vec::new(),
             workspace_ordering: Vec::new(),
             global_projects: Vec::new(),

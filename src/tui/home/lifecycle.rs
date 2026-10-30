@@ -402,7 +402,9 @@ impl HomeView {
             .unwrap_or_else(crate::session::config::resolve_default_profile);
         let snapshot = super::tests::fixture_snapshot(
             view.instances()
-                .map(|instance| crate::daemon::SessionResponse::from_instance(instance, false))
+                .map(|instance| {
+                    crate::server::api::sessions::session_response_from_instance(instance, false)
+                })
                 .collect(),
             &default_profile,
             "test",
