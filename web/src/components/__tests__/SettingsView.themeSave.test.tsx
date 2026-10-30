@@ -58,6 +58,7 @@ const updateTheme = vi.fn((_patch: Record<string, unknown>) =>
 const updateSettings = vi.fn(() => Promise.resolve("committed" as const));
 
 vi.mock("../../lib/api", () => ({
+  fetchSuggestions: vi.fn(() => Promise.resolve(null)),
   fetchProfiles: vi.fn(() => Promise.resolve(PROFILES)),
   fetchPlugins: vi.fn(() => Promise.resolve(null)),
   fetchSettings: vi.fn(() => Promise.resolve({ theme: { name: "empire", idle_decay_minutes: 0 } })),

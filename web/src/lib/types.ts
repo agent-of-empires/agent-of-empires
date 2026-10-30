@@ -558,6 +558,8 @@ export interface SuggestionSource {
   label: string;
   description: string;
   enabled: boolean;
+  /** Placeholder names every item of this criterion carries. */
+  variables: string[];
 }
 
 /** One setup check a provider reports. `detail` and `fix` are provider text and untrusted. */
@@ -574,8 +576,32 @@ export interface SuggestionProvider {
   name: string;
   status: "pending" | "ok" | "error";
   error?: string;
+  enabled: boolean;
+  /** Unix seconds of the last report; absent before the first one. */
+  updated_at?: number;
   sources: SuggestionSource[];
   checks?: SuggestionSetupCheck[];
+}
+
+export interface SuggestionPrefs {
+  homepage: boolean;
+  sidebar: boolean;
+  refresh_minutes: number;
+  /** Every provider id, in the order the user set. */
+  provider_order: string[];
+}
+
+export interface SuggestionTemplate {
+  provider_id: string;
+  criterion: string;
+  template: string;
+}
+
+export interface SuggestionMapping {
+  provider_id: string;
+  mapping_key: string;
+  /** Registered Project paths; the first is primary. */
+  projects: string[];
 }
 
 /** `preview` and `reason` are provider text and untrusted; only `draft` seeds a prompt. */
@@ -589,6 +615,8 @@ export interface SuggestionItem {
   preview: string;
   project?: string | null;
   criterion: string;
+  mapping_key?: string | null;
+  variables?: Record<string, string>;
   draft: { title: string; prompt: string };
   dismissed: boolean;
 }
@@ -596,6 +624,7 @@ export interface SuggestionItem {
 export interface SuggestionsSnapshot {
   providers: SuggestionProvider[];
   items: SuggestionItem[];
+  prefs: SuggestionPrefs;
 }
 
 export interface SuggestionPrepared {

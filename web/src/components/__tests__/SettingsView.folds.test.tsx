@@ -67,6 +67,7 @@ const MOCK_SCHEMA = ROWS.map(([section, field, label, widget, advanced, elevated
 }));
 
 vi.mock("../../lib/api", () => ({
+  fetchSuggestions: vi.fn(() => Promise.resolve(null)),
   fetchProfiles: vi.fn(() => Promise.resolve(PROFILES)),
   fetchPlugins: vi.fn(() => Promise.resolve(null)),
   fetchSettings: vi.fn(() => Promise.resolve({ acp: {}, sandbox: {}, worktree: {} })),
