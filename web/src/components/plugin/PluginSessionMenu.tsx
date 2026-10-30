@@ -5,7 +5,7 @@ import { renameSession, type RuntimeCursor } from "../../lib/api";
 import type { PageMenuItem } from "../../lib/pluginBridge";
 import { reportError, reportInfo } from "../../lib/toastBus";
 import type { Workspace } from "../../lib/types";
-import { MenuHeading, MenuItem, MenuSeparator } from "../ContextMenu";
+import { MenuHeading, MenuItem } from "../ContextMenu";
 import { useContextMenu } from "../useContextMenu";
 import { SessionActionsMenu, type SessionActionHandlers, type SessionMenuState } from "../sidebar/SessionActions";
 import { useSessionRowModel, type RowObservation } from "../sidebar/useSessionRowModel";
@@ -167,9 +167,9 @@ function HostMenu({
           setRenaming({ receipt: null });
         }}
         extraItems={
+          // The menu sets this tier apart with its own separators.
           request.items.length > 0 && (
             <>
-              <MenuSeparator />
               <MenuHeading>{request.source}</MenuHeading>
               {request.items.map((item) => (
                 <MenuItem

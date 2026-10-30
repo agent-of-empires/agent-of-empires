@@ -119,7 +119,14 @@ export function SessionActionsMenu({
                 {model.sessionColorDot && colorsEnabled && (
                   <span className={`h-2 w-2 shrink-0 rounded-full ${model.sessionColorDot}`} aria-hidden="true" />
                 )}
-                <span className="truncate">{label}</span>
+                <span className="min-w-0">
+                  <span className="block truncate">{label}</span>
+                  <span data-testid="sidebar-context-menu-summary" className="block font-sans text-xs text-text-subtle">
+                    {model.sessionCount === 1 && model.firstSession
+                      ? `${model.firstSession.status} · ${model.firstSession.view === "structured" ? "Structured view" : "Terminal view"}`
+                      : `${model.sessionCount} Sessions`}
+                  </span>
+                </span>
               </span>
             )
           }
@@ -136,8 +143,8 @@ export function SessionActionsMenu({
                 colorsEnabled={colorsEnabled}
                 unreadEnabled={unreadEnabled}
                 actions={actions}
+                extraItems={extraItems}
               />
-              {extraItems}
             </>
           )}
         </ContextMenu>

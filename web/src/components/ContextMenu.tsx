@@ -6,6 +6,7 @@ import {
   type CSSProperties,
   type ReactNode,
   type RefObject,
+  useId,
 } from "react";
 import { X } from "lucide-react";
 import { createPortal } from "react-dom";
@@ -182,10 +183,13 @@ export function MenuItem({
   className = "text-text-secondary hover:bg-surface-700/50",
   ariaExpanded,
   ariaControls,
+  detail,
   children,
 }: {
   onClick: () => void;
   testId?: string;
+  /** A second line under the label; screen readers get it as the item's description. */
+  detail?: ReactNode;
   /** For an item that discloses a group, e.g. "More". */
   ariaExpanded?: boolean;
   ariaControls?: string;
@@ -195,6 +199,7 @@ export function MenuItem({
   className?: string;
   children: ReactNode;
 }) {
+  const detailId = useId();
   return (
     <button
       type="button"
@@ -202,10 +207,21 @@ export function MenuItem({
       data-testid={testId}
       aria-expanded={ariaExpanded}
       aria-controls={ariaControls}
+      aria-describedby={detail ? detailId : undefined}
       className={`w-full text-left ${indent ? "pl-6 pr-3" : "px-3"} py-2 md:py-2 max-md:py-3 text-sm ${className} cursor-pointer transition-colors${flex ? " flex items-center gap-2" : ""}`}
     >
       {icon}
-      {children}
+      {detail ? (
+        <span className="flex min-w-0 flex-col">
+          <span>{children}</span>
+          {/* Out of the name, so it reads once, as the description. */}
+          <span id={detailId} aria-hidden="true" className="text-xs text-text-subtle">
+            {detail}
+          </span>
+        </span>
+      ) : (
+        children
+      )}
     </button>
   );
 }
