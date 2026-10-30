@@ -2,12 +2,14 @@
 // with the card's decisions in the footer. Holds no approval state, so the
 // card stays the single place a decision is submitted.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { TextMessagePartProvider } from "@assistant-ui/react";
 
 import type { ApprovalDecision, ApprovalOption } from "../../lib/acpTypes";
 import { OFFLINE_TITLE } from "../../lib/connectionState";
+import type { FileRef } from "../../lib/fileRef";
 import { BRAND_BUTTON, Dialog } from "../Dialog";
+import { AcpFileRefContext, useAcpFileRef } from "./AcpFileRefContext";
 import { CopyMarkdownButton } from "./CopyMarkdownButton";
 import { Markdown } from "./Markdown";
 
@@ -71,6 +73,21 @@ type View = (typeof VIEWS)[number];
 export function PlanModal({ plan, submitting, offline, options, onDecide, onClose }: Props) {
   const [view, setView] = useState<View>("rendered");
   useModalFocus(onClose);
+  // A plan link opens the file viewer behind the dialog, so the modal closes
+  // first rather than leaving its Tab trap active over the viewer.
+  const fileRefs = useAcpFileRef();
+  const closingFileRefs = useMemo(() => {
+    const open = fileRefs.onOpenFileRef;
+    return {
+      ...fileRefs,
+      onOpenFileRef: open
+        ? (ref: FileRef) => {
+            onClose();
+            open(ref);
+          }
+        : undefined,
+    };
+  }, [fileRefs, onClose]);
   const onTabKey = (e: React.KeyboardEvent, v: View) => {
     const at = VIEWS.indexOf(v);
     const next =
@@ -158,9 +175,11 @@ export function PlanModal({ plan, submitting, offline, options, onDecide, onClos
       </div>
       <div id="plan-panel" role="tabpanel" aria-labelledby={`plan-tab-${view}`}>
         {view === "rendered" ? (
-          <TextMessagePartProvider text={plan}>
-            <Markdown text={plan} />
-          </TextMessagePartProvider>
+          <AcpFileRefContext.Provider value={closingFileRefs}>
+            <TextMessagePartProvider text={plan}>
+              <Markdown text={plan} />
+            </TextMessagePartProvider>
+          </AcpFileRefContext.Provider>
         ) : (
           <pre className="whitespace-pre-wrap break-words font-mono text-xs text-text-secondary">{plan}</pre>
         )}

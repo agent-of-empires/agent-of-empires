@@ -4,6 +4,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 
+import { AcpFileRefContext } from "./AcpFileRefContext";
 import { ApprovalCard } from "./ApprovalCard";
 import type { Approval, ApprovalOption } from "../../lib/acpTypes";
 
@@ -13,9 +14,25 @@ vi.mock("../../lib/connectionState", () => ({
 }));
 
 // The primitive needs a message context; the plan modal's own wiring is under test.
-vi.mock("./Markdown", () => ({
-  Markdown: ({ text }: { text: string }) => <div data-testid="plan-rendered">{text}</div>,
-}));
+vi.mock("./Markdown", async () => {
+  const { useAcpFileRef } = await import("./AcpFileRefContext");
+  return {
+    // A "LINK" in the text stands in for an in-repo file link in the rendered plan.
+    Markdown: ({ text }: { text: string }) => {
+      const { onOpenFileRef } = useAcpFileRef();
+      return (
+        <div data-testid="plan-rendered">
+          {text}
+          {text.includes("LINK") && (
+            <a href="#plan-file" onClick={() => onOpenFileRef?.({ path: "/repo/PLAN.md" })}>
+              plan file
+            </a>
+          )}
+        </div>
+      );
+    },
+  };
+});
 
 function makeApproval(over: Partial<Approval> = {}, args: unknown = { command: "ls -al" }, name = "Bash"): Approval {
   return {
@@ -360,5 +377,19 @@ describe("ApprovalCard plan viewer", () => {
       expect(onResolve).toHaveBeenCalledExactlyOnceWith(decision, optionId);
       cleanup();
     }
+  });
+  it("closes the modal before handing a plan file link to the viewer", () => {
+    const onOpenFileRef = vi.fn();
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(
+      <AcpFileRefContext.Provider value={{ onOpenFileRef }}>
+        <ApprovalCard approval={makeApproval({ plan: "see LINK" })} onResolve={onResolve} />
+      </AcpFileRefContext.Provider>,
+    );
+    fireEvent.click(screen.getByText("View plan"));
+    fireEvent.click(within(screen.getByRole("dialog")).getByText("plan file"));
+    expect(onOpenFileRef).toHaveBeenCalledExactlyOnceWith({ path: "/repo/PLAN.md" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(onResolve).not.toHaveBeenCalled();
   });
 });
