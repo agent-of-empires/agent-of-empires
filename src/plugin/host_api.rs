@@ -1,7 +1,8 @@
 //! The capability-gated host API a plugin worker calls over the worker
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use aoe_plugin_api::{SuggestionsSpec, UiSlot};
@@ -35,7 +36,12 @@ pub struct HostApiState {
     profile: String,
     ui: UiStore,
     settings_revision: std::sync::atomic::AtomicU64,
+    /// Providers asked to refresh and not yet heard from, by request time.
+    refreshing: Mutex<HashMap<String, Instant>>,
 }
+
+/// A worker that never answers stops counting as refreshing after this long.
+const REFRESH_TTL: Duration = Duration::from_secs(120);
 
 impl HostApiState {
     pub fn open(
@@ -63,7 +69,29 @@ impl HostApiState {
             profile: profile.to_string(),
             ui: UiStore::new(),
             settings_revision: std::sync::atomic::AtomicU64::new(0),
+            refreshing: Mutex::new(HashMap::new()),
         })
+    }
+
+    pub(crate) fn mark_refreshing(&self, provider_id: &str) {
+        self.refreshing
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(provider_id.to_string(), Instant::now());
+    }
+
+    pub(crate) fn clear_refreshing(&self, provider_id: &str) {
+        self.refreshing
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(provider_id);
+    }
+
+    /// Providers asked to refresh within [`REFRESH_TTL`] that have not reported since.
+    pub(crate) fn refreshing_providers(&self) -> HashSet<String> {
+        let mut pending = self.refreshing.lock().unwrap_or_else(|p| p.into_inner());
+        pending.retain(|_, at| at.elapsed() < REFRESH_TTL);
+        pending.keys().cloned().collect()
     }
 
     fn storage(&self) -> anyhow::Result<Storage> {
@@ -202,16 +230,20 @@ pub fn dispatch(
         "suggestions.set" => {
             ctx.require(CAP_WORKER)?;
             let spec = suggestions_spec(ctx)?;
-            state.with_suggestions_db(|conn, profile| {
+            let reported = state.with_suggestions_db(|conn, profile| {
                 suggestions::set(conn, profile, &ctx.plugin_id, &spec, params)
-            })
+            });
+            state.clear_refreshing(&ctx.plugin_id);
+            reported
         }
         "suggestions.error" => {
             ctx.require(CAP_WORKER)?;
             suggestions_spec(ctx)?;
-            state.with_suggestions_db(|conn, profile| {
+            let reported = state.with_suggestions_db(|conn, profile| {
                 suggestions::error(conn, profile, &ctx.plugin_id, params)
-            })
+            });
+            state.clear_refreshing(&ctx.plugin_id);
+            reported
         }
         "suggestions.checks.set" => {
             ctx.require(CAP_WORKER)?;
@@ -960,6 +992,27 @@ mod tests {
 
     fn state(dir: &std::path::Path) -> HostApiState {
         HostApiState::open(&dir.join("plugin_events.db"), "default", 100).unwrap()
+    }
+
+    #[test]
+    fn a_refresh_counts_until_reported_or_expired() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        state.mark_refreshing("a");
+        state.mark_refreshing("b");
+        state.clear_refreshing("a");
+        assert_eq!(
+            state.refreshing_providers(),
+            HashSet::from(["b".to_string()])
+        );
+        let stale = Instant::now().checked_sub(REFRESH_TTL + Duration::from_secs(1));
+        if let Some(stale) = stale {
+            state.refreshing.lock().unwrap().insert("b".into(), stale);
+            assert!(
+                state.refreshing_providers().is_empty(),
+                "a silent worker expires"
+            );
+        }
     }
 
     #[test]

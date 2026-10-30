@@ -184,6 +184,11 @@ impl PluginHost {
         .await
     }
 
+    /// Providers with a refresh in flight.
+    pub(crate) fn refreshing_suggestions(&self) -> std::collections::HashSet<String> {
+        self.api.refreshing_providers()
+    }
+
     /// Ask every suggestions worker to report its setup checks again.
     /// Returns how many workers were notified.
     pub async fn run_suggestion_checks(&self) -> usize {
@@ -208,9 +213,17 @@ impl PluginHost {
             if provider_id.is_some_and(|id| id != provider.id) || disabled.contains(&provider.id) {
                 continue;
             }
+            let refresh = method == aoe_plugin_api::suggestions::SUGGESTIONS_REFRESH;
+            // Marked first, so a report that races the notification still clears it.
+            if refresh {
+                self.api.mark_refreshing(&provider.id);
+            }
             let notified = self
                 .notify_worker(&provider.id, method, serde_json::json!({}))
                 .await;
+            if refresh && !notified {
+                self.api.clear_refreshing(&provider.id);
+            }
             sent += usize::from(notified);
         }
         sent

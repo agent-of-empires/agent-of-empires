@@ -1037,6 +1037,88 @@ pub(crate) fn list_mappings(conn: &Connection, profile: &str) -> anyhow::Result<
     Ok(json!({ "mappings": mappings }))
 }
 
+/// The primary project and extras an item resolves to. A mapping whose first
+/// path resolves supplies both; otherwise the provider's `hint` applies and an
+/// extra is never promoted to primary.
+fn resolve_projects(
+    registered: &[Project],
+    hint: Option<&str>,
+    mapped: Option<&[String]>,
+) -> (Option<Project>, Vec<Project>) {
+    let from_mapping = mapped
+        .and_then(|paths| paths.split_first())
+        .and_then(|(first, rest)| {
+            let primary = resolve_path(registered, first)?;
+            let extras = rest
+                .iter()
+                .filter_map(|path| resolve_path(registered, path))
+                .collect();
+            Some((primary, extras))
+        });
+    match from_mapping {
+        Some((primary, extras)) => (Some(primary), extras),
+        None => (
+            hint.and_then(|wanted| resolve_hint(registered, wanted)),
+            Vec::new(),
+        ),
+    }
+}
+
+/// Sets `resolved_project` (`{ name, path }` or `null`) on every snapshot item,
+/// through the same rules `prepare` applies.
+pub(crate) fn attach_projects(
+    conn: &Connection,
+    profile: &str,
+    snapshot: &mut Value,
+    registered: &[Project],
+) -> anyhow::Result<()> {
+    let mut mappings: HashMap<(String, String), Vec<String>> = HashMap::new();
+    let rows: Vec<(String, String, String)> = conn
+        .prepare(
+            "SELECT provider_id, mapping_key, projects_json FROM suggestion_mappings
+             WHERE profile = ?1",
+        )?
+        .query_map([profile], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    for (provider_id, key, paths) in rows {
+        if let Ok(paths) = serde_json::from_str(&paths) {
+            mappings.insert((provider_id, key), paths);
+        }
+    }
+    let Some(items) = snapshot["items"].as_array_mut() else {
+        return Ok(());
+    };
+    for item in items {
+        let provider_id = item["provider_id"].as_str().unwrap_or_default().to_string();
+        let mapped = item["mapping_key"]
+            .as_str()
+            .and_then(|key| mappings.get(&(provider_id, key.to_string())));
+        let (project, _) = resolve_projects(
+            registered,
+            item["project"].as_str(),
+            mapped.map(Vec::as_slice),
+        );
+        item["resolved_project"] = match project {
+            Some(p) => json!({ "name": p.name, "path": p.path }),
+            None => Value::Null,
+        };
+    }
+    Ok(())
+}
+
+/// Sets `refreshing` on every snapshot provider.
+pub(crate) fn attach_refreshing(snapshot: &mut Value, refreshing: &HashSet<String>) {
+    let Some(providers) = snapshot["providers"].as_array_mut() else {
+        return;
+    };
+    for provider in providers {
+        let is = provider["id"]
+            .as_str()
+            .is_some_and(|id| refreshing.contains(id));
+        provider["refreshing"] = json!(is);
+    }
+}
+
 /// The live item plus the mapping its `mapping_key` names, if any.
 pub(crate) fn find_item_with_mapping(
     conn: &Connection,
@@ -1072,22 +1154,7 @@ pub(crate) fn prepare(
         None => item.draft.prompt.clone(),
     };
     let registered = projects::load_merged(profile).unwrap_or_default();
-    let from_mapping = mapped
-        .and_then(|paths| paths.split_first())
-        .and_then(|(first, rest)| {
-            let primary = resolve_path(&registered, first)?;
-            let extras: Vec<Project> = rest
-                .iter()
-                .filter_map(|path| resolve_path(&registered, path))
-                .collect();
-            Some((primary, extras))
-        });
-    let (project, extras) = from_mapping.unzip();
-    let project = project.or_else(|| {
-        item.project
-            .as_deref()
-            .and_then(|wanted| resolve_hint(&registered, wanted))
-    });
+    let (project, extras) = resolve_projects(&registered, item.project.as_deref(), mapped);
     let mut config = match &project {
         Some(p) => resolve_config_with_repo_or_warn(profile, Path::new(&p.path)),
         None => resolve_config_or_warn(profile),
@@ -1106,7 +1173,7 @@ pub(crate) fn prepare(
         "initial_prompt": prompt,
         "source_ref": item.source_ref,
         "project": project.as_ref().map(describe),
-        "extra_projects": extras.unwrap_or_default().iter().map(describe).collect::<Vec<_>>(),
+        "extra_projects": extras.iter().map(describe).collect::<Vec<_>>(),
         "tool": config.session.default_tool.unwrap_or_else(|| "claude".to_string()),
         "yolo": config.session.yolo_mode_default,
         "sandbox": config.sandbox.enabled_by_default,
@@ -1937,6 +2004,54 @@ mod tests {
         assert_eq!(snapshot["items"][0]["started_session"]["id"], "archived");
         assert!(snapshot["items"][1].get("started_session").is_none());
         assert!(started_sessions(&instances[2..3], "p").is_empty());
+    }
+
+    #[test]
+    fn refreshing_marks_every_provider() {
+        let mut snapshot = json!({ "providers": [{ "id": "a" }, { "id": "b" }] });
+        attach_refreshing(&mut snapshot, &HashSet::from(["b".to_string()]));
+        assert_eq!(snapshot["providers"][0]["refreshing"], false);
+        assert_eq!(snapshot["providers"][1]["refreshing"], true);
+    }
+
+    #[test]
+    fn items_get_the_project_prepare_would_resolve() {
+        let conn = store();
+        let project = |name: &str, path: &str| {
+            let scope = projects::ProjectScope::Global;
+            Project::new(name, path, scope)
+        };
+        let registered = [
+            project("api", "/tmp/aoe-api"),
+            project("web", "/tmp/aoe-web"),
+            project("twin", "/tmp/aoe-twin-a"),
+            project("twin", "/tmp/aoe-twin-b"),
+        ];
+        put_mapping(
+            &conn,
+            "p",
+            "acme.github",
+            "o/r",
+            &["/tmp/aoe-web".to_string()],
+        )
+        .unwrap();
+        let mut snapshot = json!({ "items": [
+            { "provider_id": "acme.github", "id": "hint", "project": "api" },
+            { "provider_id": "acme.github", "id": "mapped", "project": "api", "mapping_key": "o/r" },
+            { "provider_id": "acme.github", "id": "ambiguous", "project": "twin" },
+            { "provider_id": "acme.github", "id": "none" },
+            { "provider_id": "other", "id": "unmapped", "mapping_key": "o/r" },
+        ]});
+        attach_projects(&conn, "p", &mut snapshot, &registered).unwrap();
+        let resolved = |i: usize| snapshot["items"][i]["resolved_project"].clone();
+        assert_eq!(resolved(0)["name"], "api");
+        assert_eq!(
+            resolved(1),
+            json!({ "name": "web", "path": "/tmp/aoe-web" })
+        );
+        assert!(resolved(2).is_null(), "an ambiguous hint is never guessed");
+        assert!(resolved(3).is_null());
+        assert!(resolved(4).is_null(), "a mapping belongs to its provider");
     }
 
     #[test]

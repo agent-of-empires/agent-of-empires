@@ -367,7 +367,7 @@ Suggestions are stored per profile. The routes below list and act on them; none 
 
 | Route | Body | Result |
 |---|---|---|
-| `GET /api/suggestions` | none | `{ providers: [{ id, name, enabled, status, error?, updated_at?, sources: [{ criterion, label, description, variables, enabled }], checks: [{ id, label, status, detail, fix }] }], items, prefs: { homepage, sidebar, refresh_minutes, provider_order } }` |
+| `GET /api/suggestions` | none | `{ providers: [{ id, name, enabled, status, error?, updated_at?, refreshing, sources: [{ criterion, label, description, variables, enabled }], checks: [{ id, label, status, detail, fix }] }], items, prefs: { homepage, sidebar, refresh_minutes, provider_order } }` |
 | `POST /api/suggestions/refresh` | none | `{ ok, notified }` |
 | `POST /api/suggestions/checks/run` | none | `{ ok, notified }` |
 | `POST /api/suggestions/dismiss` | `{ provider_id, id }` | `{ ok }` |
@@ -385,6 +385,8 @@ Suggestions are stored per profile. The routes below list and act on them; none 
 Providers are listed in the user's `provider_order`; a provider never ordered follows, sorted by id. `prefs` defaults to `{ homepage: true, sidebar: false, refresh_minutes: 15, provider_order: [] }` and is per profile. `PATCH /api/suggestions/prefs` is partial: `refresh_minutes` is one of 5, 15, 30, 60 or 120, `provider_order` must list every provider exactly once, and `provider_enabled` maps provider ids to booleans. Other values fail with 400 `validation_failed`, and nothing is stored. `refresh_minutes` is a hint for plugins; core does not schedule refreshes yet. The route is denied in read-only (403 `read_only`) and CityHall mode.
 
 A provider's `status` is `pending` before its first publish, `ok`, or `error`. Uninstalling a plugin, or updating it to a build whose `[suggestions]` block differs, clears its items, checks and status so it is `pending` again until its next publish; source switches, dismissals, templates and mappings are kept. Each item is the published item plus `provider_id` and `dismissed`; dismissed items are still returned. Items of a disabled source or provider are hidden, and `refresh` skips a disabled provider. `updated_at` is Unix seconds of the provider's last report. `refresh` and a `sources` change send `suggestions.refresh` to the affected workers.
+
+`refreshing` is true while a refresh the host requested is unanswered, for at most two minutes, and is not stored. Each item has `resolved_project: { name, path }`, or `null`, the registered project a [mapping](#project-mappings) or the unambiguous `project` hint resolves to; group by `path`, never by the provider's `project` text.
 
 `POST /api/sessions` accepts an optional `suggestion: { provider_id, id }`, stored on the session. An item carries `started_session: { id, title, status, archived, created_at }` for the oldest non-trashed session in the profile that names it; trashing that session drops the link, and archiving keeps it. Clients omit `suggestion` to start another session without linking it.
 

@@ -113,14 +113,22 @@ pub async fn get_suggestions(State(state): State<Arc<AppState>>) -> impl IntoRes
     };
     let profile = host.suggestions_profile();
     let started = suggestions::started_sessions(&state.instances.read().await, &profile);
+    let refreshing = host.refreshing_suggestions();
     let result = tokio::task::spawn_blocking(move || {
         let providers = suggestions::providers();
-        host.with_suggestions_db(|conn, profile| suggestions::snapshot(conn, profile, &providers))
+        // Disk reads stay off the store lock.
+        let registered = crate::session::projects::load_merged(&profile).unwrap_or_default();
+        host.with_suggestions_db(|conn, profile| {
+            let mut snapshot = suggestions::snapshot(conn, profile, &providers)?;
+            suggestions::attach_projects(conn, profile, &mut snapshot, &registered)?;
+            Ok::<_, anyhow::Error>(snapshot)
+        })
     })
     .await;
     match result {
         Ok(Ok(mut snapshot)) => {
             suggestions::attach_started(&mut snapshot, &started);
+            suggestions::attach_refreshing(&mut snapshot, &refreshing);
             Json(snapshot).into_response()
         }
         Ok(Err(error)) => internal(error),
