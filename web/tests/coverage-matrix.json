@@ -3778,9 +3778,9 @@
       "id": "acp.startup-error-screen",
       "kind": "vitest",
       "risk": "high",
-      "notes": "Changed descriptive text uses text-text-subtle, with no text-text-secondary or text-text-dim classes, asserted across installable, install-off and sandboxed states.",
-      "specs": ["src/components/acp/__tests__/StartupErrorScreen.test.tsx"],
-      "components": ["web/src/components/acp/StartupErrorScreen.tsx", "web/src/components/acp/RecoveryActionRow.tsx"]
+      "specs": ["src/components/acp/__tests__/StartupErrorScreen.test.tsx", "tests/acp-startup-error-screen.spec.ts"],
+      "components": ["web/src/components/acp/StartupErrorScreen.tsx", "web/src/components/acp/RecoveryActionRow.tsx"],
+      "notes": "Steps follow install-info: installs allowed, read-only or CityHall, sandboxed, a stopped container, npm-installable. Re-reads it on focus so a setting turned on in the TUI unlocks Update; the in-container command comes from the Daemon. Descriptive text uses text-text-subtle, with no text-text-secondary or text-text-dim classes, asserted across install-off, allowed, sandboxed, non-npm and protocol states."
     },
     {
       "id": "acp.startup-error-banner",
