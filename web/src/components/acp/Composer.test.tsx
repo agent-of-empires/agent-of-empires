@@ -90,7 +90,14 @@ beforeEach(() => {
       dispatchEvent: () => false,
     })),
   );
-  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => ({ files: [] }) }));
+  // The mounted Switch Agent modal reads agent display names from /api/agents.
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string) => ({
+      ok: true,
+      json: async () => (String(url).startsWith("/api/agents") ? [] : { files: [] }),
+    })),
+  );
 });
 
 afterEach(() => {

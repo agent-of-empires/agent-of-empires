@@ -37,8 +37,11 @@ const resetIn = (hours: number, minutes: number) => Math.floor(Date.now() / 1000
 
 async function expectResetBanner(page: Page, resetSecs: number, timeout: number) {
   // Computed in-browser so locale and timezone match the UI.
-  const expected = await page.evaluate((ms) => new Date(ms).toLocaleTimeString(), resetSecs * 1000);
-  await expect(page.getByText(`resets at ${expected}`)).toBeVisible({ timeout });
+  const expected = await page.evaluate(
+    (ms) => new Date(ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }),
+    resetSecs * 1000,
+  );
+  await expect(page.getByTestId("usage-limit-reset")).toContainText(`Resets ${expected}`, { timeout });
 }
 
 test("resume re-issues the interrupted prompt so the agent continues", async ({ page, spawnServe }) => {
@@ -50,10 +53,10 @@ test("resume re-issues the interrupted prompt so the agent continues", async ({ 
     extraEnv: persistTurnCursor,
   });
   await openStructuredView(page, serve, sessionId, "keep working on the task");
-  await expect(page.getByText(/Rate-limited/i)).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByTestId("usage-limit-banner")).toContainText("usage limit reached", { timeout: 15_000 });
   await expectResetBanner(page, reset, 15_000);
 
-  await page.getByRole("button", { name: /Resume now/i }).click();
+  await page.getByTestId("usage-limit-resume").click();
   await waitForReplayContains(serve.baseUrl, sessionId, "Resumed and continued the task.", { timeoutMs: 30_000 });
 });
 
@@ -71,7 +74,7 @@ test("a later rejection still reports the reset captured on an earlier turn", as
   await openStructuredView(page, serve, sessionId, "start the task");
   await expectResetBanner(page, reset, 15_000);
 
-  await page.getByRole("button", { name: /Resume now/i }).click();
+  await page.getByTestId("usage-limit-resume").click();
   const resets = async () =>
     (
       (await replayFrames(serve.baseUrl, sessionId)) as {
@@ -94,7 +97,7 @@ test("sidebar row shows a rate-limited indicator after a park", async ({ page, s
     fakeAcpScript: script(rateLimitedTurn(resetIn(1, 0))),
   });
   await openStructuredView(page, serve, sessionId, "kick off A");
-  await expect(page.getByText(/Rate-limited/i)).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByTestId("usage-limit-banner")).toBeVisible({ timeout: 15_000 });
 
   await page.goto(serve.baseUrl);
   await expect(page.getByTitle(/Rate-limited/i)).toBeVisible({ timeout: 15_000 });
