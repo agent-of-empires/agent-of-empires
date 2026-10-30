@@ -341,14 +341,14 @@ At least one source is required. Criteria are unique, non-empty and at most 256 
 
 Call `suggestions.sources` before discovering and skip every criterion that is not enabled. A source is enabled when the user's stored switch says so, else when its `default_enabled` (default `true`) does. The host sends the `suggestions.refresh` notification (`{}`); on it, discover again and call `suggestions.set` or `suggestions.error`.
 
-An item is `{ id, title, reason, source_url, source_ref, preview, project?, criterion, variables, draft: { title, prompt } }`. `variables` holds exactly the names the item's source declares. Treat `preview`, `variables` and `draft` as untrusted source content. `projects.list` returns the registered projects so a provider can map its own keys to a `project` name or path.
+An item is `{ id, title, reason, source_url, source_ref, preview, project?, mapping_key?, criterion, variables, draft: { title, prompt } }`. `variables` holds exactly the names the item's source declares. Treat `preview`, `variables` and `draft` as untrusted source content. `projects.list` returns the registered projects so a provider can map its own keys to a `project` name or path. A user's [mapping](#project-mappings) for `mapping_key` takes precedence over `project`.
 
 `suggestions.set` fails with invalid-params, and publishes nothing, when:
 
 - an item names an undeclared `criterion`, or its `variables` differ from the source's declaration;
 - `source_url` is not an http(s) URL;
-- `id`, `title` or `source_ref` is empty, or an `id` repeats;
-- there are more than 500 items, or a string exceeds its bound (`id` 256 bytes, `title` and `draft.title` 512, `reason`, `source_url`, `source_ref` and each variable value 2 KiB, `preview` 16 KiB, `draft.prompt` 64 KiB, `project` 4 KiB).
+- `id`, `title` or `source_ref` is empty, `mapping_key` is present but empty, or an `id` repeats;
+- there are more than 500 items, or a string exceeds its bound (`id` and `mapping_key` 256 bytes, `title` and `draft.title` 512, `reason`, `source_url`, `source_ref` and each variable value 2 KiB, `preview` 16 KiB, `draft.prompt` 64 KiB, `project` 4 KiB).
 
 After validation, items of a source that is not enabled are dropped and counted in `dropped`. `suggestions.error` messages are limited to 4096 bytes.
 
@@ -365,11 +365,20 @@ Suggestions are stored per profile. The routes below list and act on them; none 
 | `POST /api/suggestions/dismiss` | `{ provider_id, id }` | `{ ok }` |
 | `POST /api/suggestions/undismiss` | `{ provider_id, id }` | `{ ok }` |
 | `PATCH /api/suggestions/sources` | `{ provider_id, criterion, enabled }` | `{ provider_id, criterion, enabled }` |
-| `POST /api/suggestions/prepare` | `{ provider_id, id }` | `{ title, initial_prompt, source_ref, project, tool, yolo, sandbox, worktree }` |
+| `POST /api/suggestions/prepare` | `{ provider_id, id }` | `{ title, initial_prompt, source_ref, project, extra_projects, tool, yolo, sandbox, worktree }` |
+| `GET /api/suggestions/mappings` | none | `{ mappings: [{ provider_id, mapping_key, projects }] }` |
+| `PUT /api/suggestions/mappings` | `{ provider_id, mapping_key, projects }` | `{ provider_id, mapping_key, projects }` |
+| `DELETE /api/suggestions/mappings?provider_id=&mapping_key=` | none | `{ ok, deleted }` |
 
 A provider's `status` is `pending` before its first publish, `ok`, or `error`. Each item is the published item plus `provider_id` and `dismissed`; dismissed items are still returned. Items of a disabled source are hidden. `refresh` and a `sources` change send `suggestions.refresh` to the affected workers.
 
-`prepare` resolves settings through the normal repo and profile config. `project` is `{ name, path }` only when the item's `project` matches exactly one registered project by name or exact path, otherwise `null`.
+`prepare` resolves settings through the normal repo and profile config. `project` is `{ name, path }` or `null`, resolved in this order: the user's mapping for the item's `mapping_key`, then the item's `project` hint (exactly one registered project by name or exact path), else `null`; an item is never given a scratch project.
+
+### Project mappings
+
+An item may carry an opaque `mapping_key` (a repository, a team). Core stores, per profile, an ordered list of registered project paths for each `(provider_id, mapping_key)`; the first is the primary project and the rest come back as `extra_projects`. A mapping whose primary path no longer resolves is ignored and the hint applies instead; stale extras are dropped, and an extra is never promoted. `GET` returns the stored paths as they are, including mappings of providers that are no longer active, and `DELETE` removes them; both stay allowed so stale rows can be repaired.
+
+`PUT` replaces the list. `projects` holds 1 to 16 distinct registered projects, each named by its path, and is stored as the registered paths. Errors: 404 `unknown_provider`, 400 `validation_failed` (empty or oversized key, bad list, a path that is not exactly one registered project), 403 `read_only`. Mutations are refused in CityHall mode.
 
 Errors: 404 `unknown_provider` (no active plugin provides suggestions under that id), 409 `stale_suggestion` (the item is no longer published, or its source is disabled), 400 `validation_failed` (`criterion` not declared by the provider), 403 `read_only`.
 
