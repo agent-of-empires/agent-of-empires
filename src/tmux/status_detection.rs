@@ -636,7 +636,7 @@ enter to select · esc to cancel"],
             &[
                 "allow this action? [y/n]",
                 "continue? (y/n)",
-                "approve changes",
+                "△ Permission required\n  Allow once   Allow always   Reject",
                 "task complete.\n>",
                 "ready for input\n> ",
                 "done! what else can i help with?\n>",
@@ -648,7 +648,13 @@ enter to select · esc to cancel"],
         assert_all(
             detect_opencode_status,
             Status::Idle,
-            &["some random output", "file saved successfully"],
+            &[
+                "some random output",
+                "file saved successfully",
+                "The approved plan remains:",
+                "the config will allow overrides",
+                "No permission required to run the tests.",
+            ],
         );
         assert_all(
             detect_vibe_status,
