@@ -9831,6 +9831,7 @@ async fn create_refuses_a_structured_session_without_its_adapter() {
     })
     .unwrap();
     let project = tempfile::tempdir().unwrap();
+    let _path = crate::session::test_support::EnvGuard::set(&[("PATH", project.path())]);
     let path = project.path().display().to_string();
     let state = crate::server::test_support::build_test_app_state(Vec::new());
     // Holds the only worker slot, so an exempt create that gets through never launches an agent.
@@ -9860,10 +9861,11 @@ async fn create_refuses_a_structured_session_without_its_adapter() {
             "{extra}: {body}"
         );
         assert_eq!(body["error"], "acp_adapter_missing", "{extra}: {body}");
-        let message = body["message"].as_str().unwrap();
         assert!(
-            message.contains(&format!("ACP adapter `{adapter}` is not installed")),
-            "{extra}: {message}"
+            body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(&adapter)),
+            "{extra}: {body}"
         );
         assert!(state.instances.read().await.is_empty(), "{extra}");
         assert!(

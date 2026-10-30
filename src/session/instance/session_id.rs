@@ -156,7 +156,7 @@ impl Instance {
             ResumeIntent::Cleared => {
                 self.set_agent_conversation(None, None, None);
                 self.resume_probe_failed_sid = None;
-                let session_id = self.fresh_launch_session_id(backend, mint_fresh_id);
+                let session_id = self.fresh_launch_session_id(backend, execution, mint_fresh_id);
                 self.set_agent_conversation(session_id.clone(), None, None);
                 return (session_id, false);
             }
@@ -267,7 +267,7 @@ impl Instance {
             }
         }
 
-        let session_id = self.fresh_launch_session_id(backend, mint_fresh_id);
+        let session_id = self.fresh_launch_session_id(backend, execution, mint_fresh_id);
         if let Some(ref id) = session_id {
             tracing::debug!(target: "session.store", "Session ID for {}: {}", self.tool, id);
             self.set_agent_conversation(session_id.clone(), None, None);
@@ -276,16 +276,18 @@ impl Instance {
         (session_id, false)
     }
 
-    /// Mint the session id for a brand-new launch. Claude and eligible Pi
-    /// launches pin a UUID. Direct host OpenCode launches pre-create a session
-    /// automatically. A preassign failure returns no id rather than guessing
-    /// from the shared store. Other supported backends capture after launch.
+    /// Preassign with known execution identity; otherwise capture the agent's publication.
     fn fresh_launch_session_id(
         &self,
         backend: Option<crate::agents::SessionCaptureBackend>,
+        execution: Option<&super::execution::NativeExecution>,
         mint_fresh_id: &dyn Fn(&str) -> Option<String>,
     ) -> Option<String> {
-        match backend? {
+        let backend = backend?;
+        if execution.is_none() && self.resolved_agent().is_none() {
+            return None;
+        }
+        match backend {
             crate::agents::SessionCaptureBackend::Claude => Some(generate_session_uuid()),
             crate::agents::SessionCaptureBackend::OpenCode
             | crate::agents::SessionCaptureBackend::Pi => mint_fresh_id(&self.project_path),
@@ -467,10 +469,10 @@ impl Instance {
             .try_retroactive_capture_in(CaptureStorage::Profiles(&file_watch))
             .ok()
             .flatten();
-        let applied = captured.as_ref().is_some_and(|captured| {
-            self.resume_probe_failed_sid.as_deref() != Some(captured.sid.as_str())
-                && persist_session_to_storage(profile, &self.id, captured, &expected, &file_watch)
-                    == SidWrite::Applied
+        let commit = captured.as_ref().and_then(|captured| {
+            (self.resume_probe_failed_sid.as_deref() != Some(captured.sid.as_str())).then(|| {
+                persist_session_to_storage(profile, &self.id, captured, &expected, &file_watch)
+            })
         });
         let released = storage.update(|instances, _groups| {
             let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
@@ -489,11 +491,11 @@ impl Instance {
         }
         self.lifecycle_generation = generation;
         self.lifecycle_reservation = None;
-        if applied {
+        if let Some(commit) = commit.filter(|commit| commit.outcome == SidWrite::Applied) {
             if let Some(observation) = captured {
                 self.apply_conversation_observation(&observation);
             }
-            self.resume_probe_failed_sid = None;
+            self.resume_probe_failed_sid = commit.failed_sid;
             tracing::info!(
                 target: "session.store",
                 instance = %self.id,
@@ -806,6 +808,10 @@ impl Instance {
             return Ok(false);
         }
         if execution.is_none() && !self.supports_native_resume() {
+            if matches!(self.resume_intent, ResumeIntent::Cleared) {
+                self.set_agent_conversation(None, None, None);
+                self.resume_probe_failed_sid = None;
+            }
             anyhow::ensure!(
                 !matches!(
                     self.resume_intent,
@@ -1270,160 +1276,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
-    fn default_bare_alias_pins_and_resumes_without_execution_attestation() {
-        const PROFILE: &str = "legacy-default-claude-wrapper";
-        let root = tempfile::tempdir().unwrap();
-        let _app = crate::session::test_support::isolate_app_dir_at(&root.path().join("app"));
-        let profile_path =
-            crate::session::config::profile_config::get_profile_config_path(PROFILE).unwrap();
-        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            profile_path,
-            "[session.agent_detect_as]\nwork-claude = \"claude\"\n",
-        )
-        .unwrap();
-        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(PROFILE);
-        let _home = EnvGuard::set(&[
-            ("HOME", root.path().to_path_buf()),
-            ("CLAUDE_CONFIG_DIR", root.path().join(".claude")),
-        ]);
-        let mut inst = tool_instance("work-claude", root.path().to_str().unwrap());
-        inst.source_profile = PROFILE.into();
-        inst.command = "work-claude".into();
-        assert!(inst.execution_agent().is_err());
-        let mut first = inst.command.clone();
-        assert!(!inst
-            .apply_session_flags(
-                &mut first,
-                None,
-                None,
-                &super::execution::AgentLaunchContext::host(
-                    inst.default_selector_agent(),
-                    inst.default_selector_agent()
-                        .and_then(|agent| inst.host_agent_command(agent, None))
-                        .as_ref()
-                ),
-                &mut inst.conversation_state()
-            )
-            .unwrap());
-        let sid = inst.agent_session_id.clone().expect("fresh Claude pin");
-        assert_eq!(first, format!("work-claude --session-id {sid}"));
-
-        let canonical_project = std::fs::canonicalize(&inst.project_path).unwrap();
-        let encoded = crate::session::capture::encode_claude_project_path(
-            &canonical_project.to_string_lossy(),
-        );
-        let project = root.path().join(".claude/projects").join(encoded);
-        std::fs::create_dir_all(&project).unwrap();
-        std::fs::write(project.join(format!("{sid}.jsonl")), "{}\n").unwrap();
-        let mut resumed = inst.command.clone();
-        assert!(inst
-            .apply_session_flags(
-                &mut resumed,
-                None,
-                None,
-                &super::execution::AgentLaunchContext::host(
-                    inst.default_selector_agent(),
-                    inst.default_selector_agent()
-                        .and_then(|agent| inst.host_agent_command(agent, None))
-                        .as_ref()
-                ),
-                &mut inst.conversation_state()
-            )
-            .unwrap());
-        assert_eq!(resumed, format!("work-claude --resume {sid}"));
-        for intent in [
-            ResumeIntent::Use(sid.clone()),
-            ResumeIntent::Fork { from: sid.clone() },
-        ] {
-            inst.resume_intent = intent;
-            let mut command = inst.command.clone();
-            assert!(inst
-                .apply_session_flags(
-                    &mut command,
-                    None,
-                    None,
-                    &super::execution::AgentLaunchContext::host(
-                        inst.default_selector_agent(),
-                        inst.default_selector_agent()
-                            .and_then(|agent| inst.host_agent_command(agent, None))
-                            .as_ref()
-                    ),
-                    &mut inst.conversation_state()
-                )
-                .is_err());
-            assert_eq!(command, "work-claude");
-        }
-        inst.resume_intent = ResumeIntent::Default;
-        for unsafe_command in [
-            "ssh -t host claude",
-            "/opt/work-claude",
-            "work-claude | cat",
-            "work-claude --",
-        ] {
-            inst.command = unsafe_command.into();
-            assert!(!inst.supports_native_resume(), "{unsafe_command}");
-            let mut command = unsafe_command.to_string();
-            assert!(!inst
-                .apply_session_flags(
-                    &mut command,
-                    None,
-                    None,
-                    &super::execution::AgentLaunchContext::host(
-                        inst.default_selector_agent(),
-                        inst.default_selector_agent()
-                            .and_then(|agent| inst.host_agent_command(agent, None))
-                            .as_ref()
-                    ),
-                    &mut inst.conversation_state()
-                )
-                .unwrap());
-            assert_eq!(command, unsafe_command);
-        }
-        inst.command = "codex".into();
-        assert!(inst.legacy_default_selector_agent().is_none());
-        inst.command = "work-claude".into();
-        inst.extra_args = "--resume external".into();
-        let mut conflict = "work-claude --resume external".to_string();
-        assert!(inst
-            .apply_session_flags(
-                &mut conflict,
-                None,
-                None,
-                &super::execution::AgentLaunchContext::host(
-                    inst.default_selector_agent(),
-                    inst.default_selector_agent()
-                        .and_then(|agent| inst.host_agent_command(agent, None))
-                        .as_ref()
-                ),
-                &mut inst.conversation_state()
-            )
-            .is_err());
-        let mut launched = tool_instance("work-claude", root.path().to_str().unwrap());
-        launched.source_profile = PROFILE.into();
-        launched.command = "work-claude".into();
-        let fresh = launched
-            .prepare_launch_command(launched.conversation_state())
-            .unwrap();
-        let launched_sid = launched.agent_session_id.clone().unwrap();
-        assert!(!fresh.is_existing);
-        assert!(fresh
-            .command
-            .unwrap()
-            .contains(&format!("work-claude --session-id {launched_sid}")));
-        std::fs::write(project.join(format!("{launched_sid}.jsonl")), "{}\n").unwrap();
-        let restart = launched
-            .prepare_launch_command(launched.conversation_state())
-            .unwrap();
-        assert!(restart.is_existing);
-        assert!(restart
-            .command
-            .unwrap()
-            .contains(&format!("work-claude --resume {launched_sid}")));
-    }
-
-    #[test]
     #[serial(hook_base)]
     fn default_detect_as_wrappers_capture_published_conversations() {
         const PROFILE: &str = "default-wrapper-capture";
@@ -1484,24 +1336,11 @@ work-opencode = "opencode"
             assert_eq!((sid, existing), (Some(SID.into()), true), "{tool}");
             assert_eq!(inst.agent_session_id.as_deref(), Some(SID), "{tool}");
             if tool == "work-claude" {
-                let mut command = tool.to_string();
-                assert!(inst
-                    .apply_session_flags(
-                        &mut command,
-                        None,
-                        None,
-                        &super::execution::AgentLaunchContext::host(
-                            inst.default_selector_agent(),
-                            inst.default_selector_agent()
-                                .and_then(|agent| inst.host_agent_command(agent, None))
-                                .as_ref()
-                        ),
-                        &mut inst.conversation_state()
-                    )
-                    .unwrap());
-                assert_eq!(command, format!("{tool} --resume {SID}"));
+                let before = inst.conversation_state();
+                assert!(inst.prepare_launch_command(before.clone()).is_err());
+                assert_eq!(inst.conversation_state(), before);
             }
-            if tool == "work-pi" && crate::agents::pi_supports_session_id_flag() {
+            if tool == "work-pi" {
                 let mut fresh = tool_instance(tool, root.path().to_str().unwrap());
                 fresh.source_profile = PROFILE.into();
                 fresh.command = tool.into();
@@ -1521,10 +1360,8 @@ work-opencode = "opencode"
                         &mut fresh.conversation_state()
                     )
                     .unwrap());
-                assert!(
-                    command.starts_with(&format!("{tool} --session-id ")),
-                    "{command}"
-                );
+                assert_eq!(command, tool);
+                assert!(fresh.agent_session_id.is_none());
             }
         }
 

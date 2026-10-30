@@ -1241,14 +1241,11 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
     for (_id, title) in &succeeded {
         println!("  · {}", title);
     }
-    if !fresh_after_failed_resume.is_empty() {
+    for (title, sid) in &fresh_after_failed_resume {
         println!(
-            "ℹ {} started fresh (a prior resume attempt failed for the stored sid; the old conversation is still reachable via the agent's own resume/history picker):",
-            fresh_after_failed_resume.len()
+            "  · {}: started fresh after a prior resume failed for sid {}; the old conversation remains in the agent's history",
+            title, sid
         );
-        for (title, sid) in &fresh_after_failed_resume {
-            println!("  · {}: sid {}", title, sid);
-        }
     }
     if !orphaned.is_empty() {
         println!(
@@ -1403,8 +1400,8 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         }
         StartOutcome::FreshAfterFailedResume { sid } => {
             println!(
-                "✓ Restarted session: {} (started fresh; a prior resume attempt failed for sid {sid}, the old conversation is still reachable via the agent's own resume/history picker)",
-                title
+                "Restarted session: {} (started fresh after a prior resume failed for sid {}; the old conversation remains in the agent's history)",
+                title, sid
             );
         }
         StartOutcome::Resumed | StartOutcome::Fresh => {
