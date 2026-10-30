@@ -374,9 +374,11 @@ A provider's `status` is `pending` before its first publish, `ok`, or `error`. E
 
 `prepare` resolves settings through the normal repo and profile config. `project` is `{ name, path }` only when the item's `project` matches exactly one registered project by name or exact path, otherwise `null`.
 
-A template is stored per profile and criterion and replaces the provider's `draft.prompt` in `prepare`'s `initial_prompt`, nowhere else. `{name}` expands to the item's variable of that name; unknown names and stray braces stay as typed, and expanded values are never scanned again. No stored template (`default: true`) uses `draft.prompt`; an empty template gives an empty prompt. Templates are limited to 64 KiB.
+A template is stored per profile and criterion and replaces the provider's `draft.prompt` in `prepare`'s `initial_prompt`, nowhere else. `{name}` expands to the item's variable of that name, scanning left to right (`{a{pr_number}}` becomes `{a42}`); unknown names and stray braces stay as typed, and expanded values are never scanned again. No stored template (`default: true`) uses `draft.prompt`; an empty template gives an empty prompt, so a client must then omit `initial_prompt` when creating the session, which rejects a blank one. A template and its expansion are each limited to 64 KiB; `prepare` fails with 400 `validation_failed` when the expansion is longer.
 
-Errors: 404 `unknown_provider` (no active plugin provides suggestions under that id), 409 `stale_suggestion` (the item is no longer published, or its source is disabled), 400 `validation_failed` (`criterion` not declared by the provider), 403 `read_only`.
+`GET` without parameters lists every stored template of the profile, including those of a disabled plugin or a criterion it no longer declares. `DELETE` checks neither, so any listed template can be removed and deleting an absent one succeeds.
+
+Errors: 404 `unknown_provider` (no active plugin provides suggestions under that id), 409 `stale_suggestion` (the item is no longer published, or its source is disabled), 400 `validation_failed` (`criterion` not declared by the provider, or a template or its expansion over 64 KiB), 403 `read_only`.
 
 ## UI slots
 

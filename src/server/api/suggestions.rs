@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::{api_error, AppState};
-use crate::plugin::suggestions::{self, Provider};
+use crate::plugin::suggestions::{self, PromptTooLong, Provider};
 use axum::http::StatusCode;
 
 #[derive(Deserialize)]
@@ -251,7 +251,15 @@ pub async fn prepare_suggestion(
     })
     .await;
     match result {
-        Ok(Ok(Some(prefill))) => Json(prefill).into_response(),
+        Ok(Ok(Some(Ok(prefill)))) => Json(prefill).into_response(),
+        Ok(Ok(Some(Err(PromptTooLong)))) => api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            format!(
+                "The expanded prompt exceeds {} bytes",
+                suggestions::MAX_PROMPT_BYTES
+            ),
+        ),
         Ok(Ok(None)) => stale_item(),
         Ok(Err(error)) => internal(error),
         Err(error) => internal(error),
@@ -264,7 +272,14 @@ fn declared_source(
     provider_id: &str,
     criterion: &str,
 ) -> Result<Provider, axum::response::Response> {
-    let provider = find_provider(provider_id).ok_or_else(unknown_provider)?;
+    check_declared(find_provider(provider_id), criterion)
+}
+
+fn check_declared(
+    provider: Option<Provider>,
+    criterion: &str,
+) -> Result<Provider, axum::response::Response> {
+    let provider = provider.ok_or_else(unknown_provider)?;
     if provider
         .spec
         .sources
@@ -279,6 +294,26 @@ fn declared_source(
             "The provider does not declare that criterion",
         ))
     }
+}
+
+/// What a PUT must satisfy before anything is stored.
+fn check_template_put(
+    provider: Option<Provider>,
+    criterion: &str,
+    template: &str,
+) -> Result<(), axum::response::Response> {
+    check_declared(provider, criterion)?;
+    if template.len() > suggestions::MAX_PROMPT_BYTES {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            format!(
+                "Template is limited to {} bytes",
+                suggestions::MAX_PROMPT_BYTES
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn template_json(
@@ -357,18 +392,12 @@ pub async fn put_suggestion_template(
     let Some(host) = state.plugin_host.clone() else {
         return unavailable();
     };
-    if let Err(response) = declared_source(&body.provider_id, &body.criterion) {
+    if let Err(response) = check_template_put(
+        find_provider(&body.provider_id),
+        &body.criterion,
+        &body.template,
+    ) {
         return response;
-    }
-    if body.template.len() > suggestions::MAX_PROMPT_BYTES {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "validation_failed",
-            format!(
-                "Template is limited to {} bytes",
-                suggestions::MAX_PROMPT_BYTES
-            ),
-        );
     }
     let result = tokio::task::spawn_blocking(move || {
         host.with_suggestions_db(|conn, profile| {
@@ -410,9 +439,8 @@ pub async fn delete_suggestion_template(
     let Some(host) = state.plugin_host.clone() else {
         return unavailable();
     };
-    if let Err(response) = declared_source(&key.provider_id, &key.criterion) {
-        return response;
-    }
+    // No provider or criterion check: a listed template must stay deletable
+    // after its plugin is disabled or drops the criterion.
     let result = tokio::task::spawn_blocking(move || {
         host.with_suggestions_db(|conn, profile| {
             suggestions::delete_template(conn, profile, &key.provider_id, &key.criterion)
@@ -423,5 +451,48 @@ pub async fn delete_suggestion_template(
         Ok(Ok(())) => Json(json!({ "ok": true })).into_response(),
         Ok(Err(error)) => internal(error),
         Err(error) => internal(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aoe_plugin_api::{SuggestionSource, SuggestionsSpec};
+
+    fn provider() -> Provider {
+        Provider {
+            id: "acme.github".into(),
+            name: "GitHub".into(),
+            spec: SuggestionsSpec {
+                sources: vec![SuggestionSource {
+                    criterion: "assigned".into(),
+                    label: "Assigned".into(),
+                    description: String::new(),
+                    variables: vec![],
+                    default_enabled: true,
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn template_put_is_bounded_and_needs_a_declared_source() {
+        let max = suggestions::MAX_PROMPT_BYTES;
+        let status = |provider: Option<Provider>, criterion: &str, len: usize| {
+            check_template_put(provider, criterion, &"x".repeat(len))
+                .err()
+                .map(|r| r.status())
+        };
+        assert_eq!(status(Some(provider()), "assigned", 0), None);
+        assert_eq!(status(Some(provider()), "assigned", max), None);
+        assert_eq!(
+            status(Some(provider()), "assigned", max + 1),
+            Some(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            status(Some(provider()), "undeclared", 1),
+            Some(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(status(None, "assigned", 1), Some(StatusCode::NOT_FOUND));
     }
 }
