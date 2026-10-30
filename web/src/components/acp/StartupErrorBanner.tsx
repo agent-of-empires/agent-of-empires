@@ -16,10 +16,11 @@ function specificRemediation(
   message: string,
   agent: string | undefined,
   name: string,
-  sandboxed: boolean,
+  /** Unknown until the install info loads; a command could then name the wrong terminal. */
+  sandboxed: boolean | undefined,
 ): React.ReactNode {
   if (/authentic|login|api[_ -]?key/i.test(message)) {
-    const steps = signInSteps(agent, name, sandboxed);
+    const steps = signInSteps(sandboxed === undefined ? null : agent, name, sandboxed === true);
     // Retry respawns the Agent, which reads a new sign-in; the Daemon reads its env only at start.
     return (
       <>
@@ -171,7 +172,7 @@ export function StartupErrorBanner({
     message,
     info?.agent ?? AGENT_IN_MESSAGE.exec(message)?.[1],
     name,
-    info?.sandboxed === true,
+    info ? info.sandboxed === true : undefined,
   );
   const canInstall = !specific && info?.install_allowed === true && info.npm_installable;
   const busy = retryState === "retrying" || install.state === "installing";

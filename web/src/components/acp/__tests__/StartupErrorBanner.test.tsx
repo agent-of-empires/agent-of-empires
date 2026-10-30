@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 
 import type { AgentInstallInfo } from "../../../lib/api";
 import { StartupErrorBanner } from "../StartupErrorBanner";
@@ -272,6 +272,17 @@ describe("StartupErrorBanner auth remediation", () => {
     });
     expect(banner.textContent).not.toContain("usually missing");
     for (const text of absent) expect(banner.textContent).not.toContain(text);
+  });
+
+  it("names no command while it can't tell host from Container", async () => {
+    const spy = stubApi({});
+    const message = 'Failed to start structured view agent "codex": authentication required';
+    const { findByTestId } = renderBanner({ message });
+    const banner = await findByTestId("startup-error-banner");
+    await waitFor(() => expect(calls(spy, "/acp/install-info")).toBe(1));
+    await act(async () => {});
+    expect(banner.textContent).toContain("Sign in to codex, then click Retry");
+    expect(banner.textContent).not.toContain("codex login");
   });
 });
 
