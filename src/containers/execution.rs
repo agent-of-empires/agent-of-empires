@@ -139,10 +139,21 @@ impl RuntimeExecutionSnapshot {
     }
 
     pub(crate) fn capture(runtime: &ContainerRuntime) -> anyhow::Result<Self> {
+        Self::capture_with(runtime, &[])
+    }
+
+    /// `overrides` replace the ambient value of a routing key, as a child env does.
+    pub(crate) fn capture_with(
+        runtime: &ContainerRuntime,
+        overrides: &[(String, String)],
+    ) -> anyhow::Result<Self> {
         use crate::session::ContainerRuntimeName as Name;
         let routing = RUNTIME_ROUTING_KEYS
             .iter()
             .map(|key| {
+                if let Some((_, value)) = overrides.iter().find(|(name, _)| name == key) {
+                    return Ok(((*key).to_owned(), Some(value.clone())));
+                }
                 let value = std::env::var_os(key)
                     .map(|value| {
                         value.into_string().map_err(|_| {

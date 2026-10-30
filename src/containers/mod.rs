@@ -184,8 +184,11 @@ impl DockerContainer {
         &self,
         id: &str,
         current: Option<&crate::session::SandboxPin>,
+        config: &ContainerConfig,
     ) -> Option<crate::session::SandboxPin> {
-        let fresh = RuntimeExecutionSnapshot::capture(&self.runtime);
+        // The routing the create command ran with: see `RuntimeBase::run_create`.
+        let (_, inherited) = container_interface::docker_env_args(&config.environment);
+        let fresh = RuntimeExecutionSnapshot::capture_with(&self.runtime, &inherited);
         if let Err(error) = &fresh {
             tracing::warn!(target: "containers.runtime", name = %self.name, %error,
                 "could not pin the sandbox runtime");
@@ -463,6 +466,54 @@ fn reconcile_pin(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Create ran with an inherited `DOCKER_HOST`, so the pin must name that endpoint and the
+    /// later stop must reach it, not the daemon's ambient one.
+    #[test]
+    #[serial_test::serial]
+    fn pin_uses_the_routing_create_ran_with() {
+        use crate::session::test_support::EnvGuard;
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let calls = temp.path().join("calls");
+        let docker = bin.join("docker");
+        std::fs::write(
+            &docker,
+            format!(
+                "#!/bin/sh\nprintf '%s %s\\n' \"$DOCKER_HOST\" \"$*\" >> '{}'\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let _env = EnvGuard::set(&[
+            ("PATH", path.as_str()),
+            ("DOCKER_HOST", "tcp://ambient:2375"),
+        ]);
+        let _clear = EnvGuard::unset(&["DOCKER_CONTEXT"]);
+        let config = ContainerConfig {
+            environment: vec![crate::containers::container_interface::EnvEntry::Inherit {
+                key: "DOCKER_HOST".into(),
+                value: "tcp://created:2375".into(),
+            }],
+            ..Default::default()
+        };
+        let container = DockerContainer::new("pin-routing", "img", ContainerRuntime::docker());
+        let pin = container.pin("c1", None, &config).unwrap();
+        assert_eq!(pin.runtime.endpoint, "tcp://created:2375");
+        pin.runtime.stop_container(&pin.container_id).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&calls).unwrap().trim(),
+            "tcp://created:2375 stop c1"
+        );
+    }
 
     #[test]
     fn reconcile_pin_refreshes_only_the_same_endpoint() {
