@@ -18,7 +18,7 @@ function order() {
   const out: string[] = [];
   for (const el of screen
     .getByTestId("sidebar-context-menu")
-    .querySelectorAll<HTMLElement>('[data-testid^="sidebar-context-menu-"], div.border-t.my-1')) {
+    .querySelectorAll<HTMLElement>('[data-testid^="sidebar-context-menu-"], [role="separator"]')) {
     const id = el.dataset.testid?.replace("sidebar-context-menu-", "");
     if (id === undefined) out.push("|");
     else if (id.endsWith("-target") || id === "summary" || id === "close") continue;
@@ -98,10 +98,18 @@ describe("Session menu tiers", () => {
     ];
     for (const [state, sessions, options, header, expected] of cases) {
       open(sessions, options);
+      // `openRowMenu` expands More, so its items are part of the order.
+      const more = screen.queryByTestId("sidebar-context-menu-more");
+      if (more) expect(more.getAttribute("aria-expanded"), state).toBe("true");
       expect(screen.getByTestId("sidebar-context-menu-summary").textContent, state).toBe(header);
       expect(order(), state).toBe(expected);
       cleanup();
     }
+  });
+
+  it("leaves out the Session line for a row with no Session", () => {
+    open([]);
+    expect(screen.queryByTestId("sidebar-context-menu-summary")).toBeNull();
   });
 
   it("names the regrouped items, with second lines as their descriptions", () => {

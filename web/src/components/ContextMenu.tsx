@@ -227,7 +227,7 @@ export function MenuItem({
 }
 
 export function MenuSeparator() {
-  return <div className="border-t border-surface-700/20 my-1" />;
+  return <div role="separator" className="border-t border-surface-700/20 my-1" />;
 }
 
 export function MenuHeading({ children }: { children: ReactNode }) {

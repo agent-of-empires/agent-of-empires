@@ -149,13 +149,16 @@ function QuickAction({
 
 /** Tiers of menu items, with a separator only between two that show something. */
 function Tiers({ tiers }: { tiers: React.ReactNode[][] }) {
-  const shown = tiers.map((tier) => tier.filter(Boolean)).filter((tier) => tier.length > 0);
+  // Keyed by position in `tiers`, so a tier emptying while the menu is open doesn't remount the rest.
+  const shown = tiers
+    .map((tier, key) => ({ key, items: tier.filter(Boolean) }))
+    .filter(({ items }) => items.length > 0);
   return (
     <>
-      {shown.map((tier, i) => (
-        <Fragment key={i}>
-          {i > 0 && <MenuSeparator />}
-          {tier}
+      {shown.map(({ key, items }, n) => (
+        <Fragment key={key}>
+          {n > 0 && <MenuSeparator />}
+          {items}
         </Fragment>
       ))}
     </>

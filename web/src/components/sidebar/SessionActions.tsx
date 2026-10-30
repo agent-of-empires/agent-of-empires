@@ -141,16 +141,14 @@ export function SessionActionsMenu({
           {menu.scope.kind === "bulk" && bulkApi ? (
             <BulkTriageMenuItems buckets={menu.scope.buckets} api={bulkApi} onDone={closeMenu} />
           ) : (
-            <>
-              <SingleRowMenuItems
-                model={model}
-                readOnly={readOnly}
-                colorsEnabled={colorsEnabled}
-                unreadEnabled={unreadEnabled}
-                actions={actions}
-                extraItems={extraItems}
-              />
-            </>
+            <SingleRowMenuItems
+              model={model}
+              readOnly={readOnly}
+              colorsEnabled={colorsEnabled}
+              unreadEnabled={unreadEnabled}
+              actions={actions}
+              extraItems={extraItems}
+            />
           )}
         </ContextMenu>
       )}
