@@ -7,7 +7,7 @@ use std::sync::mpsc::TryRecvError;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
@@ -29,6 +29,24 @@ struct Provider {
     name: String,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default = "enabled_by_default")]
+    enabled: bool,
+    /// Unix seconds of the last report.
+    #[serde(default)]
+    updated_at: Option<i64>,
+    #[serde(default)]
+    refreshing: bool,
+}
+
+fn enabled_by_default() -> bool {
+    true
+}
+
+/// The registered Project an item resolves to.
+#[derive(Debug, Clone, Deserialize)]
+struct ResolvedProject {
+    name: String,
+    path: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -47,6 +65,8 @@ struct Item {
     draft: Draft,
     #[serde(default)]
     started_session: Option<Started>,
+    #[serde(default)]
+    resolved_project: Option<ResolvedProject>,
 }
 
 /// The live Session an item was started as.
@@ -208,6 +228,35 @@ fn plain(s: &str) -> String {
         .collect()
 }
 
+/// One status line per provider: when it last updated, or why it did not.
+fn provider_status(provider: &Provider, any_items: bool, theme: &Theme) -> (String, Color) {
+    let name = &provider.name;
+    if provider.refreshing {
+        (format!("⠙ {name}: refreshing…"), theme.dimmed)
+    } else if let Some(error) = &provider.error {
+        (format!("{name}: couldn't refresh, {error}"), theme.error)
+    } else if provider.updated_at.is_none() {
+        (format!("{name}: waiting for first results"), theme.dimmed)
+    } else if !any_items {
+        (format!("{name}: nothing new"), theme.dimmed)
+    } else {
+        let ago = provider.updated_at.map_or_else(String::new, |at| {
+            format!(" {}", ago_label(chrono::Utc::now().timestamp() - at))
+        });
+        (format!("{name}: updated{ago}"), theme.text)
+    }
+}
+
+/// "just now", "5 min ago", "3h ago", "2d ago".
+fn ago_label(secs: i64) -> String {
+    match secs.max(0) / 60 {
+        0 => "just now".to_string(),
+        m if m < 60 => format!("{m} min ago"),
+        m if m < 60 * 24 => format!("{}h ago", m / 60),
+        m => format!("{}d ago", m / 60 / 24),
+    }
+}
+
 const NO_PROJECT: &str = "No registered project matches this suggestion";
 
 /// Resolves a prepared suggestion into a dialog `Start`; `None` when the
@@ -270,8 +319,14 @@ pub(super) struct SuggestionsView {
     detail_scroll: u16,
     show_dismissed: bool,
     busy: bool,
+    /// The item a dismiss request is in flight for.
+    dismissing: Option<ItemKey>,
+    /// Items dismissed in the last [`UNDO_WINDOW`], kept in the list so `x` undoes them.
+    recent: Vec<(ItemKey, std::time::Instant)>,
     worker: Worker<Req, Res>,
 }
+
+const UNDO_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl SuggestionsView {
     pub(super) fn new() -> Self {
@@ -293,6 +348,8 @@ impl SuggestionsView {
             detail_scroll: 0,
             show_dismissed: false,
             busy: false,
+            dismissing: None,
+            recent: Vec::new(),
             worker,
         }
     }
@@ -319,6 +376,24 @@ impl SuggestionsView {
             .map(|i| (i.provider_id.clone(), i.id.clone()))
     }
 
+    /// The Project path an item sits under; empty when unresolved.
+    fn group_key(&self, index: usize) -> &str {
+        self.item_at(index)
+            .and_then(|i| i.resolved_project.as_ref())
+            .map_or("", |p| p.path.as_str())
+    }
+
+    /// Headings show only once some item resolved to a Project.
+    fn has_project_groups(&self) -> bool {
+        (0..self.order.len()).any(|i| !self.group_key(i).is_empty())
+    }
+
+    fn is_recent(&self, item: &Item) -> bool {
+        self.recent
+            .iter()
+            .any(|(key, _)| key.0 == item.provider_id && key.1 == item.id)
+    }
+
     fn provider_name<'a>(&'a self, id: &'a str) -> &'a str {
         self.snapshot
             .iter()
@@ -335,9 +410,27 @@ impl SuggestionsView {
             .iter()
             .flat_map(|s| &s.items)
             .enumerate()
-            .filter(|(_, i)| self.show_dismissed || !i.dismissed)
+            .filter(|(_, i)| self.show_dismissed || !i.dismissed || self.is_recent(i))
             .map(|(index, _)| index)
             .collect();
+        // Group by resolved Project in first-seen order, unresolved last; the
+        // sort is stable, so snapshot order holds within a group.
+        let items: Vec<&Item> = self.snapshot.iter().flat_map(|s| &s.items).collect();
+        let mut seen: Vec<&str> = Vec::new();
+        for &index in &self.order {
+            if let Some(project) = &items[index].resolved_project {
+                if !seen.contains(&project.path.as_str()) {
+                    seen.push(&project.path);
+                }
+            }
+        }
+        self.order.sort_by_key(|&index| {
+            items[index]
+                .resolved_project
+                .as_ref()
+                .and_then(|p| seen.iter().position(|s| *s == p.path))
+                .unwrap_or(usize::MAX)
+        });
         let kept = key.and_then(|(provider_id, id)| {
             (0..self.order.len()).find(|&index| {
                 self.item_at(index)
@@ -380,12 +473,17 @@ impl SuggestionsView {
             KeyCode::Char('l') => self.send(Req::Load),
             KeyCode::Char('r') if mutations_allowed => self.send(Req::Refresh),
             KeyCode::Char('x') if mutations_allowed => {
-                if let Some(item) = self.item_at(self.selected) {
+                if let Some((key, dismissed)) = self
+                    .item_at(self.selected)
+                    .map(|i| ((i.provider_id.clone(), i.id.clone()), i.dismissed))
+                {
                     let req = Req::Dismiss {
-                        provider_id: item.provider_id.clone(),
-                        id: item.id.clone(),
-                        dismissed: !item.dismissed,
+                        provider_id: key.0.clone(),
+                        id: key.1.clone(),
+                        dismissed: !dismissed,
                     };
+                    self.recent.retain(|(k, _)| *k != key);
+                    self.dismissing = (!dismissed).then_some(key);
                     self.send(req);
                 }
             }
@@ -425,6 +523,13 @@ impl SuggestionsView {
 
     /// Applies a finished request, if any. True when state changed.
     pub(super) fn poll(&mut self) -> bool {
+        let before = self.recent.len();
+        self.recent.retain(|(_, at)| at.elapsed() < UNDO_WINDOW);
+        let expired = self.recent.len() != before;
+        if expired {
+            let key = self.selected_key();
+            self.reorder(key);
+        }
         let res = match self.worker.try_recv() {
             Ok(res) => res,
             Err(TryRecvError::Disconnected) if self.busy => {
@@ -432,9 +537,14 @@ impl SuggestionsView {
                 self.error = Some("The suggestions worker stopped".into());
                 return true;
             }
-            Err(_) => return false,
+            Err(_) => return expired,
         };
         self.busy = false;
+        if let Some(key) = self.dismissing.take() {
+            if matches!(res, Res::Snapshot(Ok(_))) {
+                self.recent.push((key, std::time::Instant::now()));
+            }
+        }
         match res {
             Res::Snapshot(Ok(snapshot)) => self.replace(snapshot),
             Res::Refreshed(Ok(())) => {
@@ -491,13 +601,22 @@ impl SuggestionsView {
                 Style::default().fg(theme.hint),
             )));
         }
-        for provider in self.snapshot.iter().flat_map(|s| &s.providers) {
-            if let Some(error) = &provider.error {
-                footer.push(Line::from(Span::styled(
-                    plain(&format!("{}: {error}", provider.name)),
-                    Style::default().fg(theme.waiting),
-                )));
-            }
+        for provider in self
+            .snapshot
+            .iter()
+            .flat_map(|s| &s.providers)
+            .filter(|p| p.enabled)
+        {
+            let any_items = self
+                .snapshot
+                .iter()
+                .flat_map(|s| &s.items)
+                .any(|i| i.provider_id == provider.id);
+            let (status, color) = provider_status(provider, any_items, theme);
+            footer.push(Line::from(Span::styled(
+                plain(&status),
+                Style::default().fg(color),
+            )));
         }
         footer.push(Line::from(Span::styled(
             "j/k select · Enter review/start/open · N start another · x dismiss/restore · d dismissed · r refresh · l reload · PgUp/PgDn prompt · Esc back",
@@ -524,17 +643,56 @@ impl SuggestionsView {
             return;
         };
 
-        let per_page = (list_area.height as usize / 2).max(1);
-        let start = (self.selected + 1).saturating_sub(per_page);
+        let height = list_area.height as usize;
+        let headed = self.has_project_groups();
+        // A heading opens the window and every group in it.
+        let heading_at = |first: usize, index: usize| {
+            headed && (index == first || self.group_key(index) != self.group_key(index - 1))
+        };
+        let window = |first: usize| -> usize {
+            (first..=self.selected)
+                .map(|i| 2 + usize::from(heading_at(first, i)))
+                .sum()
+        };
+        let mut start = self.selected.min(self.order.len().saturating_sub(1));
+        while start > 0 && window(start - 1) <= height {
+            start -= 1;
+        }
         let mut lines: Vec<Line> = Vec::new();
-        for index in start..self.order.len().min(start + per_page) {
+        for index in start..self.order.len() {
+            if lines.len() >= height {
+                break;
+            }
             let Some(item) = self.item_at(index) else {
                 continue;
             };
+            if heading_at(start, index) {
+                let key = self.group_key(index);
+                let name = item
+                    .resolved_project
+                    .as_ref()
+                    .map_or("No project", |p| p.name.as_str());
+                let count = (0..self.order.len())
+                    .filter(|&i| self.group_key(i) == key)
+                    .count();
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        plain(name),
+                        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!(" {count}"), Style::default().fg(theme.dimmed)),
+                ]));
+            }
             let current = index == self.selected;
             let marker = if current { "› " } else { "  " };
-            let state = if item.dismissed { " [dismissed]" } else { "" };
-            let title_style = if current {
+            let state = match (item.dismissed, self.is_recent(item)) {
+                (false, _) => "",
+                (true, true) => " [dismissed, x to undo]",
+                (true, false) => " [dismissed]",
+            };
+            let title_style = if item.dismissed {
+                Style::default().fg(theme.dimmed)
+            } else if current {
                 Style::default()
                     .fg(theme.title)
                     .add_modifier(Modifier::BOLD)
@@ -930,7 +1088,16 @@ mod tests {
                 prompt: "do the thing".into(),
             },
             started_session: None,
+            resolved_project: None,
         }
+    }
+
+    fn in_project(mut item: Item, name: &str) -> Item {
+        item.resolved_project = Some(ResolvedProject {
+            name: name.into(),
+            path: format!("/work/{name}"),
+        });
+        item
     }
 
     fn view_with(items: Vec<Item>, worker: Worker<Req, Res>) -> SuggestionsView {
@@ -940,6 +1107,9 @@ mod tests {
                 id: "p".into(),
                 name: "GitHub".into(),
                 error: None,
+                enabled: true,
+                updated_at: Some(chrono::Utc::now().timestamp() - 120),
+                refreshing: false,
             }],
             items,
         });
@@ -1099,6 +1269,86 @@ mod tests {
             (origin.provider_id.as_str(), origin.id.as_str()),
             ("p", "a")
         );
+    }
+
+    #[test]
+    fn items_group_by_resolved_project_with_unresolved_last() {
+        let mut view = view_with(
+            vec![
+                item("loose", None, false),
+                in_project(item("b1", None, false), "web"),
+                in_project(item("a1", None, false), "api"),
+                in_project(item("b2", None, false), "web"),
+            ],
+            idle_worker(),
+        );
+        assert_eq!(ids(&view), ["b1", "b2", "a1", "loose"]);
+        assert!(render_text(&view).contains("web 2"));
+        for _ in 0..3 {
+            press(&mut view, KeyCode::Char('j'), true);
+        }
+        let text = render_text(&view);
+        let at = |needle: &str| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("{needle} in {text}"))
+        };
+        assert!(
+            at("api 1") < at("No project 1"),
+            "the window scrolled to the last group"
+        );
+
+        let flat = view_with(vec![item("x", None, false)], idle_worker());
+        assert!(
+            !render_text(&flat).contains("No project"),
+            "no headings without a resolved project"
+        );
+    }
+
+    #[test]
+    fn a_dismissed_item_stays_dimmed_for_ten_seconds_and_x_undoes_it() {
+        let mut view = view_with(vec![item("a", None, false)], idle_worker());
+        let key = ("p".to_string(), "a".to_string());
+        let mut gone = item("a", None, true);
+        gone.title = "a".into();
+        view.dismissing = Some(key.clone());
+        view.busy = true;
+        view.worker = Worker::seeded_for_test(
+            "t",
+            Res::Snapshot(Ok(Snapshot {
+                providers: vec![],
+                items: vec![gone],
+            })),
+        );
+        assert!(poll_until_settled(&mut view));
+        assert_eq!(ids(&view), ["a"], "kept while the undo window is open");
+        assert!(render_text(&view).contains("[dismissed, x to undo]"));
+
+        let stale =
+            std::time::Instant::now().checked_sub(UNDO_WINDOW + std::time::Duration::from_secs(1));
+        view.recent[0].1 = stale.expect("monotonic clock far enough from boot");
+        assert!(view.poll());
+        assert!(
+            ids(&view).is_empty(),
+            "then only the dismissed list shows it"
+        );
+        press(&mut view, KeyCode::Char('d'), true);
+        assert_eq!(ids(&view), ["a"]);
+    }
+
+    #[test]
+    fn each_provider_gets_a_status_line() {
+        let mut view = view_with(vec![item("a", None, false)], idle_worker());
+        assert!(render_text(&view).contains("GitHub: updated 2 min ago"));
+        let provider = &mut view.snapshot.as_mut().unwrap().providers[0];
+        provider.refreshing = true;
+        assert!(render_text(&view).contains("⠙ GitHub: refreshing…"));
+        let provider = &mut view.snapshot.as_mut().unwrap().providers[0];
+        provider.refreshing = false;
+        provider.error = Some("API key rejected".into());
+        assert!(render_text(&view).contains("GitHub: couldn't refresh, API key rejected"));
+        view.snapshot.as_mut().unwrap().providers[0].error = None;
+        view.snapshot.as_mut().unwrap().items.clear();
+        assert!(render_text(&view).contains("GitHub: nothing new"));
     }
 
     #[test]

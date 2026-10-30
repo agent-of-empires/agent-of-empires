@@ -117,7 +117,9 @@ test("a provider error stays visible next to the last items", async ({ page }) =
   );
   await page.goto("/suggestions");
 
-  await expect(page.getByRole("region", { name: "Provider GitHub" })).toContainText("Rate limit exceeded");
+  await expect(page.getByRole("list", { name: "Provider status" })).toContainText(
+    "GitHub: couldn't refresh, Rate limit exceeded",
+  );
   await expect(page.getByText(item.title, { exact: true })).toBeVisible();
 });
 
