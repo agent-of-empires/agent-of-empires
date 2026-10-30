@@ -726,11 +726,9 @@ fn project_grouping_survives_attention_sort() {
         for item in &env.view.flat_items {
             match item {
                 Item::Group { name, .. } => current_group = Some(name.clone()),
-                Item::Session { id, .. } => {
-                    if current_group.as_deref() == Some("alpha") {
-                        if let Some(inst) = env.view.instances.get(id) {
-                            alpha_session_order.push(inst.title.clone());
-                        }
+                Item::Session { id, .. } if current_group.as_deref() == Some("alpha") => {
+                    if let Some(inst) = env.view.instances.get(id) {
+                        alpha_session_order.push(inst.title.clone());
                     }
                 }
                 _ => {}

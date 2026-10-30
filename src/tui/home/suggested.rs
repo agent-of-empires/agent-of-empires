@@ -170,4 +170,21 @@ impl HomeView {
         );
         true
     }
+
+    /// Muted `source ref ` prefix and the title of a suggestion row.
+    pub(super) fn suggestion_row_text(
+        &self,
+        provider_id: &str,
+        id: &str,
+    ) -> Option<(String, String)> {
+        let entry = self
+            .suggestions_feed
+            .entry(&(provider_id.to_owned(), id.to_owned()))?;
+        let prefix = if entry.source_ref.is_empty() {
+            format!("{:<6} ", entry.label)
+        } else {
+            format!("{:<6} {} ", entry.label, entry.source_ref)
+        };
+        Some((prefix, entry.title))
+    }
 }

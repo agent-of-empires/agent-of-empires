@@ -2467,11 +2467,9 @@ fn work_group_titles(view: &HomeView) -> Vec<&str> {
     for item in &view.flat_items {
         match item {
             Item::Group { name, .. } => in_work_group = name == "work",
-            Item::Session { id, .. } => {
-                if in_work_group {
-                    if let Some(inst) = view.get_instance(id) {
-                        titles.push(inst.title.as_str());
-                    }
+            Item::Session { id, .. } if in_work_group => {
+                if let Some(inst) = view.get_instance(id) {
+                    titles.push(inst.title.as_str());
                 }
             }
             _ => {}
