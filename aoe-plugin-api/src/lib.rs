@@ -16,8 +16,8 @@ pub use manifest::{
     SettingType, StatusContribution, ThemeContribution, UiContribution, UiSlot, MAX_SCREENSHOTS,
 };
 pub use suggestions::{
-    SetSuggestions, Suggestion, SuggestionDraft, SuggestionSource, SuggestionsError,
-    SuggestionsSpec,
+    CheckStatus, SetChecks, SetSuggestions, SetupCheck, Suggestion, SuggestionDraft,
+    SuggestionSource, SuggestionsError, SuggestionsSpec,
 };
 
 pub const API_VERSION: u32 = 20;

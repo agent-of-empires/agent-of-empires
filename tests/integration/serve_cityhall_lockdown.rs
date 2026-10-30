@@ -152,6 +152,7 @@ async fn sensitive_routes_are_blocked() {
             r#"{"enabled":true}"#,
         ),
         (Method::POST, "/api/suggestions/refresh", "{}"),
+        (Method::POST, "/api/suggestions/checks/run", "{}"),
         (
             Method::POST,
             "/api/suggestions/dismiss",
