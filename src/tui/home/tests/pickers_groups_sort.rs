@@ -2417,6 +2417,21 @@ fn test_command_palette_diff_invokes_diff_in_strict_mode() {
 
 #[test]
 #[serial]
+fn test_command_palette_opens_suggested_sessions() {
+    let mut env = create_test_env_with_sessions(1);
+    env.view.handle_key(
+        KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        None,
+    );
+    for ch in "suggested".chars() {
+        env.view.handle_key(key(KeyCode::Char(ch)), None);
+    }
+    env.view.handle_key(key(KeyCode::Enter), None);
+    assert!(env.view.suggestions_view.is_some());
+}
+
+#[test]
+#[serial]
 fn test_f5_and_e_both_open_restart_dialog() {
     // Pin the equivalence: F5 and `e`/`E` all open the restart dialog, which is what makes
     // the help overlay's "Restart session (also F5)" row honest.
