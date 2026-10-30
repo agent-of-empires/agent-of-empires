@@ -21,13 +21,6 @@ use crate::session::projects::{self, Project};
 use std::path::Path;
 
 const MAX_ITEMS: usize = 500;
-
-/// Driven from the capped items table so the read tracks live items, not
-/// historical dismissals, which are never pruned.
-const LIVE_DISMISSALS_SQL: &str = "SELECT i.provider_id, i.item_id FROM suggestion_items i
-     WHERE i.profile = ?1 AND EXISTS (
-         SELECT 1 FROM suggestion_dismissals d
-         WHERE d.profile = i.profile AND d.provider_id = i.provider_id AND d.item_id = i.item_id)";
 const MAX_TITLE_BYTES: usize = 512;
 const MAX_REASON_BYTES: usize = 2048;
 const MAX_URL_BYTES: usize = 2048;
@@ -514,6 +507,13 @@ pub(crate) fn set_dismissed(
     }
     Ok(true)
 }
+
+/// Driven from the items table, capped per provider, so the read tracks live
+/// items, not historical dismissals, which are never pruned.
+const LIVE_DISMISSALS_SQL: &str = "SELECT i.provider_id, i.item_id FROM suggestion_items i
+     WHERE i.profile = ?1 AND EXISTS (
+         SELECT 1 FROM suggestion_dismissals d
+         WHERE d.profile = i.profile AND d.provider_id = i.provider_id AND d.item_id = i.item_id)";
 
 pub(crate) fn snapshot(
     conn: &Connection,
