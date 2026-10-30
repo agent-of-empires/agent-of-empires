@@ -1000,11 +1000,7 @@ pub static BINDINGS: &[Binding] = &[
             section: HelpSection::Other,
             desc: "Suggested sessions",
         }),
-        palette: Some(PaletteMeta {
-            title: "Suggested sessions",
-            keywords: &["suggestions", "inbox", "start"],
-            group: PaletteGroup::Actions,
-        }),
+        palette: None,
     },
     // Pin toggle shares `p` (Shift+P in strict) with Projects but fires only on a project
     // header, so it must precede the Projects binding. The help desc names that gate

@@ -373,7 +373,7 @@ A provider's `status` is `pending` before its first publish, `ok`, or `error`. E
 
 Errors: 404 `unknown_provider` (no active plugin provides suggestions under that id), 409 `stale_suggestion` (the item is no longer published, or its source is disabled), 400 `validation_failed` (`criterion` not declared by the provider), 403 `read_only`.
 
-The TUI lists suggestions from Home with `S` (`Ctrl+S` in strict mode). Enter opens the new-session dialog prefilled from `prepare`, and an item whose `project` is `null` cannot be started. The key is provisional pending #4597.
+The TUI lists suggestions from Home with `S` (`Ctrl+S` in strict mode). The view shows each item's `preview` and prompt as plain text; Enter opens the new-session dialog prefilled from `prepare`, and an item whose `project` is `null` cannot be started. `r` only asks providers to refresh; `l` reloads the list. The key is provisional pending #4597.
 
 ## UI slots
 

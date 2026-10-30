@@ -1,7 +1,7 @@
 //! Typed runtime completion polling; durable lifecycle work belongs to the daemon.
 
 use super::*;
-use crate::tui::suggestions::Poll;
+use crate::tui::suggestions::{Poll, Start};
 
 impl HomeView {
     pub(super) const CANONICAL_RELOAD_RETRY_INTERVAL: std::time::Duration =
@@ -48,8 +48,9 @@ impl HomeView {
         }
     }
 
-    /// Drains the suggestions worker. A prepared suggestion replaces the view
-    /// with the regular new-session dialog, prefilled. True when state changed.
+    /// Drains the suggestions worker. A started suggestion replaces the view
+    /// with the regular new-session dialog, prefilled; when the dialog cannot
+    /// open the view stays and shows why. True when state changed.
     pub fn apply_suggestions_results(&mut self) -> bool {
         let Some(view) = &mut self.suggestions_view else {
             return false;
@@ -57,26 +58,30 @@ impl HomeView {
         match view.poll() {
             Poll::Idle => false,
             Poll::Changed => true,
-            Poll::Prepared(prepared) => {
-                self.suggestions_view = None;
-                self.open_suggestion_dialog(prepared);
+            Poll::Start(start) => {
+                match self.suggestion_dialog(start) {
+                    Ok(dialog) => {
+                        self.suggestions_view = None;
+                        self.new_dialog = Some(dialog);
+                    }
+                    Err(message) => {
+                        if let Some(view) = &mut self.suggestions_view {
+                            view.set_error(message);
+                        }
+                    }
+                }
                 true
             }
         }
     }
 
-    fn open_suggestion_dialog(&mut self, prepared: crate::tui::suggestions::Prepared) {
+    fn suggestion_dialog(&self, start: Start) -> Result<NewSessionDialog, &'static str> {
         if self.creating_stub_id.is_some() {
-            self.flash_status("A session is already being created");
-            return;
+            return Err("A session is already being created");
         }
         if !self.available_tools.any_available() {
-            self.show_no_agents();
-            return;
+            return Err("No agent is available. Set one up before starting a suggestion");
         }
-        let Some(project) = prepared.project else {
-            return;
-        };
         let profile = self
             .profile_for_cursor(self.cursor)
             .unwrap_or_else(|| self.config_profile());
@@ -89,11 +94,11 @@ impl HomeView {
             profiles,
         );
         // Path first: setting it re-resolves the defaults the rest builds on.
-        dialog.set_path(project.path);
-        dialog.set_tool(&prepared.tool);
-        dialog.set_title(prepared.title);
-        dialog.set_initial_prompt(prepared.initial_prompt);
+        dialog.set_path(start.path);
+        dialog.set_tool(&start.tool);
+        dialog.set_title(start.title);
+        dialog.set_initial_prompt(start.initial_prompt);
         dialog.focus_title();
-        self.new_dialog = Some(dialog);
+        Ok(dialog)
     }
 }
