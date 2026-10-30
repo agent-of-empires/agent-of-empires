@@ -390,3 +390,74 @@ fn path_icon_and_hash_helpers() {
     assert!(a.starts_with("sha256:"));
     assert_ne!(a, PluginManifest::hash_bytes(b"different"));
 }
+
+#[test]
+fn suggestions_require_current_schema_and_worker() {
+    let worker = "capabilities = [\"runtime.worker\"]\n[runtime]\nkind = \"command\"\ncommand = [\"./worker\"]\n";
+    let body = format!(
+        "{worker}[suggestions]\n[[suggestions.sources]]\ncriterion = \"review_requested\"\nlabel = \"Review requests\"\nvariables = [\"pr_number\", \"repo\"]\n[[suggestions.sources]]\ncriterion = \"ci_failed\"\nlabel = \"Failing checks\"\ndefault_enabled = false\n"
+    );
+    let spec = parse(20, &body).suggestions.expect("declared");
+    assert_eq!(spec.sources.len(), 2);
+    assert_eq!(spec.sources[0].variables, vec!["pr_number", "repo"]);
+    assert!(spec.sources[0].default_enabled);
+    assert!(!spec.sources[1].default_enabled);
+    assert!(parse(20, "").suggestions.is_none());
+
+    let source = "[[suggestions.sources]]\ncriterion = \"a\"\nlabel = \"A\"\n";
+    let long = "x".repeat(257);
+    let cases = [
+        (19, body.clone(), "api_version >= 20"),
+        (
+            20,
+            format!("{worker}[suggestions]\n"),
+            "at least one source",
+        ),
+        (20, source.to_string(), "runtime worker"),
+        (
+            20,
+            format!("[runtime]\nkind = \"command\"\ncommand = [\"./w\"]\n{source}"),
+            "runtime.worker capability",
+        ),
+        (20, format!("{worker}{source}{source}"), "duplicate"),
+        (
+            20,
+            format!("{worker}[[suggestions.sources]]\ncriterion = \"{long}\"\nlabel = \"A\"\n"),
+            "at most 256 bytes",
+        ),
+        (
+            20,
+            format!("{worker}[[suggestions.sources]]\ncriterion = \"a\"\nlabel = \" \"\n"),
+            "needs a label",
+        ),
+        (
+            20,
+            format!("{worker}{source}variables = [\"Pr-Number\"]\n"),
+            "[a-z0-9_]+",
+        ),
+    ];
+    for (version, body, expected) in cases {
+        assert!(
+            invalid(version, &body).iter().any(|e| e.contains(expected)),
+            "expected {expected:?} for {body:?}"
+        );
+    }
+}
+
+#[test]
+fn suggestion_items_reject_host_owned_fields() {
+    let item = |extra: serde_json::Value| {
+        let mut v = serde_json::json!({
+            "id":"w", "title":"W", "reason":"r", "source_url":"https://example.com/1",
+            "source_ref":"x", "preview":"p", "criterion":"c",
+            "draft":{"title":"W","prompt":"Do"}
+        });
+        v.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value::<aoe_plugin_api::Suggestion>(v)
+    };
+    assert!(item(serde_json::json!({})).is_ok());
+    assert!(item(serde_json::json!({"variables":{"repo":"a/b"}})).is_ok());
+    assert!(item(serde_json::json!({"provider_id":"forged"})).is_err());
+}
