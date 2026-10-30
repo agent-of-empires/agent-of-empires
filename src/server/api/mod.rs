@@ -79,7 +79,7 @@ pub use skills::{
 };
 pub use suggestions::{
     dismiss_suggestion, get_suggestions, prepare_suggestion, refresh_suggestions,
-    undismiss_suggestion, update_suggestion_source,
+    run_suggestion_checks, undismiss_suggestion, update_suggestion_source,
 };
 
 pub use system::{
@@ -595,6 +595,7 @@ mod tests {
             &[
                 "dismiss_suggestion",
                 "refresh_suggestions",
+                "run_suggestion_checks",
                 "undismiss_suggestion",
                 "update_suggestion_source",
             ],
@@ -1767,6 +1768,7 @@ mod tests {
             (Method::POST, "/api/plugins/missing/update/dismiss"),
             (Method::PATCH, "/api/theme"),
             (Method::POST, "/api/suggestions/refresh"),
+            (Method::POST, "/api/suggestions/checks/run"),
             (Method::POST, "/api/suggestions/dismiss"),
             (Method::POST, "/api/suggestions/undismiss"),
             (Method::PATCH, "/api/suggestions/sources"),

@@ -244,7 +244,7 @@ With `api_version >= 9` a worker can discover ACP capabilities and create host-o
 | `sessions.turn.send` | `session.prompt` | Deliver a turn to a session **this plugin created**. |
 | `sessions.message.send` | `session.message` | Deliver a short text message to **any** session, like `aoe send`. See [Messaging any session](#messaging-any-session). `api_version >= 15`. |
 | `plugin.storage.get` / `set` / `cas` / `remove` | `runtime.worker` | Plugin-private durable key/value storage (see [Plugin storage](#plugin-storage)). |
-| `suggestions.set` / `error` / `sources` | `runtime.worker` | Publish suggested sessions (see [Suggested sessions](#suggested-sessions)). `api_version >= 20`. |
+| `suggestions.set` / `error` / `sources` / `checks.set` | `runtime.worker` | Publish suggested sessions (see [Suggested sessions](#suggested-sessions)). `api_version >= 20`. |
 | `projects.list` | `session.read` | Registered projects of the host profile, `{ projects: [{ name, path }] }`. |
 
 **Project selection (`api_version >= 11`).** `sessions.create` takes an optional `project_path` (the trust-checked primary repo) and `extra_project_paths` (the other repos of a multi-repo session). Omitting `project_path` creates a **scratch** session: a throwaway directory with no repository, so extras alongside it are refused. Every path is canonicalized and existence-checked host-side, fail-closed and capped per call.
@@ -338,6 +338,7 @@ At least one source is required. Criteria are unique, non-empty and at most 256 
 | `suggestions.sources` | `{}` | `{ sources: [{ criterion, enabled }] }` |
 | `suggestions.set` | `{ items }` | `{ ok, accepted, dropped }` |
 | `suggestions.error` | `{ message }` | `{ ok }` |
+| `suggestions.checks.set` | `{ checks }` | `{ ok, stored }` |
 
 Call `suggestions.sources` before discovering and skip every criterion that is not enabled. A source is enabled when the user's stored switch says so, else when its `default_enabled` (default `true`) does. The host sends the `suggestions.refresh` notification (`{}`); on it, discover again and call `suggestions.set` or `suggestions.error`.
 
@@ -354,14 +355,21 @@ After validation, items of a source that is not enabled are dropped and counted 
 
 Each `suggestions.set` replaces the provider's whole set, so an empty `items` clears it and an item left out disappears. `suggestions.error` records the failure on the provider and keeps the last published items; the next successful `suggestions.set` clears it. A user's dismissal is stored by provider and item `id`, survives republishing and never changes the source, so reuse an `id` only for the same suggestion.
 
+### Setup checks
+
+A provider that cannot publish reports why with `suggestions.checks.set`, so the user sees what to fix instead of only a `suggestions.error` message. A check is `{ id, label, status, detail?, fix? }`, where `status` is `ok`, `warn` or `fail`, and `detail` and `fix` are plain display text the host never executes. Core never handles the credentials a check inspects.
+
+Each call replaces the provider's whole list. It fails with invalid-params, and stores nothing, for more than 32 checks, an empty `id` or `label`, a repeated `id`, or a string over its bound (`id` 256 bytes, `label` 512, `detail` and `fix` 2 KiB). When the host sends the `suggestions.checks.run` notification (`{}`), run the checks again and call `suggestions.checks.set`. The host does not send it on its own.
+
 ### Suggestions API
 
 Suggestions are stored per profile. The routes below list and act on them; none starts a session. Mutations return 403 `read_only` in read-only mode and are refused in CityHall mode. Item bodies name an item by `{ "provider_id", "id" }`, since an `id` is only unique within a provider.
 
 | Route | Body | Result |
 |---|---|---|
-| `GET /api/suggestions` | none | `{ providers: [{ id, name, status, error?, sources: [{ criterion, label, description, enabled }] }], items }` |
+| `GET /api/suggestions` | none | `{ providers: [{ id, name, status, error?, sources: [{ criterion, label, description, enabled }], checks: [{ id, label, status, detail, fix }] }], items }` |
 | `POST /api/suggestions/refresh` | none | `{ ok, notified }` |
+| `POST /api/suggestions/checks/run` | none | `{ ok, notified }` |
 | `POST /api/suggestions/dismiss` | `{ provider_id, id }` | `{ ok }` |
 | `POST /api/suggestions/undismiss` | `{ provider_id, id }` | `{ ok }` |
 | `PATCH /api/suggestions/sources` | `{ provider_id, criterion, enabled }` | `{ provider_id, criterion, enabled }` |

@@ -7,7 +7,9 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use aoe_plugin_api::suggestions::MAX_KEY_BYTES;
-use aoe_plugin_api::{SetSuggestions, Suggestion, SuggestionsError, SuggestionsSpec};
+use aoe_plugin_api::{
+    SetChecks, SetSuggestions, SetupCheck, Suggestion, SuggestionsError, SuggestionsSpec,
+};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
@@ -26,6 +28,8 @@ const MAX_PREVIEW_BYTES: usize = 16 * 1024;
 const MAX_PROMPT_BYTES: usize = 64 * 1024;
 const MAX_VARIABLE_VALUE_BYTES: usize = 2048;
 const MAX_ERROR_BYTES: usize = 4096;
+const MAX_CHECKS: usize = 32;
+const MAX_CHECK_TEXT_BYTES: usize = 2048;
 
 /// An active plugin that declares `[suggestions]` and has a worker.
 pub(crate) struct Provider {
@@ -77,6 +81,12 @@ pub(super) fn init(conn: &Connection) -> rusqlite::Result<()> {
              provider_id TEXT NOT NULL,
              item_id     TEXT NOT NULL,
              PRIMARY KEY (profile, provider_id, item_id)
+         );
+         CREATE TABLE IF NOT EXISTS suggestion_checks (
+             profile     TEXT NOT NULL,
+             provider_id TEXT NOT NULL,
+             checks_json TEXT NOT NULL,
+             PRIMARY KEY (profile, provider_id)
          );",
     )
 }
@@ -180,6 +190,74 @@ pub(super) fn error(
     }
     record_status(conn, profile, provider_id, Some(&request.message)).map_err(db_error)?;
     Ok(json!({ "ok": true }))
+}
+
+/// Replaces the provider's whole check list.
+pub(super) fn set_checks(
+    conn: &Connection,
+    profile: &str,
+    provider_id: &str,
+    params: &Value,
+) -> Result<Value, DispatchError> {
+    let request: SetChecks = serde_json::from_value(params.clone()).map_err(|e| {
+        DispatchError::invalid_params(format!("invalid suggestions.checks.set params: {e}"))
+    })?;
+    validate_checks(&request.checks).map_err(DispatchError::invalid_params)?;
+    let json = serde_json::to_string(&request.checks)
+        .map_err(|e| DispatchError::internal(format!("encode checks: {e}")))?;
+    conn.execute(
+        "INSERT INTO suggestion_checks (profile, provider_id, checks_json) VALUES (?1, ?2, ?3)
+         ON CONFLICT (profile, provider_id) DO UPDATE SET checks_json = ?3",
+        params![profile, provider_id, json],
+    )
+    .map_err(db_error)?;
+    Ok(json!({ "ok": true, "stored": request.checks.len() }))
+}
+
+fn validate_checks(checks: &[SetupCheck]) -> Result<(), String> {
+    if checks.len() > MAX_CHECKS {
+        return Err(format!(
+            "suggestions.checks.set accepts at most {MAX_CHECKS} checks"
+        ));
+    }
+    let mut ids = HashSet::new();
+    for check in checks {
+        let id = &check.id;
+        if id.trim().is_empty() || check.label.trim().is_empty() {
+            return Err(format!("check {id:?}: id and label must not be empty"));
+        }
+        let bounded = [
+            ("id", id.len(), MAX_KEY_BYTES),
+            ("label", check.label.len(), MAX_TITLE_BYTES),
+            ("detail", check.detail.len(), MAX_CHECK_TEXT_BYTES),
+            ("fix", check.fix.len(), MAX_CHECK_TEXT_BYTES),
+        ];
+        if let Some((name, _, max)) = bounded.iter().find(|(_, len, max)| len > max) {
+            return Err(format!("check {id:?}: {name} is limited to {max} bytes"));
+        }
+        if !ids.insert(id.as_str()) {
+            return Err(format!("duplicate check id {id:?}"));
+        }
+    }
+    Ok(())
+}
+
+fn load_checks(
+    conn: &Connection,
+    profile: &str,
+    provider_id: &str,
+) -> anyhow::Result<Vec<SetupCheck>> {
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT checks_json FROM suggestion_checks WHERE profile = ?1 AND provider_id = ?2",
+            params![profile, provider_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(match stored {
+        Some(json) => serde_json::from_str(&json)?,
+        None => Vec::new(),
+    })
 }
 
 fn record_status(
@@ -319,6 +397,7 @@ pub(crate) fn snapshot(
                 "description": s.description,
                 "enabled": effective_enabled(&provider.spec, &overrides, &s.criterion),
             })).collect::<Vec<_>>(),
+            "checks": load_checks(conn, profile, &provider.id)?,
         });
         if let Some((Some(message),)) = status {
             entry["error"] = json!(message);
@@ -729,6 +808,79 @@ mod tests {
         let out = prepared(None);
         assert_eq!(out["initial_prompt"], "Do work");
         assert_eq!(out["source_ref"], "example/1");
+    }
+
+    fn check(id: &str, status: &str) -> Value {
+        json!({ "id": id, "label": id, "status": status, "detail": "d", "fix": "run it" })
+    }
+
+    #[test]
+    fn checks_replace_per_provider_and_profile_and_default_to_empty() {
+        let conn = store();
+        assert_eq!(snap(&conn, "p")["providers"][0]["checks"], json!([]));
+        let first = json!({ "checks": [check("cli", "ok"), check("auth", "fail")] });
+        assert_eq!(
+            set_checks(&conn, "p", "acme.github", &first).unwrap(),
+            json!({ "ok": true, "stored": 2 })
+        );
+        assert_eq!(
+            snap(&conn, "p")["providers"][0]["checks"],
+            json!([check("cli", "ok"), check("auth", "fail")])
+        );
+        assert_eq!(snap(&conn, "other")["providers"][0]["checks"], json!([]));
+        set_checks(
+            &conn,
+            "p",
+            "acme.github",
+            &json!({ "checks": [check("auth", "warn")] }),
+        )
+        .unwrap();
+        assert_eq!(
+            snap(&conn, "p")["providers"][0]["checks"],
+            json!([check("auth", "warn")])
+        );
+        set_checks(&conn, "p", "acme.github", &json!({ "checks": [] })).unwrap();
+        assert_eq!(snap(&conn, "p")["providers"][0]["checks"], json!([]));
+    }
+
+    #[test]
+    fn invalid_checks_are_rejected_and_keep_the_previous_list() {
+        let conn = store();
+        let good = json!({ "checks": [check("cli", "ok")] });
+        set_checks(&conn, "p", "acme.github", &good).unwrap();
+        let long = |n| "x".repeat(n);
+        let many: Vec<Value> = (0..=MAX_CHECKS)
+            .map(|n| check(&n.to_string(), "ok"))
+            .collect();
+        let cases = [
+            ("at most 32", json!({ "checks": many })),
+            ("must not be empty", json!({ "checks": [check(" ", "ok")] })),
+            (
+                "duplicate",
+                json!({ "checks": [check("a", "ok"), check("a", "ok")] }),
+            ),
+            (
+                "limited to 256",
+                json!({ "checks": [check(&long(257), "ok")] }),
+            ),
+            (
+                "fix is limited to 2048",
+                json!({ "checks": [{ "id": "a", "label": "A", "status": "ok", "fix": long(2049) }] }),
+            ),
+            ("invalid", json!({ "checks": [check("a", "maybe")] })),
+        ];
+        for (expected, bad) in cases {
+            let err = set_checks(&conn, "p", "acme.github", &bad).unwrap_err();
+            assert!(
+                err.message.contains(expected),
+                "{expected:?} not in {:?}",
+                err.message
+            );
+        }
+        assert_eq!(
+            snap(&conn, "p")["providers"][0]["checks"],
+            json!([check("cli", "ok")])
+        );
     }
 
     #[test]

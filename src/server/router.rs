@@ -285,6 +285,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/suggestions", get(api::get_suggestions))
         .route("/api/suggestions/refresh", post(api::refresh_suggestions))
+        .route(
+            "/api/suggestions/checks/run",
+            post(api::run_suggestion_checks),
+        )
         .route("/api/suggestions/dismiss", post(api::dismiss_suggestion))
         .route(
             "/api/suggestions/undismiss",

@@ -172,17 +172,28 @@ impl PluginHost {
     /// Ask the worker of `provider_id`, or of every suggestions provider, to
     /// publish again. Returns how many workers were notified.
     pub async fn refresh_suggestions(&self, provider_id: Option<&str>) -> usize {
+        self.notify_suggestion_workers(
+            aoe_plugin_api::suggestions::SUGGESTIONS_REFRESH,
+            provider_id,
+        )
+        .await
+    }
+
+    /// Ask every suggestions worker to report its setup checks again.
+    /// Returns how many workers were notified.
+    pub async fn run_suggestion_checks(&self) -> usize {
+        self.notify_suggestion_workers(aoe_plugin_api::suggestions::SUGGESTIONS_CHECKS_RUN, None)
+            .await
+    }
+
+    async fn notify_suggestion_workers(&self, method: &str, provider_id: Option<&str>) -> usize {
         let mut sent = 0;
         for provider in crate::plugin::suggestions::providers() {
             if provider_id.is_some_and(|id| id != provider.id) {
                 continue;
             }
             let notified = self
-                .notify_worker(
-                    &provider.id,
-                    aoe_plugin_api::suggestions::SUGGESTIONS_REFRESH,
-                    serde_json::json!({}),
-                )
+                .notify_worker(&provider.id, method, serde_json::json!({}))
                 .await;
             sent += usize::from(notified);
         }

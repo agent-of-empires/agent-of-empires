@@ -89,6 +89,17 @@ pub async fn refresh_suggestions(State(state): State<Arc<AppState>>) -> impl Int
     Json(json!({ "ok": true, "notified": notified })).into_response()
 }
 
+pub async fn run_suggestion_checks(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Some(host) = &state.plugin_host else {
+        return Json(json!({ "ok": true, "notified": 0 })).into_response();
+    };
+    let notified = host.run_suggestion_checks().await;
+    Json(json!({ "ok": true, "notified": notified })).into_response()
+}
+
 async fn set_dismissed(
     state: Arc<AppState>,
     item: ItemRef,
