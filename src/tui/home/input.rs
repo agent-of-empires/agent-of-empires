@@ -427,6 +427,27 @@ fn slice_line_columns(line: &ratatui::text::Line, from: u16, to_excl: u16, width
 const PAGE_STEP: u16 = 10;
 
 impl HomeView {
+    pub(in crate::tui) fn selected_is_trashed(&self) -> bool {
+        self.selected_session
+            .as_deref()
+            .and_then(|id| self.get_instance(id))
+            .is_some_and(|inst| inst.is_trashed())
+    }
+
+    pub(in crate::tui) fn enforce_trash_read_only(&mut self) {
+        if !self.selected_is_trashed() {
+            return;
+        }
+        self.exit_live_send_if_active();
+        self.cancel_native_attachment();
+        self.send_message_dialog = None;
+        self.pending_send_session = None;
+        self.permission_response_dialog = None;
+        self.pending_permission_response = None;
+        self.restart_dialog = None;
+        self.tool_picker_dialog = None;
+    }
+
     pub fn is_diff_open(&self) -> bool {
         self.diff_view.is_some()
     }
@@ -501,6 +522,9 @@ impl HomeView {
     }
 
     fn activate_tool(&mut self, tool_name: String, toggle_current: bool) -> Option<Action> {
+        if self.selected_is_trashed() {
+            return None;
+        }
         let observed = self.selected_session.as_ref()
             .and_then(|id| self.get_instance(id))
             .is_some_and(|row| row.auxiliary.iter().any(|observation| {
@@ -925,6 +949,17 @@ impl HomeView {
     /// of the wheel handlers so the edge auto-scroll can move the pane without dragging
     /// the `handle_scroll_*` routing along.
     fn scroll_preview_offset(&mut self, delta: i32) -> bool {
+        if self.selected_is_trashed() {
+            let max = self
+                .preview_text_view
+                .total_lines
+                .saturating_sub(self.preview_visible_rows)
+                .min(u16::MAX as usize) as i32;
+            let new = (i32::from(self.preview_scroll_offset) + delta).clamp(0, max) as u16;
+            let changed = new != self.preview_scroll_offset;
+            self.preview_scroll_offset = new;
+            return changed;
+        }
         // Use the rendered output-body height the per-frame clamp uses
         // (`clamp_scroll_to_capture`), not `dimensions.1 - 1`, which over-counts the max
         // offset by a row: on an alternate-screen agent that phantom row oscillates
@@ -1007,11 +1042,24 @@ impl HomeView {
         // The structured preview's transcript is its own line source: the view re-derives
         // the pre-wrapped rows the renderer painted (`wrapped_transcript`), so slicing
         // maps one-to-one onto the on-screen cells. Terminal previews read the tmux cache.
-        let structured_lines = self
-            .structured_preview
-            .as_ref()
-            .filter(|_| self.structured_transcript_painted)
-            .map(|v| v.selection_text(width));
+        let retained = self
+            .selected_session
+            .as_deref()
+            .and_then(|id| self.get_instance(id))
+            .filter(|inst| inst.is_trashed());
+        let structured_lines = if let Some(inst) = retained {
+            Some(
+                self.retained_preview
+                    .as_ref()
+                    .filter(|view| view.matches(inst))
+                    .map_or_else(Default::default, |view| view.selection_text(width)),
+            )
+        } else {
+            self.structured_preview
+                .as_ref()
+                .filter(|_| self.structured_transcript_painted)
+                .map(|v| v.selection_text(width))
+        };
         let lines = match structured_lines.as_ref() {
             Some(text) => text,
             None => self.active_preview_cache().parsed_text.as_ref()?,
@@ -1885,6 +1933,43 @@ impl HomeView {
         // coords, so once the user does anything else the cells underneath can change and
         // it would point at unrelated content. Covers the live-send branch below too.
         self.clear_preview_selection();
+        self.enforce_trash_read_only();
+        if self.selected_is_trashed()
+            && !self.has_non_live_send_overlay()
+            && self
+                .retained_preview
+                .as_ref()
+                .is_some_and(|view| view.focused)
+        {
+            match key.code {
+                KeyCode::Esc => {
+                    if let Some(view) = self.retained_preview.as_mut() {
+                        view.focused = false;
+                    }
+                }
+                KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(view) = self.retained_preview.as_mut() {
+                        view.focused = false;
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.scroll_preview_offset(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.scroll_preview_offset(-1);
+                }
+                KeyCode::PageUp => {
+                    self.scroll_preview_offset(i32::from(PAGE_STEP));
+                }
+                KeyCode::PageDown => {
+                    self.scroll_preview_offset(-i32::from(PAGE_STEP));
+                }
+                KeyCode::Home => self.preview_scroll_offset = u16::MAX,
+                KeyCode::End => self.preview_scroll_offset = 0,
+                _ => {}
+            }
+            return None;
+        }
 
         // Handle serve view (full-screen takeover)
         if let Some(ref mut serve) = self.serve_view {
@@ -2808,6 +2893,9 @@ impl HomeView {
             // Tab is the activation key's complement: whichever of live-send and tmux
             // attach `Enter` doesn't do. Only fires when `live_send` is None.
             KeyCode::Tab => {
+                if self.selected_is_trashed() {
+                    return None;
+                }
                 // A structured session has no tmux pane to attach or live-send into, so
                 // both Tab meanings are vacuous; say so instead of ignoring the press.
                 if let Some(id) = self.selected_session.as_deref() {
@@ -2946,6 +3034,44 @@ impl HomeView {
         // cannot diverge on what an action does.
         if id.needs_canonical_session() && self.is_creating_stub_selected() {
             self.flash_status("Still creating this session; it has no runtime yet");
+            return None;
+        }
+        if self.selected_is_trashed()
+            && !matches!(
+                id,
+                ActionId::Quit
+                    | ActionId::Help
+                    | ActionId::ResolveIndeterminate
+                    | ActionId::SearchStart
+                    | ActionId::SearchNext
+                    | ActionId::NewSession
+                    | ActionId::NewFromProject
+                    | ActionId::Serve
+                    | ActionId::Settings
+                    | ActionId::Profiles
+                    | ActionId::Projects
+                    | ActionId::Plugins
+                    | ActionId::Skills
+                    | ActionId::Update
+                    | ActionId::ToggleArchive
+                    | ActionId::Delete
+                    | ActionId::JumpPrevFinished
+                    | ActionId::JumpNextFinished
+                    | ActionId::TogglePreviewInfo
+                    | ActionId::ToggleHideStopped
+                    | ActionId::ToggleDiagnostics
+                    | ActionId::OpenSystemHealth
+                    | ActionId::SortPicker
+                    | ActionId::GroupBy
+                    | ActionId::NextWaiting
+                    | ActionId::Tips
+                    | ActionId::EmptyTrash
+                    | ActionId::OpenCommandPalette
+                    | ActionId::PreviewScrollUp
+                    | ActionId::PreviewScrollDown
+                    | ActionId::DismissUpdateBanner
+            )
+        {
             return None;
         }
         match id {
@@ -3501,6 +3627,9 @@ impl HomeView {
     }
 
     fn attach_terminal_for_selected(&mut self) -> Option<Action> {
+        if self.selected_is_trashed() {
+            return None;
+        }
         // Quick-attach to paired terminal from any view.
         if let Some(id) = &self.selected_session {
             if let Some(inst) = self.get_instance(id) {
@@ -4227,6 +4356,12 @@ impl HomeView {
     pub(super) fn activate_selected_session(&mut self) -> Option<Action> {
         self.system_health_open = false;
         let id = self.selected_session.clone()?;
+        if self.get_instance(&id).is_some_and(|inst| inst.is_trashed()) {
+            if let Some(view) = self.retained_preview.as_mut() {
+                view.focused = true;
+            }
+            return None;
+        }
         if let Some(inst) = self.get_instance(&id) {
             if matches!(inst.status, Status::Deleting | Status::Creating) {
                 return None;
@@ -4299,6 +4434,9 @@ impl HomeView {
     /// in-flight guards from `activate_selected_session`.
     pub(super) fn tab_attach_action(&mut self) -> Option<Action> {
         let id = self.selected_session.clone()?;
+        if self.get_instance(&id).is_some_and(|inst| inst.is_trashed()) {
+            return None;
+        }
         if let Some(inst) = self.get_instance(&id) {
             if matches!(inst.status, Status::Deleting | Status::Creating) {
                 return None;
@@ -4352,6 +4490,7 @@ impl HomeView {
                 }
             }
             if self.selected_session != prev_session {
+                self.retained_preview = None;
                 self.system_health_open = false;
                 self.preview_scroll_offset = 0;
                 // A finalized preview selection pins to the previous pane's cells, so
@@ -4373,6 +4512,9 @@ impl HomeView {
                 // new one.
                 self.unread_dwell = None;
             }
+        }
+        if self.selected_is_trashed() {
+            self.exit_live_send_if_active();
         }
     }
 
@@ -4534,6 +4676,9 @@ impl HomeView {
     /// rides the ordered `LiveSendWorker` to stay in sequence with typed keystrokes; in
     /// passive preview it goes out as a one-shot fork. True when forwarded.
     fn forward_wheel_to_preview(&self, up: bool, col: u16, row: u16) -> bool {
+        if self.selected_is_trashed() {
+            return false;
+        }
         let cursor = self.active_preview_cursor();
         let Some(cursor) = cursor else { return false };
         let Some(key) = wheel_forward_key(&cursor, up, self.preview_text_view, col, row) else {
@@ -4549,6 +4694,9 @@ impl HomeView {
     /// alternate-screen gate keeps scroll input out of a normal-buffer shell. `up` picks
     /// the direction; `col`/`row` is the held cell. True when something was sent.
     fn forward_scroll_to_preview(&self, up: bool, col: u16, row: u16) -> bool {
+        if self.selected_is_trashed() {
+            return false;
+        }
         let Some(cursor) = self.active_preview_cursor() else {
             return false;
         };
@@ -4584,6 +4732,9 @@ impl HomeView {
     /// event fall through to aoe's handlers; Shift is the caller's escape hatch. The
     /// cursor comes back so the caller can read `mouse_sgr` for the encoding.
     fn preview_forwards_mouse(&self) -> Option<crate::tmux::PaneCursor> {
+        if self.selected_is_trashed() {
+            return None;
+        }
         let cursor = self.active_preview_cursor()?;
         (cursor.alternate_on && cursor.mouse_tracking).then_some(cursor)
     }
@@ -4732,6 +4883,9 @@ impl HomeView {
         }
         if self.selected_session.is_none() {
             return false;
+        }
+        if self.selected_is_trashed() {
+            return self.scroll_preview_offset(i32::from(STEP));
         }
         // Full-screen app: send the wheel to it rather than scrolling the irrelevant
         // normal-buffer capture. Fires in live-send and passive preview.
@@ -5503,8 +5657,7 @@ impl HomeView {
     /// groups can't be deleted, and the Trash header offers to empty the trash. Shared by
     /// the keys and the context menu.
     pub(super) fn open_delete_for_selected(&mut self) {
-        // Deletion only allowed in Structured View.
-        if self.view_mode == ViewMode::Terminal {
+        if self.view_mode == ViewMode::Terminal && !self.selected_is_trashed() {
             let hint = if self.strict_hotkeys {
                 "Terminals cannot be deleted directly. Switch to Structured View (press Shift+T) and delete the agent session instead."
             } else {
@@ -5720,7 +5873,7 @@ impl HomeView {
                 // explicit (`z`, or a deliberate double-click / Enter).
                 let archived = self
                     .get_instance(&id)
-                    .map(|inst| inst.is_archived())
+                    .map(|inst| inst.is_archived() || inst.is_trashed())
                     .unwrap_or(false);
                 // Single-click behavior is otherwise `SessionConfig::click_action`:
                 // `LiveSend` (the default) enters live-send for the clicked row or
@@ -6067,6 +6220,9 @@ impl HomeView {
         if self.selected_session.is_none() {
             return false;
         }
+        if self.selected_is_trashed() {
+            return self.scroll_preview_offset(-i32::from(STEP));
+        }
         // Mirror handle_scroll_up: a full-screen app gets the wheel
         // forwarded rather than moving the preview's capture window.
         if self.forward_wheel_to_preview(false, col, row) {
@@ -6094,6 +6250,12 @@ impl HomeView {
         // underneath can change. Doing it here covers the drag-select -> right-click ->
         // paste-into-dialog sequence, which never goes through `handle_key`.
         self.clear_preview_selection();
+        if self.selected_is_trashed() {
+            self.exit_live_send_if_active();
+            if !self.has_non_live_send_overlay() || self.send_message_dialog.is_some() {
+                return;
+            }
+        }
         if !self.has_non_live_send_overlay() {
             if let Some(state) = self.live_send.clone() {
                 if let Some(worker) = &self.live_send_worker {
@@ -6130,6 +6292,9 @@ impl HomeView {
         }
         if let Some(ref mut settings) = self.settings_view {
             settings.handle_paste(text);
+            return;
+        }
+        if self.selected_is_trashed() {
             return;
         }
 
@@ -6212,6 +6377,9 @@ impl HomeView {
             return None;
         }
         let inst = self.get_instance(&id)?;
+        if inst.is_trashed() {
+            return None;
+        }
         if matches!(inst.status, Status::Creating | Status::Deleting) {
             return None;
         }
@@ -6245,6 +6413,9 @@ impl HomeView {
     /// same revive path as a fresh entry; the view follows only once that succeeds.
     fn swap_live_send_target(&mut self, state: &live_send::LiveSendState) -> Option<Action> {
         let inst = self.get_instance(&state.session_id)?;
+        if inst.is_trashed() {
+            return None;
+        }
         let target = match state.target {
             live_send::LiveSendTarget::Terminal | live_send::LiveSendTarget::ContainerTerminal => {
                 live_send::LiveSendTarget::Agent
@@ -6284,6 +6455,13 @@ impl HomeView {
     /// runtime that owns the pane is gone, so the keystroke has nowhere to go.
     fn handle_live_send_key(&mut self, key: KeyEvent) -> Option<Action> {
         let state = self.live_send.clone()?;
+        if self
+            .get_instance(&state.session_id)
+            .is_some_and(|inst| inst.is_trashed())
+        {
+            self.teardown_live_send();
+            return None;
+        }
         if !self.session_feed.native_interaction_available() {
             self.teardown_live_send();
             return None;
@@ -6737,6 +6915,9 @@ impl HomeView {
         let id = self.selected_session.as_ref()?;
         let inst = self.get_instance(id)?;
         if matches!(inst.status, Status::Creating | Status::Deleting) {
+            return None;
+        }
+        if inst.is_trashed() {
             return None;
         }
         let target = self.current_send_target();

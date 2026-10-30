@@ -166,6 +166,100 @@ fn single_click_on_archived_row_selects_without_reviving() {
 
 #[test]
 #[serial]
+fn trash_inspection_never_requests_interaction() {
+    use crate::session::config::{update_config, AttachMode, ClickAction, ToolSessionConfig};
+    use crate::tui::home::{live_send::LiveSendState, ViewMode};
+    for archived in [false, true] {
+        for click in [ClickAction::LiveSend, ClickAction::SelectOnly] {
+            for attach in [AttachMode::Tmux, AttachMode::LiveSend] {
+                let mut env = create_test_env_with_sessions(3);
+                let mut commands = env.view.session_feed.request_driver_for_test();
+                update_config(|config| {
+                    config.session.click_action = click;
+                    config.session.default_attach_mode = attach;
+                    config.session.live_send_on_view_switch = true;
+                })
+                .unwrap();
+                let id = env.view.instance_at(0).id.clone();
+                env.view.mutate_instance(&id, |inst| {
+                    inst.trashed_at = Some(chrono::Utc::now());
+                    inst.archived_at = archived.then(chrono::Utc::now);
+                });
+                env.view.trashed_section_collapsed = false;
+                env.view.rebuild_flat_items();
+                let idx = env.view.flat_items.iter().position(
+                    |item| matches!(item, Item::Session { id: candidate, .. } if candidate == &id)
+                ).unwrap();
+                render_geometry(&mut env.view);
+                let row = shelf_row_for_idx(&env.view, idx);
+                env.view.live_send = Some(LiveSendState {
+                    session_id: "previous".into(),
+                    title: "previous".into(),
+                    tmux_name: "unused".into(),
+                    target: crate::tui::home::live_send::LiveSendTarget::Agent,
+                    exit_chords: Vec::new(),
+                    leader: None,
+                });
+                let now = std::time::Instant::now();
+                assert_eq!(env.view.handle_click_at(now, 5, row), None);
+                assert_eq!(env.view.selected_session.as_deref(), Some(id.as_str()));
+                assert!(env.view.live_send.is_none());
+                assert_eq!(
+                    env.view
+                        .handle_click_at(now + std::time::Duration::from_millis(100), 5, row),
+                    None
+                );
+                for mode in [
+                    ViewMode::Structured,
+                    ViewMode::Terminal,
+                    ViewMode::Tool("probe".into()),
+                ] {
+                    env.view.view_mode = mode;
+                    assert_eq!(env.view.activate_selected_session(), None);
+                    assert_eq!(env.view.tab_attach_action(), None);
+                    assert_eq!(env.view.start_live_send(), None);
+                    assert_eq!(env.view.maybe_auto_start_live_send(), None);
+                    assert_eq!(env.view.handle_key(key(KeyCode::Enter), None), None);
+                    assert_eq!(env.view.handle_key(key(KeyCode::Tab), None), None);
+                    env.view.handle_paste("must not become a prompt");
+                    assert!(env.view.send_message_dialog.is_none());
+                    assert!(env.view.pending_paste.is_none());
+                }
+                env.view.view_mode = ViewMode::Structured;
+                for background in [false, true] {
+                    env.view.tool_configs.insert(
+                        "probe".into(),
+                        ToolSessionConfig {
+                            command: "never execute".into(),
+                            background,
+                            ..Default::default()
+                        },
+                    );
+                    env.view.tool_hotkey_cache =
+                        vec![("probe".into(), KeyCode::Char('g'), KeyModifiers::ALT)];
+                    assert_eq!(
+                        env.view
+                            .handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::ALT), None),
+                        None
+                    );
+                    assert_eq!(env.view.view_mode, ViewMode::Structured);
+                }
+                for code in [KeyCode::Char('m'), KeyCode::Char('r'), KeyCode::Char('t')] {
+                    assert_eq!(env.view.handle_key(key(code), None), None);
+                }
+                assert!(env.view.send_message_dialog.is_none());
+                assert!(env.view.restart_dialog.is_none());
+                assert!(env.view.tool_picker_dialog.is_none());
+                assert!(env.view.pending_native_attachment.is_none());
+                assert!(commands(Err("unexpected interaction".into())).is_none());
+                assert!(env.view.get_instance(&id).unwrap().is_trashed());
+            }
+        }
+    }
+}
+
+#[test]
+#[serial]
 fn select_only_click_honors_per_profile_override() {
     // Global stays LiveSend while the test profile pins SelectOnly through
     // SessionConfigOverride, so the resolver must pick the override: a single click returns

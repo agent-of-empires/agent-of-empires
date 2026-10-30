@@ -170,8 +170,8 @@ impl HttpClient {
         decode_replay(res).await
     }
 
-    /// Fold replay pages through the first page's snapshot window. Lost pages
-    /// are consumed before stopping, so callers can reset using the same data.
+    /// Fold replay pages through the first page's snapshot window. Row replay
+    /// keeps reading retained content after a gap; raw replay stops for reset.
     async fn replay_pages(
         &self,
         session_id: &str,
@@ -182,6 +182,7 @@ impl HttpClient {
     ) -> Result<(u64, Option<u64>, bool), HttpError> {
         let mut cursor = since;
         let mut target = None;
+        let mut any_lost = false;
         loop {
             let page = if view_rows {
                 self.replay_rows_page(session_id, cursor, page_size).await?
@@ -190,13 +191,14 @@ impl HttpClient {
             };
             let cap = *target.get_or_insert(page.highest_seq);
             let (highest_seq, lowest_seq, lost) = (page.highest_seq, page.lowest_seq, page.lost);
+            any_lost |= lost;
             let (next_cursor, has_more) = (page.next_cursor, page.has_more);
             consume(page);
             match next_cursor {
-                Some(next) if !lost && has_more && next > cursor && next < cap => {
+                Some(next) if (!lost || view_rows) && has_more && next > cursor && next < cap => {
                     cursor = next;
                 }
-                _ => return Ok((highest_seq, lowest_seq, lost)),
+                _ => return Ok((highest_seq, lowest_seq, any_lost)),
             }
         }
     }
@@ -246,8 +248,8 @@ impl HttpClient {
         decode_replay(res).await
     }
 
-    /// Reconcile server-folded rows by ID across page seams, using the same
-    /// snapshot cap and retention-gap handling as raw replay.
+    /// Reconcile server-folded rows by ID across page seams, retaining the
+    /// snapshot cap and reporting gaps without dropping later retained pages.
     pub async fn replay_rows_paged(
         &self,
         session_id: &str,
@@ -1227,6 +1229,49 @@ mod tests {
             server.abort();
             let _ = server.await;
         }
+    }
+
+    #[tokio::test]
+    async fn row_replay_keeps_later_pages_after_retention_gap() {
+        use crate::acp::state::Event;
+        use axum::{routing::get, Router};
+        let mut inst = crate::session::Instance::new("retained", "/tmp");
+        inst.trashed_at = Some(chrono::Utc::now());
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        for seq in 10..=16 {
+            state
+                .acp_event_store
+                .record(
+                    &id,
+                    seq,
+                    &Event::AgentMessageChunk {
+                        text: format!("retained-{seq}"),
+                        message_id: None,
+                    },
+                )
+                .unwrap();
+        }
+        let app = Router::new()
+            .route(
+                "/api/sessions/{id}/acp/replay",
+                get(crate::server::api::acp_replay),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = HttpClient::new(endpoint(&base, None)).unwrap();
+        let (rows, lost) = client.replay_rows_paged(&id, 0, 2).await.unwrap();
+        assert!(lost);
+        assert_eq!(
+            rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(),
+            (10..=16)
+                .map(|seq| format!("retained-{seq}"))
+                .collect::<Vec<_>>()
+        );
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]

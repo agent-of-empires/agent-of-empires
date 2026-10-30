@@ -147,6 +147,26 @@ Non-ACP tools always run in the terminal view, with no toggle.
 
 See the [local Daemon workflow](quick-start.md#launch-the-tui) for startup, shutdown, and recovery. Structured sidebar statuses arrive through the runtime WebSocket. Reconnecting restores live state.
 
+### Inspecting Trash in the TUI
+
+Select a session in the expanded **Trash** section to read its retained ACP
+transcript. Inspection never starts an agent or prepares a terminal or tool pane,
+regardless of the session's current view or click preference.
+
+![Read-only Trash inspection with retained ACP history and a text selection](assets/structured-view/trash-readonly.png)
+
+Scroll with the mouse wheel, or press **Enter** to focus the reader and use
+**Up/Down**, **PageUp/PageDown**, and **Home/End**. Drag over text to copy it.
+**Esc** returns to the session list. Restore and permanent deletion remain
+separate management actions shown in the footer.
+
+The reader uses the daemon's persisted ACP events, including events retained
+before a switch to terminal view. Retention gaps are marked explicitly. It does
+not import native agent history files: those files may remain in the agent's
+store, but their formats and availability vary by agent and execution environment.
+Missing content and read failures are shown without restarting the agent.
+Destroyed tmux scrollback cannot be recovered by this reader.
+
 ### Launch command and session naming
 
 `--cmd <tool>` uses `session.agent_command_override`, preserving required ACP arguments, such as `opencode acp`. Adapter-backed agents use `session.agent_acp_cmd` for a full command swap. The wizard displays the resolved command read-only.

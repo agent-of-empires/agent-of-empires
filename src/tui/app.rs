@@ -731,6 +731,10 @@ impl App {
             tokio::select! {
                 event = self.event_stream.as_mut().expect("event_stream missing").next() => {
                     self.home.apply_session_feed();
+                    self.home.enforce_trash_read_only();
+                    if self.home.selected_is_trashed() {
+                        self.close_embedded_structured();
+                    }
                     if self.home.sidebar_source != crate::tui::session_feed::SidebarSource::Daemon
                         && self.home.serve_view.is_none() {
                         match event {
@@ -2483,9 +2487,44 @@ impl App {
     /// debounced and only while a daemon is already reachable. Returns true if
     /// the mount set changed.
     async fn reconcile_structured_preview(&mut self) -> bool {
+        let retained = self
+            .home
+            .selected_session
+            .as_deref()
+            .and_then(|id| self.home.get_instance(id))
+            .filter(|inst| inst.is_trashed());
+        if let Some(inst) = retained {
+            let matches = self
+                .home
+                .retained_preview
+                .as_ref()
+                .is_some_and(|view| view.matches(inst));
+            if !matches {
+                self.home.retained_preview =
+                    Some(crate::tui::structured_view::embedded::RetainedView::new(
+                        crate::acp::client::discover().ok(),
+                        inst,
+                    ));
+                self.home.clear_preview_selection();
+            }
+            self.home.enforce_trash_read_only();
+            self.clear_preview_mount_pending();
+            self.close_embedded_structured();
+            return self
+                .home
+                .retained_preview
+                .as_mut()
+                .is_some_and(|v| v.tick())
+                || !matches;
+        }
+        let removed_retained = self.home.retained_preview.take().is_some();
         if self.home.sidebar_source != crate::tui::session_feed::SidebarSource::Daemon {
             self.clear_preview_mount_pending();
             return self.home.structured_preview.take().is_some();
+        }
+        if removed_retained {
+            self.home.clear_preview_selection();
+            self.home.structured_preview = None;
         }
         // An active view stays unless a peer deleted, flipped, or archived its
         // session, or the selection moved: it would capture keys invisibly.
@@ -2721,6 +2760,22 @@ impl App {
         action: Action,
         terminal: &mut Terminal<TuiBackend>,
     ) -> Result<()> {
+        let target = match &action {
+            Action::AttachSession(id)
+            | Action::AttachTerminal(id, _)
+            | Action::SendMessage(id, _)
+            | Action::EnterLiveSend(id)
+            | Action::AttachToolSession(id, _)
+            | Action::RunBackgroundToolSession(id, _)
+            | Action::OpenStructuredView(id)
+            | Action::SwitchSessionView(id)
+            | Action::SmartRenameNow(id)
+            | Action::StopSession(id) => Some(id),
+            _ => None,
+        };
+        if target.is_some_and(|id| self.home.get_instance(id).is_some_and(|i| i.is_trashed())) {
+            return Ok(());
+        }
         match action {
             Action::StartDashboard => self.start_dashboard_launch(),
             Action::StopDashboard => self.request_dashboard_stop(),

@@ -37,6 +37,165 @@ pub enum EmbeddedEvent {
     SessionInfo(super::ViewSideInfo),
 }
 
+/// Retained transcript reader. No WebSocket, composer dispatcher, or worker setup.
+pub struct RetainedView {
+    session_id: String,
+    source_profile: String,
+    generation: u64,
+    pub focused: bool,
+    state: Option<StructuredViewState>,
+    load: Option<tokio::task::JoinHandle<()>>,
+    result: tokio::sync::oneshot::Receiver<
+        Result<(Vec<crate::acp::transcript::TranscriptRow>, bool), String>,
+    >,
+    message: String,
+}
+
+impl RetainedView {
+    pub fn new(endpoint: Option<DaemonEndpoint>, inst: &crate::session::Instance) -> Self {
+        let (tx, result) = tokio::sync::oneshot::channel();
+        let mut view = Self {
+            session_id: inst.id.clone(),
+            source_profile: inst.source_profile.clone(),
+            generation: inst.lifecycle_generation,
+            focused: false,
+            state: None,
+            load: None,
+            result,
+            message: "Daemon unavailable; retained transcript could not be read.".into(),
+        };
+        let Some(endpoint) = endpoint else {
+            return view;
+        };
+        let http = match crate::acp::client::HttpClient::new(endpoint.clone()) {
+            Ok(http) => http,
+            Err(error) => {
+                view.message = format!("Transcript read failed: {error}");
+                return view;
+            }
+        };
+        let mut state = StructuredViewState::new(inst.id.clone(), endpoint, http.clone(), None);
+        state.transcript.session_title = Some(inst.title.clone());
+        view.state = Some(state);
+        view.message = "Loading retained ACP transcript…".into();
+        let id = inst.id.clone();
+        view.load = Some(tokio::spawn(async move {
+            let rows = http
+                .replay_rows_paged(&id, 0, 1000)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(rows);
+        }));
+        view
+    }
+
+    pub fn matches(&self, inst: &crate::session::Instance) -> bool {
+        inst.is_trashed()
+            && self.session_id == inst.id
+            && self.source_profile == inst.source_profile
+            && self.generation == inst.lifecycle_generation
+    }
+
+    pub fn tick(&mut self) -> bool {
+        if self.load.is_none() {
+            return false;
+        }
+        let result = match self.result.try_recv() {
+            Ok(result) => result,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return false,
+            Err(error) => Err(error.to_string()),
+        };
+        self.load = None;
+        match result {
+            Ok((rows, lost)) => {
+                self.message = if rows.is_empty() {
+                    "No readable retained ACP content. Native history is not available through this reader; destroyed tmux scrollback cannot be recovered.".into()
+                } else if lost {
+                    "Retained ACP history is incomplete (retention gap).".into()
+                } else {
+                    "Retained ACP transcript · scroll to read · drag to copy".into()
+                };
+                if let Some(state) = self.state.as_mut() {
+                    state.transcript.merge_server_rows(rows);
+                }
+            }
+            Err(error) => self.message = format!("Transcript read failed: {error}"),
+        }
+        true
+    }
+
+    pub fn selection_text(&self, width: u16) -> ratatui::text::Text<'static> {
+        self.state
+            .as_ref()
+            .filter(|state| !state.transcript.server_rows.is_empty())
+            .map_or_else(Default::default, |state| {
+                render::wrapped_transcript(state, &Theme::default(), width)
+            })
+    }
+
+    pub fn render(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        theme: &Theme,
+        offset: u16,
+    ) -> render::TranscriptGeometry {
+        use ratatui::{style::Style, widgets::Paragraph};
+        let status_rows = unicode_width::UnicodeWidthStr::width(self.message.as_str())
+            .div_ceil(usize::from(area.width.max(1)))
+            .max(1)
+            .min(u16::MAX as usize) as u16;
+        let chunks = ratatui::layout::Layout::vertical([
+            ratatui::layout::Constraint::Length(1),
+            ratatui::layout::Constraint::Length(status_rows),
+            ratatui::layout::Constraint::Min(0),
+        ])
+        .split(area);
+        frame.render_widget(
+            Paragraph::new(if self.focused {
+                "Trash · read-only · Esc: sessions"
+            } else {
+                "Trash · read-only · Enter: read"
+            })
+            .style(Style::default().fg(theme.hint)),
+            chunks[0],
+        );
+        frame.render_widget(
+            Paragraph::new(self.message.as_str())
+                .style(Style::default().fg(theme.text))
+                .wrap(ratatui::widgets::Wrap { trim: false }),
+            chunks[1],
+        );
+        let text_area = chunks[2];
+        let mut text = self
+            .state
+            .as_ref()
+            .filter(|state| !state.transcript.server_rows.is_empty())
+            .map_or_else(Default::default, |state| {
+                render::wrapped_transcript(state, theme, text_area.width)
+            });
+        let total = text.lines.len();
+        let max = total.saturating_sub(text_area.height as usize);
+        let first = max.saturating_sub(offset as usize);
+        text.lines.drain(..first);
+        text.lines.truncate(text_area.height as usize);
+        frame.render_widget(Paragraph::new(text), text_area);
+        render::TranscriptGeometry {
+            text_area,
+            first_line: first,
+            total_lines: total,
+        }
+    }
+}
+
+impl Drop for RetainedView {
+    fn drop(&mut self) {
+        if let Some(load) = self.load.take() {
+            load.abort();
+        }
+    }
+}
+
 pub struct EmbeddedView {
     state: StructuredViewState,
     toast_deadline: Option<Instant>,
@@ -252,5 +411,72 @@ impl EmbeddedView {
     pub async fn paste_text_with_file_load(&mut self, text: &str) {
         super::paste_into_composer(&mut self.state, text);
         super::ensure_files_loaded(&mut self.state, &mut self.toast_deadline).await;
+    }
+}
+
+#[cfg(test)]
+mod retained_tests {
+    use super::*;
+    use axum::{
+        extract::{Path, State},
+        http::StatusCode,
+        routing::get,
+        Router,
+    };
+    use std::{sync::Arc, time::Duration};
+
+    #[tokio::test]
+    async fn obsolete_read_is_cancelled_and_failure_does_not_become_empty_history() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let app =
+            Router::new()
+                .route(
+                    "/api/sessions/{id}/acp/replay",
+                    get(
+                        |Path(id): Path<String>,
+                         State(started): State<Arc<tokio::sync::Notify>>| async move {
+                            if id == "obsolete" {
+                                started.notify_one();
+                                std::future::pending::<()>().await;
+                            }
+                            StatusCode::SERVICE_UNAVAILABLE
+                        },
+                    ),
+                )
+                .with_state(started.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = DaemonEndpoint::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            None,
+            crate::acp::client::discovery::Source::Env,
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut inst = crate::session::Instance::new("retained", "/tmp");
+        inst.id = "obsolete".into();
+        inst.trashed_at = Some(chrono::Utc::now());
+        let obsolete = RetainedView::new(Some(endpoint.clone()), &inst);
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        let task = obsolete.load.as_ref().unwrap().abort_handle();
+        drop(obsolete);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        inst.id = "failed".into();
+        let mut failed = RetainedView::new(Some(endpoint), &inst);
+        tokio::time::timeout(Duration::from_secs(5), failed.load.as_mut().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(failed.tick());
+        assert!(failed.message.contains("503"), "{}", failed.message);
+        assert!(failed.selection_text(60).lines.is_empty());
+        server.abort();
+        let _ = server.await;
     }
 }

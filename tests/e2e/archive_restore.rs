@@ -668,3 +668,175 @@ fn test_archived_waiting_row_reads_idle_and_migrates_once() {
         "the rewound install converges on the build's version"
     );
 }
+
+#[test]
+#[parallel]
+fn trash_retained_transcript_is_read_only() {
+    use crate::harness::{app_dir_in, wait_until};
+    use agent_of_empires::{
+        acp::{event_store::EventStore, state::Event},
+        session::{Instance, Status},
+    };
+    require_tmux!();
+    let mut h = TuiTestHarness::new("trash_retained");
+    h.stop_daemon_on_drop();
+    h.append_config("[session]\nlive_send_on_view_switch = true");
+    let project = h.project_path();
+    let mut retained = Instance::new("TrashRetained", project.to_str().unwrap());
+    retained.trashed_at = Some(chrono::Utc::now());
+    retained.status = Status::Stopped;
+    let id = retained.id.clone();
+    let mut empty = Instance::new("TrashEmpty", project.to_str().unwrap());
+    empty.trashed_at = Some(chrono::Utc::now());
+    empty.archived_at = empty.trashed_at;
+    empty.status = Status::Stopped;
+    let empty_id = empty.id.clone();
+    std::fs::write(
+        h.sessions_path(),
+        serde_json::to_vec(&[retained, empty]).unwrap(),
+    )
+    .unwrap();
+    let app_dir = app_dir_in(h.home_path());
+    let store = EventStore::open(&app_dir.join("acp_events.db"), 0).unwrap();
+    for seq in 10..=1014 {
+        store
+            .record(
+                &id,
+                seq,
+                &Event::AgentMessageChunk {
+                    text: format!("retained-{seq:04}\n\n"),
+                    message_id: None,
+                },
+            )
+            .unwrap();
+    }
+    drop(store);
+    let launch_marker = h.home_path().join("agent-launched");
+    let bin = h.install_path_command("claude");
+    std::fs::write(
+        bin.join("claude"),
+        format!(
+            "#!/bin/sh\nprintf started >> {}\n",
+            shell_words::quote(launch_marker.to_str().unwrap())
+        ),
+    )
+    .unwrap();
+    let clipboard = h.home_path().join("copied");
+    for command in ["wl-copy", "xclip", "xsel", "pbcopy"] {
+        let bin = h.install_path_command(command);
+        std::fs::write(
+            bin.join(command),
+            format!(
+                "#!/bin/sh\ncat > {}\n",
+                shell_words::quote(clipboard.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+    }
+    h.start_daemon();
+    h.spawn_tui();
+    h.wait_for_runtime_ready();
+    h.wait_for("Trash (");
+    h.send_keys("End");
+    h.send_keys("Right");
+    h.wait_for("TrashRetained");
+    let screen = h.capture_screen();
+    let row = screen
+        .lines()
+        .position(|line| line.contains("TrashRetained"))
+        .unwrap() as u16
+        + 1;
+    h.send_mouse_click(0, 7, row);
+    h.wait_for("retained-1014");
+    h.assert_screen_contains("Trash · read-only");
+    let before = h.read_sessions();
+    h.send_keys("Enter");
+    h.send_keys("Home");
+    h.wait_for("retained-0010");
+    h.type_text("must_not_send");
+    h.send_paste("must_not_send");
+    h.send_keys("Tab");
+    h.assert_screen_not_contains("Message the agent");
+    h.assert_screen_not_contains("Live send failed");
+    let top = h.capture_screen();
+    let (y, line) = top
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains("retained-0010"))
+        .unwrap();
+    let byte = line.find("retained-0010").unwrap();
+    let x = unicode_width::UnicodeWidthStr::width(&line[..byte]) as u16 + 1;
+    h.send_mouse_drag((x, y as u16 + 1), (x + 12, y as u16 + 1));
+    wait_until(Duration::from_secs(5), Duration::from_millis(10), || {
+        let copied = std::fs::read_to_string(&clipboard).unwrap_or_default();
+        (copied == "retained-0010")
+            .then_some(())
+            .ok_or_else(|| format!("expected retained text in isolated clipboard, got {copied:?}"))
+    });
+    if std::env::var_os("RECORD_E2E").is_some() {
+        let directory = std::path::Path::new("target/e2e-recordings");
+        std::fs::create_dir_all(directory).unwrap();
+        std::fs::write(
+            directory.join("trash-readonly.ansi"),
+            h.capture_screen_styled(),
+        )
+        .unwrap();
+        std::fs::write(directory.join("trash-readonly.txt"), h.capture_screen()).unwrap();
+    }
+    h.send_keys("PageDown");
+    h.wait_for_absent("retained-0010", Duration::from_secs(5));
+    h.send_keys("Escape");
+    for key in ["Tab", "t", "m", "r"] {
+        h.send_keys(key);
+    }
+    h.assert_screen_contains("Trash · read-only");
+    h.assert_screen_not_contains("Reviving");
+    h.assert_screen_not_contains("LIVE");
+    let after = h.read_sessions();
+    assert_eq!(
+        before, after,
+        "inspection must not mutate retained sessions"
+    );
+    assert!(!launch_marker.exists(), "inspection launched an agent");
+    let workers = h.run_cli_ok(&["ps", "--acp", "--dead", "--json"]);
+    let workers: serde_json::Value = serde_json::from_str(&workers).unwrap();
+    assert_eq!(workers, serde_json::json!([]));
+    let sessions = h
+        .tmux()
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+        .unwrap();
+    let sessions = String::from_utf8_lossy(&sessions.stdout);
+    assert!(
+        !sessions.lines().any(|name| name.starts_with("aoe_dev_")),
+        "{sessions}"
+    );
+    let screen = h.capture_screen();
+    let row = screen
+        .lines()
+        .position(|line| line.contains("TrashEmpty"))
+        .unwrap() as u16
+        + 1;
+    h.send_mouse_click(0, 7, row);
+    h.wait_for("No readable retained ACP content");
+    h.assert_screen_contains("Trash · read-only");
+    h.assert_screen_contains("Native history");
+    h.run_cli_ok(&["session", "restore", &empty_id]);
+    h.wait_for_absent("No readable retained ACP content", Duration::from_secs(5));
+    h.wait_for("Archived (");
+    let screen = h.capture_screen();
+    let row = screen
+        .lines()
+        .position(|line| line.contains("TrashRetained"))
+        .unwrap() as u16
+        + 1;
+    h.send_mouse_click(0, 7, row);
+    h.wait_for("retained-1014");
+    h.run_cli_ok(&["rm", &id, "--purge"]);
+    h.wait_for_absent("TrashRetained", Duration::from_secs(5));
+    h.wait_for_absent("retained-1014", Duration::from_secs(5));
+    assert!(
+        !launch_marker.exists(),
+        "restore or purge restarted an agent"
+    );
+}
