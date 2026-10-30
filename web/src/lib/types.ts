@@ -24,6 +24,8 @@ export interface SessionResponse {
   /** Last transition into Idle; unlike `last_accessed_at`, viewing does not bump it. */
   idle_entered_at: string | null;
   last_error: string | null;
+  /** Why the initial prompt was not typed into this terminal session. */
+  initial_prompt_error?: string | null;
   branch: string | null;
   main_repo_path: string | null;
   /** Base branch of an AoE-created worktree; null for pre-existing or default branches. */
@@ -406,6 +408,8 @@ export interface CreateSessionRequest {
   repo_bases?: { repo: string; base_branch: string }[];
   command_override?: string;
   custom_instruction?: string;
+  /** Typed into the agent as its first turn once it is ready. */
+  initial_prompt?: string;
   profile?: string;
   view?: "structured" | "terminal";
   agent_model?: string;
