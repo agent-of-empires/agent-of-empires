@@ -7,16 +7,18 @@ use serial_test::parallel;
 
 use crate::harness::{require_node, require_tmux, wait_until, TuiTestHarness};
 
-/// The alive worker's runner pid, if `aoe ps --acp` lists one for the session.
-fn alive_worker_pid(h: &TuiTestHarness, session_id: &str) -> Option<u64> {
+/// The runner pids `aoe ps --acp` lists as alive for the session.
+fn alive_worker_pids(h: &TuiTestHarness, session_id: &str) -> Vec<u64> {
     let out = h.run_cli(&["ps", "--acp", "--json"]);
     let records: serde_json::Value =
         serde_json::from_slice(&out.stdout).unwrap_or(serde_json::json!([]));
-    records.as_array()?.iter().find_map(|r| {
-        (r["session_id"] == session_id && r["alive"] == true)
-            .then(|| r["pid"].as_u64())
-            .flatten()
-    })
+    records
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| r["session_id"] == session_id && r["alive"] == true)
+        .filter_map(|r| r["pid"].as_u64())
+        .collect()
 }
 
 #[test]
@@ -31,7 +33,10 @@ fn restart_replaces_a_live_structured_worker() {
     let (port, session_id) = h.start_structured_session("RestartStructured");
     h.prompt_until_accepted(&session_id, "hello", Duration::from_secs(30));
     let before = wait_until(Duration::from_secs(10), Duration::from_millis(200), || {
-        alive_worker_pid(&h, &session_id).ok_or_else(|| "no alive worker listed".to_string())
+        alive_worker_pids(&h, &session_id)
+            .first()
+            .copied()
+            .ok_or_else(|| "no alive worker listed".to_string())
     });
 
     tokio::runtime::Runtime::new()
@@ -56,6 +61,8 @@ fn restart_replaces_a_live_structured_worker() {
                     break;
                 }
                 let body = resp.text().await.unwrap_or_default();
+                // The CLI-added Session reaches the server's list on its next reload,
+                // which can trail the worker accepting a prompt.
                 assert!(
                     status == reqwest::StatusCode::NOT_FOUND && Instant::now() < deadline,
                     "restart POST failed: {status} {body}"
@@ -68,9 +75,9 @@ fn restart_replaces_a_live_structured_worker() {
         wait_until(
             Duration::from_secs(20),
             Duration::from_millis(200),
-            || match alive_worker_pid(&h, &session_id) {
-                Some(pid) if pid != before => Ok(pid),
-                other => Err(format!("worker not replaced yet: {other:?} (was {before})")),
+            || match alive_worker_pids(&h, &session_id).as_slice() {
+                [pid] if *pid != before => Ok(*pid),
+                pids => Err(format!("worker not replaced yet: {pids:?} (was {before})")),
             },
         );
     assert_ne!(after, before);
