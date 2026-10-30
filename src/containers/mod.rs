@@ -184,10 +184,13 @@ impl DockerContainer {
         &self,
         id: &str,
         current: Option<&crate::session::SandboxPin>,
-        config: &ContainerConfig,
+        create_config: Option<&ContainerConfig>,
     ) -> Option<crate::session::SandboxPin> {
-        // The routing the create command ran with: see `RuntimeBase::run_create`.
-        let (_, inherited) = container_interface::docker_env_args(&config.environment);
+        // A created ID came from a command run with the config's inherited overrides (see
+        // `RuntimeBase::run_create`); a reused one was inspected on the ambient transport.
+        let inherited = create_config
+            .map(|config| container_interface::docker_env_args(&config.environment).1)
+            .unwrap_or_default();
         let fresh = RuntimeExecutionSnapshot::capture_with(&self.runtime, &inherited);
         if let Err(error) = &fresh {
             tracing::warn!(target: "containers.runtime", name = %self.name, %error,
@@ -506,7 +509,9 @@ mod tests {
             ..Default::default()
         };
         let container = DockerContainer::new("pin-routing", "img", ContainerRuntime::docker());
-        let pin = container.pin("c1", None, &config).unwrap();
+        let reused = container.pin("c1", None, None).unwrap();
+        assert_eq!(reused.runtime.endpoint, "tcp://ambient:2375");
+        let pin = container.pin("c1", None, Some(&config)).unwrap();
         assert_eq!(pin.runtime.endpoint, "tcp://created:2375");
         pin.runtime.stop_container(&pin.container_id).unwrap();
         assert_eq!(
