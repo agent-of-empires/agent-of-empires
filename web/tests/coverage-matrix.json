@@ -854,6 +854,20 @@
       ]
     },
     {
+      "id": "settings.suggestions",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/settings-suggestions.spec.ts", "src/components/settings/__tests__/SuggestionsSettings.test.tsx"],
+      "components": [
+        "web/src/components/settings/SuggestionsSettings.tsx",
+        "web/src/components/settings/SuggestionTemplates.tsx",
+        "web/src/components/settings/TemplateEditor.tsx",
+        "web/src/components/settings/suggestionsShared.tsx",
+        "web/src/components/settings/useSuggestionsSnapshot.ts",
+        "web/src/lib/suggestionTemplate.ts"
+      ]
+    },
+    {
       "id": "settings.advanced-fold",
       "kind": "vitest",
       "risk": "medium",

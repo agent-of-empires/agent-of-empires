@@ -169,6 +169,11 @@ async fn sensitive_routes_are_blocked() {
             r#"{"provider_id":"x","criterion":"c","enabled":true}"#,
         ),
         (
+            Method::PATCH,
+            "/api/suggestions/prefs",
+            r#"{"sidebar":true}"#,
+        ),
+        (
             Method::PUT,
             "/api/suggestions/templates",
             r#"{"provider_id":"x","criterion":"c","template":"t"}"#,

@@ -1,20 +1,22 @@
 import { useState } from "react";
 import { RefreshCw } from "lucide-react";
 import { OFFLINE_TITLE } from "../lib/connectionState";
-import { dismissSuggestion, updateSuggestionSource } from "../lib/api";
+import { dismissSuggestion } from "../lib/api";
 import { suggestionKey, useSuggestions } from "../hooks/useSuggestions";
 import { SUGGESTION_NOTE_CLASS, SuggestionActions, SuggestionRow, SuggestionStatusNotes } from "./SuggestionRow";
 import type { WizardPrefill } from "./session-wizard/SessionWizard";
 
 interface Props {
   readOnly?: boolean;
+  /** Opens on the Dismissed filter. */
+  initialDismissed?: boolean;
   onPrepare: (prefill: WizardPrefill) => void;
 }
 
-export function SuggestionsView({ readOnly = false, onPrepare }: Props) {
+export function SuggestionsView({ readOnly = false, initialDismissed = false, onPrepare }: Props) {
   const { snapshot, loading, loadFailed, refreshing, busy, notice, offline, act, refresh, start } =
     useSuggestions(onPrepare);
-  const [showDismissed, setShowDismissed] = useState(false);
+  const [showDismissed, setShowDismissed] = useState(initialDismissed);
 
   const disabled = readOnly || offline;
   const unavailableTitle = readOnly ? "Read-only dashboard" : offline ? OFFLINE_TITLE : undefined;
@@ -67,31 +69,6 @@ export function SuggestionsView({ readOnly = false, onPrepare }: Props) {
               {provider.status === "pending" && " · waiting for first results"}
               {provider.status === "error" && ` · ${provider.error ?? "provider error"}`}
             </p>
-            {provider.sources.length > 0 && (
-              <fieldset className="mt-2 grid gap-1 sm:grid-cols-2">
-                <legend className="sr-only">{provider.name} sources</legend>
-                {provider.sources.map((source) => (
-                  <label
-                    key={source.criterion}
-                    className="flex items-start gap-2 text-xs"
-                    title={source.description || undefined}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={source.enabled}
-                      disabled={disabled || busy !== null}
-                      aria-label={`${provider.name}: ${source.label}`}
-                      onChange={(e) =>
-                        void act(`source:${provider.id}:${source.criterion}`, () =>
-                          updateSuggestionSource(provider.id, source.criterion, e.target.checked),
-                        )
-                      }
-                    />
-                    <span>{source.label}</span>
-                  </label>
-                ))}
-              </fieldset>
-            )}
           </section>
         ))}
 
