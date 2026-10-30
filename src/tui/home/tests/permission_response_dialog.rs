@@ -285,7 +285,7 @@ fn removed_integration_session_reports_response_not_sent() {
                 }
             };
 
-        env.view.remove_instance(&id);
+        env.view.instances.shift_remove(&id);
         assert!(env.view.get_instance(&id).is_none());
         let _ = env.view.handle_key(key(submit_key), None);
 
