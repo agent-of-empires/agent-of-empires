@@ -109,9 +109,10 @@ export interface SingleRowActions {
   remove: () => void;
 }
 
-const NOTIFY_OPTIONS: { preset: NotifyPreset; label: string; hint: string }[] = [
+// Default follows the settings, so only the overrides explain themselves.
+const NOTIFY_OPTIONS: { preset: NotifyPreset; label: string; hint?: string }[] = [
   { preset: "off", label: "Off", hint: "No notifications from this session" },
-  { preset: "default", label: "Default", hint: "Follows your notification settings" },
+  { preset: "default", label: "Default" },
   { preset: "all", label: "All", hint: "Notifies when waiting, idle, or on error" },
 ];
 
@@ -195,8 +196,7 @@ export function SingleRowMenuItems({
         onRun={a[action]}
       />
     );
-  const notifyHint =
-    model.notifyPreset === "default" ? undefined : NOTIFY_OPTIONS.find((o) => o.preset === model.notifyPreset)?.hint;
+  const notifyHint = NOTIFY_OPTIONS.find((o) => o.preset === model.notifyPreset)?.hint;
   return (
     <Tiers
       tiers={[

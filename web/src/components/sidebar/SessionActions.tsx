@@ -121,11 +121,16 @@ export function SessionActionsMenu({
                 )}
                 <span className="min-w-0">
                   <span className="block truncate">{label}</span>
-                  <span data-testid="sidebar-context-menu-summary" className="block font-sans text-xs text-text-subtle">
-                    {model.sessionCount === 1 && model.firstSession
-                      ? `${model.firstSession.status} · ${model.firstSession.view === "structured" ? "Structured view" : "Terminal view"}`
-                      : `${model.sessionCount} Sessions`}
-                  </span>
+                  {model.sessionCount > 0 && (
+                    <span
+                      data-testid="sidebar-context-menu-summary"
+                      className="block font-sans text-xs text-text-subtle"
+                    >
+                      {model.sessionCount === 1 && model.firstSession
+                        ? `${model.firstSession.status} · ${model.firstSession.view === "structured" ? "Structured view" : "Terminal view"}`
+                        : `${model.sessionCount} Sessions`}
+                    </span>
+                  )}
                 </span>
               </span>
             )
