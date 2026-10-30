@@ -444,9 +444,12 @@ mod tests {
         // A long itemized badge is truncated to the budget, not overflowing it.
         let long_badge = state_with(
             &["s1"],
-            json!([row_badge("s1", json!({"items": [
-                {"text": "x".repeat(ROW_COLUMN_MAX_WIDTH + 20), "tone": "danger"}
-            ]}))]),
+            json!([row_badge(
+                "s1",
+                json!({"items": [
+                    {"text": "x".repeat(ROW_COLUMN_MAX_WIDTH + 20), "tone": "danger"}
+                ]})
+            )]),
         );
         let (cells, width) = row_column_cells(&long_badge, "s1");
         assert_eq!(width, ROW_COLUMN_MAX_WIDTH);
@@ -458,7 +461,10 @@ mod tests {
             json!([row_badge("s1", json!({"items": [{"text": "CI failed"}]}))]),
         );
         let painted = rows(&both);
-        assert!(painted.iter().any(|l| l.contains("CI failed")), "{painted:?}");
+        assert!(
+            painted.iter().any(|l| l.contains("CI failed")),
+            "{painted:?}"
+        );
         assert_eq!(
             column_of(&painted, "/tmp/s1"),
             column_of(&painted, "/tmp/s2")
