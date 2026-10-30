@@ -2,6 +2,8 @@
 // tree (toasts, plugin links). App listens on both and calls its router's
 // `navigate`.
 
+import { focusSessionOfUrl } from "./focusMode";
+
 export const OPEN_SESSION_EVENT = "aoe-open-session";
 
 /** `path`, when given, overrides the default `/session/<id>` route (e.g. a
@@ -32,6 +34,14 @@ export function enterFocusWindow(sessionId: string): void {
 export function replaceDocument(path: string): void {
   if (typeof window === "undefined") return;
   window.location.replace(path);
+}
+
+/** The focus session of the URL this document loaded with, which is the one the service worker sees for the window
+ *  (`Client.url`), whatever history changes followed. */
+export function loadedFocusSessionId(): string | null {
+  if (typeof window === "undefined") return null;
+  const [navigation] = performance.getEntriesByType?.("navigation") ?? [];
+  return focusSessionOfUrl(navigation?.name || window.location.href);
 }
 
 export const NAVIGATE_EVENT = "aoe-navigate";

@@ -1,6 +1,34 @@
 import { describe, expect, it } from "vitest";
 
-import { focusNavigation, focusSessionTitle, noticedSessions } from "../focusMode";
+import { createToasts, focusNavigation, focusSessionOfUrl, focusSessionTitle, noticedSessions } from "../focusMode";
+import { toastBus, type ToastApi } from "../toastBus";
+
+describe("createToasts", () => {
+  it("reports background creates in a regular window only", () => {
+    const api = { info: () => {} } as unknown as ToastApi;
+    toastBus.handler = api;
+    try {
+      expect(createToasts(false)).toBe(api);
+      expect(createToasts(true)).toBeNull();
+    } finally {
+      toastBus.handler = null;
+    }
+  });
+});
+
+describe("focusSessionOfUrl", () => {
+  it.each([
+    ["https://aoe.test/session/s1?focus=1", "s1"],
+    ["https://aoe.test/session/a%20b/?focus=1#turn", "a b"],
+    ["/session/s1?focus=1", "s1"],
+    ["https://aoe.test/session/s1", null],
+    ["https://aoe.test/session/s1?focus=0", null],
+    ["https://aoe.test/session/s1/diff?focus=1", null],
+    ["https://aoe.test/settings?focus=1", null],
+  ])("reads %s as %s", (url, expected) => {
+    expect(focusSessionOfUrl(url)).toBe(expected);
+  });
+});
 
 describe("focusSessionTitle", () => {
   it.each([
