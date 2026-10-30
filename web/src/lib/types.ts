@@ -560,12 +560,22 @@ export interface SuggestionSource {
   enabled: boolean;
 }
 
+/** One setup check a provider reports. `detail` and `fix` are provider text and untrusted. */
+export interface SuggestionSetupCheck {
+  id: string;
+  label: string;
+  status: "ok" | "warn" | "fail";
+  detail: string;
+  fix: string;
+}
+
 export interface SuggestionProvider {
   id: string;
   name: string;
   status: "pending" | "ok" | "error";
   error?: string;
   sources: SuggestionSource[];
+  checks?: SuggestionSetupCheck[];
 }
 
 /** `preview` and `reason` are provider text and untrusted; only `draft` seeds a prompt. */

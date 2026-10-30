@@ -854,6 +854,13 @@
       ]
     },
     {
+      "id": "suggestions.first-run-setup",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/SuggestionsSetup.test.tsx"],
+      "components": ["web/src/components/SuggestionsSetupHint.tsx", "web/src/components/SuggestionsSetupSheet.tsx"]
+    },
+    {
       "id": "settings.advanced-fold",
       "kind": "vitest",
       "risk": "medium",
