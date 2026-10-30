@@ -624,7 +624,13 @@ async fn lock_funnel_starts(path: &std::path::Path) -> anyhow::Result<std::fs::F
         .truncate(false)
         .write(true)
         .open(path)
-        .with_context(|| format!("couldn't open {}", path.display()))?;
+        .with_context(|| {
+            format!(
+                "couldn't open {}, which aoe locks while starting Tailscale Funnel; check that the \
+                 home directory is writable, or pass --no-tailscale to use Cloudflare.",
+                path.display()
+            )
+        })?;
     let deadline = tokio::time::Instant::now() + FUNNEL_LOCK_WAIT;
     let mut logged = false;
     loop {
