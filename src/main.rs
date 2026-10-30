@@ -101,9 +101,7 @@ fn main() -> Result<()> {
     }
     if let Some(url) = &cli.daemon_url {
         // SAFETY: no runtime or background work has started.
-        unsafe {
-            std::env::set_var("AOE_DAEMON_URL", url);
-        }
+        unsafe { agent_of_empires::acp::client::discovery::export_daemon_url(url) };
     }
     agent_of_empires::acp::client::daemon_manager::set_autostart_disabled(cli.no_autostart);
     seed_cityhall_env(&cli);
