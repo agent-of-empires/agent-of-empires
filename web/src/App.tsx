@@ -2283,6 +2283,7 @@ function AppContent({
           </div>
           <SuggestionsView
             readOnly={serverAbout?.read_only ?? false}
+            initialDismissed={searchParams.get("dismissed") === "1"}
             onPrepare={(prefill) => {
               setWizardPrefill(prefill);
               setShowSessionWizard(true);
@@ -2316,6 +2317,7 @@ function AppContent({
             await refreshProjects();
           }}
           profile={searchParams.get("profile")}
+          onOpenSuggestions={(dismissed) => navigate(dismissed ? "/suggestions?dismissed=1" : "/suggestions")}
           field={searchParams.get("field")}
           onSelectProfile={(p) => {
             const next = new URLSearchParams(searchParams);

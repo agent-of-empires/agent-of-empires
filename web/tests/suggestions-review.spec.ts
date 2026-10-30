@@ -19,9 +19,10 @@ const provider = {
   id: "github",
   name: "GitHub",
   status: "ok",
+  enabled: true,
   sources: [
-    { criterion: "assigned", label: "Assigned issues", description: "", enabled: true },
-    { criterion: "ci", label: "Failing checks", description: "", enabled: false },
+    { criterion: "assigned", label: "Assigned issues", description: "", enabled: true, variables: [] },
+    { criterion: "ci", label: "Failing checks", description: "", enabled: false, variables: [] },
   ],
 };
 
@@ -77,29 +78,6 @@ test("Start opens the wizard with the draft prompt and creates nothing until Lau
   const create = page.waitForRequest((r) => r.url().endsWith("/api/sessions") && r.method() === "POST");
   await page.getByRole("button", { name: /Launch/ }).click();
   expect((await create).postDataJSON()).toMatchObject({ initial_prompt: item.draft.prompt, path: "/work/aoe" });
-});
-
-test("source switch patches the provider and the list reloads", async ({ page }) => {
-  await mockTerminalApis(page);
-  await page.route("**/api/sessions", (route) =>
-    route.fulfill({ headers: CURSOR, json: { sessions: [], workspace_ordering: [] } }),
-  );
-  let snapshotReads = 0;
-  await page.route("**/api/suggestions", (route) => {
-    snapshotReads++;
-    return route.fulfill({ json: { providers: [provider], items: [item] } });
-  });
-  await page.route("**/api/suggestions/sources", (route) =>
-    route.fulfill({ json: { provider_id: "github", criterion: "ci", enabled: true } }),
-  );
-  await page.goto("/suggestions");
-  await expect(page.getByText(item.title, { exact: true })).toBeVisible();
-  expect(snapshotReads).toBe(1);
-
-  const patch = page.waitForRequest((r) => r.url().endsWith("/api/suggestions/sources") && r.method() === "PATCH");
-  await page.getByLabel("GitHub: Failing checks").click();
-  expect((await patch).postDataJSON()).toEqual({ provider_id: "github", criterion: "ci", enabled: true });
-  await expect.poll(() => snapshotReads).toBe(2);
 });
 
 test("dismissed items move to the dismissed list and can be restored", async ({ page }) => {

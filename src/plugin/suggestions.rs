@@ -103,6 +103,19 @@ pub(super) fn init(conn: &Connection) -> rusqlite::Result<()> {
              provider_id TEXT NOT NULL,
              checks_json TEXT NOT NULL,
              PRIMARY KEY (profile, provider_id)
+         );
+         CREATE TABLE IF NOT EXISTS suggestion_preferences (
+             profile         TEXT PRIMARY KEY,
+             homepage        INTEGER NOT NULL DEFAULT 1,
+             sidebar         INTEGER NOT NULL DEFAULT 0,
+             refresh_minutes INTEGER NOT NULL DEFAULT 15
+         );
+         CREATE TABLE IF NOT EXISTS suggestion_provider_prefs (
+             profile     TEXT NOT NULL,
+             provider_id TEXT NOT NULL,
+             enabled     INTEGER NOT NULL DEFAULT 1,
+             sort_order  INTEGER NOT NULL DEFAULT 2147483647,
+             PRIMARY KEY (profile, provider_id)
          );",
     )
 }
@@ -515,6 +528,154 @@ const LIVE_DISMISSALS_SQL: &str = "SELECT i.provider_id, i.item_id FROM suggesti
          SELECT 1 FROM suggestion_dismissals d
          WHERE d.profile = i.profile AND d.provider_id = i.provider_id AND d.item_id = i.item_id)";
 
+/// Refresh intervals the Settings select offers, in minutes.
+pub(crate) const REFRESH_MINUTES: [u32; 5] = [5, 15, 30, 60, 120];
+
+/// Partial update of the profile's suggestion preferences.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrefsPatch {
+    pub homepage: Option<bool>,
+    pub sidebar: Option<bool>,
+    pub refresh_minutes: Option<u32>,
+    /// Every provider id exactly once.
+    pub provider_order: Option<Vec<String>>,
+    pub provider_enabled: Option<BTreeMap<String, bool>>,
+}
+
+/// `(enabled, sort_order)` per stored provider; absent means enabled, last.
+fn provider_prefs(
+    conn: &Connection,
+    profile: &str,
+) -> rusqlite::Result<HashMap<String, (bool, i64)>> {
+    conn.prepare(
+        "SELECT provider_id, enabled, sort_order FROM suggestion_provider_prefs WHERE profile = ?1",
+    )?
+    .query_map([profile], |row| {
+        Ok((row.get(0)?, (row.get(1)?, row.get(2)?)))
+    })?
+    .collect()
+}
+
+/// Ids of the providers the user switched off.
+pub(crate) fn disabled_providers(
+    conn: &Connection,
+    profile: &str,
+) -> rusqlite::Result<HashSet<String>> {
+    conn.prepare(
+        "SELECT provider_id FROM suggestion_provider_prefs WHERE profile = ?1 AND enabled = 0",
+    )?
+    .query_map([profile], |row| row.get(0))?
+    .collect()
+}
+
+/// Provider indexes in the saved order; unsaved providers follow, ties broken by id.
+fn ordered_indexes(providers: &[Provider], stored: &HashMap<String, (bool, i64)>) -> Vec<usize> {
+    let rank = |i: usize| {
+        stored
+            .get(&providers[i].id)
+            .map_or(i64::from(i32::MAX), |p| p.1)
+    };
+    let mut order: Vec<usize> = (0..providers.len()).collect();
+    order.sort_by(|&a, &b| (rank(a), &providers[a].id).cmp(&(rank(b), &providers[b].id)));
+    order
+}
+
+/// `(homepage, sidebar, refresh_minutes)` of a profile that never saved any.
+pub(crate) const DEFAULT_PREFS: (bool, bool, u32) = (true, false, 15);
+
+pub(crate) fn prefs_json(prefs: (bool, bool, u32), provider_order: &[&str]) -> Value {
+    json!({
+        "homepage": prefs.0,
+        "sidebar": prefs.1,
+        "refresh_minutes": prefs.2,
+        "provider_order": provider_order,
+    })
+}
+
+fn load_prefs(conn: &Connection, profile: &str) -> rusqlite::Result<(bool, bool, u32)> {
+    Ok(conn
+        .query_row(
+            "SELECT homepage, sidebar, refresh_minutes FROM suggestion_preferences WHERE profile = ?1",
+            [profile],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?
+        .unwrap_or(DEFAULT_PREFS))
+}
+
+/// Applies `patch` atomically; the inner `Err` is a validation message and
+/// nothing is stored.
+pub(crate) fn apply_prefs(
+    conn: &Connection,
+    profile: &str,
+    known: &[String],
+    patch: &PrefsPatch,
+) -> anyhow::Result<Result<(), String>> {
+    if let Some(minutes) = patch.refresh_minutes {
+        if !REFRESH_MINUTES.contains(&minutes) {
+            return Ok(Err(format!(
+                "refresh_minutes must be one of {REFRESH_MINUTES:?}"
+            )));
+        }
+    }
+    if let Some(order) = &patch.provider_order {
+        let unique: HashSet<&String> = order.iter().collect();
+        if unique.len() != order.len()
+            || unique.len() != known.len()
+            || !known.iter().all(|k| unique.contains(k))
+        {
+            return Ok(Err(
+                "provider_order must list every provider exactly once".into()
+            ));
+        }
+    }
+    if let Some(enabled) = &patch.provider_enabled {
+        if let Some(id) = enabled.keys().find(|id| !known.contains(id)) {
+            return Ok(Err(format!("unknown provider {id:?}")));
+        }
+    }
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT OR IGNORE INTO suggestion_preferences (profile) VALUES (?1)",
+        [profile],
+    )?;
+    if let Some(v) = patch.homepage {
+        tx.execute(
+            "UPDATE suggestion_preferences SET homepage = ?2 WHERE profile = ?1",
+            params![profile, v],
+        )?;
+    }
+    if let Some(v) = patch.sidebar {
+        tx.execute(
+            "UPDATE suggestion_preferences SET sidebar = ?2 WHERE profile = ?1",
+            params![profile, v],
+        )?;
+    }
+    if let Some(v) = patch.refresh_minutes {
+        tx.execute(
+            "UPDATE suggestion_preferences SET refresh_minutes = ?2 WHERE profile = ?1",
+            params![profile, v],
+        )?;
+    }
+    for (position, id) in patch.provider_order.iter().flatten().enumerate() {
+        tx.execute(
+            "INSERT INTO suggestion_provider_prefs (profile, provider_id, sort_order) VALUES (?1, ?2, ?3)
+             ON CONFLICT (profile, provider_id) DO UPDATE SET sort_order = ?3",
+            params![profile, id, position as i64],
+        )?;
+    }
+    for (id, enabled) in patch.provider_enabled.iter().flatten() {
+        tx.execute(
+            "INSERT INTO suggestion_provider_prefs (profile, provider_id, enabled) VALUES (?1, ?2, ?3)
+             ON CONFLICT (profile, provider_id) DO UPDATE SET enabled = ?3",
+            params![profile, id, enabled],
+        )?;
+    }
+    tx.commit()?;
+    Ok(Ok(()))
+}
+
 pub(crate) fn snapshot(
     conn: &Connection,
     profile: &str,
@@ -524,37 +685,49 @@ pub(crate) fn snapshot(
         .prepare(LIVE_DISMISSALS_SQL)?
         .query_map([profile], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<Result<_, _>>()?;
+    let stored = provider_prefs(conn, profile)?;
+    let order = ordered_indexes(providers, &stored);
     let mut out_providers = Vec::with_capacity(providers.len());
     let mut out_items = Vec::new();
-    for provider in providers {
-        let status: Option<(Option<String>,)> = conn
+    for &index in &order {
+        let provider = &providers[index];
+        let enabled = stored.get(&provider.id).is_none_or(|p| p.0);
+        let status: Option<(Option<String>, i64)> = conn
             .query_row(
-                "SELECT error FROM suggestion_providers WHERE profile = ?1 AND provider_id = ?2",
+                "SELECT error, updated_at FROM suggestion_providers WHERE profile = ?1 AND provider_id = ?2",
                 params![profile, provider.id],
-                |row| Ok((row.get(0)?,)),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
         let overrides = overrides(conn, profile, &provider.id)?;
         let mut entry = json!({
             "id": provider.id,
             "name": provider.name,
+            "enabled": enabled,
             "status": match &status {
                 None => "pending",
-                Some((None,)) => "ok",
-                Some((Some(_),)) => "error",
+                Some((None, _)) => "ok",
+                Some((Some(_), _)) => "error",
             },
             "sources": provider.spec.sources.iter().map(|s| json!({
                 "criterion": s.criterion,
                 "label": s.label,
                 "description": s.description,
+                "variables": s.variables,
                 "enabled": effective_enabled(&provider.spec, &overrides, &s.criterion),
             })).collect::<Vec<_>>(),
             "checks": load_checks(conn, profile, &provider.id)?,
         });
-        if let Some((Some(message),)) = status {
-            entry["error"] = json!(message);
+        if let Some((error, updated_at)) = status {
+            entry["updated_at"] = json!(updated_at);
+            if let Some(message) = error {
+                entry["error"] = json!(message);
+            }
         }
         out_providers.push(entry);
+        if !enabled {
+            continue;
+        }
         for item in load_items(conn, profile, provider)? {
             let is_dismissed = dismissed.contains(&(provider.id.clone(), item.id.clone()));
             let mut value = serde_json::to_value(&item)?;
@@ -563,7 +736,9 @@ pub(crate) fn snapshot(
             out_items.push(value);
         }
     }
-    Ok(json!({ "providers": out_providers, "items": out_items }))
+    let order_ids: Vec<&str> = order.iter().map(|&i| providers[i].id.as_str()).collect();
+    let prefs = prefs_json(load_prefs(conn, profile)?, &order_ids);
+    Ok(json!({ "providers": out_providers, "items": out_items, "prefs": prefs }))
 }
 
 /// Returns the items of enabled criteria, or the first contract violation.
@@ -1585,6 +1760,87 @@ mod tests {
         let bomb = "{repo}".repeat(MAX_PROMPT_BYTES / "{repo}".len());
         assert!(bomb.len() <= MAX_PROMPT_BYTES);
         assert_eq!(prompt(Some(&bomb)), Err(PromptTooLong));
+    }
+
+    #[test]
+    fn prefs_default_patch_partially_and_reject_bad_input() {
+        let conn = store();
+        let known = ["acme.github".to_string(), "acme.linear".to_string()];
+        let other = || Provider {
+            id: "acme.linear".into(),
+            name: "Linear".into(),
+            spec: spec(),
+        };
+        let both = [provider(), other()];
+        let snap = |profile: &str| snapshot(&conn, profile, &both).unwrap();
+        let apply = |patch: serde_json::Value| {
+            apply_prefs(&conn, "p", &known, &serde_json::from_value(patch).unwrap()).unwrap()
+        };
+
+        assert_eq!(
+            snap("p")["prefs"],
+            json!({ "homepage": true, "sidebar": false, "refresh_minutes": 15,
+                    "provider_order": ["acme.github", "acme.linear"] })
+        );
+        assert_eq!(
+            snapshot(&conn, "p", &[]).unwrap()["prefs"],
+            prefs_json(DEFAULT_PREFS, &[])
+        );
+        // Unsaved providers sort by id whatever the registry order.
+        let reversed = [other(), provider()];
+        assert_eq!(
+            snapshot(&conn, "p", &reversed).unwrap()["prefs"]["provider_order"],
+            json!(["acme.github", "acme.linear"])
+        );
+
+        apply(json!({ "sidebar": true })).unwrap();
+        apply(json!({ "refresh_minutes": 60, "provider_order": ["acme.linear", "acme.github"] }))
+            .unwrap();
+        let prefs = snap("p")["prefs"].clone();
+        assert_eq!(prefs["sidebar"], true);
+        assert_eq!(prefs["homepage"], true);
+        assert_eq!(prefs["refresh_minutes"], 60);
+        assert_eq!(
+            prefs["provider_order"],
+            json!(["acme.linear", "acme.github"])
+        );
+        assert_eq!(snap("p")["providers"][0]["id"], "acme.linear");
+        assert_eq!(snap("other")["prefs"]["sidebar"], false);
+
+        for bad in [
+            json!({ "refresh_minutes": 7 }),
+            json!({ "provider_order": ["acme.github"] }),
+            json!({ "provider_order": ["acme.github", "acme.github"] }),
+            json!({ "provider_order": ["acme.github", "nope"] }),
+            json!({ "provider_enabled": { "nope": false } }),
+        ] {
+            assert!(apply(bad.clone()).is_err(), "{bad}");
+        }
+        assert_eq!(snap("p")["prefs"]["refresh_minutes"], 60);
+        assert!(serde_json::from_value::<PrefsPatch>(json!({ "extra": 1 })).is_err());
+    }
+
+    #[test]
+    fn disabled_provider_stays_listed_but_hides_items_and_refresh() {
+        let conn = store();
+        publish(&conn, "p", &[item("a", "assigned")]);
+        assert_eq!(ids(&snap(&conn, "p")), ["a"]);
+        assert!(disabled_providers(&conn, "p").unwrap().is_empty());
+
+        let patch = serde_json::from_value(json!({ "provider_enabled": { "acme.github": false } }))
+            .unwrap();
+        apply_prefs(&conn, "p", &["acme.github".to_string()], &patch)
+            .unwrap()
+            .unwrap();
+        let snapshot = snap(&conn, "p");
+        assert!(ids(&snapshot).is_empty());
+        assert_eq!(snapshot["providers"][0]["enabled"], false);
+        assert!(snapshot["providers"][0]["updated_at"].is_i64());
+        assert_eq!(
+            disabled_providers(&conn, "p").unwrap(),
+            HashSet::from(["acme.github".to_string()])
+        );
+        assert!(disabled_providers(&conn, "other").unwrap().is_empty());
     }
 
     #[test]
