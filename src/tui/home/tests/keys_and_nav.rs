@@ -1479,6 +1479,7 @@ fn start_for_test(path: &str) -> crate::tui::suggestions::Start {
         provider: "GitHub".to_string(),
         source_ref: "#7".to_string(),
         reason: "review requested".to_string(),
+        source_text: None,
         path: path.to_string(),
         title: "Review PR 7".to_string(),
         initial_prompt: "Inspect the diff".to_string(),

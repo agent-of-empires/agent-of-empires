@@ -105,6 +105,8 @@ pub struct PromptOrigin {
     pub provider: String,
     pub source_ref: String,
     pub reason: String,
+    /// Untrusted provider text behind the prompt, shown on Ctrl+P.
+    pub source_text: Option<String>,
 }
 
 #[derive(Clone)]
@@ -278,6 +280,8 @@ pub struct NewSessionDialog {
     /// First turn for the agent; the row exists only when `prompt_origin` is set.
     prompt: Input,
     prompt_origin: Option<PromptOrigin>,
+    /// Overlay with `prompt_origin.source_text`, opened by Ctrl+P on the Prompt row.
+    pub(super) show_prompt_source: bool,
     /// `(focused_field_index, rect)` per main-form field, repopulated every
     /// frame and empty while an overlay is up, so a click during one cannot
     /// snap focus to the field that used to sit there.
@@ -635,6 +639,7 @@ impl NewSessionDialog {
             suggested_title: String::new(),
             prompt: Input::default(),
             prompt_origin: None,
+            show_prompt_source: false,
             focusable_rects: Vec::new(),
             sandbox_config_rects: Vec::new(),
             tool_config_rects: Vec::new(),
@@ -1159,6 +1164,7 @@ impl NewSessionDialog {
             suggested_title: String::new(),
             prompt: Input::default(),
             prompt_origin: None,
+            show_prompt_source: false,
             focusable_rects: Vec::new(),
             sandbox_config_rects: Vec::new(),
             tool_config_rects: Vec::new(),
@@ -1242,6 +1248,7 @@ impl NewSessionDialog {
             suggested_title: String::new(),
             prompt: Input::default(),
             prompt_origin: None,
+            show_prompt_source: false,
             focusable_rects: Vec::new(),
             sandbox_config_rects: Vec::new(),
             tool_config_rects: Vec::new(),
@@ -1267,6 +1274,10 @@ impl NewSessionDialog {
     pub fn handle_click(&mut self, col: u16, row: u16) -> Option<DialogResult<NewSessionData>> {
         if self.show_help {
             self.show_help = false;
+            return Some(DialogResult::Continue);
+        }
+        if self.show_prompt_source {
+            self.show_prompt_source = false;
             return Some(DialogResult::Continue);
         }
 
@@ -1448,6 +1459,15 @@ impl NewSessionDialog {
             return DialogResult::Continue;
         }
 
+        if self.show_prompt_source {
+            let toggle =
+                key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL);
+            if toggle || matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                self.show_prompt_source = false;
+            }
+            return DialogResult::Continue;
+        }
+
         // The workspace-repo browser opens over the worktree overlay, so it
         // routes before the overlays.
         if self.dir_picker.is_active() {
@@ -1539,6 +1559,10 @@ impl NewSessionDialog {
                 self.refresh_inherited_sandbox_settings();
                 self.sandbox_config_mode = true;
                 self.sandbox_focused_field = 0;
+                return DialogResult::Continue;
+            }
+            if self.focused_field == fields.prompt {
+                self.show_prompt_source = true;
                 return DialogResult::Continue;
             }
         }

@@ -100,6 +100,7 @@ impl HomeView {
                 provider: start.provider,
                 source_ref: start.source_ref,
                 reason: start.reason,
+                source_text: start.source_text,
             },
         );
         dialog.focus_title();

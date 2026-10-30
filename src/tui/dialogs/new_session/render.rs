@@ -531,6 +531,10 @@ impl NewSessionDialog {
                 hint_spans.push(Span::styled("Ctrl+P", Style::default().fg(theme.hint)));
                 hint_spans.push(Span::raw(" configure  "));
             }
+            if self.focused_field == fields.prompt {
+                hint_spans.push(Span::styled("Ctrl+P", Style::default().fg(theme.hint)));
+                hint_spans.push(Span::raw(" view source  "));
+            }
             // Ctrl+T scratch chip. Always present so the binding is
             // discoverable without opening the `?` overlay. When focus is on
             // the Path row the chip is emphasized (bold accent) so users
@@ -573,6 +577,10 @@ impl NewSessionDialog {
 
         if self.show_help {
             self.render_help_overlay(frame, full_area, theme);
+        }
+
+        if self.show_prompt_source {
+            self.render_prompt_source_overlay(frame, full_area, theme);
         }
 
         if self.group_picker.is_active() {
@@ -1372,6 +1380,61 @@ impl NewSessionDialog {
             Span::styled(" to close", Style::default().fg(theme.dimmed)),
         ]));
 
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    /// The provider text behind the prompt, in the help overlay's frame.
+    /// Hard-wrapped one cell per char so the row count is exact and the
+    /// close hint always fits.
+    fn render_prompt_source_overlay(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let Some(origin) = &self.prompt_origin else {
+            return;
+        };
+        let width = HELP_DIALOG_WIDTH.min(area.width);
+        let cols = usize::from(width.saturating_sub(2)).max(1);
+        let body: Vec<String> = match origin.source_text.as_deref() {
+            Some(text) => text
+                .lines()
+                .flat_map(|line| {
+                    let chars: Vec<char> = prompt_display(line).chars().collect();
+                    let rows = chars.len().div_ceil(cols).max(1);
+                    (0..rows)
+                        .map(|row| chars.iter().skip(row * cols).take(cols).collect())
+                        .collect::<Vec<String>>()
+                })
+                .collect(),
+            None => vec!["No source text.".to_string()],
+        };
+        // Header, blank, body, close hint, plus the two border rows.
+        let max_body_rows = usize::from(area.height.saturating_sub(5)).max(1);
+        let body_rows = body.len().min(max_body_rows);
+        let height = body_rows as u16 + 5;
+
+        let block = crate::tui::dialogs::toned_dialog_block(
+            " Suggestion source ",
+            theme.border,
+            theme.title,
+        );
+        let (_, inner) =
+            crate::tui::dialogs::render_dialog_frame(frame, area, width, height, block);
+
+        let mut lines = vec![
+            Line::styled(
+                prompt_display(&format!("From {}, not checked by AoE", origin.provider)),
+                Style::default().fg(theme.dimmed),
+            ),
+            Line::from(""),
+        ];
+        lines.extend(
+            body.into_iter()
+                .take(body_rows)
+                .map(|row| Line::styled(row, Style::default().fg(theme.text))),
+        );
+        lines.push(Line::from(vec![
+            Span::styled("Press ", Style::default().fg(theme.dimmed)),
+            Span::styled("Esc", Style::default().fg(theme.hint)),
+            Span::styled(" to close", Style::default().fg(theme.dimmed)),
+        ]));
         frame.render_widget(Paragraph::new(lines), inner);
     }
 }

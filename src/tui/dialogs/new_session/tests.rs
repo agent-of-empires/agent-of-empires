@@ -103,6 +103,7 @@ fn github_origin() -> super::PromptOrigin {
         provider: "GitHub".to_string(),
         source_ref: "#4562".to_string(),
         reason: "review requested from you".to_string(),
+        source_text: Some("PR body: please review the \u{1b}[1mRFC\u{1b}[0m".to_string()),
     }
 }
 
@@ -155,6 +156,45 @@ fn the_prompt_row_exists_only_for_a_suggestion_and_hostile_text_is_neutralised()
         None,
         "a blank prompt is omitted, which creation would reject"
     );
+}
+
+#[test]
+fn ctrl_p_on_the_prompt_row_shows_the_source_text_and_esc_closes_it() {
+    let mut dialog = single_tool_dialog();
+    dialog.set_suggestion("Review PR 4562".to_string(), github_origin());
+    dialog.focused_field = dialog.field_indices().prompt;
+    let screen = screen_of(&mut dialog, 100, 40);
+    assert!(screen.contains("Ctrl+P view source"), "{screen}");
+    assert!(!screen.contains("Suggestion source"));
+
+    assert!(matches!(
+        dialog.handle_key(ctrl_key(KeyCode::Char('p'))),
+        DialogResult::Continue
+    ));
+    assert!(dialog.show_prompt_source);
+    let screen = screen_of(&mut dialog, 100, 40);
+    for expected in [
+        "Suggestion source",
+        "From GitHub, not checked by AoE",
+        "PR body: please review the \u{fffd}[1mRFC\u{fffd}[0m",
+    ] {
+        assert!(screen.contains(expected), "missing {expected:?}");
+    }
+    assert!(!screen.contains('\u{1b}'));
+
+    // Keys stay in the overlay until it closes; the prompt is untouched.
+    type_str(&mut dialog, "x");
+    assert_eq!(dialog.prompt.value(), "Review PR 4562");
+    dialog.handle_key(key(KeyCode::Esc));
+    assert!(!dialog.show_prompt_source);
+
+    let mut dialog = single_tool_dialog();
+    let mut origin = github_origin();
+    origin.source_text = None;
+    dialog.set_suggestion("Review PR 4562".to_string(), origin);
+    dialog.focused_field = dialog.field_indices().prompt;
+    dialog.handle_key(ctrl_key(KeyCode::Char('p')));
+    assert!(screen_of(&mut dialog, 100, 40).contains("No source text."));
 }
 
 #[test]

@@ -70,6 +70,8 @@ pub(super) struct Start {
     pub provider: String,
     pub source_ref: String,
     pub reason: String,
+    /// The provider's `preview`, untrusted; `None` when it is blank.
+    pub source_text: Option<String>,
     pub path: String,
     pub title: String,
     pub initial_prompt: String,
@@ -390,8 +392,8 @@ impl SuggestionsView {
                     self.error = Some("No registered project matches this suggestion".into());
                 }
                 (Some(project), Some(key)) => {
-                    let (provider, source_ref, reason) = self
-                        .item_by_key(&key)
+                    let item = self.item_by_key(&key);
+                    let (provider, source_ref, reason) = item
                         .map(|i| {
                             (
                                 self.provider_name(&i.provider_id).to_owned(),
@@ -400,6 +402,9 @@ impl SuggestionsView {
                             )
                         })
                         .unwrap_or_else(|| (key.0.clone(), String::new(), String::new()));
+                    let source_text = item
+                        .map(|i| i.preview.clone())
+                        .filter(|p| !p.trim().is_empty());
                     self.notice =
                         Some("Review the prompt below, then press Enter to start.".into());
                     self.prepared = Some((
@@ -408,6 +413,7 @@ impl SuggestionsView {
                             provider,
                             source_ref,
                             reason,
+                            source_text,
                             path: project.path,
                             title: prepared.title,
                             initial_prompt: prepared.initial_prompt,
