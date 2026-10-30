@@ -3,7 +3,11 @@
 //! Nothing here creates a session; `prepare` only resolves the wizard prefill.
 use std::sync::Arc;
 
-use axum::{extract::State, response::IntoResponse, Json};
+use axum::{
+    extract::{Query, State},
+    response::IntoResponse,
+    Json,
+};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -24,6 +28,27 @@ pub struct SourceBody {
     provider_id: String,
     criterion: String,
     enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemplateKey {
+    provider_id: String,
+    criterion: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemplateBody {
+    provider_id: String,
+    criterion: String,
+    template: String,
+}
+
+#[derive(Deserialize)]
+pub struct TemplateQuery {
+    provider_id: Option<String>,
+    criterion: Option<String>,
 }
 
 fn unavailable() -> axum::response::Response {
@@ -209,17 +234,193 @@ pub async fn prepare_suggestion(
         return unknown_provider();
     };
     let result = tokio::task::spawn_blocking(move || {
-        let (profile, found) = host.with_suggestions_db(|conn, profile| {
-            suggestions::find_item(conn, profile, &provider, &item.id)
-                .map(|found| (profile.to_string(), found))
+        let (profile, found, template) = host.with_suggestions_db(|conn, profile| {
+            let found = suggestions::find_item(conn, profile, &provider, &item.id)?;
+            let template = match &found {
+                Some(found) => {
+                    suggestions::template(conn, profile, &provider.id, &found.criterion)?
+                }
+                None => None,
+            };
+            Ok::<_, anyhow::Error>((profile.to_string(), found, template))
         })?;
         // Config and project resolution touch disk, so they run off the lock.
-        Ok::<_, anyhow::Error>(found.map(|found| suggestions::prepare(&profile, &found)))
+        Ok::<_, anyhow::Error>(
+            found.map(|found| suggestions::prepare(&profile, &found, template.as_deref())),
+        )
     })
     .await;
     match result {
         Ok(Ok(Some(prefill))) => Json(prefill).into_response(),
         Ok(Ok(None)) => stale_item(),
+        Ok(Err(error)) => internal(error),
+        Err(error) => internal(error),
+    }
+}
+
+/// The provider, or the error response when it is unknown or does not
+/// declare `criterion`.
+fn declared_source(
+    provider_id: &str,
+    criterion: &str,
+) -> Result<Provider, axum::response::Response> {
+    let provider = find_provider(provider_id).ok_or_else(unknown_provider)?;
+    if provider
+        .spec
+        .sources
+        .iter()
+        .any(|s| s.criterion == criterion)
+    {
+        Ok(provider)
+    } else {
+        Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "The provider does not declare that criterion",
+        ))
+    }
+}
+
+fn template_json(
+    provider_id: &str,
+    criterion: &str,
+    template: Option<String>,
+) -> serde_json::Value {
+    json!({
+        "provider_id": provider_id,
+        "criterion": criterion,
+        "default": template.is_none(),
+        "template": template,
+    })
+}
+
+pub async fn get_suggestion_templates(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<TemplateQuery>,
+) -> impl IntoResponse {
+    let key = match (query.provider_id, query.criterion) {
+        (None, None) => None,
+        (Some(provider_id), Some(criterion)) => {
+            if let Err(response) = declared_source(&provider_id, &criterion) {
+                return response;
+            }
+            Some((provider_id, criterion))
+        }
+        _ => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "validation_failed",
+                "Pass both provider_id and criterion, or neither",
+            )
+        }
+    };
+    let Some(host) = state.plugin_host.clone() else {
+        return match key {
+            None => Json(json!({ "templates": [] })).into_response(),
+            Some(_) => unavailable(),
+        };
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        host.with_suggestions_db(|conn, profile| match key {
+            Some((provider_id, criterion)) => {
+                suggestions::template(conn, profile, &provider_id, &criterion)
+                    .map(|t| template_json(&provider_id, &criterion, t))
+            }
+            None => suggestions::templates(conn, profile).map(|rows| {
+                json!({ "templates": rows.into_iter()
+                    .map(|(provider_id, criterion, template)| {
+                        json!({ "provider_id": provider_id, "criterion": criterion, "template": template })
+                    })
+                    .collect::<Vec<_>>() })
+            }),
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(body)) => Json(body).into_response(),
+        Ok(Err(error)) => internal(error),
+        Err(error) => internal(error),
+    }
+}
+
+pub async fn put_suggestion_template(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<TemplateBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let Some(host) = state.plugin_host.clone() else {
+        return unavailable();
+    };
+    if let Err(response) = declared_source(&body.provider_id, &body.criterion) {
+        return response;
+    }
+    if body.template.len() > suggestions::MAX_PROMPT_BYTES {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            format!(
+                "Template is limited to {} bytes",
+                suggestions::MAX_PROMPT_BYTES
+            ),
+        );
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        host.with_suggestions_db(|conn, profile| {
+            suggestions::set_template(
+                conn,
+                profile,
+                &body.provider_id,
+                &body.criterion,
+                &body.template,
+            )
+            .map(|()| {
+                template_json(
+                    &body.provider_id,
+                    &body.criterion,
+                    Some(body.template.clone()),
+                )
+            })
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(body)) => Json(body).into_response(),
+        Ok(Err(error)) => internal(error),
+        Err(error) => internal(error),
+    }
+}
+
+pub async fn delete_suggestion_template(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<TemplateKey>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(key) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let Some(host) = state.plugin_host.clone() else {
+        return unavailable();
+    };
+    if let Err(response) = declared_source(&key.provider_id, &key.criterion) {
+        return response;
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        host.with_suggestions_db(|conn, profile| {
+            suggestions::delete_template(conn, profile, &key.provider_id, &key.criterion)
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => Json(json!({ "ok": true })).into_response(),
         Ok(Err(error)) => internal(error),
         Err(error) => internal(error),
     }

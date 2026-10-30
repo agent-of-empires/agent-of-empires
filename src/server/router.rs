@@ -294,6 +294,12 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/suggestions/sources",
             patch(api::update_suggestion_source),
         )
+        .route(
+            "/api/suggestions/templates",
+            get(api::get_suggestion_templates)
+                .put(api::put_suggestion_template)
+                .delete(api::delete_suggestion_template),
+        )
         .route("/api/suggestions/prepare", post(api::prepare_suggestion))
         .route("/api/plugins/commands", get(api::plugin_commands))
         .route(

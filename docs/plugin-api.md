@@ -365,11 +365,16 @@ Suggestions are stored per profile. The routes below list and act on them; none 
 | `POST /api/suggestions/dismiss` | `{ provider_id, id }` | `{ ok }` |
 | `POST /api/suggestions/undismiss` | `{ provider_id, id }` | `{ ok }` |
 | `PATCH /api/suggestions/sources` | `{ provider_id, criterion, enabled }` | `{ provider_id, criterion, enabled }` |
+| `GET /api/suggestions/templates` | query `provider_id` and `criterion`, or neither | one: `{ provider_id, criterion, template, default }`; none: `{ templates: [{ provider_id, criterion, template }] }` |
+| `PUT /api/suggestions/templates` | `{ provider_id, criterion, template }` | `{ provider_id, criterion, template, default }` |
+| `DELETE /api/suggestions/templates` | `{ provider_id, criterion }` | `{ ok }` |
 | `POST /api/suggestions/prepare` | `{ provider_id, id }` | `{ title, initial_prompt, source_ref, project, tool, yolo, sandbox, worktree }` |
 
 A provider's `status` is `pending` before its first publish, `ok`, or `error`. Each item is the published item plus `provider_id` and `dismissed`; dismissed items are still returned. Items of a disabled source are hidden. `refresh` and a `sources` change send `suggestions.refresh` to the affected workers.
 
 `prepare` resolves settings through the normal repo and profile config. `project` is `{ name, path }` only when the item's `project` matches exactly one registered project by name or exact path, otherwise `null`.
+
+A template is stored per profile and criterion and replaces the provider's `draft.prompt` in `prepare`'s `initial_prompt`, nowhere else. `{name}` expands to the item's variable of that name; unknown names and stray braces stay as typed, and expanded values are never scanned again. No stored template (`default: true`) uses `draft.prompt`; an empty template gives an empty prompt. Templates are limited to 64 KiB.
 
 Errors: 404 `unknown_provider` (no active plugin provides suggestions under that id), 409 `stale_suggestion` (the item is no longer published, or its source is disabled), 400 `validation_failed` (`criterion` not declared by the provider), 403 `read_only`.
 
