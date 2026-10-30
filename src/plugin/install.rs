@@ -595,6 +595,9 @@ fn apply_prepared(
         "updating {id} to {}",
         prepared.fetched.manifest.version
     ));
+    let suggestions_changed = super::registry()
+        .get(id)
+        .is_none_or(|p| p.manifest.suggestions != prepared.fetched.manifest.suggestions);
     replace_and_build(id, &prepared.fetched, &final_dir, log)?;
 
     let granted = grant.is_some();
@@ -605,6 +608,9 @@ fn apply_prepared(
         &prepared.manifest_hash,
         prepared.featured_verified,
     )?;
+    if suggestions_changed {
+        forget_suggestion_publication(id);
+    }
     super::reload_registry();
 
     if prepared.caps_changed && !granted {
@@ -945,8 +951,33 @@ pub fn uninstall(id: &str) -> Result<()> {
     if lock.remove(id) {
         lock.save()?;
     }
+    forget_suggestion_publication(id);
     super::reload_registry();
     Ok(())
+}
+
+/// Best effort: the daemon holds the same database and republishes on its
+/// next refresh, so a failure only leaves stale rows until then. A worker
+/// still running can republish before the daemon reconciles.
+fn forget_suggestion_publication(plugin_id: &str) {
+    let result = (|| -> Result<()> {
+        let path = crate::session::get_app_dir()?.join(super::host_api::EVENTS_DB);
+        if !path.exists() {
+            return Ok(());
+        }
+        let conn = rusqlite::Connection::open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        super::suggestions::init(&conn)?;
+        super::suggestions::forget_publication(&conn, plugin_id)?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        tracing::warn!(
+            target: "plugin.install",
+            plugin = %plugin_id,
+            "could not clear published suggestions: {e:#}"
+        );
+    }
 }
 
 pub fn uninstall_logged(id: &str, log: &OperationLog) -> Result<()> {
@@ -1411,6 +1442,56 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("gh:"), "{err}");
+    }
+
+    /// A separate process clears a provider's published rows through the
+    /// database file, and does not create the file when no daemon ever has.
+    #[test]
+    #[serial]
+    fn forgetting_suggestions_reaches_the_daemons_database_file() {
+        let _home = isolate_app_dir();
+        let db = crate::session::get_app_dir()
+            .unwrap()
+            .join(super::super::host_api::EVENTS_DB);
+        forget_suggestion_publication("acme.thing");
+        assert!(!db.exists());
+
+        let host = super::super::host_api::HostApiState::open(&db, "default", 100).unwrap();
+        let count = |table: &str| -> i64 {
+            host.with_suggestions_db(|conn, _| {
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                    .unwrap()
+            })
+        };
+        host.with_suggestions_db(|conn, _| {
+            for (table, columns) in [
+                ("suggestion_providers", "updated_at"),
+                ("suggestion_items", "item_id, item_json"),
+                ("suggestion_sources", "criterion, enabled"),
+                ("suggestion_dismissals", "item_id"),
+            ] {
+                let values = match table {
+                    "suggestion_providers" => "0",
+                    "suggestion_items" => "'a', '{}'",
+                    "suggestion_sources" => "'c', 1",
+                    _ => "'a'",
+                };
+                conn.execute(
+                    &format!(
+                        "INSERT INTO {table} (profile, provider_id, {columns}) VALUES ('p', 'acme.thing', {values})"
+                    ),
+                    [],
+                )
+                .unwrap();
+            }
+        });
+
+        forget_suggestion_publication("acme.thing");
+
+        assert_eq!(count("suggestion_providers"), 0);
+        assert_eq!(count("suggestion_items"), 0);
+        assert_eq!(count("suggestion_sources"), 1);
+        assert_eq!(count("suggestion_dismissals"), 1);
     }
 
     /// Uninstall removes only a configured external plugin's directory: a

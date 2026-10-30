@@ -142,7 +142,7 @@ impl PluginHost {
             .with_context(|| format!("prepare {}", workers_dir.display()))?;
         worker_logs::prune_legacy(&workers_dir);
         let api = HostApiState::open(
-            &app_dir.join("plugin_events.db"),
+            &app_dir.join(crate::plugin::host_api::EVENTS_DB),
             profile,
             EVENT_RETENTION_PER_TOPIC,
         )?;

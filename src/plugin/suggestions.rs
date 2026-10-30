@@ -197,6 +197,24 @@ pub(super) fn set(
     Ok(json!({ "ok": true, "accepted": accepted.len(), "dropped": total - accepted.len() }))
 }
 
+/// Drops what a provider's worker published, in every profile, so a
+/// reinstalled or changed plugin starts `pending`. Sources, dismissals,
+/// templates and mappings are user state and stay.
+pub(super) fn forget_publication(conn: &Connection, provider_id: &str) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    for table in [
+        "suggestion_checks",
+        "suggestion_items",
+        "suggestion_providers",
+    ] {
+        tx.execute(
+            &format!("DELETE FROM {table} WHERE provider_id = ?1"),
+            [provider_id],
+        )?;
+    }
+    tx.commit()
+}
+
 pub(super) fn error(
     conn: &Connection,
     profile: &str,
@@ -1094,6 +1112,83 @@ mod tests {
         assert_eq!(snap(&conn, "other")["items"], json!([]));
         assert!(set_dismissed(&conn, "p", &p, "a", false).unwrap());
         assert_eq!(snap(&conn, "p")["items"][0]["dismissed"], false);
+    }
+
+    #[test]
+    fn forgetting_a_publication_keeps_user_state() {
+        let conn = store();
+        let p = provider();
+        for profile in ["p", "q"] {
+            publish(&conn, profile, &[item("a", "assigned")]);
+            set_source(&conn, profile, "acme.github", "quiet", true).unwrap();
+            assert!(set_dismissed(&conn, profile, &p, "a", true).unwrap());
+            for (table, columns, values) in [
+                ("suggestion_checks", "checks_json", "'[]'"),
+                (
+                    "suggestion_templates",
+                    "criterion, template",
+                    "'assigned', 't'",
+                ),
+                (
+                    "suggestion_mappings",
+                    "mapping_key, projects_json",
+                    "'k', '[]'",
+                ),
+            ] {
+                conn.execute(
+                    &format!(
+                        "INSERT INTO {table} (profile, provider_id, {columns}) VALUES ('{profile}', 'acme.github', {values})"
+                    ),
+                    [],
+                )
+                .unwrap();
+            }
+        }
+        publish(&conn, "p", &[item("a", "assigned")]);
+        conn.execute(
+            "INSERT INTO suggestion_providers (profile, provider_id, updated_at) VALUES ('p', 'other', 0)",
+            [],
+        )
+        .unwrap();
+
+        forget_publication(&conn, "acme.github").unwrap();
+
+        let count = |table: &str| -> i64 {
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE provider_id = 'acme.github'"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        for table in [
+            "suggestion_providers",
+            "suggestion_items",
+            "suggestion_checks",
+        ] {
+            assert_eq!(count(table), 0, "{table}");
+        }
+        for table in [
+            "suggestion_sources",
+            "suggestion_dismissals",
+            "suggestion_templates",
+            "suggestion_mappings",
+        ] {
+            assert_eq!(count(table), 2, "{table}");
+        }
+        let other: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM suggestion_providers WHERE provider_id = 'other'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(other, 1);
+        let after = snap(&conn, "p");
+        assert_eq!(after["providers"][0]["status"], "pending");
+        assert!(ids(&after).is_empty());
+        publish(&conn, "p", &[item("a", "assigned")]);
+        assert_eq!(snap(&conn, "p")["items"][0]["dismissed"], true);
     }
 
     #[test]
