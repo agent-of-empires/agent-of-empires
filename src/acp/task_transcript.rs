@@ -19,6 +19,8 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tokio::sync::mpsc::WeakSender;
 use tokio_util::sync::CancellationToken;
 
+use chrono::{DateTime, Utc};
+
 use crate::acp::background_agent::TailerStart;
 use crate::acp::state::{BackgroundTaskLaunch, Event};
 use crate::acp::workflow_journal::WorkflowJournal;
@@ -52,13 +54,13 @@ pub(crate) type IdleHook = Arc<dyn Fn() + Send + Sync>;
 /// leak into (a tool result that read another transcript, model text, API
 /// dumps), so a substring match on the raw line is not enough. Monitor event
 /// notifications carry the task id without a status.
-fn is_terminal_notification(line: &str, task_id: &str, tool_call_id: &str) -> bool {
+/// Returns when it ended: the entry's own time, so a resumed read does not
+/// count daemon downtime.
+fn terminal_notification(line: &str, task_id: &str, tool_call_id: &str) -> Option<DateTime<Utc>> {
     if !line.contains(task_id) {
-        return false;
+        return None;
     }
-    let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
-        return false;
-    };
+    let entry = serde_json::from_str::<serde_json::Value>(line).ok()?;
     let content = match entry.get("type").and_then(serde_json::Value::as_str) {
         Some("queue-operation")
             if entry.get("operation").and_then(serde_json::Value::as_str) == Some("enqueue") =>
@@ -68,9 +70,7 @@ fn is_terminal_notification(line: &str, task_id: &str, tool_call_id: &str) -> bo
         Some("user") => entry.pointer("/message/content"),
         _ => None,
     };
-    let Some(content) = content else {
-        return false;
-    };
+    let content = content?;
     let matches = |text: &str| {
         let Some(body) = text.trim_start().strip_prefix("<task-notification>") else {
             return false;
@@ -96,7 +96,7 @@ fn is_terminal_notification(line: &str, task_id: &str, tool_call_id: &str) -> bo
             && field("<status>", "</status>")
                 .is_some_and(|status| TERMINAL_STATUSES.contains(&status))
     };
-    content.as_str().is_some_and(matches)
+    let ended = content.as_str().is_some_and(matches)
         || content.as_array().is_some_and(|parts| {
             parts.iter().any(|part| {
                 part.get("type").and_then(serde_json::Value::as_str) == Some("text")
@@ -105,7 +105,14 @@ fn is_terminal_notification(line: &str, task_id: &str, tool_call_id: &str) -> bo
                         .and_then(serde_json::Value::as_str)
                         .is_some_and(matches)
             })
-        })
+        });
+    ended.then(|| {
+        entry
+            .get("timestamp")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+            .map_or_else(Utc::now, |at| at.with_timezone(&Utc))
+    })
 }
 
 /// `<home>/projects/<encoded-cwd>/<session>.jsonl`. The encoded directory is
@@ -232,10 +239,10 @@ impl TaskTailer {
             let journal = self.workflow.take().map(|journal| {
                 tokio::spawn(journal.run(ended.clone(), owner.cancellation.clone()))
             });
-            tokio::select! {
+            let ended_at = tokio::select! {
                 () = owner.cancellation.cancelled() => return,
-                () = self.follow() => {}
-            }
+                ended_at = self.follow() => ended_at,
+            };
             ended.cancel();
             if let Some(journal) = journal {
                 let _ = journal.await;
@@ -249,7 +256,7 @@ impl TaskTailer {
                 let _ = tx
                     .send(Event::BackgroundTaskFinished {
                         task_id: self.task_id.clone(),
-                        ended_at: Some(chrono::Utc::now()),
+                        ended_at,
                     })
                     .await;
             }
@@ -305,7 +312,7 @@ struct Cursor {
 }
 
 enum Scan {
-    Ended,
+    Ended(DateTime<Utc>),
     /// Nothing ended the task yet.
     Pending,
     /// The transcript cannot be read any more.
@@ -313,26 +320,20 @@ enum Scan {
 }
 
 impl TaskTailer {
-    /// Returns once the task ended, or tracking was given up.
-    async fn follow(&self) {
-        let Some(tool_call_id) = self.tool_call_id.as_deref() else {
-            return;
-        };
+    /// Returns when the task ended, or `None` once tracking was given up.
+    async fn follow(&self) -> Option<DateTime<Utc>> {
+        let tool_call_id = self.tool_call_id.as_deref()?;
         // A task start implies the session already ran a tool, so its
         // transcript exists; one that cannot be found is not trackable.
-        let Some(home) = self.claude_home.clone() else {
-            return;
-        };
+        let home = self.claude_home.clone()?;
         let session = self.session_id.clone();
         let Ok(Some(path)) =
             tokio::task::spawn_blocking(move || find_session_transcript(&home, &session)).await
         else {
-            return;
+            return None;
         };
         let path = tokio::fs::canonicalize(&path).await.unwrap_or(path);
-        let Some(dir) = path.parent() else {
-            return;
-        };
+        let dir = path.parent()?;
         // Subscribe before the first read, so an append between the two still
         // wakes the loop. No watcher (noop service, failed install) means a
         // closed channel: fall back to polling.
@@ -363,11 +364,10 @@ impl TaskTailer {
         };
         let mut watched = true;
         loop {
-            if self.event_tx.upgrade().is_none() {
-                return;
-            }
+            self.event_tx.upgrade()?;
             match scan(&path, &mut cursor, &self.task_id, tool_call_id).await {
-                Scan::Ended | Scan::Gone => return,
+                Scan::Ended(at) => return Some(at),
+                Scan::Gone => return None,
                 Scan::Pending => {}
             }
             (self.idle)();
@@ -403,8 +403,8 @@ async fn scan(path: &Path, cursor: &mut Cursor, task_id: &str, tool_call_id: &st
         };
         read_any = true;
         cursor.offset += read as u64;
-        if scan_chunk(cursor, &buf[..read], task_id, tool_call_id) {
-            return Scan::Ended;
+        if let Some(at) = scan_chunk(cursor, &buf[..read], task_id, tool_call_id) {
+            return Scan::Ended(at);
         }
     }
     if !read_any {
@@ -424,9 +424,14 @@ async fn scan(path: &Path, cursor: &mut Cursor, task_id: &str, tool_call_id: &st
     Scan::Pending
 }
 
-/// Whether a line completed by `chunk` is the task's terminal notification.
+/// When the task ended, if a line completed by `chunk` is its terminal notification.
 /// Only the partial line at the end of the chunk is carried over.
-fn scan_chunk(cursor: &mut Cursor, chunk: &[u8], task_id: &str, tool_call_id: &str) -> bool {
+fn scan_chunk(
+    cursor: &mut Cursor,
+    chunk: &[u8],
+    task_id: &str,
+    tool_call_id: &str,
+) -> Option<DateTime<Utc>> {
     let mut rest = chunk;
     while !rest.is_empty() {
         let Some(end) = rest.iter().position(|byte| *byte == b'\n') else {
@@ -438,7 +443,7 @@ fn scan_chunk(cursor: &mut Cursor, chunk: &[u8], task_id: &str, tool_call_id: &s
                     cursor.carry.extend_from_slice(rest);
                 }
             }
-            return false;
+            return None;
         };
         let (line, after) = (&rest[..end], &rest[end + 1..]);
         rest = after;
@@ -448,23 +453,23 @@ fn scan_chunk(cursor: &mut Cursor, chunk: &[u8], task_id: &str, tool_call_id: &s
             continue;
         }
         let ended = if cursor.carry.is_empty() {
-            is_terminal_notification(&String::from_utf8_lossy(line), task_id, tool_call_id)
+            terminal_notification(&String::from_utf8_lossy(line), task_id, tool_call_id)
         } else if cursor.carry.len() + line.len() > MAX_LINE_BYTES {
-            false
+            None
         } else {
             cursor.carry.extend_from_slice(line);
-            is_terminal_notification(
+            terminal_notification(
                 &String::from_utf8_lossy(&cursor.carry),
                 task_id,
                 tool_call_id,
             )
         };
         cursor.carry.clear();
-        if ended {
-            return true;
+        if ended.is_some() {
+            return ended;
         }
     }
-    false
+    None
 }
 
 #[cfg(test)]
@@ -473,6 +478,8 @@ mod tests {
     use std::io::Write;
     use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver};
 
+    const NOTIFIED_AT: &str = "2026-01-01T00:00:05Z";
+
     /// The shape of the entries Claude Code writes: a JSON line whose string
     /// holds the notification.
     fn notification_line(task_id: &str, status: Option<&str>) -> String {
@@ -480,7 +487,7 @@ mod tests {
             .map(|s| format!("<status>{s}</status>\\n"))
             .unwrap_or_default();
         format!(
-            "{{\"type\":\"queue-operation\",\"operation\":\"enqueue\",\"content\":\"<task-notification>\\n<task-id>{task_id}</task-id>\\n<tool-use-id>toolu_1</tool-use-id>\\n{status}</task-notification>\"}}\n"
+            "{{\"type\":\"queue-operation\",\"operation\":\"enqueue\",\"timestamp\":\"{NOTIFIED_AT}\",\"content\":\"<task-notification>\\n<task-id>{task_id}</task-id>\\n<tool-use-id>toolu_1</tool-use-id>\\n{status}</task-notification>\"}}\n"
         )
     }
 
@@ -567,7 +574,7 @@ mod tests {
         ];
         for (name, line, want) in cases {
             assert_eq!(
-                is_terminal_notification(&line, "t-1", "toolu_1"),
+                terminal_notification(&line, "t-1", "toolu_1").is_some(),
                 want,
                 "{name}"
             );
@@ -633,7 +640,7 @@ mod tests {
         ];
         for (name, line, want) in cases {
             assert_eq!(
-                is_terminal_notification(&line, "t-1", "toolu_1"),
+                terminal_notification(&line, "t-1", "toolu_1").is_some(),
                 want,
                 "{name}"
             );
@@ -759,10 +766,7 @@ mod tests {
 
     fn finished_id(event: Event) -> String {
         match event {
-            Event::BackgroundTaskFinished {
-                task_id,
-                ended_at: Some(_),
-            } => task_id,
+            Event::BackgroundTaskFinished { task_id, .. } => task_id,
             other => panic!("expected BackgroundTaskFinished, got {other:?}"),
         }
     }
@@ -854,7 +858,17 @@ mod tests {
         initial.push_str(&notification_line("t-1", Some("killed")));
         let mut resumed = fixture(&initial);
         resumed.spawn(TailerStart::Resumed).await;
-        assert_eq!(finished_id(resumed.next().await), "t-1");
+        // It ended while the daemon was down: the finish keeps that time.
+        match resumed.next().await {
+            Event::BackgroundTaskFinished { task_id, ended_at } => {
+                assert_eq!(task_id, "t-1");
+                assert_eq!(
+                    ended_at.map(|at| at.to_rfc3339()).as_deref(),
+                    Some("2026-01-01T00:00:05+00:00")
+                );
+            }
+            other => panic!("expected BackgroundTaskFinished, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -986,7 +1000,7 @@ mod tests {
         let mut cursor = start_of_transcript();
         assert!(matches!(
             scan(&path, &mut cursor, "t-1", "toolu_1").await,
-            Scan::Ended
+            Scan::Ended(_)
         ));
         assert!(
             cursor.offset <= READ_CHUNK_BYTES as u64,
@@ -1007,7 +1021,7 @@ mod tests {
         let mut cursor = start_of_transcript();
         assert!(matches!(
             scan(&path, &mut cursor, "t-1", "toolu_1").await,
-            Scan::Ended
+            Scan::Ended(_)
         ));
         assert!(
             cursor.offset > READ_CHUNK_BYTES as u64,
@@ -1025,7 +1039,7 @@ mod tests {
         let mut cursor = start_of_transcript();
         assert!(matches!(
             scan(&path, &mut cursor, "t-1", "toolu_1").await,
-            Scan::Ended
+            Scan::Ended(_)
         ));
         assert!(cursor.carry.len() <= MAX_LINE_BYTES);
     }
