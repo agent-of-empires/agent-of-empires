@@ -8,7 +8,7 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `19`. The host rejects a manifest whose `api_version` is newer than it supports. |
+| `api_version` | The manifest *schema* version. The current schema is `20`. The host rejects a manifest whose `api_version` is newer than it supports. |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
 Each key below notes the `api_version` it needs. Target the newest schema your plugin uses, and set `aoe_version` to the host range you have tested.
@@ -19,7 +19,7 @@ Each key below notes the `api_version` it needs. Target the newest schema your p
 id = "dev.example.my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = 19
+api_version = 20
 aoe_version = ">=1.11.0, <2.0.0"
 description = "What the plugin does."
 capabilities = ["runtime.worker"]
@@ -30,11 +30,12 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `19`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `20`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). A manifest with `[runtime]` must declare `runtime.worker`. Static contributions need none. |
 | `screenshots` | array | no | Up to 8. Requires `api_version >= 5`. See [Screenshots](#screenshots). |
+| `suggestions` | table | no | Suggested-session sources the worker publishes. Requires `api_version >= 20` and `runtime.worker`. See [Suggested sessions](#suggested-sessions). |
 | `setting_defaults` | table | no | Overrides for core host settings, keyed by canonical path (e.g. `"theme.idle_decay_minutes"`). Resolution is user value, then plugin override, then core default. |
 
 ## Plugin id
@@ -243,6 +244,8 @@ With `api_version >= 9` a worker can discover ACP capabilities and create host-o
 | `sessions.turn.send` | `session.prompt` | Deliver a turn to a session **this plugin created**. |
 | `sessions.message.send` | `session.message` | Deliver a short text message to **any** session, like `aoe send`. See [Messaging any session](#messaging-any-session). `api_version >= 15`. |
 | `plugin.storage.get` / `set` / `cas` / `remove` | `runtime.worker` | Plugin-private durable key/value storage (see [Plugin storage](#plugin-storage)). |
+| `suggestions.set` / `error` / `sources` | `runtime.worker` | Publish suggested sessions (see [Suggested sessions](#suggested-sessions)). `api_version >= 20`. |
+| `projects.list` | `session.read` | Registered projects of the host profile, `{ projects: [{ name, path }] }`. |
 
 **Project selection (`api_version >= 11`).** `sessions.create` takes an optional `project_path` (the trust-checked primary repo) and `extra_project_paths` (the other repos of a multi-repo session). Omitting `project_path` creates a **scratch** session: a throwaway directory with no repository, so extras alongside it are refused. Every path is canonicalized and existence-checked host-side, fail-closed and capped per call.
 
@@ -310,6 +313,44 @@ A worker has a host-backed private key/value store, namespaced by its plugin id,
 | `plugin.storage.remove` | `{ key }` | `{ removed }` |
 
 Quotas per plugin: 64 keys, 256-byte keys, 64 KiB values. `cas` (compare-and-swap) enables safe concurrent updates: the write applies only when the stored value equals `expected`.
+
+## Suggested sessions
+
+A worker declares the criteria it publishes in a `[suggestions]` block:
+
+```toml
+[suggestions]
+[[suggestions.sources]]
+criterion = "review_requested"   # stable key, matches each item's `criterion`
+label = "Review requests"        # plural, user-facing
+description = "Open PRs where your review is requested."
+variables = ["pr_number", "repo"]   # `[a-z0-9_]+`, carried by every item
+[[suggestions.sources]]
+criterion = "ci_failed"
+label = "Failing checks on your PRs"
+default_enabled = false
+```
+
+At least one source is required. Criteria are unique, non-empty and at most 256 bytes; labels are non-empty. The block grants no session authority: it needs only `runtime.worker`, not `session.create` or `session.prompt`.
+
+| Method | Params | Result |
+|---|---|---|
+| `suggestions.sources` | `{}` | `{ sources: [{ criterion, enabled }] }` |
+| `suggestions.set` | `{ items }` | `{ ok, accepted, dropped }` |
+| `suggestions.error` | `{ message }` | `{ ok }` |
+
+Call `suggestions.sources` before discovering and skip every criterion that is not enabled. A source is enabled when its `default_enabled` (default `true`) says so. The host sends the `suggestions.refresh` notification (`{}`); on it, discover again and call `suggestions.set` or `suggestions.error`.
+
+An item is `{ id, title, reason, source_url, source_ref, preview, project?, criterion, variables, draft: { title, prompt } }`. `variables` holds exactly the names the item's source declares. Treat `preview`, `variables` and `draft` as untrusted source content. `projects.list` returns the registered projects so a provider can map its own keys to a `project` name or path.
+
+`suggestions.set` fails with invalid-params, and publishes nothing, when:
+
+- an item names an undeclared `criterion`, or its `variables` differ from the source's declaration;
+- `source_url` is not an http(s) URL;
+- `id`, `title` or `source_ref` is empty, or an `id` repeats;
+- there are more than 500 items, or a string exceeds its bound (`id` 256 bytes, `title` and `draft.title` 512, `reason`, `source_url`, `source_ref` and each variable value 2 KiB, `preview` 16 KiB, `draft.prompt` 64 KiB, `project` 4 KiB).
+
+Items of a source that is not enabled are dropped and counted in `dropped`. `suggestions.error` messages are limited to 4096 bytes.
 
 ## UI slots
 
