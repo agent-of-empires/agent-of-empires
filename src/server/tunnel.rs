@@ -231,14 +231,21 @@ impl TunnelHandle {
             funnel_lock,
         );
 
-        let mut child = Command::new(program)
+        let child = Command::new(program)
             .args(funnel_args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("failed to run tailscale funnel: {}", e))?;
+            .spawn();
+        let mut child = match child {
+            Ok(child) => child,
+            Err(e) => {
+                // `--bg` never ran, so there's nothing to turn off.
+                guard.disarm();
+                anyhow::bail!("failed to run tailscale funnel: {e}");
+            }
+        };
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
 
@@ -280,12 +287,13 @@ impl TunnelHandle {
                     Err(_) => "Enable it from your tailnet admin console under \
                               Settings > Features > Funnel.".to_string(),
                 };
-                return Err(anyhow::anyhow!(
+                let e = anyhow::anyhow!(
                     "Tailscale Funnel is not enabled for this tailnet.\n\n\
                      {detail}\n\n\
                      After enabling, re-run `aoe serve --remote`. \
                      Or pass --no-tailscale to use Cloudflare instead."
-                ));
+                );
+                return Err(guard.fail(e).await);
             }
             // `--bg` may have applied the config before it failed, so these exits go through
             // `fail()` too, and the error says what was left on.
@@ -580,7 +588,8 @@ async fn lock_funnel_starts(path: &std::path::Path) -> anyhow::Result<std::fs::F
 const FUNNEL_OFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Turns off the :443 Funnel a Tailscale start switched on, unless the start finishes.
-/// The error path awaits [`Self::reset`]; `Drop` only covers a start that was cancelled.
+/// Every error return after `--bg` starts awaits [`Self::fail`]; `Drop` covers a start that was
+/// cancelled, and any other early return.
 struct FunnelStartGuard {
     program: std::ffi::OsString,
     port: u16,
@@ -1323,8 +1332,8 @@ mod tests {
     /// A fake `tailscale` that logs each call's arguments and keeps a Funnel state file.
     /// Each start's first `status --json` is its capability check and its second the URL read,
     /// shaped by `url_read` (which can read the call count `$n`). `funnel status --json` prints the state (`None` makes it fail),
-    /// `funnel --bg` makes :443 public as the real one does, touches `bg-applied`, and then
-    /// runs `bg_exit`, and
+    /// `funnel --bg` runs `bg_before`, makes :443 public as the real one does, touches
+    /// `bg-applied`, and then runs `bg_exit`, and
     /// `funnel --https=443 off` runs `off` and then empties the state.
     #[cfg(unix)]
     fn fake_tailscale(
@@ -1333,6 +1342,7 @@ mod tests {
         url_read: &str,
         off: &str,
         bg_exit: &str,
+        bg_before: &str,
     ) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let fake = dir.join("tailscale");
@@ -1357,6 +1367,7 @@ case "$*" in
     {url_read} ;;
   "funnel status --json") {funnel_status} ;;
   "funnel --bg --yes "*)
+    {bg_before}
     if [ "$(cat '{state}')" = '{{}}' ]; then
       echo "{{\"Web\":{{\"node.ts.net:443\":{{\"Handlers\":{{\"/\":{{\"Proxy\":\"http://127.0.0.1:$4\"}}}}}}}},\"AllowFunnel\":{{\"node.ts.net:443\":true}}}}" > '{state}'
     elif ! grep -q '"node.ts.net:443":true' '{state}'; then
@@ -1525,7 +1536,7 @@ esac
         ];
         for r in cases {
             let dir = tempfile::tempdir().unwrap();
-            let fake = fake_tailscale(dir.path(), r.state, r.url_read, r.off_body, r.bg_exit);
+            let fake = fake_tailscale(dir.path(), r.state, r.url_read, r.off_body, r.bg_exit, "");
             let lock = dir.path().join("funnel.lock");
             let result = TunnelHandle::spawn_tailscale_with(fake.as_os_str(), &lock, 8081).await;
             let name = format!("{:?} / {} / {}", r.state, r.url_read, r.off_body);
@@ -1560,8 +1571,9 @@ esac
         let count = |calls: &[String], want: &str| calls.iter().filter(|c| *c == want).count();
         // (where the start is blocked when it's cancelled, `off` calls expected)
         let cases = [
-            // `--bg` may already have applied the config while it's still running.
+            // Cancelled while `--bg` runs: after it applied the config, or before (nothing to undo).
             ("bg", 1),
+            ("bg before apply", 0),
             ("url read", 1),
             // The cancel kills the awaited `off`, which may not have run, so Drop sends another.
             ("reset", 2),
@@ -1575,8 +1587,15 @@ esac
             );
             let once = dir.path().join("off-once");
             let once = once.display();
+            let started = dir.path().join("bg-started");
+            let bg_before = if blocked_in == "bg before apply" {
+                format!("touch '{}'; {block}", started.display())
+            } else {
+                String::new()
+            };
             let (url_read, off, bg_exit) = match blocked_in {
                 "bg" => ("exit 1".to_owned(), String::new(), block.clone()),
+                "bg before apply" => ("exit 1".to_owned(), String::new(), String::new()),
                 "url read" => (format!("{block}; exit 1"), String::new(), String::new()),
                 _ => (
                     "exit 1".to_owned(),
@@ -1584,7 +1603,14 @@ esac
                     String::new(),
                 ),
             };
-            let fake = fake_tailscale(dir.path(), Some("{}"), &url_read, &off, &bg_exit);
+            let fake = fake_tailscale(
+                dir.path(),
+                Some("{}"),
+                &url_read,
+                &off,
+                &bg_exit,
+                &bg_before,
+            );
             let program = fake.clone();
             let lock = dir.path().join("funnel.lock");
             let start = tokio::spawn(async move {
@@ -1597,6 +1623,7 @@ esac
                 let ready = match blocked_in {
                     // Markers: the config is applied, or the first `off` is under way.
                     "bg" => dir.path().join("bg-applied").exists(),
+                    "bg before apply" => started.exists(),
                     "url read" => count(&calls, "status --json") >= 2,
                     _ => dir.path().join("off-once").exists(),
                 };
@@ -1618,8 +1645,11 @@ esac
             // nothing is left to a thread that could die with the Daemon.
             assert!(start.await.is_err_and(|e| e.is_cancelled()));
             let after = argv_log(dir.path());
+            let state = std::fs::read_to_string(dir.path().join("funnel-state")).unwrap();
             std::fs::write(&release, "").unwrap();
             assert_eq!(count(&after, OFF), offs, "{blocked_in}: {after:?}");
+            // Turned off, or never applied: either way :443 is empty again.
+            assert_eq!(state.trim(), "{}", "{blocked_in}");
         }
     }
 
@@ -1637,7 +1667,7 @@ esac
                 "while [ ! -f '{}' ]; do sleep 0.05; done; exit 1",
                 release.display()
             );
-            let fake = fake_tailscale(dir.path(), Some("{}"), &url_read, "", "");
+            let fake = fake_tailscale(dir.path(), Some("{}"), &url_read, "", "", "");
             let program = fake.clone();
             let lock = dir.path().join("funnel.lock");
             // Start A switches Funnel on for 8081, then waits on its URL read.
@@ -1700,7 +1730,7 @@ esac
             release = release.display(),
             log = log.display(),
         );
-        let fake = fake_tailscale(dir.path(), Some("{}"), url_read, &off, "");
+        let fake = fake_tailscale(dir.path(), Some("{}"), url_read, &off, "", "");
         let lock = dir.path().join("funnel.lock");
         let start = |port: u16| {
             let (program, lock) = (fake.clone(), lock.clone());
