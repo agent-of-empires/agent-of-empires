@@ -1346,7 +1346,7 @@ mod tests {
             format!("[host_hooks]\nbefore_session = \"curl --max-time 10 -fsS http://{address}/hook\"\n"),
         )
         .unwrap();
-        let spawning = {
+        let mut spawning = {
             let state = Arc::clone(&state);
             let id = id.clone();
             tokio::spawn(async move {
@@ -1378,8 +1378,10 @@ mod tests {
         .await
         .expect("stop request must acquire its fence while the hook is active");
         assert!(
-            !spawning.is_finished(),
-            "cancellation must wait for the running hook"
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut spawning)
+                .await
+                .is_err(),
+            "cancellation must not settle while the hook remains blocked"
         );
         release.notify_one();
         let response = tokio::time::timeout(std::time::Duration::from_secs(5), spawning)
