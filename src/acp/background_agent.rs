@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{Sender, WeakSender};
 use tokio_util::sync::CancellationToken;
 
 use crate::acp::state::{BackgroundAgentStatus, Event};
@@ -181,42 +181,90 @@ pub fn spawn_tailer(
             active,
             agent_id: agent_id.clone(),
         };
-        run_tailer(agent_id, output_file, source, event_tx, start, None).await;
+        run_tailer(agent_id, output_file, source, event_tx, start).await;
     });
 }
 
 /// Like [`spawn_tailer`], for a sub-agent whose end someone else reports (a
 /// workflow agent, ended by its run's journal): only progress is emitted, and
-/// the tailer runs until `stop` fires or the session goes away.
+/// the tailer runs until `stop` fires or the session goes away. The publisher
+/// is weak so a reader never keeps a dead connection's channel open.
 pub(crate) fn spawn_progress_tailer(
     agent_id: String,
     output_file: String,
-    event_tx: Sender<Event>,
+    event_tx: WeakSender<Event>,
     active: Arc<Mutex<HashSet<String>>>,
     stop: CancellationToken,
-) {
+) -> Option<tokio::task::JoinHandle<()>> {
     if !active
         .lock()
         .expect("bg-agent active set mutex poisoned")
         .insert(agent_id.clone())
     {
-        return;
+        return None;
     }
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         let _guard = ActiveGuard {
             active,
             agent_id: agent_id.clone(),
         };
-        run_tailer(
-            agent_id,
-            output_file,
-            TranscriptSource::Host,
-            event_tx,
-            TailerStart::Live,
-            Some(stop),
-        )
-        .await;
-    });
+        run_progress_tailer(agent_id, output_file, event_tx, stop).await;
+    }))
+}
+
+async fn run_progress_tailer(
+    agent_id: String,
+    output_file: String,
+    event_tx: WeakSender<Event>,
+    stop: CancellationToken,
+) {
+    let source = TranscriptSource::Host;
+    let mut offset: u64 = 0;
+    let mut line_buf = String::new();
+    let mut snap = Snapshot::default();
+    let mut last_progress = Utc::now() - chrono::Duration::seconds(10);
+    let mut last_growth = Utc::now();
+    let mut stalled_emitted = false;
+    loop {
+        let grew = source.exists(&output_file).await
+            && read_new_lines(&source, &output_file, &mut offset, &mut line_buf, &mut snap).await;
+        let now = Utc::now();
+        if grew {
+            last_growth = now;
+            stalled_emitted = false;
+        }
+        let idle = (now - last_growth).to_std().unwrap_or(Duration::ZERO);
+        let status = if idle >= STALL_AFTER {
+            BackgroundAgentStatus::Stalled
+        } else {
+            BackgroundAgentStatus::Running
+        };
+        let throttle_ok = (now - last_progress)
+            .to_std()
+            .map(|d| d >= PROGRESS_THROTTLE)
+            .unwrap_or(true);
+        let stall_edge = status == BackgroundAgentStatus::Stalled && !stalled_emitted;
+        if (grew && throttle_ok) || stall_edge {
+            let Some(tx) = event_tx.upgrade() else {
+                return; // session gone
+            };
+            if tx
+                .send(progress(agent_id.clone(), status, &snap))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            last_progress = now;
+            stalled_emitted |= stall_edge;
+        } else if event_tx.upgrade().is_none() {
+            return;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(POLL_INTERVAL) => {}
+            _ = stop.cancelled() => return,
+        }
+    }
 }
 
 /// One tool call parsed from the transcript, tracked by its tool_use id
@@ -260,20 +308,13 @@ async fn run_tailer(
     source: TranscriptSource,
     event_tx: Sender<Event>,
     start: TailerStart,
-    stop: Option<CancellationToken>,
 ) {
-    let stopped = || async {
-        match &stop {
-            Some(stop) => stop.cancelled().await,
-            None => std::future::pending().await,
-        }
-    };
     // Wait for the transcript to appear (the SDK writes it shortly after
     // the launch event). For a sandboxed session this checks inside the
     // container, not the host.
     let mut waited = Duration::ZERO;
     while !source.exists(&output_file).await {
-        if waited >= WAIT_FILE_FOR && stop.is_none() {
+        if waited >= WAIT_FILE_FOR {
             let (status, warning) = missing_transcript_outcome(start);
             let _ = event_tx
                 .send(completed(
@@ -289,7 +330,6 @@ async fn run_tailer(
         tokio::select! {
             _ = tokio::time::sleep(POLL_INTERVAL) => waited += POLL_INTERVAL,
             _ = event_tx.closed() => return, // session gone
-            _ = stopped() => return,
         }
     }
 
@@ -309,7 +349,7 @@ async fn run_tailer(
             stalled_emitted = false;
         }
 
-        if snap.done && stop.is_none() {
+        if snap.done {
             // The explicit end_turn completion path.
             let warning = format_warning(&snap);
             let _ = event_tx
@@ -325,7 +365,7 @@ async fn run_tailer(
         }
 
         let idle = (now - last_growth).to_std().unwrap_or(Duration::ZERO);
-        if idle >= ABORT_AFTER && stop.is_none() {
+        if idle >= ABORT_AFTER {
             // Stopped tracking.
             let (status, result, warning) = infer_idle_outcome(&snap);
             let _ = event_tx
@@ -370,7 +410,6 @@ async fn run_tailer(
         tokio::select! {
             _ = tokio::time::sleep(POLL_INTERVAL) => {}
             _ = event_tx.closed() => return,
-            _ = stopped() => return,
         }
     }
 }
@@ -656,21 +695,25 @@ mod tests {
         let active = Arc::new(Mutex::new(HashSet::new()));
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let stop = CancellationToken::new();
-        spawn_progress_tailer(
+        let tailer = spawn_progress_tailer(
             "wf-agent".into(),
             path.to_string_lossy().into_owned(),
-            tx,
+            tx.downgrade(),
             active.clone(),
             stop.clone(),
-        );
+        )
+        .unwrap();
         match rx.recv().await {
             Some(Event::BackgroundAgentProgress { tool_count, .. }) => assert_eq!(tool_count, 1),
             other => panic!("expected progress, got {other:?}"),
         }
         stop.cancel();
-        // The tailer drops its sender on exit, so the channel closes with no
-        // completion in between.
-        assert!(rx.recv().await.is_none());
+        tailer.await.unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "no completion from a progress tailer"
+        );
+        assert!(active.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

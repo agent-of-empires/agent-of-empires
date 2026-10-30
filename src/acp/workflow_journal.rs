@@ -91,7 +91,7 @@ impl WorkflowJournal {
         };
         let mut watched = true;
         loop {
-            if !follower.read_new(&journal).await {
+            if follower.journal.event_tx.upgrade().is_none() || !follower.read_new(&journal).await {
                 follower.stop_tailers();
                 return;
             }
@@ -256,15 +256,12 @@ impl Follower {
                     }
                 }
                 if !self.completed.contains(agent_id) && !self.tailers.contains_key(agent_id) {
-                    let Some(tx) = self.journal.event_tx.upgrade() else {
-                        return false;
-                    };
                     let stop = CancellationToken::new();
                     self.tailers.insert(agent_id.to_string(), stop.clone());
-                    spawn_progress_tailer(
+                    let _ = spawn_progress_tailer(
                         agent_id.to_string(),
                         output_file.to_string_lossy().into_owned(),
-                        tx,
+                        self.journal.event_tx.clone(),
                         self.journal.bg_agents.clone(),
                         stop,
                     );
@@ -510,6 +507,33 @@ mod tests {
             summarize(&rest),
             [r#"completed a1 Completed Some("drafted")"#]
         );
+    }
+
+    /// The supervisor's drain recovers only once every sender of a dead
+    /// connection is gone, so nothing a run starts may hold one.
+    #[tokio::test]
+    async fn a_dead_connection_is_not_kept_open_by_workflow_agents() {
+        let fx = Fixture::new();
+        fx.append(&[STARTED_A1]);
+        std::fs::write(fx.dir.join("agent-a1.jsonl"), "").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let journal = fx.journal(&fx.dir, WorkflowAgents::default(), &tx);
+        let run = tokio::spawn(journal.run(CancellationToken::new(), CancellationToken::new()));
+        assert!(matches!(
+            rx.recv().await,
+            Some(Event::BackgroundAgentLaunched { .. })
+        ));
+        // The connection ends with the run unfinished; the receiver stays open.
+        drop(tx);
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while rx.recv().await.is_some() {}
+        })
+        .await;
+        assert!(closed.is_ok(), "a workflow reader kept the channel open");
+        tokio::time::timeout(std::time::Duration::from_secs(10), run)
+            .await
+            .expect("the journal follower outlived its connection")
+            .unwrap();
     }
 
     #[tokio::test]
