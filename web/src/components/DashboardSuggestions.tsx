@@ -93,7 +93,7 @@ export function DashboardSuggestions({ readOnly = false, onPrepare, onViewAll }:
   };
 
   return (
-    <section className="mb-4 w-full max-w-2xl" aria-labelledby="suggested-sessions-heading">
+    <section className="mb-4 mt-3 w-full max-w-2xl" aria-labelledby="suggested-sessions-heading">
       <div className="mb-2 flex items-baseline justify-between px-1">
         <h2
           id="suggested-sessions-heading"
