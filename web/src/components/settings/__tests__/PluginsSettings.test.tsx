@@ -401,6 +401,24 @@ describe("updates", () => {
       "session-agent: TOKEN=local agent --flag",
     );
   });
+  it("shows a fallback when an update agent integration declares no command, and approves", async () => {
+    await openReview(
+      consentPreview({
+        prior_capabilities: [],
+        new_capabilities: [],
+        added_capabilities: [],
+        removed_capabilities: [],
+        ui: [],
+        build_steps: [],
+        agent_integrations: [{ tool: "session-agent" }],
+      }),
+    );
+    expect((await screen.findByTestId("plugin-update-agent-integrations")).textContent).toContain(
+      "session-agent: No launch command declared",
+    );
+    await click("plugin-update-approve");
+    await waitFor(() => expect(api.applyPluginUpdate).toHaveBeenCalledWith("example.plugin", "treeB||community"));
+  });
 
   it("renders removed caps, runtime change, trust downgrade, and an empty changelog", async () => {
     await openReview(
@@ -544,6 +562,26 @@ describe("marketplace", () => {
     expect((await screen.findByTestId("plugin-install-agent-integrations")).textContent).toContain(
       "session-agent: TOKEN=local agent --flag",
     );
+  });
+  it("shows a fallback when an install agent integration declares no command, and approves", async () => {
+    if (installConsent.kind !== "ok") throw new Error("expected an install consent fixture");
+    api.previewPluginInstall.mockResolvedValue({
+      kind: "ok",
+      consent: {
+        ...installConsent.consent,
+        capabilities: [],
+        ui: [],
+        build_steps: [],
+        agent_integrations: [{ tool: "session-agent" }],
+      },
+    });
+    await search();
+    await click("plugins-install-gh:acme/widget");
+    expect((await screen.findByTestId("plugin-install-agent-integrations")).textContent).toContain(
+      "session-agent: No launch command declared",
+    );
+    await click("plugin-install-approve");
+    await waitFor(() => expect(api.startPluginInstall).toHaveBeenCalledWith("gh:acme/widget", "treeA||community"));
   });
 
   it("surfaces a preview error without opening the consent modal", async () => {

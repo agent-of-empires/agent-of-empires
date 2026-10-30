@@ -2834,8 +2834,86 @@ fn agent_probe_output(
     }
 }
 
+fn home_dir() -> Option<String> {
+    std::env::var_os("HOME").and_then(|home| home.into_string().ok())
+}
+
+/// Expand the supported `$HOME`/`${HOME}` and leading `~` in a discovery
+/// command so the probe agrees with the launch shell. Quote context is
+/// preserved: single-quoted `$HOME` stays literal (the launch does not expand
+/// it), while unquoted and double-quoted forms expand. Unsupported constructs
+/// are left verbatim here and rejected later only when they sit in the probed
+/// assignments or executable (never in trailing agent arguments).
+fn expand_home_in_command(command: &str) -> String {
+    let home = home_dir().unwrap_or_default();
+    let mut out = String::with_capacity(command.len() + 16);
+    let mut chars = command.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if !in_double => {
+                in_single = !in_single;
+                out.push(c);
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                out.push(c);
+            }
+            '$' if !in_single => {
+                if chars.peek() == Some(&'{') {
+                    chars.next();
+                    let mut name = String::new();
+                    for ch in chars.by_ref() {
+                        if ch == '}' {
+                            break;
+                        }
+                        name.push(ch);
+                    }
+                    if name == "HOME" {
+                        out.push_str(&home);
+                    } else {
+                        out.push_str("${");
+                        out.push_str(&name);
+                        out.push('}');
+                    }
+                } else {
+                    let mut token = String::new();
+                    while let Some(&next) = chars.peek() {
+                        if next.is_ascii_alphanumeric() || next == '_' {
+                            token.push(next);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    if token == "HOME" {
+                        out.push_str(&home);
+                    } else {
+                        out.push('$');
+                        out.push_str(&token);
+                    }
+                }
+            }
+            '~' if !in_single
+                && matches!(
+                    out.chars().last(),
+                    None | Some(' ') | Some('\t') | Some('=') | Some(':')
+                ) =>
+            {
+                match chars.peek() {
+                    Some('/') | None => out.push_str(&home),
+                    Some(_) => out.push('~'),
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn plugin_command_parts(command: &str) -> Option<(Vec<String>, usize)> {
-    let words = shell_words::split(command).ok()?;
+    let words = shell_words::split(&expand_home_in_command(command)).ok()?;
     let assignments = words
         .iter()
         .take_while(|word| {
@@ -2843,7 +2921,20 @@ fn plugin_command_parts(command: &str) -> Option<(Vec<String>, usize)> {
                 .is_some_and(|(key, _)| crate::session::environment::is_valid_env_key(key))
         })
         .count();
-    (words.get(assignments).is_some()).then_some((words, assignments))
+    if words.len() <= assignments {
+        return None;
+    }
+    // Only the assignments and the executable are probed, so only there do we
+    // refuse constructs discovery cannot safely verify (command substitution,
+    // backticks, or a `$` the launch would expand but we kept literal). Trailing
+    // agent arguments are never inspected or run.
+    if words[..=assignments]
+        .iter()
+        .any(|word| word.contains('$') || word.contains('`'))
+    {
+        return None;
+    }
+    Some((words, assignments))
 }
 
 fn plugin_command_on_path(command: &str) -> bool {
@@ -3765,6 +3856,13 @@ mod tests {
             ("login-agent", true),
             ("TOKEN=local login-agent", true),
             (injected.as_str(), true),
+            // `$HOME` and `~/` expand so discovery agrees with the launch shell.
+            ("PATH=$HOME/login-bin login-agent", true),
+            ("PATH=~/login-bin login-agent", true),
+            // Single-quoted `$HOME` stays literal, as the launch shell would.
+            ("PATH='$HOME/login-bin' login-agent", false),
+            // Command substitution in a probed part is rejected, never run.
+            ("PATH=$(printf /missing) login-agent", false),
             ("PATH=/missing direct-agent", false),
             ("TOKEN=local", false),
             ("9INVALID=local direct-agent", false),
@@ -3902,6 +4000,60 @@ mod tests {
         ] {
             assert!(!is_fish_shell(shell), "{shell} must keep the POSIX dialect");
         }
+    }
+
+    #[test]
+    fn expand_home_in_command_expands_home_and_keeps_quote_context() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::session::test_support::EnvGuard::set(&[("HOME", home.path())]);
+        let h = home.path().to_string_lossy().into_owned();
+        assert_eq!(
+            expand_home_in_command("PATH=$HOME/.local/bin acmebot"),
+            format!("PATH={h}/.local/bin acmebot")
+        );
+        assert_eq!(
+            expand_home_in_command("PATH=\"$HOME/.local bin\" acmebot"),
+            format!("PATH=\"{h}/.local bin\" acmebot")
+        );
+        assert_eq!(
+            expand_home_in_command("PATH=${HOME}/bin acmebot"),
+            format!("PATH={h}/bin acmebot")
+        );
+        assert_eq!(
+            expand_home_in_command("PATH=~/bin acmebot"),
+            format!("PATH={h}/bin acmebot")
+        );
+        // Single quotes preserve a literal `$HOME`, exactly as the launch shell.
+        assert_eq!(
+            expand_home_in_command("PATH='$HOME/.local/bin' acmebot"),
+            "PATH='$HOME/.local/bin' acmebot"
+        );
+        // `~user` is another user's home and stays literal.
+        assert_eq!(
+            expand_home_in_command("PATH=~alice/bin acmebot"),
+            "PATH=~alice/bin acmebot"
+        );
+    }
+
+    #[test]
+    fn plugin_command_parts_rejects_unverifiable_probed_constructs() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::session::test_support::EnvGuard::set(&[("HOME", home.path())]);
+        let h = home.path().to_string_lossy().into_owned();
+        // Expanded and accepted.
+        let (words, assignments) = plugin_command_parts("PATH=$HOME/bin acmebot").unwrap();
+        assert_eq!(words, vec![format!("PATH={h}/bin"), "acmebot".to_string()]);
+        assert_eq!(assignments, 1);
+        // Command substitution, backticks, and other variables in a probed part
+        // are refused: discovery never runs arbitrary shell.
+        assert!(plugin_command_parts("PATH=$(printf /tmp) acmebot").is_none());
+        assert!(plugin_command_parts("PATH=`echo /tmp` acmebot").is_none());
+        assert!(plugin_command_parts("PATH=${OTHER} acmebot").is_none());
+        assert!(plugin_command_parts("PATH=$HOME_x acmebot").is_none());
+        // A single-quoted literal `$HOME` is refused too (it cannot be verified).
+        assert!(plugin_command_parts("PATH='$HOME/bin' acmebot").is_none());
+        // Unsupported constructs in trailing arguments are not probed.
+        assert!(plugin_command_parts("acmebot \"$(printf x)\"").is_some());
     }
 
     #[test]
