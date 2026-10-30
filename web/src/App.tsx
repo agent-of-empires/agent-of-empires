@@ -56,7 +56,7 @@ import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
 import { useMobileViewportLock } from "./hooks/useMobileViewportLock";
 import { useIsWideViewport } from "./hooks/useIsWideViewport";
 import type { RightPanelView } from "./lib/rightPanelView";
-import { usePaneLayout, dockTabs, dockGroups, dockOf, isActiveTab, isDockCollapsed } from "./lib/paneLayout";
+import { usePaneLayout, dockTabs, dockGroups, dockOf, isDockCollapsed } from "./lib/paneLayout";
 import { isPluginPaneId, resolvePaneIcon, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
 import { PluginPaneBody } from "./components/plugin/PluginPane";
 import { PluginPageView } from "./components/plugin/PluginPageView";
@@ -151,8 +151,9 @@ import { hasStartedBefore } from "./components/acp/startupWait";
 import { DiffPane } from "./components/DiffPane";
 import { FilesPane } from "./components/FilesPane";
 import { FileContentViewer } from "./components/diff/FileContentViewer";
-import { PairedShellPane, type ShellMode } from "./components/PairedTerminal";
+import { PairedShellPane } from "./components/PairedTerminal";
 import { usePairedShellModes } from "./hooks/usePairedShellModes";
+import { useOpenPairedTerminal, usePairedTerminalReveal } from "./hooks/usePairedTerminalReveal";
 import { BUILTIN_PANES, isTerminalTabId, terminalIndexOf, terminalTabId, type DockLocation } from "./lib/panes";
 import { MobileRightPanelPicker } from "./components/MobileRightPanelPicker";
 import { MobileMainPane } from "./components/MobileMainPane";
@@ -1710,50 +1711,15 @@ function AppContent({
     setShowSessionWizard(true);
   }, []);
 
-  // Shows and focuses the paired shell, never toggling back to the Agent; returns the terminal it shows.
-  const showPairedTerminal = useCallback((): number => {
-    if (singlePane) {
-      // Below md there is one full-viewport pane. Promote the paired view,
-      // then dispatch focus on the next frame: the inactive layer is inert
-      // until React commits the switch, and focus() on an inert subtree is
-      // a no-op. The paired shell mounts lazily on first activation, so its
-      // PTY may not be ready when the dispatch fires; latch the intent too,
-      // and PairedTerminal grabs focus once ready.
-      setRightPanelView("paired");
-      setPendingTerminalFocus("paired");
-      requestAnimationFrame(() => dispatchFocusTerminal("paired"));
-      return 0;
-    }
-    // The paired shell only mounts when a terminal tab is the active tab of
-    // its group. Prefer a terminal that is already active (and thus mounted)
-    // over the first one, so multi-group layouts focus the live terminal
-    // instead of switching another group's tab.
-    const terminalTabs = (["right", "bottom"] as DockLocation[])
-      .flatMap((d) => dockTabs(paneLayout, d))
-      .filter(isTerminalTabId);
-    const termTab = terminalTabs.find((id) => isActiveTab(paneLayout, id)) ?? terminalTabs[0] ?? terminalTabId(0);
-    const termDock = dockOf(paneLayout, termTab);
-    if (termDock && isActiveTab(paneLayout, termTab)) {
-      // Already the active tab (mounted): move focus synchronously so rapid
-      // agent<->paired toggles stay deterministic.
-      dispatchFocusTerminal("paired");
-      return terminalIndexOf(termTab);
-    }
-    // Not mounted yet: latch the intent and activate/open its tab; the paired
-    // panel grabs focus once its PTY is ready.
-    setPendingTerminalFocus("paired");
-    if (termDock) activateTab(termDock, termTab);
-    else openTab(termTab, "right");
-    return terminalIndexOf(termTab);
-  }, [singlePane, paneLayout, openTab, activateTab]);
+  const showPairedTerminal = usePairedTerminalReveal({
+    singlePane,
+    layout: paneLayout,
+    openTab,
+    activateTab,
+    setRightPanelView,
+  });
 
-  const handleOpenPairedTerminal = useCallback(
-    (sessionId: string, mode: ShellMode) => {
-      if (sessionId !== activeSessionId) return;
-      setShellMode(sessionId, showPairedTerminal(), mode);
-    },
-    [activeSessionId, setShellMode, showPairedTerminal],
-  );
+  const handleOpenPairedTerminal = useOpenPairedTerminal(activeSessionId, showPairedTerminal, setShellMode);
 
   const handleToggleTerminalFocus = useCallback(() => {
     if (!activeSessionId) return;
