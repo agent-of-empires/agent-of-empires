@@ -12,6 +12,100 @@ use crate::acp::state::Event;
 use crate::server::{acp_ws, api};
 
 /// Applies live status, unread and session-id observations.
+/// One line per lifecycle frame. Approval lines carry the call id, never the
+/// title: for Bash-style tools the title is the full command.
+fn log_frame(frame: &crate::acp::protocol::AcpBroadcastFrame) {
+    match frame.event.as_ref() {
+        Event::ApprovalRequested { approval } => tracing::info!(
+            target: "acp.event_listener",
+            session = %frame.session_id,
+            call = %approval.tool_call.id,
+            kind = %approval.tool_call.kind,
+            destructive = approval.destructive,
+            nonce = %approval.nonce.0,
+            "approval requested"
+        ),
+        Event::ApprovalResolved { nonce, decision } => tracing::info!(
+            target: "acp.event_listener",
+            session = %frame.session_id,
+            nonce = %nonce.0,
+            ?decision,
+            "approval resolved"
+        ),
+        Event::ElicitationRequested { elicitation } => tracing::info!(
+            target: "acp.event_listener",
+            session = %frame.session_id,
+            nonce = %elicitation.nonce.0,
+            questions = elicitation.questions.len(),
+            "question asked"
+        ),
+        Event::ElicitationResolved { nonce, outcome, .. } => tracing::info!(
+            target: "acp.event_listener",
+            session = %frame.session_id,
+            nonce = %nonce.0,
+            ?outcome,
+            "question answered"
+        ),
+        Event::ConversationCompactionStarted => tracing::info!(
+            target: "acp.event_listener",
+            session = %frame.session_id,
+            "compaction started"
+        ),
+        Event::ConversationCompacted => tracing::info!(
+            target: "acp.event_listener",
+            session = %frame.session_id,
+            "compaction completed"
+        ),
+        Event::ConversationCompactionFailed => tracing::warn!(
+            target: "acp.event_listener",
+            session = %frame.session_id,
+            "compaction failed"
+        ),
+        Event::ConversationCompactionSummary {
+            compaction_id,
+            text,
+        } => tracing::debug!(
+            target: "acp.event_listener",
+            session = %frame.session_id,
+            compaction_id,
+            summary_len = text.len(),
+            "compaction summary recorded"
+        ),
+        Event::PromptRejected { reason, .. } => tracing::warn!(
+            target: "acp.event_listener",
+            session = %frame.session_id,
+            reason,
+            "prompt rejected"
+        ),
+        Event::CancelRequested { escalates_at } => tracing::debug!(
+            target: "acp.event_listener",
+            session = %frame.session_id,
+            escalates_at = %escalates_at,
+            "turn cancel requested"
+        ),
+        Event::ModeSwitchFailed { mode_id, reason } => tracing::warn!(
+            target: "acp.event_listener",
+            session = %frame.session_id,
+            mode_id,
+            reason,
+            "mode switch failed"
+        ),
+        Event::ConfigOptionSwitchFailed {
+            config_id,
+            value,
+            reason,
+        } => tracing::warn!(
+            target: "acp.event_listener",
+            session = %frame.session_id,
+            config_id,
+            value,
+            reason,
+            "config option switch failed"
+        ),
+        _ => {}
+    }
+}
+
 pub(super) async fn acp_event_listener(state: Arc<AppState>) {
     let mut rx = state.acp_events_tx.subscribe();
     loop {
@@ -56,95 +150,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             }
         };
 
-        match frame.event.as_ref() {
-            Event::ApprovalRequested { approval } => tracing::info!(
-                target: "acp.event_listener",
-                session = %frame.session_id,
-                tool = %approval.tool_call.name,
-                kind = %approval.tool_call.kind,
-                destructive = approval.destructive,
-                nonce = %approval.nonce.0,
-                "approval requested"
-            ),
-            Event::ApprovalResolved { nonce, decision } => tracing::info!(
-                target: "acp.event_listener",
-                session = %frame.session_id,
-                nonce = %nonce.0,
-                ?decision,
-                "approval resolved"
-            ),
-            Event::ElicitationRequested { elicitation } => tracing::info!(
-                target: "acp.event_listener",
-                session = %frame.session_id,
-                nonce = %elicitation.nonce.0,
-                questions = elicitation.questions.len(),
-                "question asked"
-            ),
-            Event::ElicitationResolved { nonce, outcome, .. } => tracing::info!(
-                target: "acp.event_listener",
-                session = %frame.session_id,
-                nonce = %nonce.0,
-                ?outcome,
-                "question answered"
-            ),
-            Event::ConversationCompactionStarted => tracing::info!(
-                target: "acp.event_listener",
-                session = %frame.session_id,
-                "compaction started"
-            ),
-            Event::ConversationCompacted => tracing::info!(
-                target: "acp.event_listener",
-                session = %frame.session_id,
-                "compaction completed"
-            ),
-            Event::ConversationCompactionFailed => tracing::warn!(
-                target: "acp.event_listener",
-                session = %frame.session_id,
-                "compaction failed"
-            ),
-            Event::ConversationCompactionSummary {
-                compaction_id,
-                text,
-            } => tracing::debug!(
-                target: "acp.event_listener",
-                session = %frame.session_id,
-                compaction_id,
-                summary_len = text.len(),
-                "compaction summary recorded"
-            ),
-            Event::PromptRejected { reason, .. } => tracing::warn!(
-                target: "acp.event_listener",
-                session = %frame.session_id,
-                reason,
-                "prompt rejected"
-            ),
-            Event::CancelRequested { escalates_at } => tracing::debug!(
-                target: "acp.event_listener",
-                session = %frame.session_id,
-                escalates_at = %escalates_at,
-                "turn cancel requested"
-            ),
-            Event::ModeSwitchFailed { mode_id, reason } => tracing::warn!(
-                target: "acp.event_listener",
-                session = %frame.session_id,
-                mode_id,
-                reason,
-                "mode switch failed"
-            ),
-            Event::ConfigOptionSwitchFailed {
-                config_id,
-                value,
-                reason,
-            } => tracing::warn!(
-                target: "acp.event_listener",
-                session = %frame.session_id,
-                config_id,
-                value,
-                reason,
-                "config option switch failed"
-            ),
-            _ => {}
-        }
+        log_frame(&frame);
 
         // Detect wake-fire.
         if matches!(
@@ -2966,5 +2972,63 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
         panic!("{why}");
+    }
+
+    /// A tool title is agent-authored text (Claude's Bash reporter uses the
+    /// full command), so an inline credential must never reach the log.
+    #[test]
+    fn approval_request_log_carries_the_call_id_and_never_the_title() {
+        use std::io::Write;
+        use tracing_subscriber::layer::SubscriberExt as _;
+        struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, src: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(src);
+                Ok(src.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let writer = buf.clone();
+        let layer = tracing_subscriber::fmt::layer()
+            .with_writer(move || Buf(writer.clone()))
+            .with_ansi(false);
+        let frame = AcpBroadcastFrame {
+            session_id: "sess1".into(),
+            seq: 1,
+            event: Arc::new(crate::acp::Event::ApprovalRequested {
+                approval: crate::acp::approvals::Approval {
+                    nonce: crate::acp::approvals::Nonce("n1".into()),
+                    tool_call: crate::acp::state::ToolCall {
+                        id: "call-7".into(),
+                        name: "curl -H 'Authorization: Bearer SECRET_SENTINEL_9f3'".into(),
+                        kind: "execute".into(),
+                        args_preview: String::new(),
+                        started_at: chrono::Utc::now(),
+                        parent_tool_call_id: None,
+                        memory_recall: None,
+                        diffs: Vec::new(),
+                    },
+                    destructive: false,
+                    options: Vec::new(),
+                    choice: false,
+                    requested_at: chrono::Utc::now(),
+                    resolved: None,
+                },
+            }),
+            worker_generation: None,
+            sidebar_status: None,
+        };
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry::Registry::default().with(layer),
+            || log_frame(&frame),
+        );
+        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(out.contains("approval requested"), "{out}");
+        assert!(out.contains("call=call-7"), "{out}");
+        assert!(out.contains("kind=execute"), "{out}");
+        assert!(!out.contains("SECRET_SENTINEL_9f3"), "{out}");
     }
 }
