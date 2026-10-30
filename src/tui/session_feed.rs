@@ -883,6 +883,7 @@ async fn run_command_writer(
                         .ensure_agent(&id, &StartSessionBody { expected, size }, &epoch)
                         .await
                         .map(CommandReply::Terminal),
+
                     SessionRequest::CancelCreation => client
                         .cancel_creation(&id, &epoch)
                         .await
