@@ -752,6 +752,10 @@ fn trash_retained_transcript_is_read_only() {
     h.wait_for("retained-1014");
     h.assert_screen_contains("Trash · read-only");
     let before = h.read_sessions();
+    h.send_keys("C-q");
+    h.wait_for("Enter: read");
+    h.send_keys("Enter");
+    h.send_keys("q");
     h.send_keys("Home");
     h.wait_for("retained-0010");
     h.type_text("must_not_send");

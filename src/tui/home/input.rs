@@ -467,6 +467,16 @@ impl HomeView {
         self.attach_project_dialog = None;
         self.snooze_duration_dialog = None;
         self.pending_snooze_session = None;
+        self.diff_view = None;
+        self.pending_stop_session = None;
+        self.pending_stop_auxiliary = None;
+        if self
+            .confirm_dialog
+            .as_ref()
+            .is_some_and(|dialog| matches!(dialog.action(), "stop_auxiliary" | "stop_session"))
+        {
+            self.confirm_dialog = None;
+        }
         if self
             .context_menu
             .as_ref()
@@ -1241,6 +1251,16 @@ impl HomeView {
                 // goes through the runtime like every other one; this process
                 // does not kill it itself.
                 if let Some((session_id, target)) = self.pending_stop_auxiliary.take() {
+                    if self
+                        .get_instance(&session_id)
+                        .is_none_or(|inst| inst.is_trashed())
+                        || self
+                            .session_feed
+                            .applied_session(&session_id)
+                            .is_some_and(|row| row.trashed_at.is_some())
+                    {
+                        return None;
+                    }
                     if let Err(error) = self.session_feed.submit(
                         session_id,
                         crate::daemon::SessionMutation::StopAuxiliary(target),
@@ -2995,6 +3015,15 @@ impl HomeView {
         else {
             return;
         };
+        if self.get_instance(&id).is_some_and(|inst| inst.is_trashed())
+            || self
+                .session_feed
+                .applied_session(&id)
+                .is_some_and(|row| row.trashed_at.is_some())
+        {
+            self.diff_view = None;
+            return;
+        }
         let Some(diff) = self.diff_view.as_ref() else {
             return;
         };

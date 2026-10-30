@@ -2738,6 +2738,61 @@ fn diff_keyboard_and_mouse_refusal_are_visible_dismissible_and_keep_comparison()
 
 #[test]
 #[serial]
+fn trash_transition_discards_diff_and_delayed_base_save() {
+    let (mut env, id, _repo) = diff_admission_fixture();
+    let mut commands = env.view.session_feed.command_driver_for_test();
+    env.view
+        .diff_view
+        .as_mut()
+        .unwrap()
+        .select_branch("review".into());
+    env.view
+        .mutate_instance(&id, |inst| inst.trashed_at = Some(chrono::Utc::now()));
+    env.view.drain_pending_diff_override();
+    assert!(commands(Err("unexpected diff save".into())).is_none());
+    env.view.enforce_trash_read_only();
+    assert!(env.view.diff_view.is_none());
+}
+
+#[test]
+#[serial]
+fn trash_transition_cancels_auxiliary_stop_confirmation_and_late_submit() {
+    for late_submit in [false, true] {
+        let mut env = create_test_env_with_sessions(1);
+        let id = env.view.instance_at(0).id.clone();
+        let snapshot = daemon_snapshot(&env.view, &id, "Stopped");
+        env.view.session_feed.publish_for_test(snapshot);
+        env.view.apply_session_feed();
+        let mut commands = env.view.session_feed.command_driver_for_test();
+        env.view.select_session_by_id(&id);
+        assert!(env.view.session_feed.can_submit(&id));
+        env.view.pending_stop_auxiliary = Some((
+            id.clone(),
+            crate::daemon::StopAuxiliaryBody {
+                target: crate::session::AuxiliaryTarget::Host { index: 0 },
+                adoption: None,
+            },
+        ));
+        env.view.confirm_dialog = Some(crate::tui::dialogs::ConfirmDialog::new(
+            "Kill Terminal",
+            "fixture",
+            "stop_auxiliary",
+        ));
+        env.view
+            .mutate_instance(&id, |inst| inst.trashed_at = Some(chrono::Utc::now()));
+        if late_submit {
+            env.view.dispatch_confirm_submit("stop_auxiliary");
+        } else {
+            env.view.enforce_trash_read_only();
+            assert!(env.view.confirm_dialog.is_none());
+        }
+        assert!(env.view.pending_stop_auxiliary.is_none());
+        assert!(commands(Err("unexpected stop".into())).is_none());
+    }
+}
+
+#[test]
+#[serial]
 fn diff_save_uses_its_own_receipt_and_surfaces_rejection_or_unknown_in_takeover() {
     use crate::tui::dialogs::test_render::{draw, find};
     for outcome in ["saved", "rejected", "unknown"] {

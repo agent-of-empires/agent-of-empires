@@ -2191,6 +2191,10 @@ impl App {
             e2e_render_ack(false)?;
             return Ok(());
         }
+        if self.home.retained_reader_focused() && !self.home.has_non_live_send_overlay() {
+            let _ = self.home.handle_key(key, self.update_info.as_ref());
+            return Ok(());
+        }
         // An ACTIVE embedded view owns the keyboard; a mere preview does not.
         if self
             .home
