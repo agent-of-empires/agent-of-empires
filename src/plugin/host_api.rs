@@ -4,12 +4,13 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 
 use anyhow::Context as _;
-use aoe_plugin_api::UiSlot;
+use aoe_plugin_api::{SuggestionsSpec, UiSlot};
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::{json, Value};
 
 use crate::events::{self, Order, Schema, SeqBound};
 use crate::plugin::protocol::codes;
+use crate::plugin::suggestions;
 use crate::plugin::ui_state::{Tone, UiError, UiSnapshot, UiStore};
 use crate::session::Storage;
 
@@ -180,6 +181,23 @@ pub fn dispatch(
     params: &Value,
 ) -> Result<Value, DispatchError> {
     match method {
+        "suggestions.set" => {
+            ctx.require(CAP_WORKER)?;
+            suggestions::set(&suggestions_spec(ctx)?, params)
+        }
+        "suggestions.error" => {
+            ctx.require(CAP_WORKER)?;
+            suggestions_spec(ctx)?;
+            suggestions::error(params)
+        }
+        "suggestions.sources" => {
+            ctx.require(CAP_WORKER)?;
+            Ok(suggestions::sources(&suggestions_spec(ctx)?))
+        }
+        "projects.list" => {
+            ctx.require(CAP_SESSION_READ)?;
+            projects_list(state)
+        }
         "events.publish" => {
             ctx.require(CAP_WORKER)?;
             events_publish(state, params)
@@ -242,6 +260,28 @@ pub fn dispatch(
         }
         other => Err(DispatchError::method_not_found(other)),
     }
+}
+
+fn suggestions_spec(ctx: &PluginRpcContext) -> Result<SuggestionsSpec, DispatchError> {
+    crate::plugin::registry()
+        .get(&ctx.plugin_id)
+        .filter(|p| p.active())
+        .and_then(|p| p.manifest.suggestions.clone())
+        .ok_or_else(|| DispatchError {
+            code: codes::FORBIDDEN,
+            message: "plugin did not declare suggestions".into(),
+            data: None,
+        })
+}
+
+fn projects_list(state: &HostApiState) -> Result<Value, DispatchError> {
+    let profile = crate::session::config::effective_profile(&state.profile);
+    let projects: Vec<Value> = crate::session::projects::load_merged(&profile)
+        .map_err(|e| DispatchError::internal(e.to_string()))?
+        .into_iter()
+        .map(|project| json!({ "name": project.name, "path": project.path }))
+        .collect();
+    Ok(json!({ "projects": projects }))
 }
 
 fn str_param<'a>(params: &'a Value, key: &str) -> Result<&'a str, DispatchError> {
@@ -910,6 +950,59 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, codes::FORBIDDEN);
+    }
+
+    #[test]
+    fn suggestions_and_projects_rpcs_are_capability_gated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        for (method, caps) in [
+            ("suggestions.set", &[][..]),
+            ("suggestions.error", &[][..]),
+            ("suggestions.sources", &[CAP_SESSION_READ][..]),
+            ("projects.list", &[CAP_WORKER][..]),
+        ] {
+            let err = dispatch(&state, &ctx(caps), method, &json!({"items": []})).unwrap_err();
+            assert_eq!(err.code, codes::FORBIDDEN, "{method}");
+        }
+        // A worker whose manifest declares no [suggestions] is refused too.
+        let err = dispatch(
+            &state,
+            &ctx(&[CAP_WORKER]),
+            "suggestions.sources",
+            &json!({}),
+        )
+        .unwrap_err();
+        assert!(err.message.contains("did not declare suggestions"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn projects_list_returns_registered_name_and_path() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        crate::session::projects::add(
+            "default",
+            crate::session::projects::ProjectScope::Global,
+            crate::session::projects::Project::new(
+                "target",
+                "/tmp/project-target",
+                crate::session::projects::ProjectScope::Global,
+            ),
+            false,
+        )
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let result = dispatch(
+            &state(tmp.path()),
+            &ctx(&[CAP_SESSION_READ]),
+            "projects.list",
+            &json!({}),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            json!({ "projects": [{ "name": "target", "path": "/tmp/project-target" }] })
+        );
     }
 
     fn ctx_for(plugin_id: &str, caps: &[&str]) -> PluginRpcContext {
