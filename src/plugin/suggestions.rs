@@ -653,7 +653,8 @@ fn validate_item(spec: &SuggestionsSpec, item: &Suggestion) -> Result<(), String
 }
 
 /// An http(s) URL whose displayed host is the host a browser opens: ASCII
-/// only, and an authority that is non-empty, has no userinfo, and names a host.
+/// only, and an authority that is non-empty, has no userinfo and no
+/// percent-encoding (browsers decode it before IDNA), and names a host.
 fn is_http_url(url: &str) -> bool {
     if !url.is_ascii() || url.contains(|c: char| c.is_whitespace() || c.is_control() || c == '\\') {
         return false;
@@ -665,7 +666,7 @@ fn is_http_url(url: &str) -> bool {
         return false;
     }
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    !authority.is_empty() && !authority.contains('@') && !authority.starts_with(':')
+    !authority.is_empty() && !authority.contains(['@', '%']) && !authority.starts_with(':')
 }
 
 fn check_mapping_key(key: &str) -> Result<(), String> {
@@ -941,7 +942,7 @@ mod tests {
     #[test]
     fn contract_violations_are_rejected() {
         type Mutate = fn(&mut Suggestion);
-        let cases: [(&str, Mutate); 16] = [
+        let cases: [(&str, Mutate); 22] = [
             ("undeclared", |i| i.criterion = "nope".into()),
             ("must not be empty", |i| i.title = " ".into()),
             ("http(s)", |i| i.source_url = "javascript:alert(1)".into()),
@@ -954,6 +955,18 @@ mod tests {
             }),
             ("http(s)", |i| {
                 i.source_url = "https://exam\u{200b}ple.com/".into()
+            }),
+            ("http(s)", |i| {
+                i.source_url = "https://%65xample.com/".into()
+            }),
+            ("http(s)", |i| {
+                i.source_url = "https://exam%E2%80%8Bple.com/".into()
+            }),
+            ("http(s)", |i| i.source_url = "data:text/html,x".into()),
+            ("http(s)", |i| i.source_url = "file:///etc/passwd".into()),
+            ("http(s)", |i| i.source_url = "ftp://h/".into()),
+            ("limited to 2048", |i| {
+                i.source_url = format!("https://h/{}", "x".repeat(2040))
             }),
             ("limited to 256", |i| i.id = "x".repeat(257)),
             ("limited to 16384", |i| {
