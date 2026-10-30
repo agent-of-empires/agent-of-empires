@@ -58,7 +58,10 @@ function TemplateBlock({ provider, source, override, item, disabled, onSource, o
   else if (effective === "") preview = "starts with an empty prompt, so you type the first message.";
   else preview = effective === null ? item.draft.prompt : expandTemplate(effective, item.variables ?? {});
 
-  const plural = source.label.toLowerCase();
+  // Keeps acronyms: "CI failures" stays, "Review requests" becomes "review requests".
+  const plural = /^[A-Z]{2}/.test(source.label)
+    ? source.label
+    : source.label.charAt(0).toLowerCase() + source.label.slice(1);
   return (
     <div className="rounded-lg border border-surface-700/40 bg-surface-900 p-3">
       <div className={`flex flex-wrap items-center gap-2 ${source.enabled ? "" : "opacity-60"}`}>

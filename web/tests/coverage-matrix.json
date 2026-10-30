@@ -846,9 +846,9 @@
     },
     {
       "id": "settings.suggestions",
-      "kind": "vitest",
+      "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["src/components/settings/__tests__/SuggestionsSettings.test.tsx"],
+      "specs": ["tests/settings-suggestions.spec.ts", "src/components/settings/__tests__/SuggestionsSettings.test.tsx"],
       "components": [
         "web/src/components/settings/SuggestionsSettings.tsx",
         "web/src/components/settings/SuggestionTemplates.tsx",
