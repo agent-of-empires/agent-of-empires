@@ -288,11 +288,11 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
                 }
             }
         };
-        if let Err(error) = outcome {
-            let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
-            crate::cli::migrate::offer_restart(error, interactive).await?;
-            migrations::run_migrations_with(None)?;
-        }
+        let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
+        crate::cli::migrate::resolve_blocked_migration(outcome, interactive, || {
+            migrations::run_migrations_with(None)
+        })
+        .await?;
     }
 
     if !crate::tmux::is_tmux_available() {

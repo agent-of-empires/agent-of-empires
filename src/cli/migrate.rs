@@ -12,33 +12,64 @@ use crate::migrations::progress::{fit_width, ConsoleProgress, Event, Reporter};
 /// Run startup migrations. When a managed daemon blocks them and a person is
 /// at the terminal, offer `aoe serve --restart`, which also migrates.
 pub async fn run_offering_restart(reporter: Option<Reporter>, interactive: bool) -> Result<()> {
-    match crate::migrations::run_migrations_with(reporter.clone()) {
-        Err(error) => {
-            offer_restart(error, interactive).await?;
-            crate::migrations::run_migrations_with(reporter)
-        }
-        ok => ok,
-    }
+    let outcome = crate::migrations::run_migrations_with(reporter.clone());
+    resolve_blocked_migration(outcome, interactive, || {
+        crate::migrations::run_migrations_with(reporter)
+    })
+    .await
 }
 
-/// `Ok` once the daemon was restarted and the migration is worth retrying;
-/// otherwise the original `error`.
-pub async fn offer_restart(error: anyhow::Error, interactive: bool) -> Result<()> {
-    if !error.is::<crate::migrations::DaemonBlocksMigration>() {
+/// Settle a startup migration `outcome`. A blocking daemon is restarted when
+/// the user agrees, then `retry` runs; any other outcome, or a declined offer,
+/// is returned unchanged.
+pub async fn resolve_blocked_migration(
+    outcome: Result<()>,
+    interactive: bool,
+    retry: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    resolve_with(
+        outcome,
+        || {
+            let managed = crate::cli::serve::daemon_pid()
+                .is_some_and(crate::cli::serve::serve_launch_matches);
+            offer_allowed(interactive, managed)
+        },
+        confirm_restart,
+        || async {
+            eprintln!("Restarting the daemon...");
+            crate::cli::serve::restart_daemon_with_receipt(None, false)
+                .await
+                .map(|_| ())
+        },
+        retry,
+    )
+    .await
+}
+
+async fn resolve_with<Fut>(
+    outcome: Result<()>,
+    offer: impl FnOnce() -> bool,
+    confirm: impl FnOnce() -> Result<bool>,
+    restart: impl FnOnce() -> Fut,
+    retry: impl FnOnce() -> Result<()>,
+) -> Result<()>
+where
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let Err(error) = outcome else {
+        return Ok(());
+    };
+    if !error.is::<crate::migrations::DaemonBlocksMigration>() || !offer() || !confirm()? {
         return Err(error);
     }
-    let managed =
-        crate::cli::serve::daemon_pid().is_some_and(crate::cli::serve::serve_launch_matches);
+    restart().await?;
+    retry()
+}
+
+fn offer_allowed(interactive: bool, managed: bool) -> bool {
     let autostart_disabled = crate::acp::client::daemon_manager::autostart_disabled();
     let remote = crate::acp::client::discovery::discover_env().is_some();
-    if !should_offer_restart(interactive, autostart_disabled, remote, managed)
-        || !confirm_restart()?
-    {
-        return Err(error);
-    }
-    eprintln!("Restarting the daemon...");
-    crate::cli::serve::restart_daemon_with_receipt(None, false).await?;
-    Ok(())
+    should_offer_restart(interactive, autostart_disabled, remote, managed)
 }
 
 fn should_offer_restart(
@@ -233,18 +264,49 @@ pub async fn run(args: &MigrateArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
-    async fn offer_restart_returns_the_original_error_unless_offered() {
+    async fn blocked_migration_restarts_then_retries_only_when_offered_and_confirmed() {
         use crate::migrations::DaemonBlocksMigration;
-        let blocked: anyhow::Error = DaemonBlocksMigration("blocked").into();
-        let message = blocked.to_string();
-        let error = super::offer_restart(blocked, false).await.unwrap_err();
-        assert!(error.is::<DaemonBlocksMigration>());
-        assert_eq!(error.to_string(), message);
+        use std::cell::Cell;
+        let blocked = || -> anyhow::Result<()> { Err(DaemonBlocksMigration("blocked").into()) };
+        // (outcome, offered, confirmed, restarts, retries, succeeds)
+        let cases: [(anyhow::Result<()>, bool, bool, u32, u32, bool); 5] = [
+            (blocked(), true, true, 1, 1, true),
+            (blocked(), true, false, 0, 0, false),
+            (blocked(), false, true, 0, 0, false),
+            (Err(anyhow::anyhow!("boom")), true, true, 0, 0, false),
+            (Ok(()), true, true, 0, 0, true),
+        ];
+        for (outcome, offered, confirmed, restarts, retries, succeeds) in cases {
+            let (restarted, retried) = (Cell::new(0), Cell::new(0));
+            let result = super::resolve_with(
+                outcome,
+                || offered,
+                || Ok(confirmed),
+                || async {
+                    restarted.set(restarted.get() + 1);
+                    Ok(())
+                },
+                || {
+                    retried.set(retried.get() + 1);
+                    Ok(())
+                },
+            )
+            .await;
+            assert_eq!(result.is_ok(), succeeds);
+            assert_eq!((restarted.get(), retried.get()), (restarts, retries));
+        }
+    }
 
-        let other = super::offer_restart(anyhow::anyhow!("boom"), true)
-            .await
-            .unwrap_err();
-        assert_eq!(other.to_string(), "boom");
+    #[test]
+    #[serial_test::serial]
+    fn an_explicit_remote_target_suppresses_the_offer() {
+        // SAFETY: serialized; no other thread reads this variable meanwhile.
+        unsafe { std::env::remove_var("AOE_DAEMON_URL") };
+        assert!(super::offer_allowed(true, true));
+        unsafe { std::env::set_var("AOE_DAEMON_URL", "https://remote.example") };
+        let offered = super::offer_allowed(true, true);
+        unsafe { std::env::remove_var("AOE_DAEMON_URL") };
+        assert!(!offered);
     }
 
     #[test]
