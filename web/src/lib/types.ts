@@ -303,8 +303,10 @@ export interface AgentInfo {
   /** Has a one-shot mode for smart rename. Always false for custom agents. */
   oneshot_capable?: boolean;
   acp_capable: boolean;
-  /** The ACP adapter binary is resolvable on the host. */
+  /** The ACP adapter resolves on the host now; `on_create`/`on_launch` hooks don't count. Import and usage-limit alternatives need this. */
   acp_installed: boolean;
+  /** A non-sandboxed structured create in the served profile will accept this agent; its own hooks count. */
+  acp_create_ready?: boolean;
   /** Allowed by `[acp] allowed_agents`; `acp_capable` stays the intrinsic fact. Absent means permitted. */
   acp_allowed?: boolean;
   /** Built-in ACP launch command after `${aoe_data_dir}` substitution; absent for custom agents. */
