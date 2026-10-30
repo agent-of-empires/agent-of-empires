@@ -837,6 +837,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         })
     }
 
+    #[cfg(test)]
     pub(crate) async fn try_begin_restart(&self, session_id: &str) -> Option<RestartRequestGuard> {
         self.try_begin_restart_with_reason(session_id).await.ok()
     }
