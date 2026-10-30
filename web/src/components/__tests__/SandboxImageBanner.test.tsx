@@ -449,6 +449,25 @@ describe("SandboxImageBanner", () => {
     }
   });
 
+  it("doesn't confirm an older outcome already on screen when the reply is accepted", async () => {
+    await mount(status());
+    let reply!: (r: { ok: boolean }) => void;
+    pullSandboxImage.mockImplementationOnce(() => new Promise((resolve) => (reply = resolve)));
+    fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+    // Past the cap an older pull's done shows as the offer.
+    fetchSandboxImageStatus.mockResolvedValue(status({ pull: { state: "done" } }));
+    await pollAfter(32_000);
+    expect(banner()?.getAttribute("aria-label")).toBe("Sandbox image update available");
+    // The Daemon accepts this click; the status fetched after that is still out.
+    let fresh!: (s: SandboxImageStatus) => void;
+    fetchSandboxImageStatus.mockImplementation(() => new Promise((resolve) => (fresh = resolve)));
+    await act(async () => reply({ ok: true }));
+    expect(banner()?.getAttribute("aria-label")).toBe("Downloading sandbox image");
+    // The fresh status shows this pull's outcome.
+    await act(async () => fresh(status({ state: "current", pull: { state: "done" } } as never)));
+    expect(banner()?.getAttribute("aria-label")).toBe("Sandbox image updated");
+  });
+
   it("hides an earlier available update once a check fails", async () => {
     await mount(status());
     expect(banner()).not.toBeNull();

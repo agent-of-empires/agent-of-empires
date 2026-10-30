@@ -129,7 +129,17 @@ export function useSandboxImageBanner(): SandboxImageBannerView | null {
     void pullSandboxImage().then((reply) => {
       if (mine !== attempt.current) return;
       replyPendingSince.current = null;
-      if (reply.ok) setSawRunning(true);
+      if (reply.ok) {
+        setSawRunning(true);
+        // Acceptance ties what comes next to this click, not an outcome already on screen: until
+        // a status fetched after it lands, show the pull as running.
+        if (!pullConfirmed.current) {
+          setStatus(
+            (s) =>
+              s && (s.pull.state === "done" || s.pull.state === "failed" ? { ...s, pull: { state: "running" } } : s),
+          );
+        }
+      }
       if (!reply.ok && !pullConfirmed.current) {
         // Nothing was pulled, and the Daemon may still hold an older pull's outcome. No status has
         // shown a pull since the click, so the "running" in `status` is this page's own guess.
