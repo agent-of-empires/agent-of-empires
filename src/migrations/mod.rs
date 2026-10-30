@@ -342,6 +342,12 @@ pub(crate) fn migrate_sandbox_store_for_test(
     v027_isolate_sandbox_stores::migrate_instance_with(id, is_running, reap, None)
 }
 
+/// A live daemon or concurrent migration blocks the schema write. Callers
+/// downcast to offer a restart.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}; schema migration refused. Run `aoe serve --restart` with the new binary, or stop the daemon through its manager")]
+pub struct DaemonBlocksMigration(pub(crate) &'static str);
+
 pub fn run_migrations() -> Result<()> {
     run_migrations_with(None)
 }
@@ -402,10 +408,9 @@ fn run_migrations_inner(
     let current = ensure_schema_supported()?;
     let owned_serve;
     let serve = if (current < CURRENT_VERSION || announce) && serve.is_none() {
-        owned_serve = crate::cli::serve::try_lock_serve()?.context(
-            "A daemon or migration is starting or running; schema migration refused. \
-             Run `aoe serve --restart` with the new binary, or stop the daemon through its manager",
-        )?;
+        owned_serve = crate::cli::serve::try_lock_serve()?.ok_or(DaemonBlocksMigration(
+            "A daemon or migration is starting or running",
+        ))?;
         Some(&owned_serve)
     } else {
         serve
@@ -414,15 +419,14 @@ fn run_migrations_inner(
         let transaction = transaction.context("Missing migration lifecycle transaction")?;
         // Drop this probe before v044 and explicit recovery take nested lifetime
         // and state exclusions. The held transaction and serve lock exclude starts.
-        let _lifetime = transaction.try_lifetime()?.context(
-            "A daemon still owns its lifetime; schema migration refused. \
-             Run `aoe serve --restart` with the new binary, or stop the daemon through its manager",
-        )?;
-        anyhow::ensure!(
-            crate::cli::serve::daemon_status() == crate::cli::serve::DaemonStatus::Absent,
-            "Existing daemon identity is live or ambiguous; schema migration refused. \
-             Run `aoe serve --restart` with the new binary, or stop the daemon through its manager"
-        );
+        let _lifetime = transaction
+            .try_lifetime()?
+            .ok_or(DaemonBlocksMigration("A daemon still owns its lifetime"))?;
+        if crate::cli::serve::daemon_status() != crate::cli::serve::DaemonStatus::Absent {
+            return Err(
+                DaemonBlocksMigration("Existing daemon identity is live or ambiguous").into(),
+            );
+        }
     }
     debug!("Current schema version: {}", current);
     if current == CURRENT_VERSION {
@@ -560,6 +564,24 @@ mod tests {
             assert!(*version > prev, "Migration {version} should be > {prev}");
             prev = *version;
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_held_serve_lock_refuses_migration_with_a_typed_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        fs::create_dir_all(&app).unwrap();
+        fs::write(app.join(VERSION_FILE), "1").unwrap();
+        let _held = crate::cli::serve::try_lock_serve().unwrap().unwrap();
+
+        let error = run_migrations().unwrap_err();
+
+        assert!(error.is::<DaemonBlocksMigration>());
+        assert!(error.to_string().starts_with(
+            "A daemon or migration is starting or running; schema migration refused."
+        ));
     }
 
     #[test]

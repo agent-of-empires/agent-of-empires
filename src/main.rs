@@ -7,7 +7,7 @@ use agent_of_empires::tui;
 use anyhow::Result;
 use clap::{CommandFactory, FromArgMatches, Parser};
 use clap_complete::generate;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 
 fn is_serve_command(cli: &Cli) -> bool {
     matches!(cli.command, Some(Commands::Serve(_)))
@@ -101,9 +101,7 @@ fn main() -> Result<()> {
     }
     if let Some(url) = &cli.daemon_url {
         // SAFETY: no runtime or background work has started.
-        unsafe {
-            std::env::set_var("AOE_DAEMON_URL", url);
-        }
+        unsafe { agent_of_empires::acp::client::discovery::export_daemon_url(url) };
     }
     agent_of_empires::acp::client::daemon_manager::set_autostart_disabled(cli.no_autostart);
     seed_cityhall_env(&cli);
@@ -312,7 +310,7 @@ async fn run(
         cli.command,
         Some(Commands::Settings { .. }) | Some(Commands::Mcp { .. })
     ) {
-        run_startup_migrations(command_name, is_daemon_child, None)?;
+        run_startup_migrations(command_name, is_daemon_child, None).await?;
     }
 
     // Skipped for the detached daemon child so `aoe serve --daemon` counts once.
@@ -384,7 +382,7 @@ async fn run(
     };
 
     if cli.command.is_some() {
-        run_startup_migrations(command_name, is_daemon_child, serve_lock.as_ref())?;
+        run_startup_migrations(command_name, is_daemon_child, serve_lock.as_ref()).await?;
         agent_of_empires::session::poller::configure_session_id_poller_max_threads(
             agent_of_empires::session::poller::configured_session_id_poller_max_threads(&profile),
         );
@@ -461,7 +459,7 @@ async fn run(
 /// the parent on `.schema_version` and, for the one that writes the launch
 /// record, wait on the very lock the parent holds. Verify the schema instead
 /// of migrating, and fail closed.
-fn run_startup_migrations(
+async fn run_startup_migrations(
     command_name: Option<&str>,
     is_daemon_child: bool,
     startup: Option<&cli::serve::ServeStartup>,
@@ -472,7 +470,10 @@ fn run_startup_migrations(
     let reporter = command_name.is_some().then(cli::migrate::stderr_reporter);
     match startup {
         Some(startup) => startup.run_migrations(reporter),
-        None => migrations::run_migrations_with(reporter),
+        None => {
+            let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+            cli::migrate::run_offering_restart(reporter, interactive).await
+        }
     }
 }
 /// Every command above exits from inside its own handler, so completing one
