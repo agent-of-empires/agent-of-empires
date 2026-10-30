@@ -30,6 +30,7 @@ async fn shim_agent_round_trips_approval_allow() {
 
     let cwd = std::env::temp_dir();
     let config = SpawnConfig {
+        launch_lease: None,
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
@@ -114,7 +115,7 @@ async fn shim_agent_round_trips_approval_allow() {
         )
     });
     let saw_yes_outcome = events.iter().any(|e| match e {
-        Event::AgentMessageChunk { text } => text.contains("permission_outcome=yes"),
+        Event::AgentMessageChunk { text, .. } => text.contains("permission_outcome=yes"),
         _ => false,
     });
 
@@ -146,6 +147,7 @@ async fn shim_agent_round_trips_a_question_option_list() {
     let shim = shim_path();
 
     let config = SpawnConfig {
+        launch_lease: None,
         provider_routing: Vec::new(),
         generation: 0,
         wrapper_substitution: None,
@@ -237,7 +239,7 @@ async fn shim_agent_round_trips_a_question_option_list() {
     );
     assert!(
         events.iter().any(|e| match e {
-            Event::AgentMessageChunk { text } => text.contains("choice_outcome=choice-2"),
+            Event::AgentMessageChunk { text, .. } => text.contains("choice_outcome=choice-2"),
             _ => false,
         }),
         "agent should have received the picked option, not the first; got {events:?}"
@@ -258,6 +260,7 @@ async fn shim_agent_sees_a_dismissed_question_as_cancelled() {
     let shim = shim_path();
 
     let config = SpawnConfig {
+        launch_lease: None,
         provider_routing: Vec::new(),
         generation: 0,
         wrapper_substitution: None,
@@ -327,7 +330,7 @@ async fn shim_agent_sees_a_dismissed_question_as_cancelled() {
 
     assert!(
         events.iter().any(|e| match e {
-            Event::AgentMessageChunk { text } => text.contains("choice_outcome=cancelled"),
+            Event::AgentMessageChunk { text, .. } => text.contains("choice_outcome=cancelled"),
             _ => false,
         }),
         "a dismissal must not answer with an option; got {events:?}"
@@ -348,6 +351,7 @@ async fn shim_agent_round_trips_fs() {
     let temp = tempfile::tempdir().expect("tempdir");
     let cwd = temp.path().to_path_buf();
     let config = SpawnConfig {
+        launch_lease: None,
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
@@ -410,7 +414,7 @@ async fn shim_agent_round_trips_fs() {
     let _ = client.shutdown().await;
 
     let saw_read = events.iter().any(|e| match e {
-        Event::AgentMessageChunk { text } => text.starts_with("fs_read=hello from shim"),
+        Event::AgentMessageChunk { text, .. } => text.starts_with("fs_read=hello from shim"),
         _ => false,
     });
     assert!(
@@ -438,6 +442,7 @@ async fn shim_agent_round_trips_terminal() {
     let temp = tempfile::tempdir().expect("tempdir");
     let cwd = temp.path().to_path_buf();
     let config = SpawnConfig {
+        launch_lease: None,
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
@@ -500,7 +505,7 @@ async fn shim_agent_round_trips_terminal() {
     let _ = client.shutdown().await;
 
     let saw_terminal = events.iter().any(|e| match e {
-        Event::AgentMessageChunk { text } => {
+        Event::AgentMessageChunk { text, .. } => {
             text.contains("terminal_output=terminal-roundtrip-ok") && text.contains("exit=0")
         }
         _ => false,
@@ -540,6 +545,7 @@ async fn shim_agent_set_mode_emits_current_mode_changed() {
 
     let cwd = std::env::temp_dir();
     let config = SpawnConfig {
+        launch_lease: None,
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
@@ -626,6 +632,7 @@ async fn shim_agent_emits_rate_limit_event() {
 
     let cwd = std::env::temp_dir();
     let config = SpawnConfig {
+        launch_lease: None,
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),

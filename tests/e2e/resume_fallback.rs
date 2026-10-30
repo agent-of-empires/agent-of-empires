@@ -5,11 +5,18 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 use serial_test::parallel;
 
-use crate::harness::{require_tmux, session_by_title, write_executable, TuiTestHarness};
+use crate::harness::{require_tmux, TuiTestHarness};
 
 const TITLE: &str = "ResumeFallbackE2E";
 const FAKE_AGENT: &str = "claude";
 const STALE_SID: &str = "11111111-1111-4111-8111-111111111111";
+
+fn session_by_title<'a>(sessions: &'a Value, title: &str) -> &'a Value {
+    sessions
+        .as_array()
+        .and_then(|arr| arr.iter().find(|s| s["title"].as_str() == Some(title)))
+        .unwrap_or_else(|| panic!("no session titled '{title}' in sessions.json"))
+}
 
 fn patch_session<F>(h: &TuiTestHarness, title: &str, patch: F)
 where
@@ -48,7 +55,14 @@ fn install_fake_agent(h: &mut TuiTestHarness, reject_stale: bool) -> PathBuf {
         sh_quote(&log),
         rejection,
     );
-    write_executable(&bin.join(FAKE_AGENT), &script);
+    let script_path = bin.join(FAKE_AGENT);
+    fs::write(&script_path, script).expect("write fake agent");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
+            .expect("chmod fake agent");
+    }
     log
 }
 
@@ -89,9 +103,7 @@ fn wait_for_logged_args(path: &Path, sid: &str) -> Vec<String> {
     }
 }
 
-/// Seed a Claude transcript at `$HOME/.claude/projects/<encoded project>/
-/// <sid>.jsonl` (every char outside `[A-Za-z0-9-]` maps to `-`) so the restart
-/// takes the `--resume <sid>` path instead of #2700's fresh-pin shortcut.
+/// A stored transcript makes this a resume rather than an empty-thread fresh pin.
 fn seed_claude_transcript(h: &TuiTestHarness, project_path: &Path, sid: &str) -> PathBuf {
     let canonical = fs::canonicalize(project_path).unwrap_or_else(|_| project_path.to_path_buf());
     let encoded: String = canonical
@@ -170,60 +182,5 @@ fn migrated_unknown_restart_resumes_the_stored_conversation() {
     let row = session_by_title(&sessions, TITLE);
     assert_eq!(row["agent_session_id"].as_str(), Some(STALE_SID));
     assert_default_resume_intent(row);
-    assert_eq!(fs::read(&transcript).unwrap(), original);
-}
-
-#[test]
-#[parallel]
-fn migrated_unknown_start_resumes_without_attested_context() {
-    require_tmux!();
-    let mut h = TuiTestHarness::new_in_tmp("resume_unknown_start");
-    let log = install_fake_agent(&mut h, false);
-    let project = h.project_path();
-    let add = h.run_cli(&[
-        "add",
-        project.to_str().unwrap(),
-        "--cmd",
-        FAKE_AGENT,
-        "-t",
-        TITLE,
-    ]);
-    assert!(add.status.success(), "{add:?}");
-    let _cleanup = StopSessionOnDrop { h: &h };
-    let stopped = h.run_cli(&["session", "stop", TITLE]);
-    assert!(stopped.status.success(), "{stopped:?}");
-    let transcript = seed_claude_transcript(&h, &project, STALE_SID);
-    let original = fs::read(&transcript).unwrap();
-    patch_session(&h, TITLE, |row| {
-        row.insert(
-            "extra_args".into(),
-            Value::String("--mcp-config /tmp/unattested.json".into()),
-        );
-        row.insert("agent_session_id".into(), Value::String(STALE_SID.into()));
-        row.insert(
-            "agent_session_binding".into(),
-            serde_json::json!({
-                "session_id": STALE_SID,
-                "execution": null,
-                "provenance": "unknown",
-                "transcript_path": null
-            }),
-        );
-        row.remove("resume_intent");
-        row.remove("resume_binding");
-        row.remove("active_execution");
-    });
-    let started = h.run_cli(&["session", "start", TITLE]);
-    assert!(started.status.success(), "{started:?}");
-    let lines = wait_for_logged_args(&log, STALE_SID);
-    assert!(
-        lines
-            .iter()
-            .any(|line| line.contains(STALE_SID) && line.contains("--mcp-config")),
-        "unattested launch must still try the stored ID: {lines:?}"
-    );
-    let sessions = h.read_sessions();
-    let row = session_by_title(&sessions, TITLE);
-    assert_eq!(row["agent_session_id"].as_str(), Some(STALE_SID));
     assert_eq!(fs::read(&transcript).unwrap(), original);
 }

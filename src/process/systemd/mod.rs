@@ -1,4 +1,7 @@
-//! Unix daemon notifications and best-effort Linux transient session scopes.
+//! Unix daemon notifications and Linux transient session scopes.
+//! New scopes are best effort and may fall back to unscoped launch.
+//! Retirement requires exact captured units and proven empty cgroups.
+//! Unknown ownership or manager errors retain owned resources.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -49,12 +52,34 @@ fn escaped_id(session_id: &str) -> String {
     format!("{UNIT_PREFIX}{}", escape(session_id))
 }
 
-pub(crate) fn unit_name(session_id: &str, start_ms: u64) -> String {
-    format!("{}-{start_ms}.scope", escaped_id(session_id))
+pub(crate) fn unit_name(session_id: &str, start_ms: u64, namespace: &str) -> String {
+    format!(
+        "{}-{namespace}-{start_ms}-{}.scope",
+        escaped_id(session_id),
+        uuid::Uuid::new_v4()
+    )
 }
 
 pub(crate) fn unit_glob(session_id: &str) -> String {
     format!("{}-*.scope", escaped_id(session_id))
+}
+
+/// Application-directory consistency, not instance authentication or attestation.
+pub(crate) fn scope_namespace() -> anyhow::Result<String> {
+    scope_namespace_for(&crate::session::get_app_dir()?)
+}
+
+fn scope_namespace_for(app: &Path) -> anyhow::Result<String> {
+    use sha2::Digest;
+    let app = app.canonicalize()?;
+    let digest = sha2::Sha256::digest(app.as_os_str().as_encoded_bytes());
+    let mut namespace = String::with_capacity(digest.len() * 2);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest {
+        namespace.push(char::from(HEX[usize::from(byte >> 4)]));
+        namespace.push(char::from(HEX[usize::from(byte & 15)]));
+    }
+    Ok(namespace)
 }
 
 fn now_ms() -> u64 {
@@ -444,6 +469,19 @@ pub(crate) struct ScopePrefix {
 }
 
 impl ScopePrefix {
+    /// The only scope this prefix can create; its exact name survives SID reuse.
+    pub(crate) fn ownership(&self) -> crate::process::worker_registry::ScopeOwnership {
+        self.argv
+            .iter()
+            .find_map(|arg| arg.strip_prefix("--unit="))
+            .map(
+                |unit| crate::process::worker_registry::ScopeOwnership::Owned {
+                    unit: unit.to_owned(),
+                },
+            )
+            .unwrap_or(crate::process::worker_registry::ScopeOwnership::Unscoped)
+    }
+
     /// `argv`, then `<env> -u INVOCATION_ID`; callers append their own
     /// restore words and the command.
     pub(crate) fn with_env_restore(&self) -> Vec<String> {
@@ -459,12 +497,9 @@ impl ScopePrefix {
 /// (one attempt, 5 s at most), so call it from `spawn_blocking` in async code.
 pub(crate) fn scope_prefix_for(session_id: &str, profile: &str) -> Option<ScopePrefix> {
     let cap = capability()?;
-    let profile = if profile.is_empty() {
-        crate::session::config::effective_profile("")
-    } else {
-        profile.to_string()
-    };
-    let unit = unit_name(session_id, now_ms());
+    let profile = resolved_profile(profile);
+    let namespace = scope_namespace().ok()?;
+    let unit = unit_name(session_id, now_ms(), &namespace);
     let mut argv = vec![cap.systemd_run.to_string_lossy().into_owned()];
     argv.extend(scope_args(
         &cap.cfg,
@@ -478,43 +513,327 @@ pub(crate) fn scope_prefix_for(session_id: &str, profile: &str) -> Option<ScopeP
     })
 }
 
-/// Stops the session's scope(s) without waiting. Ignores `enabled`, which
-/// gates only new scopes: ones from before it was turned off still need
-/// stopping. Best effort; inert outside Linux.
-pub(crate) fn release(session_id: &str) {
-    #[cfg(test)]
-    release_probe::observe(session_id);
-    if cfg!(test) || !cfg!(target_os = "linux") {
-        return;
+/// An empty profile means the effective one.
+fn resolved_profile(profile: &str) -> String {
+    if profile.is_empty() {
+        crate::session::config::effective_profile("")
+    } else {
+        profile.to_string()
     }
-    let Ok(systemctl) = which::which("systemctl") else {
-        return;
-    };
-    release_with(session_id, &|argv| {
-        let mut cmd = Command::new(&systemctl);
-        cmd.args(&argv[1..]);
-        crate::process::run_with_timeout(&mut cmd, Duration::from_secs(3))
-    });
 }
 
-/// Runs `systemctl --user stop --no-block <glob>` through `run` (argv
-/// includes the program), logging any failure at debug.
-fn release_with(
-    session_id: &str,
-    run: &dyn Fn(&[String]) -> std::io::Result<Option<std::process::Output>>,
-) {
-    let glob = unit_glob(session_id);
-    let argv = ["systemctl", "--user", "stop", "--no-block", &glob].map(String::from);
-    match run(&argv) {
-        Ok(Some(o)) if !o.status.success() => tracing::debug!(
-            target: "process.systemd",
-            unit = %glob,
-            "release: {}",
-            String::from_utf8_lossy(&o.stderr)
+/// The slice `scope_prefix_for` puts a session of `profile` in, or `None`
+/// when scopes are unavailable. Blocking on the first call.
+pub(crate) fn slice_for(profile: &str) -> Option<String> {
+    let cap = capability()?;
+    Some(resolve_slice(
+        &cap.cfg.slice_template,
+        &resolved_profile(profile),
+    ))
+}
+
+/// Whether session scopes are available. Blocking on the first call, like
+/// `scope_prefix_for`.
+pub(crate) fn scopes_available() -> bool {
+    #[cfg(test)]
+    if container_scope_fixture::systemd_run().is_some() {
+        return true;
+    }
+    capability().is_some()
+}
+
+fn container_scope_words(
+    systemd_run: &str,
+    env_bin: &str,
+    slice: &str,
+    container: &str,
+    start_ms: u64,
+    unique: &str,
+) -> Vec<String> {
+    let mut words = vec![systemd_run.to_string()];
+    words.extend(
+        [
+            "--user",
+            "--scope",
+            "--quiet",
+            "--collect",
+            "--no-ask-password",
+            "--expand-environment=no",
+        ]
+        .map(String::from),
+    );
+    words.push(format!("--slice={slice}"));
+    words.push(format!(
+        "--unit=aoe-container-{}-{start_ms}-{unique}.scope",
+        escape(container)
+    ));
+    words.push(format!("--description=aoe container {container}"));
+    words.extend(["--", env_bin, "-u", INJECTED_VAR].map(String::from));
+    words
+}
+
+/// The words to put in front of a container runtime command so that the
+/// helpers it forks (pasta) stay in `slice` instead of the caller's cgroup,
+/// or `None` when scopes are unavailable. Blocking on the first call, like
+/// `scope_prefix_for`.
+pub(crate) fn container_scope_prefix(slice: &str, container: &str) -> Option<Vec<String>> {
+    #[cfg(test)]
+    let fake = container_scope_fixture::systemd_run();
+    #[cfg(not(test))]
+    let fake: Option<PathBuf> = None;
+    let (systemd_run, env_bin) = match (&fake, capability()) {
+        (Some(run), _) => (
+            run.to_string_lossy().into_owned(),
+            "/usr/bin/env".to_string(),
         ),
-        Ok(None) => tracing::debug!(target: "process.systemd", unit = %glob, "release timed out"),
-        Err(e) => tracing::debug!(target: "process.systemd", unit = %glob, "release failed: {e}"),
-        _ => {}
+        (None, Some(cap)) => (
+            cap.systemd_run.to_string_lossy().into_owned(),
+            cap.env_bin.to_string_lossy().into_owned(),
+        ),
+        (None, None) => return None,
+    };
+    Some(container_scope_words(
+        &systemd_run,
+        &env_bin,
+        slice,
+        container,
+        now_ms(),
+        &uuid::Uuid::new_v4().to_string(),
+    ))
+}
+
+/// Retire only frozen owned units, including scopes created before configuration was disabled.
+pub(crate) fn retire_scopes(
+    session_id: &str,
+    scopes: &[crate::process::worker_registry::ScopeOwnership],
+) -> anyhow::Result<()> {
+    #[cfg(test)]
+    release_probe::observe(session_id);
+    scopes
+        .iter()
+        .try_for_each(|scope| retire_scope(session_id, scope))
+}
+/// Prove a captured scope empty without selecting any replacement by SID.
+pub(crate) fn scope_stopped(
+    session_id: &str,
+    scope: &crate::process::worker_registry::ScopeOwnership,
+) -> anyhow::Result<bool> {
+    use crate::process::worker_registry::ScopeOwnership;
+    let unit = match scope {
+        ScopeOwnership::Unscoped => return Ok(true),
+        ScopeOwnership::Unresolved => anyhow::bail!("runner scope ownership is unresolved"),
+        ScopeOwnership::Owned { unit } => unit,
+    };
+    anyhow::ensure!(
+        cfg!(target_os = "linux"),
+        "captured Linux scope cannot be checked on this platform"
+    );
+    anyhow::ensure!(
+        unit.starts_with(&format!("{}-", escaped_id(session_id)))
+            && unit.ends_with(".scope")
+            && unit
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'-' | b'_' | b'.' | b':')),
+        "invalid captured scope unit"
+    );
+    let mut command = Command::new(which::which("systemctl")?);
+    command.args([
+        "--user",
+        "show",
+        "--property=LoadState",
+        "--property=ActiveState",
+        "--property=ControlGroup",
+        unit,
+    ]);
+    let output = crate::process::run_with_timeout(&mut command, Duration::from_secs(3))?
+        .ok_or_else(|| anyhow::anyhow!("scope status timed out"))?;
+    let text = std::str::from_utf8(&output.stdout)?;
+    let property = |name: &str| text.lines().find_map(|line| line.strip_prefix(name));
+    let load =
+        property("LoadState=").ok_or_else(|| anyhow::anyhow!("scope load state unavailable"))?;
+    let active = property("ActiveState=")
+        .ok_or_else(|| anyhow::anyhow!("scope active state unavailable"))?;
+    let cgroup =
+        property("ControlGroup=").ok_or_else(|| anyhow::anyhow!("scope cgroup unavailable"))?;
+    anyhow::ensure!(
+        output.status.success() || load == "not-found",
+        "scope status rejected: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(matches!(active, "inactive" | "failed") && cgroup.is_empty())
+}
+pub(crate) fn legacy_unknown_scope_absent(
+    session_id: &str,
+    known: &[crate::process::worker_registry::ScopeOwnership],
+) -> anyhow::Result<bool> {
+    anyhow::ensure!(
+        crate::session::is_valid_session_id(session_id),
+        "Invalid legacy session identity"
+    );
+    #[cfg(target_os = "linux")]
+    {
+        super::linux::legacy_scope_inventory_clear(&format!("{}-", escaped_id(session_id)), known)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        super::macos::legacy_scope_inventory_clear(known)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = known;
+        anyhow::bail!("Legacy scope authority recovery is unsupported on this platform")
+    }
+}
+
+/// Units named as releases before scope custody named this session's scopes.
+fn legacy_scope_units(session_id: &str) -> anyhow::Result<Vec<String>> {
+    #[cfg(target_os = "linux")]
+    {
+        let prefix = format!("{}-", escaped_id(session_id));
+        Ok(super::linux::legacy_scope_unit_names(&prefix)?
+            .into_iter()
+            .filter(|unit| is_legacy_unit_name(&prefix, unit))
+            .collect())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = session_id;
+        Ok(Vec::new())
+    }
+}
+
+/// `<prefix><start_ms>.scope`, without the namespace and nonce current units carry.
+#[cfg(any(target_os = "linux", test))]
+fn is_legacy_unit_name(prefix: &str, unit: &str) -> bool {
+    unit.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_suffix(".scope"))
+        .is_some_and(|start| !start.is_empty() && start.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// Teardown scopes for a terminal row. Rows from before scope custody adopt the
+/// units earlier releases named for them, which those releases stopped by the
+/// same glob; any other unknown unit must be proven absent.
+pub(crate) fn resolve_unknown_scopes(
+    session_id: &str,
+    recorded: Option<&[crate::process::worker_registry::ScopeOwnership]>,
+) -> anyhow::Result<Vec<crate::process::worker_registry::ScopeOwnership>> {
+    resolve_unknown_scopes_with(
+        session_id,
+        recorded,
+        legacy_scope_units,
+        legacy_unknown_scope_absent,
+    )
+}
+
+fn resolve_unknown_scopes_with(
+    session_id: &str,
+    recorded: Option<&[crate::process::worker_registry::ScopeOwnership]>,
+    legacy_units: impl FnOnce(&str) -> anyhow::Result<Vec<String>>,
+    unknown_absent: impl FnOnce(
+        &str,
+        &[crate::process::worker_registry::ScopeOwnership],
+    ) -> anyhow::Result<bool>,
+) -> anyhow::Result<Vec<crate::process::worker_registry::ScopeOwnership>> {
+    use crate::process::worker_registry::ScopeOwnership;
+    let mut known: Vec<ScopeOwnership> = recorded
+        .unwrap_or_default()
+        .iter()
+        .filter(|scope| **scope != ScopeOwnership::Unresolved)
+        .cloned()
+        .collect();
+    if recorded.is_some_and(|scopes| scopes.len() == known.len()) {
+        return Ok(known);
+    }
+    for unit in legacy_units(session_id)? {
+        let owned = ScopeOwnership::Owned { unit };
+        if !known.contains(&owned) {
+            known.push(owned);
+        }
+    }
+    anyhow::ensure!(
+        unknown_absent(session_id, &known)?,
+        "Terminal scope ownership is unresolved and an unknown scope is live; resources retained"
+    );
+    Ok(known)
+}
+
+/// Blocking exact-unit retirement; only completed, empty scope exit is success.
+pub(crate) fn retire_scope(
+    session_id: &str,
+    scope: &crate::process::worker_registry::ScopeOwnership,
+) -> anyhow::Result<()> {
+    if scope_stopped(session_id, scope)? {
+        return Ok(());
+    }
+    let crate::process::worker_registry::ScopeOwnership::Owned { unit } = scope else {
+        unreachable!()
+    };
+    let mut command = Command::new(which::which("systemctl")?);
+    command.args(["--user", "stop", unit]);
+    let output = crate::process::run_with_timeout(&mut command, Duration::from_secs(3))?
+        .ok_or_else(|| anyhow::anyhow!("scope stop timed out"))?;
+    let proven_empty = scope_stopped(session_id, scope)?;
+    anyhow::ensure!(
+        output.status.success() || proven_empty,
+        "scope stop rejected: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    anyhow::ensure!(proven_empty, "captured scope is not empty after stop");
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod legacy_runtime_fixture {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static ROOT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) struct Installed(Option<PathBuf>);
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            ROOT.with(|root| *root.borrow_mut() = self.0.take());
+        }
+    }
+
+    pub(crate) fn install(root: &Path) -> Installed {
+        Installed(ROOT.with(|slot| slot.replace(Some(root.to_owned()))))
+    }
+
+    pub(crate) fn root() -> Option<PathBuf> {
+        ROOT.with(|root| root.borrow().clone())
+    }
+}
+
+/// Stands in for `systemd-run` on this thread, since `capability()` is always
+/// `None` under `cfg(test)`.
+#[cfg(test)]
+pub(crate) mod container_scope_fixture {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static SYSTEMD_RUN: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) struct Installed(Option<PathBuf>);
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            SYSTEMD_RUN.with(|run| *run.borrow_mut() = self.0.take());
+        }
+    }
+
+    pub(crate) fn install(systemd_run: &Path) -> Installed {
+        Installed(SYSTEMD_RUN.with(|slot| slot.replace(Some(systemd_run.to_owned()))))
+    }
+
+    pub(super) fn systemd_run() -> Option<PathBuf> {
+        SYSTEMD_RUN.with(|run| run.borrow().clone())
     }
 }
 
@@ -594,6 +913,68 @@ mod tests {
     }
 
     #[test]
+    fn unknown_scopes_resolve_by_adopting_legacy_units_and_proving_the_rest_absent() {
+        use crate::process::worker_registry::ScopeOwnership::{self, Owned, Unresolved, Unscoped};
+        let id = "0123abcd-0000-4000-8000-000000000000";
+        let prefix = format!("{}-", escaped_id(id));
+        let current = Owned {
+            unit: format!("{prefix}{}-1700000000000-uuid.scope", "a".repeat(64)),
+        };
+        let legacy = format!("{prefix}1700000000000.scope");
+        assert!(is_legacy_unit_name(&prefix, &legacy));
+        for unit in [
+            format!("{prefix}.scope"),
+            format!("{prefix}17x.scope"),
+            format!("{prefix}{}-1700000000000-uuid.scope", "a".repeat(64)),
+            format!("{prefix}1700000000000.service"),
+        ] {
+            assert!(!is_legacy_unit_name(&prefix, &unit), "{unit}");
+        }
+        let adopted = Owned {
+            unit: legacy.clone(),
+        };
+        let cases: Vec<(
+            Option<Vec<ScopeOwnership>>,
+            bool,
+            Result<Vec<ScopeOwnership>, ()>,
+        )> = vec![
+            (
+                Some(vec![Unscoped, current.clone()]),
+                false,
+                Ok(vec![Unscoped, current.clone()]),
+            ),
+            (None, true, Ok(vec![adopted.clone()])),
+            (
+                Some(vec![Unresolved, current.clone()]),
+                true,
+                Ok(vec![current.clone(), adopted.clone()]),
+            ),
+            (None, false, Err(())),
+        ];
+        for (recorded, absent, want) in cases {
+            let consulted = std::cell::Cell::new(false);
+            let got = resolve_unknown_scopes_with(
+                id,
+                recorded.as_deref(),
+                |_| Ok(vec![legacy.clone()]),
+                |_, known| {
+                    consulted.set(true);
+                    assert!(known.iter().all(|scope| *scope != Unresolved));
+                    Ok(absent)
+                },
+            );
+            match want {
+                Ok(want) => assert_eq!(got.unwrap(), want, "{recorded:?}"),
+                Err(()) => assert!(got.is_err(), "{recorded:?}"),
+            }
+            let complete = recorded
+                .as_ref()
+                .is_some_and(|scopes| !scopes.contains(&Unresolved));
+            assert_eq!(consulted.get(), !complete, "{recorded:?}");
+        }
+    }
+
+    #[test]
     #[serial_test::serial]
     fn scopes_expected_reads_the_environment() {
         let dir = tempfile::tempdir().unwrap();
@@ -604,6 +985,87 @@ mod tests {
             .and_set("XDG_RUNTIME_DIR", path);
         assert_eq!(scopes_expected(true), cfg!(target_os = "linux"));
         assert!(!scopes_expected(false));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[serial_test::serial]
+    fn retire_scope_requires_positive_empty_proof_after_rejected_stop() {
+        use crate::process::worker_registry::ScopeOwnership;
+        use std::os::unix::fs::PermissionsExt;
+
+        let manager = tempfile::tempdir().unwrap();
+        let executable = manager.path().join("systemctl");
+        std::fs::write(
+            &executable,
+            r#"#!/bin/sh
+root=${0%/*}
+for unit in "$@"; do :; done
+case "$2" in
+  show)
+    IFS= read -r state < "$root/$unit" || exit 2
+    case "$state" in
+      active) printf 'LoadState=loaded\nActiveState=active\nControlGroup=/owned\n' ;;
+      collected) printf 'LoadState=not-found\nActiveState=inactive\nControlGroup=\n' ;;
+      nonempty) printf 'LoadState=loaded\nActiveState=inactive\nControlGroup=/owned\n' ;;
+      unknown) printf 'LoadState=loaded\nControlGroup=\n' ;;
+      unavailable) exit 7 ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  stop)
+    IFS= read -r mode < "$root/mode" || exit 2
+    case "$mode" in
+      collected|unknown|unavailable)
+        printf '%s\n' "$mode" > "$root/$unit"
+        exit 1
+        ;;
+      nonempty)
+        printf 'nonempty\n' > "$root/$unit"
+        exit 0
+        ;;
+      active) exit 1 ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  *) exit 2 ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _env = crate::session::test_support::path_prepended(manager.path());
+        let id = "retire-race";
+        let unit = format!("{}-original.scope", escaped_id(id));
+        let unrelated = format!("{}-replacement.scope", escaped_id(id));
+        let scope = ScopeOwnership::Owned { unit: unit.clone() };
+        for (mode, succeeds, expected) in [
+            ("collected", true, "collected\n"),
+            ("active", false, "active\n"),
+            ("nonempty", false, "nonempty\n"),
+            ("unknown", false, "unknown\n"),
+            ("unavailable", false, "unavailable\n"),
+        ] {
+            std::fs::write(manager.path().join("mode"), format!("{mode}\n")).unwrap();
+            std::fs::write(manager.path().join(&unit), b"active\n").unwrap();
+            std::fs::write(manager.path().join(&unrelated), b"active\n").unwrap();
+            assert!(!scope_stopped(id, &scope).unwrap(), "{mode}: starts active");
+            let result = retire_scope(id, &scope);
+            assert_eq!(result.is_ok(), succeeds, "{mode}: {result:?}");
+            assert_eq!(
+                std::fs::read(manager.path().join(&unit)).unwrap(),
+                expected.as_bytes(),
+                "{mode}: owned manager state"
+            );
+            assert_eq!(
+                std::fs::read(manager.path().join(&unrelated)).unwrap(),
+                b"active\n",
+                "{mode}: unrelated unit must remain untouched"
+            );
+            if succeeds {
+                assert!(scope_stopped(id, &scope).unwrap());
+            }
+        }
     }
 
     #[test]
@@ -618,16 +1080,26 @@ mod tests {
 
     #[test]
     fn unit_names_carry_id_and_start_number() {
-        assert_eq!(
-            unit_name("abc123", 1_700_000_000_000),
-            "aoe-session-abc123-1700000000000.scope"
+        let first = unit_name("abc123", 1_700_000_000_000, "namespace");
+        assert!(first.starts_with("aoe-session-abc123-namespace-1700000000000-"));
+        let nonce = first
+            .strip_prefix("aoe-session-abc123-namespace-1700000000000-")
+            .unwrap()
+            .strip_suffix(".scope")
+            .unwrap();
+        uuid::Uuid::parse_str(nonce).unwrap();
+        assert_ne!(
+            first,
+            unit_name("abc123", 1_700_000_000_000, "namespace"),
+            "concurrent same-SID starts cannot share scope authority"
         );
         assert_eq!(unit_glob("abc123"), "aoe-session-abc123-*.scope");
-        assert_eq!(unit_name("a b", 5), "aoe-session-a_20b-5.scope");
-        assert_eq!(unit_name("a_b/c", 5), "aoe-session-a_5fb_2fc-5.scope");
-        // The glob for `a` must not match the units of `a-b`.
+        assert!(unit_name("a b", 5, "namespace").starts_with("aoe-session-a_20b-namespace-5-"));
+        assert!(
+            unit_name("a_b/c", 5, "namespace").starts_with("aoe-session-a_5fb_2fc-namespace-5-")
+        );
         assert_eq!(unit_glob("a-b"), "aoe-session-a_2db-*.scope");
-        assert!(!unit_name("a-b", 5).starts_with("aoe-session-a-"));
+        assert!(!unit_name("a-b", 5, "namespace").starts_with("aoe-session-a-"));
         assert_eq!(description("abc123def4567890"), "aoe session abc123de");
     }
 
@@ -694,6 +1166,36 @@ mod tests {
         let flag = AtomicBool::new(false);
         let fired = (0..5).filter(|_| first_time(&flag)).count();
         assert_eq!(fired, 1);
+    }
+
+    #[test]
+    fn container_scope_words_shape() {
+        assert_eq!(
+            container_scope_words(
+                "/usr/bin/systemd-run",
+                "/usr/bin/env",
+                "background-aoe-main.slice",
+                "aoe-sandbox-ab12",
+                7,
+                "u1"
+            ),
+            [
+                "/usr/bin/systemd-run",
+                "--user",
+                "--scope",
+                "--quiet",
+                "--collect",
+                "--no-ask-password",
+                "--expand-environment=no",
+                "--slice=background-aoe-main.slice",
+                "--unit=aoe-container-aoe_2dsandbox_2dab12-7-u1.scope",
+                "--description=aoe container aoe-sandbox-ab12",
+                "--",
+                "/usr/bin/env",
+                "-u",
+                "INVOCATION_ID",
+            ]
+        );
     }
 
     #[test]
@@ -803,12 +1305,6 @@ mod tests {
                 "{limits:?} {failure:?}"
             );
         }
-    }
-
-    #[test]
-    fn capability_and_release_are_inert_under_test() {
-        assert!(scope_prefix_for("abc", "main").is_none());
-        release("abc");
     }
 
     #[test]

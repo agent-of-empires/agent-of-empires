@@ -60,7 +60,12 @@ export function useDrawerSwipe(state: DrawerSwipeState, onAction: (action: Drawe
 
     const onTouchStart = (e: TouchEvent) => {
       tracking = false;
-      if (window.innerWidth >= MOBILE_BREAKPOINT || e.touches.length !== 1) return;
+      if (
+        window.innerWidth >= MOBILE_BREAKPOINT ||
+        e.touches.length !== 1 ||
+        document.getSelection()?.isCollapsed === false
+      )
+        return;
       const t = e.touches[0];
       if (!t) return;
       if (t.clientX <= SYSTEM_EDGE_GUARD_PX || t.clientX >= window.innerWidth - SYSTEM_EDGE_GUARD_PX) return;
@@ -74,6 +79,10 @@ export function useDrawerSwipe(state: DrawerSwipeState, onAction: (action: Drawe
 
     const onTouchMove = (e: TouchEvent) => {
       if (!tracking) return;
+      if (document.getSelection()?.isCollapsed === false) {
+        tracking = false;
+        return;
+      }
       const t = e.touches[0];
       if (!t) return;
       const dx = t.clientX - startX;

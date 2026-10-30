@@ -1,4 +1,4 @@
-//! OS process utilities: timeouts, process trees, pane pids, and sleep inhibition.
+//! Process utilities for tmux session management
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -22,6 +22,17 @@ mod linux;
 mod macos;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod unix;
+pub(crate) fn validate_recovery_file(file: &std::fs::File) -> anyhow::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        unix::validate_recovery_file(file)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = file;
+        anyhow::bail!("Ownership recovery is unavailable on this platform")
+    }
+}
 
 #[cfg(target_os = "linux")]
 use linux as platform;
@@ -34,6 +45,12 @@ mod platform {
     pub(super) fn kill_process_group(_: &std::process::Child) {}
 
     pub(super) fn terminate_process_group(_: &std::process::Child) {}
+
+    pub(super) fn try_wait_status_hook(
+        child: &mut std::process::Child,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        child.try_wait()
+    }
     pub(super) fn restore_environment_value(
         _: super::FrozenEnvironmentValue<String, Vec<u8>>,
     ) -> std::io::Result<std::ffi::OsString> {
@@ -55,10 +72,6 @@ mod platform {
         )
     }
 }
-#[cfg(target_os = "linux")]
-pub(crate) fn effective_uid() -> u32 {
-    platform::effective_uid()
-}
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn metadata_identity(metadata: &std::fs::Metadata) -> (u64, u64) {
     platform::metadata_identity(metadata)
@@ -74,8 +87,6 @@ pub(crate) fn open_read_nonblocking(path: &std::path::Path) -> std::io::Result<s
     }
 }
 
-#[cfg(target_os = "linux")]
-pub(crate) use linux::runtime_io;
 pub(crate) const LIVE_PANE_ENV_KEYS: [&str; 3] = ["TERM", "TMUX", "TMUX_PANE"];
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -236,6 +247,11 @@ pub fn exec_post_login_opencode_yolo() -> anyhow::Result<()> {
     Err(platform::exec_command(&mut command).into())
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use platform::unix_peer_uid;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use unix::detach_daemon_stdin;
+
 /// Lower the child's scheduling and I/O priority where the OS supports it.
 pub(crate) fn throttle_child(cmd: &mut std::process::Command) {
     #[cfg(target_os = "macos")]
@@ -249,12 +265,20 @@ pub(crate) use platform::HAS_CODEX_MANAGED_PREFERENCES;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = true;
 
+/// System memory + agent-count sampling for the TUI diagnostics strip.
 pub(crate) mod metrics;
 
 pub mod systemd;
 
+/// Protocol-agnostic plumbing for supervised worker subprocesses, lifted
+/// out of `src/acp/` so the future plugin host can reuse it.
 pub mod worker;
 
+/// On-disk registry of detached ACP worker subprocesses (pid, socket path,
+/// build version, `stored_acp_session_id`). Colocated here with the
+/// protocol-agnostic `worker` substrate it builds on, so the plugin host can
+/// reuse that substrate directly. Dependency direction is one-way: consumers
+/// point down to `process`, never to each other.
 pub mod worker_registry;
 
 pub mod prime;
@@ -319,42 +343,60 @@ pub(crate) fn rename_exclusive(
     }
 }
 
-/// Only use this when output is not piped: a full pipe can wedge the child. Prefer
-/// [`run_with_timeout`].
+/// Wait for `child` to exit, killing and reaping it if it outlives `timeout`.
+/// Returns `Ok(None)` when the timeout fired and the child was killed.
+///
+/// Only use this directly when the child's stdout/stderr are not piped (or
+/// are drained elsewhere): a full pipe buffer can wedge the child before the
+/// deadline. [`run_with_timeout`] handles piped output safely.
 pub fn wait_with_timeout(
     child: &mut Child,
     timeout: Duration,
 ) -> std::io::Result<Option<ExitStatus>> {
-    wait_with_timeout_inner(child, timeout, false, None)
+    wait_with_timeout_inner(child, timeout, false, false, None)
 }
 
-/// With `kill_process_group`, `child` must be a process-group leader, or the kill
-/// could signal the parent's group.
+/// When `kill_process_group` is true, the caller MUST have configured `child`
+/// as a process-group leader, so its process-group id equals `child.id()`.
+/// Otherwise the kill path could signal the parent's process group.
 fn wait_with_timeout_inner(
     child: &mut Child,
     timeout: Duration,
     kill_process_group: bool,
+    cleanup_on_exit: bool,
     cancel: Option<&CancellationToken>,
 ) -> std::io::Result<Option<ExitStatus>> {
-    let deadline = Instant::now() + timeout;
+    let mut deadline = Instant::now() + timeout;
     let termination_grace = (timeout / 4).min(PROCESS_GROUP_TERMINATION_GRACE);
-    let terminate_at = deadline.checked_sub(termination_grace).unwrap_or(deadline);
+    let mut terminate_at = deadline.checked_sub(termination_grace).unwrap_or(deadline);
     let mut termination_requested = false;
     // Most children exit within a few ms; start fine and back off to the cap.
     let mut poll = Duration::from_millis(1);
     loop {
-        if let Some(status) = child.try_wait()? {
-            if !termination_requested {
+        if !termination_requested {
+            let status = if cleanup_on_exit {
+                platform::try_wait_status_hook(child)?
+            } else {
+                child.try_wait()?
+            };
+            if let Some(status) = status {
                 return Ok(Some(status));
             }
         }
         let now = Instant::now();
+        if !termination_requested && cancel.is_some_and(CancellationToken::is_cancelled) {
+            deadline = deadline.min(now + termination_grace);
+            terminate_at = now;
+        }
         if kill_process_group && !termination_requested && now >= terminate_at {
             platform::terminate_process_group(child);
             termination_requested = true;
             continue;
         }
-        if now >= deadline || cancel.is_some_and(CancellationToken::is_cancelled) {
+        // A cancellation has already shortened the deadline above, so reaching
+        // it here is the escalation step; testing the token again would skip
+        // the SIGTERM the group is entitled to and its traps.
+        if now >= deadline {
             if kill_process_group {
                 platform::kill_process_group(child);
             }
@@ -367,8 +409,14 @@ fn wait_with_timeout_inner(
     }
 }
 
-/// Output goes to temp files, so a full pipe or a descendant holding the handles cannot
-/// wedge capture. Returns `Ok(None)` on timeout.
+/// Spawn `cmd` with stdout/stderr captured in temporary regular files and wait
+/// for it to exit, killing it if it outlives `timeout`. Returns `Ok(None)` when
+/// the timeout fired and the child was killed; `Err` covers spawn/wait failures.
+///
+/// Regular temporary files prevent a full pipe buffer from wedging the child
+/// before the deadline and keep capture independent of inherited writers.
+/// The caller keeps control of stdin; pipe it to null when the child might
+/// prompt (SSH passphrases, credential helpers).
 pub fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> std::io::Result<Option<Output>> {
     run_with_timeout_inner(cmd, timeout, false, None)
 }
@@ -382,6 +430,10 @@ pub fn run_until_cancelled(
     run_with_timeout_inner(cmd, timeout, false, Some(cancel))
 }
 
+/// [`run_with_timeout`] variant that makes the child a process-group leader
+/// and kills the whole group on timeout on Linux and macOS. Other platforms
+/// still bound output capture independently of descendant-owned handles and
+/// fall back to killing and reaping the direct child.
 pub fn run_with_timeout_process_group(
     cmd: &mut Command,
     timeout: Duration,
@@ -395,6 +447,27 @@ pub fn run_with_timeout_process_group(
     )
 }
 
+/// Run a command without capturing output; cancellation terminates and reaps
+/// its process group with the same bounded grace as a timeout.
+/// Remaining process-group members are killed before reaping an exited leader.
+pub(crate) fn run_status_with_timeout_process_group(
+    cmd: &mut Command,
+    timeout: Duration,
+    cancel: Option<&CancellationToken>,
+) -> std::io::Result<Option<ExitStatus>> {
+    if cancel.is_some_and(CancellationToken::is_cancelled) {
+        return Ok(None);
+    }
+    platform::configure_process_group(cmd);
+    let mut child = cmd.spawn()?;
+    wait_with_timeout_inner(
+        &mut child,
+        timeout,
+        cfg!(any(target_os = "linux", target_os = "macos")),
+        true,
+        cancel,
+    )
+}
 pub(crate) fn run_until_cancelled_process_group(
     cmd: &mut Command,
     timeout: Duration,
@@ -421,10 +494,15 @@ fn run_with_timeout_inner(
     cmd.stderr(Stdio::from(stderr_file.reopen()?));
     let mut child = cmd.spawn()?;
 
-    let Some(status) = wait_with_timeout_inner(&mut child, timeout, kill_process_group, cancel)?
+    let Some(status) =
+        wait_with_timeout_inner(&mut child, timeout, kill_process_group, false, cancel)?
     else {
         return Ok(None);
     };
+    // Regular files, rather than pipes drained by background threads, keep
+    // output capture bounded when a descendant outlives the direct child. A
+    // read reaches the current EOF without waiting for every inherited writer
+    // handle to close.
     let mut stdout = Vec::new();
     stdout_file.as_file_mut().read_to_end(&mut stdout)?;
     let mut stderr = Vec::new();
@@ -436,8 +514,15 @@ fn run_with_timeout_inner(
     }))
 }
 
-/// `SIG_IGN` survives `exec()`, so children spawned inside `IgnoreSignalsGuard` would
-/// otherwise be impossible to Ctrl+C.
+/// Reset `SIGINT`/`SIGQUIT` to their default disposition.
+///
+/// `SIG_IGN` (unlike a caught handler) survives `exec()` per POSIX. A
+/// child spawned while `IgnoreSignalsGuard` (`src/tui/app.rs`) has
+/// SIGINT/SIGQUIT ignored on aoe itself would otherwise silently inherit
+/// that ignore, leaving no way for the user to Ctrl+C out of it. Call
+/// this from a `pre_exec` closure (see [`reset_signals_on_exec`]) on any
+/// `Command` spawned from inside that guard's window: tmux attach, the
+/// editor shell-out, update helpers (brew/tar/sudo).
 #[cfg(unix)]
 pub fn reset_ignored_signals_before_exec() -> std::io::Result<()> {
     use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
@@ -458,6 +543,9 @@ pub fn reset_ignored_signals_before_exec() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Wire [`reset_ignored_signals_before_exec`] into `cmd` via `pre_exec` so
+/// its child doesn't inherit whatever SIGINT/SIGQUIT disposition happens
+/// to be in effect on the parent at spawn time.
 #[cfg(unix)]
 pub fn reset_signals_on_exec(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
@@ -470,6 +558,10 @@ pub fn reset_signals_on_exec(cmd: &mut Command) {
     }
 }
 
+/// Recursively collect all descendant PIDs of `pid` using a pre-built
+/// parent -> children map. Shared by the per-OS `collect_pid_tree`
+/// implementations, which each build the map their own way (a `/proc`
+/// scan on Linux, a `ps` parse on macOS).
 fn collect_descendants_from_map(
     pid: u32,
     children_map: &HashMap<u32, Vec<u32>>,
@@ -483,15 +575,25 @@ fn collect_descendants_from_map(
     }
 }
 
+/// The live shell PID in the exact session’s first pane, the agent pane.
 pub fn get_pane_pid(session_name: &str) -> Option<u32> {
-    // `^.0` targets the agent pane regardless of base-index or extra windows and splits.
-    let target = format!("{session_name}:^.0");
+    let pane = crate::tmux::first_pane_id(session_name)?;
+    // The pane id must travel alone: `session:%id` reads as a window
+    // spec and falls back to the window's active pane (tmux 3.7c).
     let output = crate::tmux::tmux_command()
-        .args(["display-message", "-t", &target, "-p", "#{pane_pid}"])
+        .args([
+            "display-message",
+            "-t",
+            &pane,
+            "-p",
+            "#{pane_dead}\t#{pane_pid}",
+        ])
         .output()
         .ok()?;
 
     if !output.status.success() {
+        // Guarded: hot poll path. Only formats arguments when the user has
+        // enabled `process.ppid=trace` (or finer) on their filter.
         if tracing::enabled!(target: "process.ppid", tracing::Level::TRACE) {
             tracing::trace!(
                 target: "process.ppid",
@@ -503,7 +605,11 @@ pub fn get_pane_pid(session_name: &str) -> Option<u32> {
         return None;
     }
 
-    let pid = String::from_utf8_lossy(&output.stdout).trim().parse().ok();
+    let pid = std::str::from_utf8(&output.stdout)
+        .ok()
+        .and_then(|value| value.trim().strip_prefix("0\t"))
+        .and_then(|pid| pid.parse::<u32>().ok())
+        .filter(|pid| *pid > 0 && i32::try_from(*pid).is_ok());
     if tracing::enabled!(target: "process.ppid", tracing::Level::TRACE) {
         tracing::trace!(
             target: "process.ppid",
@@ -515,9 +621,23 @@ pub fn get_pane_pid(session_name: &str) -> Option<u32> {
     pid
 }
 
-/// Every supplied signal must match: an exact environment entry, a command-line
-/// substring, and/or an argv token with an exact basename. Empty signals never match.
-/// One process-table pass; call from `spawn_blocking` on async runtimes.
+/// For a single pass over the process table, decide for each candidate `i`
+/// whether a live process belongs to it. Every supplied signal must match:
+/// an exact environment entry, a command-line substring, and/or an executable
+/// argv token whose basename is exact. The three slices must have equal length.
+/// Empty or absent signals never match on their own. Best-effort: an unreadable
+/// process table yields all `false`.
+///
+/// Startup recovery uses this after losing an old tmux socket. Hook-enabled
+/// agents require their exact `AOE_INSTANCE_ID=<id>` marker plus their built-in
+/// executable token. This remains stable across native conversation rotation
+/// while rejecting helpers that only inherited the environment. Non-hook
+/// agents use the session id in the command line. The host `docker exec` argv
+/// carries both forms for sandboxed sessions.
+///
+/// Batching keeps this to one `/proc` walk (or one `ps` fork) regardless of
+/// candidate count. Callers on an async runtime must wrap it in
+/// `tokio::task::spawn_blocking`.
 pub fn processes_matching(
     env_needles: &[String],
     cmdline_needles: &[Option<String>],
@@ -672,13 +792,15 @@ pub(crate) fn prime_processes(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 pub struct ProcessBirthIdentity {
     pub boot_id: String,
     pub start_id: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ProcessBirthFingerprint {
     boot: [u8; 32],
     process: [u8; 32],
@@ -691,6 +813,132 @@ impl ProcessBirthIdentity {
             boot: Sha256::digest(self.boot_id.as_bytes()).into(),
             process: Sha256::digest(self.start_id.as_bytes()).into(),
         }
+    }
+}
+
+/// A handle to one physical process incarnation, never its process group.
+/// Callers must establish their own custody before sending any signal.
+pub(crate) struct CapturedProcess {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    handle: platform::ProcessHandle,
+}
+
+impl CapturedProcess {
+    pub(crate) fn capture(
+        pid: u32,
+        expected: &ProcessBirthIdentity,
+    ) -> anyhow::Result<Option<Self>> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            if process_birth_identity(pid)?.as_ref() != Some(expected) {
+                return Ok(None);
+            }
+            let identity = PrimeProcessIdentity {
+                pid,
+                start_id: expected.start_id.clone(),
+            };
+            let Some(handle) = platform::ProcessHandle::capture(&identity)? else {
+                return Ok(None);
+            };
+            if process_birth_identity(pid)?.as_ref() != Some(expected) || handle.exited()? {
+                return Ok(None);
+            }
+            Ok(Some(Self { handle }))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (pid, expected);
+            anyhow::bail!("incarnation-bound process control unsupported on this platform")
+        }
+    }
+
+    pub(crate) fn exited(&self) -> anyhow::Result<bool> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.handle.exited()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        anyhow::bail!("incarnation-bound process control unsupported on this platform")
+    }
+
+    pub(crate) fn signal(&self, signal: i32) -> anyhow::Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.handle.signal(signal)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = signal;
+            anyhow::bail!("incarnation-bound process control unsupported on this platform")
+        }
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod captured_process_tests {
+    use super::*;
+
+    struct ChildGuard(Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn waiting_child() -> ChildGuard {
+        let ready = tempfile::tempdir().unwrap();
+        let path = ready.path().join("ready");
+        let child = Command::new("sh")
+            .args(["-c", ": > \"$1\"; read -r line", "sh"])
+            .arg(&path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let child = ChildGuard(child);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !path.exists() {
+            assert!(Instant::now() < deadline, "child did not become ready");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        child
+    }
+
+    #[test]
+    fn single_process_capture_refuses_another_birth() {
+        let child = waiting_child();
+        let pid = child.0.id();
+        let birth = process_birth_identity(pid).unwrap().unwrap();
+        assert!(CapturedProcess::capture(pid, &birth).unwrap().is_some());
+        let mut wrong = birth.clone();
+        wrong.start_id.push_str("-not-this-incarnation");
+        assert!(CapturedProcess::capture(pid, &wrong).unwrap().is_none());
+        let mut wrong = birth;
+        wrong.boot_id.push_str("-not-this-boot");
+        assert!(CapturedProcess::capture(pid, &wrong).unwrap().is_none());
+    }
+
+    #[test]
+    fn single_process_handle_observes_exit_before_parent_reaps() {
+        let mut child = waiting_child();
+        let pid = child.0.id();
+        let birth = process_birth_identity(pid).unwrap().unwrap();
+        let process = CapturedProcess::capture(pid, &birth).unwrap().unwrap();
+        drop(child.0.stdin.take());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !process.exited().unwrap() {
+            assert!(
+                Instant::now() < deadline,
+                "child physical exit was not observed"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Linux zombies still satisfy kill(pid, 0), but cannot own a writer.
+        #[cfg(target_os = "linux")]
+        assert!(nix::sys::signal::kill(Pid::from_raw(pid as i32), None).is_ok());
+        child.0.wait().unwrap();
+        assert!(process.exited().unwrap());
     }
 }
 
@@ -810,10 +1058,13 @@ impl RunnerProcessGuard {
         }
         let mut identities = runner_group_identities(self.pid)?;
         if let Some(birth) = before.as_ref().filter(|_| root_attested) {
-            identities.push(PrimeProcessIdentity {
+            let root = PrimeProcessIdentity {
                 pid: self.pid,
                 start_id: birth.start_id.clone(),
-            });
+            };
+            if !identities.contains(&root) {
+                identities.push(root);
+            }
         }
         let mut added = Vec::new();
         for identity in identities {
@@ -930,6 +1181,31 @@ pub(crate) fn process_birth_identity(pid: u32) -> anyhow::Result<Option<ProcessB
     }
 }
 
+pub(crate) fn process_birth_is_live(
+    pid: u32,
+    expected: &ProcessBirthIdentity,
+) -> anyhow::Result<bool> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let Some(current) = process_birth_identity(pid)? else {
+            return Ok(false);
+        };
+        if &current != expected {
+            return Ok(false);
+        }
+        let identity = PrimeProcessIdentity {
+            pid,
+            start_id: current.start_id,
+        };
+        Ok(platform::ProcessHandle::capture(&identity)?.is_some())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (pid, expected);
+        anyhow::bail!("process birth liveness unsupported on this platform")
+    }
+}
+
 pub(crate) fn runner_birth_identity(pid: u32) -> anyhow::Result<Option<ProcessBirthIdentity>> {
     let birth = process_birth_identity(pid);
     #[cfg(target_os = "macos")]
@@ -937,6 +1213,197 @@ pub(crate) fn runner_birth_identity(pid: u32) -> anyhow::Result<Option<ProcessBi
         return Ok(None);
     }
     birth
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CapturedProcessTreeReceipt {
+    boot_id: String,
+    processes: Vec<PrimeProcessIdentity>,
+}
+
+impl CapturedProcessTreeReceipt {
+    pub(crate) fn boot_identity(&self) -> &str {
+        &self.boot_id
+    }
+
+    pub(crate) fn root_is_current(&self) -> anyhow::Result<bool> {
+        let root = self
+            .processes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("captured tool root is missing"))?;
+        Ok(process_birth_identity(root.pid)?
+            .is_some_and(|birth| birth.boot_id == self.boot_id && birth.start_id == root.start_id))
+    }
+
+    pub(crate) fn validate(&self, root_pid: u32) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.boot_id.is_empty()
+                && self
+                    .processes
+                    .first()
+                    .is_some_and(|root| root.pid == root_pid)
+                && self.processes.iter().all(|identity| {
+                    identity.pid > 0
+                        && i32::try_from(identity.pid).is_ok()
+                        && !identity.start_id.is_empty()
+                })
+                && self.processes.iter().enumerate().all(|(index, identity)| {
+                    !self.processes[..index]
+                        .iter()
+                        .any(|known| known.pid == identity.pid)
+                }),
+            "captured tool retirement identity is unavailable"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAIL_CAPTURED_TREE_AFTER_ROOT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) struct CapturedProcessTree {
+    receipt: CapturedProcessTreeReceipt,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    handles: Vec<platform::ProcessHandle>,
+}
+
+impl CapturedProcessTree {
+    pub(crate) fn capture(pid: u32) -> anyhow::Result<Self> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let start_id = platform::process_start_id(pid)?
+                .ok_or_else(|| anyhow::anyhow!("tool process exited before capture"))?;
+            let root = PrimeProcessIdentity { pid, start_id };
+            let handle = platform::ProcessHandle::capture(&root)?
+                .ok_or_else(|| anyhow::anyhow!("tool process exited before capture"))?;
+            let samples = platform::process_tree_samples(&root)?;
+            let selected = prime_selection_mask(&samples, std::slice::from_ref(&root));
+            let mut handles = vec![handle];
+            let mut identities = vec![root.clone()];
+            for (sample, selected) in samples.into_iter().zip(selected) {
+                if selected && sample.identity != root {
+                    if let Some(handle) = platform::ProcessHandle::capture(&sample.identity)? {
+                        handles.push(handle);
+                        identities.push(sample.identity);
+                    }
+                }
+            }
+            anyhow::ensure!(
+                platform::process_start_id(pid)?.as_ref() == Some(&root.start_id),
+                "tool process incarnation changed during capture"
+            );
+            Ok(Self {
+                handles,
+                receipt: CapturedProcessTreeReceipt {
+                    boot_id: boot_id()
+                        .ok_or_else(|| anyhow::anyhow!("process boot identity unavailable"))?,
+                    processes: identities,
+                },
+            })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = pid;
+            anyhow::bail!("incarnation-bound signalling unsupported on this platform")
+        }
+    }
+
+    pub(crate) fn receipt(&self) -> &CapturedProcessTreeReceipt {
+        &self.receipt
+    }
+
+    pub(crate) fn resume(
+        receipt: CapturedProcessTreeReceipt,
+        root_pid: u32,
+    ) -> anyhow::Result<Self> {
+        receipt.validate(root_pid)?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let current_boot = boot_id()
+            .filter(|identity| !identity.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("process boot identity unavailable"))?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let mut handles = Vec::new();
+            if receipt.boot_id == current_boot {
+                handles.reserve(receipt.processes.len());
+                for identity in &receipt.processes {
+                    if let Some(handle) = platform::ProcessHandle::capture(identity)? {
+                        handles.push(handle);
+                    }
+                }
+            }
+            Ok(Self { receipt, handles })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        anyhow::bail!("incarnation-bound signalling unsupported on this platform")
+    }
+
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn all_exited(&self) -> anyhow::Result<bool> {
+        for handle in &self.handles {
+            if !handle.exited()? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn settle(self, grace: Duration) -> anyhow::Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            #[cfg(test)]
+            if FAIL_CAPTURED_TREE_AFTER_ROOT.replace(false) {
+                let root = self.handles.first().expect("captured root handle");
+                root.signal(libc::SIGKILL)?;
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !root.exited()? {
+                    anyhow::ensure!(Instant::now() < deadline, "injected root exit unproven");
+                    std::thread::yield_now();
+                }
+                anyhow::bail!("injected retirement proof failure after root exit");
+            }
+            settle_process_handles(&self.handles, grace)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = grace;
+            anyhow::bail!("incarnation-bound signalling unsupported on this platform")
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn settle_process_handles(
+    handles: &[platform::ProcessHandle],
+    grace: Duration,
+) -> anyhow::Result<()> {
+    for handle in handles {
+        handle.signal(libc::SIGTERM)?;
+    }
+    let term_deadline = Instant::now() + grace;
+    let kill_deadline = term_deadline + Duration::from_secs(5);
+    let mut killed = false;
+    loop {
+        let mut live = false;
+        for handle in handles {
+            live |= !handle.exited()?;
+        }
+        if !live {
+            return Ok(());
+        }
+        let now = Instant::now();
+        if now >= term_deadline && !killed {
+            for handle in handles {
+                handle.signal(libc::SIGKILL)?;
+            }
+            killed = true;
+        }
+        anyhow::ensure!(now < kill_deadline, "owned process termination unproven");
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 pub(crate) fn fence_processes(
@@ -951,30 +1418,7 @@ pub(crate) fn fence_processes(
                 handles.push(handle);
             }
         }
-        for handle in &handles {
-            handle.signal(libc::SIGTERM)?;
-        }
-        let term_deadline = Instant::now() + grace;
-        let kill_deadline = term_deadline + Duration::from_secs(5);
-        let mut killed = false;
-        loop {
-            let mut live = false;
-            for handle in &handles {
-                live |= !handle.exited()?;
-            }
-            if !live {
-                return Ok(());
-            }
-            let now = Instant::now();
-            if now >= term_deadline && !killed {
-                for handle in &handles {
-                    handle.signal(libc::SIGKILL)?;
-                }
-                killed = true;
-            }
-            anyhow::ensure!(now < kill_deadline, "owned process termination unproven");
-            std::thread::sleep(Duration::from_millis(25));
-        }
+        settle_process_handles(&handles, grace)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -994,7 +1438,6 @@ pub(crate) fn runner_group_identities(group: u32) -> anyhow::Result<Vec<PrimePro
         anyhow::bail!("runner group inspection unsupported on this platform")
     }
 }
-
 pub fn boot_id() -> Option<String> {
     #[cfg(target_os = "linux")]
     {
@@ -1040,6 +1483,7 @@ pub(crate) fn foreground_arguments(shell_pid: u32) -> Vec<ProcessArguments> {
     }
 }
 
+/// The parent pid and `argv[0]` of `pid`, or `None` when it cannot be read.
 pub fn parent_and_argv0(pid: u32) -> Option<(u32, String)> {
     #[cfg(target_os = "linux")]
     {
@@ -1058,6 +1502,8 @@ pub fn parent_and_argv0(pid: u32) -> Option<(u32, String)> {
     }
 }
 
+/// Get the foreground process group leader PID for a given shell PID
+/// This finds the actual process that has the terminal foreground
 pub fn get_foreground_pid(shell_pid: u32) -> Option<u32> {
     let pid = {
         #[cfg(target_os = "linux")]
@@ -1087,15 +1533,28 @@ pub fn get_foreground_pid(shell_pid: u32) -> Option<u32> {
     pid
 }
 
-/// Prevents idle sleep while sessions are active. The backing child exits on its own
-/// when the daemon dies, so the assertion releases even without `Drop`.
+/// An acquired OS assertion that prevents user-idle system sleep while agent
+/// sessions are active. The assertion is held by a subprocess whose lifetime
+/// is tied to the daemon, so it releases even when the daemon exits via
+/// `std::process::exit` or dies from a panic, OOM, or `kill -9` (paths where
+/// no `Drop` runs): the child terminates itself once the daemon is gone (macOS
+/// `caffeinate -w <daemon_pid>` watches the daemon PID; the Linux `cat` sees
+/// EOF on the stdin pipe the daemon held), and init then reaps it. The
+/// `server` status loop is the only consumer.
 pub trait SleepInhibit: Send {
+    /// Acquire the assertion by spawning and retaining the backing child.
     fn acquire(&mut self) -> anyhow::Result<()>;
+    /// Release the assertion, terminating the backing child.
     fn release(&mut self);
-    /// Also true when respawning would be futile (backend unavailable, unsupported platform).
+    /// Whether the reconciler should treat the assertion as still held and skip
+    /// respawning. True while the backing child is alive, and when respawning
+    /// would be futile (backend latched unavailable, or an unsupported platform).
     fn is_held_alive(&mut self) -> bool;
 }
 
+/// Build the platform sleep inhibitor: `caffeinate -i -w <daemon_pid>` on
+/// macOS, `systemd-inhibit --what=idle:sleep ... cat` on Linux, and a no-op
+/// on every other platform.
 pub fn sleep_inhibitor() -> Box<dyn SleepInhibit> {
     #[cfg(target_os = "macos")]
     {
@@ -1113,6 +1572,8 @@ pub fn sleep_inhibitor() -> Box<dyn SleepInhibit> {
     }
 }
 
+/// Sleep inhibitor for platforms with no supported backend: acquire and release
+/// are no-ops, and `is_held_alive` reports held to avoid pointless respawns.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 struct NoopInhibitor;
 
@@ -1125,11 +1586,19 @@ impl SleepInhibit for NoopInhibitor {
     fn release(&mut self) {}
 
     fn is_held_alive(&mut self) -> bool {
+        // No backend exists on this platform, so there is nothing to respawn:
+        // report held to keep the reconciler at a steady-state no-op instead of
+        // rebuilding a fresh Noop every reconcile interval.
         true
     }
 }
 
-/// Process-global because the reconciler rebuilds the inhibitor on every reacquire.
+/// Latched once a sleep-inhibit backend is found unusable on this host: the
+/// helper binary is missing, or it spawns but exits without taking the lock
+/// (WSL2 or a container with no logind). Process-global because the reconciler
+/// builds a fresh inhibitor on every reacquire, so a per-instance guard could
+/// not remember across rebuilds; the backends read it to report the dead
+/// backend as held, which stops the reconciler respawning a doomed child.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 static SLEEP_INHIBIT_UNAVAILABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -1139,7 +1608,15 @@ fn sleep_inhibit_unavailable() -> bool {
     SLEEP_INHIBIT_UNAVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Optimistic: `true` only means no failure has latched yet.
+/// Whether a real OS sleep-inhibit backend is still believed able to hold the
+/// assertion on this host, for read-only status reporting.
+/// Optimistic: `true` only means no failure has latched yet, not that the
+/// backend was verified; it is never actively probed, so a host where it would
+/// fail still reads `true` until a real attempt latches it. `false` once the
+/// backend latches unavailable (helper binary missing, or a WSL2/container with
+/// no logind), and false on platforms with only `NoopInhibitor`. The latch is
+/// monotonic and never resets for the daemon's lifetime, so this stays false
+/// until restart even if the missing tool is later installed.
 pub(crate) fn sleep_inhibit_backend_available() -> bool {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
@@ -1151,6 +1628,9 @@ pub(crate) fn sleep_inhibit_backend_available() -> bool {
     }
 }
 
+/// Latch the sleep-inhibit backend unavailable and warn exactly once. Shared
+/// by the platform backends so the warn-once policy lives in one place while
+/// each backend keeps only its own spawn and liveness mechanics.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn latch_sleep_inhibit_unavailable(reason: &str) {
     if !SLEEP_INHIBIT_UNAVAILABLE.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -1158,6 +1638,10 @@ fn latch_sleep_inhibit_unavailable(reason: &str) {
     }
 }
 
+/// Report whether a spawned inhibitor's backing child should be treated as
+/// still holding the assertion. Shared by both platform backends because the
+/// exit-code discrimination is policy (like the warn-once latch), not per-OS
+/// mechanics, so the two copies cannot drift; only `exit_reason` differs.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn sleep_inhibit_child_held_alive(child: &mut Option<Child>, exit_reason: &str) -> bool {
     if sleep_inhibit_unavailable() {
@@ -1178,6 +1662,8 @@ fn sleep_inhibit_child_held_alive(child: &mut Option<Child>, exit_reason: &str) 
     }
 }
 
+/// Kill a process and all its descendants
+/// Sends SIGTERM first, then SIGKILL to any survivors
 pub fn kill_process_tree(pid: u32) {
     #[cfg(target_os = "linux")]
     let pids = linux::collect_pid_tree(pid);
@@ -1191,9 +1677,12 @@ pub fn kill_process_tree(pid: u32) {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = pid;
+        // No-op on unsupported platforms, fall back to tmux kill-session only
     }
 }
 
+/// SIGTERM every pid in reverse order (children first), wait briefly for
+/// graceful shutdown, then SIGKILL anything still alive.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn kill_with_fallback(pids: &[u32]) {
     tracing::debug!(
@@ -1236,7 +1725,6 @@ pub(crate) fn runner_group_executing(pid: u32) -> anyhow::Result<bool> {
         anyhow::bail!("runner settlement unsupported for PID {pid}")
     }
 }
-
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn process_exists(pid: u32) -> bool {
     match kill(Pid::from_raw(pid as i32), None) {
@@ -1246,7 +1734,14 @@ fn process_exists(pid: u32) -> bool {
     }
 }
 
-/// Pauses output while a mobile client reads scrollback; the server guarantees SIGCONT on disconnect.
+/// Send SIGSTOP to a process and all its descendants. Used to pause
+/// the agent (claude) while a mobile client is reading tmux scrollback:
+/// without this, claude's continued output keeps pushing lines into
+/// scrollback under the reader and shifts what they're trying to read.
+///
+/// Paired with [`continue_process_tree`] which sends SIGCONT. The web
+/// server guarantees a SIGCONT on client disconnect so a dropped
+/// connection cannot leave the pane's process permanently suspended.
 pub fn stop_process_tree(pid: u32) {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     signal_process_tree(pid, Signal::SIGSTOP);
@@ -1257,6 +1752,9 @@ pub fn stop_process_tree(pid: u32) {
     }
 }
 
+/// Send SIGCONT to a process and all its descendants. Inverse of
+/// [`stop_process_tree`]; SIGCONT to a non-stopped process is a no-op,
+/// so this is safe to invoke unconditionally as cleanup.
 pub fn continue_process_tree(pid: u32) {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     signal_process_tree(pid, Signal::SIGCONT);
@@ -1348,6 +1846,19 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn captured_tree_changed_boot_is_obsolete_but_malformed_identity_is_not() {
+        let current = CapturedProcessTree::capture(std::process::id()).unwrap();
+        let mut receipt = current.receipt().clone();
+        receipt.boot_id = format!("different-{}", receipt.boot_id);
+        let obsolete = CapturedProcessTree::resume(receipt.clone(), std::process::id()).unwrap();
+        assert!(obsolete.all_exited().unwrap());
+        obsolete.settle(Duration::ZERO).unwrap();
+        receipt.processes.push(receipt.processes[0].clone());
+        assert!(CapturedProcessTree::resume(receipt, std::process::id()).is_err());
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn throttle_child_lowers_the_child_scheduling_priority() {
@@ -1376,6 +1887,9 @@ mod tests {
         }
     }
 
+    /// A live process carrying a unique marker in its argv is matched by the
+    /// cmdline needle; a marker no process carries is not. Backs the #2994
+    /// orphan guard's fallback signal for non-hook agents.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn processes_matching_detects_live_process_by_cmdline() {
@@ -1393,9 +1907,13 @@ mod tests {
             .spawn()
             .expect("spawn marker process");
 
+        // env slot empty, cmdline slot carries the needle. Two candidates: the
+        // live marker and an absent one, testing both outcomes in one pass.
         let env = vec![String::new(), String::new()];
         let cmd = vec![Some(marker.clone()), Some(absent.clone())];
 
+        // Poll until the child's argv is observable (spawn returns before the
+        // kernel necessarily populates cmdline).
         let mut flags = vec![false, false];
         for _ in 0..100 {
             flags = processes_matching(&env, &cmd, &[None, None]);
@@ -1425,6 +1943,7 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
+        // Until exec completes, argv is empty or still the parent's.
         let deadline = Instant::now() + Duration::from_secs(5);
         let read = loop {
             let read = parent_and_argv0(child.id());
@@ -1440,11 +1959,19 @@ mod tests {
         assert_eq!(read, Some((std::process::id(), "sleep".to_string())));
     }
 
+    /// The environment signal: a live process with `AOE_INSTANCE_ID=<marker>`
+    /// in its environment is matched by the anchored env needle even when the
+    /// marker is absent from argv. This is the argv-rewrite-proof identity
+    /// signal the #2994 guard relies on for hook-enabled agents. Linux-only:
+    /// `/proc/<pid>/environ` is a stable probe; macOS `ps -E` env visibility is
+    /// hardening-dependent and not asserted here.
     #[cfg(target_os = "linux")]
     #[test]
     fn processes_matching_detects_live_process_by_env_entry() {
         let marker = format!("aoe_env_marker_{}", std::process::id());
 
+        // `sleep` keeps the process alive; the marker is only in the env, never
+        // in argv, so a match must come from the environ scan.
         let key = crate::tmux::env::AOE_INSTANCE_ID_KEY;
         let mut child = Command::new("sleep")
             .arg("30")
@@ -1456,6 +1983,7 @@ mod tests {
             .expect("spawn env-marker process");
 
         let env = vec![format!("{key}={marker}")];
+        // A prefix of the real value must NOT match (anchored entry, not prefix).
         let env_prefix = vec![format!("{key}={}", &marker[..marker.len() - 1])];
         let cmd = vec![None];
 
@@ -1480,7 +2008,12 @@ mod tests {
         );
     }
 
-    /// Restores signal dispositions even when a test panics.
+    /// Restores the pre-test SIGINT/SIGQUIT disposition on drop. `#[serial]`
+    /// only keeps these tests from racing each other; it does nothing to
+    /// stop a mid-test `expect`/`assert!` panic from leaving process-wide
+    /// signal state mutated for the rest of the test binary's run, since
+    /// the harness catches per-test panics and keeps going. This guard
+    /// makes that restoration unconditional.
     #[cfg(unix)]
     struct RestoreSignalsOnDrop {
         prev_sigint: Option<nix::sys::signal::SigAction>,
@@ -1559,11 +2092,18 @@ mod tests {
         );
         // SAFETY: see the test above; SIG_IGN is async-signal-safe.
         let prev_sigint = unsafe { sigaction(Signal::SIGINT, &ignore) }.expect("ignore SIGINT");
+        // This test only mutates SIGINT, so there is nothing to restore
+        // for SIGQUIT.
         let _restore = RestoreSignalsOnDrop {
             prev_sigint: Some(prev_sigint),
             prev_sigquit: None,
         };
 
+        // A shell that signals itself and only then prints: if the child
+        // inherits SIGINT ignored from the parent, the self-signal is a
+        // no-op and the shell keeps running to print "survived". If
+        // `reset_signals_on_exec` did its job, the default SIGINT action
+        // (terminate) kills the shell before the echo runs.
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "kill -INT $$; echo survived"]);
         reset_signals_on_exec(&mut cmd);
@@ -1590,6 +2130,12 @@ mod tests {
         // requirement for sigaction calls made outside a signal handler.
         let baseline = unsafe { sigaction(Signal::SIGINT, &ignore) }.expect("ignore SIGINT");
 
+        // The guard is told to restore SIG_IGN (as if that's what the test
+        // found in place). Inside the panicking scope we then flip the
+        // disposition to SIG_DFL via `reset_ignored_signals_before_exec`,
+        // so a restore that only ran on normal return would leave SIG_DFL
+        // behind; only an unconditional (Drop-based) restore gets back to
+        // SIG_IGN across the unwind.
         let unwound = std::panic::catch_unwind(|| {
             let _restore = RestoreSignalsOnDrop {
                 prev_sigint: Some(ignore),
@@ -1765,64 +2311,138 @@ mod tests {
 
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn process_group_timeout_terminates_then_kills_descendants() {
-        use std::io::BufRead as _;
+    fn timeout_and_cancellation_terminate_process_group_descendants() {
+        for cancel in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let pid_path = tmp.path().join("descendant.pid");
+            let term_path = tmp.path().join("terminated");
+            let mut cmd = Command::new("sh");
+            cmd.args([
+                "-c",
+                r#"trap 'printf term > "$2"' TERM; sh -c 'trap "" TERM; printf "%s" "$$" > "$1"; exec sleep 600' child "$1" & wait; wait"#,
+                "hook",
+            ])
+            .arg(&pid_path)
+            .arg(&term_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
 
-        // The descendant ignores SIGTERM and prints its PID only once it does, so
-        // only the escalation can end it.
-        let mut cmd = Command::new("sh");
-        cmd.args([
-            "-c",
-            "sh -c 'trap \"\" TERM; echo $$; exec sleep 600' & wait",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-        platform::configure_process_group(&mut cmd);
-        let mut child = cmd.spawn().unwrap();
-        let mut line = String::new();
-        std::io::BufReader::new(child.stdout.take().unwrap())
-            .read_line(&mut line)
-            .expect("descendant should publish its pid");
-        let pid: i32 = line.trim().parse().unwrap();
-
-        let status =
-            wait_with_timeout_inner(&mut child, Duration::from_millis(400), true, None).unwrap();
-        assert!(status.is_none(), "process group should time out");
-        // Linux fixes the exit signal when the first fatal signal is sent, so the
-        // later SIGKILL cannot mask a SIGTERM the leader already received.
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::process::ExitStatusExt;
+            let token = CancellationToken::new();
+            // Cancel once the descendant's pid is on disk, so the wait has
+            // something to tear down. The wait runs on its own thread because
+            // the child is only spawned once the call below starts, and it is
+            // bounded so a shell that never reports its pid fails the test
+            // instead of hanging it.
+            let canceler = cancel.then(|| {
+                let token = token.clone();
+                let pid_path = pid_path.clone();
+                std::thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while !pid_path.exists() {
+                        if Instant::now() >= deadline {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    token.cancel();
+                })
+            });
+            let result = if cancel {
+                run_status_with_timeout_process_group(
+                    &mut cmd,
+                    Duration::from_secs(30),
+                    Some(&token),
+                )
+            } else {
+                run_with_timeout_process_group(&mut cmd, Duration::from_secs(2))
+                    .map(|output| output.map(|output| output.status))
+            }
+            .unwrap();
+            // The canceler has fired by the time the call returns; join it so
+            // the test does not outlive its own helper thread.
+            if let Some(canceler) = canceler {
+                canceler.join().unwrap();
+            }
+            assert!(result.is_none(), "process group must be interrupted");
             assert_eq!(
-                child.try_wait().unwrap().unwrap().signal(),
-                Some(libc::SIGTERM),
+                std::fs::read_to_string(term_path).expect("SIGTERM trap should run"),
+                "term",
                 "the process-group leader must receive SIGTERM before escalation"
             );
-        }
 
-        let process_is_running = |pid: i32| {
+            let pid: i32 = std::fs::read_to_string(pid_path)
+                .expect("shell should publish descendant pid")
+                .parse()
+                .unwrap();
+            let process_is_running = |pid: i32| {
+                let output = Command::new("ps")
+                    .args(["-o", "stat=", "-p", &pid.to_string()])
+                    .output()
+                    .expect("ps should inspect descendant state");
+                let state = String::from_utf8_lossy(&output.stdout);
+                output.status.success()
+                    && !state.trim().is_empty()
+                    && !state.trim_start().starts_with('Z')
+            };
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while process_is_running(pid) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                !process_is_running(pid),
+                "descendant must be exited or a terminated zombie after interruption"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn completed_status_hook_does_not_abandon_background_children() {
+        let root = tempfile::tempdir().unwrap();
+        let pid_path = root.path().join("child.pid");
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", r#"sleep 30 & printf %s $! > "$1""#, "sh"])
+            .arg(&pid_path);
+        let result =
+            run_status_with_timeout_process_group(&mut command, Duration::from_secs(2), None)
+                .unwrap();
+        assert!(result.unwrap().success());
+        let pid: i32 = std::fs::read_to_string(pid_path).unwrap().parse().unwrap();
+        // Signalling the group precedes the descendants' exit transition.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let running = loop {
             let output = Command::new("ps")
                 .args(["-o", "stat=", "-p", &pid.to_string()])
                 .output()
-                .expect("ps should inspect descendant state");
+                .unwrap();
             let state = String::from_utf8_lossy(&output.stdout);
-            output.status.success()
+            let running = output.status.success()
                 && !state.trim().is_empty()
-                && !state.trim_start().starts_with('Z')
-        };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while process_is_running(pid) && Instant::now() < deadline {
+                && !state.trim_start().starts_with('Z');
+            if !running || Instant::now() >= deadline {
+                break running;
+            }
             std::thread::sleep(Duration::from_millis(10));
+        };
+        if running {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
         }
-        assert!(
-            !process_is_running(pid),
-            "descendant must be exited or a killed zombie after the timeout"
-        );
+        assert!(!running, "completed hook left its background child running");
     }
 
     #[test]
     #[cfg(unix)]
     fn run_with_timeout_does_not_wait_for_descendant_output_writer() {
+        // The immediate child (sh) exits fast but backgrounds a `sleep` that
+        // retains stdout/stderr. Output capture must read the current regular
+        // file contents without waiting for that descendant to close its
+        // inherited handles. `sleep 10` (>> the 4s assertion) ensures an
+        // inherited pipe plus an unbounded drain would visibly fail.
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "sleep 10 & printf done"]);
 

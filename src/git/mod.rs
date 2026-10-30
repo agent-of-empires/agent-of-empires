@@ -17,7 +17,8 @@ pub use remote::{
     clone_bare_repo, clone_repo, get_remote_owner, get_remote_owner_with_key, get_remote_slug,
     get_remote_url,
 };
-pub use worktree::{GitWorktree, WorktreeEntry};
+pub(crate) use worktree::WorktreeCreation;
+pub use worktree::{GitWorktree, PurgeClaim, WorktreeEntry};
 
 /// Open the repository at `path` without searching parents, so an unrelated
 /// ancestor repo (e.g. a dotfile-managed home) is never found.

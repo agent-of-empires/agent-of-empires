@@ -99,7 +99,7 @@ export function SessionConfigControls({
           option={providerDescriptor(provider)}
           pending={providerPending ?? null}
           onSelect={(value) => onSetProvider(value)}
-          lockedReason={providerLockedReason}
+          lockedReason={providerLockedReason ?? (providerPending ? "Switching provider" : null)}
         />
       )}
     </div>
@@ -145,6 +145,7 @@ function computeMenuLayout(rect: DOMRect, viewportHeight: number, viewportTop = 
 
 function ModelDropdown({ option, pending, onSelect, lockedReason }: SubProps) {
   const [open, setOpen] = useState(false);
+  if (lockedReason && open) setOpen(false);
   const [menuLayout, setMenuLayout] = useState<MenuLayout>(DEFAULT_MENU_LAYOUT);
   const ref = useRef<HTMLDivElement | null>(null);
   const menuId = `config-option-menu-${option.id}`;
@@ -233,9 +234,9 @@ function ModelDropdown({ option, pending, onSelect, lockedReason }: SubProps) {
                   key={opt.value}
                   type="button"
                   role="menuitem"
-                  disabled={isPending}
+                  disabled={!!lockedReason || isPending}
                   onClick={() => {
-                    if (isPending || isCurrent) {
+                    if (lockedReason || isPending || isCurrent) {
                       setOpen(false);
                       return;
                     }
@@ -303,7 +304,7 @@ function EffortSegmented({ option, pending, onSelect }: SubProps) {
             data-testid={`config-option-${option.id}-value-${opt.value}`}
             className={[
               "rounded px-2 py-0.5 text-[11px] font-medium transition-colors",
-              isCurrent ? "bg-surface-700 text-text-primary" : "text-text-secondary hover:text-text-primary",
+              isCurrent ? "bg-brand-600/20 text-text-primary" : "text-text-secondary hover:text-text-primary",
               isPending ? "cursor-not-allowed opacity-50" : "",
             ].join(" ")}
           >

@@ -255,16 +255,11 @@ impl RenameDialog {
     }
 
     fn next_field(&mut self) {
-        self.focused_field = (self.focused_field + 1) % self.field_count();
+        self.focused_field = super::cycle_focus(self.focused_field, self.field_count(), false);
     }
 
     fn prev_field(&mut self) {
-        let count = self.field_count();
-        self.focused_field = if self.focused_field == 0 {
-            count - 1
-        } else {
-            self.focused_field - 1
-        };
+        self.focused_field = super::cycle_focus(self.focused_field, self.field_count(), true);
     }
 
     fn recompute_group_ghost(&mut self) {
@@ -325,7 +320,12 @@ impl RenameDialog {
         match key.code {
             KeyCode::Esc => DialogResult::Cancel,
             KeyCode::Enter => {
-                let title_value = self.new_title.value().trim().to_string();
+                let entered_title = self.new_title.value().trim();
+                let title_value = if entered_title == self.current_title {
+                    String::new()
+                } else {
+                    entered_title.to_string()
+                };
                 let group_value = self.new_group.value().trim();
                 let selected_profile = self.selected_profile();
                 let profile_changed = selected_profile != self.current_profile;

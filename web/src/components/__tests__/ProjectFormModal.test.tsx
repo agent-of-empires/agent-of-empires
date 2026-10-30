@@ -1,11 +1,14 @@
 // @vitest-environment jsdom
 
+import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-
 import { ProjectFormModal } from "../ProjectFormModal";
+import type * as Api from "../../lib/api";
+import type { ProjectInfo } from "../../lib/types";
 
-vi.mock("../../lib/api", () => ({
+vi.mock("../../lib/api", async (importOriginal) => ({
+  ...(await importOriginal<typeof Api>()),
   createProject: vi.fn(),
   updateProject: vi.fn(),
   getSettingsSchema: vi.fn(),
@@ -13,6 +16,19 @@ vi.mock("../../lib/api", () => ({
   resolvePluginOptions: vi.fn(),
 }));
 
+function Form({ saved = async () => {} }: { saved?: () => Promise<void> }) {
+  const [open, setOpen] = useState(true);
+  return open ? (
+    <ProjectFormModal
+      profile="alpha"
+      initial={{ name: "extra", path: "/repo/extra", scope: "profile", default_base_branch: "develop", pinned: true }}
+      onClose={() => setOpen(false)}
+      onSaved={saved}
+    />
+  ) : (
+    <p>Closed</p>
+  );
+}
 import {
   createProject,
   fetchMachineSettings,
@@ -21,6 +37,8 @@ import {
   updateProject,
 } from "../../lib/api";
 
+const baseField = () =>
+  screen.getByPlaceholderText("blank = inherit global default, then auto-detect") as HTMLInputElement;
 const mockCreate = createProject as ReturnType<typeof vi.fn>;
 const mockUpdate = updateProject as ReturnType<typeof vi.fn>;
 const mockSchema = getSettingsSchema as ReturnType<typeof vi.fn>;
@@ -35,177 +53,135 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
-  vi.clearAllMocks();
+  vi.resetAllMocks();
+  vi.unstubAllGlobals();
 });
 
-const BRANCH_PLACEHOLDER = "blank = inherit global default, then auto-detect";
-
-function branchInput() {
-  return screen.getByPlaceholderText(BRANCH_PLACEHOLDER) as HTMLInputElement;
-}
-
-function renderEdit() {
-  render(
-    <ProjectFormModal
-      initial={{ name: "extra", path: "/repo/extra", scope: "global", default_base_branch: "develop" }}
-      onClose={() => {}}
-      onSaved={() => {}}
-    />,
-  );
-  return branchInput();
-}
-
 describe("ProjectFormModal", () => {
-  it("sends default_base_branch in the create payload when set", async () => {
-    mockCreate.mockResolvedValue({ ok: true });
-    render(<ProjectFormModal onClose={() => {}} onSaved={() => {}} />);
-
-    fireEvent.change(screen.getByPlaceholderText("/path/to/repo"), { target: { value: "/repo/extra" } });
-    fireEvent.change(branchInput(), { target: { value: "develop" } });
-    fireEvent.click(screen.getByRole("button", { name: "Add" }));
-
-    await waitFor(() =>
-      expect(mockCreate).toHaveBeenCalledWith(
-        expect.objectContaining({ path: "/repo/extra", default_base_branch: "develop" }),
-      ),
-    );
+  it("keeps the edited value and form open when persistence fails", async () => {
+    vi.mocked(updateProject).mockResolvedValue({ ok: false, error: "Registry is read-only" });
+    render(<Form />);
+    expect(baseField().value).toBe("develop");
+    fireEvent.change(baseField(), { target: { value: "release" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText("Registry is read-only");
+    expect(baseField().value).toBe("release");
+    expect(screen.queryByText("Closed")).toBeNull();
   });
 
-  it("omits default_base_branch when the field is left blank", async () => {
-    mockCreate.mockResolvedValue({ ok: true });
-    render(<ProjectFormModal onClose={() => {}} onSaved={() => {}} />);
-
-    fireEvent.change(screen.getByPlaceholderText("/path/to/repo"), { target: { value: "/repo/extra" } });
-    fireEvent.click(screen.getByRole("button", { name: "Add" }));
-
-    await waitFor(() => expect(mockCreate).toHaveBeenCalled());
-    expect(mockCreate.mock.calls[0]![0].default_base_branch).toBeUndefined();
+  it("stays open until the committed registry refresh finishes", async () => {
+    vi.mocked(updateProject).mockResolvedValue({ ok: true });
+    let finishRefresh!: () => void;
+    const refresh = new Promise<void>((resolve) => {
+      finishRefresh = resolve;
+    });
+    let refreshing = false;
+    render(
+      <Form
+        saved={() => {
+          refreshing = true;
+          return refresh;
+        }}
+      />,
+    );
+    fireEvent.change(baseField(), { target: { value: "release" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(refreshing).toBe(true));
+    expect(screen.queryByText("Closed")).toBeNull();
+    expect(baseField().value).toBe("release");
+    finishRefresh();
+    await screen.findByText("Closed");
   });
 
   it.each([
-    ["release", "release"],
-    ["  ", null],
-  ] as [string, string | null][])("edit mode saves the typed base branch (%j)", async (typed, sent) => {
-    mockUpdate.mockResolvedValue({ ok: true });
-    const input = renderEdit();
-    expect(input.value).toBe("develop");
-
-    fireEvent.change(input, { target: { value: typed } });
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
-
-    await waitFor(() => expect(mockUpdate).toHaveBeenCalledWith("extra", "global", sent));
-  });
-
-  it("invokes onSaved and onClose after a successful create", async () => {
-    mockCreate.mockResolvedValue({ ok: true });
+    ["inherit", undefined],
+    ["on", true],
+    ["off", false],
+  ])("creates with the exact served profile and container-start %s override", async (choice, expected) => {
+    vi.mocked(createProject).mockResolvedValue({ ok: true });
     const onSaved = vi.fn();
     const onClose = vi.fn();
-    render(<ProjectFormModal onClose={onClose} onSaved={onSaved} />);
-
+    render(<ProjectFormModal profile="served" onClose={onClose} onSaved={onSaved} />);
     fireEvent.change(screen.getByPlaceholderText("/path/to/repo"), { target: { value: "/repo/extra" } });
+    fireEvent.change(screen.getByText("Start in container by default").nextElementSibling!, {
+      target: { value: choice },
+    });
+    fireEvent.change(screen.getByText("Worktree by default").nextElementSibling!, { target: { value: "on" } });
+    fireEvent.click(screen.getByRole("button", { name: "Profile-only" }));
     fireEvent.click(screen.getByRole("button", { name: "Add" }));
-
-    await waitFor(() => expect(onSaved).toHaveBeenCalled());
-    expect(onClose).toHaveBeenCalled();
+    await waitFor(() =>
+      expect(createProject).toHaveBeenCalledWith(
+        expect.objectContaining({
+          path: "/repo/extra",
+          scope: "profile",
+          profile: "served",
+          overrides: {
+            worktree_enabled: true,
+            smart_rename: undefined,
+            sandbox_enabled: expected,
+          },
+        }),
+      ),
+    );
+    await waitFor(() => expect(onClose).toHaveBeenCalledOnce());
+    expect(onSaved).toHaveBeenCalledOnce();
   });
 
-  it("sends overrides in the create payload when a tri-state select is set to On", async () => {
-    mockCreate.mockResolvedValue({ ok: true });
-    render(<ProjectFormModal onClose={() => {}} onSaved={() => {}} />);
-
-    fireEvent.change(screen.getByPlaceholderText("/path/to/repo"), { target: { value: "/repo/extra" } });
-    const worktreeSelect = screen.getByText("Worktree by default").nextElementSibling as HTMLSelectElement;
-    fireEvent.change(worktreeSelect, { target: { value: "on" } });
-    fireEvent.click(screen.getByRole("button", { name: "Add" }));
-
+  it.each([
+    ["on", true],
+    ["off", false],
+    ["inherit", null],
+  ])("patches the container-start %s choice at the unchanged registration identity", async (choice, expected) => {
+    vi.mocked(updateProject).mockResolvedValue({ ok: true });
+    render(
+      <ProjectFormModal
+        profile="served"
+        initial={{
+          name: "friendly",
+          path: "/repo/extra",
+          scope: "profile",
+          pinned: false,
+          overrides: { worktree_enabled: false, sandbox_enabled: choice === "on" ? false : true },
+        }}
+        onClose={() => {}}
+        onSaved={() => {}}
+      />,
+    );
+    fireEvent.change(screen.getByText("Start in container by default").nextElementSibling!, {
+      target: { value: choice },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() =>
-      expect(mockCreate).toHaveBeenCalledWith(
-        expect.objectContaining({ overrides: expect.objectContaining({ worktree_enabled: true }) }),
+      expect(updateProject).toHaveBeenCalledWith(
+        "/repo/extra",
+        { scope: "profile", profile: "served" },
+        {
+          default_base_branch: null,
+          overrides: { worktree_enabled: false, smart_rename: null, sandbox_enabled: expected },
+        },
       ),
     );
   });
 
-  it("sends the container-start override in the create payload only when it is set", async () => {
-    mockCreate.mockResolvedValue({ ok: true });
-    render(<ProjectFormModal onClose={() => {}} onSaved={() => {}} />);
-
-    fireEvent.change(screen.getByPlaceholderText("/path/to/repo"), { target: { value: "/repo/extra" } });
-    const sandboxSelect = screen.getByText("Start in container by default").nextElementSibling as HTMLSelectElement;
-    fireEvent.change(sandboxSelect, { target: { value: "off" } });
-    fireEvent.click(screen.getByRole("button", { name: "Add" }));
-
+  it("omits unchanged overrides while updating the base branch", async () => {
+    vi.mocked(updateProject).mockResolvedValue({ ok: true });
+    render(<Form />);
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() =>
-      expect(mockCreate).toHaveBeenCalledWith(
-        expect.objectContaining({ overrides: expect.objectContaining({ sandbox_enabled: false }) }),
+      expect(updateProject).toHaveBeenCalledWith(
+        "/repo/extra",
+        { scope: "profile", profile: "alpha" },
+        {
+          default_base_branch: "develop",
+        },
       ),
-    );
-  });
-
-  it("PATCHes with exactly 3 arguments when overrides are left at 'Use global default' in edit mode", async () => {
-    mockUpdate.mockResolvedValue({ ok: true });
-    render(
-      <ProjectFormModal
-        initial={{ name: "extra", path: "/repo/extra", scope: "global", default_base_branch: "develop", pinned: false }}
-        onClose={() => {}}
-        onSaved={() => {}}
-      />,
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
-
-    await waitFor(() => expect(mockUpdate).toHaveBeenCalledWith("extra", "global", "develop"));
-    expect(mockUpdate.mock.calls[0]!.length).toBe(3);
-  });
-
-  it("PATCHes overrides when worktree-by-default is switched to Off in edit mode", async () => {
-    mockUpdate.mockResolvedValue({ ok: true });
-    render(
-      <ProjectFormModal
-        initial={{ name: "extra", path: "/repo/extra", scope: "global", default_base_branch: "develop", pinned: false }}
-        onClose={() => {}}
-        onSaved={() => {}}
-      />,
-    );
-
-    const worktreeSelect = screen.getByText("Worktree by default").nextElementSibling as HTMLSelectElement;
-    fireEvent.change(worktreeSelect, { target: { value: "off" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
-
-    await waitFor(() =>
-      expect(mockUpdate).toHaveBeenCalledWith("extra", "global", "develop", {
-        worktree_enabled: false,
-        smart_rename: null,
-        sandbox_enabled: null,
-      }),
-    );
-  });
-
-  it("PATCHes the sandbox override when start-in-container is switched to On in edit mode", async () => {
-    mockUpdate.mockResolvedValue({ ok: true });
-    render(
-      <ProjectFormModal
-        initial={{ name: "extra", path: "/repo/extra", scope: "global", pinned: false }}
-        onClose={() => {}}
-        onSaved={() => {}}
-      />,
-    );
-
-    const sandboxSelect = screen.getByText("Start in container by default").nextElementSibling as HTMLSelectElement;
-    fireEvent.change(sandboxSelect, { target: { value: "on" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
-
-    await waitFor(() =>
-      expect(mockUpdate).toHaveBeenCalledWith("extra", "global", null, {
-        worktree_enabled: null,
-        smart_rename: null,
-        sandbox_enabled: true,
-      }),
     );
   });
 
   it("pre-selects 'Off' for smart-rename when the project has that override set", () => {
     render(
       <ProjectFormModal
+        profile="alpha"
         initial={{
           name: "extra",
           path: "/repo/extra",
@@ -243,10 +219,11 @@ describe("ProjectFormModal", () => {
       mockSettings.mockResolvedValue({ plugins: { "acme.kit": { settings: { label: "global-label" } } } });
     });
 
-    const editProject = (overrides?: object) =>
+    const editProject = (overrides?: ProjectInfo["overrides"], scope: ProjectInfo["scope"] = "global") =>
       render(
         <ProjectFormModal
-          initial={{ name: "extra", path: "/repo/extra", scope: "global", pinned: false, overrides }}
+          profile="served"
+          initial={{ name: "extra", path: "/repo/extra", scope, pinned: false, overrides }}
           onClose={() => {}}
           onSaved={() => {}}
         />,
@@ -259,41 +236,96 @@ describe("ProjectFormModal", () => {
       expect(screen.getByText("Using the global value")).toBeTruthy();
     });
 
-    it("PATCHes a changed project value under overrides.plugin_settings", async () => {
-      mockUpdate.mockResolvedValue({ ok: true });
-      editProject();
-      const input = await screen.findByDisplayValue("global-label");
-      fireEvent.focus(input);
-      fireEvent.change(input, { target: { value: "mine" } });
-      fireEvent.keyDown(input, { key: "Enter" });
-      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    it.each(["global", "profile"] as const)(
+      "PATCHes a changed %s project value at the HTTP boundary",
+      async (scope) => {
+        const actual = await vi.importActual<typeof Api>("../../lib/api");
+        mockUpdate.mockImplementation(actual.updateProject);
+        const canonical: ProjectInfo = {
+          name: "extra",
+          path: "/repo/extra",
+          scope,
+          pinned: false,
+          overrides: { worktree_enabled: false, plugin_settings: { "acme.kit": { label: "mine" } } },
+        };
+        const fetch = vi.fn().mockResolvedValue(
+          new Response(JSON.stringify(canonical), {
+            headers: {
+              "Content-Type": "application/json",
+              "aoe-runtime-epoch": "native-test",
+              "aoe-runtime-revision": "7",
+            },
+          }),
+        );
+        vi.stubGlobal("fetch", fetch);
+        editProject({ worktree_enabled: false }, scope);
+        const input = await screen.findByDisplayValue("global-label");
+        fireEvent.focus(input);
+        fireEvent.change(input, { target: { value: "mine" } });
+        fireEvent.keyDown(input, { key: "Enter" });
+        fireEvent.click(screen.getByRole("button", { name: "Save" }));
+        await waitFor(() => expect(fetch).toHaveBeenCalledOnce());
+        const [url, init] = fetch.mock.calls[0]!;
+        const target = new URL(String(url), "http://dashboard.test");
+        expect(target.pathname).toBe("/api/projects/%2Frepo%2Fextra");
+        expect(target.searchParams.get("scope")).toBe(scope);
+        expect(target.searchParams.get("profile")).toBe(scope === "profile" ? "served" : null);
+        expect(init).toMatchObject({ method: "PATCH", headers: { "Content-Type": "application/json" } });
+        expect(JSON.parse(String(init.body))).toEqual({
+          default_base_branch: null,
+          overrides: {
+            worktree_enabled: false,
+            smart_rename: null,
+            sandbox_enabled: null,
+            plugin_settings: { "acme.kit": { label: "mine" } },
+          },
+        });
+        await expect(mockUpdate.mock.results[0]!.value).resolves.toEqual({ ok: true, project: canonical });
+      },
+    );
 
-      await waitFor(() =>
-        expect(mockUpdate).toHaveBeenCalledWith("extra", "global", null, {
-          worktree_enabled: null,
-          smart_rename: null,
-          sandbox_enabled: null,
-          plugin_settings: { "acme.kit": { label: "mine" } },
+    it("'Use global' clears only the saved project value with null over HTTP", async () => {
+      const actual = await vi.importActual<typeof Api>("../../lib/api");
+      mockUpdate.mockImplementation(actual.updateProject);
+      const canonical: ProjectInfo = {
+        name: "Canonical registration",
+        path: "/repo/extra",
+        scope: "global",
+        pinned: false,
+        overrides: { worktree_enabled: false },
+      };
+      const fetch = vi.fn().mockResolvedValue(
+        new Response(JSON.stringify(canonical), {
+          headers: {
+            "Content-Type": "application/json",
+            "aoe-runtime-epoch": "native-test",
+            "aoe-runtime-revision": "8",
+          },
         }),
       );
-    });
-
-    it("'Use global' clears a saved project value with null", async () => {
-      mockUpdate.mockResolvedValue({ ok: true });
-      editProject({ plugin_settings: { "acme.kit": { label: "saved" } } });
+      vi.stubGlobal("fetch", fetch);
+      editProject({ worktree_enabled: false, plugin_settings: { "acme.kit": { label: "saved" } } });
       await screen.findByDisplayValue("saved");
       fireEvent.click(screen.getByRole("button", { name: "Use global" }));
       expect(screen.getByDisplayValue("global-label")).toBeTruthy();
       fireEvent.click(screen.getByRole("button", { name: "Save" }));
-
-      await waitFor(() =>
-        expect(mockUpdate).toHaveBeenCalledWith(
-          "extra",
-          "global",
-          null,
-          expect.objectContaining({ plugin_settings: { "acme.kit": { label: null } } }),
-        ),
-      );
+      await waitFor(() => expect(fetch).toHaveBeenCalledOnce());
+      const [url, init] = fetch.mock.calls[0]!;
+      const target = new URL(String(url), "http://dashboard.test");
+      expect(target.pathname).toBe("/api/projects/%2Frepo%2Fextra");
+      expect(target.searchParams.get("scope")).toBe("global");
+      expect(target.searchParams.has("profile")).toBe(false);
+      expect(init).toMatchObject({ method: "PATCH" });
+      expect(JSON.parse(String(init.body))).toEqual({
+        default_base_branch: null,
+        overrides: {
+          worktree_enabled: false,
+          smart_rename: null,
+          sandbox_enabled: null,
+          plugin_settings: { "acme.kit": { label: null } },
+        },
+      });
+      await expect(mockUpdate.mock.results[0]!.value).resolves.toEqual({ ok: true, project: canonical });
     });
 
     it("resolves a dependent control from the effective sibling values, global-only ones included", async () => {
@@ -323,7 +355,7 @@ describe("ProjectFormModal", () => {
 
     it("sends the value in the create payload", async () => {
       mockCreate.mockResolvedValue({ ok: true });
-      render(<ProjectFormModal onClose={() => {}} onSaved={() => {}} />);
+      render(<ProjectFormModal profile="served" onClose={() => {}} onSaved={() => {}} />);
       const input = await screen.findByDisplayValue("global-label");
       fireEvent.change(screen.getByPlaceholderText("/path/to/repo"), { target: { value: "/repo/extra" } });
       fireEvent.focus(input);

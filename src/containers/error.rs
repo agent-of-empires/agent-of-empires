@@ -22,8 +22,15 @@ pub enum DockerError {
     #[error("Container already exists: {0}")]
     ContainerAlreadyExists(String),
 
-    #[error("Docker image not found: {0}")]
+    #[error("Image not found: {0}")]
     ImageNotFound(String),
+
+    #[error("{runtime} couldn't pull image {image}: {detail}")]
+    ImagePullFailed {
+        runtime: &'static str,
+        image: String,
+        detail: String,
+    },
 
     #[error("Failed to create container: {0}")]
     CreateFailed(String),
@@ -87,6 +94,25 @@ mod tests {
         assert!(DockerError::PermissionDenied
             .to_string()
             .contains("usermod"));
+    }
+
+    #[test]
+    fn image_errors_name_the_runtime_and_stay_single_line() {
+        for runtime in ["Docker", "Podman", "Apple Container"] {
+            let rendered = DockerError::ImagePullFailed {
+                runtime,
+                image: "img:1".to_string(),
+                detail: sanitize_stderr("denied\nretry later"),
+            }
+            .to_string();
+            assert_eq!(
+                rendered,
+                format!("{runtime} couldn't pull image img:1: denied | retry later")
+            );
+        }
+        assert!(!DockerError::ImageNotFound("img:1".to_string())
+            .to_string()
+            .contains("Docker"));
     }
 
     #[test]

@@ -108,6 +108,7 @@ pub const DEFAULT_TARGET_ROOTS: &[&str] = &[
     "tmux",
     "http",
     "serve",
+    "server",
     "runtime",
     "hooks",
     "sound",
@@ -146,6 +147,29 @@ pub const KNOWN_SUB_TARGETS: &[&str] = &[
     "git.command",
     "web.client",
     "log.runtime",
+    "migrations.v036",
+    "migrations.v037",
+    "migrations.v038",
+    "migrations.v039",
+    "migrations.v040",
+    "migrations.v041",
+    "migrations.v043",
+    "migrations.v044",
+    "migrations.v045",
+    "migrations.v046",
+    "migrations.v047",
+    "migrations.v048",
+    "migrations.v052",
+    "server.file_watch",
+    "server.lifecycle",
+    "server.idle_reap",
+    "server.runtime",
+    "server.session_service",
+    "server.session_store",
+    "server.sleep_inhibit",
+    "server.maintenance",
+    "server.status",
+    "server.sessions",
     "runtime.uds",
     "runtime.ws",
 ];
@@ -857,6 +881,29 @@ pub async fn watch_runtime_filter(
     }
 }
 
+/// Crate targets a filter may name besides aoe's own roots.
+const EXTERNAL_TARGET_ROOTS: &[&str] = &["agent_client_protocol"];
+
+/// Directive roots outside aoe's targets, such as one renamed since the filter
+/// was saved, whose directives then match no aoe log (#4991).
+fn unknown_target_roots(directive: &str) -> Vec<&str> {
+    directive
+        .split(',')
+        .filter_map(|d| {
+            let d = d.trim();
+            // A bare target means `target=trace`; a bare level names no target.
+            if d.is_empty() || LogLevel::parse(d).is_some() {
+                return None;
+            }
+            let root = d.split(['.', ':', '[', '=']).next()?.trim();
+            (!root.is_empty()
+                && !DEFAULT_TARGET_ROOTS.contains(&root)
+                && !EXTERNAL_TARGET_ROOTS.contains(&root))
+            .then_some(root)
+        })
+        .collect()
+}
+
 fn apply_filter_file(path: &std::path::Path) {
     let directive = match std::fs::read_to_string(path) {
         Ok(s) => s,
@@ -866,6 +913,14 @@ fn apply_filter_file(path: &std::path::Path) {
     if directive.is_empty() {
         return;
     }
+    let unknown = unknown_target_roots(directive);
+    if !unknown.is_empty() {
+        tracing::warn!(
+            target: "log.runtime",
+            roots = ?unknown,
+            "runtime filter names log targets outside aoe; a renamed aoe target there matches nothing"
+        );
+    }
     match set_filter(directive) {
         // Logging here would write into the watched dir and re-trigger the watcher.
         Ok(swap) if swap.changed => tracing::info!(
@@ -873,14 +928,14 @@ fn apply_filter_file(path: &std::path::Path) {
             previous = %swap.previous,
             current = %swap.current,
             source = "file-watch",
-            "runner filter swapped"
+            "filter swapped"
         ),
         Ok(_) => {}
         Err(e) => tracing::warn!(
             target: "log.runtime",
             error = %e,
             directive = %directive,
-            "runner filter swap failed"
+            "filter swap failed"
         ),
     }
     #[cfg(debug_assertions)]
@@ -895,6 +950,25 @@ mod tests {
     use super::*;
 
     use crate::session::test_support::EnvGuard;
+
+    #[test]
+    fn unknown_target_roots_cases() {
+        let cases = [
+            (
+                "agent_of_empires=trace,cockpit=trace,cockpit.event_store=debug",
+                vec!["cockpit", "cockpit"],
+            ),
+            (
+                "acp=trace,acp[turn]=debug,agent_client_protocol::jsonrpc::transport_actor=trace",
+                vec![],
+            ),
+            ("agent_of_empires::tui=debug,hyper=debug", vec!["hyper"]),
+            ("info,cockpit", vec!["cockpit"]),
+        ];
+        for (directive, want) in cases {
+            assert_eq!(unknown_target_roots(directive), want, "{directive}");
+        }
+    }
 
     #[test]
     fn log_level_parse_accepts_known() {

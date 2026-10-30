@@ -80,13 +80,10 @@ pub struct AcpTranscript {
     /// Whether the agent is mid-turn. The composer reads it to decide whether
     /// Enter sends now or parks the prompt in the daemon's queue.
     pub turn_active: bool,
-    /// Whether a background sub-agent (async Task) is still outstanding.
-    /// Display-only: unlike `turn_active`, the composer must NOT gate
-    /// send-vs-park on this, since the main turn itself is genuinely idle
-    /// (#4001). Combine with `turn_active` only for the busy spinner;
-    /// Esc-to-cancel reads `turn_active` (via `agent_busy` in mod.rs), never
-    /// this field.
+    /// Outstanding background sub-agents or Bash tasks. Display-only: combine
+    /// with `turn_active` for the busy spinner, never for send-vs-park or Esc.
     pub background_agent_active: bool,
+    background_subagent_active: bool,
     /// Whether the agent accepts `_session/steering`. When true the composer
     /// sends a mid-turn prompt straight through instead of parking it: the
     /// daemon injects it into the running turn. Re-derived as `false` on a
@@ -225,6 +222,7 @@ impl AcpTranscript {
             compacting: false,
             turn_active: false,
             background_agent_active: false,
+            background_subagent_active: false,
             usage: None,
             current_plan: Vec::new(),
             lagged: false,
@@ -311,14 +309,21 @@ impl AcpTranscript {
         }
         self.last_seq = seq;
 
-        self.background_agent_active = state.has_active_background_agent();
+        let holds = |field: &str| unchanged.iter().any(|f| f == field);
+        if !holds("background_agents") {
+            self.background_subagent_active = state
+                .background_agents
+                .iter()
+                .any(|agent| agent.ended_at.is_none());
+        }
+        self.background_agent_active =
+            self.background_subagent_active || !state.background_tasks.is_empty();
         self.agent_name = Some(state.agent.0);
         self.turn_active = state.turn_active;
         self.steering = state.steering;
         self.cancelling = state.cancelling;
         self.compacting = state.compacting;
         self.usage = state.usage;
-        let holds = |field: &str| unchanged.iter().any(|f| f == field);
         if !holds("available_commands") {
             self.available_commands = state.available_commands;
         }
@@ -471,7 +476,8 @@ mod tests {
             Some("claude-opus-5".into()),
         );
         for e in events {
-            s.apply_event(e.clone()).expect("apply ok");
+            s.apply_event(s.last_seq.saturating_add(1), e.clone())
+                .expect("apply ok");
         }
         s
     }
@@ -715,6 +721,51 @@ mod tests {
         assert!(t.background_agent_active);
     }
 
+    /// `background_agents` rides the same cold-field elision as the pickers:
+    /// a frame that omits it while it is unchanged must not read as "no
+    /// sub-agent running", or a still-busy shelf loses its indicator.
+    #[test]
+    fn an_omitted_background_agents_field_keeps_the_busy_signal() {
+        let mut t = AcpTranscript::new("s-1");
+        let launched = reduced(&[Event::BackgroundAgentLaunched {
+            agent_id: "a1".into(),
+            tool_call_id: "tc1".into(),
+            description: "map backend".into(),
+            prompt: "do the thing".into(),
+            model: "claude-opus-4-8".into(),
+            output_file: "/tmp/a1.output".into(),
+            started_at: chrono::Utc::now(),
+        }]);
+        t.apply_reduced_state(1, launched, &[]);
+        assert!(t.background_agent_active);
+
+        // The sub-agent list is unchanged, so the server omits the field.
+        t.apply_reduced_state(2, reduced(&[]), &["background_agents".to_string()]);
+        assert!(
+            t.background_agent_active,
+            "an omitted cold field must keep the held value"
+        );
+
+        // A frame that does not name it is authoritative, including empty.
+        t.apply_reduced_state(3, reduced(&[]), &[]);
+        assert!(!t.background_agent_active);
+    }
+
+    #[test]
+    fn task_activity_updates_when_the_subagent_list_is_omitted() {
+        let mut transcript = AcpTranscript::new("s-1");
+        transcript.apply_reduced_state(1, reduced(&[]), &[]);
+        let mut busy = reduced(&[]);
+        busy.background_tasks.push("task-1".into());
+        transcript.apply_reduced_state(2, busy.clone(), &["background_agents".into()]);
+        assert!(transcript.background_agent_active);
+        transcript.apply_reduced_state(3, reduced(&[]), &["background_agents".into()]);
+        assert!(!transcript.background_agent_active);
+        transcript.apply_reduced_state(4, busy, &[]);
+        transcript.apply_reduced_state(5, reduced(&[]), &["background_agents".into()]);
+        assert!(!transcript.background_agent_active);
+    }
+
     /// A snapshot that races live deltas must not rewind the view.
     #[test]
     fn stale_reduced_state_frame_is_dropped() {
@@ -816,6 +867,7 @@ mod tests {
         t.apply_reduced_state(4, s, &[]);
         t.merge_server_rows(server_rows(&[Event::AgentMessageChunk {
             text: "hi".into(),
+            message_id: None,
         }]));
         assert!(!t.server_rows.is_empty());
 
@@ -887,7 +939,10 @@ mod tests {
                 synthesized: false,
                 origin_plugin: None,
             },
-            Event::AgentMessageChunk { text: "one".into() },
+            Event::AgentMessageChunk {
+                text: "one".into(),
+                message_id: None,
+            },
         ]);
         // Append each row via a delta.
         for row in rows.clone() {

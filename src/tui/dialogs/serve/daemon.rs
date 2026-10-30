@@ -5,12 +5,10 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
 use rand::prelude::IndexedRandom;
-use rand::RngExt;
 
 use super::words::PASSPHRASE_WORDS;
 use super::{ServeMode, TransportStatus, TunnelTransport};
 
-const LOG_TAIL_LINES: usize = 200;
 const SAVED_PASSPHRASE_FILE: &str = "serve.saved_passphrase";
 /// Written by the server at startup, so CLI-launched daemons can show their passphrase.
 const EPHEMERAL_PASSPHRASE_FILE: &str = "serve.passphrase";
@@ -22,13 +20,13 @@ fn app_file(name: &str) -> Option<PathBuf> {
     crate::session::get_app_dir().ok().map(|dir| dir.join(name))
 }
 
-fn read_app_file(name: &str) -> Option<String> {
+pub(super) fn read_app_file(name: &str) -> Option<String> {
     let raw = std::fs::read_to_string(app_file(name)?).ok()?;
     let trimmed = raw.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-fn remove_app_file(name: &str) {
+pub(super) fn remove_app_file(name: &str) {
     if let Some(path) = app_file(name) {
         let _ = std::fs::remove_file(path);
     }
@@ -136,110 +134,6 @@ pub(super) fn default_transport(
     }
 }
 
-/// Spawn a Local daemon and wait until discovery finds it and it answers a health check.
-pub(crate) async fn start_local_daemon_and_wait(
-) -> Result<crate::acp::client::DaemonEndpoint, String> {
-    use crate::acp::client::{discovery::discover, HttpClient};
-
-    spawn_daemon(ServeMode::Local, None, None)?;
-    // A warm start takes about 1s; 20s covers a cold start without wedging the UI.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    loop {
-        if let Ok(endpoint) = discover() {
-            if let Ok(client) = HttpClient::new(endpoint.clone()) {
-                if client.health_check().await.is_ok() {
-                    return Ok(endpoint);
-                }
-            }
-        }
-        if std::time::Instant::now() >= deadline {
-            let tail = initial_log_tail();
-            let hint = if tail.is_empty() {
-                String::new()
-            } else {
-                format!(" Last log lines:\n{}", tail.join("\n"))
-            };
-            return Err(format!(
-                "the daemon was started but never became reachable.{hint}"
-            ));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    }
-}
-
-/// Tunnel mode takes a passphrase and the transport picked on the Confirm screen.
-pub(super) fn spawn_daemon(
-    mode: ServeMode,
-    passphrase: Option<&str>,
-    transport: Option<TunnelTransport>,
-) -> Result<(), String> {
-    // Another daemon may have started while the picker was open; spawning would orphan it.
-    if crate::cli::serve::daemon_pid().is_some() {
-        return Err(
-            "A daemon is already running. Close this dialog and reopen to see it.".to_string(),
-        );
-    }
-
-    let exe = current_exe()?;
-
-    // Stale files from a hard-killed daemon would show its URL or passphrase while starting.
-    for name in ["serve.url", "serve.mode", EPHEMERAL_PASSPHRASE_FILE] {
-        remove_app_file(name);
-    }
-
-    let port = load_or_generate_port();
-    let mut cmd = Command::new(&exe);
-    cmd.args(["serve", "--daemon", "--port", &port.to_string()]);
-    match mode {
-        ServeMode::Tunnel => {
-            cmd.args(["--remote", "--host", "127.0.0.1"]);
-            // Picking Cloudflare must skip the server's Tailscale auto-detect.
-            if transport == Some(TunnelTransport::Cloudflare) {
-                cmd.arg("--no-tailscale");
-            }
-            if let Some(pp) = passphrase {
-                cmd.env("AOE_SERVE_PASSPHRASE", pp);
-            }
-        }
-        ServeMode::Local => {
-            cmd.args(["--host", "0.0.0.0"]);
-        }
-    }
-    // The wrapper double-forks; the daemon's output lands in the log file.
-    let status = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("Failed to launch `aoe serve --daemon`: {}", e))?;
-
-    if !status.success() {
-        // Forget an occupied port so the next attempt picks a fresh one.
-        let tail = initial_log_tail().join("\n");
-        if tail.contains("EADDRINUSE") || tail.contains("Address already in use") {
-            remove_app_file("serve.last_port");
-        }
-        let hint = match mode {
-            ServeMode::Tunnel => format!(
-                "Most likely no tunnel tool is installed (install tailscale \
-                 or cloudflared) or port {} is in use.",
-                port
-            ),
-            ServeMode::Local => format!("Most likely port {} is in use.", port),
-        };
-        return Err(format!(
-            "`aoe serve --daemon` exited with {:?}. {}",
-            status.code(),
-            hint
-        ));
-    }
-    if let Some(pp) = passphrase {
-        remember_passphrase(pp);
-        save_passphrase_to_disk(pp);
-    }
-    Ok(())
-}
-
 fn current_exe() -> Result<PathBuf, String> {
     std::env::current_exe().map_err(|e| format!("Could not resolve aoe binary path: {}", e))
 }
@@ -280,15 +174,6 @@ pub(super) fn stop_daemon() -> Result<(), String> {
     Ok(())
 }
 
-pub(super) fn restart_daemon(
-    mode: ServeMode,
-    passphrase: Option<&str>,
-    transport: Option<TunnelTransport>,
-) -> Result<(), String> {
-    stop_daemon()?;
-    spawn_daemon(mode, passphrase, transport)
-}
-
 pub(super) fn read_serve_mode() -> Option<ServeMode> {
     ServeMode::from_file_token(&read_app_file("serve.mode")?)
 }
@@ -304,29 +189,49 @@ pub(super) fn remember_last_mode(mode: ServeMode) {
     }
 }
 
-/// Reusing the last port keeps a bookmarked URL valid; a random high port avoids a user's own 8080.
-fn load_or_generate_port() -> u16 {
-    match crate::session::get_app_dir() {
-        Ok(dir) => load_or_generate_port_in(&dir),
-        Err(_) => random_port(),
-    }
+/// The port the next spawn reuses, if any; `None` means it picks a random one. Mirrors the reuse
+/// rule in `autostart::load_or_generate_port` without writing the file.
+pub(super) fn saved_port() -> Option<u16> {
+    saved_port_in(&crate::session::get_app_dir().ok()?)
 }
 
-fn load_or_generate_port_in(dir: &Path) -> u16 {
-    let path = dir.join("serve.last_port");
-    let saved = std::fs::read_to_string(&path)
+fn saved_port_in(dir: &Path) -> Option<u16> {
+    std::fs::read_to_string(dir.join("serve.last_port"))
         .ok()
         .and_then(|raw| raw.trim().parse::<u16>().ok())
-        .filter(|port| *port >= 49152);
-    saved.unwrap_or_else(|| {
-        let port = random_port();
-        let _ = std::fs::write(&path, port.to_string());
-        port
-    })
+        .filter(|port| *port >= 49152)
 }
 
-fn random_port() -> u16 {
-    rand::rng().random_range(49152..65535)
+/// Whether the next start reuses `serve.token`. `load_or_generate_token` keeps it only while it
+/// is under 24 hours old, and only remote serving refreshes it while running.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum TokenWindow {
+    #[default]
+    Reused,
+    /// Within an hour of expiry, so a help overlay left open may be stale by the restart.
+    Boundary,
+    /// The next start mints a new token, which the Devices' `aoe_token` cookies don't match.
+    Renews,
+}
+
+pub(super) fn token_window() -> TokenWindow {
+    crate::session::get_app_dir()
+        .ok()
+        .map_or(TokenWindow::Renews, |dir| token_window_in(&dir))
+}
+
+fn token_window_in(dir: &Path) -> TokenWindow {
+    const HOUR: u64 = 60 * 60;
+    let age = std::fs::metadata(dir.join("serve.token"))
+        .and_then(|meta| meta.modified())
+        .ok()
+        .map(|modified| modified.elapsed().unwrap_or_default());
+    match age {
+        None => TokenWindow::Renews,
+        Some(age) if age.as_secs() >= 24 * HOUR => TokenWindow::Renews,
+        Some(age) if age.as_secs() >= 23 * HOUR => TokenWindow::Boundary,
+        Some(_) => TokenWindow::Reused,
+    }
 }
 
 fn log_file_size_opt() -> Option<u64> {
@@ -346,24 +251,6 @@ pub(super) fn log_grew(offset: &mut u64) -> bool {
     let changed = size != *offset;
     *offset = size;
     changed
-}
-
-/// The current run's lines: the log is shared, so start at the last `[AOE_START_MARKER]`.
-pub(super) fn initial_log_tail() -> Vec<String> {
-    let Some(contents) = crate::cli::serve::stdio_redirect_path()
-        .ok()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-    else {
-        return Vec::new();
-    };
-    let all: Vec<&str> = contents.lines().collect();
-    let from = all
-        .iter()
-        .rposition(|line| line.contains("[AOE_START_MARKER]"))
-        .unwrap_or(0);
-    let window = &all[from..];
-    let start = window.len().saturating_sub(LOG_TAIL_LINES);
-    window[start..].iter().map(|s| s.to_string()).collect()
 }
 
 /// `"\n\nLast log lines:\n..."` with compacted lines, or `""` for an empty tail.
@@ -488,7 +375,35 @@ mod tests {
     }
 
     #[test]
-    fn port_is_reused_only_when_valid() {
+    fn token_window_follows_the_reuse_age() {
+        use TokenWindow::{Boundary, Renews, Reused};
+        let minutes = |m: u64| std::time::Duration::from_secs(m * 60);
+        for (age, window) in [
+            (None, Renews),
+            (Some(minutes(60)), Reused),
+            (Some(minutes(23 * 60 - 1)), Reused),
+            (Some(minutes(23 * 60)), Boundary),
+            (Some(minutes(24 * 60 - 1)), Boundary),
+            (Some(minutes(24 * 60)), Renews),
+            (Some(minutes(25 * 60)), Renews),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            if let Some(age) = age {
+                let path = tmp.path().join("serve.token");
+                std::fs::write(&path, "t").unwrap();
+                std::fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_modified(std::time::SystemTime::now() - age)
+                    .unwrap();
+            }
+            assert_eq!(token_window_in(tmp.path()), window, "{age:?}");
+        }
+    }
+
+    #[test]
+    fn the_port_probe_only_reports_a_reusable_saved_port() {
         for (saved, reused) in [
             (None, None),
             (Some("55555"), Some(55555)),
@@ -500,14 +415,9 @@ mod tests {
             if let Some(saved) = saved {
                 std::fs::write(&path, saved).unwrap();
             }
-            let port = load_or_generate_port_in(tmp.path());
-            match reused {
-                Some(expected) => assert_eq!(port, expected),
-                None => {
-                    assert!(port >= 49152, "{saved:?} gave {port}");
-                    assert_eq!(std::fs::read_to_string(&path).unwrap(), port.to_string());
-                }
-            }
+            assert_eq!(saved_port_in(tmp.path()), reused, "{saved:?}");
+            // Read-only: a probe must not create the file the next spawn writes.
+            assert_eq!(path.exists(), saved.is_some(), "{saved:?}");
         }
     }
 }

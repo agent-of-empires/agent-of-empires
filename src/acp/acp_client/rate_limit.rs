@@ -45,6 +45,15 @@ pub(crate) fn is_unsupported_session_error(err: &agent_client_protocol::Error) -
         "no such session",
         "session does not exist",
     ];
+    // 0.99.0+ answers an unknown id with `-32002` and `data.sessionId`.
+    if err.code == agent_client_protocol::ErrorCode::ResourceNotFound
+        && err
+            .data
+            .as_ref()
+            .is_some_and(|d| d.get("sessionId").is_some())
+    {
+        return true;
+    }
     let msg = err.message.to_ascii_lowercase();
     PHRASES.iter().any(|phrase| msg.contains(phrase))
 }
@@ -58,13 +67,21 @@ pub(super) struct RateLimitRejection {
     pub(super) resets_at_secs: i64,
 }
 
+/// Extra usage keeps serving turns once the subscription window rejects.
+fn overage_covers(info: &serde_json::Value) -> bool {
+    matches!(
+        info.get("overageStatus").and_then(|s| s.as_str()),
+        Some("allowed" | "allowed_warning")
+    )
+}
+
 /// Only rejections are retained: a warning's epoch cannot be tied to the
 /// window that later rejects (#3152).
 pub(super) fn rate_limit_rejection_from_meta(
     meta: &Option<agent_client_protocol::schema::v1::Meta>,
 ) -> Option<RateLimitRejection> {
     let info = meta.as_ref()?.get("_claude/rateLimit")?;
-    if info.get("status")?.as_str()? != "rejected" {
+    if info.get("status")?.as_str()? != "rejected" || overage_covers(info) {
         return None;
     }
     let v = info.get("resetsAt")?;
@@ -102,10 +119,11 @@ pub(super) fn record_rate_limit_report(
         captures.insert(r.window, r.resets_at_secs);
         return true;
     }
-    if info
-        .get("status")
-        .and_then(|s| s.as_str())
-        .is_some_and(|s| s != "rejected")
+    if overage_covers(info)
+        || info
+            .get("status")
+            .and_then(|s| s.as_str())
+            .is_some_and(|s| s != "rejected")
     {
         let window = info.get("rateLimitType").and_then(|v| v.as_str());
         captures.remove(window.unwrap_or_default());
@@ -237,6 +255,22 @@ mod tests {
                 meta(json!({ "status": "allowed_warning", "resetsAt": secs })),
                 None,
             ),
+            (
+                meta(
+                    json!({ "status": "rejected", "resetsAt": secs, "overageStatus": "rejected" }),
+                ),
+                rejection(""),
+            ),
+            (
+                meta(json!({ "status": "rejected", "resetsAt": secs, "overageStatus": "allowed" })),
+                None,
+            ),
+            (
+                meta(
+                    json!({ "status": "rejected", "resetsAt": secs, "overageStatus": "allowed_warning" }),
+                ),
+                None,
+            ),
             (meta(json!({ "status": "rejected" })), None),
             (meta(json!({ "status": "rejected", "resetsAt": 0 })), None),
             (None, None),
@@ -252,29 +286,43 @@ mod tests {
             assert_eq!(rate_limit_rejection_from_meta(&meta), want, "{meta:?}");
         }
 
-        // A window that recovers after rejecting is dropped; others stay.
-        let report = |status: &str, window: &str| {
-            meta(json!({ "status": status, "rateLimitType": window, "resetsAt": secs }))
+        // A window that recovers, or that extra usage starts covering, after
+        // rejecting is dropped; others stay.
+        let report = |status: &str, overage: &str, window: &str| {
+            meta(json!({
+                "status": status,
+                "overageStatus": overage,
+                "rateLimitType": window,
+                "resetsAt": secs,
+            }))
         };
         let captures = std::sync::Mutex::new(HashMap::new());
-        for (status, window, kept, want) in [
-            ("rejected", "five_hour", true, vec!["five_hour"]),
+        for (status, overage, window, kept, want) in [
+            ("rejected", "rejected", "five_hour", true, vec!["five_hour"]),
             (
+                "rejected",
                 "rejected",
                 "seven_day",
                 true,
                 vec!["five_hour", "seven_day"],
             ),
-            ("allowed", "five_hour", false, vec!["seven_day"]),
-            ("allowed_warning", "other", false, vec!["seven_day"]),
+            ("allowed", "rejected", "five_hour", false, vec!["seven_day"]),
+            (
+                "allowed_warning",
+                "rejected",
+                "other",
+                false,
+                vec!["seven_day"],
+            ),
+            ("rejected", "allowed", "seven_day", false, vec![]),
         ] {
             assert_eq!(
-                record_rate_limit_report(&captures, &report(status, window)),
+                record_rate_limit_report(&captures, &report(status, overage, window)),
                 kept
             );
             let mut have: Vec<_> = captures.lock().unwrap().keys().cloned().collect();
             have.sort();
-            assert_eq!(have, want, "{status} {window}");
+            assert_eq!(have, want, "{status} {overage} {window}");
         }
 
         {
@@ -329,5 +377,19 @@ mod tests {
                 "{msg:?}"
             );
         }
+
+        // 0.99.0+ rejects an unknown id with a bare `-32002` and no phrase.
+        let not_found = |data| {
+            let mut e = err("Resource not found", data);
+            e.code = agent_client_protocol::ErrorCode::ResourceNotFound;
+            e
+        };
+        assert!(is_unsupported_session_error(&not_found(Some(
+            json!({ "sessionId": "abc" })
+        ))));
+        assert!(!is_unsupported_session_error(&not_found(None)));
+        assert!(!is_unsupported_session_error(&not_found(Some(
+            json!({ "uri": "file:///x" })
+        ))));
     }
 }

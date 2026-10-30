@@ -44,6 +44,10 @@ pub struct TranscriptRow {
     /// A `tool_complete` row that launched an async sub-agent.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub async_subagent: bool,
+    /// A `message` row that opens a new agent message, so a client keeps it
+    /// apart from the previous message's text.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub message_start: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +120,8 @@ pub struct TranscriptModel {
     elicitation_tool_ids: HashSet<String>,
     /// Group of the still-open run of consecutive message chunks.
     open_message_group: Option<String>,
+    /// ACP message id of the last chunk that carried one.
+    last_message_id: Option<String>,
     group_counter: u64,
     /// Frames at or below this seq are dropped, so replay overlap is harmless.
     last_seq: u64,
@@ -139,6 +145,30 @@ impl TranscriptModel {
         self.last_seq
     }
 
+    /// Note an event that precedes this fold without rendering it, so a chunk
+    /// that opens the fold still knows which message it follows, and a
+    /// completion still finds its elicitation suppressed.
+    pub fn observe_prior(&mut self, event: &Event) {
+        match event {
+            Event::ElicitationRequested { elicitation } => {
+                if let Some(id) = &elicitation.tool_call_id {
+                    self.elicitation_tool_ids.insert(id.clone());
+                }
+            }
+            Event::ToolCallCompleted { tool_call_id, .. } => {
+                self.elicitation_tool_ids.remove(tool_call_id);
+            }
+            Event::AgentMessageChunk {
+                message_id: Some(id),
+                ..
+            } => self.last_message_id = Some(id.clone()),
+            Event::UserPromptSent { .. } | Event::UserDiffCommentsPrompt { .. } => {
+                self.last_message_id = None;
+            }
+            _ => {}
+        }
+    }
+
     /// Apply one event at `seq`, returning the row changes it produced.
     pub fn apply_event(&mut self, seq: u64, event: &Event) -> Vec<TranscriptDelta> {
         if seq <= self.last_seq {
@@ -150,15 +180,27 @@ impl TranscriptModel {
         }
 
         match event {
-            Event::AgentMessageChunk { text } => {
+            Event::AgentMessageChunk { text, message_id } => {
+                // Chunks without an id keep joining whatever message is open.
+                let message_start = message_id.is_some()
+                    && self.last_message_id.is_some()
+                    && self.last_message_id != *message_id;
+                if message_id.is_some() {
+                    self.last_message_id = message_id.clone();
+                }
+                if message_start {
+                    self.open_message_group = None;
+                }
                 let group_id = self.message_group();
                 self.turn_has_output = true;
-                vec![self.append(TranscriptRow::new(
+                let mut row = TranscriptRow::new(
                     format!("msg-{seq}"),
                     group_id,
                     TranscriptRowKind::Message,
                     text.clone(),
-                ))]
+                );
+                row.message_start = message_start;
+                vec![self.append(row)]
             }
             Event::UserPromptSent {
                 text,
@@ -215,7 +257,7 @@ impl TranscriptModel {
                 completed_at,
                 async_subagent,
             } => {
-                if self.elicitation_tool_ids.contains(tool_call_id) {
+                if self.elicitation_tool_ids.remove(tool_call_id) {
                     return Vec::new();
                 }
                 let mut deltas =
@@ -614,6 +656,7 @@ impl TranscriptModel {
     }
 
     fn begin_turn(&mut self) {
+        self.last_message_id = None;
         let steered_continuation = self.turn_active && self.steering;
         self.turn_active = true;
         if !steered_continuation {
@@ -645,6 +688,7 @@ impl TranscriptRow {
             diff_comments: None,
             elicitation_answers: Vec::new(),
             async_subagent: false,
+            message_start: false,
         }
     }
 }
@@ -1318,6 +1362,123 @@ mod tests {
         assert_eq!(tool_of(&m, "start-dup").name, "Edit a.rs");
     }
 
+    /// A new ACP message id opens a new message; one streamed message,
+    /// or chunks without an id, keep joining the open one.
+    #[test]
+    fn agent_message_chunks_split_on_a_new_message_id() {
+        let chunk = |text: &str, id: Option<&str>| Event::AgentMessageChunk {
+            text: text.into(),
+            message_id: id.map(Into::into),
+        };
+        let a = Some("m-a");
+        let b = Some("m-b");
+        // (events, message_start per message row, whether the rows share one group)
+        let cases: [(Vec<Event>, Vec<bool>, bool); 7] = [
+            (
+                vec![chunk("one mes", a), chunk("sage", a)],
+                vec![false, false],
+                true,
+            ),
+            (
+                vec![chunk("First.", a), chunk("", b), chunk("Second", b)],
+                vec![false, true, false],
+                false,
+            ),
+            (
+                vec![chunk("x", None), chunk("y", None)],
+                vec![false, false],
+                true,
+            ),
+            (
+                vec![chunk("x", a), chunk("y", None)],
+                vec![false, false],
+                true,
+            ),
+            (
+                vec![chunk("x", None), chunk("y", a)],
+                vec![false, false],
+                true,
+            ),
+            // An event between the chunks of one message is not a boundary.
+            (
+                vec![chunk("x", a), Event::ThinkingStarted, chunk("y", a)],
+                vec![false, false],
+                false,
+            ),
+            // A new turn starts fresh: its first message is not marked.
+            (
+                vec![chunk("x", a), prompt("next"), chunk("y", b)],
+                vec![false, false],
+                false,
+            ),
+        ];
+        for (events, starts, one_group) in cases {
+            let label = format!("{events:?}");
+            let m = fold(events);
+            let messages: Vec<_> = m
+                .rows()
+                .iter()
+                .filter(|r| r.kind == TranscriptRowKind::Message)
+                .collect();
+            let got: Vec<bool> = messages.iter().map(|r| r.message_start).collect();
+            assert_eq!(got, starts, "{label}");
+            let groups: HashSet<_> = messages.iter().map(|r| &r.group_id).collect();
+            assert_eq!(groups.len() == 1, one_group, "{label}");
+        }
+    }
+
+    /// A fold that starts after earlier events (a reconnect, a rows page)
+    /// still marks the first chunk of a new message.
+    #[test]
+    fn observed_prior_chunks_carry_the_message_id_into_a_partial_fold() {
+        let chunk = |text: &str, id: &str| Event::AgentMessageChunk {
+            text: text.into(),
+            message_id: Some(id.into()),
+        };
+        for (prior, expected) in [
+            (vec![chunk("x", "m-a")], true),
+            (vec![chunk("x", "m-b")], false),
+            (vec![chunk("x", "m-a"), prompt("next")], false),
+            (vec![], false),
+        ] {
+            let mut m = TranscriptModel::new();
+            for event in &prior {
+                m.observe_prior(event);
+            }
+            m.apply_event(10, &chunk("", "m-b"));
+            assert!(m.rows().len() == 1, "{prior:?}");
+            assert_eq!(m.rows()[0].message_start, expected, "{prior:?}");
+        }
+    }
+
+    /// A fold that starts after `ElicitationRequested` still suppresses the
+    /// elicitation tool's card, so a reconnect cannot leak a synthesized one.
+    #[test]
+    fn partial_fold_keeps_elicitation_suppression() {
+        let events = [
+            started(tool("q", "AskUserQuestion")),
+            elicitation_requested("q"),
+            completed("q", false, "Your questions have been answered"),
+            // The adapter reuses the id for an ordinary tool after the answer.
+            started(tool("q", "Bash")),
+            completed("q", false, "ran"),
+        ];
+        let full = fold(events.clone());
+        assert_eq!(count(&full, TranscriptRowKind::ToolStart), 1);
+        assert_eq!(count(&full, TranscriptRowKind::ToolComplete), 1);
+        for split in 0..events.len() {
+            let mut m = TranscriptModel::new();
+            for (i, e) in events.iter().enumerate() {
+                if i < split {
+                    m.observe_prior(e);
+                } else {
+                    m.apply_event(i as u64 + 1, e);
+                }
+            }
+            assert_eq!(kinds(&m), kinds(&full), "split at {split}");
+        }
+    }
+
     /// ACP compaction updates are upserts by id: a late, cleared or restored
     /// summary stays beside its divider, past any later turn.
     #[test]
@@ -1332,6 +1493,7 @@ mod tests {
             summary("b", "other"),
             Event::AgentMessageChunk {
                 text: "later turn".into(),
+                message_id: None,
             },
         ]);
         let ids = |m: &TranscriptModel| -> Vec<String> {
@@ -1362,6 +1524,7 @@ mod tests {
             failed("aborted"),
             Event::AgentMessageChunk {
                 text: "later turn".into(),
+                message_id: None,
             },
         ]);
         let deltas = m.apply_event(3, &failed("out of tokens"));

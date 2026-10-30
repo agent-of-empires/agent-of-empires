@@ -11,17 +11,19 @@ const ATTACH_URL = "/api/sessions/sess-9/projects";
 
 function attachOk(worker: string, extra: Record<string, unknown> = {}) {
   return {
-    session: null,
-    attached: {
-      name: "frontend",
-      branch: "feature/abc",
-      branch_created: true,
-      moved_to: "/src/feature-abc-workspace-abcd1234",
+    ...makeSession({ id: "sess-9" }),
+    outcome: {
+      attached: {
+        name: "frontend",
+        worktree_path: "/src/workspace/frontend",
+        branch: "feature/abc",
+        branch_created: true,
+        moved_to: "/src/feature-abc-workspace-abcd1234",
+      },
+      warnings: [],
+      worker: { status: worker },
+      ...extra,
     },
-    warnings: [],
-    worker,
-    worker_message: null,
-    ...extra,
   };
 }
 
@@ -106,6 +108,32 @@ describe("AddProjectModal", () => {
     expect(screen.getByTestId("add-project-modal").querySelector("datalist")).toBeNull();
   });
 
+  it("reads saved projects in the session profile, not the machine default", async () => {
+    openRowMenu(ws({ profile: "work" }));
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-add-project"));
+    await screen.findByTitle("/src/frontend");
+    const reads = fetchSpy.mock.calls.filter(([url]) => String(url).includes("/api/projects"));
+    expect(reads.map(([url]) => String(url))).toEqual(["/api/projects?profile=work"]);
+  });
+
+  it("retries a failed saved-project read without discarding the typed path", async () => {
+    const answer = fetchSpy.getMockImplementation()!;
+    let fail = true;
+    fetchSpy.mockImplementation(async (input, init) => {
+      if (String(input).includes("/api/projects") && fail) return jsonResponse({ message: "unavailable" }, 503);
+      return answer(input, init);
+    });
+    openRowMenu(ws());
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-add-project"));
+    fireEvent.change(screen.getByTestId("add-project-modal-input"), { target: { value: "/typed/repo" } });
+    expect((await screen.findByRole("alert")).textContent).toMatch(/^Projects could not be loaded\./);
+    fail = false;
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await screen.findByTitle("/src/frontend");
+    expect((screen.getByTestId("add-project-modal-input") as HTMLInputElement).value).toBe("/typed/repo");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("posts the path of a clicked picker row", async () => {
     openRowMenu(ws());
     fireEvent.click(screen.getByTestId("sidebar-context-menu-add-project"));
@@ -154,7 +182,11 @@ describe("AddProjectModal", () => {
   });
 
   it("reports the new working directory and a failed restart", async () => {
-    mockAttach(() => jsonResponse(attachOk("restart_failed", { worker_message: "worker respawn failed: boom" })));
+    mockAttach(() =>
+      jsonResponse(
+        attachOk("restart_failed", { worker: { status: "restart_failed", message: "worker respawn failed: boom" } }),
+      ),
+    );
     await submit("frontend");
     const result = await waitFor(() => screen.getByTestId("add-project-modal-result"));
     expect(result.textContent).toContain("frontend");
@@ -162,6 +194,27 @@ describe("AddProjectModal", () => {
       "/src/feature-abc-workspace-abcd1234",
     );
     expect(screen.getByTestId("add-project-modal").textContent).toContain("did not restart");
+  });
+
+  it("retains an unconfirmed result when the captured target is replaced before ACK", async () => {
+    const response = Promise.withResolvers<Response>();
+    const entered = Promise.withResolvers<void>();
+    mockAttach(() => {
+      entered.resolve();
+      return response.promise;
+    });
+    const view = renderRow(ws());
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-more"));
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-add-project"));
+    fireEvent.change(screen.getByTestId("add-project-modal-input"), { target: { value: "frontend" } });
+    fireEvent.click(screen.getByTestId("add-project-modal-submit"));
+    await entered.promise;
+    view.rerenderRow(ws({ id: "replacement", title: "replacement target" }));
+    response.resolve(jsonResponse(attachOk("restarted")));
+    await waitFor(() => expect(screen.getByTestId("add-project-modal-error").textContent).toContain("unconfirmed"));
+    expect(screen.getByTestId("sidebar-session-row").textContent).toContain("replacement target");
+    expect(screen.queryByTestId("add-project-modal-result")).toBeNull();
   });
 
   it("surfaces the server's refusal message", async () => {

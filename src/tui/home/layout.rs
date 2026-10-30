@@ -37,6 +37,11 @@ impl HomeView {
         Self::persist_app_state("list width", |s| s.home_list_width = Some(width));
     }
 
+    pub(super) fn save_list_height(&self) {
+        let height = self.list_height;
+        Self::persist_app_state("list height", |s| s.home_list_height = height);
+    }
+
     /// Group paths that currently exist under `key`, across all profiles so
     /// switching profile never prunes another profile's collapse state.
     fn known_group_paths(&self, key: impl Fn(&Instance) -> String) -> HashSet<String> {

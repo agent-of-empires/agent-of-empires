@@ -5,8 +5,7 @@ use anyhow::Result;
 #[tracing::instrument(target = "cli.agents", skip_all)]
 pub fn run() -> Result<()> {
     let config = crate::session::Config::load_or_warn();
-    let available =
-        crate::tmux::AvailableTools::detect_with_custom_agents(&config.session.custom_agents);
+    let available = crate::tmux::AvailableTools::detect_with_custom_agents(&config.session);
     let available_list = available.available_list();
     let colorize = crate::cli::color_enabled();
     let installed_mark = if colorize {

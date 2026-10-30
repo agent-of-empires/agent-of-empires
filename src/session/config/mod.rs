@@ -420,30 +420,21 @@ fn default_show_spans() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
 #[setting_section(name = "acp", category = "Acp")]
 pub struct AcpConfig {
-    /// Show the "Structured view" toggle in the TUI's new-session dialog, and
-    /// offer switching an existing terminal session into the structured view
-    /// there. Hidden by default while the view matures; the web dashboard
-    /// always offers it. Opening already-structured sessions, and switching a
-    /// structured session back to a terminal, are unaffected.
+    /// Whether the structured view is offered, and which view new sessions
+    /// open in. `off` hides the structured option everywhere: the new-session
+    /// dialog and wizard, and switching a terminal session into it.
+    /// `terminal` and `structured` offer it on every surface and preselect that
+    /// view; the toggle still wins per session. Opening structured sessions and
+    /// switching one back to a terminal are never gated. A structured session
+    /// runs the ACP adapter, so it never registers with Claude's Remote Control
+    /// app (#3517).
     #[serde(default)]
     #[setting(
-        label = "Offer structured view in the TUI",
-        widget = "toggle",
-        tui_only
-    )]
-    pub offer_structured_in_new_session: bool,
-    /// Which view the new-session dialog starts on when the chosen agent can
-    /// back a structured session. Auto keeps each surface's own default: the
-    /// web dashboard starts on the structured view, the TUI on a terminal. The
-    /// TUI still offers the structured view only when the toggle above is on,
-    /// and the dialog's own toggle wins for that one session.
-    #[serde(default)]
-    #[setting(
-        label = "Default view for new sessions",
+        label = "Structured view",
         widget = "select",
-        options = "auto:Auto,structured:Structured view,terminal:Terminal view"
+        options = "off:Off,terminal:Terminal view,structured:Structured view"
     )]
-    pub default_new_session_view: NewSessionView,
+    pub structured_view: StructuredView,
     /// Acp agent used when --agent is not specified (e.g. claude-code,
     /// codex). Must name an agent that can start: `aoe-agent` is not
     /// packaged yet (#3553).
@@ -682,8 +673,7 @@ fn default_silent_orphan_grace_secs() -> u32 {
 impl Default for AcpConfig {
     fn default() -> Self {
         Self {
-            offer_structured_in_new_session: false,
-            default_new_session_view: NewSessionView::Auto,
+            structured_view: StructuredView::default(),
             default_agent: default_agent(),
             restrict_agents: false,
             allowed_agents: Vec::new(),
@@ -861,6 +851,10 @@ pub struct AppStateConfig {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home_list_width: Option<u16>,
+
+    /// Requested height of the stacked TUI session list. Absent means automatic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_list_height: Option<u16>,
 
     /// Whether the home-view session list is collapsed to a narrow,
     /// click-to-expand strip. Persisted so the choice survives restarts,
@@ -1084,21 +1078,6 @@ pub struct SessionConfig {
         tui_only
     )]
     pub sidebar_position: SidebarPosition,
-
-    /// Read the session state the `aoe serve` daemon owns (structured session
-    /// status) from the running daemon, the way the web dashboard does, instead
-    /// of from the local session store. With no daemon running the sidebar uses
-    /// the local store alone and daemon-owned state keeps its last value. Off
-    /// keeps the sidebar on the local store only.
-    #[serde(default = "default_true")]
-    #[setting(
-        label = "Daemon-sourced sidebar",
-        widget = "toggle",
-        global_only,
-        advanced,
-        tui_only
-    )]
-    pub daemon_sidebar: bool,
 
     /// Forward AoE's whole environment to host sessions instead of just the
     /// desktop vars (DISPLAY, XDG_*, DBUS). Lets vars like GOPATH reach an
@@ -1495,15 +1474,19 @@ pub struct SessionConfig {
     )]
     pub prevent_sleep_idle_grace_minutes: u32,
 
-    /// Text sent to the agent after a successful `aoe session restart` /
-    /// `e`-keybind restart, once the post-restart readiness probe says the
-    /// pane is alive. Restart re-execs the agent at a blank prompt; this
-    /// nudge tells the agent to pick up where it left off. Set to an
-    /// empty string to disable the wake-up message entirely (the restart
-    /// itself still runs).
+    /// Text sent after a successful explicit restart, or automatic startup
+    /// recovery when `startup_recovery_wake` is enabled, once the pane is ready.
+    /// An empty string disables the message without disabling the restart.
     #[serde(default = "default_restart_wake_message")]
     #[setting(label = "Restart Wake Message", widget = "text")]
     pub restart_wake_message: String,
+
+    /// Send `restart_wake_message` after automatic Daemon startup recovery.
+    /// Disabled by default; recovery still restores missing panes and resumes
+    /// conversations. Explicit restarts are unaffected. An empty message stays off.
+    #[serde(default)]
+    #[setting(label = "Startup Recovery Wake", widget = "toggle")]
+    pub startup_recovery_wake: bool,
 
     /// What to show next to each session title: Branch (default), Auto
     /// (profile in all-profiles view), None, Profile (always), or Sandbox
@@ -1913,14 +1896,26 @@ pub enum NewSessionMode {
     LiveSend,
 }
 
-/// See `AcpConfig::default_new_session_view`.
+/// See `AcpConfig::structured_view`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum NewSessionView {
-    #[default]
-    Auto,
-    Structured,
+pub enum StructuredView {
+    Off,
     Terminal,
+    #[default]
+    Structured,
+}
+
+impl StructuredView {
+    /// Whether the structured option is shown at all.
+    pub fn is_offered(self) -> bool {
+        self != Self::Off
+    }
+
+    /// Whether a new session opens in the structured view.
+    pub fn starts_structured(self) -> bool {
+        self == Self::Structured
+    }
 }
 
 /// See `AcpConfig::notice_display`.
@@ -2010,7 +2005,6 @@ impl Default for SessionConfig {
             pre_trust_agent_folders: false,
             show_diagnostics_pane: false,
             sidebar_position: SidebarPosition::default(),
-            daemon_sidebar: true,
             inherit_host_environment: false,
             agent_extra_args: HashMap::new(),
             agent_command_override: HashMap::new(),
@@ -2041,6 +2035,7 @@ impl Default for SessionConfig {
             prevent_sleep_when_active: false,
             prevent_sleep_idle_grace_minutes: default_prevent_sleep_idle_grace_minutes(),
             restart_wake_message: default_restart_wake_message(),
+            startup_recovery_wake: false,
             row_tag: RowTagMode::default(),
             show_activity_age: true,
             live_send_exit_chord: default_live_send_exit_chord(),
@@ -2575,7 +2570,8 @@ pub struct WorktreeConfig {
     )]
     pub enabled: bool,
 
-    /// Template for worktree paths ({repo-name}, {branch}).
+    /// Template for worktree paths ({repo-name}, {branch}). A leading `~` and
+    /// `$VAR` / `${VAR}` are expanded; see `docs/guides/worktrees.md`.
     #[serde(default = "default_worktree_template")]
     #[setting(
         label = "Path Template",
@@ -2756,6 +2752,18 @@ pub struct SandboxConfig {
         web = "elevation:sandbox config affects host isolation"
     )]
     pub auto_cleanup: bool,
+
+    /// Let the web dashboard pull a newer sandbox image. Off, it shows the Container runtime's
+    /// pull command to run instead. Read globally by the Daemon, so it can't be set per profile.
+    #[serde(default = "default_true")]
+    #[setting(
+        label = "Allow image pull from web",
+        widget = "toggle",
+        web = "local_only:pulls images on the host as the daemon user",
+        global_only,
+        advanced
+    )]
+    pub allow_image_pull: bool,
 
     /// CPU limit for containers (e.g. "4").
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3001,6 +3009,7 @@ impl Default for SandboxConfig {
             extra_volumes: Vec::new(),
             environment: default_sandbox_environment(),
             auto_cleanup: true,
+            allow_image_pull: true,
             cpu_limit: None,
             memory_limit: None,
             port_mappings: Vec::new(),
@@ -3616,29 +3625,46 @@ fn config_save_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+pub(super) fn read_optional_config(path: &std::path::Path) -> Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(content) => Ok(Some(content)),
+        // A missing file is optional; a broken link or an unreadable path is not.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && fs::symlink_metadata(path)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 impl Config {
-    /// Read and parse `config.toml` into a raw `toml::Table`, with the
-    /// stale `app_state` section stripped. Shared prelude for [`Config::load`]
-    /// and [`Config::config_ignored_keys`]; keeping the read + strip in one
-    /// place stops the ignored-key probe from ever flagging a section `load`
-    /// silently drops.
+    /// Read config.toml without the obsolete inline app_state table.
     fn load_raw_table() -> Result<toml::Table> {
         let path = config_path()?;
-        let mut table: toml::Table = if path.exists() {
-            toml::from_str(&fs::read_to_string(&path)?)?
-        } else {
-            toml::Table::new()
-        };
-        // `app_state` now lives in state.toml; strip any stale key left over
-        // from before the split (or written by an out-of-date peer) so it
-        // never shadows the authoritative source below.
-        table.remove("app_state");
-        Ok(table)
+        let result = (|| {
+            let mut table: toml::Table = match read_optional_config(&path)? {
+                Some(content) => toml::from_str(&content)?,
+                None => toml::Table::new(),
+            };
+            // state.toml is authoritative even if an older peer writes inline state.
+            table.remove("app_state");
+            Ok(table)
+        })();
+        result.map_err(|error: anyhow::Error| error.context(crate::session::LoadSource(path)))
     }
 
     pub fn load() -> Result<Self> {
         let table = Self::load_raw_table()?;
-        let mut config: Config = table.try_into()?;
+        let mut config: Config = table.try_into().map_err(|error: toml::de::Error| {
+            let error = anyhow::Error::new(error);
+            match config_path() {
+                Ok(path) => error.context(crate::session::LoadSource(path)),
+                Err(_) => error,
+            }
+        })?;
         config.app_state = AppStateConfig::load()?;
         Ok(config)
     }
@@ -3750,12 +3776,14 @@ impl AppStateConfig {
     /// `[app_state]` table). A missing file deserializes to defaults.
     pub fn load() -> Result<Self> {
         let path = state_path()?;
-        let table: toml::Table = if path.exists() {
-            toml::from_str(&fs::read_to_string(&path)?)?
-        } else {
-            toml::Table::new()
-        };
-        Ok(table.try_into()?)
+        let result = (|| {
+            let table: toml::Table = match read_optional_config(&path)? {
+                Some(content) => toml::from_str(&content)?,
+                None => toml::Table::new(),
+            };
+            Ok(table.try_into()?)
+        })();
+        result.map_err(|error: anyhow::Error| error.context(crate::session::LoadSource(path)))
     }
 }
 
@@ -3769,16 +3797,15 @@ impl AppStateConfig {
 /// concurrent writer's unrelated edits survive, and the TUI and an `aoe serve`
 /// daemon (or any two `aoe` processes) can call this concurrently without
 /// losing an update. Symlinked `state.toml` files are resolved and written
-/// through, the same as every other `locked_update` file.
+/// through the resolved target protected by `LockedDataFile`.
 pub fn update_app_state<R>(f: impl FnOnce(&mut AppStateConfig) -> R) -> Result<R> {
-    let outcome = super::storage::locked_update(
-        &state_path()?,
+    let outcome = super::storage::LockedDataFile::open(&state_path()?)?.update(
         |content| Ok(content.parse::<toml::Table>()?.try_into()?),
         |state| Ok(toml::to_string_pretty(&toml::Table::try_from(state)?)?),
         |state| -> std::result::Result<R, std::convert::Infallible> { Ok(f(state)) },
     )?;
     match outcome {
-        Ok(result) => Ok(result),
+        Ok((result, _)) => Ok(result),
         Err(never) => match never {},
     }
 }

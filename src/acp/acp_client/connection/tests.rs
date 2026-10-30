@@ -107,6 +107,9 @@ async fn cancel_under_flood() {
         winner: Some(winner_tx),
     });
     let params = ConnectionParams {
+        claude_home: None,
+        shutdown: tokio_util::sync::CancellationToken::new(),
+        cancellation: tokio_util::sync::CancellationToken::new(),
         event_tx,
         cmd_rx,
         child: None,
@@ -238,6 +241,9 @@ async fn auth_events(mode: ConnectMode, reports: bool) -> Vec<bool> {
     let temp = tempfile::tempdir().unwrap();
     let cwd = temp.path().to_path_buf();
     let params = ConnectionParams {
+        claude_home: None,
+        shutdown: tokio_util::sync::CancellationToken::new(),
+        cancellation: tokio_util::sync::CancellationToken::new(),
         event_tx,
         cmd_rx,
         child: None,
@@ -331,6 +337,7 @@ async fn spawn_fake_connection(
     let temp = tempfile::tempdir().unwrap();
     let cwd = temp.path().to_path_buf();
     let params = ConnectionParams {
+        claude_home: None,
         event_tx,
         cmd_rx,
         child: None,
@@ -357,6 +364,8 @@ async fn spawn_fake_connection(
         default_model: None,
         mcp_servers: Vec::new(),
         runner: None,
+        cancellation: tokio_util::sync::CancellationToken::new(),
+        shutdown: tokio_util::sync::CancellationToken::new(),
     };
     let transport = ByteStreams::new(daemon_write.compat_write(), daemon_read.compat());
     let connection = tokio::spawn(run_connection_task(transport, params));
@@ -450,17 +459,30 @@ async fn rate_limit_on_an_agent_initiated_turn_ends_the_connection() {
 }
 
 /// A prompted turn the adapter ends normally after a rejected window parks like
-/// the error path; a cancelled turn or an already-past reset does not.
+/// the error path; a cancelled turn, an already-past reset, or a window extra
+/// usage covers does not.
 #[tokio::test]
 async fn prompted_turn_ending_on_a_rejected_window_parks() {
     let now = chrono::Utc::now().timestamp();
-    for (stop_reason, resets_at, parks) in [
-        ("end_turn", now + 3600, true),
-        ("cancelled", now + 3600, false),
-        ("end_turn", now - 60, false),
+    for (stop_reason, resets_at, overage, parks) in [
+        ("end_turn", now + 3600, "", true),
+        ("cancelled", now + 3600, "", false),
+        ("end_turn", now - 60, "", false),
+        (
+            "end_turn",
+            now + 3600,
+            r#","overageStatus":"rejected","isUsingOverage":false"#,
+            true,
+        ),
+        (
+            "end_turn",
+            now + 3600,
+            r#","overageStatus":"allowed","isUsingOverage":true"#,
+            false,
+        ),
     ] {
         let update = format!(
-            r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s-prompted","update":{{"sessionUpdate":"usage_update","used":10,"size":100,"_meta":{{"_claude/rateLimit":{{"status":"rejected","rateLimitType":"five_hour","resetsAt":{resets_at}}}}}}}}}}}"#
+            r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s-prompted","update":{{"sessionUpdate":"usage_update","used":10,"size":100,"_meta":{{"_claude/rateLimit":{{"status":"rejected","rateLimitType":"five_hour","resetsAt":{resets_at}{overage}}}}}}}}}}}"#
         );
         let mut fake = spawn_fake_connection("s-prompted", move |id| {
             vec![
@@ -509,7 +531,10 @@ async fn prompted_turn_ending_on_a_rejected_window_parks() {
                 .expect("connection task ends after parking")
                 .expect("connection task does not panic");
         } else {
-            assert!(limit.is_none(), "{stop_reason}: must not park: {seen:?}");
+            assert!(
+                limit.is_none(),
+                "{stop_reason}{overage}: must not park: {seen:?}"
+            );
             assert_ne!(stopped_reason, "rate_limited", "{seen:?}");
             fake.connection.abort();
             let _ = fake.connection.await;

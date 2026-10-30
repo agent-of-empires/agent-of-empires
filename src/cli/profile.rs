@@ -57,7 +57,9 @@ pub enum ProfileCommands {
 #[tracing::instrument(target = "cli.session", skip_all)]
 pub async fn run(profile: &str, command: Option<ProfileCommands>) -> Result<()> {
     match command {
-        Some(ProfileCommands::List) | None => list_profiles().await,
+        Some(ProfileCommands::List) | None => {
+            bail!("internal error: runtime read reached local dispatch")
+        }
         Some(ProfileCommands::Create { name }) => create_profile(&name).await,
         Some(ProfileCommands::Delete { name }) => delete_profile(&name).await,
         Some(ProfileCommands::Rename { old_name, new_name }) => {
@@ -76,39 +78,41 @@ pub async fn run(profile: &str, command: Option<ProfileCommands>) -> Result<()> 
     }
 }
 
-async fn list_profiles() -> Result<()> {
-    let profiles = session::list_profiles_for_display()?;
-
-    if profiles.is_empty() {
-        println!("No profiles found.");
-        println!("Run 'aoe' to create the first profile automatically.");
-        return Ok(());
-    }
-
-    let default_profile = session::config::resolve_default_profile();
-
-    println!("Profiles:");
-    for p in &profiles {
-        if *p == default_profile {
-            println!("  * {} (default)", p);
-        } else {
-            println!("    {}", p);
-        }
-    }
-    println!("\nTotal: {} profiles", profiles.len());
-
-    Ok(())
-}
-
 async fn create_profile(name: &str) -> Result<()> {
     session::create_profile(name)?;
     println!("✓ Created profile: {}", name);
     println!("  Use with: aoe -p {}", name);
     Ok(())
 }
+async fn mutate_running_profile(mutation: crate::daemon::ProfileMutation) -> Result<bool> {
+    use crate::acp::client::discovery::{discover, DiscoveryError};
+    let endpoint = match discover() {
+        Ok(endpoint) => endpoint,
+        Err(DiscoveryError::NoLocalDaemon) => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let client = endpoint.daemon_client()?;
+    let info = client.runtime_info().await?;
+    anyhow::ensure!(
+        info.protocol_version == crate::daemon::RUNTIME_PROTOCOL_VERSION
+            && info.health == crate::daemon::RuntimeHealth::Healthy,
+        "Daemon runtime is not ready"
+    );
+    client.mutate_profile(&mutation, &info.epoch).await?;
+    Ok(true)
+}
 
 async fn rename_profile(old_name: &str, new_name: &str) -> Result<()> {
-    session::rename_profile(old_name, new_name)?;
+    if !mutate_running_profile(crate::daemon::ProfileMutation::Rename {
+        name: old_name.into(),
+        body: crate::daemon::RenameProfileBody {
+            new_name: new_name.into(),
+        },
+    })
+    .await?
+    {
+        session::rename_profile(old_name, new_name)?;
+    }
     println!("✓ Renamed profile: {} -> {}", old_name, new_name);
     Ok(())
 }
@@ -128,7 +132,14 @@ async fn delete_profile(name: &str) -> Result<()> {
         return Ok(());
     }
 
-    session::delete_profile(name)?;
+    if !mutate_running_profile(crate::daemon::ProfileMutation::Delete {
+        name: name.into(),
+        query: crate::daemon::DeleteProfileQuery::default(),
+    })
+    .await?
+    {
+        session::delete_profile(name)?;
+    }
     println!("✓ Deleted profile: {}", name);
     Ok(())
 }
@@ -142,11 +153,6 @@ async fn show_default_profile() -> Result<()> {
 }
 
 async fn set_default_profile(name: &str) -> Result<()> {
-    let profiles = session::list_profiles()?;
-    if !profiles.contains(&name.to_string()) {
-        bail!("Profile '{}' does not exist", name);
-    }
-
     session::set_default_profile(name)?;
     println!("✓ Default profile set to: {}", name);
     Ok(())

@@ -36,6 +36,54 @@ fn load_registry() -> PluginRegistry {
     PluginRegistry::load(&Config::load().expect("config"))
 }
 
+#[test]
+#[serial]
+fn legacy_runtime_requires_worker_declaration() {
+    use agent_of_empires::session::config::{CapabilityGrant, PluginConfig};
+    use aoe_plugin_api::PluginManifest;
+
+    let _home = isolate();
+    let id = "acme.legacy-runtime";
+    let dir = agent_of_empires::plugin::plugins_dir().unwrap().join(id);
+    std::fs::create_dir_all(&dir).unwrap();
+    for runtime in [
+        "[runtime]\nkind = \"command\"\ncommand = [\"./worker\"]\n",
+        "[runtime]\nkind = \"release-binary\"\nasset = \"worker-${target}.tar.gz\"\n",
+    ] {
+        let manifest = format!(
+            "id = \"{id}\"\nname = \"Legacy worker\"\nversion = \"0.1.0\"\napi_version = 2\n{runtime}"
+        );
+        std::fs::write(dir.join("aoe-plugin.toml"), &manifest).unwrap();
+        for capabilities in [vec![], vec!["runtime.worker".to_string()]] {
+            let mut config = Config::default();
+            config.plugins.insert(
+                id.to_string(),
+                PluginConfig {
+                    grant: Some(CapabilityGrant {
+                        manifest_hash: PluginManifest::hash_bytes(manifest.as_bytes()),
+                        capabilities,
+                        granted_at: chrono::Utc::now(),
+                    }),
+                    ..Default::default()
+                },
+            );
+            let registry = PluginRegistry::load(&config);
+            assert!(
+                registry.get(id).is_none(),
+                "a stored grant must not admit an invalid runtime declaration"
+            );
+            assert!(
+                registry
+                    .load_errors()
+                    .iter()
+                    .any(|error| error.contains(id) && error.contains("runtime.worker")),
+                "{:?}",
+                registry.load_errors()
+            );
+        }
+    }
+}
+
 fn git(args: &[&str], cwd: &Path) {
     let status = Command::new("git")
         .args(args)
@@ -269,6 +317,7 @@ capabilities = ["net"]
 
     let consent = install::reapprove_consent("acme.regrant").unwrap();
     assert_eq!(consent.capabilities, vec!["net", "notifications"]);
+    assert!(consent.agent_integrations.is_empty());
 
     // A pin that no longer matches the on-disk manifest refuses.
     let err = install::approve_installed("acme.regrant", "sha256:stale")
@@ -715,6 +764,7 @@ id = "acme.bin"
 name = "Bin"
 version = "1.0.0"
 api_version = 2
+capabilities = ["runtime.worker"]
 
 [runtime]
 kind = "release-binary"
@@ -768,6 +818,7 @@ id = "acme.built"
 name = "Built"
 version = "0.1.0"
 api_version = 2
+capabilities = ["runtime.worker"]
 
 [runtime]
 kind = "command"
@@ -815,6 +866,7 @@ id = "acme.systool"
 name = "SysTool"
 version = "0.1.0"
 api_version = 2
+capabilities = ["runtime.worker"]
 
 [runtime]
 kind = "command"
@@ -849,6 +901,7 @@ id = "acme.failbuild"
 name = "FailBuild"
 version = "0.1.0"
 api_version = 2
+capabilities = ["runtime.worker"]
 
 [runtime]
 kind = "command"
@@ -891,6 +944,7 @@ id = "acme.upd"
 name = "Upd"
 version = "0.1.0"
 api_version = 2
+capabilities = ["runtime.worker"]
 
 [runtime]
 kind = "command"
@@ -916,6 +970,7 @@ id = "acme.upd"
 name = "Upd"
 version = "0.2.0"
 api_version = 2
+capabilities = ["runtime.worker"]
 
 [runtime]
 kind = "command"
@@ -966,7 +1021,7 @@ id = "acme.recipe"
 name = "Recipe"
 version = "0.1.0"
 api_version = 2
-capabilities = ["net"]
+capabilities = ["runtime.worker", "net"]
 
 [runtime]
 kind = "command"
@@ -988,7 +1043,7 @@ id = "acme.recipe"
 name = "Recipe"
 version = "0.2.0"
 api_version = 2
-capabilities = ["net"]
+capabilities = ["runtime.worker", "net"]
 
 [runtime]
 kind = "command"

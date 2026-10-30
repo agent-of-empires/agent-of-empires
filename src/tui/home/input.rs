@@ -7,16 +7,15 @@ use tui_input::Input;
 
 use super::bindings::{self, ActionId};
 use super::{
-    live_send, DragKind, HomeView, PermissionResponseTarget, PreviewSelection, TerminalMode,
-    ViewMode,
+    live_send, DragKind, HomeView, NamespaceIntent, PermissionResponseTarget, PreviewSelection,
+    TerminalMode, ViewMode,
 };
 use crate::session::config::repo_config;
 use crate::session::config::{
     load_config, update_app_state, update_config, GroupByMode, SidebarPosition, SortOrder,
 };
-use crate::session::{list_profiles_for_display, Item, Status};
+use crate::session::{list_profiles_for_display, Item, LifecycleOperation, Status};
 use crate::tui::app::Action;
-use crate::tui::dialogs::ServeAction;
 use crate::tui::dialogs::{
     builtin_commands, CommandPaletteDialog, ConfirmDialog, ContextMenuAction, ContextMenuDialog,
     DeleteDialogConfig, DialogResult, GroupDeleteOptions, GroupDeleteOptionsDialog,
@@ -25,6 +24,7 @@ use crate::tui::dialogs::{
     RenameMode, RepoTrustAction, RestartDialog, SendMessageDialog, TipsDialog, TipsOutcome,
     UnifiedDeleteDialog, WorktreeNameDialog,
 };
+use crate::tui::dialogs::{DashboardLaunch, ServeAction, ServeView};
 use crate::tui::diff::{DiffAction, DiffView};
 use crate::tui::responsive;
 use crate::tui::settings::{SettingsAction, SettingsView};
@@ -46,7 +46,8 @@ pub(super) enum SidebarSection {
     Archived,
 }
 
-/// The `aoe.web` plugin serves the dashboard; with it disabled, `R` explains why instead.
+/// The `aoe.web` plugin serves the dashboard; with it disabled, the Connections row says so
+/// and Enter on it explains why.
 pub(super) fn web_plugin_disabled() -> bool {
     crate::plugin::registry()
         .get("aoe.web")
@@ -423,19 +424,7 @@ fn slice_line_columns(line: &ratatui::text::Line, from: u16, to_excl: u16, width
     crate::tui::components::text::line_columns(line, width).slice(from, to_excl.min(width))
 }
 
-/// `Alt+Up` / `Alt+Down`: the direction they walk the list, or `None` for any other key.
-fn jump_delta_for(key: &KeyEvent) -> Option<isize> {
-    // The bound chord is Alt alone. Ctrl+Alt+arrow is not one of ours, so inside live send it
-    // stays with the pane instead of breaking the relay.
-    if !key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::CONTROL) {
-        return None;
-    }
-    match key.code {
-        KeyCode::Up => Some(-1),
-        KeyCode::Down => Some(1),
-        _ => None,
-    }
-}
+const PAGE_STEP: u16 = 10;
 
 impl HomeView {
     pub fn is_diff_open(&self) -> bool {
@@ -478,31 +467,104 @@ impl HomeView {
         }
     }
 
+    pub(super) fn has_tool_targets(&self) -> bool {
+        !self.tool_configs.is_empty()
+            || self
+                .selected_session
+                .as_ref()
+                .and_then(|id| self.get_instance(id))
+                .is_some_and(|row| {
+                    row.auxiliary.iter().any(|observation| {
+                        matches!(
+                            observation.target,
+                            crate::session::AuxiliaryTarget::Tool { .. }
+                        )
+                    })
+                })
+    }
+
     fn open_tool_picker(&mut self) {
+        let observed = self
+            .selected_session
+            .as_ref()
+            .and_then(|id| self.get_instance(id))
+            .into_iter()
+            .flat_map(|row| row.auxiliary.iter())
+            .filter_map(|observation| match &observation.target {
+                crate::session::AuxiliaryTarget::Tool { tool_name } => Some(tool_name.as_str()),
+                _ => None,
+            });
         self.tool_picker_dialog = Some(crate::tui::dialogs::ToolPickerDialog::new(
             &self.tool_configs,
+            observed,
         ));
     }
 
     fn activate_tool(&mut self, tool_name: String, toggle_current: bool) -> Option<Action> {
+        let observed = self.selected_session.as_ref()
+            .and_then(|id| self.get_instance(id))
+            .is_some_and(|row| row.auxiliary.iter().any(|observation| {
+                matches!(&observation.target, crate::session::AuxiliaryTarget::Tool { tool_name: name } if name == &tool_name)
+            }));
+        let recovery_only = observed
+            && self
+                .tool_configs
+                .get(&tool_name)
+                .is_none_or(|config| config.background || config.command.trim().is_empty());
+        if recovery_only {
+            self.cancel_native_attachment();
+            self.exit_live_send_if_active();
+            self.view_mode = if toggle_current
+                && matches!(&self.view_mode, ViewMode::Tool(current) if current == &tool_name)
+            {
+                ViewMode::Structured
+            } else {
+                ViewMode::Tool(tool_name)
+            };
+            self.preview_scroll_offset = 0;
+            self.tool_preview_cache = super::PreviewCache::default();
+            return None;
+        }
+        if !self.tool_configs.contains_key(&tool_name) {
+            return None;
+        }
         let (background, command_is_empty) = self
             .tool_configs
             .get(&tool_name)
             .map(|config| (config.background, config.command.trim().is_empty()))
-            .unwrap_or((false, false));
+            .expect("configured tool");
 
         if !background {
             if toggle_current
                 && matches!(&self.view_mode, ViewMode::Tool(current) if current == &tool_name)
             {
+                // The pending native preparation was bound to the mode being
+                // left, so its lease must not outlive it.
+                self.cancel_native_attachment();
                 self.view_mode = ViewMode::Structured;
                 return None;
             } else {
-                self.view_mode = ViewMode::Tool(tool_name);
+                self.view_mode = ViewMode::Tool(tool_name.clone());
                 self.preview_scroll_offset = 0;
                 self.tool_preview_cache = super::PreviewCache::default();
             }
-            return self.maybe_auto_start_live_send();
+            if let Some(action) = self.maybe_auto_start_live_send() {
+                return Some(action);
+            }
+            if let Some(id) = self.selected_session.clone() {
+                if let Err(error) = self.prepare_native_attachment(
+                    &id,
+                    super::panes::NativePane::Auxiliary(crate::session::AuxiliaryTarget::Tool {
+                        tool_name,
+                    }),
+                    crate::terminal::get_size(),
+                    super::panes::PaneIntent::Preview,
+                ) {
+                    self.info_dialog =
+                        Some(InfoDialog::new("Tool preview failed", &error.to_string()));
+                }
+            }
+            return None;
         }
 
         if command_is_empty {
@@ -614,7 +676,7 @@ impl HomeView {
             return;
         }
         match self.drag_state {
-            Some(DragKind::ListDivider) => {
+            Some(DragKind::ListDivider | DragKind::StackedListDivider) => {
                 self.handle_drag_end();
             }
             Some(DragKind::PreviewSelect) => {
@@ -625,11 +687,13 @@ impl HomeView {
         self.sidebar_position = position;
     }
 
-    /// Hit the preview border shared with the list, on either side.
-    /// Stacked and takeover views clear `divider_col`; modals block drags.
+    /// Hit the shared list/preview border. Overlays block resizing.
     pub fn hit_divider(&self, col: u16, row: u16) -> bool {
-        if self.has_dialog() {
+        if self.has_non_live_send_overlay() {
             return false;
+        }
+        if let Some(div_row) = self.divider_row {
+            return row == div_row && col >= self.list_area.x && col < self.list_area.right();
         }
         let Some(div_col) = self.divider_col else {
             return false;
@@ -652,7 +716,11 @@ impl HomeView {
     /// mobile clients where Shift-bypass does nothing.
     pub fn handle_drag_start(&mut self, col: u16, row: u16) -> bool {
         if self.hit_divider(col, row) {
-            self.drag_state = Some(DragKind::ListDivider);
+            self.drag_state = Some(if self.divider_row.is_some() {
+                DragKind::StackedListDivider
+            } else {
+                DragKind::ListDivider
+            });
             return true;
         }
         // Modals that aren't live-send sit over the preview, so a click inside
@@ -678,15 +746,12 @@ impl HomeView {
         false
     }
 
-    /// Resize the list within the preview's minimum width, or update a
-    /// text selection within the preview's content bounds.
+    /// Resize the list while reserving preview space, or update a text selection.
     ///
     /// True when state changed, so the caller redraws. Nothing persists per tick: the
     /// divider saves on release and the preview-select path emits OSC 52 on release.
     pub fn handle_drag_move(&mut self, col: u16, row: u16) -> bool {
-        // Settings scrollbar grab: map the live row to a scroll offset. Handled before the
-        // cancel-on-overlay logic below, which keys off `has_dialog()` (true while settings
-        // is open) and would tear the drag down on the first move.
+        // The settings scrollbar belongs to the overlay itself.
         if matches!(self.drag_state, Some(DragKind::SettingsScrollbar)) {
             if let Some(view) = &mut self.settings_view {
                 return view.scrollbar_drag_to_row(row);
@@ -696,28 +761,16 @@ impl HomeView {
             self.drag_state = None;
             return false;
         }
-        // A dialog opened mid-drag must not keep updating the sidebar invisibly under the
-        // modal, so end the drag here and persist whatever width was reached, mirroring
-        // `handle_drag_end`.
-        //
-        // `has_dialog()` is true during live-send, which is exactly when preview
-        // drag-select is meant to work, so live mode is exempt; a real modal opening
-        // mid-select still kills the drag and drops the selection so it cannot finalize
-        // behind the overlay.
+        // Live mode keeps the separator interactive; real overlays end the gesture.
         let drag_is_preview = matches!(self.drag_state, Some(DragKind::PreviewSelect));
-        let cancel_drag = if drag_is_preview {
-            self.has_non_live_send_overlay()
-        } else {
-            self.has_dialog()
-        };
-        if cancel_drag && self.drag_state.is_some() {
-            self.drag_state = None;
+        if self.has_non_live_send_overlay() && self.drag_state.is_some() {
             if drag_is_preview {
+                self.drag_state = None;
                 self.preview_selection = None;
                 self.preview_copy_pending = false;
                 self.preview_copy_text = None;
             } else {
-                self.save_list_width();
+                self.handle_drag_end();
             }
             return false;
         }
@@ -743,6 +796,21 @@ impl HomeView {
                     return false;
                 }
                 self.list_width = clamped;
+                true
+            }
+            Some(DragKind::StackedListDivider) => {
+                if self.divider_row.is_none() {
+                    self.handle_drag_end();
+                    return false;
+                }
+                let proposed = row.saturating_sub(self.list_area.y);
+                let height = responsive::stacked_list_height(self.main_area_height, Some(proposed));
+                if responsive::stacked_list_height(self.main_area_height, self.list_height)
+                    == height
+                {
+                    return false;
+                }
+                self.list_height = Some(height);
                 true
             }
             Some(DragKind::PreviewSelect) => {
@@ -875,10 +943,7 @@ impl HomeView {
         true
     }
 
-    /// End any active drag: the divider persists its final `list_width` to config, and a
-    /// preview selection is marked `finalized` so the renderer keeps the highlight until
-    /// dismissed. The clipboard copy is the caller's job (see `app.rs`), keeping this
-    /// method free of side effects beyond state.
+    /// Persist the final list size or finalize a preview selection for the caller to copy.
     ///
     /// True when a drag was in progress, so an `Up(Left)` that wasn't part of one causes
     /// no redraw.
@@ -893,6 +958,9 @@ impl HomeView {
         match state {
             DragKind::ListDivider => {
                 self.save_list_width();
+            }
+            DragKind::StackedListDivider => {
+                self.save_list_height();
             }
             DragKind::PreviewSelect => {
                 // A bare click collapses anchor == extent; treat it as no selection so a
@@ -1015,37 +1083,98 @@ impl HomeView {
         match action {
             "delete_group" => {
                 if let Err(e) = self.delete_selected_group(&GroupDeleteOptions::default()) {
-                    tracing::error!(target: "tui.input", "Failed to delete group: {}", e);
+                    self.info_dialog =
+                        Some(InfoDialog::new("Could Not Delete Group", &e.to_string()));
                 }
                 None
             }
             "archive_group" => {
                 if let Err(e) = self.archive_selected_group() {
-                    tracing::error!(target: "tui.input", "Failed to archive group: {}", e);
+                    self.info_dialog =
+                        Some(InfoDialog::new("Could Not Archive Group", &e.to_string()));
                 }
                 None
             }
             "stop_session" => self.pending_stop_session.take().map(Action::StopSession),
-            "stop_terminal" => {
-                if let Some((session_id, mode)) = self.pending_stop_terminal.take() {
-                    if let Err(e) = self.kill_terminal_for(&session_id, mode) {
-                        tracing::error!(target: "tui.input", "Failed to kill terminal: {}", e);
+            "resume_reveal" => {
+                if let Some(intent) = self.retained_reveal.take() {
+                    if let Err(error) = self.continue_reveal(intent) {
+                        self.info_dialog = Some(InfoDialog::sized_to_fit(
+                            "Session Not Revealed",
+                            &error.to_string(),
+                        ));
                     }
                 }
                 None
             }
-            "stop_tool" => {
-                if let Some((session_id, tool_name)) = self.pending_stop_tool.take() {
-                    if let Err(e) = self.kill_tool_for(&session_id, &tool_name) {
-                        tracing::error!(target: "tui.input", "Failed to kill tool session: {}", e);
+            "resolve_namespace_indeterminate" => {
+                match self.session_feed.resolve_namespace_indeterminate() {
+                    Ok(()) => {
+                        self.namespace_unknown_message = None;
+                        self.promote_next_indeterminate();
+                        self.offer_retained_reveal();
+                    }
+                    Err(error) => {
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Namespace Quarantine Retained",
+                            &format!(
+                                "{error}\n\nReopen with Ctrl+K: Resolve unknown runtime change."
+                            ),
+                        ))
+                    }
+                }
+                None
+            }
+            "resolve_indeterminate" => {
+                if let Some(id) = self.pending_indeterminate_resolution.take() {
+                    if let Err(error) = self.session_feed.resolve_indeterminate(&id) {
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Quarantine Retained",
+                            &format!("{error}\n\nReopen resolution with Ctrl+K: Resolve unknown runtime change."),
+                        ));
+                        return None;
+                    }
+                    if let Some(at) = self
+                        .pending_indeterminate_queue
+                        .iter()
+                        .position(|(queued, _)| *queued == id)
+                    {
+                        self.pending_indeterminate_queue.remove(at);
+                    }
+                }
+                self.promote_next_indeterminate();
+                None
+            }
+            "adopt_legacy_tool" => {
+                if let Err(error) = self.confirm_legacy_tool_preparation() {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Legacy Tool Adoption Failed",
+                        &error.to_string(),
+                    ));
+                }
+                None
+            }
+            "stop_auxiliary" => {
+                // Stopping an auxiliary target is a lifecycle mutation, so it
+                // goes through the runtime like every other one; this process
+                // does not kill it itself.
+                if let Some((session_id, target)) = self.pending_stop_auxiliary.take() {
+                    if let Err(error) = self.session_feed.submit(
+                        session_id,
+                        crate::daemon::SessionMutation::StopAuxiliary(target),
+                    ) {
+                        self.info_dialog = Some(InfoDialog::new("Stop failed", &error.to_string()));
                     }
                 }
                 None
             }
             "force_remove_session" => {
-                if let Some(session_id) = self.pending_force_remove_session.take() {
-                    if let Err(e) = self.force_remove_session(&session_id) {
-                        tracing::error!(target: "tui.input", "Failed to force remove session: {}", e);
+                if let Some((session_id, generation)) = self.pending_force_remove_session.take() {
+                    if let Err(error) = self.force_remove_session(&session_id, generation) {
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Could Not Forget Purge",
+                            &error.to_string(),
+                        ));
                     }
                 }
                 None
@@ -1069,10 +1198,6 @@ impl HomeView {
                 .pending_switch_view_session
                 .take()
                 .map(Action::SwitchSessionView),
-            "start_daemon_structured" => self
-                .pending_daemon_start_session
-                .take()
-                .map(Action::StartDaemonThenOpenStructured),
             "quit_during_creation" => Some(Action::Quit),
             "quit" => Some(Action::Quit),
             _ => None,
@@ -1107,7 +1232,13 @@ impl HomeView {
         let mut count = 0;
         let mut failed = 0;
         let mut failed_forced = 0;
-        for inst in self.instances.values().filter(|i| i.is_trashed()) {
+        for inst in self.instances.values().filter(|i| {
+            i.is_trashed()
+                && self
+                    .active_profile
+                    .as_ref()
+                    .is_none_or(|profile| *profile == i.source_profile)
+        }) {
             count += 1;
             match self.failed_delete_forced(inst) {
                 Some(false) => failed += 1,
@@ -1194,6 +1325,14 @@ impl HomeView {
     }
 
     pub fn handle_dialog_click(&mut self, col: u16, row: u16) -> bool {
+        if let Some(serve) = &mut self.serve_view {
+            let key = serve.handle_click(col, row);
+            self.press_dialog_key(key);
+            return true;
+        }
+        // The confirm dialog floats over settings, so it wins click routing the same way
+        // the keyboard path checks `settings_close_confirm` before `settings_view`;
+        // otherwise a click on Yes / No goes into settings and never reaches the modal.
         if let Some(dialog) = &mut self.intro_dialog {
             let click = dialog.handle_click(col, row);
             let preview = dialog.take_pending_preview();
@@ -1231,12 +1370,15 @@ impl HomeView {
                     DialogResult::Cancel => {
                         self.unified_delete_dialog = None;
                     }
-                    DialogResult::Submit(options) => {
-                        self.unified_delete_dialog = None;
-                        if let Err(e) = self.delete_selected(&options) {
-                            tracing::error!(target: "tui.input", "Failed to delete session: {}", e);
+                    DialogResult::Submit(options) => match self.delete_selected(&options) {
+                        Ok(()) => self.unified_delete_dialog = None,
+                        Err(error) => {
+                            self.info_dialog = Some(InfoDialog::new(
+                                "Could Not Delete Session",
+                                &error.to_string(),
+                            ))
                         }
-                    }
+                    },
                 }
                 return true;
             }
@@ -1320,36 +1462,19 @@ impl HomeView {
                     DialogResult::Cancel => {
                         self.repo_trust_dialog = None;
                         self.pending_repo_trust_data = None;
+                        self.pending_repo_trust_fingerprint = None;
                     }
                     DialogResult::Submit(action) => {
                         self.repo_trust_dialog = None;
+                        let fingerprint = self.pending_repo_trust_fingerprint.take();
                         if let Some(data) = self.pending_repo_trust_data.take() {
-                            let emit = match action {
-                                RepoTrustAction::Trust {
-                                    hooks_hash,
-                                    mcp_hash,
-                                    project_path,
-                                    hooks,
-                                } => {
-                                    // Abort creation if trust cannot be persisted:
-                                    // launching anyway leaves hooks treated as approved
-                                    // while project MCP stays gated off the unwritten
-                                    // hashes.
-                                    if let Err(e) = repo_config::trust_repo(
-                                        std::path::Path::new(&project_path),
-                                        hooks_hash.as_deref(),
-                                        mcp_hash.as_deref(),
-                                    ) {
-                                        tracing::error!(target: "tui.input", "Failed to persist repo trust; aborting session creation: {}", e);
-                                        None
-                                    } else {
-                                        self.create_session_with_hooks(data, hooks)
-                                    }
+                            let decision = match action {
+                                RepoTrustAction::Trust { .. } => {
+                                    RepoTrustDecision::Approve(fingerprint)
                                 }
-                                RepoTrustAction::Skip { hooks } => {
-                                    self.create_session_with_hooks(data, hooks)
-                                }
+                                RepoTrustAction::Skip { .. } => RepoTrustDecision::Refuse,
                             };
+                            let emit = self.create_session_with_hooks(data, decision);
                             self.pending_dialog_click_action = emit;
                         }
                     }
@@ -1365,14 +1490,13 @@ impl HomeView {
             // preview underneath don't react.
             return true;
         }
-        if let Some(serve) = &mut self.serve_view {
-            let key = serve.handle_click(col, row);
-            self.press_dialog_key(key);
-            return true;
+        if self.settings_view.is_none() {
+            if let Some(view) = &mut self.diff_view {
+                view.handle_click(col, row);
+                self.drain_pending_diff_override();
+                return true;
+            }
         }
-        // The confirm dialog floats over settings, so it wins click routing the same way
-        // the keyboard path checks `settings_close_confirm` before `settings_view`;
-        // otherwise a click on Yes / No goes into settings and never reaches the modal.
         if let Some(dialog) = &mut self.confirm_dialog {
             if let Some(result) = dialog.handle_click(col, row) {
                 let action = dialog.action().to_string();
@@ -1380,9 +1504,10 @@ impl HomeView {
                     DialogResult::Continue => {}
                     DialogResult::Cancel => {
                         self.confirm_dialog = None;
+                        self.pending_indeterminate_resolution = None;
                         self.pending_stop_session = None;
-                        self.pending_stop_terminal = None;
-                        self.pending_stop_tool = None;
+                        self.pending_stop_auxiliary = None;
+                        self.pending_legacy_tool_preparation = None;
                         self.pending_force_remove_session = None;
                         self.pending_trash_session = None;
                         self.pending_image_pull = None;
@@ -1430,15 +1555,16 @@ impl HomeView {
             let _ = view.handle_click(col, row);
             return true;
         }
-        // The diff view is a full-screen takeover: it owns every click, since the
-        // stale list rect underneath would otherwise outrank `hit_diff` in `app.rs`.
-        if let Some(view) = &mut self.diff_view {
-            view.handle_click(col, row);
-            return true;
-        }
         if let Some(dialog) = &self.info_dialog {
             if let Some(DialogResult::Cancel) = dialog.handle_click(col, row) {
                 self.info_dialog = None;
+            }
+            return true;
+        }
+        if let Some(view) = &mut self.connections_view {
+            if let Some(DialogResult::Submit(())) = view.handle_click(col, row) {
+                self.connections_view = None;
+                self.open_serve();
             }
             return true;
         }
@@ -1480,15 +1606,9 @@ impl HomeView {
             }
             return true;
         }
-        if let Some(dialog) = &self.snooze_duration_dialog {
+        if let Some(dialog) = &mut self.snooze_duration_dialog {
             if let Some(DialogResult::Submit(minutes)) = dialog.handle_click(col, row) {
-                self.snooze_duration_dialog = None;
-                let sid = self.pending_snooze_session.take();
-                if let Some(id) = sid {
-                    if let Err(e) = self.snooze_session_for(&id, minutes) {
-                        tracing::error!("snooze_session_for failed: {}", e);
-                    }
-                }
+                self.submit_snooze_duration(minutes);
             }
             return true;
         }
@@ -1527,9 +1647,15 @@ impl HomeView {
                         self.group_delete_options_dialog = None;
                     }
                     DialogResult::Submit(options) => {
-                        self.group_delete_options_dialog = None;
-                        if let Err(e) = self.delete_selected_group(&options) {
-                            tracing::error!(target: "tui.input", "Failed to delete group: {}", e);
+                        let result = self.delete_selected_group(&options);
+                        match result {
+                            Ok(()) => self.group_delete_options_dialog = None,
+                            Err(error) => {
+                                self.info_dialog = Some(InfoDialog::new(
+                                    "Could Not Delete Group",
+                                    &error.to_string(),
+                                ))
+                            }
                         }
                     }
                 }
@@ -1751,10 +1877,33 @@ impl HomeView {
         key: KeyEvent,
         update_info: Option<&crate::update::UpdateInfo>,
     ) -> Option<Action> {
+        // A key is a context change: a pending native attachment was prepared
+        // for the session, profile, view and terminal mode in force when it was
+        // requested, so reconcile before the keystroke acts on any of them.
+        self.reconcile_native_attachment();
+        if key.code == KeyCode::Esc {
+            self.cancel_native_attachment();
+        }
         // Any keystroke drops a finalized preview selection: the highlight pins to cell
         // coords, so once the user does anything else the cells underneath can change and
         // it would point at unrelated content. Covers the live-send branch below too.
         self.clear_preview_selection();
+
+        // Handle serve view (full-screen takeover)
+        if let Some(ref mut serve) = self.serve_view {
+            match serve.handle_key(key) {
+                ServeAction::Continue => return None,
+                ServeAction::Stop => return Some(Action::StopDashboard),
+                ServeAction::Launch(request) => {
+                    self.pending_dashboard_launch = Some(request);
+                    return Some(Action::StartDashboard);
+                }
+                ServeAction::Close => {
+                    self.serve_view = None;
+                    return None;
+                }
+            }
+        }
 
         // Live-send capture normally wins over every other key handler: the home view is
         // a thin relay to the target pane, so dialog hotkeys, search and navigation
@@ -1765,10 +1914,11 @@ impl HomeView {
         if self.live_send.is_some() && !self.has_non_live_send_overlay() {
             // The jump keys are the one exception: they mean "take me to another session",
             // which is only answerable from the list, so they leave the relay first.
-            if let Some(delta) = jump_delta_for(&key) {
+            if let Some(id @ (ActionId::JumpPrevFinished | ActionId::JumpNextFinished)) =
+                self.live_send_action(&key)
+            {
                 self.exit_live_send_if_active();
-                self.jump_to_adjacent_finished(delta);
-                return None;
+                return self.run_action(id, None);
             }
             return self.handle_live_send_key(key);
         }
@@ -1827,17 +1977,7 @@ impl HomeView {
         // Handle diff view (full-screen takeover)
         if let Some(ref mut diff_view) = self.diff_view {
             let action = diff_view.handle_key(key);
-            if let Some((session_id, new_override)) = diff_view.take_pending_override() {
-                if let Err(e) = self.apply_user_action(&session_id, |inst| {
-                    inst.base_branch_override = new_override.clone();
-                }) {
-                    tracing::warn!(
-                        target: "tui.home",
-                        "Failed to persist base_branch_override: {}",
-                        e
-                    );
-                }
-            }
+            self.drain_pending_diff_override();
             match action {
                 DiffAction::Continue => return None,
                 DiffAction::Close => {
@@ -1846,17 +1986,6 @@ impl HomeView {
                 }
                 DiffAction::EditFile(path) => {
                     return Some(Action::EditFile(path));
-                }
-            }
-        }
-
-        // Handle serve view (full-screen takeover)
-        if let Some(ref mut serve) = self.serve_view {
-            match serve.handle_key(key) {
-                ServeAction::Continue => return None,
-                ServeAction::Close => {
-                    self.serve_view = None;
-                    return None;
                 }
             }
         }
@@ -1965,14 +2094,28 @@ impl HomeView {
             return None;
         }
 
-        if let Some(dialog) = &mut self.info_dialog {
-            match dialog.handle_key(key) {
-                DialogResult::Continue => {}
-                DialogResult::Cancel | DialogResult::Submit(_) => {
-                    self.info_dialog = None;
-                    if let Some(session_id) = self.pending_attach_after_warning.take() {
-                        return Some(Action::AttachSession(session_id));
+        if self.snooze_duration_dialog.is_none() || self.confirm_dialog.is_none() {
+            if let Some(dialog) = &mut self.info_dialog {
+                match dialog.handle_key(key) {
+                    DialogResult::Continue => {}
+                    DialogResult::Cancel | DialogResult::Submit(_) => {
+                        self.info_dialog = None;
+                        if let Some(session_id) = self.pending_attach_after_warning.take() {
+                            return Some(Action::AttachSession(session_id));
+                        }
                     }
+                }
+                return None;
+            }
+        }
+
+        if let Some(view) = &mut self.connections_view {
+            match view.handle_key(key) {
+                DialogResult::Continue => {}
+                DialogResult::Cancel => self.connections_view = None,
+                DialogResult::Submit(()) => {
+                    self.connections_view = None;
+                    self.open_serve();
                 }
             }
             return None;
@@ -2009,24 +2152,18 @@ impl HomeView {
             }
         }
 
-        if let Some(dialog) = &mut self.snooze_duration_dialog {
-            match dialog.handle_key(key) {
-                DialogResult::Continue => {}
-                DialogResult::Cancel => {
-                    self.snooze_duration_dialog = None;
-                    self.pending_snooze_session = None;
-                }
-                DialogResult::Submit(minutes) => {
-                    self.snooze_duration_dialog = None;
-                    let sid = self.pending_snooze_session.take();
-                    if let Some(id) = sid {
-                        if let Err(e) = self.snooze_session_for(&id, minutes) {
-                            tracing::error!("snooze_session_for failed: {}", e);
-                        }
+        if self.confirm_dialog.is_none() {
+            if let Some(dialog) = &mut self.snooze_duration_dialog {
+                match dialog.handle_key(key) {
+                    DialogResult::Continue => {}
+                    DialogResult::Cancel => {
+                        self.snooze_duration_dialog = None;
+                        self.pending_snooze_session = None;
                     }
+                    DialogResult::Submit(minutes) => self.submit_snooze_duration(minutes),
                 }
+                return None;
             }
-            return None;
         }
 
         // Handle other dialog input
@@ -2112,33 +2249,19 @@ impl HomeView {
                 DialogResult::Cancel => {
                     self.repo_trust_dialog = None;
                     self.pending_repo_trust_data = None;
+                    self.pending_repo_trust_fingerprint = None;
                 }
                 DialogResult::Submit(action) => {
                     self.repo_trust_dialog = None;
+                    let fingerprint = self.pending_repo_trust_fingerprint.take();
                     if let Some(data) = self.pending_repo_trust_data.take() {
-                        match action {
-                            RepoTrustAction::Trust {
-                                hooks_hash,
-                                mcp_hash,
-                                project_path,
-                                hooks,
-                            } => {
-                                // Abort creation if trust cannot be persisted, to avoid
-                                // hooks approved while project MCP stays gated off.
-                                if let Err(e) = repo_config::trust_repo(
-                                    std::path::Path::new(&project_path),
-                                    hooks_hash.as_deref(),
-                                    mcp_hash.as_deref(),
-                                ) {
-                                    tracing::error!(target: "tui.input", "Failed to persist repo trust; aborting session creation: {}", e);
-                                    return None;
-                                }
-                                return self.create_session_with_hooks(data, hooks);
+                        let decision = match action {
+                            RepoTrustAction::Trust { .. } => {
+                                RepoTrustDecision::Approve(fingerprint)
                             }
-                            RepoTrustAction::Skip { hooks } => {
-                                return self.create_session_with_hooks(data, hooks);
-                            }
-                        }
+                            RepoTrustAction::Skip { .. } => RepoTrustDecision::Refuse,
+                        };
+                        return self.create_session_with_hooks(data, decision);
                     }
                 }
             }
@@ -2158,9 +2281,10 @@ impl HomeView {
                 DialogResult::Continue => {}
                 DialogResult::Cancel => {
                     self.confirm_dialog = None;
+                    self.pending_indeterminate_resolution = None;
                     self.pending_stop_session = None;
-                    self.pending_stop_terminal = None;
-                    self.pending_stop_tool = None;
+                    self.pending_stop_auxiliary = None;
+                    self.pending_legacy_tool_preparation = None;
                     self.pending_force_remove_session = None;
                     self.pending_trash_session = None;
                     self.pending_image_pull = None;
@@ -2187,12 +2311,15 @@ impl HomeView {
                 DialogResult::Cancel => {
                     self.unified_delete_dialog = None;
                 }
-                DialogResult::Submit(options) => {
-                    self.unified_delete_dialog = None;
-                    if let Err(e) = self.delete_selected(&options) {
-                        tracing::error!(target: "tui.input", "Failed to delete session: {}", e);
+                DialogResult::Submit(options) => match self.delete_selected(&options) {
+                    Ok(()) => self.unified_delete_dialog = None,
+                    Err(error) => {
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Could Not Delete Session",
+                            &error.to_string(),
+                        ))
                     }
-                }
+                },
             }
             return None;
         }
@@ -2204,9 +2331,15 @@ impl HomeView {
                     self.group_delete_options_dialog = None;
                 }
                 DialogResult::Submit(options) => {
-                    self.group_delete_options_dialog = None;
-                    if let Err(e) = self.delete_selected_group(&options) {
-                        tracing::error!(target: "tui.input", "Failed to delete group: {}", e);
+                    let result = self.delete_selected_group(&options);
+                    match result {
+                        Ok(()) => self.group_delete_options_dialog = None,
+                        Err(error) => {
+                            self.info_dialog = Some(InfoDialog::new(
+                                "Could Not Delete Group",
+                                &error.to_string(),
+                            ))
+                        }
                     }
                 }
             }
@@ -2222,25 +2355,21 @@ impl HomeView {
                     self.group_rename_context = None;
                 }
                 DialogResult::Submit(data) => {
-                    self.rename_dialog = None;
-                    match mode {
-                        RenameMode::Session => {
-                            if let Err(e) = self.rename_selected(
-                                &data.title,
-                                data.group.as_deref(),
-                                data.profile.as_deref(),
-                                data.rename_branch,
-                            ) {
-                                tracing::error!(target: "tui.input", "Failed to rename session: {}", e);
-                            }
-                        }
-                        RenameMode::Group => {
-                            if let Err(e) = self.rename_selected_group(
-                                data.group.as_deref(),
-                                data.profile.as_deref(),
-                            ) {
-                                tracing::error!(target: "tui.input", "Failed to rename group: {}", e);
-                            }
+                    let result = match mode {
+                        RenameMode::Session => self.rename_selected(
+                            &data.title,
+                            data.group.as_deref(),
+                            data.profile.as_deref(),
+                            data.rename_branch,
+                        ),
+                        RenameMode::Group => self
+                            .rename_selected_group(data.group.as_deref(), data.profile.as_deref()),
+                    };
+                    match result {
+                        Ok(()) => self.rename_dialog = None,
+                        Err(error) => {
+                            self.info_dialog =
+                                Some(InfoDialog::new("Could Not Rename", &error.to_string()))
                         }
                     }
                 }
@@ -2255,14 +2384,14 @@ impl HomeView {
                     self.worktree_name_dialog = None;
                 }
                 DialogResult::Submit(data) => {
-                    self.worktree_name_dialog = None;
-                    if let Err(e) =
-                        self.set_worktree_name_for_selected(&data.name, data.rename_branch)
-                    {
-                        self.info_dialog = Some(InfoDialog::new(
-                            "Edit Workdir Name Failed",
-                            &format!("Could not edit the workdir name: {e}"),
-                        ));
+                    match self.set_worktree_name_for_selected(&data.name, data.rename_branch) {
+                        Ok(()) => self.worktree_name_dialog = None,
+                        Err(error) => {
+                            self.info_dialog = Some(InfoDialog::new(
+                                "Edit Workdir Name Failed",
+                                &error.to_string(),
+                            ))
+                        }
                     }
                 }
             }
@@ -2297,8 +2426,9 @@ impl HomeView {
             return None;
         }
 
+        let project_write_block = self.project_write_block();
         if let Some(dialog) = &mut self.projects_dialog {
-            match dialog.handle_key(key) {
+            match dialog.handle_key(key, project_write_block) {
                 DialogResult::Continue => {}
                 DialogResult::Cancel | DialogResult::Submit(()) => {
                     self.projects_dialog = None;
@@ -2410,33 +2540,41 @@ impl HomeView {
                         }
                     }
                     ProfilePickerAction::Created(name) => {
-                        self.profile_picker_dialog = None;
-                        match crate::session::create_profile(&name) {
-                            Ok(()) => {
-                                if let Err(e) = self.switch_profile(Some(name)) {
-                                    tracing::error!(target: "tui.input", "Failed to switch to new profile: {}", e);
-                                }
-                            }
-                            Err(e) => {
+                        let result = self.submit_namespace_intent(
+                            crate::daemon::NamespaceMutation::Profile(
+                                crate::daemon::ProfileMutation::Create(
+                                    crate::daemon::CreateProfileBody { name: name.clone() },
+                                ),
+                            ),
+                            NamespaceIntent::ProfileCreated(name),
+                        );
+                        match result {
+                            Ok(()) => self.profile_picker_dialog = None,
+                            Err(error) => {
                                 self.info_dialog = Some(InfoDialog::new(
-                                    "Error",
-                                    &format!("Failed to create profile: {}", e),
-                                ));
+                                    "Could Not Create Profile",
+                                    &error.to_string(),
+                                ))
                             }
                         }
                     }
                     ProfilePickerAction::Deleted(name) => {
-                        match crate::session::delete_profile(&name) {
-                            Ok(()) => {
-                                self.rewire_after_profile_delete(&name);
-                                self.show_profile_picker();
-                            }
-                            Err(e) => {
-                                self.profile_picker_dialog = None;
+                        let result = self.submit_namespace_intent(
+                            crate::daemon::NamespaceMutation::Profile(
+                                crate::daemon::ProfileMutation::Delete {
+                                    name: name.clone(),
+                                    query: Default::default(),
+                                },
+                            ),
+                            NamespaceIntent::ProfileDeleted(name),
+                        );
+                        match result {
+                            Ok(()) => self.profile_picker_dialog = None,
+                            Err(error) => {
                                 self.info_dialog = Some(InfoDialog::new(
-                                    "Error",
-                                    &format!("Failed to delete profile: {}", e),
-                                ));
+                                    "Could Not Delete Profile",
+                                    &error.to_string(),
+                                ))
                             }
                         }
                     }
@@ -2627,15 +2765,6 @@ impl HomeView {
             return None;
         }
 
-        // Ctrl+K opens the command palette in any hotkey mode, activated before strict
-        // normalization so the binding stays discoverable on every keymap.
-        if matches!(key.code, KeyCode::Char('k') | KeyCode::Char('K'))
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-        {
-            self.open_command_palette();
-            return None;
-        }
-
         // Strict-mode relocation happens inside dispatch_action_key through the shared
         // bindings registry, so no key rewriting happens here.
         self.dispatch_action_key(key, update_info)
@@ -2679,6 +2808,7 @@ impl HomeView {
                 return None;
             }
             KeyCode::Esc if matches!(self.view_mode, ViewMode::Tool(_)) => {
+                self.cancel_native_attachment();
                 self.view_mode = ViewMode::Structured;
                 return None;
             }
@@ -2686,12 +2816,7 @@ impl HomeView {
         }
 
         // Registry-driven action keys.
-        let ctx = bindings::Ctx {
-            view_mode: self.view_mode.clone(),
-            sort_order: self.sort_order,
-            has_search: !self.search_matches.is_empty(),
-            project_group_selected: self.project_group_at_cursor().is_some(),
-        };
+        let ctx = self.bindings_ctx(false);
         match bindings::resolve_action(&key, self.strict_hotkeys, &ctx) {
             Some(bindings::ResolvedAction::Core(id)) => return self.run_action(id, update_info),
             Some(bindings::ResolvedAction::Plugin(action)) => {
@@ -2753,7 +2878,9 @@ impl HomeView {
                 // A structured session has no tmux pane to attach or live-send into, so
                 // both Tab meanings are vacuous; say so instead of ignoring the press.
                 if let Some(id) = self.selected_session.as_deref() {
-                    if self.get_instance(id).is_some_and(|i| i.is_structured()) {
+                    if matches!(self.view_mode, ViewMode::Structured)
+                        && self.get_instance(id).is_some_and(|i| i.is_structured())
+                    {
                         return Some(Action::SetTransientStatus(
                             "Structured sessions have no tmux pane; press Enter to open the structured view."
                                 .to_string(),
@@ -2815,6 +2942,65 @@ impl HomeView {
         None
     }
 
+    pub(super) fn drain_pending_diff_override(&mut self) {
+        let Some((id, branch)) = self
+            .diff_view
+            .as_mut()
+            .and_then(DiffView::take_pending_override)
+        else {
+            return;
+        };
+        let Some(diff) = self.diff_view.as_ref() else {
+            return;
+        };
+        if diff.base_save.is_some() {
+            self.diff_view.as_mut().unwrap().base_not_saved(
+                "A base save is already pending; this comparison is not submitted.",
+            );
+            return;
+        }
+        let matches = self
+            .session_feed
+            .applied_session(&id)
+            .is_some_and(|row| row.profile == diff.profile);
+        let epoch = self.session_feed.applied_epoch().map(str::to_owned);
+        let result = if matches {
+            self.session_feed.submit_diff_base(id, branch.clone())
+        } else {
+            Err(anyhow::anyhow!(
+                "The original session/profile is not in the applied runtime; no change submitted"
+            ))
+        };
+        let diff = self.diff_view.as_mut().unwrap();
+        match result {
+            Ok(receiver) => {
+                diff.base_save_epoch = epoch;
+                diff.base_save_branch = branch;
+                diff.base_save = Some(receiver);
+            }
+            Err(error) => diff.base_not_saved(&error.to_string()),
+        }
+    }
+    fn submit_snooze_duration(&mut self, minutes: u32) {
+        let result = match self.pending_snooze_session.clone() {
+            Some(id) if self.get_instance(&id).is_some() => self.snooze_session_for(&id, minutes),
+            _ => Err(anyhow::anyhow!(
+                "The original snooze target is unavailable; no change submitted"
+            )),
+        };
+        match result {
+            Ok(()) => {
+                self.snooze_duration_dialog = None;
+                self.pending_snooze_session = None;
+            }
+            Err(error) => {
+                if let Some(dialog) = &mut self.snooze_duration_dialog {
+                    dialog.reject(minutes, &error.to_string());
+                }
+            }
+        }
+    }
+
     /// Execute a resolved [`ActionId`], the single home for each action's behavior, so
     /// the keyboard dispatcher and the command palette cannot diverge.
     fn run_action(
@@ -2822,16 +3008,33 @@ impl HomeView {
         id: ActionId,
         update_info: Option<&crate::update::UpdateInfo>,
     ) -> Option<Action> {
+        // A row still being created has no runtime to command yet. The
+        // keyboard dispatcher and the command palette both route here, so they
+        // cannot diverge on what an action does.
+        if id.needs_canonical_session() && self.is_creating_stub_selected() {
+            self.flash_status("Still creating this session; it has no runtime yet");
+            return None;
+        }
         match id {
             ActionId::Quit => return Some(Action::Quit),
+            ActionId::ResolveIndeterminate => {
+                if self.pending_indeterminate_queue.is_empty()
+                    && !self.session_feed.namespace_indeterminate()
+                {
+                    self.flash_status("No unknown runtime changes to resolve");
+                } else {
+                    self.promote_next_indeterminate();
+                }
+            }
             ActionId::Help => {
                 self.show_help = true;
                 self.help_scroll = 0;
             }
             ActionId::ToolPicker => {
                 if matches!(self.view_mode, ViewMode::Tool(_)) {
+                    self.cancel_native_attachment();
                     self.view_mode = ViewMode::Structured;
-                } else if !self.tool_configs.is_empty() {
+                } else if self.has_tool_targets() {
                     self.open_tool_picker();
                 }
             }
@@ -2857,6 +3060,10 @@ impl HomeView {
             ActionId::NewFromProject => self.open_project_session_picker(),
             ActionId::AttachTerminal => return self.attach_terminal_for_selected(),
             ActionId::ToggleView => {
+                // Same contract as the terminal-mode and profile switches: a
+                // pending native preparation is bound to the mode it was
+                // prepared for.
+                self.cancel_native_attachment();
                 self.view_mode = match self.view_mode {
                     ViewMode::Structured => ViewMode::Terminal,
                     ViewMode::Terminal | ViewMode::Tool(_) => ViewMode::Structured,
@@ -2891,7 +3098,7 @@ impl HomeView {
             ActionId::SetWorktreeName => self.open_worktree_name_for_selected(),
             ActionId::AddProject => self.open_add_project_for_selected(),
             ActionId::Diff => self.open_diff_for_selected(),
-            ActionId::Serve => self.open_serve(),
+            ActionId::Serve => self.open_connections(),
             ActionId::Settings => self.open_settings(),
             ActionId::Profiles => self.show_profile_picker(),
             ActionId::Projects => {
@@ -2910,7 +3117,7 @@ impl HomeView {
                 if self.selected_group.is_some() {
                     self.prompt_archive_selected_group();
                 } else if let Err(e) = self.toggle_archive_at_cursor() {
-                    tracing::error!("toggle_archive_at_cursor failed: {}", e);
+                    self.info_dialog = Some(InfoDialog::new("Archive not changed", &e.to_string()));
                 }
             }
             id @ (ActionId::JumpPrevFinished | ActionId::JumpNextFinished) => {
@@ -2924,22 +3131,23 @@ impl HomeView {
             id @ (ActionId::MoveRowUp | ActionId::MoveRowDown) => {
                 let delta = if id == ActionId::MoveRowUp { -1 } else { 1 };
                 if let Err(e) = self.move_row_at_cursor(delta) {
-                    tracing::error!("move_row_at_cursor failed: {}", e);
+                    self.info_dialog = Some(InfoDialog::new("Order not changed", &e.to_string()));
                 }
             }
             ActionId::ToggleFavorite => {
                 if let Err(e) = self.toggle_favorite_at_cursor() {
-                    tracing::error!("toggle_favorite_at_cursor failed: {}", e);
+                    self.info_dialog =
+                        Some(InfoDialog::new("Favorite not changed", &e.to_string()));
                 }
             }
             ActionId::ToggleSnooze => {
                 if let Err(e) = self.toggle_snooze_at_cursor() {
-                    tracing::error!("toggle_snooze_at_cursor failed: {}", e);
+                    self.info_dialog = Some(InfoDialog::new("Snooze not changed", &e.to_string()));
                 }
             }
             ActionId::ToggleUnread => {
                 if let Err(e) = self.toggle_unread_at_cursor() {
-                    tracing::error!("toggle_unread_at_cursor failed: {}", e);
+                    self.info_dialog = Some(InfoDialog::new("Unread not changed", &e.to_string()));
                 }
             }
             ActionId::ToggleContainer => self.toggle_container_for_selected(),
@@ -2956,6 +3164,15 @@ impl HomeView {
             ActionId::Fork => self.open_fork_from_selection(),
             ActionId::EmptyTrash => self.prompt_empty_trash(),
             ActionId::AutoName => return self.auto_name_selected(),
+            ActionId::OpenCommandPalette => self.open_command_palette(),
+            ActionId::PreviewScrollUp => {
+                self.preview_scroll_offset = self.preview_scroll_offset.saturating_add(PAGE_STEP)
+            }
+            ActionId::PreviewScrollDown => {
+                self.preview_scroll_offset = self.preview_scroll_offset.saturating_sub(PAGE_STEP)
+            }
+            // `App` handles the chord before the home view sees it.
+            ActionId::DismissUpdateBanner => {}
         }
         None
     }
@@ -3080,7 +3297,7 @@ impl HomeView {
     /// Whether the session's persisted view can be switched, and which it renders now:
     /// `Some(is_structured)` when the context menu should offer a switch. A structured
     /// session can always go back to a terminal; a terminal one can go structured only
-    /// when its tool is ACP-capable and `offer_structured_in_new_session` is on, the same
+    /// when its tool is ACP-capable and `acp.structured_view` is not `off`, the same
     /// gate as the new-session toggle. Archived, trashed and mid-lifecycle rows are
     /// excluded: their agent is deliberately stopped and the swap would boot a worker
     /// behind the parked state.
@@ -3099,10 +3316,8 @@ impl HomeView {
             &inst.source_profile,
             std::path::Path::new(&inst.project_path),
         );
-        // Switching a terminal session into structured view is gated on the same opt-in
-        // as the new-session toggle; the reverse direction stays available regardless, so
-        // a session can always get out.
-        (config.acp.offer_structured_in_new_session
+        // The reverse direction stays available regardless, so a session can always get out.
+        (config.acp.structured_view.is_offered()
             && crate::session::builder::structured::tool_acp_capable(&inst.tool, &config))
         .then_some(false)
     }
@@ -3159,24 +3374,6 @@ impl HomeView {
         };
         self.pending_switch_view_session = Some(id);
         self.confirm_dialog = Some(ConfirmDialog::new(title, body, "switch_view"));
-    }
-
-    /// Offer to start a localhost daemon when opening a structured view found none.
-    /// Neutral tone: nothing is destroyed, the user is just about to run a background
-    /// process. Remote setups keep their manual commands.
-    pub(in crate::tui) fn prompt_start_daemon_for_structured(&mut self, session_id: &str) {
-        self.pending_daemon_start_session = Some(session_id.to_string());
-        self.confirm_dialog = Some(
-            ConfirmDialog::new(
-                "Start structured view daemon",
-                "No `aoe serve` daemon is running, and structured sessions are \
-                 driven by it. Start a local (localhost-only) daemon now? For \
-                 remote access instead, cancel and run `aoe serve --daemon \
-                 --remote` yourself.",
-                "start_daemon_structured",
-            )
-            .neutral(),
-        );
     }
 
     /// The selected session's id when it is a previewable structured row: not mid
@@ -3430,37 +3627,7 @@ impl HomeView {
         }
     }
 
-    /// A confirm the hotkey that opened it also accepts, so the deliberate gesture is two
-    /// taps of one key while a stray keystroke is harmless. The key is read off the binding
-    /// table so the hint can't drift from it; a chord that isn't a bare character falls
-    /// back to the dialog's own y/Enter.
-    fn confirm_by_repeating(
-        &self,
-        opener: ActionId,
-        title: &str,
-        message: &str,
-        action: &str,
-    ) -> ConfirmDialog {
-        let label = bindings::label(opener, self.strict_hotkeys);
-        let mut chars = label.chars();
-        let accept_char = match (chars.next(), chars.next()) {
-            (Some(c), None) => Some(c),
-            _ => None,
-        };
-        let hint = match accept_char {
-            Some(_) => format!("Press {label} again to confirm, Esc to cancel."),
-            None => "Press y to confirm, Esc to cancel.".to_string(),
-        };
-        let dialog = ConfirmDialog::new(title, &format!("{message}\n{hint}"), action);
-        match accept_char {
-            Some(c) => dialog.confirmed_by(c),
-            None => dialog,
-        }
-    }
-
-    /// Terminal-view Stop: confirm, then kill the paired terminal (host or container,
-    /// whichever the row shows) without touching the agent session. No-op when the
-    /// terminal isn't running, so Stop on an idle row pops no dialog.
+    /// Confirm killing the visible terminal without stopping the agent.
     fn stop_terminal_selected(&mut self) {
         let Some(session_id) = self.selected_session.clone() else {
             return;
@@ -3468,17 +3635,12 @@ impl HomeView {
         let Some(inst) = self.get_instance(&session_id) else {
             return;
         };
-        let mode = self.effective_terminal_mode(&session_id);
-        let terminal_running = match mode {
-            TerminalMode::Container => inst
-                .container_terminal_tmux_session()
-                .map(|s| s.exists())
-                .unwrap_or(false),
-            TerminalMode::Host => inst
-                .terminal_tmux_session()
-                .map(|s| s.exists())
-                .unwrap_or(false),
-        };
+        // One place decides whether an auxiliary target is alive, because the
+        // view mode picks which target this is.
+        let terminal_running = matches!(
+            self.auxiliary_presence_for_view(inst),
+            crate::session::PanePresence::Alive | crate::session::PanePresence::Dead
+        );
         if !terminal_running {
             return;
         }
@@ -3486,33 +3648,25 @@ impl HomeView {
             "Are you sure you want to kill the terminal for '{}'?",
             inst.title
         );
-        self.pending_stop_terminal = Some((session_id, mode));
+        let mode = self.effective_terminal_mode(&session_id);
+        let target = match mode {
+            TerminalMode::Host => crate::session::AuxiliaryTarget::Host { index: 0 },
+            TerminalMode::Container => crate::session::AuxiliaryTarget::Container { index: 0 },
+        };
+        self.pending_stop_auxiliary = Some((
+            session_id,
+            crate::daemon::StopAuxiliaryBody {
+                target,
+                adoption: None,
+            },
+        ));
         self.confirm_dialog = Some(
-            self.confirm_by_repeating(ActionId::Stop, "Kill Terminal", &message, "stop_terminal")
+            self.confirm_by_repeating(ActionId::Stop, "Kill Terminal", &message, "stop_auxiliary")
                 .buttons("Kill", "Cancel"),
         );
     }
 
-    /// Kill the paired terminal for `session_id` (host or container per `mode`) and
-    /// refresh so the row drops back to its idle glyph. The agent session is untouched.
-    pub(super) fn kill_terminal_for(
-        &mut self,
-        session_id: &str,
-        mode: TerminalMode,
-    ) -> anyhow::Result<()> {
-        if let Some(inst) = self.get_instance(session_id) {
-            match mode {
-                TerminalMode::Container => inst.kill_container_terminal()?,
-                TerminalMode::Host => inst.kill_terminal()?,
-            }
-        }
-        crate::tmux::refresh_session_cache();
-        self.reload()?;
-        Ok(())
-    }
-
-    /// Tool-view Stop: confirm, then kill the tool session without touching the agent.
-    /// Mirrors `stop_terminal_selected`, including the no-op when nothing runs.
+    /// Confirm killing the selected tool session without stopping the agent.
     fn stop_tool_selected(&mut self, tool_name: &str) {
         let Some(session_id) = self.selected_session.clone() else {
             return;
@@ -3520,37 +3674,61 @@ impl HomeView {
         let Some(inst) = self.get_instance(&session_id) else {
             return;
         };
-        let tool_session = crate::tmux::ToolSession::new(&inst.id, &inst.title, tool_name);
-        if !tool_session.exists() || tool_session.is_pane_dead() {
+        let target = crate::session::AuxiliaryTarget::Tool {
+            tool_name: tool_name.to_owned(),
+        };
+        let Some(pane) = inst
+            .auxiliary
+            .iter()
+            .find(|observation| observation.target == target)
+            .map(|observation| &observation.pane)
+        else {
+            self.info_dialog = Some(InfoDialog::new(
+                "Kill Tool",
+                "Tool ownership has not been observed yet. Wait for the runtime snapshot.",
+            ));
             return;
-        }
-        let message = format!(
-            "Are you sure you want to kill {} for '{}'?",
-            tool_name, inst.title
-        );
-        self.pending_stop_tool = Some((session_id, tool_name.to_string()));
+        };
+        let recovery_only = self
+            .tool_configs
+            .get(tool_name)
+            .is_none_or(|config| config.background || config.command.trim().is_empty());
+        let adoption = if recovery_only {
+            None
+        } else {
+            pane.legacy_tool
+                .as_ref()
+                .map(|identity| crate::session::LegacyToolAdoption {
+                    tmux_session: pane.tmux_session.clone().expect("legacy observation name"),
+                    identity: identity.identity.clone(),
+                    server: identity.server.clone(),
+                    profile: inst.source_profile.clone(),
+                    lifecycle_generation: inst.lifecycle_generation,
+                })
+        };
+        let message = if let Some(adoption) = &adoption {
+            format!("Adopt and kill legacy tool '{}' for '{}'\nRow: {} / {} / generation {}\nTmux: {} ({})\nThis confirmation assigns this exact unmarked pane to this tool before stopping it.",
+                tool_name, inst.title, inst.source_profile, inst.id, inst.lifecycle_generation,
+                adoption.tmux_session, adoption.identity)
+        } else if recovery_only {
+            format!(
+                "Finish original cleanup for '{}' on '{}'?\nCurrent replacement panes will not be adopted.",
+                tool_name, inst.title
+            )
+        } else {
+            format!(
+                "Are you sure you want to kill {} for '{}'?",
+                tool_name, inst.title
+            )
+        };
+        self.pending_stop_auxiliary = Some((
+            session_id,
+            crate::daemon::StopAuxiliaryBody { target, adoption },
+        ));
         self.confirm_dialog = Some(
-            self.confirm_by_repeating(ActionId::Stop, "Kill Tool", &message, "stop_tool")
+            self.confirm_by_repeating(ActionId::Stop, "Kill Tool", &message, "stop_auxiliary")
                 .buttons("Kill", "Cancel"),
         );
-    }
-
-    /// Kill the tool session for `session_id`, then refresh so the Tool-view
-    /// row drops back to its idle glyph. The agent session is left untouched.
-    pub(super) fn kill_tool_for(
-        &mut self,
-        session_id: &str,
-        tool_name: &str,
-    ) -> anyhow::Result<()> {
-        if let Some(inst) = self.get_instance(session_id) {
-            let tool_session = crate::tmux::ToolSession::new(&inst.id, &inst.title, tool_name);
-            if tool_session.exists() {
-                tool_session.kill()?;
-            }
-        }
-        crate::tmux::refresh_session_cache();
-        self.reload()?;
-        Ok(())
     }
 
     fn open_diff_for_selected(&mut self) {
@@ -3593,7 +3771,6 @@ impl HomeView {
             profile,
             base_override,
             worktree_base,
-            self.file_watch.clone(),
         ) {
             Ok(view) => self.diff_view = Some(view),
             Err(e) => {
@@ -3606,10 +3783,7 @@ impl HomeView {
         }
     }
 
-    /// "Auto-name now": run the agent one-shot title generator for the selected
-    /// session, even when auto-rename-on-start is off (#3039) and over a chosen title.
-    /// Terminal sessions rename via a detached child, structured ones through the daemon.
-    /// Best-effort, not a synchronous rename.
+    /// Ask the daemon to auto-name the selected canonical session.
     fn auto_name_selected(&mut self) -> Option<Action> {
         let Some(id) = self.selected_session.clone() else {
             self.info_dialog = Some(InfoDialog::new(
@@ -3618,103 +3792,57 @@ impl HomeView {
             ));
             return None;
         };
-        let Some((title, structured, profile, tool, command, project_path, sandboxed)) =
-            self.get_instance(&id).map(|inst| {
-                (
-                    inst.title.clone(),
-                    inst.is_structured(),
-                    inst.source_profile.clone(),
-                    inst.tool.clone(),
-                    inst.command.clone(),
-                    inst.project_path.clone(),
-                    inst.is_sandboxed(),
-                )
-            })
-        else {
-            self.info_dialog = Some(InfoDialog::new("Error", "Could not find session data."));
-            return None;
-        };
-
-        if structured {
-            return Some(Action::SmartRenameNow(id));
-        }
-
-        // Preflight the gates the detached child re-applies, so this action stops
-        // reporting "auto-naming" for a session the child will silently drop
-        // (#3159). The child stays the authority; this is feedback and
-        // fork avoidance. `setting_on` and `force` are true because the manual
-        // action runs even when auto-rename-on-start is off (#3039) and over any
-        // title, matching the `--force` the child receives and the web preflight.
-        let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
-            &profile,
-            std::path::Path::new(&project_path),
-        );
-        let cfg =
-            crate::session::smart_rename::resolve_smart_rename_config(&resolved.session, None);
-        if let Err(reason) = crate::session::smart_rename::check_eligible_resolved(
-            true,
-            true,
-            true,
-            &title,
-            &tool,
-            cfg.rename_agent,
-            sandboxed,
-            &command,
-            cfg.overrides,
-        ) {
-            self.info_dialog = Some(InfoDialog::new("Can't Auto-Name", reason.user_message()));
-            return None;
-        }
-
-        // A sandboxed session's one-shot runs inside its container, so a stopped container
-        // means "not now" rather than "never". Only sandboxed sessions are inspected, so
-        // the common path spawns no `docker inspect`.
-        if sandboxed {
-            use crate::containers::Probe;
-            // A failed inspection is not a stopped container: telling the user to start
-            // one that may already be running sends them the wrong way, so the daemon
-            // error is surfaced verbatim.
-            match crate::containers::DockerContainer::from_session_id(&id).probe_running() {
-                Probe::Running => {}
-                Probe::NotRunning => {
-                    self.info_dialog = Some(InfoDialog::new(
-                        "Container Not Running",
-                        "This session's sandbox container isn't running, so its agent can't be asked for a name. Open the session to start it, then try again.",
-                    ));
-                    return None;
-                }
-                Probe::Unknown(e) => {
-                    self.info_dialog = Some(InfoDialog::new(
-                        "Container State Unknown",
-                        &format!(
-                            "Couldn't check this session's sandbox container, so its agent can't be asked for a name: {e}"
-                        ),
-                    ));
-                    return None;
-                }
-            }
-        }
-
-        crate::session::smart_rename::spawn_smart_rename_now(&profile, &id);
-        // Transient status (not a modal), matching the structured path's
-        // feedback so the two on-demand triggers behave the same.
-        Some(Action::SetTransientStatus(format!(
-            "auto-naming \"{title}\"…"
-        )))
+        Some(Action::SmartRenameNow(id))
     }
 
-    fn open_serve(&mut self) {
+    /// R: the Connections hub. Its Web dashboard row reaches [`Self::open_serve`].
+    fn open_connections(&mut self) {
+        let web = self.connections_web_state(None);
+        self.connections_view = Some(crate::tui::dialogs::ConnectionsView::new(
+            self.daemon_attention(),
+            web,
+        ));
+    }
+
+    /// The hub's Web dashboard row. `known` keeps a transport already read, so a refresh
+    /// reads `serve.mode` only until it names one.
+    pub(crate) fn connections_web_state(
+        &self,
+        known: Option<&crate::tui::dialogs::WebState>,
+    ) -> crate::tui::dialogs::WebState {
+        use crate::tui::dialogs::{served_via, WebState};
+        if web_plugin_disabled() {
+            WebState::Disabled
+        } else if !self.serve_running {
+            // A dashboard that came up another way since outranks a stored failure.
+            if matches!(self.dashboard_launch, Some(DashboardLaunch::Failed { .. })) {
+                WebState::Failed
+            } else {
+                WebState::Off
+            }
+        } else if let Some(WebState::On(Some(via))) = known {
+            WebState::On(Some(via))
+        } else {
+            WebState::On(served_via())
+        }
+    }
+
+    pub(crate) fn open_serve(&mut self) {
         if web_plugin_disabled() {
             self.info_dialog = Some(InfoDialog::new(
                 "Web dashboard disabled",
                 "The aoe.web plugin is disabled, so the web dashboard cannot \
                      be served.\n\n\
                      Re-enable it in Settings > Plugins (or run \
-                     `aoe plugin enable aoe.web`), then press R again.",
+                     `aoe plugin enable aoe.web`), then open it again from R.",
             ));
             return;
         }
-        self.serve_view = Some(crate::tui::dialogs::ServeView::new());
+        let launch = self.dashboard_launch.take();
+        self.dashboard_launch = launch
+            .clone()
+            .filter(|launch| matches!(launch, DashboardLaunch::Running { .. }));
+        self.serve_view = Some(launch.map_or_else(ServeView::new, ServeView::for_launch));
     }
 
     pub(super) fn open_settings(&mut self) {
@@ -3752,7 +3880,7 @@ impl HomeView {
                 ) {
                     let msg = match &method {
                         InstallMethod::Nix => {
-                            "Nix install: run `nix run github:agent-of-empires/agent-of-empires` to update".to_string()
+                            "Nix install: run `aoe update` in a terminal for instructions".to_string()
                         }
                         InstallMethod::Cargo => {
                             "Cargo install: run `cargo install --git https://github.com/agent-of-empires/agent-of-empires aoe`".to_string()
@@ -3794,6 +3922,30 @@ impl HomeView {
                 }
             }
         }
+    }
+
+    fn bindings_ctx(&self, live_send: bool) -> bindings::Ctx {
+        bindings::Ctx {
+            view_mode: self.view_mode.clone(),
+            sort_order: self.sort_order,
+            has_search: !self.search_matches.is_empty(),
+            project_group_selected: self.project_group_at_cursor().is_some(),
+            live_send,
+        }
+    }
+
+    /// The jump and preview-scroll actions live-send takes from the agent; every other
+    /// registry chord relays to the pane.
+    fn live_send_action(&self, key: &KeyEvent) -> Option<ActionId> {
+        bindings::resolve(key, self.strict_hotkeys, &self.bindings_ctx(true)).filter(|id| {
+            matches!(
+                id,
+                ActionId::JumpPrevFinished
+                    | ActionId::JumpNextFinished
+                    | ActionId::PreviewScrollUp
+                    | ActionId::PreviewScrollDown
+            )
+        })
     }
 
     fn open_command_palette(&mut self) {
@@ -4146,7 +4298,7 @@ impl HomeView {
             if matches!(inst.status, Status::Deleting | Status::Creating) {
                 return None;
             }
-            if inst.is_structured() {
+            if inst.is_structured() && matches!(self.view_mode, ViewMode::Structured) {
                 // The embedded structured view takes over the preview pane, so leave
                 // live-send first (mirrors `exit_live_send_before_attach`).
                 self.exit_live_send_if_active();
@@ -4157,8 +4309,7 @@ impl HomeView {
             ViewMode::Structured => {
                 // `default_attach_mode = LiveSend` swaps the historical tmux attach for
                 // live-send on Enter / double-click. Terminal view honors the same
-                // setting against the paired terminal pane; Tool view keeps
-                // AttachToolSession.
+                // setting against the displayed auxiliary pane as well.
                 //
                 // Routing through `start_live_send` honors the same-target guard, so a
                 // double-click on the live row does not re-run ensure_pane_ready and
@@ -4197,6 +4348,12 @@ impl HomeView {
                 Some(Action::AttachTerminal(id, terminal_mode))
             }
             ViewMode::Tool(ref tool_name) => {
+                if matches!(
+                    self.default_attach_mode(&id),
+                    Some(crate::session::AttachMode::LiveSend)
+                ) {
+                    return self.start_live_send();
+                }
                 let tool_name = tool_name.clone();
                 self.exit_live_send_before_attach();
                 Some(Action::AttachToolSession(id, tool_name))
@@ -4213,8 +4370,8 @@ impl HomeView {
             if matches!(inst.status, Status::Deleting | Status::Creating) {
                 return None;
             }
-            // Structured rows never reach here: the Tab keybinding refuses them with a
-            // "no tmux pane" toast first.
+            // A structured agent pane is refused by Tab before this helper; its
+            // auxiliary terminal/tool views still have daemon-owned tmux targets.
         }
         match self.view_mode {
             ViewMode::Structured => Some(Action::AttachSession(id)),
@@ -4275,6 +4432,13 @@ impl HomeView {
                 // sync, which every navigation path runs through, so the release doesn't
                 // hinge on a dwell tick firing during a quick hop.
                 self.manual_unread_hold = None;
+                // A selection change is a context change: a pending native
+                // attachment was prepared for the row the user was on.
+                self.cancel_native_attachment();
+                // And the dwell of the row just left is no longer the dwell
+                // being measured, so the timer behind it must not fire for the
+                // new one.
+                self.unread_dwell = None;
             }
         }
     }
@@ -4390,16 +4554,33 @@ impl HomeView {
             self.save_org_group_collapsed();
             return;
         }
-        // Route to the correct profile's GroupTree
-        let profile = self.profile_for_cursor(self.cursor);
-        if let Some(profile) = profile {
-            if let Some(tree) = self.group_trees.get_mut(&profile) {
-                tree.toggle_collapsed(path);
-            }
-        }
-        self.rebuild_flat_items();
-        if let Err(e) = self.save() {
-            tracing::error!(target: "tui.input", "Failed to save group state: {}", e);
+        let result = (|| -> anyhow::Result<()> {
+            let group = self.canonical_group_location(path)?;
+            let collapsed = self
+                .session_feed
+                .applied_snapshot()
+                .as_ref()
+                .and_then(|snapshot| {
+                    snapshot
+                        .contents
+                        .profiles
+                        .iter()
+                        .find(|profile| profile.name == group.profile)
+                })
+                .and_then(|profile| {
+                    profile
+                        .groups
+                        .iter()
+                        .find(|candidate| candidate.path == path)
+                })
+                .is_some_and(|candidate| candidate.collapsed);
+            self.set_group_collapsed(group, !collapsed, NamespaceIntent::Plain)
+        })();
+        if let Err(error) = result {
+            self.info_dialog = Some(InfoDialog::new(
+                "Could Not Collapse Group",
+                &error.to_string(),
+            ));
         }
     }
 
@@ -4766,6 +4947,12 @@ impl HomeView {
                 self.cursor = idx;
                 self.update_selected();
             }
+            // Every menu entry would be refused on the creating stub, so say why
+            // instead of opening a menu that can only fail.
+            if self.is_creating_stub_selected() {
+                self.flash_status("Still creating this session; it has no runtime yet");
+                return true;
+            }
             // Mirror the web sidebar's row-aware copy so a group row reads as "Rename
             // Group / Delete Group".
             // The synthetic Trash / Archived headers are `Item::Group` rows but not user
@@ -4836,14 +5023,23 @@ impl HomeView {
                     super::Item::Session { id, .. } => self.session_switch_view_target(id),
                     super::Item::Group { .. } => None,
                 };
-                ContextMenuDialog::for_session(
+                let update_restart = match &self.flat_items[idx] {
+                    super::Item::Session { id, .. } => self.update_restart_offered(id),
+                    super::Item::Group { .. } => false,
+                };
+                let menu = ContextMenuDialog::for_session(
                     anchor,
                     is_archived,
                     snooze,
                     unread,
                     can_fork,
                     switch_view,
-                )
+                );
+                if update_restart {
+                    menu.with_restart_for_update()
+                } else {
+                    menu
+                }
             });
             return true;
         }
@@ -4902,6 +5098,13 @@ impl HomeView {
     /// new menu action needs to be wired here once, not at each call
     /// site.
     pub(super) fn dispatch_context_menu_action(&mut self, action: ContextMenuAction) {
+        // The creating stub has no actions yet, so opening a menu whose every
+        // entry would refuse it is worse than saying why. Same refusal as
+        // `run_action`, which the menu is the second dispatcher for.
+        if self.is_creating_stub_selected() {
+            self.flash_status("Still creating this session; it has no runtime yet");
+            return;
+        }
         match action {
             ContextMenuAction::Rename => self.open_rename_for_selected(),
             ContextMenuAction::Delete => self.open_delete_for_selected(),
@@ -4909,20 +5112,20 @@ impl HomeView {
                 // The right-click already moved the cursor onto the row, so the
                 // toggle acts on the same session the menu was opened for.
                 if let Err(e) = self.toggle_archive_at_cursor() {
-                    tracing::error!("toggle_archive_at_cursor (context menu) failed: {}", e);
+                    self.info_dialog = Some(InfoDialog::new("Archive not changed", &e.to_string()));
                 }
             }
             ContextMenuAction::ToggleSnooze => {
                 // Same cursor-on-the-clicked-row guarantee as ToggleArchive: snoozing an
                 // active row opens the duration picker, unsnoozing wakes it.
                 if let Err(e) = self.toggle_snooze_at_cursor() {
-                    tracing::error!("toggle_snooze_at_cursor (context menu) failed: {}", e);
+                    self.info_dialog = Some(InfoDialog::new("Snooze not changed", &e.to_string()));
                 }
             }
             ContextMenuAction::ToggleUnread => {
                 // Same cursor-on-the-clicked-row guarantee as ToggleArchive.
                 if let Err(e) = self.toggle_unread_at_cursor() {
-                    tracing::error!("toggle_unread_at_cursor (context menu) failed: {}", e);
+                    self.info_dialog = Some(InfoDialog::new("Unread not changed", &e.to_string()));
                 }
             }
             ContextMenuAction::NewSession => self.open_new_session_dialog(),
@@ -4932,6 +5135,15 @@ impl HomeView {
             ContextMenuAction::NewFromSelection => self.open_new_from_selection(),
             ContextMenuAction::Fork => self.open_fork_from_selection(),
             ContextMenuAction::SwitchView => self.prompt_switch_view_for_selected(),
+            ContextMenuAction::RestartForUpdate => {
+                if let Err(e) = self.restart_selected_for_update() {
+                    tracing::warn!("restart_selected_for_update failed: {}", e);
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Restart Failed",
+                        &format!("Could not restart session: {e}"),
+                    ));
+                }
+            }
             ContextMenuAction::OpenSortPicker => self.show_sort_picker(),
             ContextMenuAction::AddProject => self.open_add_project_for_selected(),
             ContextMenuAction::OpenGroupPicker => self.show_group_picker(),
@@ -5374,12 +5586,18 @@ impl HomeView {
                     return;
                 }
                 if inst.status == Status::Deleting {
-                    let message = format!(
-                        "'{}' is stuck deleting. Force remove it from the session list? \
-                         (the sandbox container is torn down; worktrees and branches will not be cleaned up)",
-                        inst.title
-                    );
-                    self.pending_force_remove_session = Some(session_id.clone());
+                    let expected_generation = self
+                        .session_feed
+                        .applied_session(session_id)
+                        .and_then(|row| row.lifecycle_reservation.as_ref())
+                        .filter(|reservation| reservation.op == LifecycleOperation::Purge)
+                        .and_then(|reservation| std::num::NonZeroU64::new(reservation.generation));
+                    let Some(generation) = expected_generation else {
+                        self.info_dialog = Some(InfoDialog::new("Cannot Forget Purge", "No canonical purge owner is available. Wait for current runtime state and reopen this action."));
+                        return;
+                    };
+                    let message = format!("'{}' has a pending purge. Forget this exact purge owner? Runtime cleanup will be scheduled; worktrees and branches are not cleaned up by this action.", inst.title);
+                    self.pending_force_remove_session = Some((session_id.clone(), generation));
                     self.confirm_dialog = Some(ConfirmDialog::new(
                         "Force Remove",
                         &message,
@@ -6068,9 +6286,8 @@ impl HomeView {
         if matches!(inst.status, Status::Creating | Status::Deleting) {
             return None;
         }
-        // Acp-mode sessions are not tmux-backed, so live-send has no target: no-op rather
-        // than enqueue an `Action::EnterLiveSend` that would fail downstream.
-        if inst.is_structured() {
+        // A structured agent has no tmux target, but its auxiliary terminal/tool panes do.
+        if inst.is_structured() && matches!(self.view_mode, ViewMode::Structured) {
             return None;
         }
         // Pick the target from the pane being previewed: Structured view to the agent
@@ -6134,14 +6351,14 @@ impl HomeView {
     /// and drops the worker (which closes its channel, exiting the
     /// thread cleanly on the next iteration).
     ///
-    /// Before dispatching we re-verify that the target session still
-    /// exists at the same tmux name as it had at entry time. If a peer
-    /// process deleted the session or a rename diverged the name from
-    /// what the worker is targeting, the user would otherwise type
-    /// into the void with only a `tracing::warn!` for company. Auto-
-    /// exit + info dialog instead.
+    /// Forwarding also stops when the daemon no longer grants native interaction: the
+    /// runtime that owns the pane is gone, so the keystroke has nowhere to go.
     fn handle_live_send_key(&mut self, key: KeyEvent) -> Option<Action> {
         let state = self.live_send.clone()?;
+        if !self.session_feed.native_interaction_available() {
+            self.teardown_live_send();
+            return None;
+        }
 
         // Leader menu: a prior keystroke matched the configured leader
         // (tmux-style prefix, default Ctrl+B), so this key picks a
@@ -6194,24 +6411,10 @@ impl HomeView {
         // the terminal-emulator convention where shift+page works on the outer scrollback.
         // Bare PageUp/PageDown still goes to the agent so agents that page their own UI
         // keep working.
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
-        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-        if shift && !ctrl && !alt {
-            const PAGE_STEP: u16 = 10;
-            match key.code {
-                KeyCode::PageUp => {
-                    self.preview_scroll_offset =
-                        self.preview_scroll_offset.saturating_add(PAGE_STEP);
-                    return None;
-                }
-                KeyCode::PageDown => {
-                    self.preview_scroll_offset =
-                        self.preview_scroll_offset.saturating_sub(PAGE_STEP);
-                    return None;
-                }
-                _ => {}
-            }
+        if let Some(id @ (ActionId::PreviewScrollUp | ActionId::PreviewScrollDown)) =
+            self.live_send_action(&key)
+        {
+            return self.run_action(id, None);
         }
 
         // The exit chord is checked before drift: exiting is always safe, and a user
@@ -6308,7 +6511,7 @@ impl HomeView {
     /// `exit_live_send_and_restore_sizing`; the lost-lock exit calls this directly,
     /// because the surface that took over has already sized the window and re-asserting
     /// `window-size latest` would stomp it.
-    fn teardown_live_send(&mut self) {
+    pub(in crate::tui) fn teardown_live_send(&mut self) {
         let live_session_id = self.live_send.take().map(|state| state.session_id);
         self.live_send_worker = None;
         // Leave the capture worker running: the same pane is still previewed, just at the
@@ -6334,17 +6537,13 @@ impl HomeView {
         self.clear_preview_selection();
     }
 
-    /// `Some(reason)` when the live-send target drifted out from under us since entry:
-    /// the instance row was deleted, the title was renamed and the tmux session with it
-    /// (a retitle whose tmux rename did not land is not drift, since `resolve_name` still
-    /// resolves onto the worker's pane), or the tmux session is gone while our row says
-    /// otherwise. The last check reads `session_exists_from_cache`, a hashmap probe per
-    /// keystroke; a `None` entry claims no drift, leaving the row and name checks as the
-    /// safety net.
-    ///
-    /// The caller shows the message verbatim, so phrase it as a user-facing sentence.
-    fn live_send_drift_reason(&self, state: &live_send::LiveSendState) -> Option<&'static str> {
-        let Some(inst) = self.get_instance(&state.session_id) else {
+    /// Drift established by row metadata alone; a presentation reload must not probe
+    /// pane liveness or retarget an otherwise unchanged live-send session.
+    fn live_send_projection_drift_reason(
+        instance: Option<&crate::session::Instance>,
+        state: &live_send::LiveSendState,
+    ) -> Option<&'static str> {
+        let Some(inst) = instance else {
             return Some("Session was deleted while live mode was active.");
         };
         let current_name = match &state.target {
@@ -6366,10 +6565,67 @@ impl HomeView {
         if current_name != state.tmux_name {
             return Some("Session was renamed while live mode was active.");
         }
-        if crate::tmux::session_exists_from_cache(&state.tmux_name) == Some(false) {
+        None
+    }
+
+    /// `Some(reason)` when the live-send target drifted out from under us since entry:
+    /// the instance row was deleted, the title was renamed and the tmux session with it
+    /// (a retitle whose tmux rename did not land is not drift, since `resolve_name` still
+    /// resolves onto the worker's pane), or the tmux session is gone while our row says
+    /// otherwise. Presence is then probed on the target itself: an agent pane through
+    /// tmux, an auxiliary or tool pane through the snapshot's presence, so a target that
+    /// died without ever having opened a session is caught too.
+    ///
+    /// The caller shows the message verbatim, so phrase it as a user-facing sentence.
+    fn live_send_drift_reason(&self, state: &live_send::LiveSendState) -> Option<&'static str> {
+        let instance = self.get_instance(&state.session_id);
+        if let Some(reason) = Self::live_send_projection_drift_reason(instance, state) {
+            return Some(reason);
+        }
+        let inst = instance?;
+        use crate::session::{AuxiliaryTarget, PanePresence};
+        let gone = match &state.target {
+            live_send::LiveSendTarget::Agent => {
+                // The daemon may have created the pane after this process's last scan, so a
+                // cached miss is not evidence of death (the asymmetry documented on
+                // `session_exists`). Confirm with a live probe; Unknown stays put.
+                !crate::tmux::session_exists(&state.tmux_name)
+                    && crate::tmux::probe_session_existence(&state.tmux_name)
+                        == crate::tmux::SessionExistence::Absent
+            }
+            live_send::LiveSendTarget::Terminal => matches!(
+                inst.auxiliary_presence(&AuxiliaryTarget::Host { index: 0 }),
+                PanePresence::Absent | PanePresence::Dead
+            ),
+            live_send::LiveSendTarget::ContainerTerminal => matches!(
+                inst.auxiliary_presence(&AuxiliaryTarget::Container { index: 0 }),
+                PanePresence::Absent | PanePresence::Dead
+            ),
+            live_send::LiveSendTarget::Tool(name) => matches!(
+                inst.tool_presence(name),
+                PanePresence::Absent | PanePresence::Dead
+            ),
+        };
+        if gone {
             return Some("tmux pane went away while live mode was active.");
         }
         None
+    }
+
+    /// Reconcile deletion/rename after a metadata rebuild. Runtime callers retain the
+    /// full pane-presence check in end_live_send_on_drift.
+    pub(super) fn end_live_send_on_projection_drift(
+        &mut self,
+        state: &live_send::LiveSendState,
+    ) -> bool {
+        let Some(reason) =
+            Self::live_send_projection_drift_reason(self.get_instance(&state.session_id), state)
+        else {
+            return false;
+        };
+        self.exit_live_send_and_restore_sizing(state);
+        self.info_dialog = Some(InfoDialog::new("Live send ended", reason));
+        true
     }
 
     pub(super) fn end_live_send_on_drift(&mut self, state: &live_send::LiveSendState) -> bool {
@@ -6865,8 +7121,19 @@ impl HomeView {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(target: "tui.input", "Failed to check repo trust: {}", e);
-                let fallback = repo_config::ResolvedHooks::global(&data.profile);
-                return self.create_session_with_hooks(data, fallback);
+                return self.create_session_with_hooks(data, RepoTrustDecision::Refuse);
+            }
+        };
+
+        // The daemon recomputes this before it approves anything, so it pins the exact
+        // state the user is answering for; a fingerprint we cannot build can only refuse.
+        let fingerprint = match crate::session::config::profile_config::resolve_config(
+            &data.profile,
+        ) {
+            Ok(config) => repo_config::creation_trust_fingerprint(&config.hooks, &trust),
+            Err(e) => {
+                tracing::warn!(target: "tui.input", "Failed to resolve trust review base: {}", e);
+                return self.create_session_with_hooks(data, RepoTrustDecision::Refuse);
             }
         };
 
@@ -6904,7 +7171,16 @@ impl HomeView {
         };
 
         if !trust.needs_prompt() {
-            return self.create_session_with_hooks(data, hooks_on_trust);
+            // Already-trusted repository hooks are approved explicitly so the daemon runs
+            // them; an absent repository surface approves nothing but still pins the
+            // fingerprint the daemon validated against.
+            let decision = match &trust.hooks {
+                TrustSurface::Trusted(_) => RepoTrustDecision::Approve(Some(fingerprint)),
+                TrustSurface::NeedsTrust { .. } | TrustSurface::Absent => {
+                    RepoTrustDecision::Unpinned(Some(fingerprint))
+                }
+            };
+            return self.create_session_with_hooks(data, decision);
         }
 
         use crate::tui::dialogs::RepoTrustDialog;
@@ -6923,39 +7199,74 @@ impl HomeView {
             data.path.clone(),
         ));
         self.pending_repo_trust_data = Some(data);
+        self.pending_repo_trust_fingerprint = Some(fingerprint);
         None
     }
 
-    /// Create a session with optional hooks, delegating to the background
-    /// `CreationPoller` when hooks are present, the session is sandboxed, or a worktree
-    /// branch is requested, so a slow `post-checkout` can't freeze the TUI.
+    /// Hand the trust answer to the daemon, which owns session creation: this
+    /// process only submits the request and lets the runtime report the id.
     pub(super) fn create_session_with_hooks(
         &mut self,
         data: NewSessionData,
-        hooks: Option<repo_config::ResolvedHooks>,
+        decision: RepoTrustDecision,
     ) -> Option<Action> {
-        let has_hooks = hooks
-            .as_ref()
-            .is_some_and(|h| !h.hooks().on_create.is_empty() || !h.hooks().on_launch.is_empty());
-        let has_worktree = data.worktree_enabled;
+        let (trust_hooks, trust_review) = decision.into_request();
+        self.request_creation(data, trust_hooks, trust_review);
+        None
+    }
 
-        if data.sandbox || has_hooks || has_worktree {
-            self.request_creation(data, hooks);
-            return None;
+    /// A confirm the hotkey that opened it also accepts, so the deliberate gesture is two
+    /// taps of one key while a stray keystroke is harmless. The key is read off the binding
+    /// table so the hint can't drift from it; a chord that isn't a bare character falls
+    /// back to the dialog's own y/Enter.
+    fn confirm_by_repeating(
+        &self,
+        opener: ActionId,
+        title: &str,
+        message: &str,
+        action: &str,
+    ) -> ConfirmDialog {
+        let label = bindings::label(opener, self.strict_hotkeys);
+        let mut chars = label.chars();
+        let accept_char = match (chars.next(), chars.next()) {
+            (Some(c), None) => Some(c),
+            _ => None,
+        };
+        let hint = match accept_char {
+            Some(_) => format!("Press {label} again to confirm, Esc to cancel."),
+            None => "Press y to confirm, Esc to cancel.".to_string(),
+        };
+        let dialog = ConfirmDialog::new(title, &format!("{message}\n{hint}"), action);
+        match accept_char {
+            Some(c) => dialog.confirmed_by(c),
+            None => dialog,
         }
+    }
+}
 
-        match self.create_session(data) {
-            Ok(session_id) => {
-                self.new_dialog = None;
-                Some(Action::AttachAfterCreate(session_id))
-            }
-            Err(e) => {
-                tracing::error!(target: "tui.input", "Failed to create session: {}", e);
-                if let Some(dialog) = &mut self.new_dialog {
-                    dialog.set_error(e.to_string());
-                }
-                None
-            }
+/// The user's repository-trust answer, forwarded to the daemon that owns the approval.
+#[derive(Debug, Clone)]
+pub(super) enum RepoTrustDecision {
+    /// Approve the hooks the fingerprint pins; the daemon writes the hashes itself.
+    Approve(Option<crate::daemon::CreationTrustFingerprint>),
+    /// Approve nothing, so repo hooks stay gated and the global set runs.
+    Refuse,
+    /// No prompt was needed: no approval, but the reviewed fingerprint still travels.
+    Unpinned(Option<crate::daemon::CreationTrustFingerprint>),
+}
+
+impl RepoTrustDecision {
+    /// The `(trust_hooks, trust_review)` pair the daemon creation request carries.
+    fn into_request(
+        self,
+    ) -> (
+        Option<bool>,
+        Option<crate::daemon::CreationTrustFingerprint>,
+    ) {
+        match self {
+            Self::Approve(fingerprint) => (Some(true), fingerprint),
+            Self::Refuse => (Some(false), None),
+            Self::Unpinned(fingerprint) => (None, fingerprint),
         }
     }
 }
@@ -7118,164 +7429,7 @@ mod tests {
     /// alone, so a pointer over a neighbouring pane must not map against the full rect,
     /// which reported a column past pane 0's right edge. Also round-trips a painted
     /// composite cursor cell through mouse mapping, pinning the bottom-follow clipping.
-    #[test]
-    fn composited_preview_maps_the_mouse_into_pane_zero_only() {
-        use ratatui::layout::Rect;
-        // An 80x24 preview showing a window split at column 40.
-        let pane = Rect::new(0, 0, 80, 24);
-        let view = view_of(pane, 24);
-        let mut split = cursor_for(true, true, true);
-        split.mouse_all = true;
-        split.composite_pane0 = Some(crate::tmux::PaneGeom {
-            left: 0,
-            top: 0,
-            width: 40,
-            height: 24,
-        });
-
-        // Inside pane 0: maps as before, 1-based.
-        assert_eq!(
-            hover_forward_bytes(&split, view, 10, 5).as_deref(),
-            Some(b"\x1b[<35;11;6M".as_slice())
-        );
-        // Over the neighbour: dropped, not clamped to pane 0's border, which
-        // would synthesise a hover on a cell the pointer never touched.
-        assert_eq!(hover_forward_bytes(&split, view, 60, 5), None);
-        assert_eq!(wheel_forward_key(&split, true, view, 60, 5), None);
-        // The last column of pane 0 is still inside it; the first past it is not.
-        assert!(hover_forward_bytes(&split, view, 39, 5).is_some());
-        assert_eq!(hover_forward_bytes(&split, view, 40, 5), None);
-
-        // Pane 0 is projected through the painted composite slice, so a click on the
-        // painted cursor reaches the cursor's 1-based app cell, the first painted row of
-        // pane 0 reports its clipped app row, and a cell beside pane 0 is dropped.
-        // (name, window height, scroll offset, pane 0, cursor, (first painted output row,
-        // its app row), a cell outside pane 0)
-        let output = Rect::new(2, 3, 80, 24);
-        let geom = |left, top, width, height| crate::tmux::PaneGeom {
-            left,
-            top,
-            width,
-            height,
-        };
-        for (name, window_height, offset, pane0, (x, y), (first_row, app_row), outside) in [
-            // Side by side under `pane-border-status top`: bottom-follow clips the border
-            // row, so `top == first_line` cancels and pane 0 starts at the output origin.
-            (
-                "side by side",
-                25,
-                0,
-                geom(0, 1, 40, 24),
-                (10, 4),
-                (0, 1),
-                (42, 5),
-            ),
-            // Stacked: the split reads as no chrome, so the border row stays visible and
-            // pane 0 starts one row down.
-            (
-                "stacked",
-                24,
-                0,
-                geom(0, 1, 80, 11),
-                (5, 3),
-                (1, 1),
-                (10, 3),
-            ),
-            // Rotated or swapped: pane 0 sits right of another pane.
-            (
-                "rotated",
-                24,
-                0,
-                geom(40, 0, 40, 24),
-                (10, 4),
-                (0, 1),
-                (41, 5),
-            ),
-            // A window taller than the preview (another client pins its size):
-            // bottom-follow clips six of pane 0's rows off the top.
-            (
-                "clipped top",
-                30,
-                0,
-                geom(0, 0, 40, 30),
-                (10, 10),
-                (0, 7),
-                (42, 5),
-            ),
-            // The same window scrolled locally to its top: pane 0 paints from row 1.
-            (
-                "scrolled to top",
-                30,
-                6,
-                geom(0, 0, 40, 30),
-                (10, 4),
-                (0, 1),
-                (42, 5),
-            ),
-        ] {
-            let mut cursor = cursor_for(true, true, true);
-            cursor.mouse_all = true;
-            cursor.x = x;
-            cursor.y = y;
-            cursor.pane_height = window_height;
-            cursor.composite_pane0 = Some(pane0);
-            let view = scrolled_view(output, usize::from(window_height), offset);
-            let (col, row) = (output.x + pane0.left + 1, output.y + first_row);
-            let target = mouse_target(&cursor, view, col, row)
-                .unwrap_or_else(|| panic!("{name}: first painted row is inside pane 0"));
-            assert_eq!(
-                target.cell(col, row).1,
-                app_row,
-                "{name}: the first painted row of pane 0 reports its app row"
-            );
-            let painted = crate::tui::home::render::map_live_preview_cursor(view, cursor)
-                .expect("visible pane cursor");
-            let target = mouse_target(&cursor, view, painted.x, painted.y)
-                .unwrap_or_else(|| panic!("{name}: painted cursor is inside pane 0"));
-            assert_eq!(
-                target.cell(painted.x, painted.y),
-                (x + 1, y + 1),
-                "{name}: clicking the painted cursor must report the same app cell"
-            );
-            assert_eq!(
-                mouse_target(&cursor, view, outside.0, outside.1),
-                None,
-                "{name}: a cell outside pane 0 is dropped"
-            );
-        }
-
-        // A no-mouse full-screen agent gets no page key from a wheel aimed at
-        // the neighbour either, but keeps it over pane 0.
-        let mut no_mouse = cursor_for(true, false, false);
-        no_mouse.composite_pane0 = Some(crate::tmux::PaneGeom {
-            left: 0,
-            top: 0,
-            width: 40,
-            height: 24,
-        });
-        assert_eq!(wheel_forward_key(&no_mouse, true, view, 60, 5), None);
-        assert!(wheel_forward_key(&no_mouse, true, view, 10, 5).is_some());
-
-        // Unsplit is unchanged: no composite extent, so the whole rect maps.
-        let unsplit = {
-            let mut c = cursor_for(true, true, true);
-            c.mouse_all = true;
-            c
-        };
-        assert_eq!(
-            hover_forward_bytes(&unsplit, view, 60, 5).as_deref(),
-            Some(b"\x1b[<35;61;6M".as_slice())
-        );
-        // An unsplit cell outside the rect must still clamp, not drop: the press is gated
-        // by `hit_preview` and these helpers have always relied on `map_pane_cell`, so the
-        // pane-0 containment test must not leak into the single-pane path.
-        assert_eq!(
-            hover_forward_bytes(&unsplit, view, 999, 999).as_deref(),
-            Some(b"\x1b[<35;80;24M".as_slice()),
-            "unsplit coordinates clamp to the rect, they do not get dropped"
-        );
-    }
-
+    ///
     /// A pane 0 extent larger than the preview rect (an attached client keeping its own
     /// size) must clamp to the rect rather than admit cells outside it.
     #[test]
@@ -7405,6 +7559,7 @@ mod tests {
             sandbox_image: "ubuntu:latest".to_string(),
             yolo_mode: false,
             extra_env: Vec::new(),
+            hook_env: Vec::new(),
             extra_args: String::new(),
             command_override: String::new(),
             scratch: false,

@@ -7,6 +7,7 @@ import { useAcpPrefs } from "../../lib/acpPrefs";
 import { useClearAliases } from "../../lib/agentProfileContext";
 import { isClearAlias } from "../../lib/agentProfiles";
 import { isQueuedPromptLong, queuedStripLayout } from "./queuedPromptsLayout";
+import { Tooltip } from "../Tooltip";
 
 const AMBER_STRIP = "border-amber-900/40 bg-amber-950/20";
 const AMBER_ROW = "flex items-start gap-2 rounded-lg border border-amber-700/30 bg-amber-950/15 px-2.5 py-1.5";
@@ -252,6 +253,12 @@ interface QueuedPromptsStripProps {
   sendNowInterrupts: boolean;
   /** The drain cannot fire yet (disconnected, stopped, restarting, cold-starting). */
   pendingResume: boolean;
+  /** For a Session that has never started: the Agent it waits for. */
+  waitingFor?: string | null;
+  /** The Worker is running; only the connection is down. */
+  connecting?: boolean;
+  /** The Session's Agent, by display name, for the header's tooltip. */
+  agent: string;
 }
 
 export function QueuedPromptsStrip({
@@ -263,6 +270,9 @@ export function QueuedPromptsStrip({
   canSendNow,
   sendNowInterrupts,
   pendingResume,
+  waitingFor = null,
+  connecting = false,
+  agent,
 }: QueuedPromptsStripProps) {
   const isMobile = useIsCoarsePointer();
   const [expanded, setExpanded] = useState(false);
@@ -272,16 +282,37 @@ export function QueuedPromptsStrip({
   const visible = queued.slice(0, layout.visibleCount);
   return (
     <Strip tone="border-surface-800 bg-surface-900/60">
-      <div className="flex items-center justify-between pb-1.5 text-[11px] uppercase tracking-wider text-text-dim">
-        <span
-          className="inline-flex items-center gap-1"
-          title="Queued in this browser. Sends when the agent is free, even from another chat, as long as a dashboard tab stays open. Three closed chats deliver in the background at a time; the rest wait for a slot or for you to open them. Your other devices do not see it."
+      <div className="flex items-center justify-between gap-2 pb-1.5 text-[11px] uppercase tracking-wider text-text-dim">
+        {/* The Daemon holds the queue, except rows it hasn't confirmed yet: those live only here. */}
+        <Tooltip
+          multiline
+          text={
+            queued.some((q) => q.pending)
+              ? "A message isn't sent yet. This browser sends it when you're back online or reopen this chat."
+              : `Sends when ${agent} is free, even if you close this tab.`
+          }
         >
-          <Clock className="h-3 w-3" />
-          {pendingResume ? `Pending until session resumes (${queued.length})` : `Queued (${queued.length})`}
-        </span>
+          <span
+            tabIndex={0}
+            data-testid="queued-strip-header"
+            className="flex min-w-0 items-center gap-1 wrap-anywhere rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
+          >
+            <Clock className="h-3 w-3 shrink-0" />
+            {pendingResume
+              ? waitingFor
+                ? `Pending until ${waitingFor} is ready (${queued.length})`
+                : connecting
+                  ? `${queued.some((q) => q.pending) ? "Pending until connected" : "Queued"} (${queued.length})`
+                  : `Pending until session resumes (${queued.length})`
+              : `${queued.some((q) => q.pending) ? "Queuing" : "Queued"} (${queued.length})`}
+          </span>
+        </Tooltip>
         {queued.length > 1 && (
-          <button type="button" onClick={onClear} className="text-text-dim hover:text-text-secondary transition-colors">
+          <button
+            type="button"
+            onClick={onClear}
+            className="shrink-0 text-text-dim hover:text-text-secondary transition-colors"
+          >
             Clear all
           </button>
         )}

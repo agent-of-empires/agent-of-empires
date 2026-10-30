@@ -45,7 +45,7 @@ fn apply_poller_repair_if_lifecycle_unchanged(
         && live.omp_capture_generation == baseline.2
         && live.tool == baseline.0.tool
     {
-        live.poller_repair = backoff.clone();
+        live.capture_poller.set_repair(backoff.clone());
     }
 }
 
@@ -57,16 +57,13 @@ fn apply_poller_runtime_if_unchanged(
     if live.tool == repaired.tool
         && live.active_execution == repaired.active_execution
         && live.omp_capture_generation == repaired.omp_capture_generation
-        && live.session_id_poller_retry_after == baseline.3
+        && live.capture_poller.retry_after() == baseline.3
         && live.capture_started_at == baseline.4
         && live.lifecycle_generation == baseline.5
         && live.status == baseline.6
-        && !live.session_id_poller_is_running()
+        && !live.capture_poller.is_running()
     {
-        live.session_id_poller_retry_after = repaired.session_id_poller_retry_after;
-        if repaired.session_id_poller_is_running() {
-            live.session_id_poller = repaired.session_id_poller.clone();
-        }
+        live.capture_poller.adopt_repaired(&repaired.capture_poller);
     }
 }
 
@@ -97,7 +94,7 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
                         inst.conversation_state(),
                         inst.resume_probe_failed_sid.clone(),
                         inst.omp_capture_generation.clone(),
-                        inst.session_id_poller_retry_after,
+                        inst.capture_poller.retry_after(),
                         inst.capture_started_at,
                         inst.lifecycle_generation,
                         inst.status,
@@ -124,8 +121,8 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
         let runtime_changed: std::collections::HashSet<String> = snapshot
             .iter_mut()
             .filter_map(|inst| {
-                let retry_before = inst.session_id_poller_retry_after;
-                let started = inst.repair_session_id_poller_if_needed(&live);
+                let retry_before = inst.capture_poller.retry_after();
+                let started = inst.reconcile_capture_poller(&live);
                 let generation_before = inst.lifecycle_generation;
                 if inst.repair_finished_execution_identity(&live, &contended, repair_now) {
                     outcome.applied.push(inst.id.clone());
@@ -133,7 +130,7 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
                 if inst.lifecycle_generation != generation_before {
                     outcome.lifecycle_advanced.push(inst.id.clone());
                 }
-                (started || inst.session_id_poller_retry_after != retry_before)
+                (started || inst.capture_poller.retry_after() != retry_before)
                     .then(|| inst.id.clone())
             })
             .collect();
@@ -195,7 +192,7 @@ fn repair_backoffs(
 ) -> std::collections::HashMap<String, crate::session::poller::PollerRepairBackoff> {
     instances
         .iter()
-        .map(|inst| (inst.id.clone(), inst.poller_repair.clone()))
+        .map(|inst| (inst.id.clone(), inst.capture_poller.repair().clone()))
         .collect()
 }
 
@@ -207,9 +204,382 @@ fn changed_repair_backoffs(
 ) -> std::collections::HashMap<String, crate::session::poller::PollerRepairBackoff> {
     after
         .iter()
-        .filter(|inst| before.get(&inst.id) != Some(&inst.poller_repair))
-        .map(|inst| (inst.id.clone(), inst.poller_repair.clone()))
+        .filter(|inst| before.get(&inst.id) != Some(inst.capture_poller.repair()))
+        .map(|inst| (inst.id.clone(), inst.capture_poller.repair().clone()))
         .collect()
+}
+
+#[cfg(test)]
+mod migrated_tui_identity_tests {
+    use crate::server::{test_support, AppState};
+    use crate::session::test_support::{isolate_app_dir_at, AppDirGuard};
+    use crate::session::{GroupTree, Instance, Storage};
+    use serial_test::serial;
+    use tempfile::TempDir;
+    fn setup_test_home(temp: &TempDir) -> AppDirGuard {
+        isolate_app_dir_at(temp.path())
+    }
+    use crate::session::poller::SessionPoller;
+    use crate::session::{ResumeIntent, View};
+    use std::sync::{Arc, Mutex};
+
+    const NEW_SID: &str = "019342ab-1111-7aaa-8bbb-cccdddeeefff";
+
+    struct TmuxSession(String);
+
+    impl TmuxSession {
+        fn create(id: &str, title: &str) -> Self {
+            Self::create_named(crate::tmux::Session::generate_name(id, title))
+        }
+
+        fn create_terminal(id: &str, title: &str) -> Self {
+            Self::create_named(crate::tmux::TerminalSession::generate_name(id, title))
+        }
+
+        fn create_named(name: String) -> Self {
+            let _ = crate::tmux::tmux_command()
+                .args(["kill-session", "-t", &name])
+                .output();
+            let status = crate::tmux::tmux_command()
+                .args(["new-session", "-d", "-s", &name])
+                .status()
+                .expect("failed to spawn tmux");
+            assert!(status.success(), "tmux new-session failed for {}", name);
+            crate::tmux::refresh_session_cache();
+            Self(name)
+        }
+        fn name(&self) -> &str {
+            &self.0
+        }
+    }
+
+    impl Drop for TmuxSession {
+        fn drop(&mut self) {
+            let _ = crate::tmux::tmux_command()
+                .args(["kill-session", "-t", &self.0])
+                .output();
+            crate::tmux::refresh_session_cache();
+        }
+    }
+
+    fn skip_if_no_tmux() -> bool {
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
+            eprintln!("Skipping: tmux not available");
+            return true;
+        }
+        false
+    }
+
+    fn captured_env(name: &str) -> Option<String> {
+        crate::tmux::env::get_hidden_env(name, crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY)
+    }
+
+    async fn build_state_with_inst(profile: &str, inst: &Instance) -> Arc<AppState> {
+        let storage = Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|rows, groups| {
+                *rows = vec![inst.clone()];
+                *groups =
+                    GroupTree::new_with_groups(std::slice::from_ref(inst), &[]).get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+        let state = test_support::build_test_app_state(vec![inst.clone()]);
+        test_support::refresh_canonical_metadata_for_test(&state).await;
+        state
+    }
+    async fn attach_poller_with_update(state: &Arc<AppState>, id: &str, sid: &str) {
+        let mut rows = state.instances.write().await;
+        test_support::attach_session_id_update_for_test(
+            rows.iter_mut().find(|row| row.id == id).unwrap(),
+            sid,
+        );
+    }
+    async fn memory_sid(state: &Arc<AppState>, id: &str) -> Option<String> {
+        state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == id)
+            .unwrap()
+            .agent_session_id
+            .clone()
+    }
+    async fn stop_pollers(state: &Arc<AppState>) {
+        for row in state.instances.read().await.iter() {
+            if let Some(poller) = row.capture_poller.handle() {
+                poller.lock().unwrap_or_else(|p| p.into_inner()).stop();
+            }
+        }
+    }
+    fn fresh_instance(profile: &str, title: &str) -> Instance {
+        let mut inst = Instance::new(title, "/tmp/x");
+        inst.tool = "claude".to_string();
+        inst.source_profile = profile.to_string();
+        inst.agent_session_id = None;
+        inst.resume_intent = ResumeIntent::Default;
+        inst
+    }
+
+    /// An applied CAS publishes the new sid to whichever pane the row runs in: the agent
+    /// session by default, the paired terminal for terminal rows, and nowhere without a pane.
+    #[tokio::test]
+    #[serial]
+    async fn daemon_identity_publishes_after_cas() {
+        if skip_if_no_tmux() {
+            return;
+        }
+        // (profile, terminal row, create a pane)
+        for (profile, terminal, with_pane) in [
+            ("apply-publish", false, true),
+            ("apply-terminal-publish", true, true),
+            ("apply-pane-dead", false, false),
+        ] {
+            let temp = TempDir::new().unwrap();
+            let _guard = setup_test_home(&temp);
+            let mut inst = fresh_instance(profile, profile);
+            if terminal {
+                inst.terminal_info = Some(crate::session::TerminalInfo { created: true });
+            }
+            let state = build_state_with_inst(profile, &inst).await;
+            let agent_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+            let tmux = with_pane.then(|| {
+                if terminal {
+                    TmuxSession::create_terminal(&inst.id, &inst.title)
+                } else {
+                    TmuxSession::create(&inst.id, &inst.title)
+                }
+            });
+
+            attach_poller_with_update(&state, &inst.id, NEW_SID).await;
+
+            test_support::drain_session_id_updates_for_test(&state).await;
+            let mem_sid = memory_sid(&state, &inst.id).await;
+            assert_eq!(
+                Storage::new_unwatched(profile).unwrap().load().unwrap()[0]
+                    .agent_session_id
+                    .as_deref(),
+                Some(NEW_SID)
+            );
+            assert_eq!(mem_sid.as_deref(), Some(NEW_SID), "{profile}");
+            match &tmux {
+                Some(tmux) => {
+                    assert_eq!(
+                        captured_env(tmux.name()).as_deref(),
+                        Some(NEW_SID),
+                        "{profile}"
+                    );
+                    if terminal {
+                        assert!(captured_env(&agent_name).is_none(), "{profile}");
+                    }
+                }
+                None => assert!(
+                    captured_env(&agent_name).is_none(),
+                    "{profile}: no tmux session means no publish target"
+                ),
+            }
+            stop_pollers(&state).await;
+        }
+    }
+
+    /// A sid filtered before the CAS (retroactively excluded or invalid) stays out of memory,
+    /// and the pane env converges on the disk-backed mirror (None) rather than the stale value.
+    #[tokio::test]
+    #[serial]
+    async fn daemon_identity_filtered_sid_clears_env() {
+        if skip_if_no_tmux() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let _guard = setup_test_home(&temp);
+
+        // (profile, sid the poller reports, exclude it retroactively)
+        for (profile, sid, exclude) in [
+            ("apply-excludes", NEW_SID, true),
+            ("apply-invalid", "bad sid!", false),
+        ] {
+            let inst = fresh_instance(profile, profile);
+            let state = build_state_with_inst(profile, &inst).await;
+            if exclude {
+                if let Some(i) = state
+                    .instances
+                    .write()
+                    .await
+                    .iter_mut()
+                    .find(|row| row.id == inst.id)
+                {
+                    i.retroactive_capture_excludes.insert(
+                        crate::session::ConversationBinding::unknown(sid.to_string()),
+                    );
+                }
+            }
+
+            let tmux = TmuxSession::create(&inst.id, &inst.title);
+            crate::tmux::env::set_hidden_env(
+                tmux.name(),
+                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+                "stale-untouched",
+            )
+            .unwrap();
+
+            attach_poller_with_update(&state, &inst.id, sid).await;
+
+            let before =
+                std::fs::read(Storage::new_unwatched(profile).unwrap().sessions_path()).unwrap();
+            test_support::drain_session_id_updates_for_test(&state).await;
+            assert_eq!(
+                std::fs::read(Storage::new_unwatched(profile).unwrap().sessions_path()).unwrap(),
+                before
+            );
+            let mem_sid = memory_sid(&state, &inst.id).await;
+            assert!(mem_sid.is_none(), "{profile}: filtered sid entered memory");
+            assert!(
+                captured_env(tmux.name()).is_none(),
+                "{profile}: env must converge on disk (None)"
+            );
+            stop_pollers(&state).await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn daemon_identity_skipped_publishes_disk_value() {
+        if skip_if_no_tmux() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let _guard = setup_test_home(&temp);
+
+        let profile = "apply-skipped";
+        let peer_sid = "019342aa-3333-7eee-8fff-aaaabbbbcccc";
+        let other_peer = "019342bb-4444-7fff-8000-111122223333";
+
+        let mut inst = fresh_instance(profile, "ase");
+        inst.agent_session_id = Some(peer_sid.to_string());
+        let state = build_state_with_inst(profile, &inst).await;
+
+        let storage = Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|i, _g| {
+                i[0].agent_session_id = Some(other_peer.to_string());
+                Ok(())
+            })
+            .unwrap();
+
+        let tmux = TmuxSession::create(&inst.id, &inst.title);
+        crate::tmux::env::set_hidden_env(
+            tmux.name(),
+            crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+            NEW_SID,
+        )
+        .unwrap();
+
+        attach_poller_with_update(&state, &inst.id, NEW_SID).await;
+
+        test_support::drain_session_id_updates_for_test(&state).await;
+        let mem_sid = memory_sid(&state, &inst.id).await;
+        assert_eq!(
+            Storage::new_unwatched(profile).unwrap().load().unwrap()[0]
+                .agent_session_id
+                .as_deref(),
+            Some(other_peer)
+        );
+        assert_eq!(
+            mem_sid.as_deref(),
+            Some(other_peer),
+            "memory rolls back to disk after CAS skip"
+        );
+        assert_eq!(
+            captured_env(tmux.name()).as_deref(),
+            Some(other_peer),
+            "env converges from poller's pre-published NEW_SID to disk's other_peer"
+        );
+        stop_pollers(&state).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn daemon_identity_repair_skips_structured_and_repairs_live_terminal() {
+        if skip_if_no_tmux() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let _guard = setup_test_home(&temp);
+
+        let profile = "apply-poller-repair";
+        let terminal = fresh_instance(profile, "repair-terminal");
+        let mut structured = fresh_instance(profile, "repair-structured");
+        structured.view = View::Structured;
+        let state = build_state_with_inst(profile, &terminal).await;
+        Storage::new_unwatched(profile)
+            .unwrap()
+            .update(|rows, _| {
+                rows.push(structured.clone());
+                Ok(())
+            })
+            .unwrap();
+        state.instances.write().await.push(structured.clone());
+        let terminal_stopped = Arc::new(Mutex::new(SessionPoller::new(
+            "stopped".into(),
+            "claude".into(),
+            None,
+        )));
+        let structured_stopped = Arc::new(Mutex::new(SessionPoller::new(
+            "stopped".into(),
+            "claude".into(),
+            None,
+        )));
+        {
+            let mut rows = state.instances.write().await;
+            rows.iter_mut()
+                .find(|row| row.id == terminal.id)
+                .unwrap()
+                .capture_poller
+                .set_handle(Some(terminal_stopped.clone()));
+            rows.iter_mut()
+                .find(|row| row.id == structured.id)
+                .unwrap()
+                .capture_poller
+                .set_handle(Some(structured_stopped.clone()));
+        }
+        let _tmux = TmuxSession::create(&terminal.id, &terminal.title);
+        let before =
+            std::fs::read(Storage::new_unwatched(profile).unwrap().sessions_path()).unwrap();
+        test_support::drain_session_id_updates_for_test(&state).await;
+        let rows = state.instances.read().await;
+        let repaired = rows
+            .iter()
+            .find(|row| row.id == terminal.id)
+            .unwrap()
+            .capture_poller
+            .handle()
+            .cloned()
+            .expect("live pane replacement poller");
+        assert!(!Arc::ptr_eq(&repaired, &terminal_stopped));
+        assert!(repaired
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_running());
+        assert!(Arc::ptr_eq(
+            rows.iter()
+                .find(|row| row.id == structured.id)
+                .unwrap()
+                .capture_poller
+                .handle()
+                .unwrap(),
+            &structured_stopped
+        ));
+        drop(rows);
+        assert_eq!(
+            std::fs::read(Storage::new_unwatched(profile).unwrap().sessions_path()).unwrap(),
+            before
+        );
+        repaired
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .stop();
+    }
 }
 
 #[cfg(test)]
@@ -304,13 +674,17 @@ mod tests {
         );
         let mut walked = live.clone();
         let now = std::time::Instant::now();
-        walked.poller_repair.reprobe(now);
+        walked.capture_poller.repair_mut().reprobe(now);
 
         // Same lifecycle: the walk's schedule lands.
-        live.poller_repair = Default::default();
-        apply_poller_repair_if_lifecycle_unchanged(&mut live, &walked.poller_repair, &baseline);
+        live.capture_poller.set_repair(Default::default());
+        apply_poller_repair_if_lifecycle_unchanged(
+            &mut live,
+            walked.capture_poller.repair(),
+            &baseline,
+        );
         assert_eq!(
-            live.poller_repair.current_reprobe_delay(),
+            live.capture_poller.repair().current_reprobe_delay(),
             Some(std::time::Duration::from_secs(5))
         );
 
@@ -320,11 +694,15 @@ mod tests {
         let mut relaunched = live.clone();
         // A relaunch that reached the launch stamp: new start time, cleared schedule.
         relaunched.last_start_time = Some(std::time::Instant::now());
-        relaunched.poller_repair.reset();
+        relaunched.capture_poller.repair_mut().reset();
         live.merge_post_restart_with_baseline(&live.clone(), &relaunched);
-        apply_poller_repair_if_lifecycle_unchanged(&mut live, &walked.poller_repair, &baseline);
+        apply_poller_repair_if_lifecycle_unchanged(
+            &mut live,
+            walked.capture_poller.repair(),
+            &baseline,
+        );
         assert_eq!(
-            live.poller_repair.current_reprobe_delay(),
+            live.capture_poller.repair().current_reprobe_delay(),
             None,
             "a lifecycle that moved under the walk discards its verdict"
         );
@@ -344,34 +722,35 @@ mod tests {
         let mut live = Instance::new("session", "/tmp/project");
         let mut repaired = live.clone();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        repaired.session_id_poller_retry_after = Some(deadline);
+        repaired.capture_poller.set_retry_after(Some(deadline));
 
         apply_poller_runtime_if_unchanged(&mut live, &repaired, &baseline);
 
-        assert_eq!(live.session_id_poller_retry_after, Some(deadline));
+        assert_eq!(live.capture_poller.retry_after(), Some(deadline));
 
         let concurrent = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        live.session_id_poller_retry_after = Some(concurrent);
+        live.capture_poller.set_retry_after(Some(concurrent));
         apply_poller_runtime_if_unchanged(&mut live, &repaired, &baseline);
-        assert_eq!(live.session_id_poller_retry_after, Some(concurrent));
+        assert_eq!(live.capture_poller.retry_after(), Some(concurrent));
 
-        live.session_id_poller_retry_after = None;
+        live.capture_poller.set_retry_after(None);
         live.capture_started_at = Some(std::time::SystemTime::now());
         apply_poller_runtime_if_unchanged(&mut live, &repaired, &baseline);
         assert_eq!(
-            live.session_id_poller_retry_after, None,
+            live.capture_poller.retry_after(),
+            None,
             "a concurrent non-OMP relaunch must reject the stale runtime state"
         );
 
         live.capture_started_at = None;
         live.status = crate::session::Status::Stopped;
         apply_poller_runtime_if_unchanged(&mut live, &repaired, &baseline);
-        assert_eq!(live.session_id_poller_retry_after, None);
+        assert_eq!(live.capture_poller.retry_after(), None);
 
         live.status = crate::session::Status::Idle;
         live.lifecycle_generation = 1;
         apply_poller_runtime_if_unchanged(&mut live, &repaired, &baseline);
-        assert_eq!(live.session_id_poller_retry_after, None);
+        assert_eq!(live.capture_poller.retry_after(), None);
     }
 
     #[test]
@@ -447,22 +826,33 @@ mod tests {
             crate::session::Status::Idle,
         );
         let mut walked = live.clone();
-        walked.poller_repair.reprobe(std::time::Instant::now());
+        walked
+            .capture_poller
+            .repair_mut()
+            .reprobe(std::time::Instant::now());
 
-        live.poller_repair = Default::default();
-        apply_poller_repair_if_lifecycle_unchanged(&mut live, &walked.poller_repair, &baseline);
+        live.capture_poller.set_repair(Default::default());
+        apply_poller_repair_if_lifecycle_unchanged(
+            &mut live,
+            walked.capture_poller.repair(),
+            &baseline,
+        );
         assert_eq!(
-            live.poller_repair.current_reprobe_delay(),
+            live.capture_poller.repair().current_reprobe_delay(),
             Some(std::time::Duration::from_secs(5)),
             "fixture: nothing moved, so the verdict lands"
         );
 
         // The row swapped tool under the walk: same lifecycle counter, different execution.
         live.active_execution = execution("launch-2");
-        live.poller_repair = Default::default();
-        apply_poller_repair_if_lifecycle_unchanged(&mut live, &walked.poller_repair, &baseline);
+        live.capture_poller.set_repair(Default::default());
+        apply_poller_repair_if_lifecycle_unchanged(
+            &mut live,
+            walked.capture_poller.repair(),
+            &baseline,
+        );
         assert_eq!(
-            live.poller_repair.current_reprobe_delay(),
+            live.capture_poller.repair().current_reprobe_delay(),
             None,
             "a window armed for the execution the row gave up is not written onto the new one"
         );
@@ -485,21 +875,32 @@ mod tests {
             crate::session::Status::Idle,
         );
         let mut walked = live.clone();
-        walked.poller_repair.reprobe(std::time::Instant::now());
+        walked
+            .capture_poller
+            .repair_mut()
+            .reprobe(std::time::Instant::now());
 
-        live.poller_repair = Default::default();
-        apply_poller_repair_if_lifecycle_unchanged(&mut live, &walked.poller_repair, &baseline);
+        live.capture_poller.set_repair(Default::default());
+        apply_poller_repair_if_lifecycle_unchanged(
+            &mut live,
+            walked.capture_poller.repair(),
+            &baseline,
+        );
         assert_eq!(
-            live.poller_repair.current_reprobe_delay(),
+            live.capture_poller.repair().current_reprobe_delay(),
             Some(std::time::Duration::from_secs(5)),
             "fixture: nothing moved, so the verdict lands"
         );
 
         live.tool = "codex".to_string();
-        live.poller_repair = Default::default();
-        apply_poller_repair_if_lifecycle_unchanged(&mut live, &walked.poller_repair, &baseline);
+        live.capture_poller.set_repair(Default::default());
+        apply_poller_repair_if_lifecycle_unchanged(
+            &mut live,
+            walked.capture_poller.repair(),
+            &baseline,
+        );
         assert_eq!(
-            live.poller_repair.current_reprobe_delay(),
+            live.capture_poller.repair().current_reprobe_delay(),
             None,
             "a window armed for the previous agent is not written onto this one"
         );

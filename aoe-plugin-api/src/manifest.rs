@@ -756,6 +756,19 @@ impl PluginManifest {
         );
         check(!self.version.is_empty(), "version must not be empty".into());
         check(!self.name.is_empty(), "name must not be empty".into());
+        let runtime_has_worker = self.runtime.is_none()
+            || self
+                .capabilities
+                .iter()
+                .any(|capability| capability.as_str() == "runtime.worker");
+        check(
+            runtime_has_worker,
+            if runtime_has_worker {
+                String::new()
+            } else {
+                "runtime requires the `runtime.worker` capability".into()
+            },
+        );
 
         if let Some(RuntimeSpec::Command {
             command,

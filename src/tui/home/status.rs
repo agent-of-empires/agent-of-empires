@@ -1,76 +1,12 @@
-//! Status and metrics refresh: what the pollers report and how a row's
-//! status is applied and hooked.
+//! Canonical runtime projection and local system-health sampling.
 
 use super::*;
+use crate::session::Status;
 
 impl HomeView {
-    /// Snapshot of `self.instances` eligible for status polling. In-flight recovery and
-    /// restart candidates are excluded: their post-cascade `Instance` arrives through
-    /// `apply_recovery_updates` / `apply_restart_results`, and a parallel poll would race
-    /// those transitions.
+    /// Local health samples observe every canonical row; daemon recovery owns mutations.
     pub(in crate::tui) fn pollable_instances(&self) -> Vec<Instance> {
-        self.instances
-            .values()
-            .filter(|i| {
-                !self.recovery_in_flight.contains(&i.id) && !self.restart_in_flight.contains(&i.id)
-            })
-            .cloned()
-            .collect()
-    }
-
-    pub(in crate::tui) fn attached_status_hook_sessions(
-        &self,
-    ) -> Vec<crate::tui::attached_status_hooks::AttachedStatusHookSession> {
-        self.pollable_instances()
-            .into_iter()
-            .filter_map(|instance| {
-                let hook_config = self.status_hook_config_for(&instance);
-                hook_config.enabled.then_some(
-                    crate::tui::attached_status_hooks::AttachedStatusHookSession {
-                        instance,
-                        hook_config,
-                    },
-                )
-            })
-            .collect()
-    }
-
-    /// Request a status refresh in the background (non-blocking).
-    /// Call `apply_status_updates` to check for and apply results.
-    pub fn request_status_refresh(&mut self) {
-        if !self.pending_status_refresh {
-            self.status_poller
-                .request_refresh(self.pollable_instances());
-            self.pending_status_refresh = true;
-        }
-    }
-
-    /// Apply any pending status updates from the background poller.
-    /// Returns true if updates were applied.
-    pub fn apply_status_updates(&mut self) -> bool {
-        use std::sync::mpsc::TryRecvError;
-
-        match self.status_poller.try_recv_updates() {
-            Ok(updates) => {
-                for update in updates {
-                    self.apply_one_status_update(update);
-                }
-                self.pending_status_refresh = false;
-                true
-            }
-            Err(TryRecvError::Empty) => false,
-            Err(TryRecvError::Disconnected) => {
-                // The worker thread is gone (a panic in poll_statuses_once). Without a
-                // respawn, pending_status_refresh stays set and request_status_refresh
-                // never fires again, freezing every session's live status.
-                tracing::error!(
-                    target: "tui.home",
-                    "status poller worker gone; respawning a fresh poller",
-                );
-                self.reset_status_refresh();
-                true
-            }
-        }
+        self.instances.values().cloned().collect()
     }
 
     /// Request a system-health sample in the background while either health
@@ -190,201 +126,787 @@ impl HomeView {
         }
     }
 
-    /// Request the daemon's session list (non-blocking). Skipped when
-    /// `session.daemon_sidebar` is off and when no structured session is loaded, since the
-    /// daemon owns nothing on a terminal-only sidebar.
-    pub fn request_session_feed_refresh(&mut self) {
-        if !self.daemon_sidebar || self.pending_session_feed {
-            return;
-        }
-        if !self.instances.values().any(|i| i.is_structured()) {
-            return;
-        }
-        self.session_feed.request_refresh();
-        self.pending_session_feed = true;
+    pub fn connect_runtime(&mut self) {
+        self.session_feed_reload_retry_at = None;
+        self.session_feed_failed_cursor = None;
+        self.canonical_metadata_lag = None;
+        self.pending_created_attach = None;
+        self.set_sidebar_source(crate::tui::session_feed::SidebarSource::Connecting, None);
+        self.session_feed
+            .connect(self.active_profile.clone().unwrap_or_default());
     }
 
-    /// Record where daemon-owned sidebar state comes from, logging the transition so a
-    /// sidebar stuck on stale structured status is diagnosable from the log alone.
-    /// `reason` says why the daemon is not the source and is ignored for `Daemon`.
-    pub(super) fn set_sidebar_source(
+    /// The Daemon state the footer's R entry and the Connections hub surface. None while
+    /// it is healthy, connecting, applying a change, or serving a City Hall client.
+    pub(in crate::tui) fn daemon_attention(&self) -> Option<crate::tui::dialogs::DaemonAttention> {
+        use crate::tui::dialogs::DaemonAttention;
+        use crate::tui::session_feed::SidebarSource;
+        if self.session_feed.namespace_indeterminate()
+            || !self.pending_indeterminate_queue.is_empty()
+            || self
+                .pending_creation
+                .as_ref()
+                .is_some_and(|pending| pending.outcome_unknown)
+        {
+            return Some(DaemonAttention::OutcomeUnknown);
+        }
+        match self.sidebar_source {
+            SidebarSource::Connecting => None,
+            SidebarSource::Disconnected => Some(DaemonAttention::Offline),
+            SidebarSource::Daemon
+                if self.session_feed.cityhall_mode()
+                    || self.session_feed.any_pending()
+                    || self.pending_namespace_intent.is_some()
+                    || self.pending_creation.is_some()
+                    || self.session_feed.native_interaction_available() =>
+            {
+                None
+            }
+            SidebarSource::Daemon if self.session_feed.mutations_available() => {
+                Some(DaemonAttention::NativeUnavailable)
+            }
+            SidebarSource::Daemon => Some(DaemonAttention::ReadOnly),
+        }
+    }
+
+    /// What the footer used to call "Runtime ready": connected, nothing applying, and native
+    /// interaction granted. The footer no longer says so, so e2e tests read it from a file.
+    #[cfg(feature = "e2e-tests")]
+    pub(in crate::tui) fn runtime_settled(&self) -> bool {
+        self.sidebar_source == crate::tui::session_feed::SidebarSource::Daemon
+            && self.daemon_attention().is_none()
+            && !self.session_feed.cityhall_mode()
+            && !self.session_feed.any_pending()
+            && self.pending_namespace_intent.is_none()
+            && self.pending_creation.is_none()
+            && self.session_feed.native_interaction_available()
+    }
+
+    /// Record where daemon-owned sidebar state comes from, logging the
+    /// transition so a sidebar stuck on stale structured status is
+    /// diagnosable from the log alone. `reason` says why the daemon is not
+    /// the source and is ignored for `Daemon`.
+    pub(in crate::tui) fn set_sidebar_source(
         &mut self,
         source: crate::tui::session_feed::SidebarSource,
         reason: Option<&str>,
-    ) {
+    ) -> bool {
         use crate::tui::session_feed::SidebarSource;
 
-        if self.sidebar_source == source {
-            return;
+        // The offline takeover already says the Daemon isn't responding; only a real
+        // reason adds a line.
+        let reason = (source == SidebarSource::Disconnected)
+            .then(|| reason.filter(|reason| !reason.is_empty()))
+            .flatten();
+        if self.sidebar_source == source && reason == self.runtime_failure_reason.as_deref() {
+            return false;
         }
+        self.runtime_failure_reason = reason.map(str::to_owned);
         self.sidebar_source = source;
+        if source == SidebarSource::Daemon {
+            self.project_registry_authoritative = true;
+        }
+        if source != SidebarSource::Daemon {
+            self.pending_created_attach = None;
+            self.cancel_native_attachment();
+            self.teardown_live_send();
+            self.structured_preview = None;
+            self.preview_capture_worker = None;
+            self.preview_capture_target = None;
+        }
         match source {
+            SidebarSource::Connecting => {
+                tracing::info!(target: "tui.home", "sidebar: connecting to runtime")
+            }
             SidebarSource::Daemon => tracing::info!(
                 target: "tui.home",
-                "sidebar: daemon reachable; structured rows follow /api/sessions",
+                "sidebar: daemon reachable; rows follow /api/runtime/ws",
             ),
-            SidebarSource::Storage => tracing::info!(
+            SidebarSource::Disconnected => tracing::info!(
                 target: "tui.home",
                 reason = reason.unwrap_or(""),
-                "sidebar: local store only; daemon-owned state keeps its last value",
+                "sidebar: disconnected; session view unavailable",
             ),
         }
+        true
     }
 
-    /// Whether a daemon-sourced status may be applied to `id`, mirroring the tmux
-    /// producer's exclusions. A row mid-restart or mid-recovery-cascade gets its
-    /// post-cascade `Instance` from `apply_restart_results` / `apply_recovery_updates`, so
-    /// letting the daemon's copy land during that window races them; recovery already
-    /// skips structured rows, but both are checked so the producers stay symmetrical.
-    ///
-    /// Archived and trashed rows are excluded too: `/api/sessions` returns them unfiltered
-    /// and the `is_archived()` short-circuit that keeps the tmux producer off a sunk row
-    /// lives in `update_status_with_metadata_inner`, which this path never reaches, so a
-    /// sunk row would be restamped and re-marked unread. See #3201 / #1868 / #2206.
-    ///
-    /// The cost: a sunk structured row already in `Status::Error` has no producer able to
-    /// clear it, since the daemon is excluded here, the tmux poller bails on structured
-    /// rows, and `reload_storage_only` carries `prev.status` forward. It stays visible
-    /// because `agent_row_icon` lets `Error` punch through the sunk-row mask on purpose,
-    /// and unarchiving is the only way back. The tmux producer has the same property.
-    fn daemon_status_applies_to(&self, inst: &Instance) -> bool {
-        !self.recovery_in_flight.contains(&inst.id)
-            && !self.restart_in_flight.contains(&inst.id)
-            && !inst.is_archived()
-            && !inst.is_trashed()
+    /// Whether applying this runtime revision would outrun the local storage
+    /// mirror. Status and pane observations are safe to apply in place, but
+    /// durable identity/layout fields and removals must come from the locked
+    /// storage load before the revision is marked applied.
+    fn snapshot_requires_storage_reload(
+        &self,
+        snapshot: &crate::daemon::RuntimeSnapshot,
+        persisted_ordering: &[String],
+    ) -> bool {
+        // The daemon appends unknown workspaces; acknowledge the persisted manual order instead.
+        if persisted_ordering != self.observed_workspace_ordering.as_slice() {
+            return true;
+        }
+
+        let row_ids: std::collections::HashSet<_> = snapshot
+            .contents
+            .sessions
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect();
+        if self
+            .in_flight_creation_id()
+            .is_none_or(|id| !row_ids.contains(id))
+            && self
+                .instances
+                .keys()
+                .any(|id| !row_ids.contains(id.as_str()))
+        {
+            return true;
+        }
+
+        let namespace_changed = self.session_feed.applied_snapshot().is_none_or(|applied| {
+            applied.contents.profiles.len() != snapshot.contents.profiles.len()
+                || snapshot.contents.profiles.iter().any(|incoming| {
+                    applied
+                        .contents
+                        .profiles
+                        .iter()
+                        .find(|previous| previous.name == incoming.name)
+                        .is_none_or(|previous| previous.groups != incoming.groups)
+                })
+                || applied.contents.sessions.len() != snapshot.contents.sessions.len()
+                || applied
+                    .contents
+                    .sessions
+                    .iter()
+                    .zip(&snapshot.contents.sessions)
+                    .any(|(previous, row)| {
+                        previous.id != row.id
+                            || previous.workspace_repos != row.workspace_repos
+                            || previous.workspace_dir != row.workspace_dir
+                            || previous.workspace_branch != row.workspace_branch
+                            || previous.workspace_created_at != row.workspace_created_at
+                            || previous.workspace_cleanup_on_delete
+                                != row.workspace_cleanup_on_delete
+                            || previous.is_sandboxed != row.is_sandboxed
+                            || previous.sandbox_container_name != row.sandbox_container_name
+                    })
+        });
+        if namespace_changed {
+            return true;
+        }
+        snapshot.contents.sessions.iter().any(|row| {
+            // An unknown row in a tracked profile is handled by the caller's
+            // addition check; one outside this view's scope is not its row.
+            let Some(instance) = self.instances.get(&row.id) else {
+                return false;
+            };
+
+            let expected_worktree = row
+                .has_managed_worktree
+                .then_some(row.branch.as_deref())
+                .flatten();
+            let actual_worktree = instance
+                .worktree_info
+                .as_ref()
+                .map(|worktree| worktree.branch.as_str());
+            instance.color != row.color
+                || instance.command != row.command
+                || instance.extra_args != row.extra_args
+                || instance.yolo_mode != row.yolo_mode
+                || instance.scratch != row.scratch
+                || instance.notify_on_waiting != row.notify_on_waiting
+                || instance.notify_on_idle != row.notify_on_idle
+                || instance.notify_on_error != row.notify_on_error
+                || instance.project_path != row.project_path
+                || instance.sort_index != row.sort_index
+                || instance.agent_session_id != row.agent_session_id
+                || instance.parent_session_id != row.parent_session_id
+                || instance.lifecycle_generation != row.lifecycle_generation
+                || instance.lifecycle_reservation != row.lifecycle_reservation
+                || instance.trash_lifecycle_id != row.trash_lifecycle_id
+                || instance.title != row.title
+                || instance.group_path != row.group_path
+                || instance.source_profile != row.profile
+                || instance.tool != row.tool
+                || instance.view != row.view
+                || instance.base_branch_override != row.base_branch_override
+                || actual_worktree != expected_worktree
+        })
+    }
+
+    /// Present every drained error and retain every unknown-outcome ID until resolution.
+    /// Both feed-drain paths use this sink so diagnostics and quarantines cannot be lost.
+    pub(super) fn present_command_errors(
+        &mut self,
+        errors: Vec<crate::tui::session_feed::SessionCommandError>,
+    ) -> bool {
+        if errors.is_empty() {
+            return false;
+        }
+        for error in &errors {
+            if self
+                .pending_archive_cursor
+                .as_ref()
+                .is_some_and(|pending| pending.id == error.id)
+            {
+                self.pending_archive_cursor = None;
+            }
+            if error.marks_unread && self.manual_unread_hold.as_deref() == Some(&error.id) {
+                self.manual_unread_hold = None;
+            }
+            if !error.outcome_unknown {
+                continue;
+            }
+            let known = self
+                .pending_indeterminate_resolution
+                .as_deref()
+                .is_some_and(|id| id == error.id)
+                || self
+                    .pending_indeterminate_queue
+                    .iter()
+                    .any(|(id, _)| *id == error.id);
+            if !known {
+                self.pending_indeterminate_queue
+                    .push((error.id.clone(), error.message.clone()));
+            }
+        }
+
+        // The full batch, so a diagnostic shown next to the indeterminate
+        // dialog is not the only trace of the other failures in this drain.
+        let diagnostics = errors
+            .iter()
+            .map(|error| format!("{}: {}", error.id, error.message))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if let Some((id, message)) = self.pending_indeterminate_queue.first().cloned() {
+            self.open_indeterminate_dialog(&id, &message);
+            if errors.len() > 1 {
+                self.info_dialog = Some(crate::tui::dialogs::InfoDialog::sized_to_fit(
+                    "Runtime change",
+                    &diagnostics,
+                ));
+            }
+        } else {
+            self.info_dialog = Some(crate::tui::dialogs::InfoDialog::sized_to_fit(
+                "Runtime change",
+                &diagnostics,
+            ));
+        }
+        true
+    }
+
+    fn open_indeterminate_dialog(&mut self, id: &str, message: &str) {
+        self.pending_indeterminate_resolution = Some(id.to_string());
+        self.confirm_dialog = Some(
+            ConfirmDialog::new(
+                "Resolve Unknown Outcome",
+                &format!(
+                    "The previous runtime change for '{id}' has an unknown outcome: {message}\n\nVerify the current canonical state, then unlock this row for a new action. Resolution submits no mutation. To reopen after Keep Blocked, use Ctrl+K: Resolve unknown runtime change."
+                ),
+                "resolve_indeterminate",
+            )
+            .buttons("Unlock", "Keep Blocked"),
+        );
+    }
+
+    pub(super) fn apply_canonical_projection(
+        &mut self,
+        snapshot: &crate::daemon::RuntimeSnapshot,
+        refresh_metadata: bool,
+    ) -> anyhow::Result<()> {
+        let mut next = indexmap::IndexMap::new();
+        // Discover this creation's reservation without mutating the displayed model.
+        let in_flight = self.in_flight_creation_id().or_else(|| {
+            let pending = self.pending_creation.as_ref()?;
+            if pending.confirmation.is_some() {
+                return None;
+            }
+            snapshot
+                .contents
+                .sessions
+                .iter()
+                .find(|row| row.idempotency_key.as_deref() == Some(pending.request_key.as_str()))
+                .map(|row| row.id.as_str())
+        });
+        let mut opened_storages = HashMap::new();
+        let mut profile_loads = HashMap::new();
+        for profile in &snapshot.contents.profiles {
+            if self
+                .active_profile
+                .as_ref()
+                .is_some_and(|active| *active != profile.name)
+            {
+                continue;
+            }
+            if !self.storages.contains_key(&profile.name) {
+                opened_storages.insert(
+                    profile.name.clone(),
+                    Storage::open(&profile.name, self.file_watch.clone())?,
+                );
+            }
+            let needs_metadata = refresh_metadata
+                || snapshot.contents.sessions.iter().any(|row| {
+                    row.profile == profile.name
+                        && in_flight != Some(row.id.as_str())
+                        && self
+                            .instances
+                            .get(&row.id)
+                            .is_none_or(|local| local.source_profile != row.profile)
+                });
+            if needs_metadata {
+                let storage = self
+                    .storages
+                    .get(&profile.name)
+                    .or_else(|| opened_storages.get(&profile.name))
+                    .expect("profile store staged");
+                profile_loads.insert(profile.name.clone(), storage.load_complete_with_groups()?.0);
+            }
+        }
+        let duplicate_reports = if refresh_metadata {
+            let loads: Vec<(&str, &[Instance])> = profile_loads
+                .iter()
+                .map(|(name, rows)| (name.as_str(), rows.as_slice()))
+                .collect();
+            let stores: Vec<(&str, &Storage)> = self
+                .storages
+                .iter()
+                .chain(opened_storages.iter())
+                .map(|(name, storage)| (name.as_str(), storage))
+                .collect();
+            Some(crate::session::duplicate_reports(&loads, &stores))
+        } else {
+            None
+        };
+        // Each profile is loaded once; consume its owned rows instead of copying them again.
+        let mut persisted_profiles: HashMap<_, _> = profile_loads
+            .into_iter()
+            .map(|(name, rows)| (name, Self::build_instances_map(rows)))
+            .collect();
+        for row in &snapshot.contents.sessions {
+            if self
+                .active_profile
+                .as_ref()
+                .is_some_and(|active| *active != row.profile)
+                || in_flight == Some(row.id.as_str())
+            {
+                continue;
+            }
+            let reports = duplicate_reports
+                .as_deref()
+                .unwrap_or(&self.legacy_duplicate_reports);
+            if let Some(report) = reports.iter().find(|report| report.id == row.id) {
+                return Err(anyhow::Error::new(CanonicalMetadataConflict(
+                    crate::session::safe_load_label(&report.actionable_message()),
+                )));
+            }
+            // A refreshed profile must contain the row, even if the old display did.
+            // Never manufacture native worktree/conversation metadata from a wire row.
+            let mut instance = if let Some(rows) = persisted_profiles.get_mut(&row.profile) {
+                let mut instance = rows.swap_remove(&row.id).ok_or_else(|| {
+                    anyhow::Error::new(CanonicalMetadataLag {
+                        profile: row.profile.clone(),
+                        id: row.id.clone(),
+                    })
+                })?;
+                if let Some(previous) = self.instances.get(&row.id) {
+                    instance.merge_runtime_from_reload(previous);
+                }
+                instance
+            } else {
+                self.instances
+                    .get(&row.id)
+                    .filter(|local| local.source_profile == row.profile)
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow::Error::new(CanonicalMetadataLag {
+                            profile: row.profile.clone(),
+                            id: row.id.clone(),
+                        })
+                    })?
+            };
+            instance.title.clone_from(&row.title);
+            instance.project_path.clone_from(&row.project_path);
+            instance.source_profile.clone_from(&row.profile);
+            instance.group_path.clone_from(&row.group_path);
+            instance.sort_index = row.sort_index;
+            instance.tool.clone_from(&row.tool);
+            instance.command.clone_from(&row.command);
+            instance.extra_args.clone_from(&row.extra_args);
+            instance.view = row.view;
+            instance
+                .base_branch_override
+                .clone_from(&row.base_branch_override);
+            instance.agent_session_id.clone_from(&row.agent_session_id);
+            instance
+                .parent_session_id
+                .clone_from(&row.parent_session_id);
+            instance.lifecycle_generation = row.lifecycle_generation;
+            instance
+                .lifecycle_reservation
+                .clone_from(&row.lifecycle_reservation);
+            instance
+                .trash_lifecycle_id
+                .clone_from(&row.trash_lifecycle_id);
+            instance.agent_pane.clone_from(&row.agent_pane);
+            instance.auxiliary.clone_from(&row.auxiliary);
+            instance.unread = row.unread;
+            instance.color.clone_from(&row.color);
+            instance.yolo_mode = row.yolo_mode;
+            instance.scratch = row.scratch;
+            instance.notify_on_waiting = row.notify_on_waiting;
+            instance.notify_on_idle = row.notify_on_idle;
+            instance.notify_on_error = row.notify_on_error;
+            instance.last_error.clone_from(&row.last_error);
+            instance.pane_dead_observed = row.pane_dead_observed;
+            if let Some(status) = Status::from_api_str(&row.status) {
+                instance.status = status;
+            }
+            if let Some(worktree) = instance.worktree_info.as_mut() {
+                if let Some(branch) = &row.branch {
+                    worktree.branch.clone_from(branch);
+                }
+            }
+            for (raw, current) in [
+                (row.trashed_at.as_deref(), &mut instance.trashed_at),
+                (row.archived_at.as_deref(), &mut instance.archived_at),
+                (row.favorited_at.as_deref(), &mut instance.favorited_at),
+                (row.snoozed_until.as_deref(), &mut instance.snoozed_until),
+                (row.pinned_at.as_deref(), &mut instance.pinned_at),
+                (
+                    row.last_accessed_at.as_deref(),
+                    &mut instance.last_accessed_at,
+                ),
+                (
+                    row.idle_entered_at.as_deref(),
+                    &mut instance.idle_entered_at,
+                ),
+                (
+                    row.idle_dormant_since.as_deref(),
+                    &mut instance.idle_dormant_since,
+                ),
+            ] {
+                *current = raw
+                    .map(chrono::DateTime::parse_from_rfc3339)
+                    .transpose()?
+                    .map(|stamp| stamp.with_timezone(&chrono::Utc));
+            }
+            next.insert(row.id.clone(), instance);
+        }
+        if let Some(stub) = self
+            .creating_stub_id
+            .as_ref()
+            .and_then(|id| self.instances.get(id))
+            .cloned()
+        {
+            next.insert(stub.id.clone(), stub);
+        }
+        let mut trees = HashMap::new();
+        for profile in &snapshot.contents.profiles {
+            if self
+                .active_profile
+                .as_ref()
+                .is_some_and(|active| *active != profile.name)
+            {
+                continue;
+            }
+            let rows: Vec<_> = next
+                .values()
+                .filter(|row| row.source_profile == profile.name)
+                .cloned()
+                .collect();
+            trees.insert(
+                profile.name.clone(),
+                GroupTree::new_with_groups(&rows, &profile.groups),
+            );
+        }
+        // No displayed row, approval, selection, or sound changes before every read and parse succeeds.
+        for (id, instance) in &next {
+            if let Some(previous) = self.instances.get(id) {
+                if previous.status != instance.status {
+                    crate::sound::play_for_transition(
+                        previous.status,
+                        instance.status,
+                        &self.sound_config,
+                    );
+                }
+            }
+        }
+        self.instances = next;
+        self.group_trees = trees;
+        self.storages.extend(opened_storages);
+        self.storages.retain(|name, _| {
+            snapshot.contents.profiles.iter().any(|profile| {
+                profile.name == *name
+                    && self
+                        .active_profile
+                        .as_ref()
+                        .is_none_or(|active| active == name)
+            })
+        });
+        if let Some(reports) = duplicate_reports {
+            log_legacy_duplicates_once(&reports);
+            self.legacy_duplicate_reports = reports;
+            self.remote_owner_cache.borrow_mut().clear();
+            let mut disk_profiles: Vec<_> = self.storages.keys().cloned().collect();
+            disk_profiles.sort();
+            self.rewire_disk_subscriptions(&disk_profiles);
+            let config_profiles: Vec<_> = snapshot
+                .contents
+                .profiles
+                .iter()
+                .map(|profile| profile.name.clone())
+                .collect();
+            self.rewire_config_subscriptions(&config_profiles);
+        }
+        self.reconcile_in_flight_creation(&snapshot.contents.sessions);
+        self.refresh_registered_projects();
+        Ok(())
+    }
+    pub(super) fn record_canonical_projection_failure(
+        &mut self,
+        cursor: &crate::daemon::RuntimeCursor,
+        error: &anyhow::Error,
+    ) {
+        let now = std::time::Instant::now();
+        self.session_feed_failed_cursor = Some(cursor.clone());
+        self.session_feed_reload_retry_at = Some(now + Self::CANONICAL_RELOAD_RETRY_INTERVAL);
+        let message = if let Some(lag) = error.downcast_ref::<CanonicalMetadataLag>() {
+            let same = self.canonical_metadata_lag.as_ref().is_some_and(|prior| {
+                prior.epoch == cursor.epoch && prior.profile == lag.profile && prior.id == lag.id
+            });
+            if !same {
+                self.reload_failure_state.record_canonical(&Ok(()));
+                self.canonical_metadata_lag = Some(CanonicalMetadataLagState {
+                    epoch: cursor.epoch.clone(),
+                    profile: lag.profile.clone(),
+                    id: lag.id.clone(),
+                    first_seen: now,
+                });
+            }
+            if now.duration_since(self.canonical_metadata_lag.as_ref().unwrap().first_seen)
+                < Self::CANONICAL_RELOAD_RETRY_INTERVAL
+            {
+                return;
+            }
+            format!("Native metadata is still unavailable for profile '{}', session '{}'. Last complete state retained; waiting for a compatible canonical frame.",
+                crate::session::safe_load_label(&lag.profile), crate::session::safe_load_label(&lag.id))
+        } else {
+            self.canonical_metadata_lag = None;
+            match error.downcast_ref::<CanonicalMetadataConflict>() {
+                Some(conflict) => conflict.to_string(),
+                None => crate::session::sanitized_load_failure(error),
+            }
+        };
+        self.reload_failure_state
+            .record_canonical(&Err(anyhow::anyhow!(message)));
+    }
+
+    fn record_runtime_diagnostics(&mut self, health: &crate::daemon::RuntimeHealth) {
+        let diagnostic = match health {
+            crate::daemon::RuntimeHealth::Healthy => Ok(()),
+            crate::daemon::RuntimeHealth::Degraded { profiles, .. } => {
+                let owners = profiles
+                    .iter()
+                    .map(|profile| crate::session::safe_load_label(profile))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let files = self
+                    .runtime_diagnostics
+                    .iter()
+                    .map(|diagnostic| format!("{}: {}", diagnostic.path, diagnostic.message))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Err(anyhow::anyhow!(
+                    "Runtime read-only. Affected profiles: {}.\n{}",
+                    if owners.is_empty() {
+                        "global metadata"
+                    } else {
+                        &owners
+                    },
+                    files
+                ))
+            }
+        };
+        self.reload_failure_state.record_daemon(&diagnostic);
     }
 
     /// Apply a pending session-list result from the daemon. Returns true if
     /// the caller should redraw.
     pub fn apply_session_feed(&mut self) -> bool {
-        use crate::tui::session_feed::{self, SessionFeedResult, SidebarSource};
+        use crate::tui::session_feed::{SessionFeedResult, SidebarSource};
         use std::sync::mpsc::TryRecvError;
 
-        match self.session_feed.try_recv() {
-            Ok(result) => {
-                self.pending_session_feed = false;
-                // A result that was in flight when the setting flipped off is
-                // dropped, so "off" means the daemon never drives a row.
-                if !self.daemon_sidebar {
-                    return false;
-                }
-                match result {
-                    SessionFeedResult::Snapshot(rows) => {
-                        self.set_sidebar_source(SidebarSource::Daemon, None);
-                        let updates = session_feed::structured_updates(&rows);
-                        let applied = !updates.is_empty();
-                        for update in updates {
-                            self.apply_daemon_status_update(update);
-                        }
-                        // Drop pending-approval entries for sessions that no longer exist
-                        // locally, which the daemon stops listing, so
-                        // `apply_daemon_status_update` never revisits them and the entry
-                        // would leak for the life of the process.
-                        let instances = &self.instances;
-                        self.structured_pending_approvals
-                            .retain(|id, _| instances.contains_key(id));
-                        applied
-                    }
-                    SessionFeedResult::Unavailable(reason) => {
-                        self.set_sidebar_source(SidebarSource::Storage, Some(&reason));
-                        false
-                    }
-                }
+        let pending_before =
+            self.session_feed.any_pending() || self.pending_namespace_intent.is_some();
+        let mut snapshot_applied = false;
+        let diagnostics_changed = if let Some(diagnostics) = self.session_feed.take_diagnostics() {
+            self.runtime_diagnostics = diagnostics;
+            if let Some(snapshot) = self.session_feed.latest_snapshot() {
+                self.record_runtime_diagnostics(&snapshot.contents.health);
             }
+            true
+        } else {
+            false
+        };
+        let updated = match self.session_feed.try_recv() {
+            Ok(result) => match result {
+                SessionFeedResult::Snapshot(snapshot) => {
+                    self.record_runtime_diagnostics(&snapshot.contents.health);
+                    if self
+                        .session_feed_reload_retry_at
+                        .is_some_and(|retry_at| std::time::Instant::now() < retry_at)
+                        && self.session_feed_failed_cursor.as_ref() == Some(&snapshot.cursor)
+                    {
+                        false
+                    } else {
+                        self.bind_in_flight_creation(&snapshot.contents.sessions);
+                        let (persisted_ordering, ordering_error) =
+                            match crate::session::load_workspace_ordering() {
+                                Ok(ordering) => (ordering.order, None),
+                                Err(error) => (Vec::new(), Some(error)),
+                            };
+                        let unknown_row = snapshot.contents.sessions.iter().any(|row| {
+                            self.active_profile
+                                .as_ref()
+                                .is_none_or(|active| *active == row.profile)
+                                && !self.instances.contains_key(&row.id)
+                                && self.in_flight_creation_id() != Some(row.id.as_str())
+                                && !self.pending_creation.as_ref().is_some_and(|pending| {
+                                    pending.confirmation.is_none()
+                                        && row.idempotency_key.as_deref()
+                                            == Some(pending.request_key.as_str())
+                                })
+                        });
+                        let refresh_metadata = self.session_feed_reload_retry_at.is_some()
+                            || unknown_row
+                            || self
+                                .snapshot_requires_storage_reload(&snapshot, &persisted_ordering);
+                        let mut metadata_changed = false;
+                        let projection = match ordering_error {
+                            Some(error) => Err(error),
+                            None => self.apply_canonical_projection(&snapshot, refresh_metadata),
+                        };
+                        match projection {
+                            Err(error) => {
+                                self.record_canonical_projection_failure(&snapshot.cursor, &error);
+                            }
+                            Ok(()) => {
+                                metadata_changed = true;
+                                for row in &snapshot.contents.sessions {
+                                    self.apply_daemon_status_update(row);
+                                    if !row.unread
+                                        && self.manual_unread_hold.as_deref() == Some(&row.id)
+                                    {
+                                        self.manual_unread_hold = None;
+                                    }
+                                }
+                                let ids: std::collections::HashSet<_> =
+                                    self.instances.keys().map(String::as_str).collect();
+                                self.structured_pending_approvals
+                                    .retain(|id, _| ids.contains(id.as_str()));
+                                self.refresh_projection_presentation();
+                                self.session_feed_reload_retry_at = None;
+                                self.session_feed_failed_cursor = None;
+                                self.canonical_metadata_lag = None;
+                                self.reload_failure_state.record_canonical(&Ok(()));
+                                self.observed_workspace_ordering = persisted_ordering;
+                                metadata_changed |=
+                                    self.session_feed.mark_snapshot_applied(snapshot);
+                                snapshot_applied = true;
+                            }
+                        }
+                        metadata_changed |= self.set_sidebar_source(SidebarSource::Daemon, None);
+                        metadata_changed
+                    }
+                }
+                SessionFeedResult::Unavailable(reason) => {
+                    self.session_feed_reload_retry_at = None;
+                    self.session_feed_failed_cursor = None;
+                    self.canonical_metadata_lag = None;
+                    self.pending_created_attach = None;
+                    self.set_sidebar_source(SidebarSource::Disconnected, Some(&reason))
+                }
+            },
             Err(TryRecvError::Empty) => false,
-            Err(TryRecvError::Disconnected) => {
-                // Same failure mode as the tmux poller: without a respawn the in-flight
-                // flag stays set and every structured row's status freezes.
-                tracing::error!(
-                    target: "tui.home",
-                    "session feed worker gone; respawning a fresh feed",
-                );
-                self.session_feed = crate::tui::session_feed::SessionFeed::new();
-                self.pending_session_feed = false;
-                true
+            Err(TryRecvError::Disconnected) => false,
+        };
+        if !self.session_feed.native_interaction_available() {
+            self.cancel_native_attachment();
+            if snapshot_applied || self.live_send.is_some() {
+                self.teardown_live_send();
             }
         }
+        let archive_cursor_changed = snapshot_applied && self.apply_pending_archive_cursor();
+        let drained = self.session_feed.drain_command_errors();
+        let command_error = self.present_command_errors(drained);
+        let epoch = self.session_feed.applied_epoch();
+        let canonical_base = self.diff_view.as_ref().and_then(|diff| {
+            self.session_feed
+                .applied_session(diff.session_id.as_deref()?)
+                .filter(|row| row.profile == diff.profile)
+                .and_then(|row| row.base_branch_override.as_deref())
+        });
+        let diff_changed = self
+            .diff_view
+            .as_mut()
+            .is_some_and(|diff| diff.poll_base_save(epoch, canonical_base));
+        if snapshot_applied {
+            if let Some(id) = self
+                .live_send
+                .as_ref()
+                .filter(|live| {
+                    self.get_instance(&live.session_id)
+                        .is_some_and(|instance| instance.is_unread())
+                        && self.session_feed.can_submit(&live.session_id)
+                })
+                .map(|live| live.session_id.clone())
+            {
+                self.clear_unread_on_view(&id);
+            }
+        }
+        let outcomes_changed = self.apply_runtime_outcomes();
+        let pending_after =
+            self.session_feed.any_pending() || self.pending_namespace_intent.is_some();
+        updated
+            || diagnostics_changed
+            || command_error
+            || diff_changed
+            || archive_cursor_changed
+            || outcomes_changed
+            || pending_before != pending_after
     }
 
-    /// Fold one daemon-sourced structured status into the shared apply path, so sounds and
-    /// status hooks fire as they do for a tmux-derived transition. Persistence is the
-    /// deliberate exception: nothing about a structured row is the TUI's to write, so
-    /// `persist_passive_status_transition` returns early for `is_structured()`. The status
-    /// is a daemon-side overlay with no durable owner (#3201), and the automatic unread
-    /// mark is the daemon's too, written from the live ACP turn-end event (#3181).
-    ///
-    /// The row is re-checked against `is_structured()` rather than trusted from the wire:
-    /// the daemon's `view` and the local row's can disagree mid-conversion, and the tmux
-    /// poller owns terminal rows, so dropping the mismatch keeps one producer per row.
     pub(in crate::tui) fn apply_daemon_status_update(
         &mut self,
-        update: crate::tui::session_feed::DaemonStatusUpdate,
-    ) {
-        use crate::session::Status;
-        use crate::tui::status_poller::IdleIntent;
-
-        let (is_structured, applies, was_stopped, sunk) = match self.get_instance(&update.id) {
-            Some(inst) => (
-                inst.is_structured(),
-                self.daemon_status_applies_to(inst),
-                inst.status == Status::Stopped,
-                inst.is_archived() || inst.is_trashed(),
-            ),
-            None => return,
+        row: &crate::daemon::SessionResponse,
+    ) -> bool {
+        let Some(status) = crate::session::Status::from_api_str(&row.status) else {
+            return false;
         };
-        if !is_structured || !applies {
-            // Archived and trashed rows stay in `instances`, so their cached approvals
-            // would outlive every state the daemon can refresh (the refresh path returns
-            // here). Dropping the cache keeps the permission action from opening an
-            // approval the resolver can only 404 on.
-            if sunk {
-                self.structured_pending_approvals.remove(&update.id);
-            }
-            return;
+        let Some(instance) = self.instances.get_mut(&row.id) else {
+            return false;
+        };
+        let mut changed = instance.status != status
+            || instance.last_error != row.last_error
+            || instance.pane_dead_observed != row.pane_dead_observed;
+        if instance.status != status {
+            crate::sound::play_for_transition(instance.status, status, &self.sound_config);
         }
-        if update.pending_approvals.is_empty() {
-            self.structured_pending_approvals.remove(&update.id);
-        } else {
+        instance.status = status;
+        instance.last_error.clone_from(&row.last_error);
+        instance.pane_dead_observed = row.pane_dead_observed;
+        if row.view != crate::session::View::Structured
+            || row.archived_at.is_some()
+            || row.trashed_at.is_some()
+            || row.pending_approvals.is_empty()
+        {
+            changed |= self.structured_pending_approvals.remove(&row.id).is_some();
+        } else if self.structured_pending_approvals.get(&row.id) != Some(&row.pending_approvals) {
             self.structured_pending_approvals
-                .insert(update.id.clone(), update.pending_approvals.clone());
+                .insert(row.id.clone(), row.pending_approvals.clone());
+            changed = true;
         }
-        // Lift a locally-`Stopped` row before the shared apply path sees it.
-        // `apply_status_update`'s guard drops every update whose row is `Stopped`, which is
-        // right for tmux rows but wrong here: stopping a structured session persists
-        // `Stopped` and reopening it in the structured view does not clear that, so the
-        // pill would stay grey through the whole next turn.
-        //
-        // The daemon has already applied its own stricter guard (only a `HealError` from
-        // `AcpSessionAssigned` or `RateLimitAutoResumed` lifts `Stopped`, both emitted only
-        // when a fresh worker attaches), so a non-`Stopped` reading provably means a new
-        // worker epoch rather than a trailing post-stop event.
-        if update.status != Status::Stopped && was_stopped {
-            self.mutate_instance(&update.id, |inst| inst.status = Status::Idle);
-            self.rows_after_stopped_change(&update.id);
-        }
-        self.apply_status_update(
-            StatusUpdate {
-                id: update.id,
-                status: update.status,
-                last_error: update.last_error,
-                // Mirror the daemon's value rather than deriving one, so the TUI's idle
-                // fade matches the web dashboard's instead of restarting on the first local
-                // observation.
-                idle_entered_at: match update.idle_entered_at {
-                    Some(ts) => IdleIntent::Set(ts),
-                    None => IdleIntent::Clear,
-                },
-                last_accessed_at: update.last_accessed_at,
-                // Structured rows have no pane, so the Attention sort's
-                // dead-pane tier never applies to them.
-                pane_dead: false,
-                live_status_baseline: Some(update.status),
-                // A structured row has no pane to detect against.
-                detection: None,
-            },
-            true,
-            true,
-        );
+        changed
     }
     /// Queue a structured approval response without blocking input handling.
     pub(super) fn resolve_structured_approval(
@@ -495,181 +1017,289 @@ impl HomeView {
         }
     }
 
-    /// Apply a single status update from the poller. Extracted from the loop in
-    /// `apply_status_updates` so tests can drive the apply path without the background
-    /// polling thread.
-    pub(in crate::tui) fn apply_one_status_update(&mut self, update: StatusUpdate) {
-        self.apply_status_update(update, true, true);
-    }
-
-    pub(in crate::tui) fn apply_status_updates_without_hooks(
-        &mut self,
-        updates: Vec<StatusUpdate>,
-    ) {
-        for update in updates {
-            self.apply_status_update(update, false, false);
+    pub(super) fn auxiliary_presence_for_view(
+        &self,
+        instance: &Instance,
+    ) -> crate::session::PanePresence {
+        use crate::session::{AuxiliaryTarget, PanePresence};
+        match &self.view_mode {
+            ViewMode::Terminal => {
+                let target = if instance.is_sandboxed()
+                    && self.get_terminal_mode(&instance.id) == TerminalMode::Container
+                {
+                    AuxiliaryTarget::Container { index: 0 }
+                } else {
+                    AuxiliaryTarget::Host { index: 0 }
+                };
+                instance.auxiliary_presence(&target)
+            }
+            ViewMode::Tool(name) => instance.tool_presence(name),
+            ViewMode::Structured => PanePresence::Unknown,
         }
     }
-
-    pub(in crate::tui) fn reset_status_refresh(&mut self) {
-        self.status_poller = StatusPoller::new();
-        self.pending_status_refresh = false;
+    pub(super) fn record_runtime_message(&mut self, message: String) {
+        tracing::info!(target: "tui.runtime_outcome", message, "Runtime domain outcome");
+        self.runtime_outcome_messages.push(message);
     }
 
-    fn apply_status_update(&mut self, update: StatusUpdate, play_sound: bool, run_hooks: bool) {
-        use crate::session::Status;
-
-        let old_status = self.get_instance(&update.id).map(|i| i.status);
-        let should_update = old_status.is_some_and(|s| {
-            s != Status::Deleting
-                && s != Status::Creating
-                && s != Status::Stopped
-                && update.status != Status::Stopped
-        });
-
-        let new_last_accessed = update.last_accessed_at;
-        let new_pane_dead = update.pane_dead;
-
-        if should_update {
-            use crate::tui::status_poller::IdleIntent;
-
-            let new_status = update.status;
-            let new_error = update.last_error;
-            let new_idle_entered_at = update.idle_entered_at;
-            let new_live_status_baseline = update.live_status_baseline;
-            let new_detection = update.detection;
-            let status_changed = old_status != Some(new_status);
-            self.mutate_instance(&update.id, |inst| {
-                inst.status = new_status;
-                // The daemon's `last_error` is authoritative only when present: an
-                // incoming `Some` always applies, so an `Error -> Error` tick can replace
-                // the old text (gating that on a status change froze the first error). A
-                // `None` is not symmetric: the daemon tracks only ACP errors, so it cannot
-                // tell "no error" from a locally-set message such as the delete-failure
-                // text, and clearing every tick would wipe it. Clear only across a genuine
-                // transition. See #3201.
-                if let Some(err) = new_error {
-                    inst.last_error = Some(err);
-                } else if status_changed {
-                    inst.last_error = None;
+    fn record_purge_outcome(&mut self, id: &str, outcome: crate::daemon::PurgeOutcome) {
+        match outcome {
+            crate::daemon::PurgeOutcome::Deleted {
+                messages,
+                cleanup_errors,
+            } => {
+                for message in messages {
+                    self.record_runtime_message(format!("{id}: {message}"));
                 }
-                // Match on the producer's stated intent for `idle_entered_at` instead of
-                // overloading `None`; see `IdleIntent` in `status_poller` for the
-                // three-variant contract. See #2690.
-                match new_idle_entered_at {
-                    IdleIntent::Set(ts) => inst.idle_entered_at = Some(ts),
-                    IdleIntent::Clear => inst.idle_entered_at = None,
-                    IdleIntent::Keep => {}
-                }
-                if new_last_accessed.is_some() {
-                    inst.last_accessed_at = new_last_accessed;
-                }
-                // A producer with no baseline yet (`None`) must not clear one the real
-                // instance has, or every subsequent poll re-seeds from `None` and silently
-                // disables restamping on real transitions. Locked by
-                // [`apply_status_update_propagates_live_status_baseline_from_poller`].
-                // See #2690.
-                if let Some(baseline) = new_live_status_baseline {
-                    inst.live_status_baseline = Some(baseline);
-                }
-                // The poller decided on a clone, so its detection bookkeeping reaches the
-                // next poll only through here; `None` is a producer that never detected and
-                // must not reset the row. See #3642.
-                if let Some(detection) = new_detection {
-                    inst.detection = detection;
-                }
-                inst.pane_dead_observed = new_pane_dead;
-            });
-
-            if let Some(old) = old_status {
-                if old != new_status {
-                    // Auto-mark unread when a turn finishes (Running -> Idle), unless the
-                    // user is viewing this session in live-send. Runs in both apply paths,
-                    // so a different session finishing while the user is attached elsewhere
-                    // is still marked; the attached session is cleared on attach-return.
-                    let is_live_target = self
-                        .live_send
-                        .as_ref()
-                        .is_some_and(|s| s.session_id == update.id);
-                    // Skip when already unread so a re-finishing session doesn't churn the
-                    // flock once per turn.
-                    let (already_unread, structured) = self
-                        .get_instance(&update.id)
-                        .map(|i| (i.is_unread(), i.is_structured()))
-                        .unwrap_or((false, false));
-                    // Structured rows are the daemon's: `should_mark_acp_unread` marks them
-                    // off the live ACP turn-end event and persists it there (#3181), so
-                    // marking here would be a second writer of the same boolean. The
-                    // `is_live_target` exemption is always inert for them because
-                    // `start_live_send` returns `None` for `is_structured()`, not because
-                    // they lack a pane (they can own terminal and tool panes). What clears
-                    // the mark for a structured row under the cursor is `tick_unread_dwell`,
-                    // which re-checks `is_unread()` every tick.
-                    let should_mark_unread = crate::session::unread_enabled()
-                        && !structured
-                        && old == Status::Running
-                        && new_status == Status::Idle
-                        && !is_live_target
-                        && !already_unread;
-
-                    // One flock for both the status/timestamp patch and the unread mark,
-                    // matching the daemon's per-tick batching instead of two `Storage::update`
-                    // calls on the same row.
-                    self.persist_passive_status_transition(&update.id, should_mark_unread);
-                    if should_mark_unread {
-                        self.mutate_instance(&update.id, |inst| inst.mark_unread());
-                    }
-
-                    if let Some(inst) = self.get_instance(&update.id).cloned() {
-                        self.handle_status_transition(
-                            &inst, old, new_status, play_sound, run_hooks,
-                        );
-                    }
+                for error in cleanup_errors {
+                    self.record_runtime_message(format!(
+                        "{id}: Session deletion committed, but cleanup is incomplete: {error}"
+                    ));
                 }
             }
-        } else if new_last_accessed.is_some() {
-            self.mutate_instance(&update.id, |inst| {
-                inst.last_accessed_at = new_last_accessed;
-                inst.pane_dead_observed = new_pane_dead;
-            });
-        } else {
-            // No status change and no fresh activity stamp, but pane_dead_observed still
-            // needs refreshing: a corpse can sit unchanged for hours and the sort tier
-            // should reflect reality. One bool write.
-            self.mutate_instance(&update.id, |inst| {
-                inst.pane_dead_observed = new_pane_dead;
-            });
+            crate::daemon::PurgeOutcome::Kept {
+                messages,
+                teardown_started,
+            } => {
+                self.record_runtime_message(format!(
+                    "{id}: Session kept{}.",
+                    if teardown_started {
+                        " after runtime teardown began"
+                    } else {
+                        " without runtime teardown"
+                    }
+                ));
+                for message in messages {
+                    self.record_runtime_message(format!("{id}: {message}"));
+                }
+            }
         }
     }
 
-    pub(super) fn handle_status_transition(
-        &self,
-        inst: &Instance,
-        old: crate::session::Status,
-        new: crate::session::Status,
-        play_sound: bool,
-        run_hooks: bool,
-    ) {
-        if play_sound {
-            crate::sound::play_for_transition(old, new, &self.sound_config);
+    fn apply_runtime_outcomes(&mut self) -> bool {
+        use crate::daemon::{NamespaceOutcome, ReorderOutcome};
+        use crate::tui::session_feed::{CommandFailure, SessionCommandOutcome};
+        let row_outcomes = self.session_feed.drain_session_outcomes();
+        let namespace = self.session_feed.drain_namespace_result();
+        let mut changed = !row_outcomes.is_empty() || namespace.is_some();
+        for (id, outcome) in row_outcomes {
+            match outcome {
+                SessionCommandOutcome::Trashed(receipt) => match receipt.outcome.relocation {
+                    crate::daemon::TrashRelocationOutcome::Failed { reason } => {
+                        self.record_runtime_message(format!("{id}: Session is in Trash, but its worktree relocation is incomplete: {reason}"));
+                    }
+                    crate::daemon::TrashRelocationOutcome::TeardownFailed { reason } => {
+                        self.record_runtime_message(format!("{id}: Session is in Trash, but its tmux sessions could not be stopped: {reason}"));
+                    }
+                    crate::daemon::TrashRelocationOutcome::Relocated {
+                        warning: Some(warning),
+                    } => self.record_runtime_message(format!("{id}: {warning}")),
+                    crate::daemon::TrashRelocationOutcome::Relocated { warning: None }
+                    | crate::daemon::TrashRelocationOutcome::Skipped => {}
+                },
+                SessionCommandOutcome::Purged(receipt) => {
+                    self.record_purge_outcome(&id, receipt.outcome)
+                }
+                SessionCommandOutcome::Renamed(receipt) => {
+                    for warning in receipt.outcome.warnings {
+                        self.record_runtime_message(format!("{id}: {warning}"));
+                    }
+                }
+                SessionCommandOutcome::WorktreeEdited(receipt) => {
+                    for warning in receipt.outcome.warnings {
+                        self.record_runtime_message(format!("{id}: {warning}"));
+                    }
+                }
+                SessionCommandOutcome::ProjectAttached(receipt) => {
+                    if self
+                        .info_dialog
+                        .as_ref()
+                        .is_some_and(|dialog| dialog.title() == "Attaching Project")
+                    {
+                        self.info_dialog = None;
+                    }
+                    let attached = receipt.outcome.attached;
+                    self.record_runtime_message(format!(
+                        "{id}: Attached '{}' at '{}' on branch '{}'{}{}.",
+                        attached.name,
+                        attached.worktree_path,
+                        attached.branch,
+                        if attached.branch_created {
+                            " (new branch)"
+                        } else {
+                            " (existing branch)"
+                        },
+                        attached
+                            .moved_to
+                            .map(|path| format!("; session moved to '{path}'"))
+                            .unwrap_or_default()
+                    ));
+                    for warning in receipt.outcome.warnings {
+                        self.record_runtime_message(format!("{id}: {warning}"));
+                    }
+                    self.record_runtime_message(match receipt.outcome.worker {
+                        crate::daemon::AttachedWorkerOutcome::Restarted => format!("{id}: The agent restarted and sees the attached project."),
+                        crate::daemon::AttachedWorkerOutcome::NotRunning => format!("{id}: The stopped agent will see the project on its next start."),
+                        crate::daemon::AttachedWorkerOutcome::RestartFailed { message } => format!("{id}: Project attachment committed, but the agent restart failed: {message}"),
+                    });
+                }
+                SessionCommandOutcome::Restored(receipt) => match receipt.outcome {
+                    crate::daemon::RestoreOutcome::Restored { warning } => {
+                        if let Some(warning) = warning {
+                            self.record_runtime_message(format!("{id}: {warning}"));
+                        }
+                        if self.selected_session.as_deref() == Some(id.as_str()) {
+                            self.select_session_by_id(&id);
+                        }
+                    }
+                    crate::daemon::RestoreOutcome::AlreadyRestored => self.record_runtime_message(
+                        format!("{id}: already restored; canonical state retained"),
+                    ),
+                },
+            }
         }
-        if run_hooks {
-            let hook_config = self.status_hook_config_for(inst);
-            crate::status_hooks::run_for_transition(inst, old, new, &hook_config);
+        if let Some(result) = namespace {
+            let intent = self.pending_namespace_intent.take();
+            match result {
+                Err(CommandFailure::Rejected(message)) => {
+                    if matches!(&intent, Some(NamespaceIntent::Reveal { .. })) {
+                        self.retained_reveal = intent;
+                        self.offer_retained_reveal();
+                    }
+                    self.record_runtime_message(format!("Namespace change rejected: {message}"))
+                }
+                Err(CommandFailure::Unknown(message)) => {
+                    if matches!(&intent, Some(NamespaceIntent::Reveal { .. })) {
+                        self.retained_reveal = intent;
+                    }
+                    self.pending_created_attach = None;
+                    self.namespace_unknown_message = Some(message);
+                    self.open_namespace_indeterminate_dialog();
+                }
+                Ok(receipt) => match receipt.outcome {
+                    NamespaceOutcome::Committed => match intent {
+                        Some(intent @ NamespaceIntent::Reveal { .. }) => {
+                            if let Err(error) = self.continue_reveal(intent) {
+                                self.record_runtime_message(format!("Reveal cancelled: {error}"));
+                            }
+                        }
+                        Some(NamespaceIntent::ProfileCreated(name)) => {
+                            if let Err(error) = self.switch_profile(Some(name)) {
+                                self.record_runtime_message(format!("Profile created, but changing the displayed profile failed: {error}"));
+                            }
+                        }
+                        Some(NamespaceIntent::ProfileDeleted(name)) => {
+                            self.rewire_after_profile_delete(&name);
+                            self.show_profile_picker();
+                        }
+                        _ => {}
+                    },
+                    NamespaceOutcome::DeletedGroup(outcome) => {
+                        if !outcome.group_removed {
+                            self.record_runtime_message(
+                                "The group remains in the canonical namespace.".to_owned(),
+                            );
+                        }
+                        for session in outcome.sessions {
+                            self.record_purge_outcome(&session.id, session.outcome);
+                        }
+                        for failure in outcome.failures {
+                            self.record_runtime_message(format!(
+                                "{}: {}",
+                                failure.id, failure.message
+                            ));
+                        }
+                    }
+                    NamespaceOutcome::Reordered(outcome) => match outcome {
+                        ReorderOutcome::Moved { destination } => {
+                            if let Some(NamespaceIntent::ReorderSession { id, .. }) = intent {
+                                self.follow_committed_reorder(&id, destination.as_ref());
+                            } else {
+                                self.rebuild_flat_items_keeping_cursor();
+                                self.update_selected();
+                            }
+                        }
+                        ReorderOutcome::AtEdge => {
+                            if let Some(NamespaceIntent::ReorderSession {
+                                id,
+                                profile,
+                                source_group,
+                                delta,
+                                crossing: false,
+                                continuation_destination,
+                            }) = intent
+                            {
+                                // A keystroke owns both steps, but each receipt has its
+                                // own applied fence. Never retarget to the new cursor.
+                                if self.instances.get(&id).is_some_and(|row| {
+                                    row.source_profile == profile
+                                        && row.group_path == source_group
+                                        && !row.is_archived()
+                                        && !row.is_trashed()
+                                }) {
+                                    if let Some(destination) = continuation_destination {
+                                        if destination.is_empty()
+                                            || self
+                                                .group_trees
+                                                .get(&profile)
+                                                .is_some_and(|tree| tree.group_exists(&destination))
+                                        {
+                                            if let Err(error) = self.submit_session_reorder(
+                                                &id,
+                                                delta,
+                                                Some(destination),
+                                            ) {
+                                                self.record_runtime_message(format!(
+                                                    "Could not cross the group boundary: {error}"
+                                                ));
+                                            }
+                                        } else {
+                                            let _ = self.refresh_after_stale_move();
+                                        }
+                                    }
+                                } else {
+                                    let _ = self.refresh_after_stale_move();
+                                }
+                            }
+                        }
+                        ReorderOutcome::Stale => {
+                            let _ = self.refresh_after_stale_move();
+                        }
+                    },
+                },
+            }
         }
+        if self.info_dialog.is_none() && !self.runtime_outcome_messages.is_empty() {
+            let messages = std::mem::take(&mut self.runtime_outcome_messages);
+            self.info_dialog = Some(InfoDialog::sized_to_fit(
+                "Runtime change",
+                &messages.join("\n"),
+            ));
+            changed = true;
+        }
+        changed
     }
 
-    pub(super) fn status_hook_config_for(
-        &self,
-        inst: &Instance,
-    ) -> crate::status_hooks::StatusHookConfig {
-        if self.active_profile.is_some() {
-            return self.status_hook_config.clone();
+    pub(super) fn open_namespace_indeterminate_dialog(&mut self) {
+        if !self.session_feed.namespace_indeterminate() {
+            return;
         }
-        let profile = inst.effective_profile();
-        self.status_hook_configs
-            .get(&profile)
-            .cloned()
-            .unwrap_or_else(|| self.status_hook_config.clone())
+        let message = self
+            .namespace_unknown_message
+            .as_deref()
+            .unwrap_or("The admitted namespace operation was interrupted.");
+        self.confirm_dialog = Some(ConfirmDialog::new("Resolve Unknown Namespace Outcome", &format!("{message}\n\nReview the current canonical sessions, groups and profiles. Resolving acknowledges uncertainty; it does not retry the operation. Keep Blocked leaves the namespace quarantined. Reopen with Ctrl+K: Resolve unknown runtime change."), "resolve_namespace_indeterminate").buttons("Acknowledge", "Keep Blocked"));
+    }
+
+    /// Open the oldest unresolved outcome without replaying its mutation.
+    pub(super) fn promote_next_indeterminate(&mut self) {
+        if self.session_feed.namespace_indeterminate() {
+            self.open_namespace_indeterminate_dialog();
+            return;
+        }
+        let Some((id, message)) = self.pending_indeterminate_queue.first().cloned() else {
+            return;
+        };
+        self.open_indeterminate_dialog(&id, &message);
     }
 }

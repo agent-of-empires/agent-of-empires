@@ -19,6 +19,7 @@ interface Props {
   keys: readonly ToolbarKeyId[];
   sendData: (data: string) => boolean;
   sendPaste: (text: string, submit: boolean) => boolean;
+  captureWriteAdmission: () => () => boolean;
   /** Opens the compose sheet, also the fallback when the clipboard cannot be read. */
   onCompose: () => void;
   keyboardOpen: boolean;
@@ -90,6 +91,7 @@ export function MobileTerminalToolbar({
   keys,
   sendData,
   sendPaste,
+  captureWriteAdmission,
   onCompose,
   keyboardOpen,
   compact,
@@ -121,6 +123,8 @@ export function MobileTerminalToolbar({
   );
 
   const paste = async () => {
+    const canWrite = captureWriteAdmission();
+    if (!canWrite()) return;
     haptic();
     if (!window.isSecureContext) {
       // No Clipboard API on a plain-HTTP origin.
@@ -131,6 +135,7 @@ export function MobileTerminalToolbar({
       return;
     }
     const text = await readClipboardText();
+    if (!canWrite()) return;
     if (!text) {
       // The compose sheet's native long-press paste still works.
       onCompose();

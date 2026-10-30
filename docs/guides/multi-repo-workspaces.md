@@ -6,19 +6,35 @@ For fixed sibling repos that rarely change, an [`on_create` hook](repo-config.md
 
 ## Quick start
 
-Register the repos once (see [the registry](#the-project-registry)), then start a session against them:
+Register repos once, then start a session:
 
 ```bash
 aoe project add /path/to/backend
 aoe project add /path/to/frontend
+aoe project add /path/to/shared-lib
 
 aoe add /path/to/backend --project frontend --project shared-lib \
   -w feat/auth-rewrite -b
 ```
 
-TUI: in the new-session dialog, focus **Extra Repos**, press `Ctrl+R`, and pick the registered projects. Web: pick a primary repo, then click projects in the **Extra repos** picker, or paste a path.
+TUI: in the new-session dialog (`n`), focus **Extra Repos**, press `Ctrl+R`, and select registered projects. Web: select a primary repo and use **Extra repos**, or enter a path.
 
-The session starts in the workspace root with the worktrees as siblings:
+### Per-repo base branches
+
+Each repo forks from `--base-branch` by default. Override one with `--repo-base <repo>=<branch>`:
+
+```bash
+aoe add /path/to/backend --project frontend \
+  -w feat/auth-rewrite -b --base-branch develop --repo-base frontend=epic/checkout
+```
+
+`<repo>` is the repo directory name or a `--repo` path; unmatched names fail rather than falling back. The web wizard exposes the same per-repo field. Each recorded base becomes its repo's diff comparison ref, changeable with `aoe session set-base --repo <name>`; see [Base override](diff-view.md#base-override).
+
+Worktree creation runs concurrently. A failed post-checkout hook leaves the completed checkout usable and surfaces a warning rather than aborting the workspace. See [Post-checkout hooks](worktrees.md#post-checkout-hooks).
+
+### Workspace layout
+
+The session starts in the workspace root with all the worktrees as siblings:
 
 ```
 ~/aoe-workspaces/feat-auth-rewrite/
@@ -29,26 +45,17 @@ The session starts in the workspace root with the worktrees as siblings:
 
 The agent navigates between them with ordinary `cd` and git commands; AoE imposes no cross-repo orchestration.
 
-Worktree creation runs concurrently, so the wall-clock cost is roughly the slowest repo rather than the sum. A failing post-checkout hook surfaces as a warning and does not abort the workspace, as for [single-repo worktrees](worktrees.md#warnings-during-create).
+### Adding a repo to an existing session
 
-### Per-repo base branches
-
-Each repo's branch forks from `--base-branch` by default. `--repo-base <repo>=<branch>` overrides one, so a workspace can start with one repo on `develop` and another on its own epic branch:
-
-```bash
-aoe add /path/to/backend --project frontend \
-  -w feat/auth-rewrite -b --base-branch develop --repo-base frontend=epic/checkout
-```
-
-`<repo>` is the repo's directory name or a path you passed to `--repo`; an unmatched name is an error rather than a silent fallback. The web wizard has the same field per repo. The base each repo forked from becomes its default diff comparison ref (see [Base override](diff-view.md#base-override)), changeable later with `aoe session set-base --repo <name>`.
-
-## Adding a repo to an existing session
+Add a repository without recreating the session:
 
 ```bash
 aoe session add-project <session> frontend
 ```
 
-Web and TUI: **Add project** on the session's right-click menu, or the command palette. Afterwards the session is indistinguishable from one created with `--project`: both repos sit under one workspace directory and `aoe list --json` reports both in `workspace_repos`.
+Web and TUI: choose **Add project** on the session's context menu, or use the command palette. The result is the same workspace shape as `--project`, reported in `aoe list --json` as `workspace_repos`.
+
+What that means for the session depends on the shape it started in:
 
 | Session was | What happens | Working directory |
 |---|---|---|
@@ -60,9 +67,11 @@ That last row is why AoE never touches your own checkout: it creates a worktree 
 
 The session's branch name is a suggestion: if the added repo lacks that branch, AoE creates it from that repo's own base. If it already exists the attach is refused, since a same-named branch elsewhere can hold unrelated commits; pass `--attach-existing-branch` (or tick the box in the web modal) to check it out as-is, and AoE then leaves that branch alone when the session is deleted.
 
-Unless the session is already a workspace, its directory moves, so it is stopped for the move and restarted. A known conversation bound to the old directory blocks the move; other sessions may attempt to resume their stored ID, but continuity is not guaranteed. Attaching is refused mid-turn. Validation runs before stopping; if conversion later fails, AoE attempts to restore the worker. Scratch sessions cannot be attached to.
+Unless the session is already a workspace, its directory moves, so it is stopped for the move and restarted. A known conversation bound to the old directory blocks the move; other sessions may attempt to resume their stored ID, but continuity is not guaranteed. Attaching is refused mid-turn. Everything that can refuse the attach is checked before stopping; if conversion later fails, AoE attempts to restore the worker.
 
-A sandboxed session has its container recreated, since bind mounts are fixed at creation and the container mounts the common ancestor of the workspace and every repo. Build caches go with the container under the default [volume ignores strategy](sandbox.md#volume-ignores); under `"named"` they are keyed on their container path and survive an attach that leaves that path alone. Attaching a repo from outside the current common ancestor moves every mount, so those caches start cold and the volumes they leave behind need removing by hand.
+Scratch sessions cannot accept attached repositories; they have no repository of their own.
+
+A sandboxed session has its container recreated, since bind mounts are fixed at creation and the container mounts the common ancestor of the workspace and every repo. Build caches go with the container under the default [volume ignores strategy](sandbox.md#volume-ignores-strategy); under `"named"` they are keyed on their container path and survive an attach that leaves that path alone. Attaching a repo from outside the current common ancestor moves every mount, so those caches start cold and the volumes they leave behind need removing by hand.
 
 ## The project registry
 
@@ -73,26 +82,41 @@ Saved repo paths the pickers draw from, in two scopes:
 | Global | `<app_dir>/projects.json` | Every profile |
 | Profile | `<app_dir>/profiles/{profile}/projects.json` | Only that profile |
 
-```bash
-aoe project list [--scope global|profile] [--json]   # merged by default
-aoe project add /path/to/repo [--name shortname] [--scope profile]
-aoe project remove backend                           # by name or canonical path
-```
+See [File Locations](configuration.md#file-locations) for `<app_dir>`. `aoe project add` defaults to global, or to the selected profile with `-p <profile>`; `--scope global` or `--scope profile` overrides that choice. A path already registered in another scope is refused unless `--allow-override` lets a profile entry shadow the global one.
 
-`aoe project add` defaults to global, or to the profile when you pass `-p <profile>`. Adding a path that exists in another scope is an error unless you pass `--allow-override`, which lets a profile entry shadow the global one and win in merged views.
+Registered Projects appear in pickers even without sessions. **Pinning** keeps a project header visible when empty; unpinning leaves the registration intact. Only **Remove** or `aoe project remove` deletes the entry.
 
-A saved project appears in the pickers whether or not it has sessions. **Pinning** is separate: it keeps the project's header visible in the sidebar even with zero sessions. So unpinning does not delete a project; only `aoe project remove` (or the **Remove** action) deletes the registry entry.
+Pin from the TUI project view (`g`, Project grouping, then `p` on a header or its context menu), or the web project header's actions menu. Pinning registers an unregistered repo globally and marks it with `◆`. Empty pinned web projects sort below active repositories and retain their **New session** action. Pins live in the registry and appear on the other surface when refreshed.
 
-Pin from the TUI project view (press `g`, pick Project grouping, then `p` on a header, or use its right-click menu) or from the web sidebar's project header menu. Pinning registers the repo globally if it was not saved yet, marks the header with `◆`, and sorts pinned-but-empty projects below active repositories. The pin lives in the registry, so it shows up on the other surface too.
+## CLI
 
-## Where workspaces appear
+Use `aoe project list`, `aoe project add <path>` and `aoe project remove <name-or-path>` to manage registrations. See the [CLI Reference](../cli/reference.md) for scope, naming, override and JSON flags.
 
-- **TUI**: press `b` from the home view (or the command palette's "New session from saved project") for a filterable picker over the merged registry. Selecting one pre-fills the new-session dialog.
-- **Web**: the sidebar's [Projects section](web/dashboard.md#projects) manages the registry, and the wizard surfaces it as toggleable chips with a free-text input for unregistered paths. Multi-repo sessions are bucketed into a single **Multi-repo** group at the bottom of the sidebar, each row showing a chip per repo. Read-only servers hide the destructive controls.
-- **CLI**: `--repo` (a literal path) and `--project` (a registered name) may be mixed, and the builder rejects duplicate repo names, so the same repo via two paths is a hard error. `aoe list --json` carries `workspace_repos`, empty for single-repo sessions.
+`--repo` accepts literal paths and can be mixed with registered `--project` names. Duplicate repo names, including the same repo reached through two paths, are refused. `aoe list --json` reports `workspace_repos`, empty for single-repo sessions.
+
+## TUI
+
+From the home view, press `b` (or `B` with strict hotkeys) to open a filterable picker over the merged registry. Selecting a project opens the new-session dialog pre-filled with that project's path. The same action is available from the `Ctrl+K` command palette ("New session from saved project"). With no registered projects, the picker is replaced by a "No Projects" prompt pointing at `aoe project add`.
+
+## Web Dashboard
+
+Use the sidebar's **Projects, no sessions** section to add a Project, edit its default base branch, or remove its registration. Unpin a project first if it is displayed as a persistent repository header. Changing a registration's name, path, or scope requires removing and adding it again. Read-only servers hide mutation controls.
+
+Remove targets the registrations represented by that project row, using the profile captured when the action starts. It does not request deletion from unrelated profiles. Global registrations are shared, so removing one changes every profile's merged view.
+
+Registered Project suggestions in the new-session wizard follow the selected profile. An open project form keeps its original profile even if the daemon's default profile changes. The picker for adding a repository to an existing session uses that session's profile. Unregistered paths can still be entered directly.
+
+Multi-repo sessions are bucketed into a single **Multi-repo** group at the bottom of the sidebar, regardless of which repo was chosen as the primary. Each session row shows a chip per repo under the title.
 
 ## Limitations
 
-- One branch name per workspace: every repo gets the same `-w <branch>`.
-- The agent cannot add a repo to its own session; attaching may restart the agent without resuming its conversation.
-- No saved workspace templates, and no per-repo PR tracking.
+- **One branch name per workspace**: every repo gets the same `-w <branch>` value.
+- **No agent-driven repo pull-in**: the agent cannot add a repo to its own session; attaching may restart the agent without resuming its conversation.
+- **No saved workspace templates**: each session picks the repo set fresh.
+- **No per-repo PR tracking**: coordinated PR workflow happens outside AoE.
+
+## Related
+
+- [Worktrees Reference](worktrees.md): how the per-repo worktrees are created.
+- [Repository Configuration & Hooks](repo-config.md): `on_create` hooks for fixed sibling repos that don't need a registry entry.
+- [CLI Reference](../cli/reference.md): full `aoe project` and `aoe add --project` flag listing.

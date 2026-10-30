@@ -17,6 +17,8 @@ export function profileDefaults(settings: Settings, preferredTool: string, curre
   const sandbox = settings.sandbox;
   const worktree = settings.worktree;
   const tool = preferredTool || (session?.default_tool as string) || "";
+  const structuredView = settings.acp?.structured_view ?? "structured";
+  // `acp_defaults` lives in the [acp] section, not [session] (moved by v019).
   const acp = (settings.acp?.acp_defaults as Obj)?.[tool || currentTool] as Obj;
   return {
     yoloMode: (session?.yolo_mode_default as boolean) ?? false,
@@ -29,7 +31,7 @@ export function profileDefaults(settings: Settings, preferredTool: string, curre
       : [],
     agentModel: typeof acp?.model === "string" ? acp.model : "",
     agentEffort: typeof acp?.effort === "string" ? acp.effort : "",
-    // `auto` (or unset) keeps the dashboard's own default, the structured view.
-    useStructuredView: settings.acp?.default_new_session_view !== "terminal",
+    structuredViewOffered: structuredView !== "off",
+    useStructuredView: structuredView === "structured",
   };
 }

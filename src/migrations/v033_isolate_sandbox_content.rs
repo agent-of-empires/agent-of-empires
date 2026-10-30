@@ -17,6 +17,37 @@ const RECEIPTS: &str = "sandbox-content-receipts";
 pub(crate) const RECOVERY: &str = ".aoe-sandbox-recovery";
 pub(crate) const CONTENT_POLICY: u8 = 1;
 
+#[cfg(test)]
+pub(super) struct TestReconcileGuard {
+    content: Option<TestReconcileProbes>,
+    layout: Option<layout::TestReconcileProbes>,
+}
+
+#[cfg(test)]
+impl Drop for TestReconcileGuard {
+    fn drop(&mut self) {
+        TEST_RECONCILE_PROBES.set(self.content);
+        layout::TEST_RECONCILE_PROBES.set(self.layout);
+    }
+}
+
+#[cfg(test)]
+pub(super) fn install_test_reconcile_probes(
+    running: fn(&str) -> Result<bool>,
+    reap: fn(&str) -> Result<bool>,
+    exposure: fn(&str) -> Result<Vec<PathBuf>>,
+) -> TestReconcileGuard {
+    TestReconcileGuard {
+        content: TEST_RECONCILE_PROBES.replace(Some(TestReconcileProbes {
+            running,
+            reap,
+            exposure,
+        })),
+        layout: layout::TEST_RECONCILE_PROBES
+            .replace(Some(layout::TestReconcileProbes { running, reap })),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ContentRoot {
     pub(crate) path: PathBuf,
@@ -163,7 +194,13 @@ fn claim_context_reset(
         "starts a fresh"
     };
     let labelled = agent.unwrap_or(instance.tool.as_str());
-    Some((format!("Sandbox native history was isolated; this launch {context} {labelled} conversation. The existing AoE transcript is retained. Complete originals: {}", recovery.into_iter().collect::<Vec<_>>().join(", ")), slots))
+    Some((
+        format!(
+            "Sandbox native history was isolated; this launch {context} {labelled} conversation. The existing AoE transcript is retained. Complete originals: {}",
+            recovery.into_iter().collect::<Vec<_>>().join(", ")
+        ),
+        slots,
+    ))
 }
 
 pub(crate) struct AcpLaunchContext {
@@ -447,7 +484,7 @@ pub(crate) fn canonical_expected_path(path: &Path) -> Result<PathBuf> {
                 existing = existing.parent().context("content path has no parent")?;
             }
             Err(error) => {
-                return Err(error).with_context(|| format!("resolving {}", path.display()))
+                return Err(error).with_context(|| format!("resolving {}", path.display()));
             }
         }
     }
@@ -539,7 +576,10 @@ fn guard_other_transactions(
             .iter()
             .any(|part| roots.iter().any(|root| root.path == part.root.path))
         {
-            bail!("sandbox {instance} has an unfinished {} content transition; restore that tool's original configuration and finish aoe migrate before sharing its roots", receipt.tool);
+            bail!(
+                "sandbox {instance} has an unfinished {} content transition; restore that tool's original configuration and finish aoe migrate before sharing its roots",
+                receipt.tool
+            );
         }
     }
     Ok(())
@@ -903,19 +943,15 @@ fn retain_legacy_original_with(
 fn read_registries(app: &Path) -> Result<Vec<(PathBuf, Value)>> {
     let mut registries = Vec::new();
     for path in layout::registry_paths(app)? {
-        match serde_json::from_slice(&fs::read(&path)?) {
-            Ok(value) => registries.push((path, value)),
-            // A registry AoE cannot parse is a pre-existing anomaly it cannot
-            // reason about; skipping it with a warning keeps one corrupt file
-            // from bricking every launch and migration, matching the reuse path
-            // that already tolerates a failed reload.
-            Err(error) => tracing::warn!(
-                target: "session.store",
-                registry = %path.display(),
-                error = %error,
-                "skipping unparseable session registry",
-            ),
-        }
+        let value = (|| -> Result<Value> { layout::decode_session_inventory(&fs::read(&path)?) })()
+            .map_err(|source| {
+                let profile = layout::profile_for_registry(app, &path);
+                layout::SandboxCheckpointFailure {
+                    profile: (!profile.is_empty()).then_some(profile),
+                    source,
+                }
+            })?;
+        registries.push((path, value));
     }
     Ok(registries)
 }
@@ -1088,7 +1124,9 @@ fn prove_binds<'a>(
 ) -> Result<()> {
     for (source, before) in sources.iter().zip(before) {
         if !bind_identifies_mount(lines.next(), before, source_identity(source)?.as_ref()) {
-            bail!("live sandbox {id} source spelling does not identify its actual mount; defer native content isolation");
+            bail!(
+                "live sandbox {id} source spelling does not identify its actual mount; defer native content isolation"
+            );
         }
     }
     if lines.next().is_some() {
@@ -2064,7 +2102,9 @@ fn checked_receipt(
     if let Some(receipt) = read_receipt(&path)? {
         let matches = receipt_matches(&receipt, id, tool, roots);
         if !matches && receipt.phase != Phase::Committed {
-            bail!("unfinished content transition has a different root or role plan; restore the original configuration and finish aoe migrate; its originals and journal are retained");
+            bail!(
+                "unfinished content transition has a different root or role plan; restore the original configuration and finish aoe migrate; its originals and journal are retained"
+            );
         }
         uuid::Uuid::parse_str(&receipt.transaction)
             .context("invalid content transaction identity")?;
@@ -2275,8 +2315,24 @@ fn reconcile_in(
     reap: &dyn Fn(&str) -> Result<bool>,
     exposure: &ExposureProbe<'_>,
 ) -> Result<()> {
+    let registries = match read_registries(app) {
+        Ok(registries) => registries,
+        Err(error) => {
+            if let Some(profile) = (!move_stores && only.is_none())
+                .then_some(&error)
+                .and_then(layout::initial_profile_inventory_failure)
+            {
+                tracing::warn!(target: "session.store", profile, %error, "Sandbox content isolation remains pending");
+                progress::notice(format!(
+                    "sandbox content isolation remains pending: profile {profile:?} has invalid session inventory; repair it and retry"
+                ));
+                return Ok(());
+            }
+            return Err(error);
+        }
+    };
     let mut targets = BTreeMap::new();
-    for (path, registry) in read_registries(app)? {
+    for (path, registry) in registries {
         for row in registry
             .as_array()
             .context("session registry must be an array")?
@@ -2310,7 +2366,9 @@ fn reconcile_in(
                     return Err(error);
                 }
                 tracing::warn!(target: "session.profile", %error, %id, %tool, "Native source kept changing during content isolation");
-                progress::notice(format!("sandbox {id}: native configuration kept changing; content isolation remains pending"));
+                progress::notice(format!(
+                    "sandbox {id}: native configuration kept changing; content isolation remains pending"
+                ));
             }
         } else {
             let config = crate::session::config::profile_config::resolve_config(
@@ -2325,7 +2383,9 @@ fn reconcile_in(
                 }
                 let roots = row_roots(&row, &tool, home, &config)?;
                 if !roots_ready(app, &id, &tool, &roots)? {
-                    progress::notice(format!("sandbox {id}: native content isolation pending; originals will be preserved before a fresh native session starts"));
+                    progress::notice(format!(
+                        "sandbox {id}: native content isolation pending; originals will be preserved before a fresh native session starts"
+                    ));
                 }
             }
         }
@@ -2391,13 +2451,16 @@ fn reconcile_pending_with_home(move_stores: bool, home: Option<PathBuf>) -> Resu
             &probes.exposure,
         );
     }
+    let runtime = crate::containers::get_container_runtime();
+    let running = layout::batched_running_probe(&runtime, false);
+    let reap = |id: &str| layout::reap_migrated_container(id, &runtime);
     reconcile_in(
         &app,
         &home,
         None,
         move_stores,
-        &layout::batched_running_probe(false),
-        &layout::reap_migrated_container,
+        &running,
+        &reap,
         &live_bind_sources,
     )
 }
@@ -2405,13 +2468,16 @@ fn reconcile_pending_with_home(move_stores: bool, home: Option<PathBuf>) -> Resu
 pub(crate) fn migrate_instance(id: &str) -> Result<()> {
     let app = crate::session::get_app_dir()?;
     let home = dirs::home_dir().context("home directory unavailable for content isolation")?;
+    let runtime = crate::containers::get_container_runtime();
+    let running = layout::batched_running_probe(&runtime, false);
+    let reap = |id: &str| layout::reap_migrated_container(id, &runtime);
     reconcile_in(
         &app,
         &home,
         Some(id),
         true,
-        &layout::batched_running_probe(false),
-        &layout::reap_migrated_container,
+        &running,
+        &reap,
         &live_bind_sources,
     )
 }
@@ -2465,7 +2531,9 @@ fn ensure_fresh_content_with(
                         && (identity(&root.path)?.is_some()
                             || certificate_path(app, instance, &root.path)?.exists())
                     {
-                        bail!("sandbox {instance} has unproven native content; stop it and run aoe migrate before relaunch");
+                        bail!(
+                            "sandbox {instance} has unproven native content; stop it and run aoe migrate before relaunch"
+                        );
                     }
                 }
             }
@@ -2540,7 +2608,10 @@ pub(crate) fn admit_fresh_instance(
     instance: &crate::session::Instance,
 ) -> Result<crate::session::StorageFlock> {
     if instance.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION {
-        bail!("sandbox {} still uses a legacy shared store; stop the other owners and run aoe migrate", instance.id);
+        bail!(
+            "sandbox {} still uses a legacy shared store; stop the other owners and run aoe migrate",
+            instance.id
+        );
     }
     let app = crate::session::get_app_dir()?;
     let home = dirs::home_dir().context("home directory unavailable for content isolation")?;
@@ -2789,34 +2860,6 @@ mod tests {
         assert_eq!(identity(parent.path()).unwrap(), identity(&nested).unwrap());
         parent.create_child(Path::new("stage/tree/nested")).unwrap();
         assert!(nested.join("stage/tree/nested").is_dir());
-    }
-
-    struct TestReconcileGuard {
-        content: Option<TestReconcileProbes>,
-        layout: Option<layout::TestReconcileProbes>,
-    }
-
-    impl Drop for TestReconcileGuard {
-        fn drop(&mut self) {
-            TEST_RECONCILE_PROBES.set(self.content);
-            layout::TEST_RECONCILE_PROBES.set(self.layout);
-        }
-    }
-
-    fn install_test_reconcile_probes(
-        running: fn(&str) -> Result<bool>,
-        reap: fn(&str) -> Result<bool>,
-        exposure: fn(&str) -> Result<Vec<PathBuf>>,
-    ) -> TestReconcileGuard {
-        TestReconcileGuard {
-            content: TEST_RECONCILE_PROBES.replace(Some(TestReconcileProbes {
-                running,
-                reap,
-                exposure,
-            })),
-            layout: layout::TEST_RECONCILE_PROBES
-                .replace(Some(layout::TestReconcileProbes { running, reap })),
-        }
     }
 
     /// The same-kernel mount proof runs only for a running container on a
@@ -3455,6 +3498,94 @@ mod tests {
         let registry = app.join("sessions.json");
         fs::write(&registry, serde_json::to_vec(&rows).unwrap()).unwrap();
         (app, registry, instance, roots)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn incomplete_inventory_never_retires_or_certifies_native_content() {
+        for operation in ["notify", "bulk", "scoped", "recovery", "fresh"] {
+            let temporary = tempfile::tempdir().unwrap();
+            let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+            let home = dirs::home_dir().unwrap();
+            let (app, registry, instance, roots) = stopped_original_beside(temporary.path(), &[]);
+            let original = fs::read(&registry).unwrap();
+            let damaged = app.join("profiles/damaged/sessions.json");
+            fs::create_dir_all(damaged.parent().unwrap()).unwrap();
+            fs::write(&damaged, b"{").unwrap();
+            let targets = migration_targets(&app, &roots).unwrap();
+            let exposure = |_: &str| Ok(Vec::new());
+            assert!(recovery_exposure(&app, &targets, &exposure).is_err());
+            let fresh_id = "4444444444444444";
+            let config = crate::session::Config::default();
+            let fresh_roots = container_config::sandbox_content_roots(
+                "codex",
+                None,
+                &config.session,
+                &home,
+                fresh_id,
+            )
+            .unwrap();
+            let result = match operation {
+                "notify" | "bulk" | "scoped" => reconcile_in(
+                    &app,
+                    &home,
+                    (operation == "scoped").then_some(instance.id.as_str()),
+                    operation == "bulk",
+                    &|_| panic!("the initial incomplete inventory must stop before liveness"),
+                    &|_| panic!("the initial incomplete inventory must stop before reaping"),
+                    &exposure,
+                ),
+                "recovery" => migrate_target(
+                    &app,
+                    &home,
+                    (&registry, &instance.id, "codex"),
+                    &|_| Ok(false),
+                    &|_| Ok(true),
+                    &exposure,
+                )
+                .map(drop),
+                "fresh" => ensure_fresh_content_with(
+                    &app,
+                    &home,
+                    (fresh_id, "codex"),
+                    &fresh_roots,
+                    &config,
+                    temporary.path(),
+                    &exposure,
+                )
+                .map(drop),
+                _ => unreachable!(),
+            };
+            if operation == "notify" {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(
+                    layout::initial_profile_inventory_failure(&error),
+                    Some("damaged"),
+                    "{operation}: {error:#}"
+                );
+            }
+            assert_eq!(fs::read(&registry).unwrap(), original, "{operation}");
+            assert_eq!(fs::read(&damaged).unwrap(), b"{", "{operation}");
+            assert_eq!(
+                fs::read(roots[0].path.join("sessions/original.jsonl")).unwrap(),
+                b"PRIVATE_ORIGINAL_CONTEXT",
+                "{operation}",
+            );
+            assert!(
+                !app.join(RECEIPTS).exists(),
+                "{operation}: no receipt or certificate may be written"
+            );
+            assert!(
+                targets.iter().all(|path| !path.exists()),
+                "{operation}: no recovery publication"
+            );
+            assert!(
+                !fresh_roots[0].path.exists(),
+                "{operation}: no fresh content may be certified"
+            );
+        }
     }
 
     /// #4239: a live sandbox whose hook directory was removed from the host
@@ -4578,6 +4709,7 @@ mod tests {
             custom_instruction: None,
             container_workdir: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
         });
         drop(admit_fresh_instance(&instance).unwrap());
         let storage = crate::session::Storage::new_unwatched("default").unwrap();
@@ -5475,6 +5607,7 @@ mod tests {
         .unwrap();
         let original_identity = identity(&legacy).unwrap();
         let mut row = serde_json::to_value(&instance).unwrap();
+        row["terminal_handoff"] = serde_json::Value::Null;
         row["sandbox_store_generation"] = serde_json::json!(1);
         row["sandbox_info"] = serde_json::json!({"enabled": true, "image": "img", "container_name": "aoe-sandbox-fixture"});
         let registry = serde_json::to_vec(&vec![row]).unwrap();

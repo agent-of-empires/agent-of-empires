@@ -8,10 +8,12 @@ use std::time::{Duration, Instant};
 
 use rattles::presets::prelude as spinners;
 
+use super::bindings::ActionId;
 use super::{
-    live_send, HomeView, TerminalMode, ViewMode, ICON_ARCHIVED_SECTION, ICON_COLLAPSED,
-    ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED, ICON_FAVORITE, ICON_IDLE, ICON_PINNED,
-    ICON_STOPPED, ICON_TERMINAL, ICON_TRASH_SECTION, ICON_UNKNOWN, ICON_UNREAD,
+    get_indent, live_send, DragKind, HomeView, TerminalMode, ViewMode, ICON_ARCHIVED_SECTION,
+    ICON_COLLAPSED, ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED, ICON_FAVORITE,
+    ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_TERMINAL, ICON_TRASH_SECTION, ICON_UNKNOWN,
+    ICON_UNREAD,
 };
 use crate::containers::image_update::ImageUpdate;
 use crate::session::config::{GroupByMode, RowTagMode, SidebarPosition, SortOrder};
@@ -58,6 +60,7 @@ fn compose_list_title(
     format!(" {}{}{} ", prefix, profile_tag, suffix)
 }
 
+/// Pane arrangement used to keep one shared separator between list and preview.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum ListLayout {
     Horizontal(SidebarPosition),
@@ -129,41 +132,29 @@ fn live_resize_retry_due(
 /// Matches tmux's default `history-limit` and the VT grid's `SCROLLBACK_LINES`.
 const READING_CAPTURE_LINES: u16 = 2000;
 
-/// Screen cell showing the input pane's `(0, 0)`, unclipped and possibly outside
-/// `view.pane`. On a composite this is pane 0's origin from
-/// [`crate::tmux::PaneCursor::composite_pane0`]. The pane is the capture's last
-/// `pane_height` lines and row `k` paints line `first_line + k`, so this holds at the live
-/// tail and scrolled back alike. Shared by the cursor painter and pointer mapping so a
-/// click on a painted cell reaches the same pane cell.
-pub(super) fn live_pane_origin(
-    view: super::PreviewTextView,
-    cursor: &crate::tmux::PaneCursor,
-) -> (i32, i32) {
-    let pane_top = view.total_lines as i32 - cursor.pane_height as i32 - view.first_line as i32;
-    let (left, top) = cursor
-        .composite_pane0
-        .map_or((0, 0), |rect| (rect.left as i32, rect.top as i32));
-    (
-        view.pane.x as i32 + left,
-        view.pane.y as i32 + pane_top + top,
-    )
-}
-
-/// Map a tmux pane cursor onto the painted preview for live-send, from
-/// [`live_pane_origin`]. That keeps the cursor on the same text row for the status-row
-/// offset (#3515) and the shorter-pane case (#2742). A hidden or out-of-bounds cursor
-/// yields `None`.
+/// Map a tmux pane cursor onto the preview's output rect for live-send.
+///
+/// `cursor.x`/`y` are pane relative; on a composite, add the pane origin from
+/// [`crate::tmux::PaneCursor::composite_pane0`]. The renderer bottom-anchors captures that
+/// overflow `output`, so the row is `output.y + min(line_count, visible_rows) -
+/// pane_height + top + cursor.y`, while a short capture anchors at the top. That keeps the
+/// cursor on the same text row for the status-row offset (#3515) and the shorter-pane case
+/// (#2742). A hidden or out-of-bounds cursor yields `None`.
 pub(super) fn map_live_preview_cursor(
-    view: super::PreviewTextView,
+    output: Rect,
+    visible_rows: usize,
+    line_count: usize,
     cursor: crate::tmux::PaneCursor,
 ) -> Option<Position> {
     if !cursor.visible {
         return None;
     }
-    let output = view.pane;
-    let (x, y) = live_pane_origin(view, &cursor);
-    let row = y + cursor.y as i32;
-    let col = x + cursor.x as i32;
+    let anchor = line_count.min(visible_rows) as i32;
+    let (left, top) = cursor
+        .composite_pane0
+        .map_or((0, 0), |rect| (rect.left as i32, rect.top as i32));
+    let row = output.y as i32 + (anchor - cursor.pane_height as i32) + top + cursor.y as i32;
+    let col = output.x as i32 + left + cursor.x as i32;
     if row < output.y as i32
         || row >= output.y as i32 + output.height as i32
         || col < output.x as i32
@@ -172,6 +163,36 @@ pub(super) fn map_live_preview_cursor(
         return None;
     }
     Some(Position::new(col as u16, row as u16))
+}
+
+/// Follow a trusted captured cursor when a shared pane is taller than its passive view.
+fn passive_capture_scroll_offset(
+    line_count: usize,
+    visible_rows: usize,
+    cursor: Option<crate::tmux::PaneCursor>,
+) -> u16 {
+    let Some(cursor) = cursor else {
+        return 0;
+    };
+    if !cursor.visible
+        || !cursor.position_reliable
+        || visible_rows == 0
+        || usize::from(cursor.pane_height) <= visible_rows
+    {
+        return 0;
+    }
+    let origin = cursor.composite_pane0.map_or(0, |rect| rect.top as i64);
+    let row = line_count as i64 - i64::from(cursor.pane_height) + origin + i64::from(cursor.y);
+    if row < 0 || row >= line_count as i64 {
+        return 0;
+    }
+    let (tail_top, _) = preview::visible_line_range(line_count, visible_rows, 0);
+    let screen_top = line_count.saturating_sub(usize::from(cursor.pane_height));
+    let top = (row as usize + 1)
+        .saturating_sub(visible_rows)
+        .max(screen_top)
+        .min(tail_top);
+    tail_top.saturating_sub(top).min(u16::MAX as usize) as u16
 }
 
 /// Rows each split half needs; a shorter preview stays single.
@@ -434,9 +455,7 @@ pub(crate) fn agent_row_icon(inst: &crate::session::Instance) -> &'static str {
             Status::Creating => spinner_starting(&inst.created_at),
         }
     };
-    // Error and Deleting are live operation states this TUI set, not stale persisted pane
-    // statuses, so they punch through the sunk-row mask below; swallowing them left a
-    // failed Empty Trash indistinguishable from a healthy trash row.
+    // Canonical operation failures and deletion remain visible on sunk rows.
     if matches!(inst.status, Status::Error | Status::Deleting) {
         return icon;
     }
@@ -447,10 +466,8 @@ pub(crate) fn agent_row_icon(inst: &crate::session::Instance) -> &'static str {
     }
 }
 
-/// A view mode's contribution to a session row: glyph, color and any modifier describing
-/// its own backing pane. Structured seeds from `Instance.status`, Terminal from the paired
-/// terminal's liveness, Tool from the tool pane's. Everything layered on top is
-/// mode-independent and lives in [`decorate_row`].
+/// Mode-specific glyph, color and modifier from canonical agent or pane observations.
+/// Mode-independent decoration lives in [`decorate_row`].
 struct RowSeed {
     icon: &'static str,
     color: Color,
@@ -459,9 +476,7 @@ struct RowSeed {
 
 /// How a view mode resolves a sunk row (archived / trashed / snoozed).
 enum SunkRow {
-    /// Structured: the agent's own resting glyph. Error and Deleting punch through the
-    /// sink mask (they are live delete-op states, not stale pane statuses) and the seed
-    /// carries `ICON_ERROR` + `theme.error`; [`agent_row_icon`] makes the same exception.
+    /// Agent status, including canonical Error and Deleting on sunk rows.
     AgentStatus(&'static str),
     /// Terminal / Tool: one muted glyph, unconditionally. These seeds describe pane
     /// liveness and carry no error affordance, so a delete-op status punching through
@@ -530,9 +545,7 @@ fn decorate_row(
     (icon, title_text, style)
 }
 
-/// Append the selected row's `last_error` in red to a shelf placeholder when the row sits
-/// in `Status::Error`, where `apply_deletion_results` parks a failed permanent delete.
-/// Without it the calm placeholder swallowed the failure.
+/// Show canonical row errors and typed purge/trash failures on shelf placeholders.
 fn push_shelf_error_lines(
     lines: &mut Vec<Line<'static>>,
     inst: Option<&crate::session::Instance>,
@@ -557,18 +570,15 @@ fn push_shelf_error_lines(
     }
 }
 
-/// Centered placeholder body: heading, message, the selected row's `last_error`, and an
-/// optional hint. `wrap` is set by the shelf placeholders, whose prose is
-/// title-dependent; the fixed-copy ones lay their own lines out.
 struct Placeholder<'a> {
-    heading: &'a str,
-    body: String,
+    heading: &'static str,
+    body: std::borrow::Cow<'static, str>,
     inst: Option<&'a crate::session::Instance>,
     hint: Option<Line<'static>>,
     wrap: bool,
 }
 
-fn render_placeholder(frame: &mut Frame, area: Rect, theme: &Theme, placeholder: Placeholder) {
+fn render_placeholder(frame: &mut Frame, area: Rect, theme: &Theme, placeholder: Placeholder<'_>) {
     let Placeholder {
         heading,
         body,
@@ -579,7 +589,7 @@ fn render_placeholder(frame: &mut Frame, area: Rect, theme: &Theme, placeholder:
     let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled(
-            heading.to_string(),
+            heading,
             Style::default().fg(theme.text).bold(),
         )),
         Line::from(""),
@@ -599,12 +609,11 @@ fn render_placeholder(frame: &mut Frame, area: Rect, theme: &Theme, placeholder:
     frame.render_widget(para, area);
 }
 
-/// A `Press <key><tail>` hint line for a placeholder.
-fn press_hint(theme: &Theme, key: &str, tail: &str) -> Line<'static> {
+fn press_hint(theme: &Theme, key: &'static str, tail: &'static str) -> Line<'static> {
     Line::from(vec![
         Span::styled("Press ", Style::default().fg(theme.dimmed)),
-        Span::styled(key.to_string(), Style::default().fg(theme.hint).bold()),
-        Span::styled(tail.to_string(), Style::default().fg(theme.dimmed)),
+        Span::styled(key, Style::default().fg(theme.hint).bold()),
+        Span::styled(tail, Style::default().fg(theme.dimmed)),
     ])
 }
 
@@ -913,6 +922,16 @@ impl HomeView {
         }
         self.collapse_button_area = Rect::default();
         self.expand_strip_area = Rect::default();
+        self.divider_row = None;
+        self.main_area_height = 0;
+        if self.has_non_live_send_overlay()
+            && matches!(
+                self.drag_state,
+                Some(DragKind::ListDivider | DragKind::StackedListDivider)
+            )
+        {
+            self.handle_drag_end();
+        }
         // Hyperlink cells are per-frame: a takeover view or a link-free preview must
         // leave none behind for the backend to re-emit. Recover from poison rather than
         // skip, or the last recorded set would be re-wrapped over unrelated cells forever.
@@ -920,6 +939,53 @@ impl HomeView {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+
+        if let Some(ref serve) = self.serve_view {
+            self.divider_col = None;
+            self.main_area_width = 0;
+            serve.render(frame, area, theme);
+            return;
+        }
+        if self.sidebar_source != crate::tui::session_feed::SidebarSource::Daemon {
+            self.list_inner_area = Rect::default();
+            self.shelf_inner_area = Rect::default();
+            self.preview_area = Rect::default();
+            self.preview_pane_area = Rect::default();
+            self.preview_outer_area = Rect::default();
+            self.divider_col = None;
+            self.main_area_width = 0;
+            if self.sidebar_source == crate::tui::session_feed::SidebarSource::Disconnected {
+                frame.render_widget(Clear, area);
+                crate::tui::dialogs::ConnectionsView::offline(
+                    self.runtime_failure_reason.as_deref(),
+                    matches!(
+                        self.dashboard_launch,
+                        Some(crate::tui::dialogs::DashboardLaunch::Failed { .. })
+                    ),
+                )
+                .render(frame, area, theme);
+                return;
+            }
+            // A dashboard start hidden with Esc is still running behind this screen.
+            let message = if self.dashboard_launch.is_some() {
+                "Connecting to runtime…\n\nEnter: back to the Web dashboard start   q: Quit"
+            } else {
+                "Connecting to runtime…\n\nq: Quit"
+            };
+            frame.render_widget(
+                Paragraph::new(message)
+                    .style(Style::default().fg(theme.dimmed))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .padding(Padding::horizontal(1)),
+                    )
+                    .wrap(Wrap { trim: false }),
+                area,
+            );
+            return;
+        }
 
         // Settings view takes over the whole screen
         if let Some(ref mut settings) = self.settings_view {
@@ -955,14 +1021,6 @@ impl HomeView {
             self.main_area_width = 0;
 
             diff.render(frame, area, theme);
-            return;
-        }
-
-        // Serve view takes over the whole screen
-        if let Some(ref serve) = self.serve_view {
-            self.divider_col = None;
-            self.main_area_width = 0;
-            serve.render(frame, area, theme);
             return;
         }
 
@@ -1012,6 +1070,7 @@ impl HomeView {
         let content_area = main_chunks[0];
         let available_width = content_area.width;
         self.main_area_width = available_width;
+        self.main_area_height = content_area.height;
         // A collapsed strip leaves enough preview space even on narrow terminals.
         if self.sidebar_collapsed {
             self.divider_col = None;
@@ -1029,7 +1088,7 @@ impl HomeView {
             self.render_preview(frame, preview_area, theme);
         } else if available_width < responsive::STACKED_BREAKPOINT {
             let main_height = content_area.height;
-            let list_height = responsive::stacked_list_height(main_height);
+            let list_height = responsive::stacked_list_height(main_height, self.list_height);
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
@@ -1038,9 +1097,10 @@ impl HomeView {
                 ])
                 .split(content_area);
 
-            // Stacked layout has no vertical divider; only the side-by-side
-            // path exposes the resize-by-drag affordance.
             self.divider_col = None;
+            self.divider_row =
+                (chunks[0].height > 0 && chunks[1].height > 0 && content_area.width > 0)
+                    .then_some(chunks[1].y);
 
             // Stacked: the list sits above the preview, so there is no column to dock
             // under; the strip spans the list's width.
@@ -1071,6 +1131,12 @@ impl HomeView {
             let layout = ListLayout::Horizontal(self.sidebar_position);
             self.render_list(frame, list_rect, theme, layout);
             self.render_preview(frame, preview_area, theme);
+        }
+        if matches!(self.drag_state, Some(DragKind::ListDivider)) && self.divider_col.is_none()
+            || matches!(self.drag_state, Some(DragKind::StackedListDivider))
+                && self.divider_row.is_none()
+        {
+            self.handle_drag_end();
         }
         if let (Some(idx), Some(text)) = (last_prompt_idx, last_prompt.as_deref()) {
             self.render_last_prompt_footer(frame, main_chunks[idx], theme, text);
@@ -1131,9 +1197,11 @@ impl HomeView {
             };
         }
 
+        render_dialogs!(new_dialog);
+        if self.snooze_duration_dialog.is_none() {
+            render_dialogs!(confirm_dialog);
+        }
         render_dialogs!(
-            new_dialog,
-            confirm_dialog,
             unified_delete_dialog,
             group_delete_options_dialog,
             rename_dialog,
@@ -1147,8 +1215,23 @@ impl HomeView {
             changelog_dialog,
             telemetry_consent_dialog,
             tips_dialog,
-            info_dialog,
-            snooze_duration_dialog,
+        );
+        if let Some(view) = &self.connections_view {
+            let web = self.connections_web_state(Some(view.web()));
+            let daemon = self.daemon_attention();
+            if let Some(view) = &mut self.connections_view {
+                view.refresh(daemon, web);
+            }
+        }
+        render_dialogs!(connections_view);
+        if self.snooze_duration_dialog.is_none() {
+            render_dialogs!(info_dialog);
+        }
+        render_dialogs!(snooze_duration_dialog);
+        if self.snooze_duration_dialog.is_some() {
+            render_dialogs!(info_dialog, confirm_dialog);
+        }
+        render_dialogs!(
             profile_picker_dialog,
             group_picker_dialog,
             sort_picker_dialog,
@@ -1163,7 +1246,6 @@ impl HomeView {
             permission_response_dialog,
             agent_question_dialog,
             update_confirm_dialog,
-            // context_menu renders last so its popup sits above any underlying dialog.
             context_menu,
         );
     }
@@ -1329,9 +1411,10 @@ impl HomeView {
 
         // Keep the collapse button inside the outer border when one is present.
         let collapse_label = match self.sidebar_position {
-            SidebarPosition::Left => " \u{00AB} ",
-            SidebarPosition::Right => " \u{00BB} ",
+            SidebarPosition::Left => " « ",
+            SidebarPosition::Right => " » ",
         };
+
         const COLLAPSE_LABEL_WIDTH: u16 = 3;
         // Columns kept clear for the title that shares this top border row, so
         // the collapse affordance only draws when it won't collide with it.
@@ -1666,7 +1749,7 @@ impl HomeView {
         list_width: u16,
         favorite_gutter: bool,
     ) -> Line<'static> {
-        let indent = " ".repeat(item.depth().min(9));
+        let indent = get_indent(item.depth());
 
         // Snooze and urgent visuals render only under Attention sort, so the sidebar
         // stays clean for users who don't run a triage workflow. Archive is universal:
@@ -1827,40 +1910,15 @@ impl HomeView {
                                 SunkRow::AgentStatus(agent_row_icon(inst)),
                             )
                         }
-                        ViewMode::Terminal => {
-                            let terminal_running = self.paired_terminal_running_for_display(inst);
-                            // Unread means the agent produced output nobody looked
-                            // at, which the paired terminal has no notion of, so
-                            // Terminal view never paints the dot.
-                            let (icon, color) = if terminal_running {
-                                (spinner_running(&inst.created_at), theme.terminal_active)
-                            } else {
-                                (ICON_IDLE, theme.dimmed)
-                            };
-                            (
-                                RowSeed {
-                                    icon,
-                                    color,
-                                    modifier: ratatui::style::Modifier::empty(),
-                                },
-                                SunkRow::Pane,
-                            )
-                        }
-                        ViewMode::Tool(ref tool_name) => {
-                            let tool_session = crate::tmux::ToolSession::for_display(
-                                &inst.id,
-                                &inst.title,
-                                tool_name,
-                            );
-                            let tool_running = crate::tmux::session_exists_for_display(
-                                tool_session.session_name(),
-                            ) && !crate::tmux::pane_dead_for_display(
-                                tool_session.session_name(),
-                            );
-                            let (icon, color) = if tool_running {
-                                (spinner_running(&inst.created_at), theme.terminal_active)
-                            } else {
-                                (ICON_IDLE, theme.dimmed)
+                        ViewMode::Terminal | ViewMode::Tool(_) => {
+                            use crate::session::PanePresence;
+                            let (icon, color) = match self.auxiliary_presence_for_view(inst) {
+                                PanePresence::Alive => {
+                                    (spinner_running(&inst.created_at), theme.terminal_active)
+                                }
+                                PanePresence::Dead => (ICON_STOPPED, theme.dimmed),
+                                PanePresence::Absent => (ICON_IDLE, theme.dimmed),
+                                PanePresence::Unknown => (ICON_UNKNOWN, theme.waiting),
                             };
                             (
                                 RowSeed {
@@ -1947,17 +2005,8 @@ impl HomeView {
                 )
             });
 
-        // Right edge of the row: an optional terminal-mode badge and the activity column,
-        // both pinned to the pane's right edge so the column lines up down the list.
-        //
-        // Acp-mode sessions get a badge because Enter opens an info dialog rather than
-        // attaching to a pane that doesn't exist; it takes precedence over the
-        // container/host badge in Structured view, while Terminal view keeps its own
-        // badging since the host terminal still works.
         let badge_text: Option<&'static str> =
             if inst.is_structured() && self.view_mode != ViewMode::Terminal {
-                // `[structured]` rather than `[web]`: the TUI renders these sessions
-                // natively now, so the badge marks the view.
                 Some(" [structured]")
             } else if self.view_mode == ViewMode::Terminal && inst.is_sandboxed() {
                 Some(match self.get_terminal_mode(id) {
@@ -1965,9 +2014,6 @@ impl HomeView {
                     TerminalMode::Host => " [host]",
                 })
             } else if inst.is_structured() {
-                // Terminal view, non-sandboxed: the container/host badge does not apply,
-                // but structured rows still need marking or Enter opening the structured
-                // view surprises the user.
                 Some(" [structured]")
             } else {
                 None
@@ -1976,8 +2022,13 @@ impl HomeView {
         let terminal_badge = (self.view_mode == ViewMode::Structured
             && self.paired_terminal_running_for_display(inst))
         .then(|| format!(" {ICON_TERMINAL}"));
-        let badge_width =
-            badge_text.map_or(0, |s| s.len()) + terminal_badge.as_ref().map_or(0, |s| s.len());
+        // Paint must not fork tmux, so this skips the resume gate the menu applies.
+        let update_badge = (!inst.is_structured()
+            && crate::session::update_restart::binary_updated(inst))
+        .then_some(" [update]");
+        let badge_width = badge_text.map_or(0, |s| s.len())
+            + terminal_badge.as_ref().map_or(0, |s| s.len())
+            + update_badge.map_or(0, |s| s.len());
         let age = if self.show_activity_age {
             row_age(inst, in_attention)
         } else {
@@ -2022,6 +2073,17 @@ impl HomeView {
 
         if let Some(badge) = terminal_badge {
             let badge_style = Style::default().fg(theme.terminal_active);
+            line_spans.push(Span::styled(
+                badge,
+                if is_selected {
+                    selected_row_style(badge_style, theme)
+                } else {
+                    badge_style
+                },
+            ));
+        }
+        if let Some(badge) = update_badge {
+            let badge_style = Style::default().fg(theme.waiting);
             line_spans.push(Span::styled(
                 badge,
                 if is_selected {
@@ -2277,6 +2339,12 @@ impl HomeView {
         let Some(inst) = self.get_instance(&id) else {
             return;
         };
+        let parsed_lines = cache
+            .parsed_text
+            .as_ref()
+            .map_or(0, |text| text.lines.len());
+        let scroll_offset =
+            passive_capture_scroll_offset(parsed_lines, output.height as usize, cache.cursor);
         let cached = CachedPreview::new(cache.parsed_text.as_ref(), cache.is_pending_for(&id));
         if terminal_focused {
             Preview::render_with_cache(
@@ -2284,7 +2352,7 @@ impl HomeView {
                 rect,
                 inst,
                 cached,
-                0,
+                scroll_offset,
                 theme,
                 self.idle_decay_window,
                 compact,
@@ -2292,7 +2360,15 @@ impl HomeView {
             );
         } else {
             Preview::render_terminal_preview(
-                frame, rect, inst, true, cached, 0, theme, compact, false,
+                frame,
+                rect,
+                inst,
+                self.auxiliary_presence_for_view(inst),
+                cached,
+                scroll_offset,
+                theme,
+                compact,
+                false,
             );
         }
         frame.buffer_mut().set_style(
@@ -3076,6 +3152,8 @@ impl HomeView {
         }
 
         self.preview_area = inner;
+        // Keep the outer rect for partial redraws; using `inner` would nest the block.
+
         self.preview_outer_area = area;
         self.diff_area = Rect::default();
         // The agent-pane sub-rect of `inner`: the full inner when the info header is
@@ -3127,7 +3205,9 @@ impl HomeView {
                 .as_ref()
                 .and_then(|id| self.get_instance(id))
                 .is_some_and(|inst| {
-                    inst.last_error.as_deref() == Some(crate::session::TMUX_SESSION_GONE_ERROR)
+                    inst.status == Status::Stopped
+                        && inst.last_error.as_deref()
+                            != Some(crate::session::TMUX_SERVER_UNREACHABLE_ERROR)
                 });
 
         // A structured (ACP) session has no agent tmux pane; its transcript lives in the
@@ -3229,6 +3309,9 @@ impl HomeView {
                     .as_mut()
                     .and_then(|v| v.render(frame, layout.output, theme));
                 self.structured_preview = view;
+                // The preview now carries the mounted transcript, so the live
+                // geometry no longer describes what is on screen: the link and
+                // copy guards read this to refuse the stale mapping.
                 self.structured_transcript_painted = true;
                 self.preview_pane_area = layout.output;
                 if let Some(g) = geometry {
@@ -3393,36 +3476,16 @@ impl HomeView {
 
                     // Now borrow instance for rendering
                     if let Some(inst) = self.get_instance(&id) {
-                        // Snapshot-backed like the list rows: a per-name `has-session`
-                        // here would be the only fork left in a steady-state frame.
-                        let (terminal_running, cache) =
-                            match terminal_mode {
-                                TerminalMode::Container => {
-                                    let name = crate::tmux::ContainerTerminalSession::
-                                    resolve_name_for_display(&inst.id, &inst.title);
-                                    (
-                                        crate::tmux::session_exists_for_display(&name),
-                                        &self.container_terminal_preview_cache,
-                                    )
-                                }
-                                TerminalMode::Host => {
-                                    let name =
-                                        crate::tmux::TerminalSession::resolve_name_for_display(
-                                            &inst.id,
-                                            &inst.title,
-                                        );
-                                    (
-                                        crate::tmux::session_exists_for_display(&name),
-                                        &self.terminal_preview_cache,
-                                    )
-                                }
-                            };
+                        let cache = match terminal_mode {
+                            TerminalMode::Container => &self.container_terminal_preview_cache,
+                            TerminalMode::Host => &self.terminal_preview_cache,
+                        };
 
                         Preview::render_terminal_preview(
                             frame,
                             inner,
                             inst,
-                            terminal_running,
+                            self.auxiliary_presence_for_view(inst),
                             CachedPreview::new(
                                 cache.parsed_text.as_ref(),
                                 cache.is_pending_for(&id),
@@ -3476,22 +3539,11 @@ impl HomeView {
                     self.set_preview_text_view(pane_area, total_lines);
 
                     if let Some(inst) = self.get_instance(&id) {
-                        let tool_session = crate::tmux::ToolSession::for_display(
-                            &inst.id,
-                            &inst.title,
-                            &tool_name,
-                        );
-                        // Snapshot-backed for the same reason as the rows: this pair was
-                        // the last per-frame fork on the render thread in Tool view.
-                        let tool_running =
-                            crate::tmux::session_exists_for_display(tool_session.session_name())
-                                && !crate::tmux::pane_dead_for_display(tool_session.session_name());
-
                         Preview::render_terminal_preview(
                             frame,
                             inner,
                             inst,
-                            tool_running,
+                            self.auxiliary_presence_for_view(inst),
                             CachedPreview::new(
                                 self.tool_preview_cache.parsed_text.as_ref(),
                                 self.tool_preview_cache.is_pending_for(&id),
@@ -3539,7 +3591,7 @@ impl HomeView {
         // link: an overlay swallows the click (and paints over these cells, leaving the
         // backend to wrap its own text in OSC 8), and transcript rows are not the
         // capture's links.
-        if self.has_non_live_send_overlay() || self.structured_transcript_painted {
+        if self.has_non_live_send_overlay() {
             return;
         }
         let view = self.preview_text_view;
@@ -3603,9 +3655,12 @@ impl HomeView {
         if !cursor.position_reliable {
             return None;
         }
-        // Set by `set_preview_text_view` for the capture painted this frame, so the
-        // cursor anchors as the text did.
-        map_live_preview_cursor(self.preview_text_view, cursor)
+        map_live_preview_cursor(
+            self.preview_pane_area,
+            self.preview_visible_rows,
+            self.preview_text_view.total_lines,
+            cursor,
+        )
     }
 
     /// Apply the drag-select highlight to cells inside the preview pane, reversing
@@ -3785,7 +3840,7 @@ impl HomeView {
         }
 
         let key = if self.strict_hotkeys { "Z" } else { "z" };
-        let body = if title.is_empty() {
+        let parked = if title.is_empty() {
             "This session is parked. Its agent was stopped.".to_string()
         } else {
             format!("\"{}\" is parked. Its agent was stopped.", title)
@@ -3796,7 +3851,7 @@ impl HomeView {
             theme,
             Placeholder {
                 heading: "Archived",
-                body,
+                body: parked.into(),
                 inst,
                 hint: Some(press_hint(theme, key, " to unarchive it.")),
                 wrap: true,
@@ -3824,7 +3879,7 @@ impl HomeView {
             theme,
             Placeholder {
                 heading: "Deleting",
-                body,
+                body: body.into(),
                 inst: None,
                 hint: None,
                 wrap: true,
@@ -3879,7 +3934,7 @@ impl HomeView {
             theme,
             Placeholder {
                 heading: "Trash",
-                body,
+                body: body.into(),
                 inst,
                 hint: Some(hint),
                 wrap: true,
@@ -3896,7 +3951,7 @@ impl HomeView {
             theme,
             Placeholder {
                 heading: "Stopped",
-                body: "This session isn't running.".to_string(),
+                body: "This session isn't running.".into(),
                 inst: None,
                 hint: Some(press_hint(theme, "Enter", " to start it.")),
                 wrap: false,
@@ -3913,16 +3968,19 @@ impl HomeView {
             .as_ref()
             .and_then(|id| self.get_instance(id));
         let title = inst.map(|i| i.title.clone()).unwrap_or_default();
-        let name = if title.is_empty() {
-            "This session".to_string()
-        } else {
-            format!("\"{title}\"")
-        };
-        let body = match inst.and_then(|i| i.agent_name.clone()) {
-            Some(agent) => {
-                format!("{name} runs {agent} as a structured transcript, not a terminal pane.")
+        let agent = inst.and_then(|i| i.agent_name.clone());
+        let body = {
+            let name = if title.is_empty() {
+                "This session".to_string()
+            } else {
+                format!("\"{title}\"")
+            };
+            match agent {
+                Some(agent) => {
+                    format!("{name} runs {agent} as a structured transcript, not a terminal pane.")
+                }
+                None => format!("{name} renders as a structured transcript, not a terminal pane."),
             }
-            None => format!("{name} renders as a structured transcript, not a terminal pane."),
         };
         render_placeholder(
             frame,
@@ -3930,13 +3988,9 @@ impl HomeView {
             theme,
             Placeholder {
                 heading: "Structured view",
-                body,
+                body: body.into(),
                 inst: None,
-                hint: Some(press_hint(
-                    theme,
-                    "Enter",
-                    " to open it (offers to start a local `aoe serve` daemon if none is running).",
-                )),
+                hint: Some(press_hint(theme, "Enter", " to open the transcript.")),
                 wrap: false,
             },
         );
@@ -4169,16 +4223,19 @@ impl HomeView {
         let mk_key =
             |key: &str| -> Vec<Span<'static>> { vec![Span::styled(key.to_string(), key_style)] };
 
-        // Key a footer button synthesizes on click. The registry matches the bare keycode
-        // (Shift implied by an uppercase char, Ctrl by the flag), so a plain char and a
-        // Ctrl char cover every footer chord.
+        // Key a footer button synthesizes on click, for the few entries outside the registry.
         let kc = |c: char| Some(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
-        let kctrl = |c: char| Some(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
         let kenter = Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let ktab = Some(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        // Click key and compact label (`^G`) for an action's chord in the active mode.
+        let bound = |id: ActionId| {
+            (
+                super::bindings::key_event(id, strict),
+                super::bindings::label(id, strict).replace("Ctrl+", "^"),
+            )
+        };
 
-        // (priority, click-key, spans); `click-key` is `None` for the non-actionable
-        // status indicators, which render but aren't clickable.
+        // Shortcut groups carry a priority, optional key action, and display spans.
         let mut groups: Vec<(u8, Option<KeyEvent>, Vec<Span<'static>>)> = Vec::new();
 
         // Other-TUI indicator, shown when more than one `aoe` TUI is alive: two TUIs
@@ -4200,11 +4257,11 @@ impl HomeView {
         // `m` after selecting a runnable session drains it into the compose dialog.
         if let Some(buf) = &self.pending_paste {
             if !buf.is_empty() {
-                let key = if strict { "M" } else { "m" };
+                let (click, key) = bound(ActionId::SendMessage);
                 let desc = format!("send {} buffered", buf.chars().count());
-                let mut spans = mk(key, &desc);
+                let mut spans = mk(&key, &desc);
                 spans[1] = Span::styled(desc, Style::default().fg(theme.running).bold());
-                groups.push((0, kc(if strict { 'M' } else { 'm' }), spans));
+                groups.push((0, click, spans));
             }
         }
 
@@ -4237,41 +4294,32 @@ impl HomeView {
             None => (None, None),
         };
         if let Some(enter_action_text) = enter_action_text {
-            // U+21B5 renders Enter in one cell across most fonts, saving 4 cols over the
-            // word and matching k9s/lazygit/fzf. The trailing space adds a second visual
-            // gap, since the glyph fills its cell tightly.
-            groups.push((0, kenter, mk("↵ ", enter_action_text)));
+            // U+21B5 keeps Enter to one display cell without shortening its action label.
+            groups.push((0, kenter, mk("↵", enter_action_text)));
         }
         if let Some(tab_action_text) = tab_action_text {
-            groups.push((1, ktab, mk("⇥ ", tab_action_text)));
+            groups.push((2, ktab, mk("⇥ ", tab_action_text)));
         }
 
-        groups.push((
-            2,
-            kc(if strict { 'T' } else { 't' }),
-            mk(if strict { "T" } else { "t" }, "View"),
-        ));
+        let (click, key) = bound(ActionId::ToggleView);
+        groups.push((2, click, mk(&key, "View")));
         if matches!(self.view_mode, ViewMode::Tool(_)) {
-            groups.push((1, kc(';'), mk(";", "Back")));
-        } else if !self.tool_configs.is_empty() {
-            groups.push((2, kc(';'), mk(";", "Tools")));
+            let (click, key) = bound(ActionId::ToolPicker);
+            groups.push((1, click, mk(&key, "Back")));
+        } else if self.has_tool_targets() {
+            let (click, key) = bound(ActionId::ToolPicker);
+            groups.push((2, click, mk(&key, "Tools")));
         }
-        groups.push((
-            3,
-            if strict { kctrl('g') } else { kc('g') },
-            mk(if strict { "^G" } else { "g" }, "Group"),
-        ));
+        let (click, key) = bound(ActionId::GroupBy);
+        groups.push((3, click, mk(&key, "Group")));
 
         // c: container/host toggle hint for sandboxed sessions in Terminal view
         if self.view_mode == ViewMode::Terminal {
             if let Some(id) = &self.selected_session {
                 if let Some(inst) = self.get_instance(id) {
                     if inst.is_sandboxed() {
-                        groups.push((
-                            4,
-                            kc(if strict { 'C' } else { 'c' }),
-                            mk(if strict { "C" } else { "c" }, "Mode"),
-                        ));
+                        let (click, key) = bound(ActionId::ToggleContainer);
+                        groups.push((4, click, mk(&key, "Mode")));
                     }
                 }
             }
@@ -4281,55 +4329,41 @@ impl HomeView {
         // `n` for cycling, advertise Shift+N (which still creates, #3038). Strict mode
         // already uses `N`.
         let new_uses_shift = committed_search && !strict;
-        groups.push((
-            1,
-            kc(if strict || new_uses_shift { 'N' } else { 'n' }),
-            mk(if strict || new_uses_shift { "N" } else { "n" }, "New"),
-        ));
+        let (click, key) = if new_uses_shift {
+            (kc('N'), "N".to_string())
+        } else {
+            bound(ActionId::NewSession)
+        };
+        groups.push((1, click, mk(&key, "New")));
 
         // Priority 1 is the core daily workflow (new, message, the web dashboard), which
         // survives the greedy pack at ~80 cols; del stays at p3 and can drop first.
         if self.selected_session.is_some() {
-            groups.push((
-                1,
-                kc(if strict { 'M' } else { 'm' }),
-                mk(if strict { "M" } else { "m" }, "Msg"),
-            ));
+            let (click, key) = bound(ActionId::SendMessage);
+            groups.push((1, click, mk(&key, "Msg")));
         }
         if !self.flat_items.is_empty() {
-            groups.push((
-                3,
-                kc(if strict { 'D' } else { 'd' }),
-                mk(if strict { "D" } else { "d" }, "Del"),
-            ));
+            let (click, key) = bound(ActionId::Delete);
+            groups.push((3, click, mk(&key, "Del")));
         }
         // Archive / Snooze render only in Attention sort: they shape the Attention queue
         // and do nothing visible elsewhere, so they would just take footer space.
         let in_attention = self.sort_order == SortOrder::Attention;
         if in_attention {
             if !self.flat_items.is_empty() {
-                groups.push((
-                    1,
-                    kc(if strict { 'Z' } else { 'z' }),
-                    mk(if strict { "Z" } else { "z" }, "Archive"),
-                ));
+                let (click, key) = bound(ActionId::ToggleArchive);
+                groups.push((1, click, mk(&key, "Archive")));
             }
             if self.selected_session.is_some() {
-                groups.push((
-                    1,
-                    kc(if strict { 'H' } else { 'h' }),
-                    mk(if strict { "H" } else { "h" }, "Snooze"),
-                ));
+                let (click, key) = bound(ActionId::ToggleSnooze);
+                groups.push((1, click, mk(&key, "Snooze")));
             }
         }
         // Fav follows the key's own gate (`Context::FavoritesUsable`), so the footer
         // advertises it wherever `f` actually does something.
         if self.selected_session.is_some() && (in_attention || crate::session::favorites_first()) {
-            groups.push((
-                2,
-                kc(if strict { 'F' } else { 'f' }),
-                mk(if strict { "F" } else { "f" }, "Fav"),
-            ));
+            let (click, key) = bound(ActionId::ToggleFavorite);
+            groups.push((2, click, mk(&key, "Fav")));
         }
 
         // Committed-search cue: `n` cycles matches and `Esc` clears (#3038). The `[i/N]`
@@ -4345,51 +4379,51 @@ impl HomeView {
             groups.push((0, kc('n'), hint));
         }
 
-        groups.push((4, kc('/'), mk_key("/")));
-        groups.push((
-            4,
-            if strict { kctrl('d') } else { kc('D') },
-            mk(if strict { "^D" } else { "D" }, "Diff"),
-        ));
+        let (click, key) = bound(ActionId::SearchStart);
+        groups.push((4, click, mk_key(&key)));
+        let (click, key) = bound(ActionId::Diff);
+        groups.push((4, click, mk(&key, "Diff")));
+        // The R entry carries one state: a Daemon problem or limit, else the Web dashboard.
         let mut serving_status = None;
-        if !super::input::web_plugin_disabled() {
-            let (priority, spans) = web_footer_entry(self.serve_running, strict, theme);
-            serving_status = self.serve_running.then_some(groups.len());
-            groups.push((priority, if strict { kctrl('r') } else { kc('R') }, spans));
+        let attention = self.daemon_attention();
+        if attention.is_some() || !super::input::web_plugin_disabled() {
+            let (click, key) = bound(ActionId::Serve);
+            let (priority, spans) =
+                runtime_footer_entry(attention, &key, self.serve_running, theme);
+            serving_status = (priority == 0).then_some(groups.len());
+            groups.push((priority, click, spans));
         }
-        groups.push((1, kctrl('k'), mk("^K", "Cmds")));
-        groups.push((0, kc('?'), mk_key("?")));
+        let (click, key) = bound(ActionId::OpenCommandPalette);
+        groups.push((1, click, mk(&key, "Cmds")));
+        let (click, key) = bound(ActionId::Help);
+        groups.push((0, click, mk_key(&key)));
 
-        // Greedy pack by priority: a group's width is its span widths, each kept
-        // separator adds 3 cols, and 1 col is reserved for the leading margin. Measured in
-        // display cells so the pack and the click rects line up with painted cells.
-        let widths: Vec<usize> = groups
-            .iter()
-            .map(|(_, _, g)| g.iter().map(|s| s.width()).sum::<usize>())
-            .collect();
-
-        // Tips badge: pinned bottom-right and clickable, its width reserved before the
-        // greedy pack so thin terminals drop hints rather than collide with it. Hidden
-        // when nothing is unseen or it cannot fit. The footer's own bg is
-        // `theme.selection`, so hover uses the brighter `session_selection`.
         let badge_bg = if self.tips_badge_hovered {
             theme.session_selection
         } else {
             theme.selection
         };
-        let badge_line = (self.tips_unseen > 0).then(|| {
-            Line::from(Span::styled(
-                format!(" \u{1f4a1} {} tips ", self.tips_unseen),
-                Style::default().fg(theme.accent).bold().bg(badge_bg),
-            ))
+        let tips_index = (self.tips_unseen > 0).then(|| {
+            let index = groups.len();
+            groups.push((
+                2,
+                None,
+                vec![Span::styled(
+                    format!(" \u{1f4a1} {} tips ", self.tips_unseen),
+                    Style::default().fg(theme.accent).bold().bg(badge_bg),
+                )],
+            ));
+            index
         });
-        let badge_width = badge_line.as_ref().map(|l| l.width()).unwrap_or(0);
-        let badge_fits = badge_width > 0 && badge_width <= area.width as usize;
-        let badge_reserve = if badge_fits { badge_width + 1 } else { 0 };
 
-        let avail = (area.width as usize)
-            .saturating_sub(1)
-            .saturating_sub(badge_reserve);
+        // Pack shortcuts and optional Tips by priority within the runtime status boundary.
+        // Widths and separators use display cells, matching the painted click rectangles.
+        let mut widths: Vec<usize> = groups
+            .iter()
+            .map(|(_, _, g)| g.iter().map(|s| s.width()).sum::<usize>())
+            .collect();
+        let compact_badge_width = unicode_width::UnicodeWidthStr::width("\u{1f4a1}");
+        let avail = (area.width as usize).saturating_sub(1);
 
         let mut order: Vec<usize> = (0..groups.len()).collect();
         // The running server status packs before other priority-0 groups, so it is the last to drop.
@@ -4398,7 +4432,20 @@ impl HomeView {
         let mut keep = vec![false; groups.len()];
         let mut used = 0usize;
         let mut count = 0usize;
+        let mut compact_tips = false;
         for i in order {
+            if Some(i) == tips_index {
+                if used + widths[i] <= avail {
+                    keep[i] = true;
+                    used += widths[i];
+                } else if used + compact_badge_width <= avail {
+                    keep[i] = true;
+                    compact_tips = true;
+                    widths[i] = compact_badge_width;
+                    used += compact_badge_width;
+                }
+                continue;
+            }
             let sep = if count == 0 { 0 } else { 3 };
             if used + widths[i] + sep <= avail {
                 keep[i] = true;
@@ -4406,6 +4453,7 @@ impl HomeView {
                 count += 1;
             }
         }
+        let badge_width = tips_index.map(|i| widths[i] as u16).unwrap_or(0);
 
         // Inverted-chip highlight for the button under the pointer, matching
         // the LIVE chip's fg/bg swap so hover reads as "this is clickable".
@@ -4419,8 +4467,16 @@ impl HomeView {
         // Column of the next span; starts past the leading space margin. Used
         // to record each clickable button's hit rect as it's laid out.
         let mut col = area.x.saturating_add(1);
-        for (i, (_, key, group)) in groups.into_iter().enumerate() {
+        let mut badge_line = None;
+        for (i, (_, key, mut group)) in groups.into_iter().enumerate() {
             if !keep[i] {
+                continue;
+            }
+            if Some(i) == tips_index {
+                if compact_tips {
+                    group[0].content = "\u{1f4a1}".into();
+                }
+                badge_line = Some(Line::from(group));
                 continue;
             }
             if !first {
@@ -4456,23 +4512,18 @@ impl HomeView {
         let status = Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.selection));
         frame.render_widget(status, area);
 
-        // Draw the badge over the reserved right edge and remember its rect so
-        // a click there opens the tips overlay.
-        if badge_fits {
-            if let Some(line) = badge_line {
-                let bw = badge_width as u16;
-                let rect = Rect {
-                    x: area.x + area.width.saturating_sub(bw),
-                    y: area.y,
-                    width: bw,
-                    height: 1,
-                };
-                frame.render_widget(
-                    Paragraph::new(line).style(Style::default().bg(badge_bg)),
-                    rect,
-                );
-                self.tips_badge_rect = Some(rect);
-            }
+        if let Some(line) = badge_line {
+            let rect = Rect {
+                x: area.right().saturating_sub(badge_width),
+                y: area.y,
+                width: badge_width,
+                height: 1,
+            };
+            frame.render_widget(
+                Paragraph::new(line).style(Style::default().bg(badge_bg)),
+                rect,
+            );
+            self.tips_badge_rect = Some(rect);
         }
     }
 
@@ -4486,24 +4537,25 @@ impl HomeView {
         image_update: Option<&ImageUpdate>,
     ) {
         let update_style = Style::default().fg(theme.waiting).bold();
-        // The Update key is `u` (`Ctrl+u` in strict mode); pull the label from
-        // the binding registry so this hint can't drift from the dispatcher.
-        let update_key =
-            super::bindings::label(super::bindings::ActionId::Update, self.strict_hotkeys);
+        // Pull the keys from the binding registry so these hints can't drift from the
+        // dispatcher.
+        let update_key = super::bindings::label(ActionId::Update, self.strict_hotkeys);
+        let dismiss_key =
+            super::bindings::label(ActionId::DismissUpdateBanner, self.strict_hotkeys);
         // Precedence: transient status, app update, then sandbox-image update. Only one
         // banner shows at a time so its keys are unambiguous; a lower-priority banner
         // surfaces once the ones above clear.
         let text = if let Some(s) = status {
-            format!(" {s}  [Ctrl+x] dismiss")
+            format!(" {s}  [{dismiss_key}] dismiss")
         } else if let Some(info) = info {
             // Reassure users (#2220) that updating never tears down running sessions.
             // Kept after the keys so the action hints stay visible on narrow terminals.
             format!(
-                " update available {} → {}  [{update_key}] update  [Ctrl+x] dismiss  ·  running sessions stay safe",
+                " update available {} → {}  [{update_key}] update  [{dismiss_key}] dismiss  ·  running sessions stay safe",
                 info.current_version, info.latest_version
             )
         } else if image_update.is_some() {
-            format!(" sandbox image update available  [{update_key}] pull  [Ctrl+x] dismiss")
+            format!(" sandbox image update available  [u] pull  [{dismiss_key}] dismiss")
         } else {
             return;
         };
@@ -4513,15 +4565,43 @@ impl HomeView {
     }
 }
 
-/// The footer's web dashboard entry and its priority: a hint while no `aoe serve` daemon
-/// runs, then a green status that survives every width, as the old Serving badge did.
-/// A build without the dashboard bundle serves the API only, so it never says "Web".
-fn web_footer_entry(running: bool, strict: bool, theme: &Theme) -> (u8, Vec<Span<'static>>) {
+pub(super) fn live_pane_origin(
+    view: super::PreviewTextView,
+    cursor: &crate::tmux::PaneCursor,
+) -> (i32, i32) {
+    let pane_top = view.total_lines as i32 - cursor.pane_height as i32 - view.first_line as i32;
+    let (left, top) = cursor
+        .composite_pane0
+        .map_or((0, 0), |rect| (rect.left as i32, rect.top as i32));
+    (
+        view.pane.x as i32 + left,
+        view.pane.y as i32 + pane_top + top,
+    )
+}
+
+/// The footer's R entry: the Daemon's problem (red) or limit (dim) when it has one, else
+/// the Web dashboard's status or hint ("API" in a build without the dashboard bundle). A
+/// state is priority 0 and the hint 1, so a state is the last thing dropped at narrow widths.
+fn runtime_footer_entry(
+    attention: Option<crate::tui::dialogs::DaemonAttention>,
+    key: &str,
+    running: bool,
+    theme: &Theme,
+) -> (u8, Vec<Span<'static>>) {
     let what = if cfg!(feature = "web") { "Web" } else { "API" };
-    let key = Span::styled(
-        if strict { "^R " } else { "R " },
-        Style::default().fg(theme.accent).bold(),
-    );
+    let key = Span::styled(format!("{key} "), Style::default().fg(theme.accent).bold());
+    if let Some(attention) = attention {
+        let color = if attention.is_problem() {
+            theme.error
+        } else {
+            theme.dimmed
+        };
+        let status = Span::styled(
+            format!("\u{25CF} {}", attention.footer_label()),
+            Style::default().fg(color).bold(),
+        );
+        return (0, vec![key, status]);
+    }
     if running {
         let status = Span::styled(
             format!("\u{25CF} {what}"),
@@ -4535,27 +4615,69 @@ fn web_footer_entry(running: bool, strict: bool, theme: &Theme) -> (u8, Vec<Span
         )
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn web_footer_entry_hints_until_served_then_shows_a_status_that_outranks_hints() {
+    fn the_r_entry_shows_one_state_a_daemon_problem_first_then_a_limit_then_web() {
+        use crate::tui::dialogs::DaemonAttention as A;
         let theme = crate::tui::styles::load_theme("empire");
         let what = if cfg!(feature = "web") { "Web" } else { "API" };
-        for (running, strict, priority, text) in [
-            (false, false, 1, format!("R {what}")),
-            (false, true, 1, format!("^R {what}")),
-            (true, false, 0, format!("R \u{25CF} {what}")),
-            (true, true, 0, format!("^R \u{25CF} {what}")),
-        ] {
-            let (p, spans) = web_footer_entry(running, strict, &theme);
+        // (Daemon attention, Web served, strict, priority, text, label colour)
+        let cases = [
+            (None, false, false, 1, format!("R {what}"), theme.dimmed),
+            (None, false, true, 1, format!("^R {what}"), theme.dimmed),
+            (
+                None,
+                true,
+                false,
+                0,
+                format!("R \u{25CF} {what}"),
+                theme.running,
+            ),
+            (
+                None,
+                true,
+                true,
+                0,
+                format!("^R \u{25CF} {what}"),
+                theme.running,
+            ),
+            // A problem is red and replaces even a running dashboard's status. An offline
+            // Daemon never reaches the footer: Connections takes over the home screen.
+            (
+                Some(A::OutcomeUnknown),
+                true,
+                false,
+                0,
+                "R \u{25CF} Runtime outcome unknown".into(),
+                theme.error,
+            ),
+            // A limit stays visible but dim, so a refused key isn't a mystery.
+            (
+                Some(A::ReadOnly),
+                true,
+                false,
+                0,
+                "R \u{25CF} Unavailable".into(),
+                theme.dimmed,
+            ),
+            (
+                Some(A::NativeUnavailable),
+                false,
+                true,
+                0,
+                "^R \u{25CF} Native unavailable".into(),
+                theme.dimmed,
+            ),
+        ];
+        for (attention, running, strict, priority, text, color) in cases {
+            let key = if strict { "^R" } else { "R" };
+            let (p, spans) = runtime_footer_entry(attention, key, running, &theme);
             let rendered: String = spans.iter().map(|s| s.content.as_ref()).collect();
             assert_eq!((p, rendered.as_str()), (priority, text.as_str()));
-            let label_fg = spans.last().and_then(|s| s.style.fg);
-            let expected = if running { theme.running } else { theme.dimmed };
-            assert_eq!(label_fg, Some(expected), "running={running}");
+            assert_eq!(spans.last().and_then(|s| s.style.fg), Some(color), "{text}");
         }
     }
 
@@ -4607,15 +4729,6 @@ mod tests {
             (true, Some((7, t0)))
         );
     }
-    /// `output` painting the last rows of a `lines`-line capture.
-    fn tail_view(output: Rect, lines: usize) -> crate::tui::home::PreviewTextView {
-        crate::tui::home::PreviewTextView {
-            pane: output,
-            first_line: preview::compute_scroll(lines, output.height as usize, 0) as usize,
-            total_lines: lines,
-        }
-    }
-
     fn pane_cursor(x: u16, y: u16, visible: bool, pane_height: u16) -> crate::tmux::PaneCursor {
         crate::tmux::PaneCursor {
             x,
@@ -4732,7 +4845,7 @@ mod tests {
         let output = Rect::new(40, 5, 80, 24);
 
         // Steady-state single pane: the origin and anchoring delta are zero.
-        let single = map_live_preview_cursor(tail_view(output, 200), pane_cursor(3, 2, true, 24));
+        let single = map_live_preview_cursor(output, 24, 200, pane_cursor(3, 2, true, 24));
         assert_eq!(single, Some(Position::new(43, 7)));
 
         // A top border row makes the composite one row taller than the visible output and
@@ -4745,7 +4858,7 @@ mod tests {
             width: 79,
             height: 24,
         });
-        let composited = map_live_preview_cursor(tail_view(output, 200), split);
+        let composited = map_live_preview_cursor(output, 24, 200, split);
         assert_eq!(composited, Some(Position::new(44, 7)));
     }
 
@@ -4756,11 +4869,11 @@ mod tests {
         // row, and one in the clipped top maps out and drops.
         let output = Rect::new(0, 0, 80, 10);
         assert_eq!(
-            map_live_preview_cursor(tail_view(output, 100), pane_cursor(0, 23, true, 24)),
+            map_live_preview_cursor(output, 10, 100, pane_cursor(0, 23, true, 24)),
             Some(Position::new(0, 9)),
         );
         assert_eq!(
-            map_live_preview_cursor(tail_view(output, 100), pane_cursor(0, 5, true, 24)),
+            map_live_preview_cursor(output, 10, 100, pane_cursor(0, 5, true, 24)),
             None,
         );
     }
@@ -4775,19 +4888,19 @@ mod tests {
         // to overflow the 24-row output). Cursor on the pane's last row (y=22).
         let short = pane_cursor(5, 22, true, 23);
         assert_eq!(
-            map_live_preview_cursor(tail_view(output, 23), short),
+            map_live_preview_cursor(output, 24, 23, short),
             Some(Position::new(5, 22)),
             "top-anchored capture must not drift the cursor down a row",
         );
         // The buggy formula (`visible_rows - pane_height`) would place it at
         // row 23; assert the fix does not.
         assert_ne!(
-            map_live_preview_cursor(tail_view(output, 23), short),
+            map_live_preview_cursor(output, 24, 23, short),
             Some(Position::new(5, 23)),
         );
         // Cursor on the pane's top row lands on the output's top row.
         assert_eq!(
-            map_live_preview_cursor(tail_view(output, 23), pane_cursor(0, 0, true, 23)),
+            map_live_preview_cursor(output, 24, 23, pane_cursor(0, 0, true, 23)),
             Some(Position::new(0, 0)),
         );
     }
@@ -4797,12 +4910,12 @@ mod tests {
         let output = Rect::new(0, 0, 80, 24);
         // DECTCEM-hidden cursor: nothing to paint.
         assert_eq!(
-            map_live_preview_cursor(tail_view(output, 200), pane_cursor(3, 2, false, 24)),
+            map_live_preview_cursor(output, 24, 200, pane_cursor(3, 2, false, 24)),
             None,
         );
         // Column past the output width is dropped rather than clamped.
         assert_eq!(
-            map_live_preview_cursor(tail_view(output, 200), pane_cursor(80, 2, true, 24)),
+            map_live_preview_cursor(output, 24, 200, pane_cursor(80, 2, true, 24)),
             None,
         );
     }

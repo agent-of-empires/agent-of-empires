@@ -16,10 +16,12 @@ import { diffSelectionStale } from "./lib/diffSelection";
 import { useSessions } from "./hooks/useSessions";
 import { useAttentionCounts } from "./hooks/useAttentionCounts";
 import { useStatusSounds } from "./hooks/useStatusSounds";
+import { useSessionStatusStream } from "./hooks/useSessionStatusStream";
 import { useDashboardPresence } from "./hooks/useDashboardPresence";
 import { clearAcpCache } from "./hooks/useAcpSession";
 import { clearDraft, sweepOrphanDrafts } from "./lib/acpDrafts";
 import { AcpPrefsProvider } from "./lib/acpPrefs";
+import { SessionActionProvider } from "./components/sidebar/SessionActionProvider";
 import { safeGetItem, safeRemoveItem } from "./lib/safeStorage";
 import { isAutomatedSession } from "./lib/onboarding";
 import { useWorkspaces } from "./hooks/useWorkspaces";
@@ -62,7 +64,6 @@ import { PluginSessionMenu } from "./components/plugin/PluginSessionMenu";
 import { TOUR_ANCHORS, tourAnchor } from "./lib/tourSteps";
 import {
   deleteWorkspaceSessions,
-  type Notifier,
   restoreSessions,
   trashedWorkspaceRestoreIds,
   trashSessions,
@@ -85,7 +86,8 @@ import {
   markWebTourSeen,
   updateWorkspaceOrdering,
   createProject,
-  setProjectPinned,
+  updateProject,
+  projectTarget,
   deleteProject,
   setSessionUnread,
   killTerminal,
@@ -96,16 +98,19 @@ import {
   restoreSession,
   fetchPlugins,
 } from "./lib/api";
-import type { DeleteSessionOptions, ServerAbout, SettingsResponse } from "./lib/api";
+import type { DeleteSessionOptions, RuntimeCursor, ServerAbout, SettingsResponse } from "./lib/api";
+import { autoResumeSettingsHref } from "./lib/autoResumeSettingsHref";
 import { getClientCapabilities } from "./lib/clientCapabilities";
 import { normalizeProjectPathKey } from "./lib/registeredProjects";
 import { IdleDecayWindowContext, parseIdleDecayWindowMs } from "./lib/idleDecay";
 import { parseUnreadIndicatorEnabled, UnreadIndicatorContext, useUnreadIndicatorEnabled } from "./lib/unreadIndicator";
 import { parseSessionRowTagMode, SessionRowTagContext, type SessionRowTagMode } from "./lib/sessionRowTag";
 import { parseSessionColorsEnabled, SessionColorsContext } from "./lib/sessionColors";
+import { settleSettingsIntrosReadOnly } from "./lib/settingsIntros";
 import { onSettingsChanged } from "./lib/settingsEvents";
 import { parseSystemHealthEnabled, SystemHealthEnabledContext } from "./lib/systemHealth";
 import { toastBus, reportError } from "./lib/toastBus";
+import { restartForUpdate } from "./lib/restartForUpdate";
 import { startPendingCreates } from "./lib/pendingCreates";
 import { isAbsolutePath, resolveToRepoRelative, type FileRef } from "./lib/fileRef";
 import { NAVIGATE_EVENT, OPEN_SESSION_EVENT } from "./lib/sessionRoute";
@@ -124,6 +129,7 @@ import { SwitchViewDialog } from "./components/SwitchViewDialog";
 import { TopBar } from "./components/TopBar";
 import { AppShellSkeleton, MainPaneSkeleton } from "./components/AppShellSkeleton";
 import { ContentSplit } from "./components/ContentSplit";
+import { StructuredSessionStack } from "./components/StructuredSessionStack";
 import { TerminalSessionStack } from "./components/TerminalSessionStack";
 // Lazy-load the acp surface so non-acp users never download
 // the @assistant-ui/react, shiki, and in-house StringDiff/DiffLine
@@ -141,6 +147,7 @@ import { BottomDock } from "./components/BottomDock";
 import { PaneDndController } from "./components/PaneDndController";
 import { visibleToFullIndex, type DropTarget } from "./components/paneDnd";
 import { BackgroundAgentsPanel } from "./components/acp/BackgroundAgentsPanel";
+import { hasStartedBefore } from "./components/acp/startupWait";
 import { DiffPane } from "./components/DiffPane";
 import { FilesPane } from "./components/FilesPane";
 import { FileContentViewer } from "./components/diff/FileContentViewer";
@@ -160,7 +167,7 @@ import { ThemeIntro } from "./components/onboarding/ThemeIntro";
 import type { TourScope } from "./lib/tourSteps";
 import { SessionWizard } from "./components/session-wizard/SessionWizard";
 import type { WizardPrefill } from "./components/session-wizard/SessionWizard";
-import type { ProjectInfo, RepoGroup, SessionResponse } from "./lib/types";
+import type { ProjectInfo, RepoGroup, SessionResponse, Workspace } from "./lib/types";
 import { Dashboard } from "./components/Dashboard";
 import { LoginPage } from "./components/LoginPage";
 import { TokenEntryPage } from "./components/TokenEntryPage";
@@ -391,7 +398,13 @@ function AppContent({
     loaded: sessionsLoaded,
     injectSession,
     setSessionStatus,
+    clearDeletingStatus,
     applySession,
+    applySessionMutation,
+    observedById,
+    runtimeEpoch,
+    refresh: refreshSessions,
+    applyPushedStatus,
   } = useSessions();
   const workspaces = useWorkspaces(sessions);
   // Creates whose outcome the wizard never learned keep reconciling here, past its unmount.
@@ -418,7 +431,15 @@ function AppContent({
   const trashedWorkspaces = useMemo(() => workspaces.filter(workspaceIsTrashed), [workspaces]);
 
   const { unreadCount, waitingCount } = useAttentionCounts(sessions, activeSessionId);
-  useStatusSounds(sessions);
+  const { onSoundDue, cancelCue } = useStatusSounds(sessions, activeSessionId);
+  const onPushedStatus = useCallback(
+    (id: string, status: SessionResponse["status"], cursor: RuntimeCursor) => {
+      cancelCue(id);
+      applyPushedStatus(id, status, cursor);
+    },
+    [cancelCue, applyPushedStatus],
+  );
+  useSessionStatusStream({ onStatus: onPushedStatus, onSoundDue, onResync: refreshSessions });
   const attentionBadgeColors = useMemo(() => getAttentionBadgeColors(resolvedTheme), [resolvedTheme]);
 
   // Remember the active session and restore it on a PWA relaunch (#2103).
@@ -492,7 +513,12 @@ function AppContent({
     [setSidebarSortMode],
   );
 
-  const { projects, refresh: refreshProjects } = useProjects();
+  const { projects, profile: projectProfile, ready: projectsReady, refresh: refreshProjects } = useProjects();
+  const requireProjectProfile = useCallback(() => {
+    if (projectsReady && projectProfile) return projectProfile;
+    toastBus.handler?.error("Projects are not ready. Refresh before changing the registry.");
+    return undefined;
+  }, [projectProfile, projectsReady]);
   const {
     groups: repoGroups,
     savedProjects,
@@ -1102,19 +1128,27 @@ function AppContent({
   }, [navigate]);
 
   const [wizardPrefill, setWizardPrefill] = useState<WizardPrefill | undefined>(undefined);
-  const [deletingSessionIds, setDeletingSessionIds] = useState<string[] | null>(null);
+  const [deletingSessions, setDeletingSessions] = useState<SessionResponse[]>([]);
   const [stoppingSessionId, setStoppingSessionId] = useState<string | null>(null);
   const [switchViewTarget, setSwitchViewTarget] = useState<{ sessionId: string; toStructured: boolean } | null>(null);
   // `serverAbout === null` conflates "not fetched yet" with "fetch failed", so
   // the tour gates auto-launch on an explicit loaded flag instead.
   const [serverAboutLoaded, setServerAboutLoaded] = useState(false);
+  const [servedProfileReady, setServedProfileReady] = useState(false);
+  const serverAboutGeneration = useRef(0);
 
   const refreshServerAbout = useCallback(async () => {
+    const generation = ++serverAboutGeneration.current;
+    setServedProfileReady(false);
     try {
       const about = await fetchAbout();
-      if (about) setServerAbout(about);
+      if (generation === serverAboutGeneration.current && about) {
+        setServerAbout(about);
+        setServedProfileReady(true);
+        settleSettingsIntrosReadOnly(about.read_only);
+      }
     } finally {
-      setServerAboutLoaded(true);
+      if (generation === serverAboutGeneration.current) setServerAboutLoaded(true);
     }
   }, []);
 
@@ -1123,10 +1157,16 @@ function AppContent({
   // setState synchronously, so set-state-in-effect is not triggered.
   useEffect(() => {
     let active = true;
+    const generation = ++serverAboutGeneration.current;
     void fetchAbout()
       .then((about) => {
-        if (!active) return;
-        if (about) setServerAbout(about);
+        if (!active || generation !== serverAboutGeneration.current) return;
+        if (about) {
+          setServerAbout(about);
+          setServedProfileReady(true);
+          // Settings intro choices made before this answer was in wait to learn where they go.
+          settleSettingsIntrosReadOnly(about.read_only);
+        }
         // Read-only servers can't persist an opt-in choice, so skip the ping.
         if (about && !about.read_only) reportTelemetrySeen("web");
       })
@@ -1134,7 +1174,7 @@ function AppContent({
       // or missing /api/about too, not only on success. Otherwise the shell
       // would hang on its placeholder.
       .finally(() => {
-        if (active) setServerAboutLoaded(true);
+        if (active && generation === serverAboutGeneration.current) setServerAboutLoaded(true);
       });
     void fetchTelemetryStatus()
       .then((status) => {
@@ -1170,15 +1210,6 @@ function AppContent({
     void setTelemetryConsent(enabled);
   }, []);
 
-  // Ids, not a workspace id: a sidebar group slice covers only some of its workspace's sessions.
-  const deletingSessions = useMemo(
-    () =>
-      (deletingSessionIds ?? []).flatMap((id) => {
-        const session = sessions.find((s) => s.id === id);
-        return session ? [session] : [];
-      }),
-    [deletingSessionIds, sessions],
-  );
   const liveDeletingSessions = deletingSessions.filter((session) => !session.trashed_at);
   const deletingSession = deletingSessions[0] ?? null;
   const deletingDefaultToTrash = liveDeletingSessions.some((session) => session.cleanup_defaults.delete_to_trash);
@@ -1195,20 +1226,25 @@ function AppContent({
   const deletingBranchName =
     deletingSessions.find((session) => session.branch)?.branch ?? deletingSession?.branch ?? null;
 
-  const handleDeleteSession = useCallback((sessionIds: string[]) => {
-    setDeletingSessionIds(sessionIds);
-  }, []);
+  const handleDeleteSession = useCallback(
+    (sessionIds: string[]) => {
+      setDeletingSessions(
+        sessionIds.flatMap((id) => {
+          const session = sessions.find((session) => session.id === id);
+          return session ? [session] : [];
+        }),
+      );
+    },
+    [sessions],
+  );
 
   const handleConfirmDelete = async (options: DeleteSessionOptions) => {
     if (deletingSessions.length === 0) return;
-    // Close the dialog immediately; the loop, ordering, and toast logic live
-    // in deleteWorkspaceSessions so they are unit-testable without the bundle.
-    setDeletingSessionIds(null);
+    setDeletingSessions([]);
     await deleteWorkspaceSessions(deletingSessions, options, activeSessionId, {
       setStatus: setSessionStatus,
-      // Drop a deleted session's local-only state (#1358 acp cache + draft,
-      // #1842 diff comments). Cross-tab / cross-device deletes fall to the
-      // startup sweep.
+      clearDeleting: clearDeletingStatus,
+      // Clear local state only after the daemon confirms deletion.
       purgeLocal: (id) => {
         clearAcpCache(id);
         clearDraft(id);
@@ -1219,60 +1255,59 @@ function AppContent({
     });
   };
 
-  // Empty Trash (#3167): purge every trashed workspace in one action, mirroring
-  // the TUI's `empty_trash_all`. Reuses the atomic per-workspace delete loop, so
-  // partial failures stay consistent (each call flags only its own failed ids).
-  // Per-workspace toasts are suppressed for one summary; force_delete matches
-  // the TUI so a dirty worktree cannot block a bulk purge.
-  // Rows stay in `trashedWorkspaces` (as Deleting) until the next /api/sessions
-  // poll drops them, so the Trash panel and its Empty Trash button are still
-  // clickable while this loop runs. Without the guard a second confirm starts a
-  // concurrent loop that re-issues a DELETE for every workspace and fires a
-  // second summary toast.
+  // Keep shared-repository cleanup sequential.
   const emptyingTrashRef = useRef(false);
-  const handleEmptyTrash = useCallback(async () => {
-    if (trashedWorkspaces.length === 0 || emptyingTrashRef.current) return;
-    emptyingTrashRef.current = true;
-    let anyFailed = false;
-    const notify: Notifier = {
-      error: () => {
-        anyFailed = true;
-      },
-      info: () => {},
-    };
-    // Purge one workspace at a time, matching the CLI's sequential
-    // `for inst in &trashed` loop (src/cli/session.rs) and the TUI's single
-    // shared deletion poller. Running teardowns in series keeps the summary
-    // toast trivially ordered and stops N git worktree removals from racing on
-    // one source repo, the same sequential-await idiom trashActions.ts uses.
-    try {
-      for (const ws of trashedWorkspaces) {
-        await deleteWorkspaceSessions(
-          ws.sessions,
-          {
-            ...workspaceCleanupDefaults(ws.sessions),
-            force_delete: true,
-          },
-          activeSessionId,
-          {
-            setStatus: setSessionStatus,
-            purgeLocal: (id) => {
-              clearAcpCache(id);
-              clearDraft(id);
-              clearStoredComments(id);
+  const handleEmptyTrash = useCallback(
+    async (confirmed: Workspace[]) => {
+      if (confirmed.length === 0 || emptyingTrashRef.current) return;
+      emptyingTrashRef.current = true;
+      let anyFailed = false;
+      let anyBusy = false;
+      let anyKept = false;
+      try {
+        for (const ws of confirmed) {
+          const result = await deleteWorkspaceSessions(
+            ws.sessions,
+            {
+              ...workspaceCleanupDefaults(ws.sessions),
+              force_delete: true,
+              expected_trash: true,
             },
-            navigateHome: leaveActiveSession,
-            notify,
-          },
-        );
+            activeSessionId,
+            {
+              setStatus: setSessionStatus,
+              clearDeleting: clearDeletingStatus,
+              purgeLocal: (id) => {
+                clearAcpCache(id);
+                clearDraft(id);
+                clearStoredComments(id);
+              },
+              navigateHome: leaveActiveSession,
+              notify: null,
+            },
+          );
+          const busy = (result.busy?.length ?? 0) > 0;
+          anyBusy ||= busy;
+          anyFailed ||= (!result.ok && !busy) || (result.failed?.length ?? 0) > 0;
+          anyKept ||= (result.kept?.length ?? 0) > 0;
+        }
+      } finally {
+        emptyingTrashRef.current = false;
       }
-    } finally {
-      emptyingTrashRef.current = false;
-    }
-    toastBus.handler?.[anyFailed ? "error" : "info"](
-      anyFailed ? "Some trashed sessions could not be deleted" : "Emptied trash",
-    );
-  }, [trashedWorkspaces, activeSessionId, setSessionStatus, leaveActiveSession]);
+      toastBus.handler?.[anyFailed || anyBusy ? "error" : "info"](
+        anyFailed
+          ? anyBusy
+            ? "Some trashed sessions could not be deleted, and some are busy with another operation; retry the busy ones when it finishes"
+            : "Some trashed sessions could not be deleted"
+          : anyBusy
+            ? "Some trashed sessions are busy with another operation; retry when it finishes"
+            : anyKept
+              ? "Some selected sessions changed and were not deleted"
+              : "Emptied trash",
+      );
+    },
+    [activeSessionId, setSessionStatus, clearDeletingStatus, leaveActiveSession],
+  );
 
   // Move-to-trash path (#2489): the safe default. Unlike permanent delete it
   // deliberately KEEPS the per-session acp cache, draft, and stored comments
@@ -1283,7 +1318,7 @@ function AppContent({
     if (ids.length === 0) return;
     const wasActive = activeSessionId != null && ids.includes(activeSessionId);
 
-    setDeletingSessionIds(null);
+    setDeletingSessions([]);
     for (const id of ids) setSessionStatus(id, "Stopped");
     if (wasActive) {
       leaveActiveSession();
@@ -1337,6 +1372,9 @@ function AppContent({
   const handleSwitchView = useCallback((sessionId: string, toStructured: boolean) => {
     setSwitchViewTarget({ sessionId, toStructured });
   }, []);
+  // The startup error banner's way out, where the server allows the switch. Each
+  // mounted Structured view switches its own Session.
+  const canSwitchToTerminal = !serverAbout?.read_only && caps.canUseTerminal;
 
   const handleConfirmSwitchView = useCallback(async () => {
     if (!switchViewTarget) return;
@@ -1383,39 +1421,39 @@ function AppContent({
         .filter((s) => (s.main_repo_path || s.project_path) === repoPath)
         .sort((a, b) => (b.last_accessed_at ?? "").localeCompare(a.last_accessed_at ?? ""));
       const latest = projectSessions[0];
-
-      // Quick-create skips ProjectStep's selection, which is what normally reports the override.
+      const profile = latest?.profile || requireProjectProfile();
+      if (!profile) return;
       const key = normalizeProjectPathKey(repoPath);
-      const registered = projects.find((p) => normalizeProjectPathKey(p.path) === key);
+      const registered = projects.find((project) => normalizeProjectPathKey(project.path) === key);
 
       setWizardPrefill({
         path: repoPath,
-        tool: latest?.tool ?? "claude",
+        tool: latest?.tool,
         yoloMode: latest?.yolo_mode ?? false,
         sandboxEnabled: latest?.is_sandboxed ?? false,
-        profile: latest?.profile || undefined,
+        profile,
         group: latest?.group_path || undefined,
         worktreeEnabled: registered?.overrides?.worktree_enabled,
       });
       setShowSessionWizard(true);
     },
-    [sessions, projects],
+    [sessions, projects, requireProjectProfile],
   );
 
-  // Pin a repo so its header persists with zero sessions. If the repo is
-  // already a saved project, just set its pin flag (PATCH); otherwise register
-  // it pinned (scope global, matching the TUI's global registry). Then refresh
-  // so the diamond / empty header reflects it. See #2047, #2208.
   const handlePinProject = useCallback(
     async (repoPath: string) => {
+      const profile = requireProjectProfile();
+      if (!profile) return;
       const key = normalizeProjectPathKey(repoPath);
       const existing = projects.filter((p) => normalizeProjectPathKey(p.path) === key);
       let failed: { error?: string } | undefined;
       if (existing.length > 0) {
-        const results = await Promise.all(existing.map((p) => setProjectPinned(p.name, p.scope, true)));
+        const results = await Promise.all(
+          existing.map((p) => updateProject(p.path, projectTarget(p.scope, profile), { pinned: true })),
+        );
         failed = results.find((r) => !r.ok);
       } else {
-        const res = await createProject({ path: repoPath, scope: "global", pinned: true });
+        const res = await createProject({ path: repoPath, scope: "global", profile, pinned: true });
         if (!res.ok) failed = res;
       }
       if (failed) {
@@ -1424,32 +1462,39 @@ function AppContent({
       }
       await refreshProjects();
     },
-    [projects, refreshProjects],
+    [projects, refreshProjects, requireProjectProfile],
   );
 
-  // Unpin a repo: clear the pin flag on every pinned registry entry for its
-  // path (a path can be registered under both global and profile scope),
-  // keeping the saved project so it stays in the Projects view and the wizard.
-  // Only the Projects view's Remove deletes the entry. See #2208.
+  // Unpin every returned registration without deleting saved projects.
   const handleUnpinProject = useCallback(
     async (group: SidebarGroup) => {
+      const profile = requireProjectProfile();
+      if (!profile || !group.registeredProjects.every((project) => projects.includes(project))) return;
       const pinned = group.registeredProjects.filter((p) => p.pinned);
-      const results = await Promise.all(pinned.map((p) => setProjectPinned(p.name, p.scope, false)));
+      const results = await Promise.all(
+        pinned.map((p) => updateProject(p.path, projectTarget(p.scope, profile), { pinned: false })),
+      );
       const failed = results.find((r) => !r.ok);
       if (failed) {
         toastBus.handler?.error(failed.error ?? "Failed to unpin project");
       }
       await refreshProjects();
     },
-    [refreshProjects],
+    [projects, refreshProjects, requireProjectProfile],
   );
 
-  // Add / edit a saved project from the sidebar Projects section. The modal is
-  // open for `add` (no editProject) or `edit` (a specific registration); both
-  // refresh the registry on save. See #2212.
-  const [projectForm, setProjectForm] = useState<{ editProject: ProjectInfo | null } | null>(null);
-  const handleAddProject = useCallback(() => setProjectForm({ editProject: null }), []);
-  const handleEditProject = useCallback((project: ProjectInfo) => setProjectForm({ editProject: project }), []);
+  const [projectForm, setProjectForm] = useState<{ editProject: ProjectInfo | null; profile: string } | null>(null);
+  const handleAddProject = useCallback(() => {
+    const profile = requireProjectProfile();
+    if (profile) setProjectForm({ editProject: null, profile });
+  }, [requireProjectProfile]);
+  const handleEditProject = useCallback(
+    (project: ProjectInfo) => {
+      const profile = requireProjectProfile();
+      if (profile && projects.includes(project)) setProjectForm({ editProject: project, profile });
+    },
+    [projects, requireProjectProfile],
+  );
 
   // The synthetic Scratch group has no repo path to register a project entry under, so it gets
   // a dedicated settings modal instead of ProjectFormModal.
@@ -1462,35 +1507,41 @@ function AppContent({
         setScratchSettingsOpen(true);
         return;
       }
-      if (group.registeredProjects.length > 0) {
-        setProjectForm({ editProject: group.registeredProjects[0]! });
+      const profile = requireProjectProfile();
+      if (!profile) return;
+      const registered = group.registeredProjects.find((project) => projects.includes(project));
+      if (registered) {
+        setProjectForm({ editProject: registered, profile });
         return;
       }
       if (!group.repoPath) return;
-      const res = await createProject({ path: group.repoPath, scope: "global" });
-      if (!res.ok || !res.project) {
-        toastBus.handler?.error(res.error ?? "Failed to register project");
+      const result = await createProject({ path: group.repoPath, scope: "global", profile });
+      if (!result.ok || !result.project) {
+        toastBus.handler?.error(result.error ?? "Failed to register project");
         return;
       }
       await refreshProjects();
-      setProjectForm({ editProject: res.project });
+      setProjectForm({ editProject: result.project, profile });
     },
-    [refreshProjects],
+    [projects, refreshProjects, requireProjectProfile],
   );
 
-  // Remove a saved project: delete every registration for its path, then
-  // refresh. Confirms first since it is not undoable. See #2212.
+  // Remove only the registrations captured by this sidebar row.
   const handleRemoveProject = useCallback(
     async (group: RepoGroup) => {
+      const profile = requireProjectProfile();
+      if (!profile || !group.registeredProjects.every((project) => projects.includes(project))) return;
       if (!confirm(`Remove project '${group.displayName}' from the sidebar?`)) return;
-      const results = await Promise.all(group.registeredProjects.map((p) => deleteProject(p.name, p.scope)));
+      const results = await Promise.all(
+        group.registeredProjects.map((p) => deleteProject(p.path, projectTarget(p.scope, profile))),
+      );
       const failed = results.find((r) => !r.ok);
       if (failed) {
         toastBus.handler?.error(failed.error ?? "Failed to remove project");
       }
       await refreshProjects();
     },
-    [refreshProjects],
+    [projects, refreshProjects, requireProjectProfile],
   );
 
   // The right-panel control toggles the desktop split, but on mobile there
@@ -1759,8 +1810,8 @@ function AppContent({
         // abort. Cancel/stop must stay behind an explicit gesture
         // (the assistant-ui Stop button in the composer).
         onEscape: () => {
-          if (deletingSessionIds) {
-            setDeletingSessionIds(null);
+          if (deletingSessions.length > 0) {
+            setDeletingSessions([]);
             return;
           }
           if (stoppingSessionId) {
@@ -1793,7 +1844,7 @@ function AppContent({
         toggleDiff,
         toggleRightDock,
         showPalette,
-        deletingSessionIds,
+        deletingSessions,
         stoppingSessionId,
         showSettings,
         handleCloseSettings,
@@ -1920,6 +1971,7 @@ function AppContent({
       }
       return (
         <PairedShellPane
+          readOnly={!!serverAbout?.read_only}
           session={activeSession ?? null}
           sessionId={activeSessionId}
           terminalIndex={isTerminalTabId(id) ? terminalIndexOf(id) : 0}
@@ -1936,32 +1988,48 @@ function AppContent({
               <div className="flex-1 flex flex-col min-h-0 overflow-hidden relative">
                 <div className={selectedFilePath ? "hidden" : "flex-1 flex flex-col min-h-0 overflow-hidden"}>
                   {activeSession?.view === "structured" ? (
-                    <Suspense fallback={<AcpLoadingFallback />}>
-                      <StructuredView
-                        key={activeSessionId}
-                        sessionId={activeSessionId!}
-                        acpWorkerState={activeSession.acp_worker_state ?? "absent"}
-                        rateLimitAutoResume={activeSession.rate_limit_auto_resume}
-                        tool={activeSession.tool}
-                        acpAgent={activeSession.acp_agent ?? null}
-                        acpProvider={activeSession.acp_provider ?? null}
-                        clearAliases={activeSession.clear_aliases}
-                        archivedAt={activeSession.archived_at ?? null}
-                        snoozedUntil={activeSession.snoozed_until ?? null}
-                        trashedAt={activeSession.trashed_at ?? null}
-                        onRestore={
-                          activeSession.trashed_at
-                            ? () => handleRestoreSession(trashedWorkspaceRestoreIds(workspaces, activeSessionId!))
-                            : undefined
-                        }
-                        onOpenFileRef={handleOpenFileRef}
-                        fileRefSession={activeSession}
-                        onOpenAgentsPane={openAgentsPane}
-                        isSandboxed={activeSession.is_sandboxed}
-                      />
-                    </Suspense>
+                    <StructuredSessionStack
+                      active={!selectedFilePath}
+                      activeSessionId={activeSessionId!}
+                      sessions={sessions.filter((session) => session.view === "structured")}
+                      persistent={webSettings.persistentStructuredViews}
+                      maxPersistentViews={webSettings.maxPersistentStructuredViews}
+                      renderSession={(session, active, selected) => (
+                        <Suspense fallback={<AcpLoadingFallback />}>
+                          <StructuredView
+                            active={active}
+                            selected={selected}
+                            sessionId={session.id}
+                            acpWorkerState={session.acp_worker_state ?? "absent"}
+                            rateLimitAutoResume={session.rate_limit_auto_resume}
+                            settingsHref={autoResumeSettingsHref(session.profile, serverAbout)}
+                            tool={session.tool}
+                            acpAgent={session.acp_agent ?? null}
+                            startedBefore={hasStartedBefore(session)}
+                            acpProvider={session.acp_provider ?? null}
+                            clearAliases={session.clear_aliases}
+                            archivedAt={session.archived_at ?? null}
+                            snoozedUntil={session.snoozed_until ?? null}
+                            trashedAt={session.trashed_at ?? null}
+                            onRestore={
+                              session.trashed_at
+                                ? () => handleRestoreSession(trashedWorkspaceRestoreIds(workspaces, session.id))
+                                : undefined
+                            }
+                            onOpenFileRef={handleOpenFileRef}
+                            fileRefSession={session}
+                            onOpenAgentsPane={openAgentsPane}
+                            isSandboxed={session.is_sandboxed}
+                            onSwitchToTerminal={
+                              canSwitchToTerminal ? () => handleSwitchView(session.id, false) : undefined
+                            }
+                          />
+                        </Suspense>
+                      )}
+                    />
                   ) : (
                     <TerminalSessionStack
+                      readOnly={!!serverAbout?.read_only}
                       activeSessionId={activeSessionId!}
                       sessions={sessions.filter((session) => session.view !== "structured")}
                       persistent={webSettings.persistentTerminals}
@@ -2074,10 +2142,14 @@ function AppContent({
               request={request}
               workspaces={workspaces}
               readOnly={serverAbout?.read_only ?? false}
+              observedById={observedById}
+              runtimeEpoch={runtimeEpoch}
               handlers={{
+                onSessionMutation: applySessionMutation,
                 onDelete: handleDeleteSession,
                 onStop: handleStopSession,
                 onStart: handleStartSession,
+                onRestartForUpdate: restartForUpdate,
                 onSwitchView: handleSwitchView,
                 onCreateSession: handleCreateSession,
               }}
@@ -2106,8 +2178,12 @@ function AppContent({
             const p = searchParams.get("profile");
             navigate(`/settings${p ? `?profile=${encodeURIComponent(p)}` : ""}`, { replace: true });
           }}
-          onServerAboutRefresh={refreshServerAbout}
+          onServerAboutRefresh={async () => {
+            await refreshServerAbout();
+            await refreshProjects();
+          }}
           profile={searchParams.get("profile")}
+          field={searchParams.get("field")}
           onSelectProfile={(p) => {
             const next = new URLSearchParams(searchParams);
             next.set("profile", p);
@@ -2156,10 +2232,12 @@ function AppContent({
     if (singlePane) {
       return (
         <MobileMainPane
+          readOnly={!!serverAbout?.read_only}
           view={rightPanelView}
           pluginPanes={pluginPanes}
           onBackToAgent={() => handlePickView("agent")}
           onOpenAgentsPane={() => handlePickView("agents")}
+          onSwitchToTerminal={canSwitchToTerminal ? (id) => handleSwitchView(id, false) : undefined}
           pairedMounted={pairedMounted}
           activeSession={activeSession ?? null}
           activeSessionId={activeSessionId}
@@ -2186,6 +2264,7 @@ function AppContent({
           onOpenSendDialog={() => setSendDialogOpen(true)}
           onCloseSendDialog={() => setSendDialogOpen(false)}
           onClearSelectedFile={() => setSelectedFile(null)}
+          serverAbout={serverAbout}
         />
       );
     }
@@ -2291,14 +2370,12 @@ function AppContent({
   });
   const tour = useTour({
     scope: tourScope,
-    readOnly: !!serverAbout?.read_only,
-    cityhall: caps.cityhall,
+    readOnly: serverAbout?.read_only,
     isDesktop: !isCoarse,
     autoLaunchReady: tourAutoLaunchReady && welcome.resolved,
     seen: tourSeen,
     seenKnown: tourSeenKnown,
     onSeen: handleTourSeen,
-    onNavigate: (tab) => (tab ? navigate(`/settings/${tab}`) : handleCloseSettings()),
   });
 
   // Auto-pop the tip-of-the-day once per load, after onboarding settles, like
@@ -2375,286 +2452,306 @@ function AppContent({
 
   return (
     <AcpPrefsProvider value={acpPrefs}>
-      <div className="h-(--app-height) flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
-        {/* Wrapped unconditionally, not behind the `headerCollapsible`
+      <SessionActionProvider
+        sessions={sessions}
+        runtimeEpoch={runtimeEpoch}
+        observedById={observedById}
+        onSessionMutation={applySessionMutation}
+        readOnly={serverAbout?.read_only}
+        available={!error}
+      >
+        <div className="h-(--app-height) flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
+          {/* Wrapped unconditionally, not behind the `headerCollapsible`
             ternary: swapping the element type at this position would remount
             `TopBar` (and reset its overflow menu) every time the boundary
             flips, e.g. opening settings on a phone. An expanded region is a
             `1fr` grid row around a fixed-height bar, so the wrapper is inert
             for every view that cannot collapse. */}
-        <CollapsibleRegion id="conversation-header" collapsed={headerCollapsible && headerCollapsed}>
-          <TopBar
-            activeWorkspace={activeWorkspace}
-            activeSession={activeSession ?? null}
-            onToggleSidebar={handleToggleSidebar}
-            onOpenPalette={() => setShowPalette(true)}
-            onToggleDiff={toggleDiff}
-            paneIds={allPaneIds}
-            paneDescriptor={paneDescriptor}
-            isPaneOpen={isPaneOpen}
-            onTogglePane={togglePaneAny}
-            onOpenHelp={handleOpenHelp}
-            onOpenAbout={handleOpenAbout}
-            onStartTutorial={tour.startTour}
-            unreadCount={unreadCount}
-            waitingCount={waitingCount}
-            attentionBadgeColors={attentionBadgeColors}
-            onLogout={onLogout}
-            loginRequired={loginRequired}
-            isOffline={!!error}
-            isDevBuild={isDebugBuild(serverAbout)}
-            onOpenTips={tips.open}
-            onGoDashboard={handleGoDashboard}
-            sidebarColumnVisible={!fullPageView && sidebarOpen}
-            rightColumnVisible={isMdUp && !fullPageView && !!activeWorkspace && !!activeSession && !rightDockCollapsed}
-          />
-        </CollapsibleRegion>
+          <CollapsibleRegion id="conversation-header" collapsed={headerCollapsible && headerCollapsed}>
+            <TopBar
+              activeWorkspace={activeWorkspace}
+              activeSession={activeSession ?? null}
+              onToggleSidebar={handleToggleSidebar}
+              onOpenPalette={() => setShowPalette(true)}
+              onToggleDiff={toggleDiff}
+              paneIds={allPaneIds}
+              paneDescriptor={paneDescriptor}
+              isPaneOpen={isPaneOpen}
+              onTogglePane={togglePaneAny}
+              onOpenHelp={handleOpenHelp}
+              onOpenAbout={handleOpenAbout}
+              onStartTutorial={tour.startTour}
+              unreadCount={unreadCount}
+              waitingCount={waitingCount}
+              attentionBadgeColors={attentionBadgeColors}
+              onLogout={onLogout}
+              loginRequired={loginRequired}
+              isOffline={!!error}
+              isDevBuild={isDebugBuild(serverAbout)}
+              onOpenTips={tips.open}
+              onGoDashboard={handleGoDashboard}
+              sidebarColumnVisible={!fullPageView && sidebarOpen}
+              rightColumnVisible={
+                isMdUp && !fullPageView && !!activeWorkspace && !!activeSession && !rightDockCollapsed
+              }
+            />
+          </CollapsibleRegion>
 
-        <BannerStack />
+          <BannerStack />
 
-        {/* Below the banners, not directly under the bar: the handle is
+          {/* Below the banners, not directly under the bar: the handle is
             absolutely positioned at the top-right, and hanging it off the bar
             puts it on top of the update banner's dismiss button (same corner),
             which then cannot be tapped at all. */}
-        {headerCollapsible && (
-          <ChromeCollapseHandle
-            edge="top"
-            collapsed={headerCollapsed}
-            onToggle={() => setHeaderCollapsed((v) => !v)}
-            collapseLabel="Collapse conversation header"
-            expandLabel="Expand conversation header"
-            controlsId="conversation-header"
-            testId="header-collapse-toggle"
-          />
-        )}
-
-        <div className="flex flex-1 min-h-0">
-          {!fullPageView && (
-            <WorkspaceSidebar
-              groups={sidebarGroups}
-              nestedGroups={nestedGroups}
-              orgGroups={orgGroups}
-              trashedWorkspaces={trashedWorkspaces}
-              onToggleSubgroup={toggleSubgroupCollapsed}
-              onToggleOrg={toggleOrgCollapsed}
-              onToggleOrgRepo={toggleOrgRepoCollapsed}
-              onReorderWorkspaces={handleReorderWorkspaces}
-              onReorderGroups={reorderRepoGroups}
-              activeId={activeWorkspace?.id ?? null}
-              open={sidebarOpen}
-              onToggle={() => setSidebarOpen(false)}
-              onSelect={handleSelectWorkspace}
-              onToggleGroup={toggleSidebarGroup}
-              onUpdateRepoAppearance={updateRepoAppearance}
-              onNew={() => {
-                setWizardPrefill(undefined);
-                setShowSessionWizard(true);
-              }}
-              onCreateSession={handleCreateSession}
-              onPinProject={handlePinProject}
-              onUnpinProject={handleUnpinProject}
-              onEditProjectSettings={handleEditProjectSettings}
-              savedProjects={savedProjects}
-              onAddProject={handleAddProject}
-              onEditProject={handleEditProject}
-              onRemoveProject={handleRemoveProject}
-              onSettings={handleOpenSettings}
-              onDeleteSession={handleDeleteSession}
-              onRestoreSession={handleRestoreSession}
-              onEmptyTrash={handleEmptyTrash}
-              onStopSession={handleStopSession}
-              onStartSession={handleStartSession}
-              onSwitchView={handleSwitchView}
-              readOnly={serverAbout?.read_only}
-              canManageProjects={caps.canManageProjects}
-              sortMode={sidebarSortMode}
-              onSortModeChange={selectSidebarSortMode}
-              pluginSortRef={pluginSortRef}
-              onPluginSortChange={setPluginSortRef}
-              axis={sidebarAxis}
-              onAxisChange={setSidebarAxis}
+          {headerCollapsible && (
+            <ChromeCollapseHandle
+              edge="top"
+              collapsed={headerCollapsed}
+              onToggle={() => setHeaderCollapsed((v) => !v)}
+              collapseLabel="Collapse conversation header"
+              expandLabel="Expand conversation header"
+              controlsId="conversation-header"
+              testId="header-collapse-toggle"
             />
           )}
 
-          <div className="flex-1 flex flex-col min-h-0 min-w-0">{renderContent()}</div>
-        </div>
+          <div className="flex flex-1 min-h-0">
+            {!fullPageView && (
+              <WorkspaceSidebar
+                observedById={observedById}
+                runtimeEpoch={runtimeEpoch}
+                onSessionMutation={applySessionMutation}
+                groups={sidebarGroups}
+                nestedGroups={nestedGroups}
+                orgGroups={orgGroups}
+                trashedWorkspaces={trashedWorkspaces}
+                onToggleSubgroup={toggleSubgroupCollapsed}
+                onToggleOrg={toggleOrgCollapsed}
+                onToggleOrgRepo={toggleOrgRepoCollapsed}
+                onReorderWorkspaces={handleReorderWorkspaces}
+                onReorderGroups={reorderRepoGroups}
+                activeId={activeWorkspace?.id ?? null}
+                open={sidebarOpen}
+                onToggle={() => setSidebarOpen(false)}
+                onSelect={handleSelectWorkspace}
+                onToggleGroup={toggleSidebarGroup}
+                onUpdateRepoAppearance={updateRepoAppearance}
+                onNew={() => {
+                  setWizardPrefill(undefined);
+                  setShowSessionWizard(true);
+                }}
+                onCreateSession={handleCreateSession}
+                onPinProject={projectsReady ? handlePinProject : undefined}
+                onUnpinProject={projectsReady ? handleUnpinProject : undefined}
+                onEditProjectSettings={handleEditProjectSettings}
+                savedProjects={savedProjects}
+                onAddProject={handleAddProject}
+                onEditProject={handleEditProject}
+                onRemoveProject={handleRemoveProject}
+                onSettings={handleOpenSettings}
+                onDeleteSession={handleDeleteSession}
+                onRestoreSession={handleRestoreSession}
+                onEmptyTrash={handleEmptyTrash}
+                onStopSession={handleStopSession}
+                onStartSession={handleStartSession}
+                onRestartForUpdate={restartForUpdate}
+                onSwitchView={handleSwitchView}
+                readOnly={serverAbout?.read_only}
+                canManageProjects={caps.canManageProjects}
+                sortMode={sidebarSortMode}
+                onSortModeChange={selectSidebarSortMode}
+                pluginSortRef={pluginSortRef}
+                onPluginSortChange={setPluginSortRef}
+                axis={sidebarAxis}
+                onAxisChange={setSidebarAxis}
+              />
+            )}
 
-        {showSessionWizard && (
-          <SessionWizard
-            onClose={() => {
-              setShowSessionWizard(false);
-              setWizardPrefill(undefined);
-            }}
-            onCreated={(session?: SessionResponse) => {
-              if (session) {
+            <div className="flex-1 flex flex-col min-h-0 min-w-0">{renderContent()}</div>
+          </div>
+
+          {showSessionWizard && (
+            <SessionWizard
+              servedProfile={servedProfileReady ? serverAbout?.profile : undefined}
+              onRetryServedProfile={refreshServerAbout}
+              onClose={() => {
+                setShowSessionWizard(false);
+                setWizardPrefill(undefined);
+              }}
+              onCreated={(session?: SessionResponse) => {
+                if (session) {
+                  injectSession(session);
+                  navigate(`/session/${encodeURIComponent(session.id)}`);
+                  if (window.innerWidth < 768) setSidebarOpen(false);
+                }
+                setShowSessionWizard(false);
+                setWizardPrefill(undefined);
+              }}
+              onCreatedInBackground={(session?: SessionResponse) => {
+                if (!session) return;
                 injectSession(session);
-                navigate(`/session/${encodeURIComponent(session.id)}`);
-                if (window.innerWidth < 768) setSidebarOpen(false);
-              }
-              setShowSessionWizard(false);
-              setWizardPrefill(undefined);
+                toastBus.handler?.info(`"${session.title}" is ready`);
+              }}
+              prefill={wizardPrefill}
+              nameOnly={caps.nameOnlyWizard}
+            />
+          )}
+
+          {projectForm && (
+            <ProjectFormModal
+              initial={projectForm.editProject}
+              profile={projectForm.profile}
+              onClose={() => setProjectForm(null)}
+              onSaved={() => refreshProjects()}
+            />
+          )}
+
+          {scratchSettingsOpen && (
+            <ScratchOverridesModal profile={serverAbout?.profile ?? ""} onClose={() => setScratchSettingsOpen(false)} />
+          )}
+
+          {welcome.showWelcome && (
+            <ThemeIntro
+              onDone={welcome.dismissWelcome}
+              tourFollows={!isCoarse}
+              onSkipTour={() => {
+                handleTourSeen();
+                welcome.dismissWelcome();
+              }}
+            />
+          )}
+
+          {tour.tourElement}
+
+          {showHelp && <HelpOverlay onClose={() => setShowHelp(false)} />}
+
+          {tips.isOpen && (
+            <TipsModal
+              tips={tips.tips}
+              startIndex={tips.startIndex}
+              enabled={tips.enabled}
+              onMarkSeen={tips.markSeen}
+              onSetEnabled={tips.setEnabled}
+              onClose={tips.close}
+            />
+          )}
+
+          {showAbout && <AboutModal onClose={() => setShowAbout(false)} sessionId={activeSessionId} />}
+          {telemetryConsentNeeded && <TelemetryConsentModal onChoose={handleTelemetryConsent} />}
+
+          {deletingSession && deletingCleanupDefaults && (
+            <DeleteSessionDialog
+              sessionTitle={deletingSession.title}
+              branchName={deletingBranchName}
+              hasManagedWorktree={deletingSessions.some((session) => session.has_cleanable_worktree ?? false)}
+              isSandboxed={deletingSessions.some((session) => session.is_sandboxed)}
+              isScratch={deletingSessions.some((session) => session.scratch)}
+              cleanupDefaults={deletingCleanupDefaults}
+              defaultToTrash={deletingDefaultToTrash}
+              affectedSessions={deletingSessions.map((session) => ({
+                id: session.id,
+                title: session.title,
+                isSandboxed: session.is_sandboxed,
+              }))}
+              worktreeSharedWith={deletingWorktreeSharedWith}
+              onConfirm={handleConfirmDelete}
+              onTrash={handleConfirmTrash}
+              onCancel={() => setDeletingSessions([])}
+            />
+          )}
+
+          {stoppingSession && (
+            <StopSessionDialog
+              sessionTitle={stoppingSession.title}
+              onConfirm={handleConfirmStop}
+              onCancel={() => setStoppingSessionId(null)}
+            />
+          )}
+
+          {switchViewTarget && switchViewSession && (
+            <SwitchViewDialog
+              sessionTitle={switchViewSession.title}
+              toStructured={switchViewTarget.toStructured}
+              keepsContext={switchViewSession.keeps_context ?? false}
+              onConfirm={handleConfirmSwitchView}
+              onCancel={() => setSwitchViewTarget(null)}
+            />
+          )}
+
+          <CommandPalette
+            open={showPalette}
+            onClose={() => {
+              setShowPalette(false);
+              setPaletteQuery("");
             }}
-            onCreatedInBackground={(session?: SessionResponse) => {
-              if (!session) return;
-              injectSession(session);
-              toastBus.handler?.info(`"${session.title}" is ready`);
-            }}
-            prefill={wizardPrefill}
-            nameOnly={caps.nameOnlyWizard}
+            actions={[
+              ...commandActions,
+              ...conversationActions,
+              ...pluginPageActions,
+              ...settingsCommands,
+              ...pluginCommandActions,
+            ]}
+            onSearchChange={setPaletteQuery}
+            searching={conversationSearching}
           />
-        )}
 
-        {projectForm && (
-          <ProjectFormModal
-            initial={projectForm.editProject}
-            onClose={() => setProjectForm(null)}
-            onSaved={() => refreshProjects()}
+          {pluginLinkPicker}
+
+          {snoozeTargetId && (
+            <SnoozeModal
+              title="Snooze session"
+              onCancel={() => setSnoozeTargetId(null)}
+              onPick={(minutes) => {
+                const id = snoozeTargetId;
+                setSnoozeTargetId(null);
+                void setSessionSnooze(id, minutes).then((result) => {
+                  if (result) applySession(result);
+                  else reportError("Failed to snooze session");
+                });
+              }}
+            />
+          )}
+
+          {singlePane && activeWorkspace && activeSession && (
+            <MobileRightPanelPicker
+              open={pickerOpen}
+              active={rightPanelView}
+              sessionTitle={activeSession.title}
+              availablePanes={mobilePaneIds}
+              describePane={paneDescriptor}
+              onSelect={handlePickView}
+              onClose={closePicker}
+            />
+          )}
+
+          <textarea
+            ref={setKeyboardProxyRef}
+            data-keyboard-proxy
+            data-session-input={
+              activeSession &&
+              !fullPageView &&
+              (!singlePane || rightPanelView === "agent" || rightPanelView === "paired")
+                ? ""
+                : undefined
+            }
+            aria-hidden="true"
+            tabIndex={-1}
+            // Keep the element in the visual viewport. Focusing a zero-size
+            // textarea thousands of pixels above an iOS PWA can leave WebKit's
+            // focus scroll in a broken state until the keyboard is toggled.
+            // This matches the live terminal's hidden input geometry.
+            className="fixed bottom-0 left-0 w-px h-px opacity-0 pointer-events-none"
+            style={{ caretColor: "transparent", color: "transparent" }}
+            // Typed text stays in this textarea as IME context (see
+            // bindHiddenInput), so keep the OS from rewriting it the way the
+            // live terminal's own hidden input already does.
+            autoCapitalize="off"
+            autoCorrect="off"
+            autoComplete="off"
+            spellCheck={false}
           />
-        )}
-
-        {scratchSettingsOpen && (
-          <ScratchOverridesModal profile={serverAbout?.profile ?? ""} onClose={() => setScratchSettingsOpen(false)} />
-        )}
-
-        {welcome.showWelcome && (
-          <ThemeIntro
-            onDone={welcome.dismissWelcome}
-            tourFollows={!isCoarse}
-            onSkipTour={() => {
-              handleTourSeen();
-              welcome.dismissWelcome();
-            }}
-          />
-        )}
-
-        {tour.tourElement}
-
-        {showHelp && <HelpOverlay onClose={() => setShowHelp(false)} />}
-
-        {tips.isOpen && (
-          <TipsModal
-            tips={tips.tips}
-            startIndex={tips.startIndex}
-            enabled={tips.enabled}
-            onMarkSeen={tips.markSeen}
-            onSetEnabled={tips.setEnabled}
-            onClose={tips.close}
-          />
-        )}
-
-        {showAbout && <AboutModal onClose={() => setShowAbout(false)} sessionId={activeSessionId} />}
-        {telemetryConsentNeeded && <TelemetryConsentModal onChoose={handleTelemetryConsent} />}
-
-        {deletingSession && deletingCleanupDefaults && (
-          <DeleteSessionDialog
-            sessionTitle={deletingSession.title}
-            branchName={deletingBranchName}
-            hasManagedWorktree={deletingSessions.some((session) => session.has_cleanable_worktree ?? false)}
-            isSandboxed={deletingSessions.some((session) => session.is_sandboxed)}
-            isScratch={deletingSessions.some((session) => session.scratch)}
-            cleanupDefaults={deletingCleanupDefaults}
-            defaultToTrash={deletingDefaultToTrash}
-            affectedSessions={deletingSessions.map((session) => ({
-              id: session.id,
-              title: session.title,
-              isSandboxed: session.is_sandboxed,
-            }))}
-            worktreeSharedWith={deletingWorktreeSharedWith}
-            onConfirm={handleConfirmDelete}
-            onTrash={handleConfirmTrash}
-            onCancel={() => setDeletingSessionIds(null)}
-          />
-        )}
-
-        {stoppingSession && (
-          <StopSessionDialog
-            sessionTitle={stoppingSession.title}
-            onConfirm={handleConfirmStop}
-            onCancel={() => setStoppingSessionId(null)}
-          />
-        )}
-
-        {switchViewTarget && switchViewSession && (
-          <SwitchViewDialog
-            sessionTitle={switchViewSession.title}
-            toStructured={switchViewTarget.toStructured}
-            keepsContext={switchViewSession.keeps_context ?? false}
-            onConfirm={handleConfirmSwitchView}
-            onCancel={() => setSwitchViewTarget(null)}
-          />
-        )}
-
-        <CommandPalette
-          open={showPalette}
-          onClose={() => {
-            setShowPalette(false);
-            setPaletteQuery("");
-          }}
-          actions={[
-            ...commandActions,
-            ...conversationActions,
-            ...pluginPageActions,
-            ...settingsCommands,
-            ...pluginCommandActions,
-          ]}
-          onSearchChange={setPaletteQuery}
-          searching={conversationSearching}
-        />
-
-        {pluginLinkPicker}
-
-        {snoozeTargetId && (
-          <SnoozeModal
-            title="Snooze session"
-            onCancel={() => setSnoozeTargetId(null)}
-            onPick={(minutes) => {
-              const id = snoozeTargetId;
-              setSnoozeTargetId(null);
-              void setSessionSnooze(id, minutes).then((result) => {
-                if (result) applySession(result);
-                else reportError("Failed to snooze session");
-              });
-            }}
-          />
-        )}
-
-        {singlePane && activeWorkspace && activeSession && (
-          <MobileRightPanelPicker
-            open={pickerOpen}
-            active={rightPanelView}
-            sessionTitle={activeSession.title}
-            availablePanes={mobilePaneIds}
-            describePane={paneDescriptor}
-            onSelect={handlePickView}
-            onClose={closePicker}
-          />
-        )}
-
-        <textarea
-          ref={setKeyboardProxyRef}
-          data-keyboard-proxy
-          data-session-input={
-            activeSession && !fullPageView && (!singlePane || rightPanelView === "agent" || rightPanelView === "paired")
-              ? ""
-              : undefined
-          }
-          aria-hidden="true"
-          tabIndex={-1}
-          // Keep the element in the visual viewport. Focusing a zero-size
-          // textarea thousands of pixels above an iOS PWA can leave WebKit's
-          // focus scroll in a broken state until the keyboard is toggled.
-          // This matches the live terminal's hidden input geometry.
-          className="fixed bottom-0 left-0 w-px h-px opacity-0 pointer-events-none"
-          style={{ caretColor: "transparent", color: "transparent" }}
-          // Typed text stays in this textarea as IME context (see
-          // bindHiddenInput), so keep the OS from rewriting it the way the
-          // live terminal's own hidden input already does.
-          autoCapitalize="off"
-          autoCorrect="off"
-          autoComplete="off"
-          spellCheck={false}
-        />
-      </div>
+        </div>
+      </SessionActionProvider>
     </AcpPrefsProvider>
   );
 }

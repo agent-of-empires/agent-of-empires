@@ -3,9 +3,8 @@
 
 use super::*;
 
-/// One tmux-backed session, selected, with the split on. Returns the agent and paired
-/// terminal tmux names for the caller to pin in the session cache.
-fn split_env(structured: bool) -> (TestEnv, String, String) {
+/// One selected session with split preview and a daemon-observed paired terminal.
+fn split_env(structured: bool, running: bool) -> (TestEnv, String, String) {
     let mut inst = Instance::new("splitter", "/tmp/split");
     if structured {
         inst.view = crate::session::View::Structured;
@@ -13,6 +12,20 @@ fn split_env(structured: bool) -> (TestEnv, String, String) {
     let agent = crate::tmux::Session::generate_name(&inst.id, &inst.title);
     let term = crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title);
     let mut env = seeded_env(test_home(), &[inst.clone()], true);
+    env.view.mutate_instance(&inst.id, |instance| {
+        instance.auxiliary = vec![crate::session::AuxiliaryObservation {
+            target: crate::session::AuxiliaryTarget::Host { index: 0 },
+            pane: crate::session::PaneObservation {
+                state: if running {
+                    crate::session::PanePresence::Alive
+                } else {
+                    crate::session::PanePresence::Absent
+                },
+                tmux_session: running.then(|| term.clone()),
+                legacy_tool: None,
+            },
+        }];
+    });
     env.view.select_session_by_id(&inst.id);
     env.view.split_terminal = true;
     (env, agent, term)
@@ -77,12 +90,9 @@ fn split_preview_layout_and_focus() {
             height,
             expect_split,
         } = case;
-        let (mut env, agent, term) = split_env(structured);
-        let present: Vec<&str> = [(agent_alive, agent.as_str()), (running, term.as_str())]
-            .into_iter()
-            .filter_map(|(on, name)| on.then_some(name))
-            .collect();
-        cache.force_present(&present);
+        let (mut env, agent, _term) = split_env(structured, running);
+        let present: &[&str] = if agent_alive { &[agent.as_str()] } else { &[] };
+        cache.force_present(present);
         env.view.view_mode = mode.clone();
 
         let screen = render_home_to_string(&mut env.view, 120, height);
@@ -122,8 +132,8 @@ fn split_preview_layout_and_focus() {
 #[serial]
 fn split_focus_swap_keeps_the_other_half_cached() {
     let cache = crate::tmux::SessionCacheGuard::capture();
-    let (mut env, agent, term) = split_env(false);
-    cache.force_present(&[agent.as_str(), term.as_str()]);
+    let (mut env, agent, term) = split_env(false, true);
+    cache.force_present(&[agent.as_str()]);
     let id = env.view.selected_session.clone().unwrap();
     render_home_to_string(&mut env.view, 120, 40);
     assert_eq!(
@@ -151,6 +161,122 @@ fn split_focus_swap_keeps_the_other_half_cached() {
         env.view.split_capture_target.as_deref(),
         Some(term.as_str())
     );
+}
+
+#[test]
+#[serial]
+fn passive_split_follows_captured_cursor_without_discarding_history_or_clear_frames() {
+    use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
+    use ratatui::Terminal;
+
+    let present = crate::tmux::SessionCacheGuard::capture();
+    let (mut env, agent, _term) = split_env(false, true);
+    present.force_present(&[agent.as_str()]);
+    render_home_to_string(&mut env.view, 100, 30);
+    env.view
+        .split_capture_worker
+        .as_mut()
+        .expect("passive observer exists")
+        .stop_for_test();
+    let cursor = crate::tmux::PaneCursor {
+        x: 33,
+        y: 2,
+        visible: true,
+        pane_height: 26,
+        history_size: 2,
+        pane_width: 61,
+        alternate_on: false,
+        mouse_tracking: false,
+        mouse_sgr: false,
+        mouse_all: false,
+        position_reliable: true,
+        composite_pane0: None,
+    };
+    let mut top = [""; 28];
+    top[0] = "HISTORY_ONLY";
+    top[2] = "SHELL_SIDE";
+    top[4] = "$ ";
+    let mut background = top;
+    background[3] = "\x1b[44m \x1b[0m";
+    let mut cleared = [""; 28];
+    cleared[0] = "HISTORY_ONLY";
+    cleared[1] = "OLD_SHELL_SIDE";
+    let mut bottom = [""; 28];
+    bottom[0] = "HISTORY_ONLY";
+    bottom[27] = "SHELL_SIDE";
+    let top = top.join("\n") + "\n";
+    let background = background.join("\n") + "\n";
+    let cleared = cleared.join("\n") + "\n";
+    let bottom = bottom.join("\n") + "\n";
+    let theme = crate::tui::styles::load_theme("empire");
+    for (name, content, cursor, shell_visible, background_visible) in [
+        ("taller screen", top.as_str(), Some(cursor), true, false),
+        (
+            "cleared screen",
+            cleared.as_str(),
+            Some(crate::tmux::PaneCursor { y: 0, ..cursor }),
+            false,
+            false,
+        ),
+        ("fresh empty frame", "", Some(cursor), false, false),
+        (
+            "painted background",
+            background.as_str(),
+            Some(cursor),
+            true,
+            true,
+        ),
+        (
+            "unreliable cursor",
+            top.as_str(),
+            Some(crate::tmux::PaneCursor {
+                position_reliable: false,
+                ..cursor
+            }),
+            false,
+            false,
+        ),
+        ("missing cursor", top.as_str(), None, false, false),
+        (
+            "bottom cursor",
+            bottom.as_str(),
+            Some(crate::tmux::PaneCursor { y: 25, ..cursor }),
+            true,
+            false,
+        ),
+    ] {
+        env.view
+            .split_capture_worker
+            .as_ref()
+            .expect("passive observer exists")
+            .inject_frame_with_cursor_for_test(2000, content, cursor);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                env.view.render(frame, area, &theme, None, None, None);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert_eq!(
+            screen.contains("SHELL_SIDE"),
+            shell_visible,
+            "{name}:\n{screen}"
+        );
+        assert!(!screen.contains("HISTORY_ONLY"), "{name}:\n{screen}");
+        if background_visible {
+            let outer = env.view.preview_outer_area;
+            let passive_top = env.view.preview_area.bottom();
+            assert!(
+                (passive_top..outer.bottom()).any(|y| {
+                    (outer.x..outer.right()).any(|x| buffer[(x, y)].bg == Color::Blue)
+                }),
+                "captured background cells remain painted:\n{screen}"
+            );
+        }
+    }
 }
 
 /// A worktree agent's tall info header must not eat the split half: headers are off while
@@ -207,7 +333,7 @@ fn split_empty_terminal_hint_follows_live_mode() {
         ),
     ];
     for (i, (name, leader, expected)) in cases.into_iter().enumerate() {
-        let (mut env, agent, _term) = split_env(false);
+        let (mut env, agent, _term) = split_env(false, false);
         cache.force_present(&[agent.as_str()]);
         if i > 0 {
             let inst = env.view.instance_at(0).clone();

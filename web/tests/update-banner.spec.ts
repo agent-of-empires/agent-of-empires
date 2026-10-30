@@ -4,7 +4,12 @@ import { Page } from "@playwright/test";
 
 async function mockBase(page: Page) {
   await mockStaticApis(page);
-  await page.route("**/api/sessions", (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }));
+  await page.route("**/api/sessions", (r) =>
+    r.fulfill({
+      headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
+      json: { sessions: [], workspace_ordering: [] },
+    }),
+  );
 }
 
 test.describe("Update banner (#984, #1140)", () => {
@@ -61,5 +66,42 @@ test.describe("Update banner (#984, #1140)", () => {
     await observeFor(page, 300, async () => {
       expect(await page.getByRole("status", { name: /Update available/i }).count()).toBe(0);
     });
+  });
+
+  test("at 375px the longest command wraps inside its box and nothing scrolls sideways (#4720)", async ({ page }) => {
+    const cargo = "cargo install --git https://github.com/agent-of-empires/agent-of-empires aoe";
+    await mockBase(page);
+    await page.route("**/api/system/update-status", (r) =>
+      r.fulfill({
+        json: {
+          update_check_mode: "notify",
+          current_version: "1.19.0",
+          latest_version: "1.20.0",
+          update_available: true,
+          release_url: "https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.20.0",
+          error: null,
+          dismissed_version: null,
+          install_method: "cargo",
+          update_command: cargo,
+        },
+      }),
+    );
+    await page.setViewportSize({ width: 375, height: 812 });
+    await page.goto("/");
+    const banner = page.getByRole("status", { name: /Update available/i });
+    await expect(banner).toBeVisible();
+    await expect(banner.getByText(cargo)).toBeVisible();
+    // The restart qualifier is visible text, not a tooltip.
+    await expect(banner.getByText("or restart it through your service manager")).toBeVisible();
+    const box = (await banner.boundingBox())!;
+    for (const name of [`Copy ${cargo}`, "Copy aoe serve --restart", "Dismiss update notice"]) {
+      const control = (await banner.getByRole("button", { name }).boundingBox())!;
+      expect(control.height, name).toBeGreaterThanOrEqual(32);
+      expect(control.x + control.width, name).toBeLessThanOrEqual(box.x + box.width + 0.5);
+    }
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth),
+    ).toBeLessThanOrEqual(0);
+    expect(await banner.evaluate((el) => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(0);
   });
 });

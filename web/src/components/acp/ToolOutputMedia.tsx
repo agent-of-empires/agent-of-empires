@@ -3,13 +3,21 @@ import { FileDown, Image as ImageIcon, Link as LinkIcon, Music } from "lucide-re
 
 import type { ToolOutputBlock } from "../../lib/acpTypes";
 import { ExpandableImage } from "./artifactMedia";
+import { CopyRow } from "./CopyRow";
 import { SAFE_LINK_SCHEMES, SAFE_MEDIA_SCHEMES, safeUri } from "./ToolCardChrome";
 
-/** Structured completion payload rendered under any tool card. A block with no
- *  usable bytes or uri degrades to a labelled placeholder rather than vanishing. */
-export function ToolOutputMedia({ blocks }: { blocks: ToolOutputBlock[] }) {
+/** Structured completion payload rendered under any tool card, or with `bare`
+ *  inside a card body that already supplies the box. A block with no usable
+ *  bytes or uri degrades to a labelled placeholder rather than vanishing. */
+export function ToolOutputMedia({ blocks, bare }: { blocks: ToolOutputBlock[]; bare?: boolean }) {
   return (
-    <div className="my-1 space-y-2 overflow-hidden rounded-md border border-surface-700 bg-surface-800/50 p-3 text-sm">
+    <div
+      className={
+        bare
+          ? "space-y-2 border-t border-surface-800 px-3 py-2 text-sm"
+          : "my-1 space-y-2 overflow-hidden rounded-md border border-surface-700 bg-surface-800/50 p-3 text-sm"
+      }
+    >
       {blocks.map((block, i) => (
         <ToolOutputBlockView key={i} block={block} />
       ))}
@@ -30,7 +38,11 @@ function MediaPlaceholder({ icon, label }: { icon: ReactNode; label: string }) {
 }
 
 function TextPre({ text }: { text: string }) {
-  return <pre className="whitespace-pre-wrap break-words font-mono text-xs text-text-secondary">{text}</pre>;
+  return (
+    <CopyRow source={text} label="Copy text">
+      <pre className="whitespace-pre-wrap break-words font-mono text-xs text-text-secondary">{text}</pre>
+    </CopyRow>
+  );
 }
 
 function LinkRow({ icon, label, ...anchor }: { icon: ReactNode; label: string } & React.ComponentProps<"a">) {

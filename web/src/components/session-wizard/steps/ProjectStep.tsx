@@ -2,14 +2,15 @@ import { useState } from "react";
 import type { AgentInfo, ImportableSession, ProjectOverrides } from "../../../lib/types";
 import { DirectoryBrowser } from "../../DirectoryBrowser";
 import { ImportSessionPicker } from "./ImportSessionPicker";
+import { CloneRepoForm } from "./CloneRepoForm";
 import { ProjectSearchList } from "./ProjectSearchList";
 import { useProjectPicker } from "./projectPicker";
-import { CloneRepoForm } from "./CloneRepoForm";
 import type { WizardData } from "../wizardReducer";
 
 type Tab = "recent" | "browse" | "clone" | "import" | "scratch";
 
 interface Props {
+  profile: string | undefined;
   data: WizardData;
   onChange: (field: string, value: unknown) => void;
   initialTab?: Tab;
@@ -23,19 +24,26 @@ interface Props {
 }
 
 /** The wizard's project panel: recent and saved projects, browse, clone, import, or scratch. */
-export function ProjectStep({ data, onChange, initialTab, agents = [], onSelectSavedProject, onPicked }: Props) {
+export function ProjectStep({
+  data,
+  profile,
+  onChange,
+  initialTab,
+  agents = [],
+  onSelectSavedProject,
+  onPicked,
+}: Props) {
   // Until a tab is picked, show Recent while loading or when there are picks, else Browse.
   const [manualTab, setManualTab] = useState<Tab | null>(initialTab ?? (data.scratch ? "scratch" : null));
-  const { loading, registryAvailable, saved, query, setQuery, filteredSaved, filteredRecent, hasPicks } =
-    useProjectPicker([], data.profile || undefined);
+  const { loading, error, retry, registryAvailable, saved, query, setQuery, filteredSaved, filteredRecent, hasPicks } =
+    useProjectPicker(profile);
   const activeTab: Tab = manualTab ?? (!loading && !hasPicks ? "browse" : "recent");
 
   const normalizePath = (p: string) => p.replace(/\/+$/, "") || "/";
 
-  // Match against the full saved list: a registered project can fall outside the search filter.
   const selectPath = (path: string) => {
     onChange("path", path);
-    const matched = saved.find((p) => normalizePath(p.path) === normalizePath(path));
+    const matched = saved.find((project) => normalizePath(project.path) === normalizePath(path));
     // A failed registry request reports `null`: the overrides are unknown, which is not "none".
     onSelectSavedProject?.(registryAvailable ? matched?.overrides : null, path);
     onPicked?.();
@@ -54,22 +62,37 @@ export function ProjectStep({ data, onChange, initialTab, agents = [], onSelectS
     { id: "scratch", label: "Scratch" },
   ];
 
-  // A native id only resolves in its recorded cwd on the host, so worktree, scratch and sandbox are cleared.
+  // Native imports resume in their host cwd, without worktrees, extra repos or a sandbox.
   const handleImportSelect = (s: ImportableSession, agent: string) => {
     onChange("scratch", false);
     onChange("path", s.cwd);
     onChange("tool", agent);
     onChange("useStructuredView", true);
     onChange("useWorktree", false);
+    onChange("extraRepoPaths", []);
+    onChange("repoBases", {});
     onChange("sandboxEnabled", false);
     onChange("attachExisting", false);
     onChange("importAcpSessionId", s.session_id);
     if (s.title) onChange("title", s.title.slice(0, 60));
+    onChange("worktreeBranch", "");
+    onChange("baseBranch", "");
     onPicked?.();
   };
 
   return (
     <div>
+      {error && (
+        <div
+          role="alert"
+          className="mb-4 rounded-md border border-status-warning/40 bg-surface-900 px-3 py-2 text-sm text-text-secondary"
+        >
+          Projects could not be loaded. Browse and Clone are still available.
+          <button type="button" onClick={retry} className="ml-2 text-brand-400 hover:underline cursor-pointer">
+            Retry
+          </button>
+        </div>
+      )}
       {!loading && (
         <div className="flex gap-1 mb-4 border-b border-surface-700/30 overflow-x-auto">
           {tabs.map((tab) => (
@@ -111,14 +134,19 @@ export function ProjectStep({ data, onChange, initialTab, agents = [], onSelectS
 
       {!loading && activeTab === "browse" && <DirectoryBrowser onSelect={selectPath} />}
 
-      {!loading && activeTab === "import" && importAgents.length > 0 && (
-        <ImportSessionPicker
-          agents={importAgents}
-          profile={data.profile || undefined}
-          onSelect={handleImportSelect}
-          selectedSessionId={data.importAcpSessionId}
-        />
-      )}
+      {!loading &&
+        activeTab === "import" &&
+        importAgents.length > 0 &&
+        (profile ? (
+          <ImportSessionPicker
+            agents={importAgents}
+            profile={profile}
+            onSelect={handleImportSelect}
+            selectedSessionId={data.importAcpSessionId}
+          />
+        ) : (
+          <p className="text-sm text-text-muted">Resolve the server profile or select a profile to import a session.</p>
+        ))}
 
       {!loading && activeTab === "clone" && <CloneRepoForm onCloned={selectPath} />}
 

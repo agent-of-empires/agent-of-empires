@@ -62,6 +62,8 @@ import { useDictationBurstGuard } from "./useDictationBurstGuard";
 import { useProviderSwitch } from "./useProviderSwitch";
 
 interface Props {
+  /** False for a hidden or covered retained view: it takes no focus requests. */
+  active?: boolean;
   sessionId: string;
   currentAgent: AcpState["agent"];
   /** Pinned LLM backend, or null when the host environment decides. */
@@ -78,6 +80,10 @@ interface Props {
   availableCommands: AcpState["availableCommands"];
   /** WS open and worker healthy. Sends still work when false; they queue until resume. */
   connected: boolean;
+  /** For a Session that has never started: the Agent it waits for. */
+  waitingFor?: string | null;
+  /** The Worker is running; only the connection is down. */
+  connecting?: boolean;
   /** Mid-turn the textarea stays editable and sends go through the queue. */
   turnActive: boolean;
   /** Queue path used by the custom send buttons and mid-turn Enter, which the primitive blocks. */
@@ -136,7 +142,7 @@ export function Composer(props: Props) {
   useDraftPersistence(sessionId, client, composerText, draftTextRef, taRef);
   useInitialFocus(isMobile, taRef);
   // Sidebar session selection focuses the composer even when already mounted.
-  useFocusTerminalTarget("composer", taRef);
+  useFocusTerminalTarget("composer", taRef, props.active);
 
   // Opened from the sidebar row's "Switch agent" item.
   const pendingSwitchAgentSessionId = useSyncExternalStore(
@@ -362,13 +368,21 @@ export function Composer(props: Props) {
                     <StopButton />
                     <QueueSendButton
                       connected={connected}
+                      waitingFor={props.waitingFor}
+                      connecting={props.connecting}
                       steering={!!promptCapabilities?.steering}
                       disabled={!canSend}
                       onSend={submitComposer}
                     />
                   </>
                 ) : (
-                  <SendButton connected={connected} disabled={!canSend} onSend={submitComposer} />
+                  <SendButton
+                    connected={connected}
+                    waitingFor={props.waitingFor}
+                    connecting={props.connecting}
+                    disabled={!canSend}
+                    onSend={submitComposer}
+                  />
                 )}
               </div>
             </div>

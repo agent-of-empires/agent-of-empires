@@ -85,7 +85,11 @@ impl Instance {
             ));
         }
         let bind_dir = self.sandbox_capture_store_dir()?;
-        let config = self.build_container_config().ok()?;
+        let launch_config = crate::session::storage::local_launch_configuration(
+            &self.effective_profile(),
+            Path::new(&self.project_path),
+        );
+        let config = self.build_container_config(&launch_config).ok()?;
         let (container_root, flag, sidecar_root) = match backend {
             SessionCaptureBackend::Pi => {
                 container_config::install_pi_sandbox_extension_at(&bind_dir).ok()?;
@@ -236,21 +240,30 @@ impl Instance {
         )
     }
 
-    pub(crate) fn absorb_published_pi_session(&mut self) {
+    pub(crate) fn absorb_published_pi_session_in(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+    ) {
         let Some(observation) = self.pi_published_conversation(true) else {
             return;
         };
         let expected = self.conversation_state();
-        match persist_session_to_storage(
-            &self.effective_profile(),
+        let commit = super::sid_persist::persist_session_with_storage(
+            storage,
             &self.id,
             &observation,
             &expected,
-            &self.resolve_file_watch(),
-        ) {
-            SidWrite::Applied => self.apply_conversation_observation(&observation),
+        );
+        match commit.outcome {
+            SidWrite::Applied => {
+                self.apply_conversation_observation(&observation);
+                self.resume_probe_failed_sid = commit.failed_sid;
+            }
+            // Nothing was written in any of these arms: a peer wrote between
+            // capture and CAS, a peer durably owns the sid, or the row pins
+            // another conversation. Reloading converges on all three.
             SidWrite::Skipped | SidWrite::OwnershipConflict | SidWrite::PinnedForeign => {
-                self.reconcile_from_disk();
+                let _ = self.reconcile_from_store(storage);
             }
             SidWrite::Failed => {}
         }
@@ -259,6 +272,10 @@ impl Instance {
     pub(crate) fn uses_pi_session_sidecar(&self) -> bool {
         self.pi_sidecar_source().is_some_and(|source| {
             self.pi_extension_launched
+                || self
+                    .active_execution
+                    .as_ref()
+                    .is_some_and(|active| matches!(active.capture, Some(CaptureContext::Pi { .. })))
                 || source
                     .read_file(&self.id, "session_id", SESSION_SIDECAR_MAX_BYTES, None)
                     .is_some()
@@ -302,6 +319,7 @@ impl Instance {
 
     /// Persist the transcript path a poller observation carried. False only while the write keeps
     /// failing, so the caller holds the observation for a retry.
+    #[cfg(test)]
     pub(crate) fn persist_observed_pi_transcript(
         &mut self,
         observation: &crate::session::poller::SessionIdObservation,
@@ -324,6 +342,7 @@ impl Instance {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn persist_pi_transcript_into(
         &mut self,
         storage: &crate::session::storage::Storage,
@@ -342,6 +361,7 @@ impl Instance {
     }
 
     /// Write a published path only while the durable row still owns its execution and source.
+    #[cfg(test)]
     pub(super) fn store_pi_session_path(
         &self,
         storage: &crate::session::storage::Storage,
@@ -351,14 +371,7 @@ impl Instance {
         match storage.update(|instances, _| {
             #[cfg(test)]
             anyhow::ensure!(
-                !FAIL_PI_PATH_WRITES.with(std::cell::Cell::get)
-                    && !FAIL_NEXT_PI_PATH_WRITE.with(|fail| {
-                        let armed = fail.replace(false);
-                        if armed {
-                            FAIL_NEXT_PI_PATH_WRITE_CONSUMED.with(|consumed| consumed.set(true));
-                        }
-                        armed
-                    }),
+                !Self::pi_path_write_fails_for_test(),
                 "injected transcript path write failure"
             );
             let row = instances
@@ -419,6 +432,22 @@ impl Instance {
             previous_armed,
             previous_consumed,
         }
+    }
+
+    /// Whether this thread's next Pi transcript-path write must fail. Every
+    /// write site consults this, so an armed
+    /// [`Self::fail_next_pi_path_write_for_test`] is consumed by the production
+    /// store write and the arming test can prove that write was attempted.
+    #[cfg(test)]
+    pub(crate) fn pi_path_write_fails_for_test() -> bool {
+        FAIL_PI_PATH_WRITES.with(std::cell::Cell::get)
+            || FAIL_NEXT_PI_PATH_WRITE.with(|fail| {
+                let armed = fail.replace(false);
+                if armed {
+                    FAIL_NEXT_PI_PATH_WRITE_CONSUMED.with(|consumed| consumed.set(true));
+                }
+                armed
+            })
     }
 
     #[cfg(test)]
@@ -585,6 +614,91 @@ mod tests {
             "and the final flush must read it"
         );
     }
+    #[test]
+    #[serial_test::serial]
+    fn reloaded_pi_stop_flushes_only_its_scoped_child_transcript() {
+        let (_hooks, _base, _hooks_tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        let root = home.path().canonicalize().unwrap();
+        let profile = "pi-scoped-stop";
+        let sid = "01a053b6-c470-78de-9d8f-bc00ef05332a";
+        let launch = "22222222-3333-4333-8444-555555555555";
+        let mut inst = tool_instance("pi", root.to_str().unwrap());
+        inst.source_profile = profile.into();
+        let source = SessionSidecarSource::host_hooks(&inst.id);
+        let binding = crate::session::ExecutionBinding {
+            agent: "pi".into(),
+            stores: vec![root.clone()],
+            configuration: Vec::new(),
+            cwd: root.clone(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+            exported_default_store: None,
+        };
+        inst.active_execution = Some(ActiveExecution {
+            launch_id: launch.into(),
+            binding: binding.clone(),
+            capture: Some(CaptureContext::Pi {
+                source,
+                root: root.clone(),
+            }),
+            container: None,
+        });
+        inst.set_agent_conversation(
+            Some(sid.into()),
+            Some(crate::session::ConversationBinding {
+                session_id: sid.into(),
+                execution: Some(binding),
+                provenance: crate::session::ConversationProvenance::Preallocated,
+                transcript_path: None,
+            }),
+            None,
+        );
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
+        let reloaded = storage.load().unwrap().remove(0);
+        assert!(!reloaded.pi_extension_launched);
+        assert!(reloaded.supports_session_poller());
+        assert!(reloaded.final_publication_observation().is_none());
+        let sidecar = crate::hooks::ensure_instance_dir_path(&inst.id).unwrap();
+        crate::hooks::write_session_id_via_guard(&inst.id, sid, Some(launch)).unwrap();
+        let id_only = reloaded.final_publication_observation().unwrap();
+        assert_eq!(id_only.sid, sid);
+        assert!(id_only.transcript_path.is_none());
+        let child = root.join(format!("child_{sid}.jsonl"));
+        std::fs::write(
+            &child,
+            format!("{{\"type\":\"session\",\"id\":\"{sid}\"}}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            sidecar.join(format!("session_path.{launch}")),
+            child.to_str().unwrap(),
+        )
+        .unwrap();
+        let parent =
+            publish_host_pi_transcript(&inst.id, "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", &root);
+        let parent_bytes = std::fs::read(&parent).unwrap();
+        reloaded.stop().unwrap();
+        let stopped = storage.load().unwrap().remove(0);
+        assert_eq!(stopped.status, Status::Stopped);
+        assert_eq!(stopped.agent_session_id.as_deref(), Some(sid));
+        let observed = stopped.agent_session_binding.unwrap();
+        assert_eq!(
+            observed.provenance,
+            crate::session::ConversationProvenance::Observed
+        );
+        assert_eq!(observed.transcript_path.as_ref(), Some(&child));
+        assert_eq!(stopped.pi_session_path.as_deref(), child.to_str());
+        assert_eq!(std::fs::read(parent).unwrap(), parent_bytes);
+        assert!(!sidecar.exists());
+    }
 
     #[test]
     #[serial_test::serial]
@@ -679,7 +793,6 @@ pi = "~/.pi-personal"
         declared
             .apply_session_flags(
                 &mut cmd,
-                "test",
                 crate::agents::get_agent("pi"),
                 None,
                 &super::execution::AgentLaunchContext::host(
@@ -841,7 +954,6 @@ pi = "~/.pi-personal"
         let resumed = inst
             .apply_session_flags(
                 &mut cmd,
-                "test",
                 crate::agents::get_agent("pi"),
                 None,
                 &super::execution::AgentLaunchContext::host(
@@ -866,7 +978,6 @@ pi = "~/.pi-personal"
         assert!(inst
             .apply_session_flags(
                 &mut cmd,
-                "test",
                 crate::agents::get_agent("pi"),
                 None,
                 &super::execution::AgentLaunchContext::host(
@@ -893,7 +1004,7 @@ pi = "~/.pi-personal"
         inst.tool = "pi".to_string();
         inst.sandbox_info = Some(test_sandbox("aoe-pi-path-retry", None));
         inst.agent_session_id = Some(sid.to_string());
-        let mut storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
         let seed = inst.clone();
         storage
             .update(|instances, _| {
@@ -912,13 +1023,13 @@ pi = "~/.pi-personal"
         );
 
         // No sidecar exists to re-read: only the observation carries the path.
-        storage.set_fail_writes_for_test(true);
+        let failing_writes = storage.fail_writes_for_test();
         assert!(!inst.persist_pi_transcript_into(&storage, &observation, &published));
         assert_eq!(
             inst.pi_session_path, None,
             "an unstored path must not look current"
         );
-        storage.set_fail_writes_for_test(false);
+        drop(failing_writes);
         assert_eq!(stored(&storage), None);
 
         assert!(inst.persist_observed_pi_transcript(&observation));

@@ -5,9 +5,13 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 use std::collections::HashSet;
 
+use crate::session::rename_transaction::{
+    apply_worktree_edit, ensure_unique, rekey_tmux, rekey_warning, worktree_edit_gate,
+    RenameRefusal, WorktreeChange,
+};
 use crate::session::{
-    acquire_session_identity_lock, duplicate_session_error, is_duplicate_session, GroupTree,
-    Instance, LifecycleOperation, ResumeIntent, StartOutcome, Storage,
+    acquire_session_identity_lock, GroupTree, Instance, LifecycleOperation, ResumeIntent,
+    StartOutcome, Status, Storage,
 };
 
 #[derive(Subcommand)]
@@ -27,8 +31,19 @@ pub enum SessionCommands {
     /// Show session details
     Show(ShowArgs),
 
+    /// Block until a session's agent activity status matches one of the
+    /// `--until` values. Exits 0 on a match, 124 on timeout (like
+    /// `timeout(1)`), and 1 if the session stops. Tmux sessions only.
+    Wait(WaitArgs),
+
     /// Rename a session
     Rename(RenameArgs),
+
+    /// Move sessions to another profile. Sessions that look active when the
+    /// command starts are refused; one that starts mid-batch can still move.
+    /// Each keeps its title, group and worktree; the target profile's config
+    /// applies from the next start.
+    Move(super::session_move::MoveArgs),
 
     /// Edit a managed worktree session's workdir directory name (and,
     /// optionally, its git branch). Moves the worktree directory in place;
@@ -166,6 +181,39 @@ pub struct ArchiveArgs {
     pub no_kill: bool,
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum WaitStatus {
+    Running,
+    Waiting,
+    Idle,
+    Error,
+}
+
+impl From<WaitStatus> for Status {
+    fn from(s: WaitStatus) -> Self {
+        match s {
+            WaitStatus::Running => Status::Running,
+            WaitStatus::Waiting => Status::Waiting,
+            WaitStatus::Idle => Status::Idle,
+            WaitStatus::Error => Status::Error,
+        }
+    }
+}
+
+#[derive(Args)]
+pub struct WaitArgs {
+    /// Session ID or title
+    pub identifier: String,
+
+    /// Activity status to wait for; repeat to accept any of several
+    #[arg(long, required = true)]
+    pub until: Vec<WaitStatus>,
+
+    /// Give up after this many milliseconds
+    #[arg(long, default_value_t = 300_000)]
+    pub timeout: u64,
+}
+
 #[derive(Args)]
 pub struct SessionIdArgs {
     /// Session ID or title
@@ -294,7 +342,8 @@ pub struct SetSessionIdArgs {
     /// keeps its ACP conversation and needs the native ID plus an explicit
     /// `--store` and a bound Claude conversation.
     session_id: String,
-    /// Assert the native store: a Claude store directory, or a Pi/OMP transcript file.
+    /// Assert the native store: the Claude config root (the directory
+    /// containing `projects/`), or a Pi/OMP transcript file.
     #[arg(long)]
     store: Option<std::path::PathBuf>,
 }
@@ -344,51 +393,6 @@ pub struct SetColorArgs {
     pub color: String,
 }
 
-#[derive(Serialize)]
-struct SessionDetails {
-    id: String,
-    title: String,
-    path: String,
-    group: String,
-    tool: String,
-    command: String,
-    status: String,
-    state: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    trashed_at: Option<chrono::DateTime<chrono::Utc>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    archived_at: Option<chrono::DateTime<chrono::Utc>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    snoozed_until: Option<chrono::DateTime<chrono::Utc>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pinned_at: Option<chrono::DateTime<chrono::Utc>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    agent_session_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    parent_session_id: Option<String>,
-    profile: String,
-}
-
-fn session_details(inst: &Instance, profile: &str) -> SessionDetails {
-    SessionDetails {
-        id: inst.id.clone(),
-        title: inst.title.clone(),
-        path: inst.project_path.clone(),
-        group: inst.group_path.clone(),
-        tool: inst.tool.clone(),
-        command: inst.command.clone(),
-        status: format!("{:?}", inst.status).to_lowercase(),
-        state: inst.effective_bucket().as_str(),
-        trashed_at: inst.trashed_at,
-        archived_at: inst.archived_at,
-        snoozed_until: inst.active_snoozed_until(),
-        pinned_at: inst.pinned_at,
-        agent_session_id: inst.agent_session_id.clone(),
-        parent_session_id: inst.parent_session_id.clone(),
-        profile: profile.to_string(),
-    }
-}
-
 #[tracing::instrument(target = "cli.session", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
     match command {
@@ -396,9 +400,11 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::Stop(args) => stop_session(profile, args).await,
         SessionCommands::Restart(args) => restart_session_dispatch(profile, args).await,
         SessionCommands::Attach(args) => attach_session(profile, args).await,
-        SessionCommands::Show(args) => show_session(profile, args).await,
+        SessionCommands::Show(_) => bail!("internal error: runtime read reached local dispatch"),
+        SessionCommands::Wait(args) => wait_session(profile, args).await,
         SessionCommands::Capture(args) => capture_session(profile, args).await,
         SessionCommands::Rename(args) => rename_session(profile, args).await,
+        SessionCommands::Move(args) => super::session_move::run(profile, args).await,
         SessionCommands::SetWorktreeName(args) => set_worktree_name(profile, args).await,
         SessionCommands::Current(args) => current_session(args).await,
         SessionCommands::SetSessionId(args) => set_session_id(profile, args).await,
@@ -419,7 +425,9 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         }
         SessionCommands::Restore(args) => restore_session(profile, args).await,
         SessionCommands::Import(args) => import_sessions(profile, args).await,
-        SessionCommands::ListTrash => list_trash(profile).await,
+        SessionCommands::ListTrash => {
+            bail!("internal error: runtime read reached local dispatch")
+        }
         SessionCommands::EmptyTrash => empty_trash(profile).await,
     }
 }
@@ -472,17 +480,17 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
     let inst = super::resolve_session(&args.identifier, &instances)?;
     let id = inst.id.clone();
     let title = inst.title.clone();
-    let inst = inst.clone();
 
     let _lifecycle_lock = storage
         .acquire_instance_lifecycle_lock(&id)
         .context("failed to acquire instance archive lock")?;
     if !args.no_kill {
-        if let Err(e) = inst.kill_locked() {
-            eprintln!("Warning: failed to kill agent tmux session: {}", e);
-        }
-        inst.kill_ancillary_tmux_sessions_locked();
-        inst.release_scope();
+        let inst = storage
+            .load()?
+            .into_iter()
+            .find(|row| row.id == id)
+            .context("session disappeared before archive")?;
+        inst.kill_all_tmux_sessions_locked()?;
     }
 
     let landed = storage.update(|instances, _groups| {
@@ -509,22 +517,33 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
 
     let (instances, _groups) = storage.load_with_groups()?;
-    let trashed: Vec<_> = instances
-        .iter()
-        .filter(|i| i.is_trashed())
-        .cloned()
-        .collect();
-    let mut inst = super::resolve_session(&args.identifier, &trashed)
-        .map_err(|_| anyhow::anyhow!("No trashed session matching '{}'", args.identifier))?
-        .clone();
+    let trashed: Vec<_> = instances.into_iter().filter(Instance::is_trashed).collect();
+    let inst = super::resolve_session(&args.identifier, &trashed)
+        .map_err(|_| anyhow::anyhow!("No trashed session matching '{}'", args.identifier))?;
     let restore_id = inst.id.clone();
 
+    let _identity = crate::session::acquire_session_identity_lock()?;
     let _lifecycle_lock = storage
         .acquire_instance_lifecycle_lock(&restore_id)
         .context("failed to acquire instance restore lock")?;
-    let decision = storage.update(|instances, _groups| {
-        crate::session::claim::decide_restore_claim(instances, &restore_id, chrono::Utc::now())
-            .map_err(anyhow::Error::new)
+    let (decision, fresh) = storage.update(|instances, _groups| {
+        let decision = crate::session::claim::decide_restore_claim(
+            instances,
+            &restore_id,
+            chrono::Utc::now(),
+        )?;
+        let fresh = if matches!(
+            decision,
+            crate::session::claim::RestoreClaimDecision::Claimed(_)
+        ) {
+            instances
+                .iter()
+                .find(|instance| instance.id == restore_id)
+                .cloned()
+        } else {
+            None
+        };
+        Ok((decision, fresh))
     })?;
     let restore_generation = match decision {
         crate::session::claim::RestoreClaimDecision::AlreadyGone => {
@@ -537,13 +556,17 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         ),
         crate::session::claim::RestoreClaimDecision::Claimed(generation) => generation,
     };
+    let mut inst = fresh.context("restored session disappeared after claim")?;
+    inst.source_profile = storage.profile().to_owned();
 
-    if let crate::session::trash::RestoreOutcome::Failed { reason } =
-        crate::session::trash::restore_worktree_location(&mut inst)
-    {
-        release_restore_reservation(&storage, &restore_id, restore_generation);
-        anyhow::bail!("Cannot restore worktree: {reason}");
-    }
+    let warning = match crate::session::trash::restore_worktree_location(&mut inst) {
+        crate::session::trash::RestoreOutcome::Failed { reason } => {
+            release_restore_reservation(&storage, &restore_id, restore_generation);
+            anyhow::bail!("Cannot restore worktree: {reason}");
+        }
+        crate::session::trash::RestoreOutcome::Restored { warning, .. } => warning,
+        crate::session::trash::RestoreOutcome::NoChange => None,
+    };
     let restored_path = inst.project_path.clone();
     let restored_pre = inst.pre_trash_project_path.clone();
 
@@ -567,6 +590,9 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         }
     }
     println!("Restored: {}", inst.title);
+    if let Some(warning) = warning {
+        eprintln!("Warning: {warning}");
+    }
     Ok(())
 }
 
@@ -582,149 +608,102 @@ fn release_restore_reservation(storage: &Storage, restore_id: &str, generation: 
     });
 }
 
-async fn list_trash(profile: &str) -> Result<()> {
-    let storage = Storage::open_unwatched(profile)?;
-    let (instances, _groups) = storage.load_with_groups()?;
-    let trashed: Vec<_> = instances.iter().filter(|i| i.is_trashed()).collect();
-    if trashed.is_empty() {
-        println!("Trash is empty.");
-        return Ok(());
-    }
-    println!("Trashed sessions in profile '{}':", storage.profile());
-    for inst in trashed {
-        let when = inst
-            .trashed_at
-            .map(|value| value.to_rfc3339())
-            .unwrap_or_else(|| "?".to_string());
-        println!("  {}  {}  (trashed {})", inst.id, inst.title, when);
-    }
-    Ok(())
-}
-
 async fn empty_trash(profile: &str) -> Result<()> {
-    let storage = Storage::open_unwatched(profile)?;
+    use crate::daemon::{EmptyTrashBody, GroupSessionFailureCode, PurgeOutcome};
 
-    let (instances, _groups) = storage.load_with_groups()?;
-    let mut trashed: Vec<_> = instances
-        .iter()
-        .filter(|i| i.is_trashed())
-        .cloned()
-        .collect();
-    for instance in &mut trashed {
-        instance.source_profile = storage.profile().to_string();
-    }
-    trashed.sort_by(|left, right| left.id.cmp(&right.id));
-    if trashed.is_empty() {
+    let (client, epoch) = super::group::daemon_client().await?;
+    let profile = if profile.is_empty() {
+        client.default_profile().await?
+    } else {
+        profile.to_string()
+    };
+    let outcome = client
+        .empty_trash(
+            &EmptyTrashBody {
+                profile: profile.clone(),
+            },
+            &epoch,
+        )
+        .await?
+        .outcome;
+    if outcome.sessions.is_empty() && outcome.failures.is_empty() {
         println!("Trash is empty.");
         return Ok(());
     }
 
     let mut removed = 0usize;
     let mut restored_after_teardown = 0usize;
-    let mut kept_for_retry = 0usize;
     let mut being_restored_elsewhere = 0usize;
-    let mut being_purged_elsewhere = 0usize;
-    for inst in &trashed {
-        let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
-            profile,
-            std::path::Path::new(&inst.project_path),
-        );
-        let delete_worktree =
-            config.worktree.auto_cleanup && inst.has_managed_worktree_or_workspace();
-        let delete_branch = delete_worktree && config.worktree.delete_branch_on_cleanup;
-        let delete_sandbox =
-            inst.sandbox_info.as_ref().is_some_and(|s| s.enabled) && config.sandbox.auto_cleanup;
-        let row_storage = Storage::open_unwatched(profile)?;
-        let reservation = crate::session::deletion::PurgeTransaction::reserve(
-            row_storage,
-            crate::session::deletion::DeletionRequest {
-                session_id: inst.id.clone(),
-                instance: inst.clone(),
-                delete_worktree,
-                delete_branch,
-                delete_sandbox,
-                force_delete: true,
-                detach_hooks: false,
-                keep_scratch: false,
-            },
-        )?;
-        let transaction = match reservation {
-            crate::session::deletion::PurgeReservation::Reserved(transaction) => transaction,
-            crate::session::deletion::PurgeReservation::Rejected(result) => {
-                match result.disposition {
-                    crate::session::deletion::DeletionDisposition::KeptRestored => {
-                        being_restored_elsewhere += 1;
-                    }
-                    crate::session::deletion::DeletionDisposition::Busy => {
-                        being_purged_elsewhere += 1;
-                    }
-                    _ => {}
-                }
-                continue;
-            }
-        };
-        let result = transaction.run_hooks().complete_with(|instance| {
-            super::purge_acp_transcript(instance).map_err(|error| {
-                format!("transcript not purged, keeping session in trash: {error}")
-            })
-        });
-        for err in &result.errors {
-            eprintln!("Warning ({}): {}", inst.title, err);
-        }
-        match result.disposition {
-            crate::session::deletion::DeletionDisposition::Removed => removed += 1,
-            crate::session::deletion::DeletionDisposition::KeptRestored => {
-                if result.teardown_started {
-                    restored_after_teardown += 1;
-                } else {
-                    being_restored_elsewhere += 1;
+    for session in &outcome.sessions {
+        match &session.outcome {
+            PurgeOutcome::Deleted { cleanup_errors, .. } => {
+                removed += 1;
+                for err in cleanup_errors {
+                    eprintln!("Warning ({}): {}", session.id, err);
                 }
             }
-            crate::session::deletion::DeletionDisposition::Busy => {
-                being_purged_elsewhere += 1;
-            }
-            crate::session::deletion::DeletionDisposition::Failed => kept_for_retry += 1,
-            crate::session::deletion::DeletionDisposition::AlreadyGone => {}
+            PurgeOutcome::Kept {
+                teardown_started: true,
+                ..
+            } => restored_after_teardown += 1,
+            PurgeOutcome::Kept { .. } => being_restored_elsewhere += 1,
         }
     }
-    let outcome = super::EmptyTrashOutcome {
-        removed,
-        restored_after_teardown,
-        kept_for_retry,
+    let count = |code: GroupSessionFailureCode| {
+        outcome
+            .failures
+            .iter()
+            .filter(|failure| failure.code == code)
+            .count()
     };
-    if outcome.restored_after_teardown > 0 {
+    let kept_for_retry = count(GroupSessionFailureCode::PurgeFailed);
+    let being_purged_elsewhere = count(GroupSessionFailureCode::Superseded);
+    let busy = count(GroupSessionFailureCode::LifecycleBusy);
+
+    if restored_after_teardown > 0 {
         eprintln!(
-            "Warning: {} session(s) were restored mid-purge after teardown began; kept the \
-             restored records, but their worktree, branch, container, or transcript may already \
-             have been removed. Inspect and repair them.",
-            outcome.restored_after_teardown
+            "Warning: {restored_after_teardown} session(s) were restored mid-purge after teardown \
+             began; kept the restored records, but their worktree, branch, container, or \
+             transcript may already have been removed. Inspect and repair them."
         );
     }
-    let mut parts = vec![format!("purged {} session(s)", outcome.removed)];
-    if outcome.kept_for_retry > 0 {
-        parts.push(format!("kept {} for retry", outcome.kept_for_retry));
+    let mut parts = vec![format!("purged {removed} session(s)")];
+    if kept_for_retry > 0 {
+        parts.push(format!("kept {kept_for_retry} for retry"));
     }
     if being_restored_elsewhere > 0 {
         parts.push(format!(
             "{being_restored_elsewhere} being restored by another process"
         ));
     }
+    if busy > 0 {
+        parts.push(format!("skipped {busy} busy"));
+    }
     if being_purged_elsewhere > 0 {
         parts.push(format!(
-            "{being_purged_elsewhere} being purged by another process"
+            "{being_purged_elsewhere} changed during purge, rerun to retry"
         ));
     }
-    if outcome.restored_after_teardown > 0 {
-        parts.push(format!(
-            "{} restored mid-purge",
-            outcome.restored_after_teardown
-        ));
+    if restored_after_teardown > 0 {
+        parts.push(format!("{restored_after_teardown} restored mid-purge"));
     }
-    println!(
-        "Emptied trash: {} (profile '{}').",
-        parts.join(", "),
-        storage.profile()
-    );
+    println!("Emptied trash: {} (profile '{profile}').", parts.join(", "));
+    for failure in &outcome.failures {
+        if failure.code == GroupSessionFailureCode::PurgeFailed {
+            eprintln!("  Kept for retry: {} ({})", failure.id, failure.message);
+        }
+    }
+    if busy > 0 {
+        for failure in &outcome.failures {
+            if failure.code == GroupSessionFailureCode::LifecycleBusy {
+                eprintln!("  Busy: {} ({})", failure.id, failure.message);
+            }
+        }
+        anyhow::bail!(
+            "{busy} session(s) were skipped because another operation holds them; nothing changed \
+             for those, retry once the operation finishes"
+        );
+    }
     Ok(())
 }
 
@@ -875,26 +854,29 @@ fn apply_import_mode(
     s: &crate::session::claude_import::ClaudeSessionSummary,
     structured: bool,
 ) {
+    let binding = crate::session::ConversationBinding {
+        session_id: s.session_id.clone(),
+        execution: Some(crate::session::ExecutionBinding {
+            agent: "claude".into(),
+            stores: vec![s.config_dir.clone()],
+            configuration: Vec::new(),
+            cwd: crate::session::capture::canonicalize_or_raw(&s.cwd),
+            filesystem: "host".into(),
+            cwd_filesystem: "host".into(),
+            exported_default_store: Some(true),
+        }),
+        provenance: crate::session::ConversationProvenance::Imported,
+        transcript_path: None,
+    };
     if structured {
         inst.view = crate::session::View::Structured;
         inst.acp_session_id = Some(s.session_id.clone());
+        inst.agent_session_id = Some(s.session_id.clone());
+        inst.agent_session_binding = Some(binding);
         inst.import_pending = Some(true);
     } else {
         inst.resume_intent = ResumeIntent::Use(s.session_id.clone());
-        inst.resume_binding = Some(crate::session::ConversationBinding {
-            session_id: s.session_id.clone(),
-            execution: Some(crate::session::ExecutionBinding {
-                agent: "claude".into(),
-                stores: vec![s.config_dir.clone()],
-                configuration: Vec::new(),
-                cwd: crate::session::capture::canonicalize_or_raw(&s.cwd),
-                filesystem: "host".into(),
-                cwd_filesystem: "host".into(),
-                exported_default_store: None,
-            }),
-            provenance: crate::session::ConversationProvenance::Imported,
-            transcript_path: None,
-        });
+        inst.resume_binding = Some(binding);
     }
 }
 
@@ -994,6 +976,10 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
         let mut ids = Vec::new();
         for (s, session_config) in to_import.iter().zip(&session_configs) {
             if already_imported(all_instances, &s.session_id) {
+                continue;
+            }
+            if crate::git::GitWorktree::is_within_purging(std::path::Path::new(&s.cwd)) {
+                eprintln!("Skipping {}: its project path is being purged", s.cwd);
                 continue;
             }
             let inst = build_import_instance(s, structured, &group, session_config);
@@ -1255,14 +1241,11 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
     for (_id, title) in &succeeded {
         println!("  · {}", title);
     }
-    if !fresh_after_failed_resume.is_empty() {
+    for (title, sid) in &fresh_after_failed_resume {
         println!(
-            "ℹ {} started fresh (a prior resume attempt failed for the stored sid; the old conversation is still reachable via the agent's own resume/history picker):",
-            fresh_after_failed_resume.len()
+            "  · {}: started fresh after a prior resume failed for sid {}; the old conversation remains in the agent's history",
+            title, sid
         );
-        for (title, sid) in &fresh_after_failed_resume {
-            println!("  · {}: sid {}", title, sid);
-        }
     }
     if !orphaned.is_empty() {
         println!(
@@ -1417,8 +1400,8 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         }
         StartOutcome::FreshAfterFailedResume { sid } => {
             println!(
-                "✓ Restarted session: {} (started fresh; a prior resume attempt failed for sid {sid}, the old conversation is still reachable via the agent's own resume/history picker)",
-                title
+                "Restarted session: {} (started fresh after a prior resume failed for sid {}; the old conversation remains in the agent's history)",
+                title, sid
             );
         }
         StartOutcome::Resumed | StartOutcome::Fresh => {
@@ -1458,84 +1441,131 @@ async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     supervise_attach_capture(&mut working, |_| tmux_session.attach())
 }
 
-async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
-    let storage = Storage::open_unwatched(profile)?;
-    let (instances, _) = storage.load_with_groups()?;
+const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+const WAIT_TIMEOUT_EXIT_CODE: i32 = 124;
 
-    let mut inst = if let Some(id) = &args.identifier {
-        super::resolve_session(id, &instances)?.clone()
-    } else {
-        let current_session = std::env::var("TMUX_PANE")
-            .ok()
-            .and_then(|_| crate::tmux::get_current_session_name());
-
-        if let Some(session_name) = current_session {
-            instances
-                .iter()
-                .find(|i| crate::tmux::agent_session_belongs_to(&session_name, &i.id))
-                .ok_or_else(|| {
-                    anyhow::anyhow!("Current tmux session is not an Agent of Empires session")
-                })?
-                .clone()
-        } else {
-            bail!("Not in a tmux session. Specify a session ID or run inside tmux.");
-        }
-    };
-    inst.source_profile = storage.profile().to_string();
-
-    crate::session::config::profile_config::resolve_config_or_warn(profile);
-
-    crate::tmux::refresh_session_cache();
-    inst.update_status_once(None, None);
-    let contended = crate::session::Instance::contended_capture_cwds(&instances);
-    inst.self_heal_session_id(profile, &contended);
-
-    if args.json {
-        super::output::print_json(&session_details(&inst, storage.profile()))?;
-    } else {
-        println!("Session: {}", inst.title);
-        println!("  ID:      {}", inst.id);
-        println!("  Path:    {}", inst.project_path);
-        println!("  Group:   {}", inst.group_path);
-        println!("  Tool:    {}", inst.tool);
-        println!("  Command: {}", inst.command);
-        println!("  Status:  {:?}", inst.status);
-        if let Some(at) = inst.trashed_at.or(inst.archived_at) {
-            println!(
-                "  State:   {} ({})",
-                inst.effective_bucket().as_str(),
-                at.format("%+")
-            );
-        }
-        println!("  Profile: {}", storage.profile());
-        for line in relationship_lines(&inst, &instances) {
-            println!("{line}");
-        }
-    }
-
-    Ok(())
+#[derive(Debug, PartialEq, Eq)]
+enum WaitDecision {
+    Matched,
+    Terminated,
+    TimedOut,
+    Continue,
 }
 
-fn relationship_lines(
-    inst: &crate::session::Instance,
-    instances: &[crate::session::Instance],
-) -> Vec<String> {
-    let mut lines = Vec::new();
-    if let Some(parent_id) = &inst.parent_session_id {
-        lines.push(match instances.iter().find(|i| &i.id == parent_id) {
-            Some(parent) => format!("  Parent:  {} ({parent_id})", parent.title),
-            None => format!("  Parent:  {parent_id}"),
-        });
+/// Termination wins over a match, so a vanished session never satisfies `--until error` or
+/// `--until idle`. Otherwise a match wins, so an already-satisfied wait returns on its first poll.
+fn wait_decision(
+    current: Status,
+    targets: &[Status],
+    terminated: bool,
+    elapsed: std::time::Duration,
+    timeout: std::time::Duration,
+) -> WaitDecision {
+    if terminated {
+        WaitDecision::Terminated
+    } else if targets.contains(&current) {
+        WaitDecision::Matched
+    } else if elapsed >= timeout {
+        WaitDecision::TimedOut
+    } else {
+        WaitDecision::Continue
     }
-    let mut children = instances
-        .iter()
-        .filter(|i| i.parent_session_id.as_deref() == Some(inst.id.as_str()))
-        .peekable();
-    if children.peek().is_some() {
-        lines.push("  Children:".to_string());
-        lines.extend(children.map(|child| format!("    {} ({})", child.title, child.id)));
+}
+
+/// Confirmed absence only. An unreachable tmux server leaves a plain `Error`, and a launch that
+/// holds the reservation has not created its pane yet.
+fn is_terminated(
+    status: Status,
+    last_error: Option<&str>,
+    launching: bool,
+    existence: crate::tmux::SessionExistence,
+) -> bool {
+    !launching
+        && (status == Status::Stopped
+            || (status == Status::Error
+                && last_error == Some(crate::session::TMUX_SESSION_GONE_ERROR))
+            // A capture that loses a vanishing pane reads as Idle, so recheck the pane itself.
+            || existence == crate::tmux::SessionExistence::Absent)
+}
+
+fn confirmed_terminated(inst: &Instance) -> bool {
+    let existence = inst
+        .tmux_session()
+        .map_or(crate::tmux::SessionExistence::Unknown, |s| s.existence());
+    is_terminated(
+        inst.status,
+        inst.last_error.as_deref(),
+        inst.has_fresh_launch_reservation(chrono::Utc::now()),
+        existence,
+    )
+}
+
+/// Take durable lifecycle fields from the stored row, keeping `live`'s detection state.
+fn adopt_stored(live: &Instance, mut stored: Instance) -> Result<Instance> {
+    bail_if_acp(&stored, "wait")?;
+    stored.merge_runtime_from_reload(live);
+    Ok(stored)
+}
+
+async fn wait_session(profile: &str, args: WaitArgs) -> Result<()> {
+    let storage = Storage::open_unwatched(profile)?;
+    let profile = storage.profile();
+    let (instances, _) = storage.load_with_groups()?;
+    let inst = super::resolve_session(&args.identifier, &instances)?;
+    bail_if_acp(inst, "wait")?;
+    let mut live = inst.clone();
+    crate::session::config::profile_config::resolve_config_or_warn(profile);
+
+    let targets: Vec<Status> = args.until.iter().map(|s| (*s).into()).collect();
+    let timeout = std::time::Duration::from_millis(args.timeout);
+    let start = std::time::Instant::now();
+    let mut first = true;
+    loop {
+        crate::tmux::refresh_session_cache();
+        // The first poll must decide on its own; later polls share one detection state so a
+        // Running to Idle transition can be confirmed by a second observation.
+        if first {
+            live.update_status_once(None, None);
+            first = false;
+        } else {
+            let stored = storage
+                .load()?
+                .into_iter()
+                .find(|i| i.id == live.id)
+                .with_context(|| format!("session '{}' was removed", live.title))?;
+            live = adopt_stored(&live, stored)?;
+            live.update_status_with_metadata(None, None);
+        }
+        tracing::debug!(target: "cli.session", "wait poll status={}", live.status.as_str());
+        let elapsed = start.elapsed();
+        // The poll may have lost a vanishing pane; reread liveness before deciding.
+        crate::tmux::refresh_session_cache();
+        match wait_decision(
+            live.status,
+            &targets,
+            confirmed_terminated(&live),
+            elapsed,
+            timeout,
+        ) {
+            WaitDecision::Matched => {
+                println!("{}", live.status.as_str());
+                return Ok(());
+            }
+            WaitDecision::Terminated => bail!("session '{}' is not running", live.title),
+            WaitDecision::TimedOut => {
+                eprintln!(
+                    "Error: timed out after {}ms waiting for '{}' (last status: {})",
+                    args.timeout,
+                    live.title,
+                    live.status.as_str()
+                );
+                std::process::exit(WAIT_TIMEOUT_EXIT_CODE);
+            }
+            WaitDecision::Continue => {
+                tokio::time::sleep(WAIT_POLL_INTERVAL.min(timeout - elapsed)).await;
+            }
+        }
     }
-    lines
 }
 
 async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
@@ -1606,7 +1636,7 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
                 &observation,
             )
             .status
-            .unwrap_or_default()
+            .unwrap_or(inst.status)
         } else {
             let hook = hook.filter(|_| !crate::tmux::status_rules::has_rules(profile, &rules_tool));
             match hook {
@@ -1709,7 +1739,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         .find(|instance| instance.id == id)
         .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
     let mut inst = inst.clone();
-    if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist(
+    if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist_locked(
         &storage,
         &mut inst,
         &mut Default::default(),
@@ -1724,7 +1754,6 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         .trim()
         .to_string();
     let new_group = args.group.as_ref().map(|g| g.trim().to_string());
-    let title_changed = old_title != effective_title;
 
     let config = crate::session::config::profile_config::resolve_config_or_warn(profile);
     let tied = inst.tie_workdir_applies(config.session.tie_workdir_to_name);
@@ -1737,18 +1766,10 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     } else {
         inst.project_path.clone()
     };
-    let pair_changed = title_changed
-        || duplicate_path.trim_end_matches('/') != inst.project_path.trim_end_matches('/');
-    if pair_changed
-        && is_duplicate_session(
-            authoritative_instances.iter(),
-            &effective_title,
-            &duplicate_path,
-            Some(&id),
-        )
-    {
-        return Err(duplicate_session_error(&effective_title));
-    }
+    let mut renamed = inst.clone();
+    renamed.title = effective_title.clone();
+    renamed.project_path = duplicate_path;
+    ensure_unique(&authoritative_instances, &inst, &renamed)?;
 
     let mut new_path: Option<String> = None;
     let mut new_branch: Option<String> = None;
@@ -1818,30 +1839,30 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
             live.source_profile = profile.to_string();
             crate::tmux::refresh_session_cache();
             live.update_status_with_metadata(None, None);
-            let container_holds = !live.status.blocks_worktree_edit()
-                && moves_worktree
-                && crate::session::worktree_edit::ensure_sandbox_container_released(
-                    &id,
-                    is_sandboxed,
-                );
-            if live.status.blocks_worktree_edit() || container_holds {
-                bail!("Stop the session before renaming its worktree directory or branch. Disable session.tie_workdir_to_name to relabel a running session.");
-            }
+            worktree_edit_gate(
+                &id,
+                is_sandboxed,
+                live.status.blocks_worktree_edit(),
+                WorktreeChange {
+                    moves_dir: moves_worktree,
+                    renames_branch,
+                },
+                false,
+            )?;
         }
-        match crate::session::worktree_edit::edit_worktree_workdir(
+        match apply_worktree_edit(
             crate::session::worktree_edit::WorktreeEditRequest {
                 worktree_info: &worktree_info,
                 current_path: std::path::Path::new(&current_path),
                 new_name: &leaf,
                 rename_branch: args.rename_branch,
             },
+            &id,
+            is_sandboxed,
         ) {
             Ok(outcome) => {
-                if outcome.new_path != std::path::Path::new(&current_path) {
-                    crate::session::worktree_edit::discard_sandbox_container_after_move(
-                        &id,
-                        is_sandboxed,
-                    );
+                if let Some(warning) = &outcome.warning {
+                    eprintln!("Warning: {warning}");
                 }
                 new_path = Some(outcome.new_path.to_string_lossy().to_string());
                 new_branch = outcome.new_branch;
@@ -1925,14 +1946,16 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         let rekey_id = id.clone();
         let rekey_old_title = persisted_old_title.clone();
         let rekey_new_title = committed_title.clone();
-        match tokio::task::spawn_blocking(move || {
-            crate::tmux::rekey_session(&rekey_id, &rekey_old_title, &rekey_new_title)
+        let warning = match tokio::task::spawn_blocking(move || {
+            rekey_tmux(&rekey_id, &rekey_old_title, &rekey_new_title)
         })
         .await
         {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => eprintln!("Warning: failed to rename tmux session: {error}"),
-            Err(error) => eprintln!("Warning: tmux rename task failed: {error}"),
+            Ok(warning) => warning,
+            Err(error) => Some(rekey_warning(&error)),
+        };
+        if let Some(warning) = warning {
+            eprintln!("Warning: {warning}");
         }
     }
 
@@ -2436,7 +2459,10 @@ mod rename_tests {
         .await
         .unwrap_err();
         assert!(
-            error.to_string().contains("while the session is active"),
+            matches!(
+                error.downcast_ref::<crate::session::rename_transaction::RenameRefusal>(),
+                Some(crate::session::rename_transaction::RenameRefusal::Running)
+            ),
             "{error}"
         );
         assert!(worktree.is_dir());
@@ -2487,7 +2513,7 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
         .find(|instance| instance.id == id)
         .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
     let mut inst = inst.clone();
-    if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist(
+    if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist_locked(
         &storage,
         &mut inst,
         &mut Default::default(),
@@ -2503,7 +2529,7 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
             .session
             .tie_workdir_to_name,
     ) {
-        bail!("Renaming is unified while session.tie_workdir_to_name is on; use 'aoe session rename --title <name>' instead, and the worktree directory follows. Disable the setting to edit the directory independently.");
+        return Err(RenameRefusal::Tied.into());
     }
     let duplicate_path = crate::session::worktree_edit::target_worktree_path(
         std::path::Path::new(&current_path),
@@ -2512,16 +2538,9 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     .unwrap_or_else(|| std::path::PathBuf::from(&current_path))
     .to_string_lossy()
     .into_owned();
-    if duplicate_path.trim_end_matches('/') != current_path.trim_end_matches('/')
-        && is_duplicate_session(
-            authoritative_instances.iter(),
-            &inst.title,
-            &duplicate_path,
-            Some(&id),
-        )
-    {
-        return Err(duplicate_session_error(&inst.title));
-    }
+    let mut moved = inst.clone();
+    moved.project_path = duplicate_path;
+    ensure_unique(&authoritative_instances, &inst, &moved)?;
     let mut live = inst.clone();
     live.source_profile = profile.to_string();
     crate::tmux::refresh_session_cache();
@@ -2530,32 +2549,36 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
         std::path::Path::new(&current_path),
         args.name.trim(),
     );
-    if live.status.blocks_worktree_edit()
-        || (moves_worktree
-            && crate::session::worktree_edit::ensure_sandbox_container_released(
-                &id,
-                live.is_sandboxed(),
-            ))
-    {
-        bail!("Cannot edit the workdir name while the session is active; stop it first");
-    }
+    worktree_edit_gate(
+        &id,
+        live.is_sandboxed(),
+        live.status.blocks_worktree_edit(),
+        WorktreeChange {
+            moves_dir: moves_worktree,
+            renames_branch: crate::session::worktree_edit::worktree_branch_rename_required(
+                &worktree_info,
+                args.name.trim(),
+                args.rename_branch,
+            ),
+        },
+        true,
+    )?;
 
-    let outcome = crate::session::worktree_edit::edit_worktree_workdir(
+    let outcome = apply_worktree_edit(
         crate::session::worktree_edit::WorktreeEditRequest {
             worktree_info: &worktree_info,
             current_path: std::path::Path::new(&current_path),
             new_name: args.name.trim(),
             rename_branch: args.rename_branch,
         },
+        &id,
+        live.is_sandboxed(),
     )?;
-    if outcome.new_path != std::path::Path::new(&current_path) {
-        crate::session::worktree_edit::discard_sandbox_container_after_move(
-            &id,
-            live.is_sandboxed(),
-        );
-    }
     let new_path = outcome.new_path.to_string_lossy().to_string();
     let new_branch = outcome.new_branch.clone();
+    if let Some(warning) = &outcome.warning {
+        eprintln!("Warning: {warning}");
+    }
 
     storage
         .update(|instances, _groups| {
@@ -2651,13 +2674,39 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
             .id
             .clone()
     };
+    let _handoff_driver = crate::session::try_acquire_terminal_handoff_driver(&target_id)?
+        .context("terminal handoff driver is active; retry after it finishes")?;
     let lifecycle_lock = storage
         .acquire_instance_lifecycle_lock(&target_id)
         .context("failed to acquire instance resume-target lock")?;
     let title = storage.update(|instances, _groups| {
         super::patch_instance(instances, &target_id, |inst| {
+            let pending_recovery = inst.terminal_handoff.as_ref().map(|intent| (intent.id, intent.stage));
+            if let Some((_, stage)) = pending_recovery {
+                anyhow::ensure!(matches!(stage,
+                    crate::session::TerminalHandoffStage::TerminalCommitOwed
+                        | crate::session::TerminalHandoffStage::TerminalLaunchOwed),
+                    "terminal handoff must finish original retirement before its native target can change");
+                let pending = inst.terminal_handoff.as_ref().expect("pending recovery");
+                anyhow::ensure!(pending.final_event_seq.is_some(),
+                    "original retirement completion has not been durably captured");
+                anyhow::ensure!(pending.profile == storage.profile()
+                    && pending.profile_identity == storage.bound_profile_identity()?
+                    && pending.generation == inst.lifecycle_generation,
+                    crate::session::LifecycleReservationError::Superseded);
+                pending.ensure_original_stopped(&inst.id)?;
+                let pane = inst.tmux_session()?;
+                if pane.exists_live() {
+                    anyhow::ensure!(pane.is_pane_dead(),
+                        "terminal handoff pane is live; retry disable to complete adoption before changing its target");
+                    let launch = pending.launch.as_ref().ok_or_else(|| anyhow::anyhow!(
+                        "existing dead pane has no handoff receipt; pane retained"))?;
+                    crate::session::Instance::ensure_terminal_handoff_pane_matches(pane.name(),
+                        crate::session::TerminalHandoffKey { id: pending.id, generation: pending.generation }, launch)?;
+                }
+            }
             inst.source_profile = storage.profile().to_string();
-            if inst.is_structured() {
+            if inst.is_structured() && pending_recovery.is_none() {
                 anyhow::ensure!(args.store.is_some() && matches!((&new_intent, inst.acp_session_id.as_deref()), (crate::session::ResumeIntent::Use(sid), Some(acp_sid)) if sid == acp_sid),
                     "ACP manages its own conversation; a native handoff assertion requires its current ID and an explicit --store");
             }
@@ -2665,11 +2714,39 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                 crate::session::ResumeIntent::Use(sid) => Some(inst.asserted_resume_binding(sid, args.store.as_deref())?),
                 _ => None,
             };
-            anyhow::ensure!(!inst.is_structured() || binding.as_ref().and_then(|binding| binding.execution.as_ref()).is_some_and(|execution| execution.agent == "claude"),
+            anyhow::ensure!(pending_recovery.is_some() || !inst.is_structured() || binding.as_ref().and_then(|binding| binding.execution.as_ref()).is_some_and(|execution| execution.agent == "claude"),
                 "ACP terminal handoff is supported only for an explicitly bound Claude conversation");
             inst.resume_binding = binding;
             inst.resume_intent = new_intent.clone();
             inst.resume_probe_failed_sid = None;
+            if let Some((intent_id, _)) = pending_recovery {
+                let context = match &new_intent {
+                    crate::session::ResumeIntent::Use(_) => {
+                        let native_store = inst.resume_binding.as_ref().and_then(|binding| binding.execution.clone())
+                            .context("pending handoff recovery requires a proven native store")?;
+                        crate::session::TerminalHandoffContext::Keep { native_store }
+                    }
+                    crate::session::ResumeIntent::Cleared => crate::session::TerminalHandoffContext::Discard,
+                    _ => unreachable!(),
+                };
+                let generation = inst.lifecycle_generation.checked_add(1)
+                    .ok_or(crate::session::LifecycleReservationError::GenerationOverflow)?;
+                let target = inst.conversation_state();
+                let source_acp_session_id = inst.acp_session_id.clone();
+                inst.lifecycle_generation = generation;
+                inst.lifecycle_reservation = None;
+                let pending = inst.terminal_handoff.as_mut().expect("validated handoff");
+                anyhow::ensure!(pending.id == intent_id,
+                    crate::session::LifecycleReservationError::Superseded);
+                pending.generation = generation;
+                pending.target_generation = generation;
+                pending.context = context;
+                pending.source_conversation = target.clone();
+                pending.source_acp_session_id = source_acp_session_id;
+                pending.terminal = Some(target);
+                pending.launch_started = false;
+                // Retain the original checkpoint solely as the owned dead-pane receipt.
+            }
             Ok(inst.title.clone())
         })
     })?;
@@ -2735,7 +2812,13 @@ async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
         crate::session::attach_project::Quiesced::default()
     };
 
-    let outcome = match crate::session::attach_project::attach_planned(&storage, &id, inst, plan) {
+    let outcome = match crate::session::attach_project::attach_planned(
+        &storage,
+        &id,
+        inst,
+        plan,
+        quiesced.lifecycle_generation,
+    ) {
         Ok(outcome) => outcome,
         Err(e) => {
             crate::session::attach_project::resume_after_conversion(&storage, &id, quiesced);
@@ -2919,14 +3002,14 @@ mod restart_args_tests {
         let first = "01a053b6-c470-78de-9d8f-bc00ef05332a";
         supervise_attach_capture(&mut inst, |live| {
             assert!(
-                live.session_id_poller_is_running(),
+                live.capture_poller.is_running(),
                 "capture must be supervised before the blocking attach call"
             );
             crate::session::publish_host_pi_transcript(&live.id, first, home.path());
             Ok(())
         })
         .unwrap();
-        assert!(inst.session_id_poller.is_none());
+        assert!(inst.capture_poller.handle().is_none());
         assert_eq!(
             storage.load().unwrap()[0].agent_session_id.as_deref(),
             Some(first)
@@ -2940,7 +3023,7 @@ mod restart_args_tests {
 
         assert_eq!(result.unwrap_err().to_string(), "fake attach failure");
         assert!(
-            inst.session_id_poller.is_none(),
+            inst.capture_poller.handle().is_none(),
             "an immediate nested attach return must not orphan its poller"
         );
         assert_eq!(
@@ -3551,162 +3634,131 @@ mod import_tests {
 }
 
 #[cfg(test)]
-mod show_json_tests {
-    use super::*;
+mod wait_decision_tests {
+    use super::{adopt_stored, is_terminated, wait_decision, WaitDecision};
+    use crate::session::{
+        Instance, LifecycleOperation, Status, TMUX_SERVER_UNREACHABLE_ERROR,
+        TMUX_SESSION_GONE_ERROR,
+    };
+    use std::time::Duration;
+
+    const SECS: fn(u64) -> Duration = Duration::from_secs;
 
     #[test]
-    fn relationship_lines_name_parent_and_children() {
-        let parent = Instance::new("orchestrator", "/repo");
-        let mut child = Instance::new("worker", "/repo");
-        child.parent_session_id = Some(parent.id.clone());
-        let mut orphan = Instance::new("stray", "/repo");
-        orphan.parent_session_id = Some("gone".to_string());
-        let instances = vec![parent.clone(), child.clone(), orphan.clone()];
-
-        for (inst, expected) in [
+    fn decides_match_stop_timeout_or_continue() {
+        use WaitDecision::*;
+        let cases = [
+            // already in the target state, even with no time left
+            (Status::Idle, vec![Status::Idle], false, 0, 0, Matched),
+            (Status::Idle, vec![Status::Idle], false, 99, 10, Matched),
+            // any one of several targets satisfies the wait
             (
-                &parent,
-                vec![
-                    "  Children:".to_string(),
-                    format!("    worker ({})", child.id),
-                ],
+                Status::Waiting,
+                vec![Status::Idle, Status::Waiting],
+                false,
+                1,
+                10,
+                Matched,
             ),
+            (Status::Error, vec![Status::Error], false, 1, 10, Matched),
             (
-                &child,
-                vec![format!("  Parent:  orchestrator ({})", parent.id)],
+                Status::Running,
+                vec![Status::Idle, Status::Waiting],
+                false,
+                1,
+                10,
+                Continue,
             ),
-            (&orphan, vec!["  Parent:  gone".to_string()]),
-        ] {
+            (Status::Running, vec![Status::Idle], false, 10, 10, TimedOut),
+            (
+                Status::Starting,
+                vec![Status::Idle],
+                false,
+                99,
+                10,
+                TimedOut,
+            ),
+            // termination beats a match, including a gone pane that reads as Error or Idle
+            (Status::Stopped, vec![Status::Idle], true, 1, 10, Terminated),
+            (Status::Error, vec![Status::Error], true, 1, 10, Terminated),
+            (Status::Idle, vec![Status::Idle], true, 1, 10, Terminated),
+        ];
+        for (current, targets, terminated, elapsed, timeout, want) in cases {
             assert_eq!(
-                relationship_lines(inst, &instances),
-                expected,
-                "{}",
-                inst.title
+                wait_decision(current, &targets, terminated, SECS(elapsed), SECS(timeout)),
+                want,
+                "{current:?} {targets:?} terminated={terminated} elapsed={elapsed} timeout={timeout}"
             );
         }
     }
 
     #[test]
-    fn show_json_reports_state_and_only_the_timestamps_that_apply() {
-        let plain = Instance::new("z", "/repo");
-        let serialized = serde_json::to_string(&session_details(&plain, "p")).unwrap();
-        assert!(!serialized.contains("trashed_at"), "{serialized}");
-        assert!(!serialized.contains("archived_at"), "{serialized}");
-        assert!(serialized.contains("\"state\":\"live\""), "{serialized}");
-
-        let mut archived = Instance::new("z", "/repo");
-        archived.archive();
-        let details = session_details(&archived, "p");
-        assert_eq!(details.state, "archived");
-        assert!(details.archived_at.is_some());
-        assert!(details.trashed_at.is_none());
-
-        let mut trashed = archived;
-        trashed.trash();
-        let details = session_details(&trashed, "p");
-        assert_eq!(
-            details.state, "trashed",
-            "trash outranks an earlier archive"
-        );
-        assert!(details.trashed_at.is_some());
-        assert!(details.archived_at.is_some());
+    fn only_confirmed_absence_is_termination() {
+        use crate::tmux::SessionExistence::{Absent, Present, Unknown};
+        let cases = [
+            (Status::Stopped, None, false, Present, true),
+            (
+                Status::Error,
+                Some(TMUX_SESSION_GONE_ERROR),
+                false,
+                Present,
+                true,
+            ),
+            (
+                Status::Error,
+                Some(TMUX_SERVER_UNREACHABLE_ERROR),
+                false,
+                Unknown,
+                false,
+            ),
+            (Status::Error, None, false, Unknown, false),
+            (
+                Status::Idle,
+                Some(TMUX_SESSION_GONE_ERROR),
+                false,
+                Present,
+                false,
+            ),
+            // a capture that lost the pane reads Idle; the pane check still catches it
+            (Status::Idle, None, false, Absent, true),
+            // a launch holding its reservation has no pane yet
+            (Status::Starting, None, true, Absent, false),
+            (Status::Stopped, None, true, Absent, false),
+        ];
+        for (status, last_error, launching, existence, want) in cases {
+            assert_eq!(
+                is_terminated(status, last_error, launching, existence),
+                want,
+                "{status:?} {last_error:?} launching={launching} {existence:?}"
+            );
+        }
     }
 
     #[test]
-    fn show_json_mirrors_the_api_snooze_and_pin_keys() {
+    fn adopt_stored_sees_a_launch_commit_and_keeps_detection_state() {
         let now = chrono::Utc::now();
-        let future = now + chrono::Duration::minutes(15);
-        let past = now - chrono::Duration::minutes(15);
-        let row = |f: &dyn Fn(&mut Instance)| {
-            let mut inst = Instance::new("z", "/repo");
-            f(&mut inst);
-            inst
-        };
-        let check = |label: &str, f: &dyn Fn(&mut Instance), snooze: bool, pin: bool, state| {
-            let value = serde_json::to_value(session_details(&row(f), "p")).unwrap();
-            let seen = (
-                value.get("snoozed_until").is_some(),
-                value.get("pinned_at").is_some(),
-                value["state"].as_str(),
-            );
-            assert_eq!(seen, (snooze, pin, Some(state)), "{label}: {value}");
-        };
-
-        check("plain row", &|_| {}, false, false, "live");
-        check(
-            "active snooze",
-            &|i| i.snoozed_until = Some(future),
-            true,
-            false,
-            "live",
-        );
-        check(
-            "expired snooze",
-            &|i| i.snoozed_until = Some(past),
-            false,
-            false,
-            "live",
-        );
-        check("pinned", &|i| i.pinned_at = Some(now), false, true, "live");
-        check(
-            "snoozed and archived",
-            &|i| {
-                i.archived_at = Some(now);
-                i.snoozed_until = Some(future);
-            },
-            true,
-            false,
-            "archived",
-        );
-        check(
-            "pinned and snoozed",
-            &|i| {
-                i.pinned_at = Some(now);
-                i.snoozed_until = Some(future);
-            },
-            true,
-            true,
-            "live",
-        );
-        check(
-            "trashed and snoozed",
-            &|i| {
-                i.snooze(30);
-                i.trash();
-            },
-            true,
-            false,
-            "trashed",
-        );
-        check(
-            "trashed and pinned",
-            &|i| {
-                i.pin();
-                i.trash();
-            },
-            false,
-            true,
-            "trashed",
-        );
-        check(
-            "pinned and archived",
-            &|i| {
-                i.archived_at = Some(now);
-                i.pinned_at = Some(now);
-            },
-            false,
-            true,
-            "archived",
-        );
-
-        let active = serde_json::to_value(session_details(
-            &row(&|i| i.snoozed_until = Some(future)),
-            "p",
-        ))
+        let mut live = Instance::new("t", "/p");
+        live.try_acquire_lifecycle_reservation(
+            LifecycleOperation::Launch,
+            Instance::LIFECYCLE_RESERVATION_TTL,
+            now,
+        )
         .unwrap();
-        assert_eq!(
-            active["snoozed_until"],
-            serde_json::to_value(future).unwrap()
-        );
+        live.status = Status::Starting;
+        live.detection.pending = Some(Status::Idle);
+        assert!(live.has_fresh_launch_reservation(now));
+
+        let mut stored = live.clone();
+        stored.lifecycle_generation += 1;
+        stored.lifecycle_reservation = None;
+        stored.detection.pending = None;
+        stored.source_profile = "original".into();
+
+        let adopted = adopt_stored(&live, stored).unwrap();
+        assert!(!adopted.has_fresh_launch_reservation(now));
+        assert_eq!(adopted.detection.pending, Some(Status::Idle));
+        let mut converted = adopted;
+        converted.view = crate::session::View::Structured;
+        assert!(adopt_stored(&live, converted).is_err());
     }
 }

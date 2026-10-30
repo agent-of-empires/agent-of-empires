@@ -1,69 +1,114 @@
-import { useEffect, useState } from "react";
+import { useEffect, useId, useState } from "react";
 
 import type { IncompatibleAgentDetail } from "../../lib/acpTypes";
-import { fetchSettings, installAcpAgent } from "../../lib/api";
+import { fetchAgentInstallInfo, type AgentInstallInfo } from "../../lib/api";
 import { useRespawnSession } from "../../hooks/useRespawnSession";
+import { splitInstallHint, useAdapterInstall } from "./adapterRecovery";
+import { CommandBlock, RecoveryActionRow, type RecoveryAction } from "./RecoveryActionRow";
 
 interface Props {
   detail: IncompatibleAgentDetail;
   sessionId: string;
-  /** The adapter lives in a container, so the host install command does not apply. */
+  /** Used until install-info answers. */
   isSandboxed?: boolean;
 }
 
-/** Replaces the chat when the adapter compatibility check refuses the session. Shows
- *  the exact remediation, a respawn, and (with `acp.allow_agent_install`, which only the
- *  TUI can enable) an install that also respawns other sessions blocked on the adapter. */
-export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: Props) {
-  const heading = headingFor(detail);
-  const summary = summaryFor(detail);
-  const installCommand = installCommandFor(detail);
-  const autoInstallable = "auto_install" in detail && detail.auto_install;
-  const showHostCommand = installCommand && !isSandboxed;
+const SETTING_PATH = 'TUI › Settings › Global › Acp › Advanced › "Allow agent install from web"';
 
-  const { state: respawnState, error: respawnError, respawn } = useRespawnSession(sessionId);
-  const [allowInstall, setAllowInstall] = useState(false);
-  const [installState, setInstallState] = useState<"idle" | "installing" | "failed">("idle");
-  const [installError, setInstallError] = useState<string | null>(null);
-  const [installOutput, setInstallOutput] = useState<string | null>(null);
-  const [recoveredCount, setRecoveredCount] = useState(0);
+function Code({ children }: { children: React.ReactNode }) {
+  return <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">{children}</code>;
+}
 
+/** install-info, re-read when the page regains focus so a setting turned on in
+ *  the TUI unlocks the install without a reload. */
+function useInstallInfo(sessionId: string, detail: IncompatibleAgentDetail): AgentInstallInfo | null {
+  const [info, setInfo] = useState<AgentInstallInfo | null>(null);
+  // A new detail means the adapter ran again, for example once its container started.
   useEffect(() => {
     let alive = true;
-    fetchSettings().then((s) => {
-      if (alive) {
-        setAllowInstall(s?.acp?.allow_agent_install === true);
-      }
-    });
+    // Focus and visibilitychange often fire together; only the latest read may land.
+    let latest = 0;
+    const load = () => {
+      const seq = ++latest;
+      void fetchAgentInstallInfo(sessionId).then((next) => {
+        if (alive && seq === latest && next) setInfo(next);
+      });
+    };
+    const onVisible = () => {
+      if (document.visibilityState === "visible") load();
+    };
+    load();
+    window.addEventListener("focus", load);
+    document.addEventListener("visibilitychange", onVisible);
     return () => {
       alive = false;
+      window.removeEventListener("focus", load);
+      document.removeEventListener("visibilitychange", onVisible);
     };
-  }, []);
+  }, [sessionId, detail]);
+  return info;
+}
 
-  const busy = respawnState === "retrying" || installState === "installing";
+/** Replaces the chat when the adapter compatibility check refuses the Session:
+ *  the steps that fix it from here, or the command to run by hand. */
+export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: Props) {
+  const info = useInstallInfo(sessionId, detail);
+  const sandboxed = info?.sandboxed ?? isSandboxed;
+  const name = info?.display_name ?? null;
+  const stepOneId = useId();
+  const [detailsOpen, setDetailsOpen] = useState(false);
 
-  const handleUpdateAndRestart = async () => {
-    setInstallState("installing");
-    setInstallError(null);
-    setInstallOutput(null);
-    try {
-      const res = await installAcpAgent(sessionId);
-      const log = `${res.stdout}\n${res.stderr}`.trim();
-      setInstallOutput(log || null);
-      if (!res.success) {
-        setInstallState("failed");
-        setInstallError(`Install exited with code ${res.exit_code ?? "unknown"}.`);
-        return;
-      }
-      setRecoveredCount(res.recovered_sessions);
-      setInstallState("idle");
-      // Re-run the handshake against the freshly installed version.
-      await respawn();
-    } catch (e) {
-      setInstallState("failed");
-      setInstallError(e instanceof Error ? e.message : String(e));
-    }
+  const { state: respawnState, error: respawnError, respawn } = useRespawnSession(sessionId);
+  // A version failure that arrives after a successful install is a new detail.
+  const [installedFor, setInstalledFor] = useState<IncompatibleAgentDetail | null>(null);
+  const install = useAdapterInstall(sessionId, () => {
+    setInstalledFor(detail);
+    return respawn();
+  });
+  const failsAgain = installedFor !== null && installedFor !== detail;
+  // A refused Update, cleared by the next detail, which arrives once the started container runs the adapter again.
+  const [containerDownFor, setContainerDownFor] = useState<IncompatibleAgentDetail | null>(null);
+
+  const hostCommand = "install_command" in detail ? detail.install_command : null;
+  const manualCommand = sandboxed ? (info?.container_install_command ?? null) : hostCommand;
+  // A sandboxed adapter npm can't install has no Daemon-built command; its hint runs in the container.
+  const containerHint = sandboxed && !manualCommand ? hostCommand : null;
+  // Read-only and CityHall dashboards can neither install nor respawn.
+  const observer = info?.install_blocked === "read_only" || info?.install_blocked === "cityhall";
+  const webInstall = !observer && "auto_install" in detail && detail.auto_install;
+  const allowed = info?.install_allowed === true;
+  // Only the Update steps wait on the container; manual and protocol steps keep their own.
+  const containerDown =
+    webInstall &&
+    (info?.install_blocked === "container_not_running" ||
+      (containerDownFor === detail && install.errorCode === "container_not_running"));
+  const busy = respawnState === "retrying" || install.state === "installing";
+
+  const updateLabel = sandboxed ? "Update in Sandbox & restart" : "Update & restart";
+  const checkAgain: RecoveryAction = {
+    label: respawnState === "retrying" ? "Checking…" : "Check again",
+    onClick: () => void respawn(),
+    testId: "startup-error-restart",
+    disabled: busy,
   };
+  const update: RecoveryAction = {
+    label: install.state === "installing" ? "Updating…" : updateLabel,
+    onClick: () =>
+      void install.install().then((code) => {
+        if (code === "container_not_running") setContainerDownFor(detail);
+      }),
+    testId: "startup-error-update-restart",
+    disabled: busy || !allowed,
+    describedBy: allowed ? undefined : stepOneId,
+  };
+  const startContainer: RecoveryAction = {
+    label: respawnState === "retrying" ? "Starting…" : "Start the container",
+    onClick: () => void respawn(),
+    testId: "startup-error-start-container",
+    disabled: busy,
+  };
+  const primary = containerDown ? startContainer : webInstall ? update : checkAgain;
+  const secondary = containerDown ? [] : webInstall ? [checkAgain] : [];
 
   return (
     <div
@@ -72,218 +117,257 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
       data-testid="startup-error-screen"
       className="flex h-full flex-1 items-center justify-center bg-surface-900 px-4 py-12"
     >
-      <div className="w-full max-w-xl rounded-lg border border-status-error/60 bg-surface-850 p-6 text-text-primary shadow-lg">
-        <div className="text-[11px] font-semibold uppercase tracking-wide text-status-error">
-          Adapter compatibility check failed
+      <div className="w-full max-w-xl rounded-lg border border-status-error/60 bg-surface-850 p-4 text-text-primary shadow-lg sm:p-6">
+        <div className="text-[11px] font-semibold uppercase tracking-wide text-status-error-text">
+          {detail.kind === "unsupported_protocol_version" ? "Adapter not supported" : "Adapter out of date"}
         </div>
-        <h2 className="mt-2 text-lg font-semibold text-text-primary">{heading}</h2>
-        <p className="mt-3 text-sm text-text-secondary">{summary}</p>
+        <h2 className="mt-2 text-lg font-semibold text-text-primary">{headlineFor(detail, name)}</h2>
+        <p data-testid="startup-error-version" className="mt-1 break-words font-mono text-[12px] text-text-subtle">
+          {versionLineFor(detail)}
+        </p>
 
-        {showHostCommand && (
-          <div className="mt-4">
-            <div className="text-[11px] font-medium uppercase tracking-wide text-text-dim">
-              Run this, then restart the agent
-            </div>
-            <pre
-              data-testid="startup-error-install-command"
-              className="mt-1 overflow-x-auto rounded-md border border-surface-700 bg-surface-950 p-2 font-mono text-[12px] text-text-primary"
-            >
-              {installCommand}
-            </pre>
-          </div>
+        {failsAgain && (
+          <p data-testid="startup-error-fails-again" className="mt-3 text-sm text-status-error-text">
+            The update finished, but the adapter still fails the check, so the install didn't change the version it
+            reports. Run the command below by hand, then Check again.
+          </p>
+        )}
+        {containerDown && (
+          <p data-testid="startup-error-container-down" className="mt-3 text-sm text-status-error-text">
+            This Session's container isn't running, so the update has nowhere to run. Start the container, then update
+            the adapter.
+          </p>
         )}
 
-        {isSandboxed && installCommand && (
-          <div className="mt-4" data-testid="startup-error-sandbox-note">
-            <div className="text-[11px] font-medium uppercase tracking-wide text-text-dim">
-              This session runs in a sandbox
-            </div>
-            {autoInstallable ? (
-              <p className="mt-1 text-sm text-text-secondary">
-                The adapter lives inside the container, so a host{" "}
-                <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">npm install</code> would not reach
-                it. Use <span className="font-medium text-text-secondary">Update &amp; restart</span> below to install
-                the adapter <span className="font-medium text-text-secondary">inside the container</span> and reload the
-                session.
-              </p>
-            ) : (
-              <>
-                <p className="mt-1 text-sm text-text-secondary">
-                  The adapter lives inside the container, so installing it on the host would not reach it.
-                </p>
-                <div className="mt-3 text-[11px] font-medium uppercase tracking-wide text-text-dim">
-                  Run this inside the container, then press Restart agent
-                </div>
-                <pre
-                  data-testid="startup-error-sandbox-install-command"
-                  className="mt-1 overflow-x-auto rounded-md border border-surface-700 bg-surface-950 p-2 font-mono text-[12px] text-text-primary"
-                >
-                  {installCommand}
-                </pre>
-              </>
-            )}
-            <p className="mt-2 text-xs text-text-dim">
-              This updates the running container only. To keep new sessions from hitting this, refresh the sandbox
-              image: the aoe TUI shows a "sandbox image update available" banner that pulls the right image with your
-              configured container runtime.
-            </p>
-          </div>
-        )}
-
-        <DetailRows detail={detail} />
-
-        <div className="mt-5 flex flex-wrap items-center gap-2">
-          <button
-            type="button"
-            data-testid="startup-error-restart"
-            onClick={respawn}
-            disabled={busy}
-            className="rounded-md border border-surface-700 bg-surface-800 px-3 py-1.5 text-xs font-medium text-text-primary hover:bg-surface-700 disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            {respawnState === "retrying" ? "Restarting…" : "Restart agent"}
-          </button>
-          {autoInstallable && allowInstall && (
-            <button
-              type="button"
-              data-testid="startup-error-update-restart"
-              onClick={handleUpdateAndRestart}
-              disabled={busy}
-              className="rounded-md border border-status-error/60 bg-status-error/20 px-3 py-1.5 text-xs font-medium text-text-primary hover:bg-status-error/30 disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              {installState === "installing"
-                ? "Updating…"
-                : isSandboxed
-                  ? "Update in sandbox & restart"
-                  : "Update & restart"}
-            </button>
+        <ol className="mt-4 space-y-3 text-sm" data-testid="startup-error-steps">
+          {detail.kind === "unsupported_protocol_version" ? (
+            <>
+              <Step n={1} title={`Install an adapter that speaks ACP protocol ${detail.expected}`}>
+                This aoe build negotiates protocol {detail.expected}; the adapter speaks {detail.received}. Install an
+                adapter version for protocol {detail.expected}, or update aoe.
+              </Step>
+              {!observer && <Step n={2} title="Click Check again" />}
+            </>
+          ) : containerDown ? (
+            <>
+              <Step n={1} title="Click Start the container" />
+              <Step n={2} title="Then update the adapter">
+                The update comes back here once the container is running.
+              </Step>
+            </>
+          ) : webInstall ? (
+            <>
+              <Step n={1} id={stepOneId} done={allowed} title="Allow installs from the Web dashboard">
+                Turn on {SETTING_PATH}. The install runs <Code>npm install</Code> as the Daemon's user.
+              </Step>
+              <Step n={2} title={`Click ${updateLabel}`}>
+                It updates the adapter {sandboxed ? "in this Session's container" : "where the Daemon runs"} and
+                restarts the agent.
+                {manualCommand && (
+                  <div className="mt-2" data-testid="startup-error-fallback">
+                    <p className="text-xs text-text-subtle">Or run this where the Daemon runs, then Check again:</p>
+                    <CommandBlock {...splitInstallHint(manualCommand)} testId="startup-error-install-command" scroll />
+                  </div>
+                )}
+              </Step>
+            </>
+          ) : (
+            <>
+              <Step
+                n={1}
+                title={containerHint ? "Run this inside this Session's container" : "Run this where the Daemon runs"}
+              >
+                {manualCommand || containerHint ? (
+                  <CommandBlock
+                    {...splitInstallHint((manualCommand ?? containerHint)!)}
+                    testId="startup-error-install-command"
+                    scroll
+                  />
+                ) : (
+                  <>
+                    Run <Code>aoe acp doctor --fix</Code>.
+                  </>
+                )}
+              </Step>
+              <Step n={2} title={observer ? "Restart the agent from the TUI" : "Click Check again"}>
+                {observer &&
+                  (info?.install_blocked === "cityhall"
+                    ? "A CityHall dashboard can't restart the agent."
+                    : "This dashboard is read-only, so it can't restart the agent.")}
+              </Step>
+            </>
           )}
-          {autoInstallable && !allowInstall && (
-            <button
-              type="button"
-              data-testid="startup-error-update-restart-disabled"
-              disabled
-              title="Enable acp.allow_agent_install in the aoe TUI settings (Advanced) to install from the dashboard"
-              className="cursor-not-allowed rounded-md border border-surface-700 bg-surface-800 px-3 py-1.5 text-xs font-medium text-text-dim opacity-60"
-            >
-              Update & restart
-            </button>
-          )}
-        </div>
+        </ol>
 
-        {autoInstallable && !allowInstall && (
-          <div className="mt-2 text-xs text-text-dim" data-testid="startup-error-enable-hint">
-            One-click install is off. Enable{" "}
-            <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">acp.allow_agent_install</code> in the{" "}
-            <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">aoe</code> TUI settings (Advanced) to
-            run the update from here. It is blocked from the web on purpose: it runs{" "}
-            <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">npm install</code>{" "}
-            {isSandboxed ? "inside the sandbox container" : "on the host"}.
-          </div>
+        {!observer && (
+          <RecoveryActionRow
+            primary={primary}
+            secondary={secondary}
+            install={{
+              // Its own message replaces this, and stays gone once the container is running.
+              error: install.errorCode === "container_not_running" ? null : install.error,
+              output: install.output,
+            }}
+          />
         )}
 
         {respawnState === "ok" && (
-          <div className="mt-2 text-xs text-emerald-200/90">
-            Restart requested. The agent re-runs the compatibility check on the next handshake.
-            {recoveredCount > 0 &&
-              ` Also restarting ${recoveredCount} other session${recoveredCount === 1 ? "" : "s"} blocked on the same adapter.`}
+          <div className="mt-2 text-xs text-text-subtle">
+            Checking again. The adapter's version is checked when it starts.
+            {install.recovered > 0 &&
+              ` Also restarting ${install.recovered} other Session${install.recovered === 1 ? "" : "s"} blocked on the same adapter.`}
           </div>
         )}
         {respawnState === "failed" && respawnError && (
-          <div className="mt-2 text-xs text-status-error">Restart failed: {respawnError}</div>
-        )}
-        {installState === "failed" && installError && (
-          <div className="mt-2 text-xs text-status-error">{installError}</div>
-        )}
-        {installOutput && (
-          <pre className="mt-2 max-h-40 overflow-auto rounded-md border border-surface-700 bg-surface-950 p-2 font-mono text-[11px] text-text-secondary">
-            {installOutput}
-          </pre>
+          <div className="mt-2 text-xs text-status-error-text">Check again failed: {respawnError}</div>
         )}
 
-        <div className="mt-4 text-xs text-text-dim">
-          The session is paused until the adapter satisfies the required version. After installing, use{" "}
-          <span className="font-medium text-text-secondary">Restart agent</span> above (no full restart of{" "}
-          <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">aoe serve</code> needed) and the check
-          re-runs at the next ACP <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">initialize</code>{" "}
-          handshake.
+        <div className="mt-4 border-t border-status-error/30 pt-2">
+          <button
+            type="button"
+            data-testid="startup-error-details"
+            aria-expanded={detailsOpen}
+            onClick={() => setDetailsOpen(!detailsOpen)}
+            className="text-xs font-medium text-text-primary underline-offset-2 hover:underline"
+          >
+            Details
+          </button>
+          {detailsOpen && (
+            <div data-testid="startup-error-details-body" className="mt-2 space-y-2 text-xs text-text-subtle">
+              <p>{rationaleFor(detail)}</p>
+              {sandboxed && (
+                <p>
+                  Refreshing the Sandbox image fixes new Sessions only: this Session's container keeps the image it
+                  started with. When a newer image is published and update checks are on, the dashboard's "Sandbox image
+                  update available" banner pulls it, or shows the command to run.
+                </p>
+              )}
+              <p>
+                Check again restarts the agent, and the check runs again at the next ACP <Code>initialize</Code>{" "}
+                handshake. <Code>aoe serve</Code> doesn't need a restart.
+              </p>
+              <DetailRows detail={detail} sandboxed={sandboxed} />
+            </div>
+          )}
         </div>
       </div>
     </div>
   );
 }
 
-function headingFor(detail: IncompatibleAgentDetail): string {
+function Step({
+  n,
+  id,
+  done = false,
+  title,
+  children,
+}: {
+  n: number;
+  id?: string;
+  done?: boolean;
+  title: string;
+  children?: React.ReactNode;
+}) {
+  return (
+    <li id={id} className="flex gap-3" data-testid={`startup-error-step-${n}`} data-done={done || undefined}>
+      <span
+        aria-hidden
+        className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-xs font-semibold ${
+          done ? "bg-status-running/20 text-status-running" : "bg-surface-800 text-text-subtle"
+        }`}
+      >
+        {done ? "✓" : n}
+      </span>
+      <div className="min-w-0 flex-1">
+        <div className="font-medium text-text-primary">
+          {title}
+          {done && <span className="ml-2 text-xs font-normal text-text-subtle">Done</span>}
+        </div>
+        {children && <div className="mt-0.5 text-xs text-text-subtle">{children}</div>}
+      </div>
+    </li>
+  );
+}
+
+function headlineFor(detail: IncompatibleAgentDetail, name: string | null): string {
+  const adapter = name ? `The ${name} ACP adapter` : "The ACP adapter";
   switch (detail.kind) {
     case "incompatible_agent_version":
-      return `${detail.package_name} ${detail.installed} is below the required ${detail.required}`;
+      return `${adapter} needs an update`;
     case "missing_agent_info":
-      return "Adapter did not report its package version";
+      return `${adapter} didn't report its version`;
     case "mismatched_agent_name":
-      return `Adapter package name does not match the expected agent`;
+      return `${adapter} isn't the package aoe expects`;
     case "unparseable_agent_version":
-      return `Adapter reported an invalid version string`;
+      return `${adapter} reported a version aoe can't read`;
     case "unsupported_protocol_version":
-      return `Adapter speaks an unsupported ACP protocol version`;
+      return `${adapter} speaks an ACP protocol aoe doesn't support`;
   }
 }
 
-function summaryFor(detail: IncompatibleAgentDetail): string {
+function versionLineFor(detail: IncompatibleAgentDetail): string {
   switch (detail.kind) {
     case "incompatible_agent_version":
-      return `aoe requires ${detail.package_name} version ${detail.required} or newer. The installed adapter is ${detail.installed}. Updating the adapter unblocks the session; aoe relies on behavior (memory_recall tool calls, native cancelled stop reason, others) that older versions do not emit.`;
+      return `${detail.package_name} ${detail.installed} installed · needs ${detail.required} or newer`;
     case "missing_agent_info":
-      return `aoe expected ${detail.expected_package} to report a package version in its ACP initialize response. The adapter returned an empty agent_info block, which usually means a stale install or a wrapper that strips metadata. Reinstall to the pinned version.`;
+      return `${detail.expected_package} · no version reported`;
     case "mismatched_agent_name":
-      return `aoe expected the adapter to identify itself as ${detail.expected} but it reported ${detail.received}. This usually means a wrapper script or a stale binary is on PATH. Reinstall the official adapter at the pinned version.`;
+      return `${detail.received} reported · expected ${detail.expected}`;
     case "unparseable_agent_version":
-      return `aoe expected ${detail.package_name} to report a semver-compatible version string but received ${detail.raw_version}. Required minimum is ${detail.required}. Reinstall the official build to recover.`;
+      return `${detail.package_name} "${detail.raw_version}" · needs ${detail.required} or newer`;
     case "unsupported_protocol_version":
-      return `aoe negotiated ACP protocol ${detail.expected} but the adapter reported ${detail.received}. The session cannot proceed. This usually means an older or newer adapter generation than aoe currently supports.`;
+      return `protocol ${detail.received} · needs ${detail.expected}`;
   }
 }
 
-function installCommandFor(detail: IncompatibleAgentDetail): string | null {
+function rationaleFor(detail: IncompatibleAgentDetail): string {
   switch (detail.kind) {
     case "incompatible_agent_version":
+      return `aoe relies on behavior that ${detail.package_name} versions before ${detail.required} don't have, such as memory_recall tool calls and the native cancelled stop reason.`;
     case "missing_agent_info":
+      return `The adapter returned no package version in its ACP initialize response. That usually means a stale install or a wrapper that strips the metadata.`;
     case "mismatched_agent_name":
+      return `The adapter identified itself as ${detail.received}. That usually means a wrapper script or a stale binary is found first on PATH.`;
     case "unparseable_agent_version":
-      return detail.install_command;
+      return `The adapter reported "${detail.raw_version}", which isn't a semver version. Reinstalling the official build fixes it.`;
     case "unsupported_protocol_version":
-      return null;
+      return `The adapter is from an older or newer generation than this aoe build supports.`;
   }
 }
 
-function DetailRows({ detail }: { detail: IncompatibleAgentDetail }) {
+function DetailRows({ detail, sandboxed }: { detail: IncompatibleAgentDetail; sandboxed: boolean }) {
   const rows: Array<[string, string]> = [];
   switch (detail.kind) {
     case "incompatible_agent_version":
-      rows.push(["Package", detail.package_name]);
-      rows.push(["Installed", detail.installed]);
-      rows.push(["Required", `>=${detail.required}`]);
+      rows.push(
+        ["Package", detail.package_name],
+        ["Installed", detail.installed],
+        ["Required", `>=${detail.required}`],
+      );
       break;
     case "missing_agent_info":
       rows.push(["Expected package", detail.expected_package]);
       break;
     case "mismatched_agent_name":
-      rows.push(["Expected", detail.expected]);
-      rows.push(["Received", detail.received]);
+      rows.push(["Expected", detail.expected], ["Received", detail.received]);
       break;
     case "unparseable_agent_version":
-      rows.push(["Package", detail.package_name]);
-      rows.push(["Raw version", detail.raw_version]);
-      rows.push(["Required", `>=${detail.required}`]);
+      rows.push(
+        ["Package", detail.package_name],
+        ["Raw version", detail.raw_version],
+        ["Required", `>=${detail.required}`],
+      );
       break;
     case "unsupported_protocol_version":
-      rows.push(["Expected protocol", detail.expected]);
-      rows.push(["Received protocol", detail.received]);
+      rows.push(["Expected protocol", detail.expected], ["Received protocol", detail.received]);
       break;
   }
+  rows.push(["Where", sandboxed ? "This Session's container" : "Host, where the Daemon runs"]);
   return (
-    <dl className="mt-4 grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 font-mono text-[11px] text-text-secondary">
+    <dl className="grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 font-mono text-[11px] text-text-subtle">
       {rows.map(([label, value]) => (
         <div key={label} className="contents">
-          <dt className="font-medium text-text-dim">{label}</dt>
+          <dt className="font-medium text-text-subtle">{label}</dt>
           <dd className="break-all">{value}</dd>
         </div>
       ))}

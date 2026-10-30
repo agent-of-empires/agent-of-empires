@@ -8,18 +8,36 @@ use super::access::{access_policy, cityhall_gate, security_headers};
 #[cfg(feature = "web")]
 use super::assets::{serve_asset, serve_index, serve_public_file};
 use super::state::AppState;
-use crate::server::{acp_ws, api, auth, live_ws, login, passkeys, push, runtime_ws};
+use crate::server::{
+    acp_ws, api, auth, live_ws, login, passkeys, push, runtime_ws, session_status_ws,
+};
 
 pub(super) fn build_router(state: Arc<AppState>) -> Router {
     use axum::routing::{delete, get, patch, post, put};
+    let read_only = axum::middleware::from_fn_with_state(state.clone(), api::read_only_gate);
 
     let app = Router::new()
-        // Explicit browser visibility heartbeat.
+        .route("/api/runtime", get(super::runtime::get_runtime_info))
+        .route(
+            "/api/runtime/snapshot",
+            get(super::runtime::get_runtime_snapshot),
+        )
+        .route("/api/runtime/ws", get(super::runtime::runtime_ws))
+        // Explicit browser visibility heartbeat. Ordinary API requests do not
+        // imply the dashboard is foregrounded, so they must not suppress push.
         .route("/api/presence", post(api::post_dashboard_presence))
         // Sessions
         .route(
             "/api/sessions",
             get(api::list_sessions).post(api::create_session),
+        )
+        .route(
+            "/api/sessions/creation-trust",
+            post(api::review_creation_trust).layer(read_only.clone()),
+        )
+        .route(
+            "/api/sessions/{id}/creation/cancel",
+            post(api::cancel_creation).layer(read_only.clone()),
         )
         // Static segment; registered before /api/sessions/{id} so the
         // literal "search" never resolves as a session id. See #2515.
@@ -34,7 +52,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             put(api::update_workspace_ordering),
         )
         // Atomic multi-session workspace delete.
-        .route("/api/workspaces", delete(api::delete_workspace))
+        .route(
+            "/api/workspaces",
+            delete(api::delete_workspace).layer(read_only.clone()),
+        )
         // Unified MCP management surface (#1996)
         .route(
             "/api/mcp/servers",
@@ -65,8 +86,14 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             put(api::edit_skill).delete(api::delete_skill),
         )
         .route(
+            "/api/sessions/empty-trash",
+            post(api::empty_trash).layer(read_only.clone()),
+        )
+        .route(
             "/api/sessions/{id}",
-            patch(api::rename_session).delete(api::delete_session),
+            patch(api::rename_session)
+                .delete(api::delete_session)
+                .layer(read_only.clone()),
         )
         .route("/api/sessions/{id}/group", patch(api::update_session_group))
         .route(
@@ -82,6 +109,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/file/raw", get(api::session_file_raw))
         // Read-only runtime read: one Hello, one Snapshot, one clean close.
         .route("/api/runtime/read/ws", get(runtime_ws::runtime_ws))
+        .route(
+            "/api/sessions/status/ws",
+            get(session_status_ws::session_status_ws),
+        )
         .route(
             "/api/sessions/{id}/artifacts/{*path}",
             get(api::serve_session_artifact),
@@ -111,17 +142,32 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             post(api::attach_session_project),
         )
         .route("/api/sessions/{id}/pin", patch(api::update_session_pin))
+        .route(
+            "/api/sessions/{id}/favorite",
+            patch(api::update_session_favorite).layer(read_only.clone()),
+        )
         .route("/api/sessions/{id}/color", patch(api::update_session_color))
         .route(
             "/api/sessions/{id}/archive",
             patch(api::update_session_archive),
         )
         .route(
+            "/api/sessions/{id}/access",
+            patch(api::touch_session_access).layer(read_only.clone()),
+        )
+        .route(
             "/api/sessions/{id}/snooze",
             patch(api::update_session_snooze),
         )
-        .route("/api/sessions/{id}/trash", post(api::trash_session))
+        .route(
+            "/api/sessions/{id}/trash",
+            post(api::trash_session).layer(read_only.clone()),
+        )
         .route("/api/sessions/{id}/restore", post(api::restore_session))
+        .route(
+            "/api/sessions/{id}/purge/abandon",
+            post(api::abandon_purge).layer(read_only.clone()),
+        )
         .route(
             "/api/sessions/{id}/unread",
             patch(api::update_session_unread),
@@ -134,12 +180,32 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/summarize", post(api::summarize_session))
         .route("/api/sessions/{id}/start", post(api::start_session))
         .route(
+            "/api/sessions/{id}/restart",
+            post(api::restart_session).layer(read_only.clone()),
+        )
+        .route(
+            "/api/sessions/{id}/recreate-container",
+            post(api::recreate_container).layer(read_only.clone()),
+        )
+        .route(
+            "/api/sessions/{id}/restart-for-update",
+            post(api::restart_for_update).layer(read_only.clone()),
+        )
+        .route(
             "/api/sessions/{id}/terminal",
             post(api::ensure_terminal).delete(api::kill_terminal),
         )
         .route(
             "/api/sessions/{id}/container-terminal",
             post(api::ensure_container_terminal),
+        )
+        .route(
+            "/api/sessions/{id}/tools/ensure",
+            post(api::ensure_tool).layer(read_only.clone()),
+        )
+        .route(
+            "/api/sessions/{id}/auxiliary/stop",
+            post(api::stop_auxiliary).layer(read_only.clone()),
         )
         // Agents
         .route("/api/agents", get(api::list_agents))
@@ -161,7 +227,19 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/git/worktrees", get(api::list_worktrees))
         .route("/api/git/is-repo", get(api::is_git_repo))
         .route("/api/git/clone", post(api::clone_repo))
-        .route("/api/groups", get(api::list_groups))
+        .route(
+            "/api/groups",
+            get(api::list_groups)
+                .post(api::create_group)
+                .patch(api::move_group)
+                .delete(api::delete_group)
+                .layer(read_only.clone()),
+        )
+        .route(
+            "/api/groups/collapse",
+            patch(api::collapse_group).layer(read_only.clone()),
+        )
+        .route("/api/reorder", post(api::reorder).layer(read_only.clone()))
         .route(
             "/api/projects",
             get(api::list_projects).post(api::create_project),
@@ -171,6 +249,15 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             patch(api::update_project).delete(api::delete_project),
         )
         .route("/api/docker/status", get(api::docker_status))
+        .route("/api/sandbox/image-status", get(api::sandbox_image_status))
+        .route(
+            "/api/sandbox/image-pull",
+            post(api::sandbox_image_pull).layer(read_only.clone()),
+        )
+        .route(
+            "/api/sandbox/image-dismiss",
+            post(api::sandbox_image_dismiss).layer(read_only.clone()),
+        )
         .route("/api/system/health", get(api::system_health))
         .route("/api/system/logs", get(api::get_logs))
         // Settings + themes
@@ -199,16 +286,19 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/plugins/commands", get(api::plugin_commands))
         .route(
             "/api/plugins/commands/{fqid}/invoke",
-            post(api::invoke_plugin_command),
+            post(api::invoke_plugin_command).layer(read_only.clone()),
         )
         .route("/api/plugins/ui-state", get(api::plugin_ui_state))
         .route("/api/plugins/updates", get(api::plugin_updates))
         .route("/api/plugins/discover", get(api::plugin_discover))
         .route("/api/plugins/details", get(api::plugin_details))
-        .route("/api/plugins/{id}/enabled", post(api::set_plugin_enabled))
+        .route(
+            "/api/plugins/{id}/enabled",
+            post(api::set_plugin_enabled).layer(read_only.clone()),
+        )
         .route(
             "/api/plugins/{id}/worker/restart",
-            post(api::restart_plugin_worker),
+            post(api::restart_plugin_worker).layer(read_only.clone()),
         )
         .route("/api/plugins/{id}/action", post(api::invoke_plugin_action))
         .route("/api/plugins/{id}/sessions", get(api::plugin_sessions))
@@ -218,12 +308,15 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/plugins/install/preview",
-            post(api::preview_plugin_install),
+            post(api::preview_plugin_install).layer(read_only.clone()),
         )
-        .route("/api/plugins/install", post(api::start_plugin_install))
+        .route(
+            "/api/plugins/install",
+            post(api::start_plugin_install).layer(read_only.clone()),
+        )
         .route(
             "/api/plugins/{id}/uninstall",
-            post(api::start_plugin_uninstall),
+            post(api::start_plugin_uninstall).layer(read_only.clone()),
         )
         .route("/api/plugins/jobs/{job_id}", get(api::plugin_job_status))
         .route(
@@ -232,11 +325,11 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/plugins/{id}/update/apply",
-            post(api::apply_plugin_update),
+            post(api::apply_plugin_update).layer(read_only.clone()),
         )
         .route(
             "/api/plugins/{id}/update/dismiss",
-            post(api::dismiss_plugin_update),
+            post(api::dismiss_plugin_update).layer(read_only.clone()),
         )
         .route(
             "/api/app-state/web-tour-seen",
@@ -348,7 +441,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/acp", delete(api::shutdown_acp))
         .route(
             "/api/sessions/{id}/acp/switch-agent",
-            post(api::switch_acp_agent),
+            post(api::switch_acp_agent).layer(read_only.clone()),
         )
         .route(
             "/api/sessions/{id}/acp/switch-provider",
@@ -423,15 +516,26 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
 
     // Dashboard bundle (Vite build output) plus the SPA fallback.
     #[cfg(feature = "web")]
-    let app = app
-        .route("/assets/{*path}", get(serve_asset))
-        .route("/manifest.json", get(serve_public_file))
-        .route("/sw.js", get(serve_public_file))
-        .route("/icon-192.png", get(serve_public_file))
-        .route("/icon-512.png", get(serve_public_file))
-        .fallback(get(serve_index));
+    let app = if state.core_only {
+        app
+    } else {
+        app.route("/assets/{*path}", get(serve_asset))
+            .route("/manifest.json", get(serve_public_file))
+            .route("/sw.js", get(serve_public_file))
+            .route("/icon-192.png", get(serve_public_file))
+            .route("/icon-512.png", get(serve_public_file))
+            .fallback(get(serve_index))
+    };
 
     app.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        super::runtime::mutation_scope,
+    ))
+    .layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        super::runtime::epoch_gate,
+    ))
+    .layer(axum::middleware::from_fn_with_state(
         state.clone(),
         cityhall_gate,
     ))
@@ -443,16 +547,35 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         state.clone(),
         access_policy,
     ))
+    .layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        super::ingress::plaintext_gate,
+    ))
     .layer(axum::middleware::from_fn(security_headers))
     .layer(axum::middleware::from_fn(http_request_span))
     .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
     .with_state(state)
 }
 
-/// Placeholder logged in place of a route template when axum matched no route.
+/// Placeholder logged in place of a route template when axum matched no
+/// route: the SPA fallback, and the 405 that fallback returns for a
+/// non-GET method. A request whose *path* matched a registered route still
+/// carries its template even when the method router rejects it, because
+/// axum matches on path before it dispatches on method. The raw URI is never
+/// substituted here: it is attacker- or user-controlled text, and the whole
+/// point of [`log_route`] is that only strings we wrote ourselves reach the
+/// log file.
 pub(super) const UNMATCHED_ROUTE: &str = "<unmatched>";
 
 /// Route template for a request, for logging only.
+///
+/// Deliberately never the raw URI. `aoe serve` puts the auth token in the
+/// URL's query string, path segments carry session ids, and `debug.log` is a
+/// file users paste into issue reports. `MatchedPath` is the template we
+/// registered in [`build_router`] (`/api/sessions/{id}/acp/replay`), a
+/// compile-time constant with no request data in it, so logging it cannot
+/// leak a token or an id no matter what the client sent. Axum fills the
+/// extension during routing, before any `Router::layer` middleware runs.
 pub(super) fn log_route(request: &axum::extract::Request) -> &str {
     request
         .extensions()
@@ -460,10 +583,21 @@ pub(super) fn log_route(request: &axum::extract::Request) -> &str {
         .map_or(UNMATCHED_ROUTE, |m| m.as_str())
 }
 
-/// Longest client-supplied `X-Request-Id` we are willing to echo.
+/// Longest client-supplied `X-Request-Id` we are willing to echo. A
+/// correlation token needs far less; anything longer is a caller padding
+/// every one of its log lines.
 pub(super) const MAX_CLIENT_REQUEST_ID: usize = 64;
 
 /// Whether a client-supplied `X-Request-Id` can be reused verbatim.
+///
+/// Held to the same rule as [`log_route`]. `request_id` is a field of the
+/// completion event, so it renders under the default `show_spans = false`
+/// formatter, and `HeaderValue::to_str` accepts any visible ASCII, spaces
+/// and `=` included. An unfiltered value therefore lets an unauthenticated
+/// caller (the event fires outside the auth layer) forge `status=` and
+/// `path=` pairs on the very line #3402 added for triage, or pad every 4xx
+/// line to churn the file through rotation. Anything outside a bounded
+/// token charset is replaced by a generated uuid.
 pub(super) fn is_log_safe_request_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_CLIENT_REQUEST_ID
@@ -472,9 +606,25 @@ pub(super) fn is_log_safe_request_id(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
-/// Middleware that wraps every request in an `http.request` span with a generated or echoed
-/// `X-Request-Id`, then emits one completion event at the level matching the response
-/// status.
+/// Middleware that wraps every request in an `http.request` span with a
+/// generated or echoed `X-Request-Id`, then emits one completion event at
+/// the level matching the response status. Logs fired inside the request
+/// (auth middleware, route handlers, downstream `tracing` events) inherit
+/// the span fields, so a single grep on `request_id` reconstructs the call.
+///
+/// The completion event repeats `request_id`, `method`, and `path` as its
+/// own fields rather than relying on the span: `[logging].show_spans` is
+/// `false` by default, which drops the span prefix from the rendered line
+/// and used to leave `completed status=500 latency_ms=0` with nothing to
+/// identify the request (#3402). For the same reason the event is emitted
+/// outside the span, so enabling `show_spans` prints each field once
+/// instead of twice.
+///
+/// Successful completions (2xx/3xx) emit at `debug`, not `info`: the web
+/// UI polls `/api/sessions` every ~2s, so an info-level success log here
+/// would flood `debug.log` at the default `info` filter. Users who want
+/// to see every request can dial `http.request=debug` from settings;
+/// 4xx (`warn`) and 5xx (`error`) stay visible at the default level.
 pub(super) async fn http_request_span(
     request: axum::extract::Request,
     next: axum::middleware::Next,
@@ -548,7 +698,12 @@ mod tests {
         }
     }
 
-    /// #3402.
+    /// #3402: the `http.request` completion line must identify the request.
+    /// It is rendered with the default `show_spans = false` formatter, which
+    /// drops span fields, so `request_id` / `method` / `path` have to be
+    /// fields of the event itself. `path` is the route template, never the
+    /// raw URI: `aoe serve` ships its auth token in the query string and
+    /// session ids sit in path segments, and neither may reach the log.
     #[tokio::test]
     async fn http_request_log_identifies_request_without_leaking_uri() {
         use tower::ServiceExt;

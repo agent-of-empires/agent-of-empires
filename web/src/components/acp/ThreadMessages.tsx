@@ -1,9 +1,10 @@
 import { createContext, useContext, useMemo } from "react";
 
-import { MessagePrimitive, useAuiState } from "@assistant-ui/react";
+import { MessagePrimitive, useAui, useAuiState } from "@assistant-ui/react";
 
 import { isElicitationAnswersPayload, type ActivityRow, type ToolCall, type ToolOutputBlock } from "../../lib/acpTypes";
 import { parseJsonObject } from "../../lib/acpArgs";
+import { pickDiffs } from "../../lib/diffPreview";
 import { pickMemoryRecall } from "../../lib/memoryRecall";
 import { openInNewTab } from "../../lib/openInNewTab";
 import { ArtifactImage } from "./artifactMedia";
@@ -11,7 +12,9 @@ import { DiffCommentsUserCard } from "../diff/comments/DiffCommentsUserCard";
 import { isDiffCommentsCardPayload, parseDiffCommentsSentinel } from "../diff/comments/buildPrompt";
 import { SUBAGENT_TASK_NAME, TODO_GROUP_NAME, TOOL_GROUP_NAME } from "./activityMessages";
 import { ElicitationAnswerCard } from "./ElicitationAnswerCard";
+import { CopyMarkdownButton } from "./CopyMarkdownButton";
 import { Markdown } from "./Markdown";
+import { MessageCopyMenu } from "./MessageCopyMenu";
 import { AsyncSubagentCard, SubagentCard, ToolGroupCard } from "./GroupToolCards";
 import { TodoGroupCard } from "./TodoCards";
 import { ToolCard } from "./ToolCards";
@@ -32,6 +35,10 @@ export function UserMessage() {
       s.message.content.some((part) => part.type === "image" || part.type === "file")
     );
   });
+  // The text parts only: an attachment has nothing to copy as markdown.
+  const promptText = useAuiState((s) =>
+    s.message.content.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("\n\n"),
+  );
   const parts = <MessagePrimitive.Parts components={{ Text: UserText, Image: UserImage, File: UserFile }} />;
   return (
     <MessagePrimitive.Root className="group mt-4 flex flex-col items-end gap-1">
@@ -41,11 +48,18 @@ export function UserMessage() {
         </div>
       )}
       {shareBubble ? (
-        <div
-          data-testid="user-message-bubble"
-          className="flex max-w-[80%] min-w-0 flex-col gap-1.5 rounded-2xl rounded-br-sm border border-surface-700 bg-surface-800/70 p-1.5 text-sm"
-        >
-          <SharedBubbleContext.Provider value>{parts}</SharedBubbleContext.Provider>
+        <div className="acp-copy-host flex max-w-[80%] min-w-0 flex-col items-end">
+          <div
+            data-testid="user-message-bubble"
+            className="flex min-w-0 flex-col gap-1.5 rounded-2xl rounded-br-sm border border-surface-700 bg-surface-800/70 p-1.5 text-sm"
+          >
+            <SharedBubbleContext.Provider value>{parts}</SharedBubbleContext.Provider>
+          </div>
+          {promptText.trim() && (
+            <div className="acp-copy-reveal">
+              <CopyMarkdownButton compact source={promptText} label="Copy prompt" />
+            </div>
+          )}
         </div>
       ) : (
         parts
@@ -104,18 +118,24 @@ function UserText({ text }: { text: string }) {
     );
   }
   return (
-    <div className="max-w-[80%] min-w-0 rounded-2xl rounded-br-sm border border-surface-700 bg-surface-800/70 px-3 py-1.5 text-sm">
-      <Markdown text={text} smooth={false} breaks />
+    <div className="acp-copy-host flex max-w-[80%] min-w-0 flex-col items-end">
+      <div className="min-w-0 rounded-2xl rounded-br-sm border border-surface-700 bg-surface-800/70 px-3 py-1.5 text-sm">
+        <Markdown text={text} smooth={false} breaks />
+      </div>
+      <div className="acp-copy-reveal">
+        <CopyMarkdownButton compact source={text} label="Copy prompt" />
+      </div>
     </div>
   );
 }
 
 export function AssistantMessage() {
   return (
-    <MessagePrimitive.Root className="group mt-4 mr-auto w-full">
+    <MessagePrimitive.Root className="acp-copy-host group mt-4 mr-auto w-full">
       <div className="text-sm text-text-primary leading-relaxed">
         <MessagePrimitive.Parts components={{ Text: AssistantText, tools: { Override: AssistantToolCall } }} />
       </div>
+      <MessageCopyMenu />
     </MessagePrimitive.Root>
   );
 }
@@ -126,6 +146,10 @@ function AssistantText({ text }: { text: string }) {
   const compactionSummary = useAuiState(
     (s) => (s.message.metadata?.custom as { compactionSummary?: unknown } | undefined)?.compactionSummary === true,
   );
+  // A lone part is the whole message, and the last part's button lives in the message footer.
+  const query = useAui().part.query as { index?: number } | null;
+  const partIndex = query?.index ?? -1;
+  const ownsFooter = useAuiState((s) => partIndex >= 0 && partIndex < s.message.content.length - 1);
   if (!text) return null;
   if (compactionSummary) {
     return (
@@ -139,7 +163,16 @@ function AssistantText({ text }: { text: string }) {
       </details>
     );
   }
-  return <Markdown text={text} smooth={isRunning} />;
+  return (
+    <div className="acp-copy-host">
+      <Markdown text={text} smooth={isRunning} />
+      {ownsFooter && (
+        <div className="acp-copy-reveal flex justify-end">
+          <CopyMarkdownButton source={text} label="Copy text as markdown" compact />
+        </div>
+      )}
+    </div>
+  );
 }
 
 /** assistant-ui tool-call part; AcpRuntime puts `{ content, endedAt?, stopped? }` in `result`. */
@@ -202,6 +235,7 @@ function toToolItem(part: ToolPart): { tool: ToolCall; result?: ActivityRow; kin
     args_preview: part.argsText ?? safeStringify(part.args ?? null),
     started_at: pickStartedAt(part.args, part.argsText) ?? fallbackAt,
     memory_recall: pickMemoryRecall(part.args, part.argsText),
+    diffs: pickDiffs(part.args, part.argsText),
   };
   const result =
     part.result !== undefined

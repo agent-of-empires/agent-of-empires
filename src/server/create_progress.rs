@@ -37,7 +37,16 @@ pub struct CreateProgressSnapshot {
     pub output: Vec<String>,
 }
 
-pub struct CreateProgress(Mutex<State>);
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CreateProgressVisibility {
+    WebReadable,
+    UnixOwnerOnly,
+}
+
+pub struct CreateProgress {
+    state: Mutex<State>,
+    visibility: CreateProgressVisibility,
+}
 
 struct State {
     stage: CreateStage,
@@ -46,20 +55,23 @@ struct State {
 }
 
 impl CreateProgress {
-    fn new() -> Self {
-        Self(Mutex::new(State {
-            stage: CreateStage::Preparing,
-            hook: None,
-            output: VecDeque::new(),
-        }))
+    fn new(visibility: CreateProgressVisibility) -> Self {
+        Self {
+            state: Mutex::new(State {
+                stage: CreateStage::Preparing,
+                hook: None,
+                output: VecDeque::new(),
+            }),
+            visibility,
+        }
     }
 
     pub fn set_stage(&self, stage: CreateStage) {
-        self.0.lock().expect("create progress poisoned").stage = stage;
+        self.state.lock().expect("create progress poisoned").stage = stage;
     }
 
     pub fn record(&self, progress: HookProgress) {
-        let mut state = self.0.lock().expect("create progress poisoned");
+        let mut state = self.state.lock().expect("create progress poisoned");
         match progress {
             HookProgress::Started(cmd) => {
                 state.stage = CreateStage::RunningHooks;
@@ -76,8 +88,8 @@ impl CreateProgress {
         }
     }
 
-    pub fn snapshot(&self) -> CreateProgressSnapshot {
-        let state = self.0.lock().expect("create progress poisoned");
+    fn snapshot(&self) -> CreateProgressSnapshot {
+        let state = self.state.lock().expect("create progress poisoned");
         CreateProgressSnapshot {
             stage: state.stage,
             hook: state.hook.clone(),
@@ -138,8 +150,12 @@ impl CreateProgressRegistry {
         &self.boot_id
     }
 
-    pub fn register(&self, key: &str) -> CreateProgressRegistration {
-        let progress = Arc::new(CreateProgress::new());
+    pub fn register(
+        &self,
+        key: &str,
+        visibility: CreateProgressVisibility,
+    ) -> CreateProgressRegistration {
+        let progress = Arc::new(CreateProgress::new(visibility));
         self.live
             .lock()
             .expect("create progress registry poisoned")
@@ -151,11 +167,22 @@ impl CreateProgressRegistry {
         }
     }
 
-    pub fn snapshot(&self, key: &str) -> Option<CreateProgressSnapshot> {
+    pub fn snapshot(
+        &self,
+        key: &str,
+        local: Option<&super::principal::Principal>,
+    ) -> Option<CreateProgressSnapshot> {
         self.live
             .lock()
             .expect("create progress registry poisoned")
             .get(key)
+            .filter(|p| {
+                p.visibility == CreateProgressVisibility::WebReadable
+                    || super::principal::authorize(
+                        local,
+                        super::principal::Capability::CreationProgress,
+                    )
+            })
             .map(|p| p.snapshot())
     }
 
@@ -231,9 +258,9 @@ mod tests {
     #[test]
     fn progress_tracks_hooks_caps_output_and_unregisters_on_drop() {
         let registry = CreateProgressRegistry::default();
-        let reg = registry.register("k");
+        let reg = registry.register("k", CreateProgressVisibility::WebReadable);
         assert_eq!(
-            registry.snapshot("k").unwrap().stage,
+            registry.snapshot("k", None).unwrap().stage,
             CreateStage::Preparing
         );
 
@@ -246,7 +273,7 @@ mod tests {
         reg.progress
             .record(HookProgress::Output("x".repeat(MAX_LINE_CHARS * 2)));
 
-        let snap = registry.snapshot("k").unwrap();
+        let snap = registry.snapshot("k", None).unwrap();
         assert_eq!(snap.stage, CreateStage::RunningHooks);
         assert_eq!(snap.hook.as_deref(), Some("npm install"));
         assert_eq!(snap.output.len(), MAX_OUTPUT_LINES);
@@ -254,6 +281,6 @@ mod tests {
         assert_eq!(snap.output.last().unwrap().len(), MAX_LINE_CHARS);
 
         drop(reg);
-        assert!(registry.snapshot("k").is_none());
+        assert!(registry.snapshot("k", None).is_none());
     }
 }

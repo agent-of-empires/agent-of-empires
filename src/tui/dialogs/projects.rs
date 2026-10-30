@@ -117,7 +117,7 @@ impl ProjectsDialog {
         }
     }
 
-    pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<()> {
+    pub fn handle_key(&mut self, key: KeyEvent, write_block: Option<&str>) -> DialogResult<()> {
         // While the notice is up, keys dismiss it rather than driving the form.
         if let Some(notice) = &mut self.non_git_notice {
             if matches!(notice.handle_key(key), DialogResult::Cancel) {
@@ -127,8 +127,8 @@ impl ProjectsDialog {
         }
         self.info = None;
         match self.mode {
-            Mode::Browse => self.handle_browse_key(key),
-            Mode::Adding => self.handle_add_key(key),
+            Mode::Browse => self.handle_browse_key(key, write_block),
+            Mode::Adding => self.handle_add_key(key, write_block),
         }
     }
 
@@ -154,7 +154,7 @@ impl ProjectsDialog {
                 {
                     self.add_focused = field;
                     if field >= 2 {
-                        self.handle_add_key(KeyEvent::from(KeyCode::Char(' ')));
+                        self.handle_add_key(KeyEvent::from(KeyCode::Char(' ')), None);
                     }
                     return None;
                 }
@@ -179,7 +179,7 @@ impl ProjectsDialog {
         }
     }
 
-    fn handle_browse_key(&mut self, key: KeyEvent) -> DialogResult<()> {
+    fn handle_browse_key(&mut self, key: KeyEvent, write_block: Option<&str>) -> DialogResult<()> {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => DialogResult::Cancel,
             KeyCode::Down | KeyCode::Char('j') => {
@@ -198,6 +198,10 @@ impl ProjectsDialog {
             }
             KeyCode::Char('d') | KeyCode::Delete => {
                 if let Some(project) = self.items.get(self.selected).cloned() {
+                    if let Some(reason) = write_block {
+                        self.error = Some(reason.to_owned());
+                        return DialogResult::Continue;
+                    }
                     match projects::remove(&self.profile, project.scope, &project.name) {
                         Ok(_) => {
                             self.info = Some(format!("Removed '{}'", project.name));
@@ -212,7 +216,7 @@ impl ProjectsDialog {
         }
     }
 
-    fn handle_add_key(&mut self, key: KeyEvent) -> DialogResult<()> {
+    fn handle_add_key(&mut self, key: KeyEvent, write_block: Option<&str>) -> DialogResult<()> {
         match key.code {
             KeyCode::Esc => {
                 if self.close_on_add_cancel {
@@ -224,11 +228,11 @@ impl ProjectsDialog {
                 DialogResult::Continue
             }
             KeyCode::Tab => {
-                self.add_focused = (self.add_focused + 1) % 7;
+                self.add_focused = super::cycle_focus(self.add_focused, 7, false);
                 DialogResult::Continue
             }
             KeyCode::BackTab => {
-                self.add_focused = (self.add_focused + 6) % 7;
+                self.add_focused = super::cycle_focus(self.add_focused, 7, true);
                 DialogResult::Continue
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if self.add_focused == 2 => {
@@ -334,14 +338,18 @@ impl ProjectsDialog {
                         .with_base_branch(base_branch)
                         .with_overrides(overrides);
                 let is_git = project.is_git();
+                if let Some(reason) = write_block {
+                    self.error = Some(reason.to_owned());
+                    return DialogResult::Continue;
+                }
                 match projects::add(
                     &self.profile,
                     self.add_scope,
                     project,
                     self.add_allow_override,
                 ) {
-                    Ok(saved) => {
-                        let saved_name = saved.name.clone();
+                    Ok(committed) => {
+                        let saved = &committed.projects[committed.result];
                         self.info = Some(format!(
                             "Added '{}' [{}]",
                             saved.name,
@@ -353,7 +361,7 @@ impl ProjectsDialog {
                         self.close_on_add_cancel = false;
                         self.reload();
                         if !is_git {
-                            self.maybe_warn_non_git(&saved_name);
+                            self.maybe_warn_non_git(&saved.name);
                         }
                     }
                     Err(e) => self.error = Some(format!("Add failed: {}", e)),
@@ -699,9 +707,9 @@ mod tests {
 
     /// Add `dir`: enter add mode, set the path input directly, submit.
     fn add_dir(dialog: &mut ProjectsDialog, dir: &std::path::Path) {
-        dialog.handle_key(key(KeyCode::Char('a')));
+        dialog.handle_key(key(KeyCode::Char('a')), None);
         dialog.add_input = Input::new(dir.to_string_lossy().to_string());
-        dialog.handle_key(key(KeyCode::Enter));
+        dialog.handle_key(key(KeyCode::Enter), None);
     }
 
     #[test]
@@ -723,7 +731,7 @@ mod tests {
         assert_eq!(notice.title(), "Not a Git Repository");
 
         // Enter dismisses it.
-        dialog.handle_key(key(KeyCode::Enter));
+        dialog.handle_key(key(KeyCode::Enter), None);
         assert!(dialog.non_git_notice.is_none(), "Enter should dismiss");
 
         // A second non-git add does not re-show it: the persisted flag latched.
@@ -801,7 +809,7 @@ mod tests {
             Some(KeyCode::Char('a'))
         );
 
-        d.handle_key(key(KeyCode::Char('a')));
+        d.handle_key(key(KeyCode::Char('a')), None);
         let buf = draw(100, 40, |f, theme| d.render(f, f.area(), theme));
         let (x, y) = find(&buf, "Scope:");
         assert_eq!(d.handle_click(x, y), None);
@@ -826,15 +834,15 @@ mod tests {
         std::fs::create_dir_all(&repo).unwrap();
 
         let mut dialog = ProjectsDialog::new("test");
-        dialog.handle_key(key(KeyCode::Char('a')));
+        dialog.handle_key(key(KeyCode::Char('a')), None);
         dialog.add_input = Input::new(repo.to_string_lossy().to_string());
         // Tab from path(0) -> base(1) -> scope(2) -> allow_override(3) -> worktree_override(4).
         for _ in 0..4 {
-            dialog.handle_key(key(KeyCode::Tab));
+            dialog.handle_key(key(KeyCode::Tab), None);
         }
         assert_eq!(dialog.add_focused, 4);
-        dialog.handle_key(key(KeyCode::Right)); // None -> Some(true)
-        dialog.handle_key(key(KeyCode::Enter));
+        dialog.handle_key(key(KeyCode::Right), None); // None -> Some(true)
+        dialog.handle_key(key(KeyCode::Enter), None);
 
         let saved = crate::session::projects::load_global().expect("load global");
         let project = saved
@@ -854,13 +862,13 @@ mod tests {
         std::fs::create_dir_all(&repo).unwrap();
 
         let mut dialog = ProjectsDialog::new("test");
-        dialog.handle_key(key(KeyCode::Char('a')));
+        dialog.handle_key(key(KeyCode::Char('a')), None);
         dialog.add_input = Input::new(repo.to_string_lossy().to_string());
         // BackTab from path(0) wraps to the last row, sandbox_override(6).
-        dialog.handle_key(key(KeyCode::BackTab));
+        dialog.handle_key(key(KeyCode::BackTab), None);
         assert_eq!(dialog.add_focused, 6);
-        dialog.handle_key(key(KeyCode::Left)); // None -> Some(false)
-        dialog.handle_key(key(KeyCode::Enter));
+        dialog.handle_key(key(KeyCode::Left), None); // None -> Some(false)
+        dialog.handle_key(key(KeyCode::Enter), None);
 
         let saved = crate::session::projects::load_global().expect("load global");
         let project = saved
@@ -883,13 +891,13 @@ mod tests {
         std::fs::create_dir_all(&repo).unwrap();
 
         let mut dialog = ProjectsDialog::new("test");
-        dialog.handle_key(key(KeyCode::Char('a')));
+        dialog.handle_key(key(KeyCode::Char('a')), None);
         dialog.add_input = Input::new(repo.to_string_lossy().to_string());
         for _ in 0..4 {
-            dialog.handle_key(key(KeyCode::Tab));
+            dialog.handle_key(key(KeyCode::Tab), None);
         }
         assert_eq!(dialog.add_focused, 4);
-        dialog.handle_key(key(KeyCode::Left));
+        dialog.handle_key(key(KeyCode::Left), None);
         assert_eq!(dialog.add_worktree_override, Some(false));
     }
 
@@ -909,5 +917,76 @@ mod tests {
             dialog.non_git_notice.is_none(),
             "a git repo add should not warn"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn current_policy_blocks_keyboard_mouse_and_automatic_add_without_losing_form() {
+        use crate::tui::dialogs::test_render::{draw, find};
+        let temporary = tempdir().unwrap();
+        let _home = isolate_home(temporary.path());
+        let repo = temporary.path().join("policy-repo");
+        git2::Repository::init(&repo).unwrap();
+        let registry = crate::session::get_app_dir().unwrap().join("projects.json");
+        for automatic in [false, true] {
+            for mouse in [false, true] {
+                let mut dialog = if automatic {
+                    ProjectsDialog::new_adding("test")
+                } else {
+                    ProjectsDialog::new("test")
+                };
+                if !automatic {
+                    dialog.handle_key(key(KeyCode::Char('a')), None);
+                }
+                dialog.add_input = Input::new(repo.to_string_lossy().into_owned());
+                dialog.add_base_branch = Input::new("release/preserved".into());
+                dialog.add_scope = ProjectScope::Global;
+                dialog.add_allow_override = true;
+                dialog.add_worktree_override = Some(false);
+                dialog.add_smart_rename_override = Some(true);
+                dialog.add_sandbox_override = Some(false);
+                let before = std::fs::read(&registry).ok();
+                let input = if mouse {
+                    let buffer = draw(110, 42, |frame, theme| {
+                        dialog.render(frame, frame.area(), theme)
+                    });
+                    let (column, row) = find(&buffer, "Enter save");
+                    dialog.handle_click(column, row).expect("mouse save action")
+                } else {
+                    key(KeyCode::Enter)
+                };
+                dialog.handle_key(input, Some("current runtime became read-only"));
+                assert_eq!(std::fs::read(&registry).ok(), before);
+                assert_eq!(dialog.add_input.value(), repo.to_str().unwrap());
+                assert_eq!(dialog.add_base_branch.value(), "release/preserved");
+                assert!(dialog.add_allow_override);
+                assert_eq!(dialog.add_worktree_override, Some(false));
+                assert_eq!(dialog.add_smart_rename_override, Some(true));
+                assert_eq!(dialog.add_sandbox_override, Some(false));
+                let buffer = draw(110, 42, |frame, theme| {
+                    dialog.render(frame, frame.area(), theme)
+                });
+                find(&buffer, "current runtime became read-only");
+            }
+        }
+        let mut dialog = ProjectsDialog::new_adding("test");
+        dialog.add_input = Input::new(repo.to_string_lossy().into_owned());
+        dialog.handle_key(key(KeyCode::Enter), None);
+        let bytes = std::fs::read(&registry).unwrap();
+        let selected = dialog.selected;
+        for mouse in [false, true] {
+            let input = if mouse {
+                let buffer = draw(110, 42, |frame, theme| {
+                    dialog.render(frame, frame.area(), theme)
+                });
+                let (column, row) = find(&buffer, "d remove");
+                dialog.handle_click(column, row).unwrap()
+            } else {
+                key(KeyCode::Char('d'))
+            };
+            dialog.handle_key(input, Some("City Hall forbids local registry writes"));
+            assert_eq!(std::fs::read(&registry).unwrap(), bytes);
+            assert_eq!(dialog.selected, selected);
+        }
     }
 }

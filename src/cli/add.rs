@@ -127,6 +127,11 @@ pub struct AddArgs {
     #[arg(long = "sandbox-image")]
     sandbox_image: Option<String>,
 
+    /// Env var for the host `before_start` hook only, never the container
+    /// (`KEY=VALUE` or `KEY`; repeatable; requires --sandbox)
+    #[arg(long = "hook-env", value_name = "KEY[=VALUE]")]
+    hook_env: Vec<String>,
+
     /// Enable YOLO mode (skip permission prompts)
     #[arg(short = 'y', long)]
     yolo: bool,
@@ -199,6 +204,10 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         bail!("--effort cannot be empty");
     }
 
+    if !args.hook_env.is_empty() && !(args.sandbox || args.sandbox_image.is_some()) {
+        bail!("--hook-env requires --sandbox; host_hooks.before_start only runs for sandboxed sessions");
+    }
+
     if args.scratch && args.path.is_some() {
         bail!(
             "Cannot specify a project path with --scratch\nTip: drop the path argument, the session runs in a fresh scratch directory"
@@ -222,6 +231,9 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
 
     if !args.scratch && !path.is_dir() {
         bail!("Path is not a directory: {}", path.display());
+    }
+    if !args.scratch {
+        crate::session::builder::ensure_not_purging(&path)?;
     }
 
     if (!args.extra_repos.is_empty() || !args.projects.is_empty())
@@ -361,7 +373,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             let resolve_extra = |path: &std::path::Path| {
                 let project = project_bases
                     .get(&crate::session::projects::canonical_key(
-                        &path.to_string_lossy(),
+                        path.to_string_lossy(),
                     ))
                     .map(String::as_str);
                 builder::resolve_base_branch(session_base, project, global_default)
@@ -628,6 +640,9 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         crate::session::View::Terminal
     };
 
+    // Set when the adapter isn't found but an on_create hook may install it, which holds only if
+    // the hook still runs once trust is decided.
+    let mut adapter_awaits_hooks: Option<String> = None;
     if instance.is_structured() {
         let (mut spec, spec_from_registry) = match registry.get(&agent_name) {
             Some(spec) => (spec.clone(), true),
@@ -672,10 +687,39 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 &mut spec,
             )?;
         }
-        if !crate::cli::acp::command_present(&spec.command) {
+        if structured_adapter_missing(
+            &args,
+            &config,
+            &spec.command,
+            std::path::Path::new(&instance.project_path),
+            || containers::get_container_runtime().is_available(),
+            // Trust is asked later, so without --trust-hooks the repository's hooks may still run.
+            || {
+                let apply = crate::session::builder::structured::preparation_hooks_apply(
+                    &crate::session::config::profile_config::resolve_config_or_warn(profile).hooks,
+                    &original_project_path,
+                    args.scratch,
+                    args.trust_hooks.then_some(true),
+                );
+                if apply {
+                    adapter_awaits_hooks = Some(spec.command.clone());
+                }
+                apply
+            },
+        ) {
             let hint = crate::acp::install_hints::install_hint_for(&spec.command)
                 .unwrap_or("install via your package manager and re-run");
             if user_picked_agent {
+                cleanup_partial_session(
+                    &path,
+                    instance.worktree_info.as_ref(),
+                    instance.workspace_info.as_ref(),
+                    args.create_branch,
+                    instance
+                        .scratch
+                        .then(|| std::path::Path::new(&instance.project_path)),
+                    None,
+                );
                 bail!(
                     "ACP adapter `{}` is not installed or not on $PATH.\n\
                          Install: {}\n\
@@ -732,39 +776,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         instance.acp_effort = explicit_effort;
     }
 
-    if let Some(seed) = fork_seed {
-        match seed {
-            crate::session::ForkSeed::Terminal {
-                parent,
-                child_session_id,
-                unattributed_parent_agent,
-            } => {
-                // Only an unattributed parent needs this: the launch
-                // identity-checks a qualified one itself, and this path builds
-                // the child itself, so nothing else would hold it.
-                if let Some(parent_agent) = unattributed_parent_agent.as_deref() {
-                    let launched = crate::session::Instance::execution_agent_for(
-                        &instance.tool,
-                        instance.get_tool_command(),
-                        &config.session,
-                    )
-                    .map_err(anyhow::Error::msg)?;
-                    crate::session::fork::ensure_child_matches_parent_agent(
-                        Some(parent_agent),
-                        launched.name,
-                    )
-                    .map_err(anyhow::Error::msg)?;
-                }
-                instance.agent_session_id = Some(child_session_id);
-                instance.resume_intent = crate::session::ResumeIntent::Fork {
-                    from: parent.session_id.clone(),
-                };
-                instance.resume_binding = Some(*parent);
-            }
-            crate::session::ForkSeed::Structured { .. } => {}
-        }
-    }
-
     let use_sandbox = args.sandbox || args.sandbox_image.is_some();
 
     let runtime = containers::get_container_runtime();
@@ -778,7 +789,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 );
             }
         } else {
-            for w in crate::session::validate_env_entries(&config.sandbox.environment) {
+            for w in sandbox_env_warnings(&config.sandbox.environment, &args.hook_env) {
                 eprintln!("⚠ {}", w);
             }
 
@@ -796,9 +807,28 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 extra_env: None,
                 custom_instruction: config.sandbox.custom_instruction.clone(),
                 before_start_env: Vec::new(),
+                before_start_hook_env: args.hook_env.clone(),
                 provider: None,
                 container_workdir: None,
             });
+        }
+    }
+
+    if let Some(seed) = fork_seed {
+        match seed {
+            crate::session::ForkSeed::Terminal {
+                parent,
+                child_session_id,
+                unattributed_parent_agent,
+            } => crate::session::fork::apply_terminal_fork_seed(
+                &mut instance,
+                &config.session,
+                profile,
+                *parent,
+                child_session_id,
+                unattributed_parent_agent.as_deref(),
+            )?,
+            crate::session::ForkSeed::Structured { .. } => {}
         }
     }
 
@@ -890,6 +920,8 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 }
             }
         };
+
+        refuse_adapter_without_hooks(adapter_awaits_hooks.as_deref(), resolved_hooks.as_ref())?;
 
         if let Some(resolved) = resolved_hooks {
             let commands = &resolved.hooks().on_create;
@@ -1329,6 +1361,55 @@ fn cleanup_partial_session(
     }
 }
 
+/// Once trust is decided, refuse the adapter the first check let through for a preparation
+/// hook if declining trust left no such hook to run.
+fn refuse_adapter_without_hooks(
+    adapter_awaits_hooks: Option<&str>,
+    resolved: Option<&repo_config::ResolvedHooks>,
+) -> Result<()> {
+    let Some(command) = adapter_awaits_hooks else {
+        return Ok(());
+    };
+    if resolved.is_some_and(|resolved| {
+        let hooks = resolved.hooks();
+        !hooks.on_create.is_empty() || !hooks.on_launch.is_empty()
+    }) {
+        return Ok(());
+    }
+    let hint = crate::acp::install_hints::install_hint_for(command)
+        .unwrap_or("install via your package manager and re-run");
+    bail!(
+        "ACP adapter `{command}` is not installed or not on $PATH, and no on_create or \
+         on_launch hook will run to install it (the repository's hooks weren't trusted).\n\
+         Install: {hint}\n\
+         Or re-run with --trust-hooks, or use the terminal view: drop --agent / --structured-view."
+    )
+}
+
+/// Whether a structured `aoe add` must refuse, or fall back, for its adapter. A sandboxed
+/// adapter runs inside the container, which bundles it, so a sandbox the runtime can start
+/// skips the host check. `preparation_hooks` is asked only when the adapter isn't found:
+/// an `on_create` or `on_launch` hook that runs first may install it.
+fn structured_adapter_missing(
+    args: &AddArgs,
+    config: &crate::session::Config,
+    command: &str,
+    project_path: &std::path::Path,
+    runtime_available: impl FnOnce() -> bool,
+    preparation_hooks: impl FnOnce() -> bool,
+) -> bool {
+    let sandboxed =
+        (args.sandbox || args.sandbox_image.is_some() || config.sandbox.enabled_by_default)
+            && runtime_available();
+    !sandboxed
+        && !crate::session::builder::structured::adapter_reachable(
+            command,
+            Some(project_path),
+            config,
+        )
+        && !preparation_hooks()
+}
+
 fn resolve_tool_for_add(args: &AddArgs, config: &crate::session::Config) -> Result<String> {
     let tool_name = if let Some(tool) = &args.tool {
         let selection = resolve_named_tool(tool, config)?;
@@ -1542,6 +1623,10 @@ fn resolve_named_tool(tool: &str, config: &crate::session::Config) -> Result<Nam
     )
 }
 
+fn sandbox_env_warnings(sandbox_env: &[String], hook_env: &[String]) -> Vec<String> {
+    crate::session::validate_env_entries(sandbox_env.iter().chain(hook_env))
+}
+
 fn resolve_sandbox_image(
     flag: Option<&str>,
     merged_default: &str,
@@ -1691,6 +1776,34 @@ command = "plugin-helper --safe"
                     .unwrap();
             assert_eq!(trusted.hooks().on_create, vec!["repo-create".to_string()]);
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn hook_env_requires_sandbox() {
+        use clap::Parser;
+        let _app = crate::session::test_support::isolate_app_dir();
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["aoe", "add", "--hook-env", "MINT_REPO=a/b"];
+            argv.extend_from_slice(extra);
+            match crate::cli::Cli::try_parse_from(argv).unwrap().command {
+                Some(crate::cli::Commands::Add(args)) => *args,
+                _ => panic!("expected an add invocation"),
+            }
+        };
+        let err = super::run("default", parse(&[])).await.unwrap_err();
+        assert!(err.to_string().contains("--hook-env requires --sandbox"));
+        assert_eq!(parse(&["-s"]).hook_env, ["MINT_REPO=a/b"]);
+    }
+
+    #[test]
+    fn sandbox_env_warnings_cover_hook_env() {
+        let unset = "AOE_TEST_HOOK_ENV_UNSET_9f3a";
+        let hook = vec![format!("GH_TOKEN=${unset}")];
+        let warnings = super::sandbox_env_warnings(&[], &hook);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains(unset));
+        assert!(super::sandbox_env_warnings(&[], &[]).is_empty());
     }
 
     #[test]
@@ -2019,6 +2132,185 @@ command = "plugin-helper --safe"
             }
         }
 
+        /// After trust is decided, an adapter the first check let through for an on_create
+        /// hook is refused when no such hook will run.
+        #[test]
+        #[serial]
+        fn declined_trust_refuses_an_adapter_waiting_on_hooks() {
+            use crate::session::config::repo_config::ResolvedHooks;
+            let _home = crate::session::test_support::isolate_app_dir();
+            let repo = tempfile::tempdir().unwrap();
+            let installing = ResolvedHooks::with_repo(
+                "default",
+                repo.path(),
+                crate::session::HooksConfig {
+                    on_create: vec!["npm install".into()],
+                    ..Default::default()
+                },
+            );
+            let launching = ResolvedHooks::with_repo(
+                "default",
+                repo.path(),
+                crate::session::HooksConfig {
+                    on_launch: vec!["npm install".into()],
+                    ..Default::default()
+                },
+            );
+            assert!(installing.is_some() && launching.is_some());
+            let refuse = super::super::refuse_adapter_without_hooks;
+            assert!(refuse(None, None).is_ok(), "nothing waited on hooks");
+            for (hook, resolved) in [("on_create", &installing), ("on_launch", &launching)] {
+                assert!(
+                    refuse(Some("my-acp"), resolved.as_ref()).is_ok(),
+                    "an {hook} hook will run"
+                );
+            }
+            let refused = refuse(Some("my-acp"), None).unwrap_err().to_string();
+            assert!(
+                refused.contains("`my-acp`") && refused.contains("--trust-hooks"),
+                "{refused}"
+            );
+        }
+
+        /// `aoe add` skips the host adapter check only for a sandbox the runtime can start,
+        /// whichever way it was asked for, and otherwise judges the adapter as the create
+        /// check does.
+        #[test]
+        #[serial]
+        fn structured_adapter_check_follows_the_sandbox_and_the_agent_path() {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let project = tempfile::tempdir().unwrap();
+            let bin = tempfile::tempdir().unwrap();
+            let adapter = format!("aoe-test-add-adapter-{}", std::process::id());
+            crate::session::test_support::write_stub_adapter(bin.path(), &adapter);
+            let config = |tweak: &dyn Fn(&mut crate::session::Config)| {
+                let mut config = crate::session::Config::default();
+                tweak(&mut config);
+                config
+            };
+            let plain = config(&|_| {});
+            let on_path =
+                config(&|c| c.environment = vec![format!("PATH={}", bin.path().display())]);
+            let hooked = config(&|c| c.host_hooks.before_session = vec!["true".into()]);
+            let sandbox_default = config(&|c| c.sandbox.enabled_by_default = true);
+            let dir = project.path().to_str().unwrap();
+            struct Case<'a> {
+                label: &'static str,
+                extra: &'a [&'a str],
+                config: &'a crate::session::Config,
+                runtime: bool,
+                refused: bool,
+            }
+            let cases = [
+                Case {
+                    label: "found nowhere",
+                    extra: &[],
+                    config: &plain,
+                    runtime: true,
+                    refused: true,
+                },
+                Case {
+                    label: "on the configured PATH",
+                    extra: &[],
+                    config: &on_path,
+                    runtime: true,
+                    refused: false,
+                },
+                Case {
+                    label: "a before_session hook may set PATH",
+                    extra: &[],
+                    config: &hooked,
+                    runtime: true,
+                    refused: false,
+                },
+                Case {
+                    label: "--sandbox",
+                    extra: &["--sandbox"],
+                    config: &plain,
+                    runtime: true,
+                    refused: false,
+                },
+                Case {
+                    label: "--sandbox-image",
+                    extra: &["--sandbox-image", "img:1"],
+                    config: &plain,
+                    runtime: true,
+                    refused: false,
+                },
+                Case {
+                    label: "sandbox on by default",
+                    extra: &[],
+                    config: &sandbox_default,
+                    runtime: true,
+                    refused: false,
+                },
+                Case {
+                    label: "--sandbox without a runtime",
+                    extra: &["--sandbox"],
+                    config: &plain,
+                    runtime: false,
+                    refused: true,
+                },
+                Case {
+                    label: "sandbox default without a runtime",
+                    extra: &[],
+                    config: &sandbox_default,
+                    runtime: false,
+                    refused: true,
+                },
+            ];
+            for case in cases {
+                let argv: Vec<&str> = ["aoe", "add", dir]
+                    .iter()
+                    .chain(case.extra)
+                    .copied()
+                    .collect();
+                let (_, args) = dispatch_argv(&argv);
+                let checked_runtime = std::cell::Cell::new(false);
+                let got = super::super::structured_adapter_missing(
+                    &args,
+                    case.config,
+                    &adapter,
+                    project.path(),
+                    || {
+                        checked_runtime.set(true);
+                        case.runtime
+                    },
+                    || false,
+                );
+                assert_eq!(got, case.refused, "{}", case.label);
+                let asked_for_sandbox =
+                    !case.extra.is_empty() || case.config.sandbox.enabled_by_default;
+                assert_eq!(
+                    checked_runtime.get(),
+                    asked_for_sandbox,
+                    "{}: runtime probe",
+                    case.label
+                );
+            }
+            // Check preparation hooks only when the adapter is missing.
+            let (_, args) = dispatch_argv(&["aoe", "add", dir]);
+            for (label, config, missing) in [
+                ("found nowhere", &plain, true),
+                ("on PATH", &on_path, false),
+            ] {
+                let asked = std::cell::Cell::new(false);
+                let got = super::super::structured_adapter_missing(
+                    &args,
+                    config,
+                    &adapter,
+                    project.path(),
+                    || false,
+                    || {
+                        asked.set(true);
+                        true
+                    },
+                );
+                assert!(!got, "{label}: an on_create hook may install it");
+                assert_eq!(asked.get(), missing, "{label}: asked about hooks");
+            }
+        }
+
         /// `add` builds the fork child itself rather than through the session
         /// builder, so it needs its own identity comparison: a child asked for
         /// under another agent must not fork a conversation it cannot resume.
@@ -2126,6 +2418,100 @@ command = "plugin-helper --safe"
             assert!(
                 msg.contains("codex") && msg.contains("claude"),
                 "the refusal must name both agents, got: {msg}"
+            );
+        }
+
+        /// `aoe add --fork-from --tool <account>` is the #4347 workflow: the
+        /// child's own store must receive the parent's transcript and be the
+        /// one its binding records.
+        #[tokio::test]
+        #[serial]
+        async fn add_fork_carries_the_parent_onto_the_childs_store() {
+            let root = tempfile::tempdir().unwrap();
+            let _guard = crate::session::test_support::isolate_app_dir_at(root.path());
+            let _claude = crate::session::test_support::install_login_shell_path_command(
+                root.path(),
+                "claude",
+                "#!/bin/sh\nexit 1\n",
+            );
+            let home = dirs::home_dir().unwrap();
+            let project = tempfile::tempdir().unwrap();
+            let source = home.join("source");
+            let sid = "11111111-2222-3333-4444-555555555555";
+            let transcript = std::path::Path::new("projects")
+                .join(crate::session::capture::encode_claude_project_path(
+                    &project.path().to_string_lossy(),
+                ))
+                .join(format!("{sid}.jsonl"));
+            std::fs::create_dir_all(source.join(transcript.parent().unwrap())).unwrap();
+            std::fs::write(source.join(&transcript), "parent conversation\n").unwrap();
+            let storage = crate::session::Storage::new_unwatched("real").unwrap();
+            std::fs::write(
+                crate::session::get_profile_dir("real")
+                    .unwrap()
+                    .join("config.toml"),
+                "[session.custom_agents]\nclaude-b = \"claude\"\n\
+                 [session.agent_detect_as]\nclaude-b = \"claude\"\n\
+                 [session.agent_config_dir]\nclaude-b = \"~/destination\"\n",
+            )
+            .unwrap();
+            let parent_id = "parent-session-uuid";
+            storage
+                .update(|rows, _| {
+                    let mut parent =
+                        crate::session::Instance::new("parent", project.path().to_str().unwrap());
+                    parent.id = parent_id.to_string();
+                    parent.tool = "claude".into();
+                    parent.command = "claude".into();
+                    parent.agent_session_id = Some(sid.into());
+                    parent.agent_session_binding = Some(crate::session::ConversationBinding {
+                        session_id: sid.into(),
+                        provenance: crate::session::ConversationProvenance::Observed,
+                        transcript_path: None,
+                        execution: Some(crate::session::ExecutionBinding {
+                            agent: "claude".into(),
+                            stores: vec![source.clone()],
+                            configuration: Vec::new(),
+                            cwd: project.path().to_path_buf(),
+                            cwd_filesystem: "host".into(),
+                            filesystem: "host".into(),
+                            exported_default_store: None,
+                        }),
+                    });
+                    *rows = vec![parent];
+                    Ok(())
+                })
+                .unwrap();
+
+            let (profile, args) = dispatch_argv(&[
+                "aoe",
+                "add",
+                project.path().to_str().unwrap(),
+                "--fork-from",
+                parent_id,
+                "--tool",
+                "claude-b",
+                "-p",
+                "real",
+            ]);
+            super::super::run(&profile, args).await.unwrap();
+
+            let destination = home.join("destination");
+            assert_eq!(
+                std::fs::read_to_string(destination.join(&transcript)).unwrap(),
+                "parent conversation\n"
+            );
+            let rows = storage.load().unwrap();
+            let child = rows.iter().find(|row| row.tool == "claude-b").unwrap();
+            assert_eq!(
+                child
+                    .resume_binding
+                    .clone()
+                    .unwrap()
+                    .execution
+                    .unwrap()
+                    .stores,
+                vec![destination.canonicalize().unwrap()]
             );
         }
 

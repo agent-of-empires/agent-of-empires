@@ -6,9 +6,10 @@
 //!
 //! While a VT channel carries input (`[tmux] vt_live`, tmux 3.8+, unix) the action is
 //! encoded to raw terminal bytes and written into the pane socket, bypassing tmux's key
-//! translation, so the encoder honors the pane's DECCKM itself. That is the default, and
-//! a live input channel is a single-writer signal: two writers would interleave on one
-//! pty input stream, so nothing goes through `send-keys` while it exists.
+//! translation, so the encoder honors the pane's DECCKM itself. That is the default:
+//! ordinary batches use the live input channel as their single writer. A batch containing
+//! `Paste` sets `force_tmux` for the entire batch, including other keys, to preserve ordering
+//! through tmux instead of mixing socket writes with `send-keys` on one pty input stream.
 //!
 //! Otherwise each action forks `tmux send-keys`: plain characters literally, every other
 //! key by tmux key name with `C-` / `M-` prefixes. That covers tmux older than 3.8 (where
@@ -67,26 +68,36 @@ pub(super) const DEFAULT_LEADER: &str = "C-b";
 /// lowercase under any modifier, so `C-q` and `C-Q` share one canonical form.
 pub(super) fn parse_chord(spec: &str) -> Option<(KeyCode, KeyModifiers)> {
     let trimmed = spec.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    // Split on `-` or `+`; both are common in user-facing key specs.
-    let parts: Vec<&str> = trimmed.split(['-', '+']).collect();
-    if parts.is_empty() {
-        return None;
-    }
+    let (mod_spec, key) = split_chord(trimmed)?;
     let mut modifiers = KeyModifiers::NONE;
-    for piece in &parts[..parts.len().saturating_sub(1)] {
-        match piece.to_ascii_lowercase().as_str() {
-            "c" | "ctrl" | "control" => modifiers |= KeyModifiers::CONTROL,
-            "m" | "alt" | "meta" => modifiers |= KeyModifiers::ALT,
-            "s" | "shift" => modifiers |= KeyModifiers::SHIFT,
-            _ => return None,
+    if !mod_spec.is_empty() {
+        for piece in mod_spec.split(['-', '+']).map(str::trim) {
+            match piece.to_ascii_lowercase().as_str() {
+                "c" | "ctrl" | "control" => modifiers |= KeyModifiers::CONTROL,
+                "m" | "alt" | "meta" => modifiers |= KeyModifiers::ALT,
+                "s" | "shift" => modifiers |= KeyModifiers::SHIFT,
+                _ => return None,
+            }
         }
     }
-    let key = *parts.last()?;
+    let key = key.trim();
     let code = parse_key_name(key, modifiers.contains(KeyModifiers::CONTROL))?;
     Some((code, modifiers))
+}
+
+/// Split a chord into its modifier prefix and key. Separators are `-` or `+`, but a trailing
+/// one is the key itself when it opens the spec or follows a separator (`-`, `C--`, `Ctrl+-`).
+fn split_chord(spec: &str) -> Option<(&str, &str)> {
+    let last = spec.chars().next_back()?;
+    if matches!(last, '-' | '+') {
+        let (head, key) = spec.split_at(spec.len() - 1);
+        let head = head.trim_end();
+        if head.is_empty() {
+            return Some(("", key));
+        }
+        return Some((head.strip_suffix(['-', '+'])?, key));
+    }
+    Some(spec.rsplit_once(['-', '+']).unwrap_or(("", spec)))
 }
 
 fn parse_key_name(name: &str, has_ctrl: bool) -> Option<KeyCode> {
@@ -392,11 +403,8 @@ pub(super) enum WorkerMsg {
     Resize { cols: u16, rows: u16 },
 }
 
-/// Background dispatcher: drains `WorkerMsg`s and runs each through a one-shot
-/// `send-keys` / `resize-window` after `coalesce`. Spawned by `prepare_live_send` and
-/// dropped on exit, which closes the channel so the thread's `recv` fails and it exits.
-/// Deliberately not joined: the worker is idempotent and harmless if it outlives a rapid
-/// live-mode toggle by a moment.
+/// Coalesced one-shot tmux dispatcher. The grant lease is checked before
+/// acquiring size ownership and before each fork, including queued work.
 pub(in crate::tui) struct LiveSendWorker {
     tx: Sender<WorkerMsg>,
     /// Set (sticky) by the worker when the size-owner lock is seen held by another
@@ -409,10 +417,13 @@ pub(in crate::tui) struct LiveSendWorker {
 }
 
 impl LiveSendWorker {
-    /// `capture_wake`, when present, nudges the preview capture worker out of its
-    /// inter-capture wait after each dispatched batch, so typed echo is captured
-    /// immediately rather than a full cadence cycle later.
-    pub(super) fn spawn(tmux_name: String, capture_wake: Option<LiveCaptureWake>) -> Self {
+    /// `capture_wake` requests an early preview capture after each dispatched batch.
+    /// The target process may not have echoed the input yet.
+    pub(super) fn spawn(
+        tmux_name: String,
+        capture_wake: Option<LiveCaptureWake>,
+        lease: crate::tui::session_feed::NativeLease,
+    ) -> Self {
         let (tx, rx) = channel::<WorkerMsg>();
         let lock_lost = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let thread_lock_lost = std::sync::Arc::clone(&lock_lost);
@@ -435,6 +446,9 @@ impl LiveSendWorker {
                 std::process::id(),
                 LIVE_SEND_WORKER_COUNTER.fetch_add(1, Ordering::Relaxed)
             );
+            if !lease.is_valid() {
+                return;
+            }
             let session = crate::tmux::Session::from_name(&tmux_name);
             // Entry is explicit user intent, so it forces the lock even over a live
             // holder. False means the session is missing or broken at entry, or another
@@ -464,7 +478,12 @@ impl LiveSendWorker {
             // ownership is re-asserted at most once per heartbeat. Resize batches keep the
             // steal-before-dispatch ordering, since geometry must not race another grid.
             let mut last_owner_maintenance = std::time::Instant::now();
+            // The sender may be revoked while a batch is queued.
+            // The dispatch path checks again before every fork.
             loop {
+                if !lease.is_valid() {
+                    break;
+                }
                 match rx.recv_timeout(crate::tmux::SIZE_OWNER_HEARTBEAT) {
                     Ok(first) => {
                         let mut batch = vec![first];
@@ -510,7 +529,7 @@ impl LiveSendWorker {
                             }
                         }
                         if !batch.is_empty() {
-                            match dispatch_batch(&tmux_name, &owner_id, batch) {
+                            match dispatch_batch(&tmux_name, &owner_id, batch, &lease) {
                                 ResizeDispatchResult::Failed => {
                                     owned = false;
                                     thread_resize_failed.store(true, Ordering::Relaxed);
@@ -767,9 +786,8 @@ impl<T: Send + Sync + 'static> PendingArm<T> {
     }
 }
 
-/// Cloneable handle that nudges a [`LiveCaptureWorker`] out of its inter-capture wait, so
-/// a dispatched keystroke batch captures the typed echo immediately. Backed by the same
-/// condvar as `set_live` / `set_target`, so a wake just runs one capture early.
+/// Wake signal shared with `set_live` and `set_target` for an early capture.
+/// Waking does not wait for the target process to echo dispatched input.
 type CaptureWake = std::sync::Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>;
 
 fn signal_capture_wake(wakeup: &CaptureWake) {
@@ -939,30 +957,19 @@ impl Drop for LiveCaptureWorker {
         }
     }
 }
-/// How often the worker re-asks how many panes its target window has and whether one is
-/// zoomed. The answer changes only on a manual split, close or zoom, so a lazy cadence is
-/// enough at one tiny `display-message` fork.
-///
-/// It also bounds a visible transient: the render-thread fallback probes `window_panes` in
-/// the same fork as its capture, so it composites as soon as the user splits while the
-/// worker keeps publishing single-pane frames until this elapses, and the preview
-/// alternates until they agree.
+/// Refresh cadence for `LiveCaptureWorker` pane-count and zoom observations.
+/// The tmux fallback probes `window_panes` in the same fork as capture.
 const PANE_COUNT_PROBE_MS: u64 = 1_000;
 
-/// How many panes the worker's target window has, for deciding whether the preview needs
-/// the composite path. Returns 1 on any failure, keeping the caller on the cheap
-/// single-pane transport.
-///
-/// A zoomed pane also reports 1: tmux keeps `window_panes` at the real count while
-/// reporting every pane at the window's full rectangle, so the compositor's tiling
-/// assumption breaks and compositing would hide the zoomed pane behind border fill.
+/// Use the composite preview only for an unzoomed split window.
+/// Missing or malformed observations retain the single-pane transport.
 fn probe_pane_count(name: &str, deadline: &crate::tmux::TmuxCommandDeadline) -> u16 {
     let mut command = crate::tmux::tmux_command();
     command.args([
         "display-message",
         "-p",
         "-t",
-        &format!("{name}:^"),
+        &format!("={name}:^"),
         "-F",
         "#{window_panes} #{window_zoomed_flag}",
     ]);
@@ -1049,6 +1056,11 @@ fn capture_composited_over_grid(
     let Some((_, layout)) = state.layout.as_ref() else {
         return capture_composited(name, lines, forward_empty, deadline);
     };
+    if layout.first_pane_id() != Some(channel.pane_id()) {
+        *state.layout = None;
+        *state.last_pane_probe = None;
+        return capture_composited(name, lines, forward_empty, deadline);
+    }
     let Some(first) = layout.first_pane() else {
         return capture_composited(name, lines, forward_empty, deadline);
     };
@@ -1075,7 +1087,7 @@ fn capture_composited_over_grid(
     cursor.history_size = 0;
     cursor.composite_pane0 = Some(first);
     (
-        Some(layout.composite_with_first_pane_rows(&rows)),
+        Some(layout.composite_with_first_pane_rows(channel.pane_id(), &rows)),
         Some(cursor),
     )
 }
@@ -2008,6 +2020,7 @@ fn dispatch_batch(
     tmux_name: &str,
     resize_owner: &str,
     batch: Vec<WorkerMsg>,
+    lease: &crate::tui::session_feed::NativeLease,
 ) -> ResizeDispatchResult {
     let actions = coalesce(batch);
     // A Paste can only go through tmux (`paste-buffer -p` decides whether the pane gets
@@ -2016,6 +2029,9 @@ fn dispatch_batch(
     let force_tmux = actions.iter().any(|a| matches!(a, TmuxAction::Paste(_)));
     let mut resize_result = ResizeDispatchResult::None;
     for action in actions {
+        if !lease.is_valid() {
+            break;
+        }
         let is_resize = matches!(action, TmuxAction::Resize { .. });
         match dispatch_via_fork(tmux_name, &action, force_tmux, Some(resize_owner)) {
             Ok(()) if is_resize => resize_result = ResizeDispatchResult::Succeeded,
@@ -2046,9 +2062,10 @@ fn dispatch_via_fork(
 ) -> anyhow::Result<()> {
     use std::process::Stdio;
 
-    // Fast path (`[tmux] vt_live`): while a live input channel is armed for this pane, all
-    // pane input goes through the socket and none through `send-keys`. Mixing the two would
-    // interleave writers on one pty input stream and can corrupt multi-byte sequences, as
+    // Fast path (`[tmux] vt_live`): while a live input channel is armed for this pane,
+    // ordinary batches send pane input through the socket, not `send-keys`. A batch
+    // containing `Paste` sets `force_tmux` and sends the whole batch through tmux instead.
+    // Mixing writers on one pty input stream can corrupt multi-byte sequences, since
     // `pipe-pane -I` arbitrates nothing. `input_mode` returns `Some` only while the
     // forwarder is connected, so a dead or not-yet-connected channel falls through to the
     // fork below instead of vanishing. Keys are encoded here against the pane's DECCKM from
@@ -2079,7 +2096,8 @@ fn dispatch_via_fork(
         }
     }
 
-    let target = format!("{}:^.0", tmux_name);
+    let target = crate::tmux::Session::from_name(tmux_name)
+        .live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?;
     let mut cmd = crate::tmux::tmux_command();
     cmd.stderr(Stdio::null());
     match action {
@@ -2454,10 +2472,6 @@ pub(super) fn send_key_oneshot(tmux_name: &str, key: TmuxKey) {
     }
 }
 
-/// Upper bound on bytes encoded into one `tmux send-keys -H` fork. Each byte becomes a
-/// ~2-char hex argument plus its argv pointer (~11 bytes of kernel arg space) and macOS caps
-/// `execve` argv+envp at 256 KiB, so a large paste overflows around 20 KB and fails with
-/// E2BIG. 4 KiB per fork keeps every argv under ~45 KiB while keeping the fork count low.
 /// Send a literal string through one `tmux send-keys -l --` fork, for the head of a payload
 /// whose trailing semicolons were peeled off (see [`dispatch_via_fork`]).
 fn send_literal(target: &str, s: &str) -> anyhow::Result<()> {
@@ -2596,6 +2610,21 @@ fn mod_prefix(ctrl: bool, alt: bool, shift: bool) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cancelled_native_continuation_discards_queued_worker_actions() {
+        let lease = crate::tui::session_feed::NativeLease::valid_for_test();
+        lease.cancel_continuation();
+        assert_eq!(
+            dispatch_batch(
+                "missing-native-session",
+                "owner",
+                vec![WorkerMsg::Resize { cols: 80, rows: 24 }],
+                &lease,
+            ),
+            ResizeDispatchResult::None,
+        );
+    }
+
     fn k(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
@@ -2674,6 +2703,13 @@ mod tests {
             ("X-q", None),  // unknown modifier
             ("C-qq", None), // multi-char key without F-prefix
             ("C-", None),   // missing key
+            // A trailing separator is the literal key; whitespace around tokens is ignored.
+            ("-", Some((KeyCode::Char('-'), KeyModifiers::NONE))),
+            ("C--", Some((KeyCode::Char('-'), ctrl))),
+            ("Ctrl+-", Some((KeyCode::Char('-'), ctrl))),
+            ("Ctrl + J", Some((KeyCode::Char('j'), ctrl))),
+            ("Ctrl+", None),
+            ("Ctrl+K+J", None),
         ];
         for (input, expected) in cases {
             assert_eq!(parse_chord(input), expected, "{input:?}");
@@ -3564,7 +3600,11 @@ mod tests {
             "the bounded resize path must expose failure"
         );
 
-        let worker = LiveSendWorker::spawn(name.to_string(), None);
+        let worker = LiveSendWorker::spawn(
+            name.to_string(),
+            None,
+            crate::tui::session_feed::NativeLease::valid_for_test(),
+        );
         worker.resize(80, 24);
         wait_until(
             "live resize failure flag",
@@ -3588,7 +3628,7 @@ mod tests {
                 "display-message",
                 "-p",
                 "-t",
-                &format!("{name}:^.0"),
+                &format!("{name}:^"),
                 "-F",
                 "#{pane_width}",
             ])
@@ -3643,6 +3683,7 @@ mod tests {
     }
 
     // Losing size ownership drops queued resizes, not keys.
+
     #[test]
     #[serial_test::serial]
     fn worker_flags_lock_loss_and_drops_resize_after_external_steal() {
@@ -3653,7 +3694,11 @@ mod tests {
         let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_livelock_steal");
         let session = create_live_send_fixture(guard.name());
 
-        let worker = LiveSendWorker::spawn(guard.name().to_string(), None);
+        let worker = LiveSendWorker::spawn(
+            guard.name().to_string(),
+            None,
+            crate::tui::session_feed::NativeLease::valid_for_test(),
+        );
         wait_until(
             "worker entry steal",
             std::time::Duration::from_secs(5),
@@ -3708,7 +3753,11 @@ mod tests {
         let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_livelock_own");
         let session = create_live_send_fixture(guard.name());
 
-        let worker = LiveSendWorker::spawn(guard.name().to_string(), None);
+        let worker = LiveSendWorker::spawn(
+            guard.name().to_string(),
+            None,
+            crate::tui::session_feed::NativeLease::valid_for_test(),
+        );
         wait_until(
             "worker entry steal",
             std::time::Duration::from_secs(5),
@@ -3724,6 +3773,7 @@ mod tests {
     }
 
     // Start before session creation to exercise the failed entry-steal retry.
+
     #[test]
     #[serial_test::serial]
     fn worker_defers_to_live_owner_when_entry_steal_found_no_session() {
@@ -3733,7 +3783,11 @@ mod tests {
         }
         let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_livelock_late");
         // A failed resize acknowledges that the worker observed the absent session.
-        let worker = LiveSendWorker::spawn(guard.name().to_string(), None);
+        let worker = LiveSendWorker::spawn(
+            guard.name().to_string(),
+            None,
+            crate::tui::session_feed::NativeLease::valid_for_test(),
+        );
         worker.resize(60, 20);
         wait_until(
             "resize against absent session",
@@ -3789,7 +3843,11 @@ mod tests {
             return;
         }
         let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_livelock_vacant");
-        let worker = LiveSendWorker::spawn(guard.name().to_string(), None);
+        let worker = LiveSendWorker::spawn(
+            guard.name().to_string(),
+            None,
+            crate::tui::session_feed::NativeLease::valid_for_test(),
+        );
         worker.resize(60, 20);
         wait_until(
             "resize against absent session",
@@ -3809,6 +3867,24 @@ mod tests {
         assert!(
             matches!(session.size_owner(), Some((id, _)) if id.starts_with("tui-")),
             "vacant lock must still be claimed on the retry path"
+        );
+    }
+
+    #[test]
+    fn queued_resize_batch_does_not_dispatch_after_its_native_lease_is_revoked() {
+        let lease = crate::tui::session_feed::NativeLease::valid_for_test();
+        let queued = vec![WorkerMsg::Resize { cols: 80, rows: 24 }];
+        let missing_target = format!("aoe_absent_lease_probe_{}", uuid::Uuid::new_v4());
+        assert_eq!(
+            dispatch_batch(&missing_target, "fixture-owner", queued.clone(), &lease),
+            ResizeDispatchResult::Failed,
+            "positive control reaches real resize dispatch for a valid lease and absent target"
+        );
+        lease.cancel_continuation();
+        assert_eq!(
+            dispatch_batch(&missing_target, "fixture-owner", queued, &lease),
+            ResizeDispatchResult::None,
+            "already queued native work must not reach resize dispatch after revocation"
         );
     }
 }

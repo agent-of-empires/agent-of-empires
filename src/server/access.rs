@@ -1,4 +1,5 @@
-//! Who may reach the dashboard.
+//! Who may reach the dashboard: the host and origin allowlist, the
+//! city-hall mutation gate, and the security headers every response carries.
 
 use std::sync::Arc;
 
@@ -11,8 +12,10 @@ pub(crate) fn is_wildcard_bind(host: &str) -> bool {
     matches!(host, "0.0.0.0" | "::" | "[::]")
 }
 
-/// Strip an optional `:port` and IPv6 brackets from a `Host`/authority value, yielding the
-/// canonical bare host.
+/// Strip an optional `:port` and IPv6 brackets from a `Host`/authority value,
+/// yielding the canonical bare host. `localhost:8080` -> `localhost`,
+/// `[::1]:8080` -> `::1`, `127.0.0.1` -> `127.0.0.1`. A bare (unbracketed)
+/// IPv6 literal has multiple colons and no port, so it is returned unchanged.
 pub(super) fn strip_host_port(host: &str) -> &str {
     let host = host.trim();
     if let Some(rest) = host.strip_prefix('[') {
@@ -24,13 +27,34 @@ pub(super) fn strip_host_port(host: &str) -> &str {
     }
 }
 
-/// Canonical host key for the allowlist and for `Host` comparison.
+/// Canonical host key for the allowlist and for `Host` comparison: bare host,
+/// ASCII-lowercased (DNS is case-insensitive), with a single trailing FQDN
+/// root dot stripped so `example.com.` and `example.com` compare equal. Runs
+/// on both the incoming `Host` and every allowlist entry, so the two stay
+/// symmetric. `pub(crate)` so the CLI `--allowed-host` validator can reject an
+/// entry that normalizes to nothing (e.g. `:8080`).
 pub(crate) fn norm_host(host: &str) -> String {
     let bare = strip_host_port(host);
     bare.strip_suffix('.').unwrap_or(bare).to_ascii_lowercase()
 }
 
-/// True when a `norm_host`'d value is a routable IP literal we trust unconditionally.
+/// True when a `norm_host`'d value is a routable IP literal accepted as a
+/// `Host` without an allowlist entry. An IP literal is dialed directly and
+/// never DNS-resolved, so it cannot be the target of DNS rebinding (see
+/// `is_trusted_ip_literal`). Restoring `aoe serve --host 0.0.0.0`
+/// reachability by LAN/tailnet IP with no `--allowed-host` does not trust an
+/// arbitrary browser `Origin`: that must still be allowlisted or have the
+/// exact same authority as `Host`. Hostnames always require an allowlist
+/// entry. See #2735.
+///
+/// The excluded ranges are hygiene, not rebinding-necessity (IPs can't be
+/// rebound): the unspecified address (`0.0.0.0` / `::`, also a Linux/macOS
+/// rebinding bypass), multicast, and link-local (v4 `169.254.0.0/16`, which
+/// contains the `169.254.169.254` cloud-metadata address; v6 `fe80::/10`) are
+/// never a legitimate dashboard endpoint. Routable IPs (LAN, tailnet
+/// `100.64.0.0/10`, ULA, global unicast) are trusted. IPv4-mapped IPv6 forms
+/// (`::ffff:a.b.c.d`) are canonicalized first so those exclusions also cover
+/// e.g. `::ffff:169.254.169.254`.
 pub(super) fn is_trusted_ip_literal(host: &str) -> bool {
     use std::net::IpAddr;
     let Ok(ip) = host.parse::<IpAddr>() else {
@@ -48,7 +72,14 @@ pub(super) fn is_trusted_ip_literal(host: &str) -> bool {
     }
 }
 
-/// True when a `norm_host`'d value parses as an IP literal the gate refuses to trust.
+/// True when a `norm_host`'d value parses as an IP literal the gate refuses to
+/// trust: unspecified (`0.0.0.0` / `::`), link-local, or multicast. A hostname
+/// is not an IP literal and returns false, so the CLI validators still accept
+/// `aoe.example.com`. This is the inverse of `is_trusted_ip_literal` over the
+/// values that actually parse as an IP; sharing the one predicate keeps the
+/// `--allowed-host` / `--allowed-origin` validators from ever admitting an entry
+/// that the gate's trust check excludes (the exact ordering bypass where an
+/// allowlist match wins before `is_trusted_ip_literal` runs). See #2735.
 pub(crate) fn is_untrusted_ip_literal(host: &str) -> bool {
     host.parse::<std::net::IpAddr>().is_ok() && !is_trusted_ip_literal(host)
 }
@@ -69,7 +100,12 @@ pub(super) fn push_unique(list: &mut Vec<String>, item: String) {
     }
 }
 
-/// Canonicalize an `Origin` to the exact form a browser serializes.
+/// Canonicalize an `Origin` to the exact form a browser serializes: trimmed,
+/// ASCII-lowercased, no trailing slash, and with the scheme's default port
+/// elided (`https://x:443` -> `https://x`, `http://x:80` -> `http://x`). Runs
+/// on both the allowlist build and the incoming header so the two never drift;
+/// without it a copy-pasted `https://x/` or `https://x:443` would silently 403
+/// every request. See #2735.
 pub(super) fn norm_origin(origin: &str) -> String {
     let o = origin.trim().trim_end_matches('/').to_ascii_lowercase();
     // Strip a single trailing FQDN root dot from the host so `https://example.com.` ==
@@ -105,7 +141,21 @@ pub(super) fn host_from_url(url: &str) -> Option<String> {
     (!host.is_empty()).then_some(host)
 }
 
-/// Resolve the `(allowed_hosts, allowed_origins)` pair the DNS-rebinding gate enforces.
+/// Resolve the `(allowed_hosts, allowed_origins)` pair the DNS-rebinding gate
+/// enforces. Pure so the defaulting, wildcard handling, and tunnel
+/// auto-injection are unit-testable without a live server (#2735).
+///
+/// - Loopback trio (`localhost`, `127.0.0.1`, `::1`) is always trusted, plus
+///   the concrete bind `host` (wildcards excluded: they mean "all interfaces",
+///   not a routable Host).
+/// - Each local host gets `http`/`https` origins on the actual bind `port`.
+/// - Operator `--allowed-host` entries are trusted for direct access on the
+///   bind port and for standard-port (proxy) access.
+/// - A `tunnel_host` (Cloudflare/Tailscale public name) is auto-injected with
+///   its portless `https` origin, so tunnels work with no operator flag.
+/// - Operator `--allowed-origin` entries are normalized to the browser's
+///   `Origin` form (lowercased, no trailing slash, default port elided) for
+///   reverse proxies on nonstandard ports.
 pub(super) fn resolve_access_policy(
     host: &str,
     port: u16,
@@ -167,7 +217,12 @@ pub(super) enum AccessDecision {
     DenyOrigin,
 }
 
-/// Pure DNS-rebinding decision.
+/// Pure DNS-rebinding decision: reject a missing `Host`; accept a `Host` that
+/// is allowlisted or a routable IP literal (IPs can't be rebound, see
+/// `is_trusted_ip_literal`); exempt requests with no `Origin` (curl / native
+/// TUI / non-browser WS). A present `Origin` must either be allowlisted or
+/// have exactly the authority named by `Host`, including default-port and
+/// bracketed-IPv6 equivalence. See #2735.
 pub(super) fn evaluate_access(
     host_header: Option<&str>,
     origin_header: Option<&str>,
@@ -183,27 +238,97 @@ pub(super) fn evaluate_access(
     }
     if let Some(origin) = origin_header {
         let origin = norm_origin(origin);
-        // A by-IP dashboard sends an IP-literal Origin; trust it like the Host (auth is the backstop).
-        let origin_is_trusted_ip =
-            host_from_url(&origin).is_some_and(|h| is_trusted_ip_literal(&h));
-        if !allowed_origins.contains(&origin) && !origin_is_trusted_ip {
+        if !allowed_origins.contains(&origin) && !origin_has_host_authority(&origin, raw_host) {
             return AccessDecision::DenyOrigin;
         }
     }
     AccessDecision::Allow
 }
 
-/// Uniform 403 for every DNS-rebinding rejection.
+/// Split an HTTP `Host` authority into its normalized host and explicit port.
+fn host_port(raw: &str) -> Option<(String, Option<u16>)> {
+    let raw = raw.trim();
+    let (host, port) = if let Some(end) = raw
+        .strip_prefix('[')
+        .and_then(|rest| rest.find(']'))
+        .map(|index| 1 + index)
+    {
+        let host = &raw[1..end];
+        let rest = &raw[end + 1..];
+        if rest.is_empty() {
+            (host, None)
+        } else {
+            (host, Some(rest.strip_prefix(':')?))
+        }
+    } else {
+        match raw.rsplit_once(':') {
+            Some((host, port)) if !host.contains(':') => (host, Some(port)),
+            _ => (raw, None),
+        }
+    };
+    let port = match port {
+        Some(value) => Some(value.parse().ok()?),
+        None => None,
+    };
+    let host = norm_host(host);
+    (!host.is_empty() && port != Some(0)).then_some((host, port))
+}
+
+/// Compare an Origin authority with Host. Host carries no scheme, so only the
+/// host and effective port are comparable; an Origin's default port matches
+/// an omitted Host port and an explicit default port.
+fn origin_has_host_authority(origin: &str, host: &str) -> bool {
+    let Some((scheme, authority)) = origin
+        .split_once("://")
+        .filter(|(scheme, _)| matches!(*scheme, "http" | "https"))
+    else {
+        return false;
+    };
+    if authority
+        .chars()
+        .any(|character| matches!(character, '/' | '?' | '#' | '@'))
+    {
+        return false;
+    }
+    let Some((origin_host, origin_port)) = host_port(authority) else {
+        return false;
+    };
+    let Some((request_host, request_port)) = host_port(host) else {
+        return false;
+    };
+    if origin_host != request_host {
+        return false;
+    }
+    let default_port = if scheme == "https" { 443 } else { 80 };
+    let origin_effective = origin_port.unwrap_or(default_port);
+    let request_effective = request_port.unwrap_or(default_port);
+    if origin_effective != request_effective {
+        return false;
+    }
+    // Host has no scheme. An explicit HTTPS non-default port is therefore
+    // ambiguous (it cannot be proven to be the Host authority), whereas HTTP
+    // same-port navigation is the normal dashboard path.
+    !(scheme == "https" && origin_port.is_some_and(|port| port != 443))
+}
+
+/// Uniform 403 for every DNS-rebinding rejection. Names both gates but not
+/// which one tripped, so it is accurate for a missing/unlisted `Host` and an
+/// unlisted `Origin` alike without handing a prober a which-check oracle; the
+/// specific reason stays in the `http.access` debug log. See #2735.
 pub(super) fn access_denied() -> axum::response::Response {
     use axum::response::IntoResponse;
     (
         axum::http::StatusCode::FORBIDDEN,
+        crate::daemon::ApiErrorCode::AccessPolicyDenied.header(),
         "forbidden: host or origin not allowed",
     )
         .into_response()
 }
 
-/// DNS-rebinding gate.
+/// DNS-rebinding gate. Runs before `auth_middleware` (layered outside it) so a
+/// rejected request never reaches auth: the 403 short-circuits here. HTTP/1.1
+/// always carries `Host`; for HTTP/2 the `:authority` pseudo-header maps to it,
+/// with the URI authority as a fallback. See #2735.
 pub(super) async fn access_policy(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     request: axum::extract::Request,
@@ -243,23 +368,34 @@ pub(super) async fn access_policy(
     }
 }
 
-/// Mutating routes (POST/PUT/PATCH/DELETE) reachable in CityHall client mode.
+/// Mutating routes reachable in CityHall. Handlers enforce structured ownership;
+/// unlisted mutations are denied before handlers run.
 pub(super) const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
     // Session creation (server-derived) + lifecycle / metadata on the structured
     // sessions this mode owns; each handler re-checks the target is structured.
     ("POST", "/api/sessions"),
+    ("POST", "/api/sessions/{id}/creation/cancel"),
     ("DELETE", "/api/sessions/{id}"),
     ("DELETE", "/api/workspaces"),
     ("PATCH", "/api/sessions/{id}"),
     ("PATCH", "/api/sessions/{id}/archive"),
+    ("PATCH", "/api/sessions/{id}/access"),
     ("PATCH", "/api/sessions/{id}/color"),
     ("PATCH", "/api/sessions/{id}/diff-base"),
+    ("PATCH", "/api/sessions/{id}/favorite"),
     ("PATCH", "/api/sessions/{id}/group"),
+    ("PATCH", "/api/groups"),
+    ("POST", "/api/groups"),
+    ("DELETE", "/api/groups"),
+    ("PATCH", "/api/groups/collapse"),
+    ("POST", "/api/reorder"),
     ("PATCH", "/api/sessions/{id}/notifications"),
     ("PATCH", "/api/sessions/{id}/pin"),
     ("PATCH", "/api/sessions/{id}/snooze"),
     ("PATCH", "/api/sessions/{id}/unread"),
     ("PATCH", "/api/sessions/{id}/worktree-name"),
+    ("POST", "/api/sessions/{id}/purge/abandon"),
+    ("POST", "/api/sessions/{id}/restart-for-update"),
     ("POST", "/api/sessions/{id}/restore"),
     ("POST", "/api/sessions/{id}/start"),
     ("POST", "/api/sessions/{id}/stop"),
@@ -315,9 +451,17 @@ pub(super) const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
     ("DELETE", "/api/login/sessions/{id}"),
 ];
 
-/// Mutating routes deliberately UNREACHABLE in CityHall.
+/// Mutating routes deliberately unavailable in CityHall.
 #[cfg(test)]
 pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
+    ("POST", "/api/sandbox/image-pull"),
+    ("POST", "/api/sandbox/image-dismiss"),
+    ("POST", "/api/sessions/creation-trust"),
+    ("POST", "/api/sessions/empty-trash"),
+    ("POST", "/api/sessions/{id}/restart"),
+    ("POST", "/api/sessions/{id}/recreate-container"),
+    ("POST", "/api/sessions/{id}/tools/ensure"),
+    ("POST", "/api/sessions/{id}/auxiliary/stop"),
     // Terminal surface.
     ("POST", "/api/sessions/{id}/ensure"),
     ("POST", "/api/sessions/{id}/send"),
@@ -337,6 +481,10 @@ pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     ("PATCH", "/api/profiles/{name}/rename"),
     ("PATCH", "/api/default-profile"),
     // MCP mutations.
+    ("POST", "/mcp"),
+    ("PUT", "/mcp"),
+    ("PATCH", "/mcp"),
+    ("DELETE", "/mcp"),
     ("POST", "/api/mcp/servers"),
     ("PUT", "/api/mcp/servers/{name}"),
     ("DELETE", "/api/mcp/servers/{name}"),
@@ -375,7 +523,298 @@ pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     ("PUT", "/api/workspace-ordering"),
 ];
 
-/// Default-deny CityHall reachability boundary.
+#[cfg(test)]
+#[derive(Debug)]
+pub(super) struct MutatingRoute<'a> {
+    pub method: &'static str,
+    pub path: &'a str,
+    pub handler: &'a str,
+    pub read_only_layer: bool,
+}
+
+#[cfg(test)]
+pub(super) fn router_mutating_handlers() -> Vec<MutatingRoute<'static>> {
+    mutating_routes(include_str!("router.rs"))
+}
+
+#[cfg(test)]
+fn mutating_routes(source: &str) -> Vec<MutatingRoute<'_>> {
+    let file = syn::parse_file(source).expect("router source must be valid Rust");
+    assert!(
+        file.items.iter().any(|item| {
+            matches!(item, syn::Item::Use(item) if RouteAudit::canonical_import(
+                &item.tree, &["axum", "Router"]
+            ))
+        }),
+        "router audit requires the unaliased axum::Router import"
+    );
+    let function = file
+        .items
+        .iter()
+        .find_map(|item| match item {
+            syn::Item::Fn(function) if function.sig.ident == "build_router" => Some(function),
+            _ => None,
+        })
+        .expect("top-level build_router must exist");
+    let imports = function.block.stmts.iter().fold(0, |imports, statement| {
+        if let syn::Stmt::Item(syn::Item::Use(item)) = statement {
+            imports | RouteAudit::routing_import(&item.tree, 0)
+        } else {
+            imports
+        }
+    });
+    assert_eq!(
+        imports,
+        (1u8 << RouteAudit::METHODS.len()) - 1,
+        "router audit requires unaliased Axum method imports"
+    );
+    let mut audit = RouteAudit {
+        source,
+        routes: Vec::new(),
+    };
+    audit.router_block(&function.block);
+    audit.routes
+}
+
+#[cfg(test)]
+struct RouteAudit<'a> {
+    source: &'a str,
+    routes: Vec<MutatingRoute<'a>>,
+}
+
+#[cfg(test)]
+impl<'a> RouteAudit<'a> {
+    const METHODS: [(&'static str, Option<&'static str>); 5] = [
+        ("get", None),
+        ("post", Some("POST")),
+        ("put", Some("PUT")),
+        ("patch", Some("PATCH")),
+        ("delete", Some("DELETE")),
+    ];
+
+    fn text(&self, node: &impl syn::spanned::Spanned) -> &'a str {
+        &self.source[node.span().byte_range()]
+    }
+
+    fn canonical_import(tree: &syn::UseTree, path: &[&str]) -> bool {
+        match tree {
+            syn::UseTree::Group(group) => group
+                .items
+                .iter()
+                .any(|tree| Self::canonical_import(tree, path)),
+            syn::UseTree::Path(item) => path.split_first().is_some_and(|(name, rest)| {
+                item.ident == *name && Self::canonical_import(&item.tree, rest)
+            }),
+            syn::UseTree::Name(item) => path.len() == 1 && item.ident == path[0],
+            _ => false,
+        }
+    }
+
+    fn routing_import(tree: &syn::UseTree, depth: usize) -> u8 {
+        match tree {
+            syn::UseTree::Path(item)
+                if (depth == 0 && item.ident == "axum")
+                    || (depth == 1 && item.ident == "routing") =>
+            {
+                Self::routing_import(&item.tree, depth + 1)
+            }
+            syn::UseTree::Group(group) => group
+                .items
+                .iter()
+                .fold(0, |mask, tree| mask | Self::routing_import(tree, depth)),
+            syn::UseTree::Name(item) if depth == 2 => {
+                let index = Self::METHODS
+                    .iter()
+                    .position(|(name, _)| item.ident == *name)
+                    .expect("unsupported routing import");
+                1 << index
+            }
+            _ => panic!("router audit requires canonical, unaliased Axum method imports"),
+        }
+    }
+
+    fn router_block(&mut self, block: &syn::Block) {
+        for statement in &block.stmts {
+            match statement {
+                syn::Stmt::Local(local) => {
+                    let syn::Pat::Ident(binding) = &local.pat else {
+                        panic!("unsupported router binding: {}", self.text(local));
+                    };
+                    let init = local
+                        .init
+                        .as_ref()
+                        .expect("router binding needs an initializer");
+                    assert!(
+                        init.diverge.is_none(),
+                        "unsupported diverging router binding"
+                    );
+                    if binding.ident == "app" {
+                        self.router_expression(&init.expr);
+                    } else {
+                        assert!(
+                            binding.ident == "read_only",
+                            "unsupported router binding: {}",
+                            self.text(local)
+                        );
+                        assert!(
+                            matches!(&*init.expr, syn::Expr::Call(call)
+                                if self.text(&call.func) == "axum::middleware::from_fn_with_state"
+                                && call.args.len() == 2
+                                && Self::is_clone_of(&call.args[0], "state")
+                                && self.text(&call.args[1]) == "api::read_only_gate"),
+                            "unsupported read-only layer initializer"
+                        );
+                    }
+                }
+                syn::Stmt::Item(syn::Item::Use(item)) => {
+                    Self::routing_import(&item.tree, 0);
+                }
+                syn::Stmt::Expr(expression, None) => self.router_expression(expression),
+                _ => panic!("unsupported router statement: {}", self.text(statement)),
+            }
+        }
+    }
+
+    fn condition(expression: &syn::Expr) -> bool {
+        match expression {
+            syn::Expr::Path(path) => path.path.is_ident("state"),
+            syn::Expr::Field(field) => Self::condition(&field.base),
+            syn::Expr::Paren(paren) => Self::condition(&paren.expr),
+            _ => false,
+        }
+    }
+
+    fn is_clone_of(expression: &syn::Expr, name: &str) -> bool {
+        matches!(expression, syn::Expr::MethodCall(call)
+            if call.method == "clone" && call.args.is_empty()
+            && matches!(&*call.receiver, syn::Expr::Path(path) if path.path.is_ident(name)))
+    }
+
+    fn router_expression(&mut self, expression: &syn::Expr) {
+        match expression {
+            syn::Expr::Path(path) if path.path.is_ident("app") => {}
+            syn::Expr::Call(call)
+                if call.args.is_empty()
+                    && matches!(self.text(&call.func), "Router::new" | "axum::Router::new") => {}
+            syn::Expr::Paren(paren) => self.router_expression(&paren.expr),
+            syn::Expr::Block(block) => self.router_block(&block.block),
+            syn::Expr::If(branch) => {
+                assert!(
+                    Self::condition(&branch.cond),
+                    "unsupported router condition"
+                );
+                self.router_block(&branch.then_branch);
+                let (_, other) = branch
+                    .else_branch
+                    .as_ref()
+                    .expect("router condition needs both branches");
+                self.router_expression(other);
+            }
+            syn::Expr::MethodCall(call) => {
+                self.router_expression(&call.receiver);
+                if call.method == "route" || call.method == "route_service" {
+                    assert_eq!(call.args.len(), 2, "route needs a path and handler");
+                    let path = self.text(&call.args[0]);
+                    let path = path
+                        .strip_prefix('"')
+                        .and_then(|path| path.strip_suffix('"'))
+                        .filter(|path| !path.contains('\\'))
+                        .expect("canonical literal route path");
+                    if call.method == "route_service" {
+                        for method in ["POST", "PUT", "PATCH", "DELETE"] {
+                            self.routes.push(MutatingRoute {
+                                method,
+                                path,
+                                handler: self.text(&call.args[1]),
+                                read_only_layer: false,
+                            });
+                        }
+                    } else {
+                        let start = self.routes.len();
+                        let covered = self.method_router(path, &call.args[1]);
+                        for route in &mut self.routes[start..] {
+                            route.read_only_layer = covered;
+                        }
+                    }
+                } else if call.method == "layer" || call.method == "with_state" {
+                    assert_eq!(call.args.len(), 1, "router modifier needs one argument");
+                } else if call.method == "fallback" {
+                    assert_eq!(call.args.len(), 1, "fallback needs one handler");
+                    let start = self.routes.len();
+                    self.method_router("<fallback>", &call.args[0]);
+                    assert_eq!(
+                        self.routes.len(),
+                        start,
+                        "mutating fallback requires explicit classification support"
+                    );
+                } else {
+                    panic!("unsupported router composition: {}", self.text(expression));
+                }
+            }
+            _ => panic!("unsupported router expression: {}", self.text(expression)),
+        }
+    }
+
+    fn method_router(&mut self, path: &'a str, expression: &syn::Expr) -> bool {
+        let (name, handler, covered) = match expression {
+            syn::Expr::Call(call) => {
+                assert_eq!(call.args.len(), 1, "method builder needs one handler");
+                let name = self.text(&call.func);
+                (
+                    name.strip_prefix("axum::routing::").unwrap_or(name),
+                    &call.args[0],
+                    false,
+                )
+            }
+            syn::Expr::MethodCall(call) => {
+                let covered = self.method_router(path, &call.receiver);
+                assert_eq!(
+                    call.args.len(),
+                    1,
+                    "method router modifier needs one argument"
+                );
+                if call.method == "layer" {
+                    return covered || Self::is_clone_of(&call.args[0], "read_only");
+                }
+                (self.text(&call.method), &call.args[0], covered)
+            }
+            syn::Expr::Paren(paren) => return self.method_router(path, &paren.expr),
+            _ => panic!(
+                "unsupported method router for {path}: {}",
+                self.text(expression)
+            ),
+        };
+        let (_, method) = Self::METHODS
+            .iter()
+            .find(|(supported, _)| *supported == name)
+            .unwrap_or_else(|| panic!("unsupported method builder for {path}: {name}"));
+        assert!(
+            matches!(handler, syn::Expr::Path(_)),
+            "unsupported handler for {path}"
+        );
+        let handler = self.text(handler);
+        assert!(
+            handler
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | ':')),
+            "noncanonical handler for {path}: {handler}"
+        );
+        if let Some(method) = method {
+            self.routes.push(MutatingRoute {
+                method,
+                path,
+                handler,
+                read_only_layer: false,
+            });
+            false
+        } else {
+            covered
+        }
+    }
+}
+
+/// Refuse unlisted mutations in CityHall mode with the canonical 403.
+/// Unmatched routes and omitted prefixes fail closed.
 pub(super) async fn cityhall_gate(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     request: axum::extract::Request,
@@ -413,6 +852,30 @@ pub(super) async fn cityhall_gate(
 }
 
 /// Content-Security-Policy for the dashboard.
+///
+/// - `default-src 'self'`: deny everything we don't explicitly allow.
+/// - `script-src 'self' 'wasm-unsafe-eval'`: scripts are bundled by
+///   Vite from the same origin; no inline scripts, no `eval`. The
+///   `'wasm-unsafe-eval'` source is the CSP3 opt-in for WebAssembly
+///   compilation; Shiki's Oniguruma regex engine ships as WASM, so
+///   the diff syntax highlighter falls over without it (PR #1275
+///   dropped this when wterm was replaced with xterm.js on the
+///   incorrect premise that nothing else still needed WASM).
+/// - `style-src 'self' 'unsafe-inline'`: React writes to element.style at
+///   runtime (terminal font-size updates) and Tailwind v4 emits inline
+///   `<style>` blocks in dev. Blocking inline styles breaks xterm.js's
+///   rendered viewport.
+/// - `img-src 'self' data: https://github.com https://avatars.githubusercontent.com https://raw.githubusercontent.com`:
+///   repo-owner avatars are loaded from `github.com/{user}.png` which 302s
+///   to `avatars.githubusercontent.com`; CSP checks both URLs across the
+///   redirect, so both hosts must be allowed. `data:` covers inline icons.
+///   `raw.githubusercontent.com` serves plugin screenshots resolved by the
+///   plugin detail endpoint (#2484).
+/// - `font-src 'self'`: Geist fonts are bundled under /fonts/.
+/// - `connect-src 'self' ws: wss:`: REST + PTY WebSocket to same origin.
+/// - `frame-ancestors 'none'`: CSP-native equivalent of X-Frame-Options.
+/// - `base-uri 'self'`, `form-action 'self'`, `object-src 'none'`: tighten
+///   the usual attack surfaces on injection bugs.
 pub(super) const CSP: &str = "default-src 'self'; \
     script-src 'self' 'wasm-unsafe-eval'; \
     style-src 'self' 'unsafe-inline'; \
@@ -446,57 +909,161 @@ pub(super) async fn security_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::server::test_helpers::vecs;
     use crate::server::test_support;
-
-    /// Extract every mutating `(METHOD, path-template)` pair registered in `build_router`
-    /// by scanning `.route("<path>", <handlers>)` and reading the method combinators inside
-    /// each handler expression (balanced parens so a nested `get(...).post(...)` doesn't
-    /// bleed into the next route).
     fn router_mutating_routes() -> std::collections::BTreeSet<(String, String)> {
-        let src = include_str!("router.rs");
-        let start = src.find("fn build_router").expect("build_router present");
-        let end = src[start..]
-            .find(".layer(axum::middleware::from_fn_with_state")
-            .map(|o| start + o)
-            .unwrap_or(src.len());
-        let body = &src[start..end];
-        let mut out = std::collections::BTreeSet::new();
-        let bytes = body.as_bytes();
-        let marker = ".route(";
-        let mut i = 0;
-        while let Some(rel) = body[i..].find(marker) {
-            let mut j = i + rel + marker.len();
-            // Skip to the opening quote of the path literal.
-            while j < body.len() && bytes[j] != b'"' {
-                j += 1;
+        router_mutating_handlers()
+            .into_iter()
+            .map(|route| (route.method.to_owned(), route.path.to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn mutation_scan_keeps_chained_methods_and_nested_layers() {
+        let routes = mutating_routes(
+            r#"
+            use axum::Router;
+            fn build_router() {
+            use axum::routing::{delete, get, patch, post, put};
+            Router::new()
+            // .route("/comment", post(api::not_a_route))
+            .route /* gap */ ("/first", get(api::read).post(api::write).layer(read_only.clone()))
+            .route(
+                "/second",
+                patch(api::change).delete(api::remove).layer(limit(2)),
+            )
+            .route("/third", post(api::early).layer(read_only.clone()).patch(api::late))
+            .route_service("/service", super::mcp::service(state.clone()))
+            .route(
+                "/spaced",
+                axum::routing::post /* gap */ (api::spaced)
+                    .layer(trace(".route(\"/string\", post(api::not_a_route))")),
+            )
             }
-            j += 1;
-            let path_start = j;
-            while j < body.len() && bytes[j] != b'"' {
-                j += 1;
-            }
-            let path = &body[path_start..j];
-            // Handler expression.
-            let mut depth = 1i32;
-            let mut k = j;
-            while k < body.len() && depth > 0 {
-                match bytes[k] {
-                    b'(' => depth += 1,
-                    b')' => depth -= 1,
-                    _ => {}
-                }
-                k += 1;
-            }
-            let expr = &body[j..k];
-            for method in ["post", "patch", "put", "delete"] {
-                if expr.contains(&format!("{method}(")) {
-                    out.insert((method.to_uppercase(), path.to_string()));
-                }
-            }
-            i = k;
+        "#,
+        );
+        let observed: Vec<_> = routes
+            .iter()
+            .map(|route| {
+                (
+                    route.method,
+                    route.path,
+                    route.handler,
+                    route.read_only_layer,
+                )
+            })
+            .collect();
+        assert_eq!(
+            observed,
+            vec![
+                ("POST", "/first", "api::write", true),
+                ("PATCH", "/second", "api::change", false),
+                ("DELETE", "/second", "api::remove", false),
+                ("POST", "/third", "api::early", false),
+                ("PATCH", "/third", "api::late", false),
+                (
+                    "POST",
+                    "/service",
+                    "super::mcp::service(state.clone())",
+                    false
+                ),
+                (
+                    "PUT",
+                    "/service",
+                    "super::mcp::service(state.clone())",
+                    false
+                ),
+                (
+                    "PATCH",
+                    "/service",
+                    "super::mcp::service(state.clone())",
+                    false
+                ),
+                (
+                    "DELETE",
+                    "/service",
+                    "super::mcp::service(state.clone())",
+                    false
+                ),
+                ("POST", "/spaced", "api::spaced", false),
+            ]
+        );
+    }
+
+    #[test]
+    fn mutation_scan_rejects_opaque_method_routers() {
+        for builder in [
+            "any(api::write)",
+            "axum::routing::any(api::write)",
+            "on(MethodFilter::POST, api::write)",
+            "axum::routing::on(axum::routing::MethodFilter::POST, api::write)",
+            "get(api::read).on(MethodFilter::POST, api::write)",
+            "post(api::known).any(api::hidden)",
+            "get(api::read).merge(post(api::hidden))",
+            "write_routes",
+            "make_routes()",
+            "make_routes(post(api::hidden))",
+            "routes!()",
+        ] {
+            let source = format!(
+                r#"
+                use axum::Router;
+                fn build_router() {{
+                    use axum::routing::{{delete, get, patch, post, put}};
+                    Router::new().route("/unclassified", {builder})
+                }}
+                "#
+            );
+            assert!(
+                std::panic::catch_unwind(|| mutating_routes(&source)).is_err(),
+                "accepted unaudited method router: {builder}"
+            );
         }
-        out
+    }
+
+    #[test]
+    fn mutation_scan_rejects_opaque_router_composition() {
+        for (imports, router) in [
+            (
+                "delete, get, patch, post, put",
+                "Router::new().route(\"/known\", post(api::write)).merge(other_router)",
+            ),
+            (
+                "delete, get, patch, post, put",
+                "Router::new().nest(\"/hidden\", other_router)",
+            ),
+            (
+                "delete, get, patch, post, put",
+                "Router::new().fallback(post(api::write))",
+            ),
+            (
+                "delete, get, patch, post, put",
+                "make_router().route(\"/hidden\", post(api::write))",
+            ),
+            (
+                "delete, any as get, patch, post, put",
+                "Router::new().route(\"/hidden\", get(api::write))",
+            ),
+            (
+                "delete, get, patch, post, put",
+                "let mut app = Router::new(); let read_only = { app = app.route(\"/hidden\", post(api::write)); axum::middleware::from_fn_with_state(state.clone(), api::read_only_gate) }; app",
+            ),
+        ] {
+            let source = format!(
+                r#"
+                use axum::Router;
+                fn build_router() {{
+                    use axum::routing::{{{imports}}};
+                    {router}
+                }}
+                "#
+            );
+            assert!(
+                std::panic::catch_unwind(|| mutating_routes(&source)).is_err(),
+                "accepted unaudited router: {router}"
+            );
+        }
     }
 
     #[test]
@@ -513,6 +1080,11 @@ mod tests {
             .map(|(m, p)| ((*m).to_string(), (*p).to_string()))
             .collect();
 
+        assert_eq!(
+            classified.len(),
+            CITYHALL_MUTATION_ALLOW.len() + CITYHALL_MUTATION_DENY.len(),
+            "duplicate CityHall classification"
+        );
         let mut failures = Vec::new();
         for route in routed.difference(&classified) {
             failures.push(format!(
@@ -544,58 +1116,260 @@ mod tests {
         );
     }
 
-    #[test]
-    fn host_and_origin_are_canonicalized_to_browser_form() {
-        // (raw, strip_host_port, norm_host)
-        for (raw, stripped, normed) in [
-            ("localhost:8080", "localhost", "localhost"),
-            ("localhost", "localhost", "localhost"),
-            ("127.0.0.1:8080", "127.0.0.1", "127.0.0.1"),
-            ("[::1]:8080", "::1", "::1"),
-            ("[::1]", "::1", "::1"),
-            ("::1", "::1", "::1"),
-            ("example.com", "example.com", "example.com"),
-            ("example.com.", "example.com.", "example.com"),
-            ("example.com.:8080", "example.com.", "example.com"),
-            ("LOCALHOST", "LOCALHOST", "localhost"),
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cityhall_reorder_preserves_native_rows_and_allows_structured_ordering() {
+        use tower::ServiceExt;
+        for (structured, native_peer, group_request, expected) in [
+            (true, false, false, axum::http::StatusCode::OK),
+            (false, true, false, axum::http::StatusCode::FORBIDDEN),
+            (true, true, false, axum::http::StatusCode::FORBIDDEN),
+            (false, true, true, axum::http::StatusCode::FORBIDDEN),
         ] {
-            assert_eq!(strip_host_port(raw), stripped, "strip_host_port({raw})");
-            assert_eq!(norm_host(raw), normed, "norm_host({raw})");
-        }
-
-        for (raw, normed) in [
-            ("https://x/", "https://x"),
-            ("https://x:443", "https://x"),
-            ("http://x:80", "http://x"),
-            ("https://x:8443", "https://x:8443"),
-            ("http://x:443", "http://x:443"),
-            ("HTTPS://X", "https://x"),
-            ("https://[::1]:443", "https://[::1]"),
-            ("https://example.com.", "https://example.com"),
-            ("https://example.com.:443", "https://example.com"),
-            ("http://example.com.:80", "http://example.com"),
-            ("https://example.com.:8443", "https://example.com:8443"),
-        ] {
-            assert_eq!(norm_origin(raw), normed, "norm_origin({raw})");
-        }
-        // The Origin gate and the Host gate agree on the trailing FQDN dot.
-        assert_eq!(
-            norm_origin("https://example.com."),
-            format!("https://{}", norm_host("example.com."))
-        );
-
-        for (url, host) in [
-            ("https://x.trycloudflare.com", Some("x.trycloudflare.com")),
-            ("https://foo.ts.net/path?x=1", Some("foo.ts.net")),
-            ("https://Foo.TS.net", Some("foo.ts.net")),
-            ("", None),
-        ] {
-            assert_eq!(host_from_url(url).as_deref(), host, "host_from_url({url})");
+            let _home = crate::session::test_support::isolate_app_dir();
+            let mut a = crate::session::Instance::new("first", "/tmp/first");
+            let mut b = crate::session::Instance::new("second", "/tmp/second");
+            for row in [&mut a, &mut b] {
+                row.source_profile = "default".into();
+                row.group_path = "work".into();
+                row.status = crate::session::Status::Stopped;
+            }
+            a.sort_index = Some(0);
+            b.sort_index = Some(1);
+            if !native_peer {
+                a.view = crate::session::View::Structured;
+            }
+            if structured {
+                b.view = crate::session::View::Structured;
+            }
+            let storage = crate::session::Storage::new_unwatched("default").unwrap();
+            storage
+                .update(|rows, _| {
+                    *rows = vec![a.clone(), b.clone()];
+                    Ok(())
+                })
+                .unwrap();
+            let before = std::fs::read(storage.sessions_path()).unwrap();
+            let state = test_support::build_test_app_state_with_policy_configured(
+                vec![a.clone(), b.clone()],
+                vec!["localhost".into()],
+                Vec::new(),
+                None,
+                |state| state.cityhall_mode = true,
+            );
+            test_support::refresh_canonical_metadata_for_test(&state).await;
+            let body = if group_request {
+                serde_json::json!({"target":"group","group":{"profile":"default","path":"work"},"direction":"up"})
+            } else {
+                serde_json::json!({"target":"session","id":b.id,"profile":"default","source_group":"work","direction":"up"})
+            };
+            let response = test_support::build_router_for_test(state)
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/api/reorder")
+                        .header("host", "localhost")
+                        .header("content-type", "application/json")
+                        .extension(axum::extract::ConnectInfo(
+                            "127.0.0.1:5555".parse::<std::net::SocketAddr>().unwrap(),
+                        ))
+                        .body(axum::body::Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                status,
+                expected,
+                "structured={structured}, native_peer={native_peer}, group={group_request}: {}",
+                String::from_utf8_lossy(&bytes)
+            );
+            if expected == axum::http::StatusCode::OK {
+                let mut rows = storage.load().unwrap();
+                rows.sort_by_key(|row| row.sort_index);
+                assert_eq!(
+                    rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+                    [b.id.as_str(), a.id.as_str()]
+                );
+            } else {
+                assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
+            }
         }
     }
 
     #[test]
-    fn ip_literal_trust_follows_the_canonicalized_address() {
+    fn strip_host_port_variants() {
+        assert_eq!(strip_host_port("localhost:8080"), "localhost");
+        assert_eq!(strip_host_port("localhost"), "localhost");
+        assert_eq!(strip_host_port("127.0.0.1:8080"), "127.0.0.1");
+        assert_eq!(strip_host_port("[::1]:8080"), "::1");
+        assert_eq!(strip_host_port("[::1]"), "::1");
+        assert_eq!(strip_host_port("::1"), "::1");
+        assert_eq!(strip_host_port("example.com"), "example.com");
+    }
+
+    #[test]
+    fn host_from_url_extracts_bare_host() {
+        assert_eq!(
+            host_from_url("https://x.trycloudflare.com").as_deref(),
+            Some("x.trycloudflare.com")
+        );
+        assert_eq!(
+            host_from_url("https://foo.ts.net/path?x=1").as_deref(),
+            Some("foo.ts.net")
+        );
+        assert_eq!(
+            host_from_url("https://Foo.TS.net").as_deref(),
+            Some("foo.ts.net")
+        );
+        assert_eq!(host_from_url(""), None);
+    }
+
+    #[test]
+    fn host_in_allowlist_passes() {
+        assert_eq!(
+            evaluate_access(Some("localhost"), None, &vecs(&["localhost"]), &[]),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn host_not_in_allowlist_403() {
+        assert_eq!(
+            evaluate_access(Some("evil.com"), None, &vecs(&["localhost"]), &[]),
+            AccessDecision::DenyHost
+        );
+    }
+
+    #[test]
+    fn host_port_stripped_before_match() {
+        assert_eq!(
+            evaluate_access(Some("localhost:8080"), None, &vecs(&["localhost"]), &[]),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn host_ipv6_bracketed_port_stripped() {
+        assert_eq!(
+            evaluate_access(Some("[::1]:8080"), None, &vecs(&["::1"]), &[]),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn host_match_is_case_insensitive() {
+        assert_eq!(
+            evaluate_access(Some("LOCALHOST"), None, &vecs(&["localhost"]), &[]),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn missing_host_denied() {
+        assert_eq!(
+            evaluate_access(None, None, &vecs(&["localhost"]), &[]),
+            AccessDecision::DenyMissingHost
+        );
+    }
+
+    #[test]
+    fn origin_absent_is_exempt() {
+        assert_eq!(
+            evaluate_access(
+                Some("localhost"),
+                None,
+                &vecs(&["localhost"]),
+                &vecs(&["http://localhost:8080"])
+            ),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn origin_in_allowlist_passes() {
+        assert_eq!(
+            evaluate_access(
+                Some("localhost"),
+                Some("http://localhost:8080"),
+                &vecs(&["localhost"]),
+                &vecs(&["http://localhost:8080"])
+            ),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn origin_not_in_allowlist_403() {
+        assert_eq!(
+            evaluate_access(
+                Some("localhost"),
+                Some("https://evil.com"),
+                &vecs(&["localhost"]),
+                &vecs(&["http://localhost:8080"])
+            ),
+            AccessDecision::DenyOrigin
+        );
+    }
+
+    #[test]
+    fn origin_match_is_case_insensitive() {
+        assert_eq!(
+            evaluate_access(
+                Some("localhost"),
+                Some("https://X.TryCloudflare.com"),
+                &vecs(&["localhost"]),
+                &vecs(&["https://x.trycloudflare.com"])
+            ),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn null_origin_is_denied() {
+        assert_eq!(
+            evaluate_access(
+                Some("localhost"),
+                Some("null"),
+                &vecs(&["localhost"]),
+                &vecs(&["http://localhost:8080"])
+            ),
+            AccessDecision::DenyOrigin
+        );
+    }
+
+    #[test]
+    fn userinfo_host_is_denied() {
+        assert_eq!(
+            evaluate_access(Some("user@localhost"), None, &vecs(&["localhost"]), &[]),
+            AccessDecision::DenyHost
+        );
+    }
+
+    #[test]
+    fn wildcard_bind_defaults_to_localhost_trio() {
+        let (h, _o) = resolve_access_policy("0.0.0.0", 8080, &[], &[], None);
+        // The static allowlist is still just the trio; a wildcard bind adds no
+        // routable *name*. A HOSTNAME is still denied without --allowed-host.
+        assert_eq!(h, vecs(&["localhost", "127.0.0.1", "::1"]));
+        assert_eq!(
+            evaluate_access(Some("my-box.local"), None, &h, &[]),
+            AccessDecision::DenyHost
+        );
+        // But a LAN IP literal is trusted unconditionally (Pattern A: an IP
+        // cannot be DNS-rebound), so by-IP access works with no flag.
+        assert_eq!(
+            evaluate_access(Some("192.168.1.5"), None, &h, &[]),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn is_trusted_ip_literal_accepts_routable_rejects_special() {
         for good in [
             "127.0.0.1",
             "192.168.1.5",
@@ -607,145 +1381,191 @@ mod tests {
             "::ffff:192.168.1.5", // IPv4-mapped routable: canonicalized, then trusted
         ] {
             assert!(is_trusted_ip_literal(good), "{good} should be trusted");
-            assert!(!is_untrusted_ip_literal(good), "{good} is not excluded");
         }
-        for excluded in [
+        for bad in [
             "0.0.0.0",
             "::",
             "169.254.169.254", // cloud metadata (v4 link-local)
             "fe80::1",         // v6 link-local
             "224.0.0.1",       // multicast
             "ff02::1",
-            "::ffff:169.254.169.254", // IPv4-mapped metadata
-            "::ffff:0.0.0.0",
-            "::ffff:224.0.0.1",
+            "::ffff:169.254.169.254", // IPv4-mapped metadata: canonicalized, then excluded
+            "::ffff:0.0.0.0",         // IPv4-mapped unspecified
+            "::ffff:224.0.0.1",       // IPv4-mapped multicast
+            "example.com",
+            "my-box",
+            "",
         ] {
-            assert!(!is_trusted_ip_literal(excluded), "{excluded} not trusted");
-            assert!(is_untrusted_ip_literal(excluded), "{excluded} is excluded");
+            assert!(!is_trusted_ip_literal(bad), "{bad} must not be trusted");
         }
-        // Hostnames are not IP literals at all, so neither validator claims them.
-        for name in ["example.com", "my-box", "aoe.example.com", ""] {
-            assert!(!is_trusted_ip_literal(name), "{name} is not an IP literal");
+    }
+
+    #[test]
+    fn is_untrusted_ip_literal_flags_only_excluded_literals() {
+        for excluded in [
+            "0.0.0.0",
+            "::",
+            "169.254.169.254",
+            "fe80::1",
+            "224.0.0.1",
+            "ff02::1",
+            "::ffff:169.254.169.254",
+        ] {
             assert!(
-                !is_untrusted_ip_literal(name),
-                "{name} is not an IP literal"
+                is_untrusted_ip_literal(excluded),
+                "{excluded} is an IP literal the gate excludes"
+            );
+        }
+        // Routable/loopback literals pass, and hostnames are not IP literals at
+        // all, so both must clear the validators.
+        for allowed in [
+            "127.0.0.1",
+            "::1",
+            "192.168.1.5",
+            "100.68.123.45",
+            "2001:db8::1",
+            "aoe.example.com",
+            "my-box",
+            "",
+        ] {
+            assert!(
+                !is_untrusted_ip_literal(allowed),
+                "{allowed} must not be flagged as an untrusted IP literal"
             );
         }
     }
 
     #[test]
-    fn evaluate_access_gates_host_then_origin() {
-        use AccessDecision::*;
-        let hosts = vecs(&["localhost"]);
-        let origins = vecs(&["http://localhost:8080"]);
-        let d = |host: Option<&str>, origin: Option<&str>| {
-            evaluate_access(host, origin, &hosts, &origins)
-        };
-
-        assert_eq!(d(Some("localhost"), None), Allow);
-        assert_eq!(d(Some("localhost:8080"), None), Allow, "port stripped");
-        assert_eq!(d(Some("[::1]:8080"), None), Allow, "bracketed ipv6");
-        assert_eq!(d(Some("LOCALHOST"), None), Allow, "case-insensitive");
-        assert_eq!(d(Some("localhost."), None), Allow, "trailing fqdn dot");
-        assert_eq!(d(Some("evil.com"), None), DenyHost);
-        assert_eq!(d(Some("user@localhost"), None), DenyHost, "userinfo");
-        assert_eq!(d(None, None), DenyMissingHost);
-
-        // A routable IP literal is trusted without an --allowed-host entry, as Host
-        // and as Origin; the excluded literals are not.
-        assert_eq!(d(Some("192.168.1.5:8080"), None), Allow);
-        assert_eq!(d(Some("[2001:db8::5]:8080"), None), Allow);
-        let ip_origin = d(Some("192.168.1.5:8080"), Some("http://192.168.1.5:8080"));
-        assert_eq!(ip_origin, Allow);
-        assert_eq!(d(Some("0.0.0.0"), None), DenyHost, "unspecified");
-        assert_eq!(d(Some("169.254.169.254"), None), DenyHost, "metadata");
-        assert_eq!(d(Some("fe80::1"), None), DenyHost, "link-local");
-
-        // Origin is consulted only once the Host passes, and an absent one is exempt.
-        assert_eq!(d(Some("localhost"), Some("http://localhost:8080")), Allow);
-        assert_eq!(d(Some("localhost"), Some("https://evil.com")), DenyOrigin);
-        assert_eq!(d(Some("localhost"), Some("null")), DenyOrigin);
-        // An unlisted hostname Origin must not slip through the IP exemption.
-        assert_eq!(d(Some("192.168.1.5"), Some("https://evil.com")), DenyOrigin);
-
-        // Origin matching is case-insensitive against the allowlist.
+    fn ip_literal_host_allowed_without_flag() {
+        let allow = vecs(&["localhost"]);
         assert_eq!(
-            evaluate_access(
-                Some("localhost"),
-                Some("https://X.TryCloudflare.com"),
-                &hosts,
-                &vecs(&["https://x.trycloudflare.com"]),
-            ),
-            Allow
+            evaluate_access(Some("192.168.1.5:8080"), None, &allow, &[]),
+            AccessDecision::Allow
+        );
+        assert_eq!(
+            evaluate_access(Some("[2001:db8::5]:8080"), None, &allow, &[]),
+            AccessDecision::Allow
         );
     }
 
     #[test]
-    fn resolve_access_policy_builds_the_allowlists_the_gate_enforces() {
-        // A wildcard bind adds no routable *name*: the static allowlist stays the
-        // localhost trio, so a hostname is denied without --allowed-host while a
-        // LAN IP literal is trusted unconditionally.
-        for wild in ["0.0.0.0", "::", "[::]"] {
-            let (h, _o) = resolve_access_policy(wild, 8080, &[], &[], None);
+    fn ip_literal_origin_requires_same_host_authority() {
+        let allow = vecs(&["localhost"]);
+        for (host, origin) in [
+            ("192.168.1.5:8080", "http://192.168.1.5:8080"),
+            ("[2001:db8::5]:8080", "http://[2001:db8::5]:8080"),
+        ] {
             assert_eq!(
-                h,
-                vecs(&["localhost", "127.0.0.1", "::1"]),
-                "wildcard {wild}"
-            );
-            assert_eq!(
-                evaluate_access(Some("my-box.local"), None, &h, &[]),
-                AccessDecision::DenyHost
-            );
-            assert_eq!(
-                evaluate_access(Some("192.168.1.5"), None, &h, &[]),
+                evaluate_access(Some(host), Some(origin), &allow, &[]),
                 AccessDecision::Allow
             );
         }
+        for (host, origin) in [
+            ("192.168.1.5:8080", "http://192.168.1.6:8080"),
+            ("192.168.1.5:8080", "http://192.168.1.5:9090"),
+            ("192.168.1.5:8080", "https://192.168.1.5:8080"),
+            ("192.168.1.5", "http://192.168.1.5:8080"),
+            ("[2001:db8::5]:8080", "http://[2001:db8::6]:8080"),
+        ] {
+            assert_eq!(
+                evaluate_access(Some(host), Some(origin), &allow, &[]),
+                AccessDecision::DenyOrigin,
+                "host {host}, origin {origin}"
+            );
+        }
+    }
 
-        // A concrete bind trusts itself as Host and as Origin.
+    #[test]
+    fn same_authority_normalizes_default_ports_and_ipv6() {
+        let allow = vecs(&["example.com", "::1"]);
+        for (host, origin) in [
+            ("example.com", "https://example.com:443"),
+            ("example.com:80", "http://example.com"),
+            ("[::1]", "http://[::1]:80"),
+            ("[::1]:8080", "http://[::1]:8080"),
+        ] {
+            assert_eq!(
+                evaluate_access(Some(host), Some(origin), &allow, &[]),
+                AccessDecision::Allow,
+                "host {host}, origin {origin}"
+            );
+        }
+    }
+
+    #[test]
+    fn excluded_ip_literals_still_denied() {
+        let allow = vecs(&["localhost"]);
+        for bad in ["0.0.0.0", "169.254.169.254", "fe80::1"] {
+            assert_eq!(
+                evaluate_access(Some(bad), None, &allow, &[]),
+                AccessDecision::DenyHost,
+                "{bad}"
+            );
+        }
+        // An unlisted hostname origin must not slip through the IP exemption.
+        assert_eq!(
+            evaluate_access(
+                Some("192.168.1.5"),
+                Some("https://evil.com"),
+                &allow,
+                &vecs(&["http://localhost:8080"])
+            ),
+            AccessDecision::DenyOrigin
+        );
+    }
+
+    #[test]
+    fn concrete_bind_host_is_allowed() {
         let (h, o) = resolve_access_policy("192.168.1.5", 8080, &[], &[], None);
         assert!(h.contains(&"192.168.1.5".to_string()));
         assert!(o.contains(&"http://192.168.1.5:8080".to_string()));
+    }
 
-        // `--allowed-host` extends both lists, with and without the port, and a
-        // trailing FQDN dot is normalized away on both sides of the comparison.
-        let (h, o) =
-            resolve_access_policy("0.0.0.0", 8080, &vecs(&["aoe.example.com."]), &[], None);
+    #[test]
+    fn explicit_host_flag_extends_allowlist() {
+        let (h, o) = resolve_access_policy("0.0.0.0", 8080, &vecs(&["aoe.example.com"]), &[], None);
         assert!(h.contains(&"aoe.example.com".to_string()));
         assert!(o.contains(&"https://aoe.example.com".to_string()));
         assert!(o.contains(&"https://aoe.example.com:8080".to_string()));
+    }
+
+    #[test]
+    fn remote_tunnel_host_auto_injected() {
+        let (h, _o) =
+            resolve_access_policy("127.0.0.1", 8080, &[], &[], Some("x.trycloudflare.com"));
+        assert!(h.contains(&"x.trycloudflare.com".to_string()));
+        assert_eq!(
+            evaluate_access(Some("x.trycloudflare.com"), None, &h, &[]),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn tunnel_origin_auto_injected() {
+        let (h, o) =
+            resolve_access_policy("127.0.0.1", 8080, &[], &[], Some("x.trycloudflare.com"));
+        assert!(o.contains(&"https://x.trycloudflare.com".to_string()));
         assert_eq!(
             evaluate_access(
-                Some("aoe.example.com."),
-                Some("https://aoe.example.com."),
+                Some("x.trycloudflare.com"),
+                Some("https://x.trycloudflare.com"),
                 &h,
                 &o
             ),
             AccessDecision::Allow
         );
-        // A portless allowlist entry still matches the browser's default-port Origin.
-        assert_eq!(
-            evaluate_access(
-                Some("aoe.example.com"),
-                Some("https://aoe.example.com:443"),
-                &h,
-                &o
-            ),
-            AccessDecision::Allow
-        );
+    }
 
-        // A tunnel host is injected as an https Origin as well as a Host.
-        for tunnel in ["x.trycloudflare.com", "host.tailnet.ts.net"] {
-            let (h, o) = resolve_access_policy("127.0.0.1", 8080, &[], &[], Some(tunnel));
-            assert!(h.contains(&tunnel.to_string()), "{tunnel} host");
-            assert!(o.contains(&format!("https://{tunnel}")), "{tunnel} origin");
-            assert_eq!(
-                evaluate_access(Some(tunnel), Some(&format!("https://{tunnel}")), &h, &o),
-                AccessDecision::Allow
-            );
-        }
+    #[test]
+    fn tailscale_host_auto_injected() {
+        let (h, o) =
+            resolve_access_policy("127.0.0.1", 8080, &[], &[], Some("host.tailnet.ts.net"));
+        assert!(h.contains(&"host.tailnet.ts.net".to_string()));
+        assert!(o.contains(&"https://host.tailnet.ts.net".to_string()));
+    }
 
-        // `--allowed-origin` values are stored in canonical browser form.
+    #[test]
+    fn explicit_origin_flag_normalized() {
         let (_h, o) = resolve_access_policy(
             "127.0.0.1",
             8080,
@@ -763,88 +1583,358 @@ mod tests {
         assert!(o.contains(&"https://std.example.com".to_string()));
     }
 
-    /// The gate runs ahead of auth (403 wins over 401) and every rejection returns the
-    /// same non-leaking body whatever the reason.
-    #[tokio::test]
-    async fn access_gate_runs_before_auth_at_the_router() {
-        use axum::http::StatusCode;
-        use tower::ServiceExt;
+    #[test]
+    fn norm_origin_canonicalizes_to_browser_form() {
+        assert_eq!(norm_origin("https://x/"), "https://x");
+        assert_eq!(norm_origin("https://x:443"), "https://x");
+        assert_eq!(norm_origin("http://x:80"), "http://x");
+        assert_eq!(norm_origin("https://x:8443"), "https://x:8443");
+        assert_eq!(norm_origin("http://x:443"), "http://x:443");
+        assert_eq!(norm_origin("HTTPS://X"), "https://x");
+        assert_eq!(norm_origin("https://[::1]:443"), "https://[::1]");
+    }
 
-        // Status plus body, so the generic deny text is asserted alongside the verdict.
-        async fn probe(
-            allowed_hosts: &[&str],
-            uri: &str,
-            host: Option<&str>,
-            origin: Option<&str>,
-        ) -> (StatusCode, String) {
-            let state = test_support::build_test_app_state_with_policy(
+    #[test]
+    fn norm_origin_strips_trailing_fqdn_dot() {
+        assert_eq!(norm_origin("https://example.com."), "https://example.com");
+        assert_eq!(
+            norm_origin("https://example.com.:443"),
+            "https://example.com"
+        );
+        assert_eq!(norm_origin("http://example.com.:80"), "http://example.com");
+        assert_eq!(
+            norm_origin("https://example.com.:8443"),
+            "https://example.com:8443"
+        );
+        // Symmetric with the Host gate.
+        assert_eq!(
+            norm_origin("https://example.com."),
+            format!("https://{}", norm_host("example.com."))
+        );
+    }
+
+    #[test]
+    fn origin_default_port_matches_portless_allowlist() {
+        let (_h, o) =
+            resolve_access_policy("127.0.0.1", 8080, &vecs(&["proxy.example.com"]), &[], None);
+        assert_eq!(
+            evaluate_access(
+                Some("proxy.example.com"),
+                Some("https://proxy.example.com:443"),
+                &vecs(&["proxy.example.com"]),
+                &o
+            ),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn norm_host_strips_trailing_dot() {
+        assert_eq!(norm_host("example.com."), "example.com");
+        assert_eq!(norm_host("example.com.:8080"), "example.com");
+        assert_eq!(norm_host("[::1]:8080"), "::1");
+    }
+
+    #[test]
+    fn trailing_dot_host_matches_allowlist() {
+        let (h, _o) =
+            resolve_access_policy("0.0.0.0", 8080, &vecs(&["aoe.example.com."]), &[], None);
+        assert!(h.contains(&"aoe.example.com".to_string()));
+        assert_eq!(
+            evaluate_access(Some("aoe.example.com."), None, &h, &[]),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn trailing_dot_origin_matches_allowlist() {
+        let (h, o) = resolve_access_policy("0.0.0.0", 8080, &vecs(&["aoe.example.com"]), &[], None);
+        assert_eq!(
+            evaluate_access(
+                Some("aoe.example.com."),
+                Some("https://aoe.example.com."),
+                &h,
+                &o
+            ),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn wildcard_bind_ipv6_forms_default_to_trio() {
+        for wild in ["::", "[::]"] {
+            let (h, _o) = resolve_access_policy(wild, 8080, &[], &[], None);
+            assert_eq!(
+                h,
+                vecs(&["localhost", "127.0.0.1", "::1"]),
+                "wildcard {wild}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn access_policy_rejects_unlisted_host_at_router() {
+        use tower::ServiceExt;
+        let state = test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vecs(&["localhost"]),
+            vecs(&["http://localhost:8080"]),
+            None,
+        );
+        let app = test_support::build_router_for_test(state);
+        let req = axum::http::Request::builder()
+            .uri("/api/sessions")
+            .header("host", "evil.com")
+            .extension(axum::extract::ConnectInfo(
+                "203.0.113.7:5555".parse::<std::net::SocketAddr>().unwrap(),
+            ))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn access_policy_rejects_cross_authority_ip_origin_at_router() {
+        use tower::ServiceExt;
+        let state = test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vecs(&["localhost", "192.168.1.5"]),
+            vecs(&["http://192.168.1.5:8080"]),
+            None,
+        );
+        let app = test_support::build_router_for_test(state);
+        let mut req = axum::http::Request::builder()
+            .uri("/api/sessions")
+            .header("host", "192.168.1.5:8080")
+            .header("origin", "http://192.168.1.6:8080")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(
+            "203.0.113.7:5555".parse::<std::net::SocketAddr>().unwrap(),
+        ));
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn access_policy_runs_before_auth() {
+        use tower::ServiceExt;
+        let remote: std::net::SocketAddr = "203.0.113.7:5555".parse().unwrap();
+        let make_state = || {
+            test_support::build_test_app_state_with_policy(
                 Vec::new(),
-                vecs(allowed_hosts),
+                vecs(&["localhost"]),
                 vecs(&["http://localhost:8080"]),
                 Some("secret-token".to_string()),
+            )
+        };
+
+        let app = test_support::build_router_for_test(make_state());
+        let mut bad = axum::http::Request::builder()
+            .uri("/api/sessions")
+            .header("host", "evil.com")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        bad.extensions_mut()
+            .insert(axum::extract::ConnectInfo(remote));
+        let resp = app.oneshot(bad).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "an unlisted Host must 403 before auth can 401"
+        );
+
+        let app = test_support::build_router_for_test(make_state());
+        let mut good = axum::http::Request::builder()
+            .uri("/api/sessions")
+            .header("host", "localhost")
+            .header("authorization", "Bearer secret-token")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        good.extensions_mut()
+            .insert(axum::extract::ConnectInfo(remote));
+        let resp = app.oneshot(good).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "a listed Host over plain HTTP reaches auth and the handler"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_http_off_host_reaches_auth_without_tls_gate() {
+        use axum::http::StatusCode;
+        use tower::ServiceExt;
+        for (peer, proto) in [
+            ("127.0.0.1:5555", None),
+            ("127.0.0.1:5555", Some("http")),
+            ("203.0.113.7:5555", None),
+            ("203.0.113.7:5555", Some("http")),
+            ("203.0.113.7:5555", Some("https")),
+        ] {
+            let state = test_support::build_test_app_state_with_policy_configured(
+                Vec::new(),
+                vecs(&["localhost"]),
+                Vec::new(),
+                None,
+                |state| state.behind_tunnel = true,
             );
-            let mut builder = axum::http::Request::builder().uri(uri);
-            for (name, value) in [("host", host), ("origin", origin)] {
-                if let Some(value) = value {
-                    builder = builder.header(name, value);
-                }
+            let mut request = axum::http::Request::builder()
+                .uri("/api/login/status")
+                .header("host", "localhost");
+            if let Some(proto) = proto {
+                request = request.header("x-forwarded-proto", proto);
             }
-            let mut req = builder.body(axum::body::Body::empty()).unwrap();
-            req.extensions_mut().insert(axum::extract::ConnectInfo(
-                "203.0.113.7:5555".parse::<std::net::SocketAddr>().unwrap(),
+            let mut request = request.body(axum::body::Body::empty()).unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                peer.parse::<std::net::SocketAddr>().unwrap(),
             ));
-            let resp = test_support::build_router_for_test(state)
-                .oneshot(req)
+            let response = test_support::build_router_for_test(state)
+                .oneshot(request)
                 .await
                 .unwrap();
-            let status = resp.status();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "{peer} with {proto:?} must not be gated by transport"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn denied_body_is_generic_for_host_and_origin() {
+        use tower::ServiceExt;
+        async fn body_of(resp: axum::response::Response) -> String {
             let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
                 .unwrap();
-            (status, String::from_utf8(bytes.to_vec()).unwrap())
+            String::from_utf8(bytes.to_vec()).unwrap()
         }
-        let denied = (
-            StatusCode::FORBIDDEN,
-            "forbidden: host or origin not allowed".to_string(),
-        );
-        let local: &[&str] = &["localhost"];
-        let api = "/api/sessions";
-
-        assert_eq!(probe(local, api, Some("evil.com"), None).await, denied);
-        assert_eq!(
-            probe(local, api, Some("localhost"), Some("https://evil.com")).await,
-            denied
-        );
-        // A listed Host or Origin clears the gate and lands on auth instead.
-        for origin in [None, Some("http://localhost:8080")] {
-            let (status, _) = probe(local, api, Some("localhost"), origin).await;
-            assert_eq!(status, StatusCode::UNAUTHORIZED, "origin {origin:?}");
-        }
-
-        // With no Host header the gate falls back to the absolute-form `:authority`.
-        let (status, _) = probe(
-            &["x.trycloudflare.com"],
-            "http://x.trycloudflare.com/api/sessions",
-            None,
-            None,
-        )
-        .await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert_eq!(
-            probe(
-                local,
-                "http://evil.trycloudflare.com/api/sessions",
+        let make_state = || {
+            test_support::build_test_app_state_with_policy(
+                Vec::new(),
+                vecs(&["localhost"]),
+                vecs(&["http://localhost:8080"]),
                 None,
-                None
             )
-            .await,
-            denied
+        };
+
+        let app = test_support::build_router_for_test(make_state());
+        let host_deny = axum::http::Request::builder()
+            .uri("/api/sessions")
+            .header("host", "evil.com")
+            .extension(axum::extract::ConnectInfo(
+                "203.0.113.7:5555".parse::<std::net::SocketAddr>().unwrap(),
+            ))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let host_body = body_of(app.oneshot(host_deny).await.unwrap()).await;
+
+        let app = test_support::build_router_for_test(make_state());
+        let origin_deny = axum::http::Request::builder()
+            .uri("/api/sessions")
+            .header("host", "localhost")
+            .header("origin", "https://evil.com")
+            .extension(axum::extract::ConnectInfo(
+                "203.0.113.7:5555".parse::<std::net::SocketAddr>().unwrap(),
+            ))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let origin_body = body_of(app.oneshot(origin_deny).await.unwrap()).await;
+
+        assert!(!host_body.contains("evil.com"));
+        assert_eq!(
+            host_body, origin_body,
+            "both deny reasons must return an identical, non-leaking body"
         );
+    }
+
+    #[tokio::test]
+    async fn listed_origin_passes_gate_to_auth() {
+        use tower::ServiceExt;
+        let remote: std::net::SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        let state = test_support::build_test_app_state_with_policy_configured(
+            Vec::new(),
+            vecs(&["localhost"]),
+            vecs(&["http://localhost:8080"]),
+            Some("secret-token".to_string()),
+            |state| state.behind_tunnel = true,
+        );
+        let app = test_support::build_router_for_test(state);
+        let mut req = axum::http::Request::builder()
+            .uri("/api/sessions")
+            .header("host", "localhost")
+            .header("origin", "http://localhost:8080")
+            .header("x-forwarded-proto", "https")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(remote));
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "a listed Origin must pass the gate and reach auth"
+        );
+    }
+
+    #[tokio::test]
+    async fn access_policy_authority_fallback_allows_listed() {
+        use tower::ServiceExt;
+        let remote: std::net::SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        let state = test_support::build_test_app_state_with_policy_configured(
+            Vec::new(),
+            vecs(&["x.trycloudflare.com"]),
+            Vec::new(),
+            Some("secret-token".to_string()),
+            |state| state.behind_tunnel = true,
+        );
+        let app = test_support::build_router_for_test(state);
+        // Absolute-form URI + no Host header: access_policy falls back to
+        // request.uri().authority() (the HTTP/2 :authority path).
+        let mut req = axum::http::Request::builder()
+            .uri("http://x.trycloudflare.com/api/sessions")
+            .header("x-forwarded-proto", "https")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(req.headers().get(axum::http::header::HOST).is_none());
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(remote));
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "an :authority in the allowlist passes the gate and reaches auth"
+        );
+    }
+
+    #[tokio::test]
+    async fn access_policy_authority_fallback_rejects_unlisted() {
+        use tower::ServiceExt;
+        let state = test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vecs(&["localhost"]),
+            Vec::new(),
+            None,
+        );
+        let app = test_support::build_router_for_test(state);
+        let req = axum::http::Request::builder()
+            .uri("http://evil.trycloudflare.com/api/sessions")
+            .extension(axum::extract::ConnectInfo(
+                "203.0.113.7:5555".parse::<std::net::SocketAddr>().unwrap(),
+            ))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
     }
 
     #[test]
     fn csp_parses_as_valid_header_value() {
         // Catches typos that would make the header unparseable.
+        // security_headers() calls `.parse().unwrap()` at request time;
+        // this test surfaces any regression at `cargo test` time instead.
         let parsed: axum::http::HeaderValue = CSP.parse().expect("CSP must parse");
         let rendered = parsed.to_str().expect("CSP must be ASCII");
         // Spot-check load-bearing directives so a future edit that

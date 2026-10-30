@@ -112,8 +112,10 @@
      from `theme.unread` (see resolved.rs); this default matches `zinc`. */
   --color-status-unread: #38bdf8;
   --color-status-error: #ef4444;
+  /* Text on a solid status-error fill: black or white, whichever reads (see resolved.rs). */
+  --color-text-on-status-error: #000000;
   /* Error as body text: projected as the theme error lifted until it clears
-     4.5:1 on surface-900 and -850 (see resolved.rs). This default is zinc's. */
+     4.5:1 on surface-900, -850 and the error banner's tint (see resolved.rs). This default is zinc's. */
   --color-status-error-text: #f26969;
   --color-status-starting: #f59e0b;
   --color-status-stopped: #52525b;
@@ -402,17 +404,19 @@ html[data-ios-standalone]:not([data-editing]) {
   margin: 0.75rem 0;
 }
 .acp-markdown .acp-table-block {
-  position: relative;
   margin: 0.75rem 0;
 }
-/* Hidden until hover or focus; touch has no hover, so it stays visible there. */
+/* Copy rows of a message, its text parts and its tables: hidden until hover or keyboard focus (touch has no hover,
+   so they stay visible there). Only keyboard focus counts: a clicked button keeps focus, which must not pin the row
+   open. Direct children only, so a hovered message does not reveal its parts' rows. */
 @media (hover: hover) and (pointer: fine) {
-  .acp-markdown .acp-table-copy {
+  .acp-copy-host > .acp-copy-reveal {
     opacity: 0;
   }
-  .acp-markdown .acp-table-block:hover .acp-table-copy,
-  .acp-markdown .acp-table-copy:focus-visible,
-  .acp-markdown .acp-table-copy[data-copied="true"] {
+  .acp-copy-host:hover > .acp-copy-reveal,
+  .acp-copy-host > .acp-copy-reveal:has(:focus-visible),
+  .acp-copy-host > .acp-copy-reveal[data-open="true"],
+  .acp-copy-host > .acp-copy-reveal[data-copied="true"] {
     opacity: 1;
   }
 }

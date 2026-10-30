@@ -3,7 +3,13 @@
 import type { Page } from "@playwright/test";
 
 import { test, expect } from "./helpers/mockedTest";
-import { mockAcpSession, openStructuredSession, agentMessageChunk, stopped } from "./helpers/acpMock";
+import {
+  mockAcpSession,
+  openStructuredSession,
+  agentMessageChunk,
+  stopped,
+  waitForComposerConnected,
+} from "./helpers/acpMock";
 
 function userPrompt(text: string) {
   return { UserPromptSent: { text } };
@@ -46,9 +52,8 @@ test("scrolling to the top auto-loads earlier messages", async ({ page }) => {
   await expect(page.getByText(`reply number ${TURNS - 1}`)).toBeVisible({ timeout: 10_000 });
   await expect(page.getByText("prompt number 0")).toHaveCount(0);
 
-  await page.getByTestId("acp-viewport").evaluate((el) => {
-    el.scrollTop = 0;
-  });
+  await page.getByTestId("acp-viewport").hover();
+  await page.mouse.wheel(0, -100_000);
   await expect(page.getByText("prompt number 0")).toBeVisible({ timeout: 10_000 });
 });
 
@@ -65,8 +70,21 @@ test("loads older events from the server when the loaded window is exhausted", a
   await openStructuredSession(page, mock);
 
   await expect(page.getByText("reply number 349")).toBeVisible({ timeout: 10_000 });
+  await waitForComposerConnected(page);
   await expect(page.getByText("prompt number 0")).toHaveCount(0);
 
-  await revealOldestTurn(page);
+  const olderPage = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    const before = Number(url.searchParams.get("before"));
+    return (
+      url.pathname.endsWith(`/sessions/${encodeURIComponent(mock.sessionId)}/acp/replay`) &&
+      url.searchParams.get("view") === "rows" &&
+      Number.isFinite(before) &&
+      before > 0 &&
+      before < Number.MAX_SAFE_INTEGER
+    );
+  });
+  const [response] = await Promise.all([olderPage, revealOldestTurn(page)]);
+  expect(response.status()).toBe(200);
   await expect(page.getByText("prompt number 0")).toBeVisible({ timeout: 10_000 });
 });

@@ -14,26 +14,31 @@ pub mod callback;
 pub(crate) mod create_progress;
 pub(crate) mod disk_watch;
 pub(crate) mod idle_reap;
+pub(crate) mod ingress;
 pub(crate) mod ip_discovery;
+pub mod lifecycle_feed;
 pub mod live_ws;
 pub mod login;
 mod mcp;
 mod pane;
 pub mod passkeys;
+pub(crate) mod peer;
 pub mod plugin_status;
+pub mod principal;
 pub mod push;
 pub mod push_send;
 pub mod rate_limit;
 pub(crate) mod reload;
 pub(crate) mod router;
-#[cfg(target_os = "linux")]
-pub(crate) mod runtime_uds;
+pub(crate) mod runtime;
 pub(crate) mod runtime_ws;
 mod secure_store;
 pub(crate) mod serve_snapshot;
 pub(crate) mod session_identity;
 pub(crate) mod session_service;
 pub(crate) mod session_spawn;
+pub(crate) mod session_status_ws;
+pub(crate) mod session_store;
 pub(crate) mod sleep_inhibit;
 pub(crate) mod startup;
 pub(crate) mod startup_recovery;
@@ -53,7 +58,6 @@ pub mod tunnel;
 /// `crate::server::` so existing supervisor/WS call sites keep resolving without churn.
 pub use crate::acp::protocol::AcpBroadcastFrame;
 pub(crate) use access::{is_untrusted_ip_literal, is_wildcard_bind, norm_host};
-pub(crate) use acp_events::{apply_status_intent, derive_acp_status};
 #[cfg(feature = "web")]
 pub use assets::web_build_id;
 
@@ -71,7 +75,7 @@ pub(crate) use sleep_inhibit::{
     SLEEP_INHIBIT_SNAPSHOT_ENABLED, SLEEP_INHIBIT_SNAPSHOT_SLOT_PRESENT,
 };
 pub(crate) use startup::resolve_auth_mode;
-pub use startup::{start_server, ServerConfig};
+pub(crate) use startup::{start_server, ServerConfig};
 pub use state::{AppState, CleanupDefaultsCache};
 pub(crate) use token::generate_token;
 pub use token::TokenManager;

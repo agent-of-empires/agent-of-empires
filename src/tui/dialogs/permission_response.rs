@@ -215,7 +215,7 @@ impl PermissionResponseDialog {
                 DialogResult::Continue
             }
             KeyCode::Right | KeyCode::Down | KeyCode::Tab => {
-                self.focused = (self.focused + 1) % self.choices.len();
+                self.focused = super::cycle_focus(self.focused, self.choices.len(), false);
                 DialogResult::Continue
             }
             // a/d mirror structured_view/input.rs; A offered only when the

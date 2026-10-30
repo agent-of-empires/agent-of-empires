@@ -40,7 +40,7 @@ pub struct AgentRegistry {
 }
 
 impl AgentRegistry {
-    /// One entry per tool with a published ACP server, plus aoe's own `aoe-agent`.
+    /// One entry per tool with a published ACP server, plus the built-in agent.
     pub fn with_defaults() -> Self {
         let claude_install = install_hint_for("claude-agent-acp").unwrap_or("(see project docs)");
         let claude_description =
@@ -152,9 +152,17 @@ pub fn inherited_acp_base(tool: &str, agent_detect_as: &HashMap<String, String>)
 /// "Codex couldn't start".
 pub fn display_name_for(agent: &str) -> Option<&'static str> {
     Some(match agent {
-        "claude" | "claude-code" => "Claude",
+        "claude" | "claude-code" => "Claude Code",
         "opencode" => "OpenCode",
-        "gemini" => "Gemini",
+        "gemini" => "Gemini CLI",
+        "cursor" => "Cursor",
+        "copilot" => "Copilot CLI",
+        "droid" => "Factory Droid",
+        "settl" => "Settl",
+        "hermes" => "Hermes",
+        "kiro" => "Kiro CLI",
+        "qwen" => "Qwen Code",
+        "antigravity" => "Antigravity CLI",
         "codex" => "Codex",
         "vibe" => "Mistral Vibe",
         "pi" => "Pi",
@@ -336,9 +344,12 @@ mod tests {
     }
 
     #[test]
-    fn every_default_agent_has_a_display_name() {
+    fn every_agent_has_a_display_name() {
         for (name, _) in AgentRegistry::with_defaults().list() {
             assert!(display_name_for(name).is_some(), "{name}");
+        }
+        for agent in crate::agents::AGENTS {
+            assert!(display_name_for(agent.name).is_some(), "{}", agent.name);
         }
     }
 

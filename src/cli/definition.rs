@@ -58,16 +58,27 @@ pub struct Cli {
     #[arg(short = 'p', long, global = true)]
     pub profile: Option<String>,
 
-    /// Select a daemon endpoint for read-only CLI commands or the TUI
+    /// Select a daemon endpoint for read-only CLI commands or the TUI.
     ///
-    /// Explicit CLI endpoints never fall back. `AOE_DAEMON_URL` discovery may
-    /// fall back to local storage before reaching a TCP peer, with a notice.
-    /// Authenticate CLI reads with `AOE_DAEMON_TOKEN` or `AOE_DAEMON_PASSPHRASE`;
-    /// TUI session lists support bearer tokens only. An unauthenticated daemon
-    /// needs neither. See the HTTP API reference for transport and fallback rules.
+    /// Explicit endpoints and `AOE_DAEMON_URL` never fall back to local storage
+    /// or start a local daemon. Authenticate with `AOE_DAEMON_TOKEN` or
+    /// `AOE_DAEMON_PASSPHRASE`. An unauthenticated daemon needs neither.
+    /// See the HTTP API reference for transport and authentication rules.
     // Keep the explicit flag separate from the optional environment endpoint.
     #[arg(long, global = true)]
     pub daemon_url: Option<String>,
+
+    /// Fail instead of starting a local daemon when none is running
+    ///
+    /// Also read from `AOE_NO_AUTOSTART=1`. Has no effect with `--daemon-url`
+    /// or `AOE_DAEMON_URL`, which never start a daemon.
+    #[arg(
+        long,
+        global = true,
+        env = "AOE_NO_AUTOSTART",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub no_autostart: bool,
 
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -229,6 +240,13 @@ pub enum Commands {
     /// builds that embed it
     Serve(ServeArgs),
 
+    /// Control the background aoe daemon; each verb is the matching `aoe serve`
+    /// flag (`--daemon`, `--stop`, `--status`, `--restart`)
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommands,
+    },
+
     /// Print the URL of a running `aoe serve` daemon
     Url(UrlArgs),
 
@@ -260,13 +278,10 @@ pub enum Commands {
     /// Update aoe to the latest release
     Update(UpdateArgs),
 
-    /// Run pending data migrations now, showing progress. A sandboxed session
-    /// moves its own agent store when it starts; use this to move every
-    /// eligible store at once instead. Trashed and archived sessions are
-    /// skipped; each moves when it is started, or restore or unarchive it
-    /// and run this again. Refuses while the aoe serve daemon runs; stop it
-    /// with `aoe serve --stop` first.
-    Migrate,
+    /// Run pending migrations or restore complete original lifecycle authority.
+    /// Stop the daemon with `aoe serve --stop` first. By default, also move
+    /// eligible sandbox stores and retry deferred ownership recovery.
+    Migrate(crate::cli::migrate::MigrateArgs),
 
     /// Generate shell completions
     Completion {
@@ -274,6 +289,42 @@ pub enum Commands {
         #[arg(value_enum)]
         shell: Shell,
     },
+}
+
+#[derive(Subcommand, Clone, Copy)]
+pub enum DaemonCommands {
+    /// Start the daemon in the background (`aoe serve --daemon`)
+    Start,
+    /// Stop the running daemon (`aoe serve --stop`)
+    Stop,
+    /// Print the daemon's PID, mode, URLs and log path, or remote reachability with `AOE_DAEMON_URL` (`aoe serve --status`)
+    Status,
+    /// Restart the daemon with its persisted launch config (`aoe serve --restart`)
+    Restart,
+}
+
+impl Commands {
+    /// Rewrites `aoe daemon <verb>` into the equivalent `aoe serve` command so
+    /// both spellings share every startup and gating path.
+    pub fn resolve_daemon_alias(self) -> Self {
+        let Commands::Daemon { command } = self else {
+            return self;
+        };
+        let flag = match command {
+            DaemonCommands::Start => "--daemon",
+            DaemonCommands::Stop => "--stop",
+            DaemonCommands::Status => "--status",
+            DaemonCommands::Restart => "--restart",
+        };
+        let args = ServeCli::parse_from(["serve", flag]).args;
+        Commands::Serve(args)
+    }
+}
+
+#[derive(Parser)]
+struct ServeCli {
+    #[command(flatten)]
+    args: ServeArgs,
 }
 
 pub const CLI_COMMAND_NAMES: &[&str] = &[
@@ -288,6 +339,7 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
     "send",
     "status",
     "killall",
+    "daemon",
     "session",
     "group",
     "plugin",
@@ -326,6 +378,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::Send(_) => "send",
         Commands::Status(_) => "status",
         Commands::Killall(_) => "killall",
+        Commands::Daemon { .. } => "daemon",
         Commands::Stop { .. } => return None,
         Commands::Session { .. } => "session",
         Commands::Group { .. } => "group",
@@ -350,7 +403,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::ExtractSessionId(_) => return None,
         Commands::Uninstall(_) => "uninstall",
         Commands::Update(_) => "update",
-        Commands::Migrate => "migrate",
+        Commands::Migrate(_) => "migrate",
         Commands::Completion { .. } => "completion",
     })
 }
@@ -359,6 +412,35 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn daemon_verbs_resolve_to_the_serve_lifecycle_flags() {
+        for (verb, expect) in [
+            ("start", "--daemon"),
+            ("stop", "--stop"),
+            ("status", "--status"),
+            ("restart", "--restart"),
+        ] {
+            let alias = Cli::try_parse_from(["aoe", "daemon", verb]).expect("parse");
+            let Some(Commands::Serve(got)) = alias.command.map(Commands::resolve_daemon_alias)
+            else {
+                panic!("daemon {verb} did not resolve to serve");
+            };
+            let Some(Commands::Serve(want)) = Cli::try_parse_from(["aoe", "serve", expect])
+                .expect("parse")
+                .command
+            else {
+                unreachable!()
+            };
+            assert_eq!(
+                (got.daemon, got.stop, got.status, got.restart),
+                (want.daemon, want.stop, want.status, want.restart),
+                "daemon {verb}"
+            );
+            assert_eq!(got.resolved_port(), want.resolved_port());
+            assert_eq!(got.host, want.host);
+        }
+    }
 
     #[test]
     fn command_name_is_allowlisted_and_identifier_safe() {

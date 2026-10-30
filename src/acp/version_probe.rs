@@ -294,8 +294,8 @@ mod tests {
             ("v0.37.0", true),
             // A stale global install that used to clear the floor.
             ("0.55.0", true),
-            ("0.82.0", false),
-            ("0.83.0", false),
+            ("0.98.0", true),
+            ("0.99.1", false),
             ("version=0.37.0", false),
             ("0.37.0-beta.1", true),
             ("junk", false),
@@ -355,6 +355,7 @@ mod tests {
             custom_instruction: None,
             container_workdir: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
         });
         assert!(gates_needed_by_instances(&[sandboxed.clone()]).is_empty());
 

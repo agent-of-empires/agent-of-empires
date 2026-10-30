@@ -3,19 +3,6 @@
 use super::*;
 use crate::agents::SessionCaptureBackend;
 
-/// Native selectors besides the resume strategy's own flags that make Claude
-/// pick its conversation itself.
-const CLAUDE_SELECTORS: &[&str] = &[
-    "-c",
-    "--continue",
-    "-r",
-    "--from-pr",
-    "--teleport",
-    "--cloud",
-    "--remote",
-    "--fork-session",
-];
-
 pub(super) fn read_session_settings(
     path: &Path,
 ) -> anyhow::Result<Option<serde_json::Map<String, serde_json::Value>>> {
@@ -40,8 +27,23 @@ pub(super) fn read_session_settings(
 impl Instance {
     /// Explicit intents win; default intent keeps a stored id unless its backend rotated.
     /// Returns the id, resume status and whether the native API created a fresh id.
+    #[cfg(test)]
     fn acquire_session_id(
         &mut self,
+        execution: Option<&super::execution::NativeExecution>,
+        launch_context: &super::execution::AgentLaunchContext<'_>,
+    ) -> (Option<String>, bool, bool) {
+        let file_watch = crate::file_watch::FileWatchService::noop();
+        self.acquire_session_id_in(
+            CaptureStorage::Profiles(&file_watch),
+            execution,
+            launch_context,
+        )
+    }
+
+    fn acquire_session_id_in(
+        &mut self,
+        stores: CaptureStorage<'_>,
         execution: Option<&super::execution::NativeExecution>,
         launch_context: &super::execution::AgentLaunchContext<'_>,
     ) -> (Option<String>, bool, bool) {
@@ -67,7 +69,7 @@ impl Instance {
         );
 
         let native_created = std::cell::Cell::new(false);
-        let result = self.acquire_session_id_with(execution, &|path| {
+        let result = self.acquire_session_id_with_in(stores, execution, &|path| {
             if pin_pi {
                 return Some(crate::session::capture::generate_session_uuid());
             }
@@ -112,8 +114,23 @@ impl Instance {
     /// tests can drive the fresh-launch arms without a real opencode binary,
     /// network, or installed pi. Production wraps this with the live preassign
     /// helper and the Pi pin.
+    #[cfg(test)]
     pub(super) fn acquire_session_id_with(
         &mut self,
+        execution: Option<&super::execution::NativeExecution>,
+        mint_fresh_id: &dyn Fn(&str) -> Option<String>,
+    ) -> (Option<String>, bool) {
+        let file_watch = crate::file_watch::FileWatchService::noop();
+        self.acquire_session_id_with_in(
+            CaptureStorage::Profiles(&file_watch),
+            execution,
+            mint_fresh_id,
+        )
+    }
+
+    fn acquire_session_id_with_in(
+        &mut self,
+        stores: CaptureStorage<'_>,
         execution: Option<&super::execution::NativeExecution>,
         mint_fresh_id: &dyn Fn(&str) -> Option<String>,
     ) -> (Option<String>, bool) {
@@ -139,7 +156,7 @@ impl Instance {
             ResumeIntent::Cleared => {
                 self.set_agent_conversation(None, None, None);
                 self.resume_probe_failed_sid = None;
-                let session_id = self.fresh_launch_session_id(backend, mint_fresh_id);
+                let session_id = self.fresh_launch_session_id(backend, execution, mint_fresh_id);
                 self.set_agent_conversation(session_id.clone(), None, None);
                 return (session_id, false);
             }
@@ -183,7 +200,7 @@ impl Instance {
         }
 
         if let Some(stored) = self.agent_session_id.clone() {
-            let stored = match self.capture_freshest_conversation() {
+            let stored = match self.capture_freshest_conversation_in(stores) {
                 Some(observation) => {
                     tracing::info!(target: "session.store", stale = %stored, fresh = %observation.sid, tool = %self.tool,
                         "Replacing stored conversation with fresher live observation");
@@ -239,7 +256,7 @@ impl Instance {
 
         let tmux_exists = self.tmux_session().is_ok_and(|s| s.exists());
         if tmux_exists {
-            if let Some(observation) = self.try_retroactive_capture() {
+            if let Some(observation) = self.try_retroactive_capture_in(stores).ok().flatten() {
                 tracing::info!(target: "session.store",
                     "Retroactive capture found session ID for {}: {}",
                     self.tool,
@@ -250,8 +267,7 @@ impl Instance {
             }
         }
 
-        let session_id = self.fresh_launch_session_id(backend, mint_fresh_id);
-
+        let session_id = self.fresh_launch_session_id(backend, execution, mint_fresh_id);
         if let Some(ref id) = session_id {
             tracing::debug!(target: "session.store", "Session ID for {}: {}", self.tool, id);
             self.set_agent_conversation(session_id.clone(), None, None);
@@ -260,16 +276,18 @@ impl Instance {
         (session_id, false)
     }
 
-    /// Mint the session id for a brand-new launch. Claude and eligible Pi
-    /// launches pin a UUID. Direct host OpenCode launches pre-create a session
-    /// automatically. A preassign failure returns no id rather than guessing
-    /// from the shared store. Other supported backends capture after launch.
+    /// Preassign with known execution identity; otherwise capture the agent's publication.
     fn fresh_launch_session_id(
         &self,
         backend: Option<crate::agents::SessionCaptureBackend>,
+        execution: Option<&super::execution::NativeExecution>,
         mint_fresh_id: &dyn Fn(&str) -> Option<String>,
     ) -> Option<String> {
-        match backend? {
+        let backend = backend?;
+        if execution.is_none() && self.resolved_agent().is_none() {
+            return None;
+        }
+        match backend {
             crate::agents::SessionCaptureBackend::Claude => Some(generate_session_uuid()),
             crate::agents::SessionCaptureBackend::OpenCode
             | crate::agents::SessionCaptureBackend::Pi => mint_fresh_id(&self.project_path),
@@ -279,15 +297,21 @@ impl Instance {
 
     /// Preassignment requires a directly mirrorable host OpenCode launch.
     fn opencode_preassign_enabled(&self) -> bool {
-        !self.is_sandboxed()
-            && crate::session::config::profile_config::resolve_config_or_warn(
+        if self.is_sandboxed()
+            || !crate::session::config::profile_config::resolve_config_or_warn(
                 &self.effective_profile(),
             )
             .session
             .opencode_preassign_session_id
-            && self.opencode_launch_mirrorable_by_ambient_serve()
+        {
+            return false;
+        }
+        self.opencode_launch_mirrorable_by_ambient_serve()
     }
 
+    /// Whether the ephemeral `opencode serve` used for preassignment runs the
+    /// same binary as the real launch. The caller passes the resolved launch
+    /// environment to both processes so their data-store routing also matches.
     fn opencode_launch_mirrorable_by_ambient_serve(&self) -> bool {
         self.resolved_agent().is_some_and(|agent| {
             agent.name == "opencode" && self.launch_invokes_resolved_agent_directly(agent)
@@ -380,6 +404,14 @@ impl Instance {
         }
     }
 
+    /// Best-effort backfill of a missing `agent_session_id` during a read-only
+    /// CLI command.
+    ///
+    /// Eligibility requires default intent, an active live pane, no competing
+    /// id-less session for the same tool and cwd, and lifecycle ownership. The
+    /// declared capture context remains authoritative: pane-scoped sources may
+    /// publish their own id, while managed stores still require the in-memory
+    /// launch floor and exclusive lease. A miss or CAS race is a silent no-op.
     fn needs_session_id_backfill(&self) -> bool {
         self.agent_session_id.is_none()
             && self.resume_intent.is_default()
@@ -397,7 +429,10 @@ impl Instance {
         profile: &str,
         contended: &HashSet<(String, String)>,
     ) {
-        if !self.self_heal_row_is_eligible(contended) || !self.tmux_alive_cached() {
+        if !self.self_heal_row_is_eligible(contended) {
+            return;
+        }
+        if !self.tmux_alive_cached() {
             return;
         }
         let file_watch = self.resolve_file_watch();
@@ -430,11 +465,14 @@ impl Instance {
             return;
         };
         let expected = self.conversation_state();
-        let captured = self.try_retroactive_capture();
-        let applied = captured.as_ref().is_some_and(|captured| {
-            self.resume_probe_failed_sid.as_deref() != Some(captured.sid.as_str())
-                && persist_session_to_storage(profile, &self.id, captured, &expected, &file_watch)
-                    == SidWrite::Applied
+        let captured = self
+            .try_retroactive_capture_in(CaptureStorage::Profiles(&file_watch))
+            .ok()
+            .flatten();
+        let commit = captured.as_ref().and_then(|captured| {
+            (self.resume_probe_failed_sid.as_deref() != Some(captured.sid.as_str())).then(|| {
+                persist_session_to_storage(profile, &self.id, captured, &expected, &file_watch)
+            })
         });
         let released = storage.update(|instances, _groups| {
             let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
@@ -453,11 +491,11 @@ impl Instance {
         }
         self.lifecycle_generation = generation;
         self.lifecycle_reservation = None;
-        if applied {
+        if let Some(commit) = commit.filter(|commit| commit.outcome == SidWrite::Applied) {
             if let Some(observation) = captured {
                 self.apply_conversation_observation(&observation);
             }
-            self.resume_probe_failed_sid = None;
+            self.resume_probe_failed_sid = commit.failed_sid;
             tracing::info!(
                 target: "session.store",
                 instance = %self.id,
@@ -473,7 +511,7 @@ impl Instance {
         now: std::time::Instant,
     ) -> bool {
         self.needs_session_id_backfill()
-            && self.poller_repair.due(now)
+            && self.capture_poller.repair().due(now)
             && !self.has_live_agent_pane_in(live)
     }
 
@@ -490,26 +528,41 @@ impl Instance {
             return false;
         }
         // A missing publication must not acquire and persist a Capture reservation.
-        if self.try_retroactive_capture().is_some_and(|observation| {
-            observation.execution.as_ref() == self.active_execution.as_ref()
-                && self.resume_probe_failed_sid.as_deref() != Some(observation.sid.as_str())
-        }) {
+        let file_watch = crate::file_watch::FileWatchService::noop();
+        if self
+            .try_retroactive_capture_in(CaptureStorage::Profiles(&file_watch))
+            .ok()
+            .flatten()
+            .is_some_and(|observation| {
+                observation.execution.as_ref() == self.active_execution.as_ref()
+                    && self.resume_probe_failed_sid.as_deref() != Some(observation.sid.as_str())
+            })
+        {
             let profile = self.effective_profile();
             self.self_heal_session_id(&profile, contended);
         }
         // Only a released, applied CAS fills the previously missing id.
         if self.agent_session_id.is_some() {
-            self.poller_repair.reset();
+            self.capture_poller.reset_repair();
             true
         } else {
-            self.poller_repair.reprobe(std::time::Instant::now());
+            self.capture_poller.reprobe(std::time::Instant::now());
             false
         }
     }
 
     /// A newly observed native conversation attributed to this execution.
+    #[cfg(test)]
     pub(crate) fn capture_freshest_conversation(
         &self,
+    ) -> Option<crate::session::poller::SessionIdObservation> {
+        let file_watch = crate::file_watch::FileWatchService::noop();
+        self.capture_freshest_conversation_in(CaptureStorage::Profiles(&file_watch))
+    }
+
+    pub(crate) fn capture_freshest_conversation_in(
+        &self,
+        stores: CaptureStorage<'_>,
     ) -> Option<crate::session::poller::SessionIdObservation> {
         if self.is_sandboxed()
             && !crate::migrations::v033_isolate_sandbox_content::instance_ready(self).ok()?
@@ -524,7 +577,9 @@ impl Instance {
             )?,
             SessionCaptureBackend::Pi => self.pi_published_conversation(false)?,
             SessionCaptureBackend::PrimeAgent => self.prime_published_conversation()?,
-            _ => self.try_retroactive_capture()?,
+            // Claude and the sidecar backend read the sidecar in every context,
+            // so the guarded arm above already answers for them.
+            _ => self.try_retroactive_capture_in(stores).ok()??,
         };
         if self.is_capture_excluded(&observation.sid, observation.source()) {
             return None;
@@ -538,9 +593,12 @@ impl Instance {
         Some(observation)
     }
 
-    /// Whether to emit the `existing` resume arm. A Pi id AoE minted takes the
-    /// pinning arm instead: `--session-id` recreates a never-prompted conversation
-    /// that `--session` would exit 1 on. User pins keep `--session`.
+    /// Whether to emit the `existing` arm of [`crate::agents::ResumeStrategy`].
+    ///
+    /// It tracks `is_existing` except for Pi on a pinnable binary, where the
+    /// pinning arm serves both: pi writes its session file on the first
+    /// message, so a pane pinned and never prompted holds an id `--session`
+    /// exits 1 on, and `--session-id` recreates it.
     pub(super) fn resume_flag_arm_is_existing(
         &self,
         execution: Option<&super::execution::NativeExecution>,
@@ -554,11 +612,14 @@ impl Instance {
             |execution| execution.agent.name == "pi",
         ) && pi_pinnable
             && !explicitly_pinned
-            && session_id.is_some_and(|sid| Uuid::parse_str(sid).is_ok());
+            && session_id.is_some_and(|sid| uuid::Uuid::parse_str(sid).is_ok());
         is_existing && !takes_pinning_arm
     }
 
-    /// Why this row can never resume; mirrors what `apply_session_flags` refuses.
+    /// Why this row can never resume, decided from the agent registry and the
+    /// launch shape alone. Reports what `apply_session_flags` below actually
+    /// refuses, so the availability the API and TUI render cannot drift from
+    /// the launch line.
     fn terminal_resume_static_unavailable(&self) -> Option<ResumeStaticUnavailable> {
         let Some(agent) = self
             .default_selector_agent()
@@ -582,6 +643,13 @@ impl Instance {
         None
     }
 
+    fn terminal_resume_explicit_target_invalid(&self) -> bool {
+        matches!(
+            &self.resume_intent,
+            ResumeIntent::Use(target) if !is_valid_session_id(target)
+        )
+    }
+
     pub(crate) fn terminal_context_resume_cached(&self) -> TerminalContextResume {
         self.terminal_context_resume_with_runtime_source(|| {
             self.tmux_session()
@@ -594,24 +662,24 @@ impl Instance {
         &self,
         runtime_source: impl FnOnce() -> crate::tmux::SessionExistence,
     ) -> TerminalContextResume {
-        match (
-            self.terminal_resume_static_unavailable(),
-            &self.resume_intent,
-        ) {
-            (Some(ResumeStaticUnavailable::Agent), _) => TerminalContextResume::AgentUnsupported,
-            (Some(ResumeStaticUnavailable::Sandbox), _) => {
-                TerminalContextResume::SandboxUnsupported
+        if let Some(unavailable) = self.terminal_resume_static_unavailable() {
+            return match unavailable {
+                ResumeStaticUnavailable::Agent => TerminalContextResume::AgentUnsupported,
+                ResumeStaticUnavailable::Sandbox => TerminalContextResume::SandboxUnsupported,
+                ResumeStaticUnavailable::Command => TerminalContextResume::CommandUnsupported,
+            };
+        }
+        match &self.resume_intent {
+            ResumeIntent::Cleared => TerminalContextResume::ForcedFresh,
+            ResumeIntent::Fork { .. } => TerminalContextResume::ForkPending,
+            ResumeIntent::Use(_) => {
+                if self.terminal_resume_explicit_target_invalid() {
+                    TerminalContextResume::InvalidTarget
+                } else {
+                    TerminalContextResume::Available
+                }
             }
-            (Some(ResumeStaticUnavailable::Command), _) => {
-                TerminalContextResume::CommandUnsupported
-            }
-            (None, ResumeIntent::Cleared) => TerminalContextResume::ForcedFresh,
-            (None, ResumeIntent::Fork { .. }) => TerminalContextResume::ForkPending,
-            (None, ResumeIntent::Use(target)) if !is_valid_session_id(target) => {
-                TerminalContextResume::InvalidTarget
-            }
-            (None, ResumeIntent::Use(_)) => TerminalContextResume::Available,
-            (None, ResumeIntent::Default) => {
+            ResumeIntent::Default => {
                 if self.agent_session_id.is_some()
                     && self.agent_session_id == self.resume_probe_failed_sid
                 {
@@ -627,7 +695,6 @@ impl Instance {
         }
     }
 
-    /// A native session selector the command already carries, if any.
     fn existing_session_selector(&self, words: &[String]) -> Option<String> {
         let agent = self.default_selector_agent()?;
         let strategy = agent.session_support.as_ref()?.resume;
@@ -642,13 +709,22 @@ impl Instance {
                         .is_some_and(|rest| rest.starts_with('='))
             })
         };
-        let claude_selectors = if agent.name == "claude" {
-            CLAUDE_SELECTORS
-        } else {
-            &[]
-        };
-        if let Some(selector) = claude_selectors.iter().find(|flag| flag_present(flag)) {
-            return Some(selector.to_string());
+        if agent.name == "claude" {
+            if let Some(selector) = [
+                "-c",
+                "--continue",
+                "-r",
+                "--from-pr",
+                "--teleport",
+                "--cloud",
+                "--remote",
+                "--fork-session",
+            ]
+            .into_iter()
+            .find(|selector| flag_present(selector))
+            {
+                return Some(selector.to_string());
+            }
         }
         match strategy {
             crate::agents::ResumeStrategy::Flag(flag) => {
@@ -669,15 +745,42 @@ impl Instance {
     }
 
     /// Splice resume or fork flags into `cmd`; returns whether this launch resumes.
+    #[cfg(test)]
     pub(super) fn apply_session_flags(
         &mut self,
         cmd: &mut String,
-        context: &str,
         agent: Option<&'static crate::agents::AgentDef>,
         execution: Option<&super::execution::NativeExecution>,
         launch_context: &super::execution::AgentLaunchContext<'_>,
         expected: &mut ConversationState,
     ) -> Result<bool> {
+        let file_watch = crate::file_watch::FileWatchService::noop();
+        self.apply_session_flags_in(
+            CaptureStorage::Profiles(&file_watch),
+            cmd,
+            agent,
+            execution,
+            launch_context,
+            expected,
+        )
+    }
+
+    pub(super) fn apply_session_flags_in(
+        &mut self,
+        stores: CaptureStorage<'_>,
+        cmd: &mut String,
+        agent: Option<&'static crate::agents::AgentDef>,
+        execution: Option<&super::execution::NativeExecution>,
+        launch_context: &super::execution::AgentLaunchContext<'_>,
+        expected: &mut ConversationState,
+    ) -> Result<bool> {
+        let context = if self.is_sandboxed() {
+            "sandboxed"
+        } else if self.command.is_empty() {
+            "host agent"
+        } else {
+            "host custom"
+        };
         let agent = execution
             .map(|execution| execution.agent)
             .or(agent)
@@ -705,6 +808,10 @@ impl Instance {
             return Ok(false);
         }
         if execution.is_none() && !self.supports_native_resume() {
+            if matches!(self.resume_intent, ResumeIntent::Cleared) {
+                self.set_agent_conversation(None, None, None);
+                self.resume_probe_failed_sid = None;
+            }
             anyhow::ensure!(
                 !matches!(
                     self.resume_intent,
@@ -793,9 +900,11 @@ impl Instance {
             );
             return Ok(false);
         }
+        // Read before acquisition: a Use intent marks an id the user pinned
+        // rather than one AoE minted or captured.
         let explicitly_pinned = matches!(self.resume_intent, ResumeIntent::Use(_));
         let (mut session_id, is_existing, native_created) =
-            self.acquire_session_id(execution, launch_context);
+            self.acquire_session_id_in(stores, execution, launch_context);
 
         if let Some(path) = execution.and_then(|execution| execution.pi_transcript_path.as_ref()) {
             self.set_agent_conversation(
@@ -842,6 +951,7 @@ impl Instance {
                 return Ok(true);
             }
         }
+
         if flag_arm_is_existing
             && !explicitly_pinned
             && session_id.is_some()
@@ -901,71 +1011,31 @@ impl Instance {
     }
 
     /// Persist an ambiguous resume-probe failure without clearing the durable
-    /// sid; the CAS guard keeps peer sid changes authoritative.
-    pub(super) fn mark_resume_probe_failed(&mut self, profile: &str, sid: &str) -> SidWrite {
-        let storage =
-            match crate::session::storage::Storage::new(profile, self.resolve_file_watch()) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(target: "session.store",
-                        "Failed to create storage for resume-probe failure marker for {}: {}",
-                        self.id,
-                        e
-                    );
-                    return SidWrite::Failed;
-                }
-            };
-
-        let outcome = storage.update(|instances, _groups| {
-            let Some(inst) = instances.iter_mut().find(|i| i.id == self.id) else {
-                return Ok(SidWrite::Failed);
-            };
-            if inst.agent_session_id.as_deref() != Some(sid) {
-                tracing::warn!(target: "session.store",
-                    instance_id = %self.id,
-                    expected_sid = %sid,
-                    disk_sid = ?inst.agent_session_id,
-                    "sid CAS mismatch in resume-probe failure marker; skipping write"
-                );
-                return Ok(SidWrite::Skipped);
+    /// resume sid. The CAS guard keeps peer sid changes authoritative.
+    pub(super) fn mark_resume_probe_failed(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+        sid: &str,
+    ) -> Result<()> {
+        storage.update(|rows, _| {
+            let row = rows
+                .iter_mut()
+                .find(|row| row.id == self.id)
+                .ok_or(LifecycleReservationError::Superseded)?;
+            if row.agent_session_id.as_deref() == Some(sid) {
+                row.resume_probe_failed_sid = Some(sid.to_owned());
             }
-            inst.resume_probe_failed_sid = Some(sid.to_string());
-            Ok(SidWrite::Applied)
-        });
-
-        match outcome {
-            Ok(write @ (SidWrite::Applied | SidWrite::Skipped)) => {
-                if let Some(disk) = storage
-                    .load()
-                    .ok()
-                    .and_then(|insts| insts.into_iter().find(|i| i.id == self.id))
-                {
-                    self.agent_session_id = disk.agent_session_id;
-                    self.resume_intent = disk.resume_intent;
-                    self.resume_probe_failed_sid = disk.resume_probe_failed_sid;
-                }
-                write
-            }
-            Ok(SidWrite::Failed) => {
-                tracing::warn!(target: "session.store",
-                    "Resume-probe failure marker found no instance row for {}", self.id);
-                SidWrite::Failed
-            }
-            // The closure above writes a marker on the caller's own row, so it can
-            // neither lose a peer-owned sid nor meet a foreign pin. Fail closed if
-            // that ever stops holding rather than reloading a refusal we cannot act on.
-            Ok(refused @ (SidWrite::OwnershipConflict | SidWrite::PinnedForeign)) => {
-                tracing::warn!(target: "session.store",
-                    instance = %self.id, sid, ?refused,
-                    "Resume-probe failure marker hit an unexpected refusal");
-                SidWrite::Failed
-            }
-            Err(e) => {
-                tracing::warn!(target: "session.store",
-                    "Failed to mark resume-probe failure for {}: {}", self.id, e);
-                SidWrite::Failed
-            }
-        }
+            Ok(())
+        })?;
+        let disk = storage
+            .load()?
+            .into_iter()
+            .find(|row| row.id == self.id)
+            .ok_or(LifecycleReservationError::Superseded)?;
+        self.agent_session_id = disk.agent_session_id;
+        self.resume_intent = disk.resume_intent;
+        self.resume_probe_failed_sid = disk.resume_probe_failed_sid;
+        Ok(())
     }
 }
 
@@ -1008,7 +1078,6 @@ mod tests {
             let mut cmd = format!("opencode {args}");
             let result = inst.apply_session_flags(
                 &mut cmd,
-                "test",
                 Some(agent),
                 None,
                 &super::execution::AgentLaunchContext::host(
@@ -1126,7 +1195,6 @@ mod tests {
         assert!(!inst
             .apply_session_flags(
                 &mut cmd,
-                "test",
                 crate::agents::get_agent("claude"),
                 None,
                 &super::execution::AgentLaunchContext::host(
@@ -1176,7 +1244,6 @@ mod tests {
         assert!(!fresh
             .apply_session_flags(
                 &mut cmd,
-                "test",
                 None,
                 None,
                 &super::execution::AgentLaunchContext::host(
@@ -1194,7 +1261,6 @@ mod tests {
         assert!(fresh
             .apply_session_flags(
                 &mut cmd,
-                "test",
                 None,
                 None,
                 &super::execution::AgentLaunchContext::host(
@@ -1207,165 +1273,6 @@ mod tests {
                 &mut fresh.conversation_state()
             )
             .unwrap());
-    }
-
-    #[test]
-    #[serial]
-    fn default_bare_alias_pins_and_resumes_without_execution_attestation() {
-        const PROFILE: &str = "legacy-default-claude-wrapper";
-        let root = tempfile::tempdir().unwrap();
-        let _app = crate::session::test_support::isolate_app_dir_at(&root.path().join("app"));
-        let profile_path =
-            crate::session::config::profile_config::get_profile_config_path(PROFILE).unwrap();
-        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            profile_path,
-            "[session.agent_detect_as]\nwork-claude = \"claude\"\n",
-        )
-        .unwrap();
-        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(PROFILE);
-        let _home = EnvGuard::set(&[
-            ("HOME", root.path().to_path_buf()),
-            ("CLAUDE_CONFIG_DIR", root.path().join(".claude")),
-        ]);
-        let mut inst = tool_instance("work-claude", root.path().to_str().unwrap());
-        inst.source_profile = PROFILE.into();
-        inst.command = "work-claude".into();
-        assert!(inst.execution_agent().is_err());
-        let mut first = inst.command.clone();
-        assert!(!inst
-            .apply_session_flags(
-                &mut first,
-                "test",
-                None,
-                None,
-                &super::execution::AgentLaunchContext::host(
-                    inst.default_selector_agent(),
-                    inst.default_selector_agent()
-                        .and_then(|agent| inst.host_agent_command(agent, None))
-                        .as_ref()
-                ),
-                &mut inst.conversation_state()
-            )
-            .unwrap());
-        let sid = inst.agent_session_id.clone().expect("fresh Claude pin");
-        assert_eq!(first, format!("work-claude --session-id {sid}"));
-
-        let canonical_project = std::fs::canonicalize(&inst.project_path).unwrap();
-        let encoded = crate::session::capture::encode_claude_project_path(
-            &canonical_project.to_string_lossy(),
-        );
-        let project = root.path().join(".claude/projects").join(encoded);
-        std::fs::create_dir_all(&project).unwrap();
-        std::fs::write(project.join(format!("{sid}.jsonl")), "{}\n").unwrap();
-        let mut resumed = inst.command.clone();
-        assert!(inst
-            .apply_session_flags(
-                &mut resumed,
-                "test",
-                None,
-                None,
-                &super::execution::AgentLaunchContext::host(
-                    inst.default_selector_agent(),
-                    inst.default_selector_agent()
-                        .and_then(|agent| inst.host_agent_command(agent, None))
-                        .as_ref()
-                ),
-                &mut inst.conversation_state()
-            )
-            .unwrap());
-        assert_eq!(resumed, format!("work-claude --resume {sid}"));
-        for intent in [
-            ResumeIntent::Use(sid.clone()),
-            ResumeIntent::Fork { from: sid.clone() },
-        ] {
-            inst.resume_intent = intent;
-            let mut command = inst.command.clone();
-            assert!(inst
-                .apply_session_flags(
-                    &mut command,
-                    "test",
-                    None,
-                    None,
-                    &super::execution::AgentLaunchContext::host(
-                        inst.default_selector_agent(),
-                        inst.default_selector_agent()
-                            .and_then(|agent| inst.host_agent_command(agent, None))
-                            .as_ref()
-                    ),
-                    &mut inst.conversation_state()
-                )
-                .is_err());
-            assert_eq!(command, "work-claude");
-        }
-        inst.resume_intent = ResumeIntent::Default;
-        for unsafe_command in [
-            "ssh -t host claude",
-            "/opt/work-claude",
-            "work-claude | cat",
-            "work-claude --",
-        ] {
-            inst.command = unsafe_command.into();
-            assert!(!inst.supports_native_resume(), "{unsafe_command}");
-            let mut command = unsafe_command.to_string();
-            assert!(!inst
-                .apply_session_flags(
-                    &mut command,
-                    "test",
-                    None,
-                    None,
-                    &super::execution::AgentLaunchContext::host(
-                        inst.default_selector_agent(),
-                        inst.default_selector_agent()
-                            .and_then(|agent| inst.host_agent_command(agent, None))
-                            .as_ref()
-                    ),
-                    &mut inst.conversation_state()
-                )
-                .unwrap());
-            assert_eq!(command, unsafe_command);
-        }
-        inst.command = "codex".into();
-        assert!(inst.legacy_default_selector_agent().is_none());
-        inst.command = "work-claude".into();
-        inst.extra_args = "--resume external".into();
-        let mut conflict = "work-claude --resume external".to_string();
-        assert!(inst
-            .apply_session_flags(
-                &mut conflict,
-                "test",
-                None,
-                None,
-                &super::execution::AgentLaunchContext::host(
-                    inst.default_selector_agent(),
-                    inst.default_selector_agent()
-                        .and_then(|agent| inst.host_agent_command(agent, None))
-                        .as_ref()
-                ),
-                &mut inst.conversation_state()
-            )
-            .is_err());
-        let mut launched = tool_instance("work-claude", root.path().to_str().unwrap());
-        launched.source_profile = PROFILE.into();
-        launched.command = "work-claude".into();
-        let fresh = launched
-            .prepare_launch_command(launched.conversation_state())
-            .unwrap();
-        let launched_sid = launched.agent_session_id.clone().unwrap();
-        assert!(!fresh.is_existing);
-        assert!(fresh
-            .command
-            .unwrap()
-            .contains(&format!("work-claude --session-id {launched_sid}")));
-        std::fs::write(project.join(format!("{launched_sid}.jsonl")), "{}\n").unwrap();
-        let restart = launched
-            .prepare_launch_command(launched.conversation_state())
-            .unwrap();
-        assert!(restart.is_existing);
-        assert!(restart
-            .command
-            .unwrap()
-            .contains(&format!("work-claude --resume {launched_sid}")));
     }
 
     #[test]
@@ -1429,25 +1336,11 @@ work-opencode = "opencode"
             assert_eq!((sid, existing), (Some(SID.into()), true), "{tool}");
             assert_eq!(inst.agent_session_id.as_deref(), Some(SID), "{tool}");
             if tool == "work-claude" {
-                let mut command = tool.to_string();
-                assert!(inst
-                    .apply_session_flags(
-                        &mut command,
-                        "test",
-                        None,
-                        None,
-                        &super::execution::AgentLaunchContext::host(
-                            inst.default_selector_agent(),
-                            inst.default_selector_agent()
-                                .and_then(|agent| inst.host_agent_command(agent, None))
-                                .as_ref()
-                        ),
-                        &mut inst.conversation_state()
-                    )
-                    .unwrap());
-                assert_eq!(command, format!("{tool} --resume {SID}"));
+                let before = inst.conversation_state();
+                assert!(inst.prepare_launch_command(before.clone()).is_err());
+                assert_eq!(inst.conversation_state(), before);
             }
-            if tool == "work-pi" && crate::agents::pi_supports_session_id_flag() {
+            if tool == "work-pi" {
                 let mut fresh = tool_instance(tool, root.path().to_str().unwrap());
                 fresh.source_profile = PROFILE.into();
                 fresh.command = tool.into();
@@ -1455,7 +1348,6 @@ work-opencode = "opencode"
                 assert!(!fresh
                     .apply_session_flags(
                         &mut command,
-                        "test",
                         None,
                         None,
                         &super::execution::AgentLaunchContext::host(
@@ -1468,10 +1360,8 @@ work-opencode = "opencode"
                         &mut fresh.conversation_state()
                     )
                     .unwrap());
-                assert!(
-                    command.starts_with(&format!("{tool} --session-id ")),
-                    "{command}"
-                );
+                assert_eq!(command, tool);
+                assert!(fresh.agent_session_id.is_none());
             }
         }
 
@@ -1669,7 +1559,6 @@ work-opencode = "opencode"
         ] {
             let result = sandboxed.apply_session_flags(
                 &mut command,
-                "sandbox fork",
                 Some(agent),
                 None,
                 &super::execution::AgentLaunchContext::resolved(generation),
@@ -1706,7 +1595,6 @@ work-opencode = "opencode"
             let mut command = "prime-agent".to_string();
             let result = inst.apply_session_flags(
                 &mut command,
-                "prime fork",
                 Some(agent),
                 None,
                 &super::execution::AgentLaunchContext::resolved(generation),
@@ -1931,7 +1819,7 @@ work-opencode = "opencode"
                     persisted[0].agent_session_id.as_deref(),
                     (published && !rejected).then_some(SID)
                 );
-                assert!(rows[0].session_id_poller.is_none());
+                assert!(rows[0].capture_poller.handle().is_none());
                 assert!(persisted[0].lifecycle_reservation.is_none());
                 if !published || rejected {
                     assert_eq!(std::fs::read(&registry).unwrap(), before);
@@ -2009,7 +1897,6 @@ work-opencode = "opencode"
             assert_eq!(
                 inst.apply_session_flags(
                     &mut cmd,
-                    "test",
                     crate::agents::get_agent(tool),
                     None,
                     &super::execution::AgentLaunchContext::host(
@@ -2035,7 +1922,6 @@ work-opencode = "opencode"
         assert!(!automatic_copilot
             .apply_session_flags(
                 &mut automatic_cmd,
-                "test",
                 None,
                 None,
                 &super::execution::AgentLaunchContext::host(
@@ -2057,7 +1943,6 @@ work-opencode = "opencode"
         assert!(host_prime
             .apply_session_flags(
                 &mut cmd,
-                "test",
                 None,
                 None,
                 &super::execution::AgentLaunchContext::host(
@@ -2133,7 +2018,6 @@ work-opencode = "opencode"
         assert!(wrapped
             .apply_session_flags(
                 &mut cmd,
-                "test",
                 wrapped.resolved_agent(),
                 None,
                 &super::execution::AgentLaunchContext::host(
@@ -2166,7 +2050,6 @@ work-opencode = "opencode"
         assert!(direct
             .apply_session_flags(
                 &mut direct_cmd,
-                "test",
                 direct.resolved_agent(),
                 None,
                 &super::execution::AgentLaunchContext::host(
@@ -2195,7 +2078,6 @@ work-opencode = "opencode"
         assert!(qualified
             .apply_session_flags(
                 &mut qualified_cmd,
-                "test",
                 qualified.resolved_agent(),
                 None,
                 &super::execution::AgentLaunchContext::host(
@@ -2226,7 +2108,6 @@ work-opencode = "opencode"
             assert!(
                 bare.apply_session_flags(
                     &mut bare_cmd,
-                    "test",
                     bare.resolved_agent(),
                     None,
                     &super::execution::AgentLaunchContext::host(
@@ -2253,7 +2134,6 @@ work-opencode = "opencode"
         assert!(!inst
             .apply_session_flags(
                 &mut cmd,
-                "test",
                 None,
                 None,
                 &super::execution::AgentLaunchContext::host(
@@ -2267,8 +2147,8 @@ work-opencode = "opencode"
             .unwrap());
         assert_eq!(cmd, "gemini");
         inst.capture_started_at = Some(std::time::SystemTime::now());
-        inst.maybe_start_poller_since(None);
-        assert!(inst.session_id_poller.is_none());
+        inst.maybe_start_poller_since();
+        assert!(inst.capture_poller.handle().is_none());
     }
 
     /// A command's own session selector skips AoE injection, and conflicts with AoE state.
@@ -2294,7 +2174,6 @@ work-opencode = "opencode"
             assert!(!inst
                 .apply_session_flags(
                     &mut actual,
-                    "test",
                     None,
                     None,
                     &super::execution::AgentLaunchContext::host(
@@ -2324,7 +2203,6 @@ work-opencode = "opencode"
                 let error = managed
                     .apply_session_flags(
                         &mut command.to_string(),
-                        "test",
                         None,
                         None,
                         &super::execution::AgentLaunchContext::host(
@@ -2354,7 +2232,6 @@ work-opencode = "opencode"
         assert!(!external
             .apply_session_flags(
                 &mut command,
-                "test",
                 None,
                 None,
                 &super::execution::AgentLaunchContext::host(
@@ -2376,7 +2253,6 @@ work-opencode = "opencode"
         assert!(value_token
             .apply_session_flags(
                 &mut command,
-                "test",
                 value_token.resolved_agent(),
                 None,
                 &super::execution::AgentLaunchContext::host(
@@ -2401,7 +2277,6 @@ work-opencode = "opencode"
         assert!(!alias
             .apply_session_flags(
                 &mut command,
-                "test",
                 alias.resolved_agent(),
                 None,
                 &super::execution::AgentLaunchContext::host(
@@ -2468,7 +2343,6 @@ work-opencode = "opencode"
         assert!(inst
             .apply_session_flags(
                 &mut command,
-                "test",
                 inst.resolved_agent(),
                 None,
                 &super::execution::AgentLaunchContext::host(
@@ -2521,7 +2395,6 @@ work-opencode = "opencode"
         assert!(inst
             .apply_session_flags(
                 &mut pinned,
-                "test",
                 None,
                 None,
                 &super::execution::AgentLaunchContext::host(
@@ -2562,6 +2435,19 @@ work-opencode = "opencode"
             pairs.push(("XDG_CONFIG_HOME", temp.path().join(".config")));
             pairs.push(("CLAUDE_CONFIG_DIR", temp.path().join(".claude")));
             EnvGuard::set(&pairs)
+        }
+
+        /// The transcript probe resolves the existing prefix of the project
+        /// path, so a literal `/tmp/...` fixture would be looked up under
+        /// `/private/tmp/...` on macOS. Create the directory and hand back its
+        /// canonical spelling so the fixture and the probe agree.
+        fn canonical_project(temp: &TempDir, name: &str) -> String {
+            let dir = temp.path().join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::canonicalize(dir)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
         }
 
         fn write_transcript(claude_home: &Path, project_path: &str, sid: &str, age_secs: u64) {
@@ -2678,11 +2564,11 @@ work-opencode = "opencode"
                 let temp = tempdir().unwrap();
                 let _home = claude_home_guard(&temp);
                 let (_hooks, _base, _hook_temp) = crate::hooks::test_support::BaseGuard::ready();
-                let project_path = "/tmp/aoe-test-verify-on-resume";
+                let project_path = canonical_project(&temp, "aoe-test-verify-on-resume");
                 for (sid, age) in transcripts {
-                    write_transcript(&temp.path().join(".claude"), project_path, sid, *age);
+                    write_transcript(&temp.path().join(".claude"), &project_path, sid, *age);
                 }
-                let mut inst = tool_instance(tool, project_path);
+                let mut inst = tool_instance(tool, &project_path);
                 inst.agent_session_id = Some(stored.to_string());
                 if sandboxed {
                     inst.sandbox_info = Some(test_sandbox("verify-sandbox", None));
@@ -2744,14 +2630,14 @@ work-opencode = "opencode"
         fn same_cwd_sessions_resume_their_own_profile_scoped_conversation() {
             let temp = tempdir().unwrap();
             let _guard = claude_home_guard(&temp);
-            let project_path = "/tmp/aoe-test-3399-shared-cwd";
+            let project_path = canonical_project(&temp, "aoe-test-3399-shared-cwd");
             let cases = [
                 ("aoe-3399-personal", "11111111-1111-4111-8111-111111111111"),
                 ("aoe-3399-work", "22222222-2222-4222-8222-222222222222"),
             ];
             let home_for = |profile: &str| temp.path().join(format!(".claude-{profile}"));
             for (profile, sid) in cases {
-                write_transcript(&home_for(profile), project_path, sid, 3600);
+                write_transcript(&home_for(profile), &project_path, sid, 3600);
                 let config_path = crate::session::get_profile_dir_path(profile)
                     .unwrap()
                     .join("config.toml");
@@ -2763,7 +2649,7 @@ work-opencode = "opencode"
                 fs::write(&config_path, config).unwrap();
             }
             let acquire = |profile: &str, sid: &str, minted: Option<&str>| {
-                let mut inst = tool_instance("claude", project_path);
+                let mut inst = tool_instance("claude", &project_path);
                 inst.source_profile = profile.to_string();
                 inst.agent_session_id = Some(sid.to_string());
                 inst.pending_host_env = minted

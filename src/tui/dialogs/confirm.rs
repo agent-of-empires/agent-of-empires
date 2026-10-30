@@ -185,12 +185,7 @@ impl ConfirmDialog {
     fn move_focus(&mut self, forward: bool) {
         let order = self.focus_order();
         let i = order.iter().position(|f| *f == self.focus).unwrap_or(0);
-        let n = order.len();
-        self.focus = order[if forward {
-            (i + 1) % n
-        } else {
-            (i + n - 1) % n
-        }];
+        self.focus = order[super::cycle_focus(i, order.len(), !forward)];
     }
 
     fn toggle_focused_checkbox(&mut self) {
