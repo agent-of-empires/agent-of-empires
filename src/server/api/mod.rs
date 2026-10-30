@@ -78,8 +78,9 @@ pub use skills::{
     adopt_skill, create_skill, delete_skill, edit_skill, list_skills, read_skill, sync_skills,
 };
 pub use suggestions::{
-    delete_suggestion_mapping, dismiss_suggestion, get_suggestions, list_suggestion_mappings,
-    prepare_suggestion, put_suggestion_mapping, refresh_suggestions, undismiss_suggestion,
+    delete_suggestion_mapping, delete_suggestion_template, dismiss_suggestion,
+    get_suggestion_templates, get_suggestions, list_suggestion_mappings, prepare_suggestion,
+    put_suggestion_mapping, put_suggestion_template, refresh_suggestions, undismiss_suggestion,
     update_suggestion_source,
 };
 
@@ -595,8 +596,10 @@ mod tests {
             include_str!("suggestions.rs"),
             &[
                 "delete_suggestion_mapping",
+                "delete_suggestion_template",
                 "dismiss_suggestion",
                 "put_suggestion_mapping",
+                "put_suggestion_template",
                 "refresh_suggestions",
                 "undismiss_suggestion",
                 "update_suggestion_source",
@@ -1773,6 +1776,8 @@ mod tests {
             (Method::POST, "/api/suggestions/dismiss"),
             (Method::POST, "/api/suggestions/undismiss"),
             (Method::PATCH, "/api/suggestions/sources"),
+            (Method::PUT, "/api/suggestions/templates"),
+            (Method::DELETE, "/api/suggestions/templates"),
             (Method::PUT, "/api/suggestions/mappings"),
             (Method::DELETE, "/api/suggestions/mappings"),
             (Method::POST, "/api/sandbox/image-pull"),

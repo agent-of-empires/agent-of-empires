@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::{api_error, AppState};
-use crate::plugin::suggestions::{self, Provider};
+use crate::plugin::suggestions::{self, PromptTooLong, Provider};
 use axum::http::StatusCode;
 
 #[derive(Deserialize)]
@@ -28,6 +28,27 @@ pub struct SourceBody {
     provider_id: String,
     criterion: String,
     enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemplateKey {
+    provider_id: String,
+    criterion: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemplateBody {
+    provider_id: String,
+    criterion: String,
+    template: String,
+}
+
+#[derive(Deserialize)]
+pub struct TemplateQuery {
+    provider_id: Option<String>,
+    criterion: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -228,19 +249,221 @@ pub async fn prepare_suggestion(
         return unknown_provider();
     };
     let result = tokio::task::spawn_blocking(move || {
-        let (profile, found) = host.with_suggestions_db(|conn, profile| {
-            suggestions::find_item_with_mapping(conn, profile, &provider, &item.id)
-                .map(|found| (profile.to_string(), found))
+        let (profile, found, template) = host.with_suggestions_db(|conn, profile| {
+            let found = suggestions::find_item_with_mapping(conn, profile, &provider, &item.id)?;
+            let template = match &found {
+                Some((found, _)) => {
+                    suggestions::template(conn, profile, &provider.id, &found.criterion)?
+                }
+                None => None,
+            };
+            Ok::<_, anyhow::Error>((profile.to_string(), found, template))
         })?;
         // Config and project resolution touch disk, so they run off the lock.
-        Ok::<_, anyhow::Error>(
-            found.map(|(found, mapped)| suggestions::prepare(&profile, &found, mapped.as_deref())),
-        )
+        Ok::<_, anyhow::Error>(found.map(|(found, mapped)| {
+            suggestions::prepare(&profile, &found, template.as_deref(), mapped.as_deref())
+        }))
     })
     .await;
     match result {
-        Ok(Ok(Some(prefill))) => Json(prefill).into_response(),
+        Ok(Ok(Some(Ok(prefill)))) => Json(prefill).into_response(),
+        Ok(Ok(Some(Err(PromptTooLong)))) => api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            format!(
+                "The expanded prompt exceeds {} bytes",
+                suggestions::MAX_PROMPT_BYTES
+            ),
+        ),
         Ok(Ok(None)) => stale_item(),
+        Ok(Err(error)) => internal(error),
+        Err(error) => internal(error),
+    }
+}
+
+/// The provider, or the error response when it is unknown or does not
+/// declare `criterion`.
+fn declared_source(
+    provider_id: &str,
+    criterion: &str,
+) -> Result<Provider, axum::response::Response> {
+    check_declared(find_provider(provider_id), criterion)
+}
+
+fn check_declared(
+    provider: Option<Provider>,
+    criterion: &str,
+) -> Result<Provider, axum::response::Response> {
+    let provider = provider.ok_or_else(unknown_provider)?;
+    if provider
+        .spec
+        .sources
+        .iter()
+        .any(|s| s.criterion == criterion)
+    {
+        Ok(provider)
+    } else {
+        Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "The provider does not declare that criterion",
+        ))
+    }
+}
+
+/// What a PUT must satisfy before anything is stored.
+fn check_template_put(
+    provider: Option<Provider>,
+    criterion: &str,
+    template: &str,
+) -> Result<(), axum::response::Response> {
+    check_declared(provider, criterion)?;
+    if template.len() > suggestions::MAX_PROMPT_BYTES {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            format!(
+                "Template is limited to {} bytes",
+                suggestions::MAX_PROMPT_BYTES
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn template_json(
+    provider_id: &str,
+    criterion: &str,
+    template: Option<String>,
+) -> serde_json::Value {
+    json!({
+        "provider_id": provider_id,
+        "criterion": criterion,
+        "default": template.is_none(),
+        "template": template,
+    })
+}
+
+pub async fn get_suggestion_templates(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<TemplateQuery>,
+) -> impl IntoResponse {
+    let key = match (query.provider_id, query.criterion) {
+        (None, None) => None,
+        (Some(provider_id), Some(criterion)) => {
+            if let Err(response) = declared_source(&provider_id, &criterion) {
+                return response;
+            }
+            Some((provider_id, criterion))
+        }
+        _ => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "validation_failed",
+                "Pass both provider_id and criterion, or neither",
+            )
+        }
+    };
+    let Some(host) = state.plugin_host.clone() else {
+        return match key {
+            None => Json(json!({ "templates": [] })).into_response(),
+            Some(_) => unavailable(),
+        };
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        host.with_suggestions_db(|conn, profile| match key {
+            Some((provider_id, criterion)) => {
+                suggestions::template(conn, profile, &provider_id, &criterion)
+                    .map(|t| template_json(&provider_id, &criterion, t))
+            }
+            None => suggestions::templates(conn, profile).map(|rows| {
+                json!({ "templates": rows.into_iter()
+                    .map(|(provider_id, criterion, template)| {
+                        json!({ "provider_id": provider_id, "criterion": criterion, "template": template })
+                    })
+                    .collect::<Vec<_>>() })
+            }),
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(body)) => Json(body).into_response(),
+        Ok(Err(error)) => internal(error),
+        Err(error) => internal(error),
+    }
+}
+
+pub async fn put_suggestion_template(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<TemplateBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let Some(host) = state.plugin_host.clone() else {
+        return unavailable();
+    };
+    if let Err(response) = check_template_put(
+        find_provider(&body.provider_id),
+        &body.criterion,
+        &body.template,
+    ) {
+        return response;
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        host.with_suggestions_db(|conn, profile| {
+            suggestions::set_template(
+                conn,
+                profile,
+                &body.provider_id,
+                &body.criterion,
+                &body.template,
+            )
+            .map(|()| {
+                template_json(
+                    &body.provider_id,
+                    &body.criterion,
+                    Some(body.template.clone()),
+                )
+            })
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(body)) => Json(body).into_response(),
+        Ok(Err(error)) => internal(error),
+        Err(error) => internal(error),
+    }
+}
+
+pub async fn delete_suggestion_template(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<TemplateKey>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(key) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let Some(host) = state.plugin_host.clone() else {
+        return unavailable();
+    };
+    // No provider or criterion check: a listed template must stay deletable
+    // after its plugin is disabled or drops the criterion.
+    let result = tokio::task::spawn_blocking(move || {
+        host.with_suggestions_db(|conn, profile| {
+            suggestions::delete_template(conn, profile, &key.provider_id, &key.criterion)
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => Json(json!({ "ok": true })).into_response(),
         Ok(Err(error)) => internal(error),
         Err(error) => internal(error),
     }
@@ -333,5 +556,48 @@ pub async fn delete_suggestion_mapping(
         Ok(Ok(deleted)) => Json(json!({ "ok": true, "deleted": deleted })).into_response(),
         Ok(Err(error)) => internal(error),
         Err(error) => internal(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aoe_plugin_api::{SuggestionSource, SuggestionsSpec};
+
+    fn provider() -> Provider {
+        Provider {
+            id: "acme.github".into(),
+            name: "GitHub".into(),
+            spec: SuggestionsSpec {
+                sources: vec![SuggestionSource {
+                    criterion: "assigned".into(),
+                    label: "Assigned".into(),
+                    description: String::new(),
+                    variables: vec![],
+                    default_enabled: true,
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn template_put_is_bounded_and_needs_a_declared_source() {
+        let max = suggestions::MAX_PROMPT_BYTES;
+        let status = |provider: Option<Provider>, criterion: &str, len: usize| {
+            check_template_put(provider, criterion, &"x".repeat(len))
+                .err()
+                .map(|r| r.status())
+        };
+        assert_eq!(status(Some(provider()), "assigned", 0), None);
+        assert_eq!(status(Some(provider()), "assigned", max), None);
+        assert_eq!(
+            status(Some(provider()), "assigned", max + 1),
+            Some(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            status(Some(provider()), "undeclared", 1),
+            Some(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(status(None, "assigned", 1), Some(StatusCode::NOT_FOUND));
     }
 }
