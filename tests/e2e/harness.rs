@@ -1779,11 +1779,12 @@ fn tui_launch_isolates_daemon_endpoint_from_the_tmux_server() {
             let mut tmux = harness.tmux();
             tmux.env("HOME", harness.home_path())
                 .env("XDG_CONFIG_HOME", harness.home_path().join(".config"))
-                .env("PATH", harness.env_path())
-                .envs(HOSTILE);
+                .env("PATH", harness.env_path());
             for (key, value) in &harness.extra_env {
                 tmux.env(key, value);
             }
+            // Stale server globals must survive the `set_env` overrides.
+            tmux.envs(HOSTILE);
             let output = tmux
                 .args(["new-session", "-d", "-s", "server"])
                 .arg(format!(
