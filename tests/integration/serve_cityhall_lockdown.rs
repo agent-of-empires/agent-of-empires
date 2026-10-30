@@ -168,6 +168,16 @@ async fn sensitive_routes_are_blocked() {
             r#"{"provider_id":"x","criterion":"c","enabled":true}"#,
         ),
         (
+            Method::PUT,
+            "/api/suggestions/templates",
+            r#"{"provider_id":"x","criterion":"c","template":"t"}"#,
+        ),
+        (
+            Method::DELETE,
+            "/api/suggestions/templates",
+            r#"{"provider_id":"x","criterion":"c"}"#,
+        ),
+        (
             Method::POST,
             "/api/suggestions/prepare",
             r#"{"provider_id":"x","id":"y"}"#,
