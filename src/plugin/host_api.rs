@@ -214,6 +214,13 @@ pub fn dispatch(
                 suggestions::error(conn, profile, &ctx.plugin_id, params)
             })
         }
+        "suggestions.checks.set" => {
+            ctx.require(CAP_WORKER)?;
+            suggestions_spec(ctx)?;
+            state.with_suggestions_db(|conn, profile| {
+                suggestions::set_checks(conn, profile, &ctx.plugin_id, params)
+            })
+        }
         "suggestions.sources" => {
             ctx.require(CAP_WORKER)?;
             let spec = suggestions_spec(ctx)?;
@@ -1015,6 +1022,7 @@ mod tests {
         for (method, caps) in [
             ("suggestions.set", &[][..]),
             ("suggestions.error", &[][..]),
+            ("suggestions.checks.set", &[][..]),
             ("suggestions.sources", &[CAP_SESSION_READ][..]),
             ("projects.list", &[CAP_WORKER][..]),
         ] {
@@ -1022,14 +1030,13 @@ mod tests {
             assert_eq!(err.code, codes::FORBIDDEN, "{method}");
         }
         // A worker whose manifest declares no [suggestions] is refused too.
-        let err = dispatch(
-            &state,
-            &ctx(&[CAP_WORKER]),
-            "suggestions.sources",
-            &json!({}),
-        )
-        .unwrap_err();
-        assert!(err.message.contains("did not declare suggestions"));
+        for method in ["suggestions.sources", "suggestions.checks.set"] {
+            let err = dispatch(&state, &ctx(&[CAP_WORKER]), method, &json!({})).unwrap_err();
+            assert!(
+                err.message.contains("did not declare suggestions"),
+                "{method}"
+            );
+        }
     }
 
     #[test]
