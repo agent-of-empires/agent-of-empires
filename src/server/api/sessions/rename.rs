@@ -26,11 +26,10 @@ pub async fn rename_session(
         Ok(body) => body,
         Err(error) => return error.into_response(),
     };
-    let title = body.title.clone();
-    let (group, profile) = (body.group.clone(), body.profile.clone());
+    let before = row_labels(&state, &id).await;
     match edit_session(&state, &id, SessionEdit::Rename(body)).await {
         Ok(warnings) => {
-            tracing::info!(target: "session.rename", session = %id, title = title.as_deref().unwrap_or_default(), ?group, ?profile, "session renamed");
+            log_committed_edit(&id, before, row_labels(&state, &id).await);
             crate::server::runtime::session_mutation_response(
                 &state,
                 &id,
@@ -85,6 +84,42 @@ fn edit_identity_matches(row: &Instance, expected: &Instance) -> bool {
         && row.lifecycle_generation == expected.lifecycle_generation
         && row.lifecycle_reservation.is_none()
         && row.worktree_info == expected.worktree_info
+}
+
+/// Committed (title, group, profile) of a row, for logging what an edit changed.
+async fn row_labels(state: &Arc<AppState>, id: &str) -> Option<(String, String, String)> {
+    state
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|row| row.id == id)
+        .map(|row| {
+            (
+                row.title.clone(),
+                row.group_path.clone(),
+                row.source_profile.clone(),
+            )
+        })
+}
+
+fn log_committed_edit(
+    id: &str,
+    before: Option<(String, String, String)>,
+    after: Option<(String, String, String)>,
+) {
+    let (Some(before), Some(after)) = (before, after) else {
+        return;
+    };
+    if before.0 != after.0 {
+        tracing::info!(target: "session.rename", session = %id, from = %before.0, to = %after.0, "session renamed");
+    }
+    if before.1 != after.1 {
+        tracing::info!(target: "session.sync", session = %id, field = "group", value = %after.1, "session updated");
+    }
+    if before.2 != after.2 {
+        tracing::info!(target: "session.sync", session = %id, field = "profile", value = %after.2, "session updated");
+    }
 }
 
 async fn edit_session(
