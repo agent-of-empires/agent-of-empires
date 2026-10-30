@@ -892,6 +892,7 @@ last_seen_version = "{}"
             .env("TERM", "xterm-256color")
             .env_remove("NO_COLOR")
             .env_remove("AOE_NO_AUTOSTART")
+            .env_remove("AGENT_OF_EMPIRES_PROFILE")
             .envs(self.extra_env.iter().map(|(key, value)| (key, value)))
             .output()
             .expect("failed to run tmux new-session");
@@ -951,6 +952,7 @@ last_seen_version = "{}"
             .env("PATH", self.env_path())
             .env("TERM", "xterm-256color")
             .env_remove("NO_COLOR")
+            .env_remove("AGENT_OF_EMPIRES_PROFILE")
             .envs(self.extra_env.iter().map(|(key, value)| (key, value)))
             .output()
             .expect("failed to run tmux new-session");
@@ -1393,6 +1395,8 @@ last_seen_version = "{}"
             .env_remove("AOE_NO_AUTOSTART")
             .env_remove("AOE_DAEMON_URL")
             .env_remove("AOE_DAEMON_TOKEN")
+            // The harness creates only the `default` profile.
+            .env_remove("AGENT_OF_EMPIRES_PROFILE")
             .envs(self.extra_env.iter().map(|(key, value)| (key, value)));
         for key in &self.extra_env_remove {
             command.env_remove(key);

@@ -1254,8 +1254,18 @@ async fn validate_launch_args(profile: &str, args: &ServeArgs) -> Result<AuthMod
         if args.passphrase.is_none() {
             bail!("Remote exposure requires --passphrase or AOE_SERVE_PASSPHRASE");
         }
-        let tailscale_ok =
-            tokio::task::spawn_blocking(crate::server::tunnel::tailscale_available_sync).await?;
+        // The same decision `start_server` makes, so a wedged Tailscale fails here with the
+        // probe's `--no-tailscale` advice rather than the cloudflared install error below.
+        use crate::server::tunnel::{skips_tailscale, tailscale_probe};
+        let tailscale_ok = if skips_tailscale(
+            args.no_tailscale,
+            args.tunnel_name.as_deref(),
+            args.tunnel_url.as_deref(),
+        ) {
+            false
+        } else {
+            tailscale_probe().await.use_funnel()?
+        };
         if cloudflared_required(args.no_tailscale, args.tunnel_name.is_some(), tailscale_ok) {
             tokio::task::spawn_blocking(crate::server::tunnel::check_cloudflared).await??;
         }

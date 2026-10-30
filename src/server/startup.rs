@@ -605,8 +605,7 @@ pub(crate) async fn start_server(
     let tunnel_handle = if remote {
         // Choosing and starting the tunnel is the part that can hang, so it shares one deadline.
         let handle = within_tunnel_deadline(tunnel_deadline, async {
-            let named = tunnel_name.is_some() && tunnel_url.is_some();
-            let tailscale_ok = if no_tailscale || named {
+            let tailscale_ok = if tunnel::skips_tailscale(no_tailscale, tunnel_name, tunnel_url) {
                 tracing::debug!(target: "http.middleware", "tunnel: --no-tailscale or a named tunnel, skipping Tailscale auto-detection");
                 false
             } else {
