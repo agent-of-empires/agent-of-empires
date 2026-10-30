@@ -188,6 +188,14 @@ fn ctrl_p_on_the_prompt_row_shows_the_source_text_and_esc_closes_it() {
     dialog.handle_key(key(KeyCode::Esc));
     assert!(!dialog.show_prompt_source);
 
+    // Enter closes the overlay instead of submitting the form.
+    dialog.handle_key(ctrl_key(KeyCode::Char('p')));
+    assert!(matches!(
+        dialog.handle_key(key(KeyCode::Enter)),
+        DialogResult::Continue
+    ));
+    assert!(!dialog.show_prompt_source);
+
     let mut dialog = single_tool_dialog();
     let mut origin = github_origin();
     origin.source_text = None;
@@ -195,6 +203,51 @@ fn ctrl_p_on_the_prompt_row_shows_the_source_text_and_esc_closes_it() {
     dialog.focused_field = dialog.field_indices().prompt;
     dialog.handle_key(ctrl_key(KeyCode::Char('p')));
     assert!(screen_of(&mut dialog, 100, 40).contains("No source text."));
+}
+
+#[test]
+fn the_source_overlay_wraps_by_cell_width_and_counts_hidden_rows() {
+    let wide = "\u{4e2d}".repeat(10);
+    assert_eq!(
+        super::render::wrap_cells(&wide, 8),
+        vec![
+            "\u{4e2d}".repeat(4),
+            "\u{4e2d}".repeat(4),
+            "\u{4e2d}".repeat(2)
+        ],
+        "10 CJK chars are 20 cells, so 8 cols hold 4 per row"
+    );
+    assert_eq!(
+        super::render::wrap_cells("ab\u{200d}cd", 2),
+        vec!["ab\u{200d}", "cd"],
+        "a zero-width char stays on its row"
+    );
+    assert_eq!(super::render::wrap_cells("", 8), vec![""]);
+
+    // 12 rows leave 7 for the body: 6 lines, then the hidden count.
+    let mut dialog = single_tool_dialog();
+    let mut origin = github_origin();
+    origin.source_text = Some(
+        (0..20)
+            .map(|i| format!("line {i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    dialog.set_suggestion("Review PR 4562".to_string(), origin);
+    dialog.focused_field = dialog.field_indices().prompt;
+    dialog.handle_key(ctrl_key(KeyCode::Char('p')));
+    let screen = screen_of(&mut dialog, 100, 12);
+    assert!(screen.contains("line 05"), "{screen}");
+    assert!(!screen.contains("line 06"), "{screen}");
+    assert!(screen.contains("\u{2026} 14 more lines"), "{screen}");
+    assert!(
+        screen.contains("Press Esc, Enter or Ctrl+P to close"),
+        "{screen}"
+    );
+
+    let screen = screen_of(&mut dialog, 100, 40);
+    assert!(screen.contains("line 19"), "{screen}");
+    assert!(!screen.contains("more lines"), "{screen}");
 }
 
 #[test]

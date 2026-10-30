@@ -3,6 +3,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 use tui_input::Input;
+use unicode_width::UnicodeWidthChar;
 
 use super::{NewSessionDialog, FIELD_HELP, HELP_DIALOG_WIDTH};
 use crate::tui::components::{
@@ -64,6 +65,23 @@ fn prompt_display(s: &str) -> String {
             c => c,
         })
         .collect()
+}
+
+/// Hard-wraps `line` into rows of at most `cols` display cells. Zero-width
+/// chars stay on the current row so they never start one by themselves.
+pub(super) fn wrap_cells(line: &str, cols: usize) -> Vec<String> {
+    let mut rows = vec![String::new()];
+    let mut used = 0;
+    for c in line.chars() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used > 0 && used + w > cols {
+            rows.push(String::new());
+            used = 0;
+        }
+        rows.last_mut().expect("one row").push(c);
+        used += w;
+    }
+    rows
 }
 
 impl NewSessionDialog {
@@ -1324,13 +1342,15 @@ impl NewSessionDialog {
 
         let dialog_width: u16 = HELP_DIALOG_WIDTH;
         let has_profile_selection = self.has_profile_selection();
+        let has_prompt = self.prompt_origin.is_some();
         // Base fields: Scratch, Title, Path, YOLO, Worktree, Group + close hint
         let base_height: u16 = 20;
         let dialog_height: u16 = base_height
             + if has_profile_selection { 3 } else { 0 }
             + if has_tool_selection { 3 } else { 0 }
             + if has_sandbox { 3 } else { 0 }
-            + if show_sandbox_options_help { 12 } else { 0 };
+            + if show_sandbox_options_help { 12 } else { 0 }
+            + if has_prompt { 3 } else { 0 };
 
         let block = crate::tui::dialogs::toned_dialog_block(
             " New Session Help ",
@@ -1356,6 +1376,7 @@ impl NewSessionDialog {
                 "YOLO Mode" => !self.selected_tool_always_yolo(),
                 "Sandbox" => has_sandbox,
                 "Image" | "Environment" | "Host hook env" => show_sandbox_options_help,
+                "Prompt" => has_prompt,
                 _ => true,
             };
             if !show {
@@ -1384,8 +1405,8 @@ impl NewSessionDialog {
     }
 
     /// The provider text behind the prompt, in the help overlay's frame.
-    /// Hard-wrapped one cell per char so the row count is exact and the
-    /// close hint always fits.
+    /// Hard-wrapped by cell width so the row count is exact and the close
+    /// hint always fits; rows past the area are folded into a count.
     fn render_prompt_source_overlay(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let Some(origin) = &self.prompt_origin else {
             return;
@@ -1395,13 +1416,7 @@ impl NewSessionDialog {
         let body: Vec<String> = match origin.source_text.as_deref() {
             Some(text) => text
                 .lines()
-                .flat_map(|line| {
-                    let chars: Vec<char> = prompt_display(line).chars().collect();
-                    let rows = chars.len().div_ceil(cols).max(1);
-                    (0..rows)
-                        .map(|row| chars.iter().skip(row * cols).take(cols).collect())
-                        .collect::<Vec<String>>()
-                })
+                .flat_map(|line| wrap_cells(&prompt_display(line), cols))
                 .collect(),
             None => vec!["No source text.".to_string()],
         };
@@ -1409,6 +1424,13 @@ impl NewSessionDialog {
         let max_body_rows = usize::from(area.height.saturating_sub(5)).max(1);
         let body_rows = body.len().min(max_body_rows);
         let height = body_rows as u16 + 5;
+        // On overflow the last visible row becomes the hidden-row count.
+        let shown = if body.len() > body_rows {
+            body_rows - 1
+        } else {
+            body_rows
+        };
+        let hidden = body.len() - shown;
 
         let block = crate::tui::dialogs::toned_dialog_block(
             " Suggestion source ",
@@ -1427,12 +1449,22 @@ impl NewSessionDialog {
         ];
         lines.extend(
             body.into_iter()
-                .take(body_rows)
+                .take(shown)
                 .map(|row| Line::styled(row, Style::default().fg(theme.text))),
         );
+        if hidden > 0 {
+            lines.push(Line::styled(
+                format!("\u{2026} {hidden} more lines"),
+                Style::default().fg(theme.dimmed),
+            ));
+        }
         lines.push(Line::from(vec![
             Span::styled("Press ", Style::default().fg(theme.dimmed)),
             Span::styled("Esc", Style::default().fg(theme.hint)),
+            Span::styled(", ", Style::default().fg(theme.dimmed)),
+            Span::styled("Enter", Style::default().fg(theme.hint)),
+            Span::styled(" or ", Style::default().fg(theme.dimmed)),
+            Span::styled("Ctrl+P", Style::default().fg(theme.hint)),
             Span::styled(" to close", Style::default().fg(theme.dimmed)),
         ]));
         frame.render_widget(Paragraph::new(lines), inner);

@@ -97,6 +97,10 @@ pub(super) const FIELD_HELP: &[FieldHelp] = &[
         name: "Group",
         description: "Optional grouping for organization (Ctrl+P to browse existing groups)",
     },
+    FieldHelp {
+        name: "Prompt",
+        description: "First turn for the agent, prefilled by a suggestion (Ctrl+P view source)",
+    },
 ];
 
 /// Where a prefilled prompt came from, shown with the Prompt row.
