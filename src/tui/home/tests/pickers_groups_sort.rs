@@ -2082,7 +2082,7 @@ fn test_non_strict_w_cycles_through_all_idle_sessions_in_attention_sort() {
         .iter()
         .filter_map(|item| match item {
             Item::Session { id, .. } => Some(id.clone()),
-            Item::Group { .. } => None,
+            _ => None,
         })
         .collect();
     assert_eq!(session_ids.len(), 4);
@@ -2474,6 +2474,7 @@ fn work_group_titles(view: &HomeView) -> Vec<&str> {
                     }
                 }
             }
+            _ => {}
         }
     }
     titles

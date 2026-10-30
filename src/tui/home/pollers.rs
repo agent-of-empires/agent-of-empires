@@ -51,9 +51,26 @@ impl HomeView {
 
     /// Drains the suggestions worker. True when state changed.
     pub fn apply_suggestions_results(&mut self) -> bool {
-        self.suggestions_view
+        let mut changed = self
+            .suggestions_view
             .as_mut()
-            .is_some_and(SuggestionsView::poll)
+            .is_some_and(SuggestionsView::poll);
+        self.suggestions_feed.tick();
+        let polled = self.suggestions_feed.poll();
+        if polled.changed {
+            self.rebuild_flat_items_keeping_cursor();
+            self.update_selected();
+            changed = true;
+        }
+        if let Some(start) = polled.start {
+            self.start_suggestion(start);
+            changed = true;
+        }
+        if let Some(error) = polled.error {
+            self.flash_status(error);
+            changed = true;
+        }
+        changed
     }
 
     /// Replaces the view with the regular new-session dialog, prefilled; when
