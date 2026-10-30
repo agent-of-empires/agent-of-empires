@@ -150,10 +150,10 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
     let profile = state.profile.clone();
     let result = tokio::task::spawn_blocking(move || {
         let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
-        let custom_agents = config.session.custom_agents;
-        let agent_acp_cmd = config.session.agent_acp_cmd;
-        let agent_detect_as = config.session.agent_detect_as;
-        let tools = crate::tmux::AvailableTools::detect_with_custom_agents(&custom_agents);
+        let custom_agents = &config.session.custom_agents;
+        let agent_acp_cmd = &config.session.agent_acp_cmd;
+        let agent_detect_as = &config.session.agent_detect_as;
+        let tools = crate::tmux::AvailableTools::detect_with_custom_agents(&config.session);
         let available = tools.available_list();
         let acp_registry = crate::acp::AgentRegistry::with_defaults();
         // Global config, not `config` above: the allowlist is an operator
@@ -211,9 +211,9 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
             });
         }
         agents.extend(build_custom_agent_infos(
-            &custom_agents,
-            &agent_acp_cmd,
-            &agent_detect_as,
+            custom_agents,
+            agent_acp_cmd,
+            agent_detect_as,
             &policy,
         ));
         agents

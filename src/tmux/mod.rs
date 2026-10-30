@@ -2290,6 +2290,78 @@ fn plugin_cache_key(agent: crate::plugin::agent_integration::PluginAgent<'_>) ->
     )
 }
 
+fn shell_basename(shell: &str) -> &str {
+    std::path::Path::new(shell)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(shell)
+}
+
+/// Only fish needs the `begin; set -lx …; and printf` probe dialect. The other
+/// non-POSIX shells (nu, pwsh) cannot parse either dialect, so they keep the
+/// POSIX form rather than receiving fish syntax.
+fn is_fish_shell(shell: &str) -> bool {
+    shell_basename(shell) == "fish"
+}
+
+/// Quote one word as a fish single-quoted literal (fish rejects the POSIX
+/// `'\''` idiom, so escaping must stay inside one single-quoted segment).
+fn fish_quote_word(word: &str) -> String {
+    let mut out = String::with_capacity(word.len() + 2);
+    out.push('\'');
+    for character in word.chars() {
+        if character == '\'' || character == '\\' {
+            out.push('\\');
+        }
+        out.push(character);
+    }
+    out.push('\'');
+    out
+}
+
+/// One batched login-shell availability probe for a plugin agent. POSIX shells
+/// scope the leading `KEY=VALUE` assignments in a subshell; fish has no
+/// position subshell (`( cmd )` is a rejected command substitution), so it gets
+/// a `begin; set -lx …; end; and printf …` block with identical semantics.
+fn plugin_probe_fragment(fish: bool, assignments: &[String], binary: &str, index: usize) -> String {
+    let mut fragment = if fish {
+        String::from("begin; ")
+    } else {
+        String::from("( ")
+    };
+    for assignment in assignments {
+        let (key, value) = assignment.split_once('=').unwrap();
+        if fish {
+            fragment.push_str("set -lx ");
+            fragment.push_str(key);
+            fragment.push(' ');
+            fragment.push_str(&fish_quote_word(value));
+            fragment.push_str("; ");
+        } else {
+            fragment.push_str(key);
+            fragment.push('=');
+            fragment.push_str(&shell_words::quote(value));
+            fragment.push(' ');
+        }
+    }
+    let terminator = if fish {
+        " >/dev/null 2>&1; end; and printf '\\nAOE_PLUGIN_OK "
+    } else {
+        " >/dev/null 2>&1 ) && printf '\\nAOE_PLUGIN_OK "
+    };
+    let quoted_binary = if fish {
+        fish_quote_word(binary)
+    } else {
+        shell_words::quote(binary).into_owned()
+    };
+    fragment.push_str("command -v ");
+    fragment.push_str(&quoted_binary);
+    fragment.push_str(terminator);
+    fragment.push_str(&index.to_string());
+    fragment.push_str("\\n'; ");
+    fragment
+}
+
 fn plugin_agents_available(
     agents: &[crate::plugin::agent_integration::PluginAgent<'_>],
     login_shell: bool,
@@ -2386,21 +2458,16 @@ fn plugin_agents_available(
     }
 
     if !needs_shell.is_empty() {
+        let probe_shell = crate::session::user_shell();
+        let fish = is_fish_shell(&probe_shell);
         let mut script = String::new();
         for (index, (_, words, assignments)) in needs_shell.iter().enumerate() {
-            script.push_str("( ");
-            for assignment in &words[..*assignments] {
-                let (key, value) = assignment.split_once('=').unwrap();
-                script.push_str(key);
-                script.push('=');
-                script.push_str(&shell_words::quote(value));
-                script.push(' ');
-            }
-            script.push_str("command -v ");
-            script.push_str(&shell_words::quote(&words[*assignments]));
-            script.push_str(" >/dev/null 2>&1 ) && printf '\\nAOE_PLUGIN_OK ");
-            script.push_str(&index.to_string());
-            script.push_str("\\n'; ");
+            script.push_str(&plugin_probe_fragment(
+                fish,
+                &words[..*assignments],
+                &words[*assignments],
+                index,
+            ));
         }
         let output = agent_probe_output(
             Command::new(crate::session::user_shell()).args(["-lc", &script]),
@@ -2740,14 +2807,15 @@ impl AvailableTools {
     /// Startup's local snapshot. Login shells and executable probes run later.
     pub(crate) fn detect_on_path() -> Self {
         let refs: Vec<_> = crate::agents::AGENTS.iter().collect();
-        let config = crate::session::config::Config::load().ok();
-        let custom_agents = config.as_ref().map(|config| &config.session.custom_agents);
+        let session = crate::session::config::Config::load()
+            .ok()
+            .map(load_session);
         Self::from_detected(
             agent_availability_snapshot(&refs),
             false,
             None,
             false,
-            custom_agents,
+            session.as_ref(),
         )
     }
 
@@ -2755,17 +2823,19 @@ impl AvailableTools {
         let agents = crate::agents::AGENTS;
         let refs: Vec<&crate::agents::AgentDef> = agents.iter().collect();
         let found = probe_agents_available(&refs);
-        let config = crate::session::config::Config::load().ok();
-        let custom_agents = config.as_ref().map(|config| &config.session.custom_agents);
-        Self::from_detected(found, true, None, false, custom_agents)
+        let session = crate::session::config::Config::load()
+            .ok()
+            .map(load_session);
+        Self::from_detected(found, true, None, false, session.as_ref())
     }
 
     pub(crate) fn detect_with_custom_agents(
-        custom_agents: &std::collections::HashMap<String, String>,
+        session: &crate::session::config::SessionConfig,
     ) -> Self {
+        session.warn_custom_agent_issues();
         let refs: Vec<_> = crate::agents::AGENTS.iter().collect();
         let found = probe_agents_available(&refs);
-        Self::from_detected(found, true, None, false, Some(custom_agents))
+        Self::from_detected(found, true, None, false, Some(session))
     }
 
     pub(crate) fn detect_cancellable(
@@ -2774,9 +2844,10 @@ impl AvailableTools {
     ) -> Self {
         let refs: Vec<_> = crate::agents::AGENTS.iter().collect();
         let found = probe_agents_available_inner(&refs, Some(cancel), force);
-        let config = crate::session::config::Config::load().ok();
-        let custom_agents = config.as_ref().map(|config| &config.session.custom_agents);
-        Self::from_detected(found, true, Some(cancel), force, custom_agents)
+        let session = crate::session::config::Config::load()
+            .ok()
+            .map(load_session);
+        Self::from_detected(found, true, Some(cancel), force, session.as_ref())
     }
 
     fn from_detected(
@@ -2784,7 +2855,7 @@ impl AvailableTools {
         login_shell: bool,
         cancel: Option<&tokio_util::sync::CancellationToken>,
         force: bool,
-        custom_agents: Option<&std::collections::HashMap<String, String>>,
+        session_config: Option<&crate::session::config::SessionConfig>,
     ) -> Self {
         let agents = crate::agents::AGENTS;
         let mut available: Vec<String> = agents
@@ -2792,21 +2863,9 @@ impl AvailableTools {
             .filter(|agent| found.contains(agent.name))
             .map(|agent| agent.name.to_string())
             .collect();
-        let loaded_config = if custom_agents.is_none() {
-            crate::session::config::Config::load().ok()
-        } else {
-            None
-        };
-        if let Some(config) = &loaded_config {
-            config.session.warn_custom_agent_issues();
-        }
         let empty_custom_agents = std::collections::HashMap::new();
-        let custom_agents = custom_agents
-            .or_else(|| {
-                loaded_config
-                    .as_ref()
-                    .map(|config| &config.session.custom_agents)
-            })
+        let custom_agents = session_config
+            .map(|config| &config.custom_agents)
             .unwrap_or(&empty_custom_agents);
         let mut custom: Vec<_> = custom_agents
             .iter()
@@ -2851,16 +2910,23 @@ impl AvailableTools {
         !self.available.is_empty()
     }
 
-    pub fn available_list(&self) -> &[String] {
-        &self.available
-    }
-
     #[cfg(test)]
     pub fn with_tools(tools: &[&str]) -> Self {
         Self {
             available: tools.iter().map(|s| s.to_string()).collect(),
         }
     }
+
+    pub fn available_list(&self) -> &[String] {
+        &self.available
+    }
+}
+
+/// Load the effective session config once and surface its misconfiguration
+/// warnings here, so discovery and the picker do not reload it or warn twice.
+fn load_session(config: crate::session::config::Config) -> crate::session::config::SessionConfig {
+    config.session.warn_custom_agent_issues();
+    config.session
 }
 
 #[cfg(test)]
@@ -3224,6 +3290,139 @@ mod tests {
         assert!(
             agent_availability_snapshot(&[crate::agents::get_agent("vibe").unwrap()])
                 .contains("vibe")
+        );
+    }
+
+    #[test]
+    fn fish_probe_dialect_is_selected_only_for_fish() {
+        for shell in ["fish", "/usr/bin/fish", "/opt/homebrew/bin/fish"] {
+            assert!(is_fish_shell(shell), "{shell} is fish");
+        }
+        for shell in [
+            "bash",
+            "zsh",
+            "sh",
+            "nu",
+            "nushell",
+            "pwsh",
+            "powershell",
+            "/bin/bash",
+        ] {
+            assert!(!is_fish_shell(shell), "{shell} must keep the POSIX dialect");
+        }
+    }
+
+    #[test]
+    fn plugin_probe_fragment_matches_posix_and_fish_dialects() {
+        let assignments = ["TOKEN=local".to_string()];
+        let posix = plugin_probe_fragment(false, &assignments, "session-agent", 2);
+        assert!(posix.starts_with("( TOKEN="), "POSIX subshell: {posix}");
+        assert!(posix.contains(") && printf"), "POSIX: {posix}");
+        let fish = plugin_probe_fragment(true, &assignments, "session-agent", 2);
+        assert!(
+            fish.starts_with("begin; set -lx TOKEN "),
+            "fish block, not a rejected position subshell: {fish}"
+        );
+        assert!(fish.contains("end; and printf"), "fish: {fish}");
+        assert!(
+            !fish.contains("( "),
+            "fish fragment drops the abandoned position-subshell syntax"
+        );
+
+        // An apostrophe is a valid assignment value; each dialect must quote it
+        // into a single word its parser accepts.
+        let tricky = ["TITLE=a'b c".to_string()];
+        let posix = plugin_probe_fragment(false, &tricky, "session-agent", 3);
+        assert!(
+            posix.contains("TITLE='a'\\''b c'"),
+            "POSIX keeps the `'\\''` idiom: {posix}"
+        );
+        let fish = plugin_probe_fragment(true, &tricky, "session-agent", 3);
+        assert!(
+            fish.contains("'a\\'b c'"),
+            "fish keeps the apostrophe inside one single-quoted literal: {fish}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn fish_login_probe_fragments_execute_under_fish() {
+        // Fish rejects `( cmd )` at a position command (a disallowed command
+        // substitution), so its login-shell variant must use begin/set/and.
+        // If fish is not installed the fragment-shape test above still pins the
+        // dialect contract.
+        let fish = std::env::var_os("AOE_FISH_BIN")
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.exists())
+            .unwrap_or_else(|| std::path::PathBuf::from("/opt/homebrew/bin/fish"));
+        if !fish.exists() {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let first: &[String] = &["TITLE=a'b c".to_string()];
+        let none: &[String] = &[];
+        let mut batched = String::new();
+        for (assignments, binary, index) in [(first, "/bin/sh", 0), (none, "definitely-missing", 1)]
+        {
+            batched.push_str(&plugin_probe_fragment(true, assignments, binary, index));
+        }
+        let mut command = Command::new(&fish);
+        command
+            .args(["-lc", &batched])
+            .env_clear()
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join(".config"))
+            .env("PATH", "/bin:/usr/bin");
+        let output = command.output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let found: HashSet<usize> = stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix("AOE_PLUGIN_OK "))
+            .filter_map(|index| index.parse().ok())
+            .collect();
+        assert_eq!(found, HashSet::from([0]), "stdout: {stdout}");
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[serial_test::serial]
+    fn posix_login_probe_fragments_still_execute_under_sh() {
+        // The trailing probe legitimately fails, so the batch exits nonzero;
+        // availability is read from the printed markers, not the shell status.
+        let first: &[String] = &["TITLE=a'b c".to_string()];
+        let none: &[String] = &[];
+        let mut batched = String::new();
+        for (assignments, binary, index) in [(first, "sh", 0), (none, "definitely-missing-agnt", 1)]
+        {
+            batched.push_str(&plugin_probe_fragment(false, assignments, binary, index));
+        }
+        let output = Command::new("/bin/sh")
+            .args(["-c", &batched])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let found: HashSet<usize> = stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix("AOE_PLUGIN_OK "))
+            .filter_map(|index| index.parse().ok())
+            .collect();
+        assert_eq!(found, HashSet::from([0]), "stdout: {stdout}");
+    }
+
+    #[test]
+    fn detect_with_custom_agents_warns_on_misconfigured_entries() {
+        let mut session = crate::session::config::SessionConfig::default();
+        session
+            .custom_agents
+            .insert("empty-cmd".to_string(), String::new());
+        let logs = crate::session::test_support::LogCapture::start();
+        let _ = AvailableTools::detect_with_custom_agents(&session);
+        let captured = logs.contents();
+        drop(logs);
+        assert!(
+            captured.contains("has an empty command"),
+            "misconfigured custom agent must be surfaced once: {captured}"
         );
     }
 

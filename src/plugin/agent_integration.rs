@@ -70,6 +70,25 @@ pub fn catalog<'a, 'b, 'c>(
     unique_candidates(candidates, builtin_names, custom_names)
 }
 
+/// Display form of a plugin-declared command: control characters (including
+/// terminal escape sequences, which a malicious manifest could otherwise use to
+/// rewrite the approval prompt) become visible `\x..` escapes. The runnable
+/// command is never altered, only this disclosure string.
+pub fn display_command(command: &str) -> String {
+    if !command.chars().any(char::is_control) {
+        return command.to_string();
+    }
+    let mut out = String::with_capacity(command.len());
+    for character in command.chars() {
+        if character.is_control() {
+            out.extend(character.escape_default());
+        } else {
+            out.push(character);
+        }
+    }
+    out
+}
+
 /// Resolve a unique plugin-provided agent launch command.
 pub fn agent_command<'a>(
     tool: &str,
@@ -95,7 +114,7 @@ pub fn agent_command<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{unique_candidates, PluginAgent};
+    use super::{display_command, unique_candidates, PluginAgent};
 
     #[test]
     fn catalog_suppresses_duplicate_provider_and_custom_or_builtin_collisions() {
@@ -128,5 +147,14 @@ mod tests {
                 "built-in alias should reserve {tool}"
             );
         }
+    }
+
+    #[test]
+    fn display_command_escapes_only_controls() {
+        assert_eq!(
+            display_command("session-helper --flag"),
+            "session-helper --flag"
+        );
+        assert_eq!(display_command("x\u{1b}[2Jtail"), "x\\u{1b}[2Jtail");
     }
 }

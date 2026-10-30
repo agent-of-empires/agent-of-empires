@@ -835,6 +835,7 @@ pub struct ReapproveConsent {
     pub validation: String,
     pub capabilities: Vec<String>,
     pub ui: Vec<UiView>,
+    pub agent_integrations: Vec<AgentIntegrationContribution>,
     pub manifest_hash: String,
 }
 
@@ -878,6 +879,7 @@ pub fn reapprove_consent(id: &str) -> Result<ReapproveConsent> {
                 id: u.id.clone(),
             })
             .collect(),
+        agent_integrations: plugin.manifest.agent_integrations.clone(),
         manifest_hash: plugin.manifest_hash.clone(),
     })
 }
@@ -1200,7 +1202,11 @@ fn confirm_capabilities(
         println!("Plugin {id} declares these agent commands (run as your user, unsandboxed):");
         for integration in integrations {
             if let Some(command) = &integration.command {
-                println!("  {}: {command}", integration.tool);
+                println!(
+                    "  {}: {}",
+                    integration.tool,
+                    super::agent_integration::display_command(command)
+                );
             }
         }
     }

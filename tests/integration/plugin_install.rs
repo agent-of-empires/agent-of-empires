@@ -269,6 +269,7 @@ capabilities = ["net"]
 
     let consent = install::reapprove_consent("acme.regrant").unwrap();
     assert_eq!(consent.capabilities, vec!["net", "notifications"]);
+    assert!(consent.agent_integrations.is_empty());
 
     // A pin that no longer matches the on-disk manifest refuses.
     let err = install::approve_installed("acme.regrant", "sha256:stale")
