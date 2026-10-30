@@ -8,30 +8,15 @@ import {
   updateSuggestionSource,
   type SuggestionResult,
 } from "../lib/api";
-import type { SuggestionItem, SuggestionPrepared, SuggestionsSnapshot } from "../lib/types";
+import type { SuggestionItem, SuggestionsSnapshot } from "../lib/types";
+import { STALE_NOTICE, toWizardPrefill } from "../lib/suggestionPrefill";
+import { SuggestionRow } from "./SuggestionRow";
 import { OFFLINE_TITLE, useServerDown } from "../lib/connectionState";
 import type { WizardPrefill } from "./session-wizard/SessionWizard";
 
 interface Props {
   readOnly?: boolean;
   onPrepare: (prefill: WizardPrefill) => void;
-}
-
-const STALE_NOTICE = "That suggestion changed. Refreshing the list.";
-
-// `p.worktree` is dropped on purpose: the wizard resolves worktree itself, and
-// `WizardPrefill.worktreeEnabled` means a registered-project override.
-function toWizardPrefill(p: SuggestionPrepared, source: NonNullable<WizardPrefill["source"]>): WizardPrefill {
-  return {
-    source,
-    title: p.title || undefined,
-    path: p.project?.path,
-    tool: p.tool,
-    yoloMode: p.yolo,
-    sandboxEnabled: p.sandbox,
-    // A blank initial_prompt is rejected by POST /api/sessions, so send none.
-    initialPrompt: p.initial_prompt || undefined,
-  };
 }
 
 export function SuggestionsView({ readOnly = false, onPrepare }: Props) {
@@ -207,52 +192,42 @@ export function SuggestionsView({ readOnly = false, onPrepare }: Props) {
               const key = `${item.provider_id}:${item.id}`;
               const providerName = snapshot.providers.find((p) => p.id === item.provider_id)?.name ?? item.provider_id;
               return (
-                <li
+                <SuggestionRow
                   key={key}
-                  className="flex items-center gap-3 border-t border-surface-700/40 px-3 py-2.5 first:border-t-0"
-                >
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-sm text-text-primary">{item.title}</p>
-                    <p className="mt-0.5 truncate text-xs text-text-muted">
-                      <span className="font-mono font-medium text-text-secondary">{providerName}</span>
-                      {" · "}
-                      {item.reason}
-                      {item.project && (
-                        <>
-                          {" · "}
-                          <span className="font-mono font-medium text-text-secondary">{item.project}</span>
-                        </>
+                  title={item.title}
+                  source={providerName}
+                  reason={item.reason}
+                  project={item.project}
+                  actions={
+                    <>
+                      {!item.dismissed && (
+                        <button
+                          type="button"
+                          onClick={() => void start(item, providerName)}
+                          disabled={busy !== null || disabled}
+                          title={startTitle}
+                          className="inline-flex h-8 items-center rounded-md border border-surface-700 bg-surface-800 px-3 text-xs font-medium text-text-primary hover:bg-surface-700/50 disabled:opacity-50"
+                        >
+                          Start
+                        </button>
                       )}
-                    </p>
-                  </div>
-                  <div className="flex flex-none gap-1">
-                    {!item.dismissed && (
-                      <button
-                        type="button"
-                        onClick={() => void start(item, providerName)}
-                        disabled={busy !== null || disabled}
-                        title={startTitle}
-                        className="inline-flex h-8 items-center rounded-md border border-surface-700 bg-surface-800 px-3 text-xs font-medium text-text-primary hover:bg-surface-700/50 disabled:opacity-50"
-                      >
-                        Start
-                      </button>
-                    )}
-                    {!readOnly && (
-                      <button
-                        type="button"
-                        aria-label={item.dismissed ? "Restore" : "Dismiss"}
-                        title={item.dismissed ? "Restore" : "Dismiss"}
-                        onClick={() =>
-                          void act(key, () => dismissSuggestion(item.provider_id, item.id, !item.dismissed))
-                        }
-                        disabled={busy !== null || disabled}
-                        className="inline-flex h-8 w-8 items-center justify-center rounded-md text-text-secondary hover:bg-surface-700/50 disabled:opacity-50"
-                      >
-                        {item.dismissed ? <Undo2 className="h-4 w-4" /> : <X className="h-4 w-4" />}
-                      </button>
-                    )}
-                  </div>
-                </li>
+                      {!readOnly && (
+                        <button
+                          type="button"
+                          aria-label={item.dismissed ? "Restore" : "Dismiss"}
+                          title={item.dismissed ? "Restore" : "Dismiss"}
+                          onClick={() =>
+                            void act(key, () => dismissSuggestion(item.provider_id, item.id, !item.dismissed))
+                          }
+                          disabled={busy !== null || disabled}
+                          className="inline-flex h-8 w-8 items-center justify-center rounded-md text-text-secondary hover:bg-surface-700/50 disabled:opacity-50"
+                        >
+                          {item.dismissed ? <Undo2 className="h-4 w-4" /> : <X className="h-4 w-4" />}
+                        </button>
+                      )}
+                    </>
+                  }
+                />
               );
             })}
             {visible.length === 0 && (
