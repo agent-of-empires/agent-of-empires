@@ -797,6 +797,50 @@ mod tests {
         assert_eq!(finished_id(f.next().await), "t-1");
     }
 
+    /// A resumed workflow run whose journal is gone settles the agents the log
+    /// recorded before the task reports its end.
+    #[tokio::test]
+    async fn a_workflow_run_settles_its_agents_before_it_finishes() {
+        let mut f = fixture(&notification_line("t-1", Some("completed")));
+        let tx = f.tx.as_ref().expect("sender kept").downgrade();
+        let _ = TaskTailer {
+            tool_call_id: Some("toolu_1".into()),
+            claude_home: Some(f.home.clone()),
+            watch: FileWatchService::noop(),
+            task_id: "t-1".into(),
+            session_id: "sess".into(),
+            active: f.active.clone(),
+            event_tx: tx.clone(),
+            start: TailerStart::Resumed,
+            idle: f.idle.clone(),
+            workflow: Some(WorkflowJournal {
+                launch: crate::acp::state::WorkflowLaunch {
+                    run_id: "wf_1".into(),
+                    name: "drafts".into(),
+                    summary: None,
+                    transcript_dir: f.home.join("gone").to_string_lossy().into_owned(),
+                },
+                tool_call_id: "toolu_1".into(),
+                claude_home: f.home.clone(),
+                known: crate::acp::state::WorkflowAgents {
+                    launched: HashSet::from(["a1".to_string()]),
+                    completed: HashSet::new(),
+                },
+                event_tx: tx,
+                bg_agents: Arc::default(),
+                watch: FileWatchService::noop(),
+            }),
+        }
+        .spawn(None)
+        .await;
+        assert!(matches!(
+            f.next().await,
+            Event::BackgroundAgentCompleted { agent_id, status: crate::acp::state::BackgroundAgentStatus::Detached, .. }
+                if agent_id == "a1"
+        ));
+        assert_eq!(finished_id(f.next().await), "t-1");
+    }
+
     #[tokio::test]
     async fn a_resumed_tailer_scans_the_whole_transcript() {
         // The notification sits beyond the live lookback window and many

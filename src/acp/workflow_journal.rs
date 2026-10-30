@@ -58,11 +58,12 @@ impl WorkflowJournal {
                         run_id = %self.launch.run_id,
                         "workflow transcript directory is outside the Claude home; not following its agents"
                     );
-                    return;
+                    return self.settle_without_journal(ended, stopped).await;
                 }
                 Dir::NotYet => tokio::select! {
-                    () = ended.cancelled() => return,
+                    biased;
                     () = stopped.cancelled() => return,
+                    () = ended.cancelled() => return self.settle_without_journal(ended, stopped).await,
                     () = tokio::time::sleep(FALLBACK_POLL) => {}
                 },
             }
@@ -110,6 +111,32 @@ impl WorkflowJournal {
                 }
                 change = changes.recv(), if watched => watched = change.is_some(),
                 () = tokio::time::sleep(if watched { SAFETY_REREAD } else { FALLBACK_POLL }) => {}
+            }
+        }
+    }
+}
+
+impl WorkflowJournal {
+    /// With no journal to read, the agents the log recorded as launched (a
+    /// resumed run) are still settled when the run ends.
+    async fn settle_without_journal(self, ended: CancellationToken, stopped: CancellationToken) {
+        tokio::select! {
+            biased;
+            () = stopped.cancelled() => return,
+            () = ended.cancelled() => {}
+        }
+        let mut unreported: Vec<&String> = self
+            .known
+            .launched
+            .difference(&self.known.completed)
+            .collect();
+        unreported.sort();
+        for agent_id in unreported {
+            let Some(tx) = self.event_tx.upgrade() else {
+                return;
+            };
+            if tx.send(detached(agent_id)).await.is_err() {
+                return;
             }
         }
     }
@@ -292,12 +319,7 @@ impl Follower {
         unreported.sort();
         for agent_id in unreported {
             self.finish_tailer(&agent_id).await;
-            let event = completed(
-                &agent_id,
-                BackgroundAgentStatus::Detached,
-                None,
-                Some("workflow ended before this agent reported".into()),
-            );
+            let event = detached(&agent_id);
             self.completed.insert(agent_id);
             if !self.send(event).await {
                 return;
@@ -329,6 +351,15 @@ impl Follower {
             None => false,
         }
     }
+}
+
+fn detached(agent_id: &str) -> Event {
+    completed(
+        agent_id,
+        BackgroundAgentStatus::Detached,
+        None,
+        Some("workflow ended before this agent reported".into()),
+    )
 }
 
 fn completed(
@@ -575,6 +606,38 @@ mod tests {
         assert_eq!(agent.tools.len(), 1);
         assert_eq!(agent.tools[0].ok, Some(true));
         assert_eq!(agent.result.as_deref(), Some("drafted"));
+    }
+
+    /// A resumed run whose journal is gone, or was never followable, still
+    /// settles the agents the log recorded before its task finishes.
+    #[tokio::test]
+    async fn a_run_without_its_journal_settles_recorded_agents() {
+        let fx = Fixture::new();
+        let outside = tempfile::tempdir().unwrap();
+        let known = || WorkflowAgents {
+            launched: HashSet::from(["a1".to_string(), "a2".to_string()]),
+            completed: HashSet::from(["a1".to_string()]),
+        };
+        for dir in [
+            fx.home.path().join("projects/gone"),
+            outside.path().to_path_buf(),
+        ] {
+            let (tx, rx) = tokio::sync::mpsc::channel(32);
+            let journal = fx.journal(&dir, known(), &tx);
+            assert_eq!(
+                summarize(&run_ended(journal, tx, rx).await),
+                ["completed a2 Detached None"],
+                "{dir:?}"
+            );
+        }
+        // A replaced launch hands the agents over instead.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let stopped = CancellationToken::new();
+        stopped.cancel();
+        fx.journal(outside.path(), known(), &tx)
+            .run(CancellationToken::new(), stopped)
+            .await;
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
