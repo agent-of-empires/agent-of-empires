@@ -392,6 +392,17 @@ pub struct WorkflowLaunch {
     pub transcript_dir: String,
 }
 
+/// A workflow run whose task is still open, so a client whose replay window
+/// starts after the launch can still tie the task to its tool call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenWorkflowRun {
+    pub task_id: String,
+    pub tool_call_id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
 /// The workflow run and phase a background sub-agent belongs to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowRef {
@@ -503,6 +514,8 @@ pub struct AcpState {
     /// Ids of running background tasks that are not sub-agents.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub background_tasks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workflow_runs: Vec<OpenWorkflowRun>,
 
     /// Whether the main turn is in flight. Dispatch (`acp::dispatch::decide`)
     /// and the queue drain gate on this directly, so it tracks only the main
@@ -1168,12 +1181,28 @@ impl AcpState {
                     }
                 }
             }
-            Event::BackgroundTaskStarted { task_id, .. } => {
+            Event::BackgroundTaskStarted {
+                task_id,
+                tool_call_id,
+                workflow,
+                ..
+            } => {
+                // A reused task id replaces whatever run held it.
+                self.workflow_runs.retain(|run| run.task_id != task_id);
+                if let (Some(workflow), Some(tool_call_id)) = (workflow, tool_call_id) {
+                    self.workflow_runs.push(OpenWorkflowRun {
+                        task_id: task_id.clone(),
+                        tool_call_id,
+                        name: workflow.name,
+                        summary: workflow.summary,
+                    });
+                }
                 if !self.background_tasks.contains(&task_id) {
                     self.background_tasks.push(task_id);
                 }
             }
             Event::BackgroundTaskFinished { task_id, .. } => {
+                self.workflow_runs.retain(|run| run.task_id != task_id);
                 self.background_tasks.retain(|id| *id != task_id);
             }
             // Titles live on `Instance`; wakeups and monitors are read from the log.
@@ -2199,6 +2228,44 @@ mod tests {
         s.apply_event(s.last_seq.saturating_add(1), finished("t-2"))
             .unwrap();
         assert!(!s.has_active_background_agent());
+    }
+
+    #[test]
+    fn open_workflow_runs_follow_their_task() {
+        let workflow = |id: &str, call: &str| Event::BackgroundTaskStarted {
+            task_id: id.into(),
+            tool_call_id: Some(call.into()),
+            description: "drafts".into(),
+            workflow: Some(WorkflowLaunch {
+                run_id: "wf_1".into(),
+                name: "drafts".into(),
+                summary: None,
+                transcript_dir: "/home/u/.claude/wf".into(),
+            }),
+        };
+        let open = |s: &AcpState| {
+            s.workflow_runs
+                .iter()
+                .map(|run| run.tool_call_id.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut s = applied([workflow("wfx", "toolu_a"), workflow("wfy", "toolu_b")]);
+        assert_eq!(open(&s), ["toolu_a", "toolu_b"]);
+        for event in [
+            Event::BackgroundTaskStarted {
+                task_id: "wfx".into(),
+                tool_call_id: Some("toolu_bash".into()),
+                description: "sleep".into(),
+                workflow: None,
+            },
+            Event::BackgroundTaskFinished {
+                task_id: "wfy".into(),
+                ended_at: None,
+            },
+        ] {
+            s.apply_event(s.last_seq.saturating_add(1), event).unwrap();
+        }
+        assert!(open(&s).is_empty(), "replaced and finished runs close");
     }
 
     /// #4001: `turn_active` gates prompt dispatch and the queue drain, not

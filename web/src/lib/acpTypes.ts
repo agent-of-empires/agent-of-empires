@@ -525,6 +525,8 @@ export interface ReducedState {
   session_notices?: SessionNotice[];
   /** Open background task ids; the daemon omits the field when none are open. */
   background_tasks?: string[];
+  /** Workflow runs whose task is still open; omitted when none are. */
+  workflow_runs?: { task_id: string; tool_call_id: string; name: string; summary?: string | null }[];
 }
 
 export interface AcpState {
@@ -1403,8 +1405,23 @@ export function applyReducedState(state: AcpState, reduced: ReducedState, unchan
     // Likewise authoritative: a task that started before the replay window
     // has no start event here, yet the session is still busy.
     backgroundTasks: reduced.background_tasks ?? [],
+    workflowRuns: restoreOpenWorkflowRuns(state.workflowRuns, reduced.workflow_runs ?? []),
     locallyResolved,
   };
+}
+
+/** A run launched before the replay window has no start event here. */
+function restoreOpenWorkflowRuns(
+  runs: Record<string, WorkflowRun>,
+  open: NonNullable<ReducedState["workflow_runs"]>,
+): Record<string, WorkflowRun> {
+  const missing = open.filter((run) => !runs[run.tool_call_id]);
+  if (missing.length === 0) return runs;
+  const next = { ...runs };
+  for (const run of missing) {
+    next[run.tool_call_id] = { taskId: run.task_id, name: run.name, summary: run.summary ?? null };
+  }
+  return next;
 }
 
 /** Merge a duplicate `ToolCallStarted`: a sparse permission start must not clobber a real one. */
