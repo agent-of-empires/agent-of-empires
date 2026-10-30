@@ -19,6 +19,7 @@ mod queue;
 mod sandbox_image;
 pub(crate) mod sessions;
 mod skills;
+mod suggestions;
 pub(crate) mod system;
 mod telemetry;
 
@@ -75,6 +76,10 @@ pub(crate) use sessions::{
 };
 pub use skills::{
     adopt_skill, create_skill, delete_skill, edit_skill, list_skills, read_skill, sync_skills,
+};
+pub use suggestions::{
+    dismiss_suggestion, get_suggestions, prepare_suggestion, refresh_suggestions,
+    undismiss_suggestion, update_suggestion_source,
 };
 
 pub use system::{
@@ -585,6 +590,16 @@ mod tests {
             ],
         ),
         (
+            "suggestions.rs",
+            include_str!("suggestions.rs"),
+            &[
+                "dismiss_suggestion",
+                "refresh_suggestions",
+                "undismiss_suggestion",
+                "update_suggestion_source",
+            ],
+        ),
+        (
             "skills.rs",
             include_str!("skills.rs"),
             &[
@@ -657,6 +672,12 @@ mod tests {
             "/api/plugins/{id}/settings/options/resolve",
             "api::resolve_options",
             "UI option discovery may run capability probes and populate the shared catalog.",
+        ),
+        (
+            "POST",
+            "/api/suggestions/prepare",
+            "api::prepare_suggestion",
+            "Resolves a wizard prefill; mutates nothing.",
         ),
         (
             "POST",
@@ -1745,6 +1766,10 @@ mod tests {
             (Method::POST, "/api/plugins/missing/update/apply"),
             (Method::POST, "/api/plugins/missing/update/dismiss"),
             (Method::PATCH, "/api/theme"),
+            (Method::POST, "/api/suggestions/refresh"),
+            (Method::POST, "/api/suggestions/dismiss"),
+            (Method::POST, "/api/suggestions/undismiss"),
+            (Method::PATCH, "/api/suggestions/sources"),
             (Method::POST, "/api/sandbox/image-pull"),
             (Method::POST, "/api/sandbox/image-dismiss"),
         ] {
