@@ -6,7 +6,7 @@ Today almost every mutating CLI command writes `sessions.json`, tmux, worktrees 
 
 ## Decision
 
-- **The CLI auto-starts a local Daemon** when it needs one and none answers, then hard fails with reconnect guidance if the start fails. The started Daemon is the one #3838 describes: detached, shared, Unix socket only, no idle exit; the Web dashboard and Tunnel follow the Web serving and Tunnel settings (off by default). Until the socket listener lands (#3897 on Linux, #4431 on macOS) it binds loopback TCP and is discovered through `serve.url`, as `aoe serve --daemon` does today, so auto-start does not wait on it. The CLI and the TUI share one spawn path; when several Clients race, exactly one Daemon wins and the others connect to it.
+- **The CLI auto-starts a local Daemon** when it needs one and none answers, then hard fails with reconnect guidance if the start fails. The started Daemon is the one #3838 describes: detached, shared, Unix socket only, no idle exit; the Web dashboard and Tunnel follow the Web serving and Tunnel settings (off by default). The CLI and the TUI share one spawn path; when several Clients race, exactly one Daemon wins and the others connect to it.
 - **Auto-start is local only.** With `AOE_DAEMON_URL` or `--daemon-url` set, the CLI never spawns and hard fails when the remote Daemon is unreachable. A Client-only build (Windows) has no local Daemon, so without a URL it hard fails with guidance.
 - **Opt-out:** a global `--no-autostart` flag, also read from `AOE_NO_AUTOSTART=1`, honored by the CLI and the TUI. With it, a missing Daemon is a hard fail.
 - **Auto-start is announced** with one line on stderr (`Started aoe daemon (pid N)`), also under `--json`, so stdout stays parseable.

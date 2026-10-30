@@ -16,7 +16,6 @@ use crate::session::config::{
 };
 use crate::session::{list_profiles_for_display, Item, LifecycleOperation, Status};
 use crate::tui::app::Action;
-use crate::tui::dialogs::ServeAction;
 use crate::tui::dialogs::{
     builtin_commands, CommandPaletteDialog, ConfirmDialog, ContextMenuAction, ContextMenuDialog,
     DeleteDialogConfig, DialogResult, GroupDeleteOptions, GroupDeleteOptionsDialog,
@@ -25,6 +24,7 @@ use crate::tui::dialogs::{
     RenameMode, RepoTrustAction, RestartDialog, SendMessageDialog, TipsDialog, TipsOutcome,
     UnifiedDeleteDialog, WorktreeNameDialog,
 };
+use crate::tui::dialogs::{DashboardLaunch, ServeAction, ServeView};
 use crate::tui::diff::{DiffAction, DiffView};
 use crate::tui::responsive;
 use crate::tui::settings::{SettingsAction, SettingsView};
@@ -3739,7 +3739,7 @@ impl HomeView {
 
     /// The hub's Web dashboard row. `known` keeps a transport already read, so a refresh
     /// reads `serve.mode` only until it names one.
-    pub(super) fn connections_web_state(
+    pub(crate) fn connections_web_state(
         &self,
         known: Option<&crate::tui::dialogs::WebState>,
     ) -> crate::tui::dialogs::WebState {
@@ -3747,7 +3747,12 @@ impl HomeView {
         if web_plugin_disabled() {
             WebState::Disabled
         } else if !self.serve_running {
-            WebState::Off
+            // A dashboard that came up another way since outranks a stored failure.
+            if matches!(self.dashboard_launch, Some(DashboardLaunch::Failed { .. })) {
+                WebState::Failed
+            } else {
+                WebState::Off
+            }
         } else if let Some(WebState::On(Some(via))) = known {
             WebState::On(Some(via))
         } else {
@@ -3755,7 +3760,7 @@ impl HomeView {
         }
     }
 
-    fn open_serve(&mut self) {
+    pub(crate) fn open_serve(&mut self) {
         if web_plugin_disabled() {
             self.info_dialog = Some(InfoDialog::new(
                 "Web dashboard disabled",
@@ -3766,7 +3771,11 @@ impl HomeView {
             ));
             return;
         }
-        self.serve_view = Some(crate::tui::dialogs::ServeView::new());
+        let launch = self.dashboard_launch.take();
+        self.dashboard_launch = launch
+            .clone()
+            .filter(|launch| matches!(launch, DashboardLaunch::Running { .. }));
+        self.serve_view = Some(launch.map_or_else(ServeView::new, ServeView::for_launch));
     }
 
     pub(super) fn open_settings(&mut self) {
@@ -7428,6 +7437,7 @@ mod tests {
             sandbox_image: "ubuntu:latest".to_string(),
             yolo_mode: false,
             extra_env: Vec::new(),
+            hook_env: Vec::new(),
             extra_args: String::new(),
             command_override: String::new(),
             scratch: false,

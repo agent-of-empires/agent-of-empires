@@ -207,7 +207,7 @@ agent_detect_as = { "lenovo-claude" = "claude" }
 - **`agent_detect_as`** reuses built-in status detection and ACP adapter inheritance. It never proves which native CLI owns a terminal conversation. Use [status rules](#status-rules-for-custom-agents) when output differs from the built-in.
 - **`agent_acp_cmd`** (optional): ACP launch command that lets the agent run in the structured view (see below).
 - **`agent_execution_as`** declares the native agent actually invoked by an opaque wrapper, together with its `agent_config_dir` store contract. This is required for managed resume and fork through such a wrapper.
-  Bare, non-path wrappers can receive Default automatic resume flags and pane-scoped capture without this contract. Cleared launches selected by a failed-resume marker or disabled `auto_resume_on_restart` start fresh, mint and pass fresh-session flags where supported, and capture the new pane-scoped ID; explicit resume and fork remain unavailable. See [Execution identity and wrappers](session-resume.md#execution-identity-and-wrappers).
+  Bare, non-path wrappers can start fresh and capture their pane-scoped published ID without this contract. Resuming the recorded conversation requires the contract. See [Execution identity and wrappers](session-resume.md#execution-identity-and-wrappers) for wrapper contracts and [Pinning or resetting a conversation](session-resume.md#pinning-or-resetting-a-conversation) for failed-resume recovery.
 - **`agent_config_dir`** (optional): The config directory the wrapper points its CLI at, when that is not the built-in default (see below).
 - **`default_tool`** can select a custom-agent name for new sessions.
 
@@ -445,7 +445,7 @@ Scope note: `before_session` applies to the **agent** launch, matching the stati
 The command's environment carries:
 
 - **Lifecycle variables:** `AOE_SESSION_ID`, `AOE_SESSION_TITLE`, `AOE_PROJECT_PATH`, `AOE_PROFILE`, `AOE_TOOL`, `AOE_GROUP_PATH`, `AOE_SESSION_BRANCH` for worktrees, and `AOE_REPO_SLUG` when the origin remote parses as `owner/repo`. Structured `before_session` receives the available subset: ID, profile, tool and project path.
-- **Sandbox input** (`before_start` only): the session's environment, or its effective profile/global `sandbox.environment`. Set per-session values in the new-session dialog. Repo config cannot supply this host-hook input. `aoe add --sandbox --hook-env KEY=VALUE` (repeatable), or the web wizard's Host hook environment list, adds hook-only input that wins a same-key entry and never enters the container; a value the container needs must be printed by the hook as `KEY=VALUE`.
+- **Sandbox input** (`before_start` only): the session's environment, or its effective profile/global `sandbox.environment`. Set per-session values in the new-session dialog. Repo config cannot supply this host-hook input. `aoe add --sandbox --hook-env KEY=VALUE` (repeatable), or the Host hook env list in the TUI dialog (or the web wizard), adds hook-only input that wins a same-key entry and never enters the container; a value the container needs must be printed by the hook as `KEY=VALUE`.
 
 `host_hooks` is **global/profile only**: it is never honored from a repo's `.agent-of-empires/config.toml`, because a checked-out repository must not be able to run host commands. Declare it in your global or profile `config.toml`.
 

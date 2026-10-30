@@ -171,6 +171,7 @@ impl HomeView {
             serve_view: None,
             connections_view: None,
             pending_dashboard_launch: None,
+            dashboard_launch: None,
             update_confirm_dialog: None,
             telemetry_consent_dialog: None,
             tips_dialog: None,

@@ -752,7 +752,10 @@ impl SessionPoller {
         self.result_tx
             .send((
                 instance_id.to_string(),
-                SessionIdObservation::unguarded(session_id.to_string()),
+                SessionIdObservation {
+                    execution: self.execution.clone(),
+                    ..SessionIdObservation::unguarded(session_id.to_string())
+                },
             ))
             .expect("inject_test_update: result channel disconnected");
     }
