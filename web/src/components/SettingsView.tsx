@@ -721,7 +721,14 @@ export function SettingsView({
       case "plugins":
         return (
           <div className="space-y-6">
-            <PluginsSettings readOnly={cityhall} />
+            <PluginsSettings
+              readOnly={cityhall}
+              initialMarketplaceFilter={
+                new URLSearchParams(window.location.search).get("marketplace") === "suggestions"
+                  ? "suggestions"
+                  : undefined
+              }
+            />
             {!cityhall &&
               (schemaGuard() ?? <PluginSettingsSections schema={schema} settings={settings} onSaveField={sendSave} />)}
           </div>

@@ -2182,6 +2182,9 @@ function AppContent({
           </div>
           <SuggestionsView
             readOnly={serverAbout?.read_only ?? false}
+            onOpenMarketplace={
+              caps.canManageProjects ? () => requestNavigate("/settings/plugins?marketplace=suggestions") : undefined
+            }
             onPrepare={(prefill) => {
               setWizardPrefill(prefill);
               setShowSessionWizard(true);
@@ -2254,6 +2257,7 @@ function AppContent({
             setShowSessionWizard(true);
           }}
           onViewAllSuggestions={() => requestNavigate("/suggestions")}
+          onOpenSuggestionsMarketplace={() => requestNavigate("/settings/plugins?marketplace=suggestions")}
         />
       );
     }
