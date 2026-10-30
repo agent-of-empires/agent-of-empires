@@ -42,7 +42,6 @@ pub struct RetainedView {
     session_id: String,
     source_profile: String,
     generation: u64,
-    pub focused: bool,
     state: Option<StructuredViewState>,
     load: Option<tokio::task::JoinHandle<()>>,
     result: tokio::sync::oneshot::Receiver<
@@ -58,7 +57,6 @@ impl RetainedView {
             session_id: inst.id.clone(),
             source_profile: inst.source_profile.clone(),
             generation: inst.lifecycle_generation,
-            focused: false,
             state: None,
             load: None,
             result,
@@ -138,7 +136,8 @@ impl RetainedView {
         frame: &mut Frame,
         area: Rect,
         theme: &Theme,
-        offset: u16,
+        offset: usize,
+        focused: bool,
     ) -> render::TranscriptGeometry {
         use ratatui::{style::Style, widgets::Paragraph};
         let status_rows = unicode_width::UnicodeWidthStr::width(self.message.as_str())
@@ -152,7 +151,7 @@ impl RetainedView {
         ])
         .split(area);
         frame.render_widget(
-            Paragraph::new(if self.focused {
+            Paragraph::new(if focused {
                 "Trash · read-only · Esc: sessions"
             } else {
                 "Trash · read-only · Enter: read"
@@ -176,7 +175,7 @@ impl RetainedView {
             });
         let total = text.lines.len();
         let max = total.saturating_sub(text_area.height as usize);
-        let first = max.saturating_sub(offset as usize);
+        let first = max.saturating_sub(offset);
         text.lines.drain(..first);
         text.lines.truncate(text_area.height as usize);
         frame.render_widget(Paragraph::new(text), text_area);
@@ -424,6 +423,43 @@ mod retained_tests {
         Router,
     };
     use std::{sync::Arc, time::Duration};
+
+    #[test]
+    fn trash_home_reaches_history_beyond_u16_lines() {
+        let inst = crate::session::Instance::new("large retained", "/tmp");
+        let endpoint = DaemonEndpoint::new(
+            "http://127.0.0.1:1".into(),
+            None,
+            crate::acp::client::discovery::Source::Env,
+        );
+        let http = crate::acp::client::HttpClient::new(endpoint.clone()).unwrap();
+        let mut state = StructuredViewState::new(inst.id.clone(), endpoint, http, None);
+        let mut model = crate::acp::transcript::TranscriptModel::new();
+        model.apply_event(
+            1,
+            &crate::acp::state::Event::AgentMessageChunk {
+                text: format!(
+                    "oldest retained text\n\n{}newest retained text",
+                    "line\n\n".repeat(70_000)
+                ),
+                message_id: None,
+            },
+        );
+        state.transcript.merge_server_rows(model.rows().to_vec());
+        let mut view = RetainedView::new(None, &inst);
+        view.state = Some(state);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 10)).unwrap();
+        let mut first = usize::MAX;
+        terminal
+            .draw(|frame| {
+                first = view
+                    .render(frame, frame.area(), &Theme::default(), usize::MAX, false)
+                    .first_line;
+            })
+            .unwrap();
+        assert_eq!(first, 0, "Home must reach the oldest retained line");
+    }
 
     #[tokio::test]
     async fn obsolete_read_is_cancelled_and_failure_does_not_become_empty_history() {

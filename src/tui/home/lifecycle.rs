@@ -223,6 +223,8 @@ impl HomeView {
             structured_preview: None,
             structured_preview_pending: false,
             retained_preview: None,
+            retained_focus: None,
+            retained_scroll_offset: 0,
             pending_force_remove_session: None,
             pending_trash_session: None,
             pending_dialog_click_action: None,

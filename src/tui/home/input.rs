@@ -434,6 +434,21 @@ impl HomeView {
             .is_some_and(|inst| inst.is_trashed())
     }
 
+    pub(in crate::tui) fn retained_reader_focused(&self) -> bool {
+        self.selected_session
+            .as_deref()
+            .and_then(|id| self.get_instance(id))
+            .is_some_and(|inst| {
+                inst.is_trashed()
+                    && self
+                        .retained_focus
+                        .as_ref()
+                        .is_some_and(|(id, generation)| {
+                            id == &inst.id && *generation == inst.lifecycle_generation
+                        })
+            })
+    }
+
     pub(in crate::tui) fn enforce_trash_read_only(&mut self) {
         if !self.selected_is_trashed() {
             return;
@@ -446,6 +461,19 @@ impl HomeView {
         self.pending_permission_response = None;
         self.restart_dialog = None;
         self.tool_picker_dialog = None;
+        self.rename_dialog = None;
+        self.group_rename_context = None;
+        self.worktree_name_dialog = None;
+        self.attach_project_dialog = None;
+        self.snooze_duration_dialog = None;
+        self.pending_snooze_session = None;
+        if self
+            .context_menu
+            .as_ref()
+            .is_some_and(|menu| !menu.is_read_only_session_menu())
+        {
+            self.context_menu = None;
+        }
     }
 
     pub fn is_diff_open(&self) -> bool {
@@ -921,7 +949,11 @@ impl HomeView {
                 // lines up from the newest, the top `offset + height - 1`. Deriving it
                 // from the offset rather than the stale `total_lines` keeps it correct
                 // before the next capture.
-                let offset = self.preview_scroll_offset as usize;
+                let offset = if self.selected_is_trashed() {
+                    self.retained_scroll_offset
+                } else {
+                    self.preview_scroll_offset as usize
+                };
                 let from_bottom = if at_top {
                     offset + (pane.height as usize).saturating_sub(1)
                 } else {
@@ -953,11 +985,13 @@ impl HomeView {
             let max = self
                 .preview_text_view
                 .total_lines
-                .saturating_sub(self.preview_visible_rows)
-                .min(u16::MAX as usize) as i32;
-            let new = (i32::from(self.preview_scroll_offset) + delta).clamp(0, max) as u16;
-            let changed = new != self.preview_scroll_offset;
-            self.preview_scroll_offset = new;
+                .saturating_sub(self.preview_visible_rows);
+            let new = self
+                .retained_scroll_offset
+                .saturating_add_signed(delta as isize)
+                .min(max);
+            let changed = new != self.retained_scroll_offset;
+            self.retained_scroll_offset = new;
             return changed;
         }
         // Use the rendered output-body height the per-frame clamp uses
@@ -1934,23 +1968,13 @@ impl HomeView {
         // it would point at unrelated content. Covers the live-send branch below too.
         self.clear_preview_selection();
         self.enforce_trash_read_only();
-        if self.selected_is_trashed()
-            && !self.has_non_live_send_overlay()
-            && self
-                .retained_preview
-                .as_ref()
-                .is_some_and(|view| view.focused)
-        {
+        if self.retained_reader_focused() && !self.has_non_live_send_overlay() {
             match key.code {
                 KeyCode::Esc => {
-                    if let Some(view) = self.retained_preview.as_mut() {
-                        view.focused = false;
-                    }
+                    self.retained_focus = None;
                 }
                 KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if let Some(view) = self.retained_preview.as_mut() {
-                        view.focused = false;
-                    }
+                    self.retained_focus = None;
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.scroll_preview_offset(1);
@@ -1964,8 +1988,8 @@ impl HomeView {
                 KeyCode::PageDown => {
                     self.scroll_preview_offset(-i32::from(PAGE_STEP));
                 }
-                KeyCode::Home => self.preview_scroll_offset = u16::MAX,
-                KeyCode::End => self.preview_scroll_offset = 0,
+                KeyCode::Home => self.retained_scroll_offset = usize::MAX,
+                KeyCode::End => self.retained_scroll_offset = 0,
                 _ => {}
             }
             return None;
@@ -3225,10 +3249,20 @@ impl HomeView {
             ActionId::AutoName => return self.auto_name_selected(),
             ActionId::OpenCommandPalette => self.open_command_palette(),
             ActionId::PreviewScrollUp => {
-                self.preview_scroll_offset = self.preview_scroll_offset.saturating_add(PAGE_STEP)
+                if self.selected_is_trashed() {
+                    self.scroll_preview_offset(i32::from(PAGE_STEP));
+                } else {
+                    self.preview_scroll_offset =
+                        self.preview_scroll_offset.saturating_add(PAGE_STEP);
+                }
             }
             ActionId::PreviewScrollDown => {
-                self.preview_scroll_offset = self.preview_scroll_offset.saturating_sub(PAGE_STEP)
+                if self.selected_is_trashed() {
+                    self.scroll_preview_offset(-i32::from(PAGE_STEP));
+                } else {
+                    self.preview_scroll_offset =
+                        self.preview_scroll_offset.saturating_sub(PAGE_STEP);
+                }
             }
             // `App` handles the chord before the home view sees it.
             ActionId::DismissUpdateBanner => {}
@@ -4356,10 +4390,8 @@ impl HomeView {
     pub(super) fn activate_selected_session(&mut self) -> Option<Action> {
         self.system_health_open = false;
         let id = self.selected_session.clone()?;
-        if self.get_instance(&id).is_some_and(|inst| inst.is_trashed()) {
-            if let Some(view) = self.retained_preview.as_mut() {
-                view.focused = true;
-            }
+        if let Some(inst) = self.get_instance(&id).filter(|inst| inst.is_trashed()) {
+            self.retained_focus = Some((id, inst.lifecycle_generation));
             return None;
         }
         if let Some(inst) = self.get_instance(&id) {
@@ -4491,6 +4523,8 @@ impl HomeView {
             }
             if self.selected_session != prev_session {
                 self.retained_preview = None;
+                self.retained_focus = None;
+                self.retained_scroll_offset = 0;
                 self.system_health_open = false;
                 self.preview_scroll_offset = 0;
                 // A finalized preview selection pins to the previous pane's cells, so
@@ -5185,6 +5219,18 @@ impl HomeView {
     /// new menu action needs to be wired here once, not at each call
     /// site.
     pub(super) fn dispatch_context_menu_action(&mut self, action: ContextMenuAction) {
+        if self.selected_is_trashed()
+            && !matches!(
+                action,
+                ContextMenuAction::Restore
+                    | ContextMenuAction::Delete
+                    | ContextMenuAction::NewSession
+                    | ContextMenuAction::OpenSortPicker
+                    | ContextMenuAction::OpenGroupPicker
+            )
+        {
+            return;
+        }
         // The creating stub has no actions yet, so opening a menu whose every
         // entry would refuse it is worse than saying why. Same refusal as
         // `run_action`, which the menu is the second dispatcher for.
@@ -5866,33 +5912,19 @@ impl HomeView {
                     self.cursor = abs_idx;
                     self.update_selected();
                 }
-                // An archived row is parked, its pane killed on archive. A single click
-                // is a "let me look at this" gesture, so it must not enter live-send,
-                // which would respawn the pane and auto-unarchive the row through
-                // touch_last_accessed. Stop at the cursor update; bringing it back stays
-                // explicit (`z`, or a deliberate double-click / Enter).
+                // Shelved rows select without preparing a pane.
                 let archived = self
                     .get_instance(&id)
                     .map(|inst| inst.is_archived() || inst.is_trashed())
                     .unwrap_or(false);
-                // Single-click behavior is otherwise `SessionConfig::click_action`:
-                // `LiveSend` (the default) enters live-send for the clicked row or
-                // switches the live target, while `SelectOnly` stops at the cursor update
-                // so the user can browse previews, exiting live mode if a different row
-                // was live. Double-click still activates via `default_attach_mode`.
-                // `click_action` returns `None` for structured sessions, where
-                // `start_live_send` already short-circuits.
+                // SelectOnly also leaves any existing live-send target.
                 if archived
                     || matches!(
                         self.click_action(&id),
                         Some(crate::session::ClickAction::SelectOnly)
                     )
                 {
-                    // The click only moves the cursor and, if live-sending, leaves live
-                    // mode. That holds for a different row (keystrokes were aimed at the
-                    // old session) and for the row already live: a single click is a "stop
-                    // touching that" gesture. In `LiveSend` mode the `start_live_send`
-                    // branch below retargets instead.
+                    // Do not leave keystrokes aimed at the previously live row.
                     if let Some(state) = self.live_send.clone() {
                         self.exit_live_send_and_restore_sizing(&state);
                     }
@@ -5960,7 +5992,7 @@ impl HomeView {
         // `active_preview_cache` is the tmux capture while `preview_text_view` may come from
         // the transcript's geometry; resolving one against the other opens a URL from
         // another session's output. `paint_preview_links` skips the same case.
-        if self.structured_transcript_painted {
+        if self.selected_is_trashed() || self.structured_transcript_painted {
             return None;
         }
         let view = self.preview_text_view;
@@ -6940,6 +6972,9 @@ impl HomeView {
     /// inadvertent typing and opens the compose dialog pre-filled with it. Mirrors
     /// handle_paste's delegation and fallback.
     fn capture_letter_to_compose(&mut self, c: char) {
+        if self.selected_is_trashed() {
+            return;
+        }
         let s = c.to_string();
         if let Some(ref mut dialog) = self.send_message_dialog {
             dialog.handle_paste(&s);

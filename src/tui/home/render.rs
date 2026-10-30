@@ -3187,7 +3187,7 @@ impl HomeView {
         //
         // Structured view only: the gone-error is about the agent pane, and Tool /
         // Terminal views show independently live panes the placeholder must not hide.
-        // A trashed session's pane was killed too, with a restore hint.
+        // Trash reads retained content instead of capturing a pane.
         let selected_trashed = self
             .selected_session
             .as_ref()
@@ -3260,6 +3260,7 @@ impl HomeView {
         }
 
         if selected_trashed {
+            self.structured_transcript_painted = true;
             self.render_trashed_preview(frame, inner, theme);
             self.paint_preview_selection(frame, theme);
             return;
@@ -3910,13 +3911,20 @@ impl HomeView {
             .as_ref()
             .filter(|view| inst.is_some_and(|inst| view.matches(inst)))
         {
-            let geometry = view.render(frame, area, theme, self.preview_scroll_offset);
-            self.preview_scroll_offset = self.preview_scroll_offset.min(
-                geometry
-                    .total_lines
-                    .saturating_sub(geometry.text_area.height as usize)
-                    .min(u16::MAX as usize) as u16,
+            let geometry = view.render(
+                frame,
+                area,
+                theme,
+                self.retained_scroll_offset,
+                self.retained_reader_focused(),
             );
+            if geometry.total_lines > 0 {
+                self.retained_scroll_offset = self.retained_scroll_offset.min(
+                    geometry
+                        .total_lines
+                        .saturating_sub(geometry.text_area.height as usize),
+                );
+            }
             self.preview_pane_area = geometry.text_area;
             self.preview_visible_rows = geometry.text_area.height as usize;
             self.preview_text_view = crate::tui::home::PreviewTextView {
@@ -4391,10 +4399,7 @@ impl HomeView {
             let (click, key) = bound(ActionId::Help);
             groups.push((0, click, mk_key(&key)));
         } else {
-            let focused = self
-                .retained_preview
-                .as_ref()
-                .is_some_and(|view| view.focused);
+            let focused = self.retained_reader_focused();
             if focused {
                 groups.push((
                     0,

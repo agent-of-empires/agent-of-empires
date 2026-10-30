@@ -343,6 +343,8 @@ pub struct HomeView {
     pub(in crate::tui) structured_preview_pending: bool,
     pub(in crate::tui) retained_preview:
         Option<crate::tui::structured_view::embedded::RetainedView>,
+    pub(in crate::tui) retained_focus: Option<(String, u64)>,
+    pub(in crate::tui) retained_scroll_offset: usize,
     /// The last frame painted the mounted structured transcript into the preview, so
     /// `preview_text_view` maps transcript rows rather than the tmux capture.
     pub(super) structured_transcript_painted: bool,

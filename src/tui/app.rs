@@ -2500,11 +2500,15 @@ impl App {
                 .as_ref()
                 .is_some_and(|view| view.matches(inst));
             if !matches {
-                self.home.retained_preview =
-                    Some(crate::tui::structured_view::embedded::RetainedView::new(
-                        crate::acp::client::discover().ok(),
-                        inst,
-                    ));
+                let view = crate::tui::structured_view::embedded::RetainedView::new(
+                    crate::acp::client::discover().ok(),
+                    inst,
+                );
+                if self.home.retained_preview.is_some() && !self.home.retained_reader_focused() {
+                    self.home.retained_scroll_offset = 0;
+                    self.home.retained_focus = None;
+                }
+                self.home.retained_preview = Some(view);
                 self.home.clear_preview_selection();
             }
             self.home.enforce_trash_read_only();
@@ -2518,6 +2522,10 @@ impl App {
                 || !matches;
         }
         let removed_retained = self.home.retained_preview.take().is_some();
+        if removed_retained {
+            self.home.retained_focus = None;
+            self.home.retained_scroll_offset = 0;
+        }
         if self.home.sidebar_source != crate::tui::session_feed::SidebarSource::Daemon {
             self.clear_preview_mount_pending();
             return self.home.structured_preview.take().is_some();

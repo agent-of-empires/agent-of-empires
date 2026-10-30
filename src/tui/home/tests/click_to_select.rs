@@ -252,10 +252,123 @@ fn trash_inspection_never_requests_interaction() {
                 assert!(env.view.tool_picker_dialog.is_none());
                 assert!(env.view.pending_native_attachment.is_none());
                 assert!(commands(Err("unexpected interaction".into())).is_none());
+                env.view.strict_hotkeys = true;
+                env.view.handle_key(key(KeyCode::Char('a')), None);
+                assert!(
+                    env.view.pending_paste.is_none(),
+                    "Trash typing must not become a future prompt"
+                );
                 assert!(env.view.get_instance(&id).unwrap().is_trashed());
             }
         }
     }
+}
+
+#[test]
+#[serial]
+fn trash_enter_before_reader_mount_keeps_navigation_in_reader() {
+    let mut env = create_test_env_with_sessions(2);
+    let id = env.view.instance_at(0).id.clone();
+    env.view
+        .mutate_instance(&id, |inst| inst.trashed_at = Some(chrono::Utc::now()));
+    env.view.trashed_section_collapsed = false;
+    env.view.rebuild_flat_items();
+    env.view.select_session_by_id(&id);
+    assert!(env.view.retained_preview.is_none());
+    assert_eq!(env.view.handle_key(key(KeyCode::Enter), None), None);
+    env.view.handle_key(key(KeyCode::Home), None);
+    assert_eq!(env.view.selected_session.as_deref(), Some(id.as_str()));
+}
+
+#[test]
+#[serial]
+fn trash_transition_discards_edit_dialog_and_stale_menu_actions() {
+    use crate::tui::{
+        dialogs::ContextMenuAction,
+        home::bindings::{self, ActionId},
+    };
+    for action in [ActionId::Rename, ActionId::SetWorktreeName] {
+        let mut env = create_test_env_with_sessions(1);
+        let id = env.view.instance_at(0).id.clone();
+        env.view.mutate_instance(&id, |inst| {
+            inst.status = Status::Stopped;
+            inst.worktree_info = Some(crate::session::WorktreeInfo {
+                branch: "fixture".into(),
+                main_repo_path: "/tmp".into(),
+                managed_by_aoe: true,
+                created_at: chrono::Utc::now(),
+                base_branch: None,
+            });
+        });
+        env.view.select_session_by_id(&id);
+        env.view
+            .handle_key(bindings::key_event(action, false).unwrap(), None);
+        assert!(env.view.rename_dialog.is_some() || env.view.worktree_name_dialog.is_some());
+        env.view
+            .mutate_instance(&id, |inst| inst.trashed_at = Some(chrono::Utc::now()));
+        env.view.enforce_trash_read_only();
+        assert!(env.view.rename_dialog.is_none());
+        assert!(env.view.worktree_name_dialog.is_none());
+        let mut commands = env.view.session_feed.request_driver_for_test();
+        assert!(env
+            .view
+            .rename_selected("new title", None, None, false)
+            .is_err());
+        assert!(env
+            .view
+            .set_worktree_name_for_selected("new-name", false)
+            .is_err());
+        assert!(commands(Err("unexpected edit".into())).is_none());
+        env.view.context_menu = Some(crate::tui::dialogs::ContextMenuDialog::for_session(
+            (1, 1),
+            false,
+            None,
+            None,
+            false,
+            None,
+        ));
+        env.view.enforce_trash_read_only();
+        assert!(env.view.context_menu.is_none());
+        env.view.context_menu = Some(crate::tui::dialogs::ContextMenuDialog::for_trashed_session(
+            (1, 1),
+        ));
+        env.view.enforce_trash_read_only();
+        assert!(
+            env.view.context_menu.is_some(),
+            "management remains available"
+        );
+        env.view.context_menu = None;
+        env.view
+            .dispatch_context_menu_action(ContextMenuAction::Rename);
+        assert!(env.view.rename_dialog.is_none());
+    }
+}
+
+#[test]
+#[serial]
+fn trash_dwell_and_engagement_do_not_mark_retained_data_read() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.mutate_instance(&id, |inst| {
+        inst.trashed_at = Some(chrono::Utc::now());
+        inst.mark_unread();
+    });
+    let snapshot = super::session_feed_tests::daemon_snapshot(&env.view, &id, "Stopped");
+    env.view.session_feed.publish_for_test(snapshot);
+    env.view.apply_session_feed();
+    let mut commands = env.view.session_feed.request_driver_for_test();
+    env.view.select_session_by_id(&id);
+    crate::session::set_unread_enabled(true);
+    assert!(!env.view.has_dialog());
+    assert!(env.view.session_feed.can_submit(&id));
+    let now = std::time::Instant::now();
+    assert!(!env.view.tick_unread_dwell(now));
+    assert!(!env
+        .view
+        .tick_unread_dwell(now + std::time::Duration::from_secs(3)));
+    assert!(!env.view.clear_unread_on_view(&id));
+    assert!(commands(Err("unexpected read mutation".into())).is_none());
+    assert!(env.view.get_instance(&id).unwrap().is_unread());
 }
 
 #[test]

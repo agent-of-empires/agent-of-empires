@@ -685,6 +685,7 @@ fn trash_retained_transcript_is_read_only() {
     let mut retained = Instance::new("TrashRetained", project.to_str().unwrap());
     retained.trashed_at = Some(chrono::Utc::now());
     retained.status = Status::Stopped;
+    retained.mark_unread();
     let id = retained.id.clone();
     let mut empty = Instance::new("TrashEmpty", project.to_str().unwrap());
     empty.trashed_at = Some(chrono::Utc::now());
@@ -747,10 +748,10 @@ fn trash_retained_transcript_is_read_only() {
         .unwrap() as u16
         + 1;
     h.send_mouse_click(0, 7, row);
+    h.send_keys("Enter");
     h.wait_for("retained-1014");
     h.assert_screen_contains("Trash · read-only");
     let before = h.read_sessions();
-    h.send_keys("Enter");
     h.send_keys("Home");
     h.wait_for("retained-0010");
     h.type_text("must_not_send");

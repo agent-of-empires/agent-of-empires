@@ -612,6 +612,7 @@ impl HomeView {
         new_name: &str,
         rename_branch: bool,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.selected_is_trashed(), "Trash sessions are read-only");
         let Some(id) = self.selected_session.clone() else {
             return Ok(());
         };
@@ -667,6 +668,7 @@ impl HomeView {
         new_profile: Option<&str>,
         rename_branch: bool,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.selected_is_trashed(), "Trash sessions are read-only");
         let Some(id) = self.selected_session.clone() else {
             return Ok(());
         };
