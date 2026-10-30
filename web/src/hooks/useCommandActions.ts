@@ -113,7 +113,8 @@ export function useCommandActions({
         keywords: ["focus", "exit", "sidebar", "sessions", "leave"],
         perform: onExitFocusMode,
       });
-    } else if (activeSessionId) {
+    } else if (activeSessionId && !activeSession?.trashed_at) {
+      // A trashed session cannot show on its own, as in the Session menu (see `sessionActionTargets`).
       actions.push({
         id: "action:enter-focus-mode",
         title: "Show only this Session",
