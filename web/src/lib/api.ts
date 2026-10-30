@@ -20,7 +20,10 @@ import type {
   CreationTrustFingerprint,
   ImportableSession,
   SettingsFieldDescriptor,
+  SuggestionMapping,
+  SuggestionPrefs,
   SuggestionPrepared,
+  SuggestionTemplate,
   SuggestionsSnapshot,
 } from "./types";
 import type { ConfigOptionDescriptor } from "./acpTypes";
@@ -3250,3 +3253,41 @@ export const updateSuggestionSource = (providerId: string, criterion: string, en
 /** Resolves the wizard prefill. Creates nothing. */
 export const prepareSuggestion = (providerId: string, id: string) =>
   suggestionRequest<SuggestionPrepared>("/api/suggestions/prepare", "POST", { provider_id: providerId, id });
+
+export type SuggestionPrefsPatch = Partial<Omit<SuggestionPrefs, "provider_order">> & {
+  provider_order?: string[];
+  provider_enabled?: Record<string, boolean>;
+};
+
+export const updateSuggestionPrefs = (patch: SuggestionPrefsPatch) =>
+  suggestionRequest("/api/suggestions/prefs", "PATCH", patch);
+
+export async function fetchSuggestionTemplates(): Promise<SuggestionTemplate[] | null> {
+  const body = await fetchJson<{ templates: SuggestionTemplate[] }>("/api/suggestions/templates");
+  return body?.templates ?? null;
+}
+
+export const putSuggestionTemplate = (providerId: string, criterion: string, template: string) =>
+  suggestionRequest("/api/suggestions/templates", "PUT", { provider_id: providerId, criterion, template });
+
+/** Drops the override, so the provider's own prompt applies again. */
+export const resetSuggestionTemplate = (providerId: string, criterion: string) =>
+  suggestionRequest("/api/suggestions/templates", "DELETE", { provider_id: providerId, criterion });
+
+export async function fetchSuggestionMappings(): Promise<SuggestionMapping[] | null> {
+  const body = await fetchJson<{ mappings: SuggestionMapping[] }>("/api/suggestions/mappings");
+  return body?.mappings ?? null;
+}
+
+export const putSuggestionMapping = (providerId: string, mappingKey: string, projects: string[]) =>
+  suggestionRequest("/api/suggestions/mappings", "PUT", {
+    provider_id: providerId,
+    mapping_key: mappingKey,
+    projects,
+  });
+
+export const deleteSuggestionMapping = (providerId: string, mappingKey: string) =>
+  suggestionRequest(
+    `/api/suggestions/mappings?${new URLSearchParams({ provider_id: providerId, mapping_key: mappingKey })}`,
+    "DELETE",
+  );
