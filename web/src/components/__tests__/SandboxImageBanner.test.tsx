@@ -393,6 +393,52 @@ describe("SandboxImageBanner", () => {
     expect(banner()?.getAttribute("aria-label")).toBe("Sandbox image updated");
   });
 
+  it("keeps watching for the pull past the cap while the Update now reply is out", async () => {
+    await mount(status());
+    pullSandboxImage.mockImplementationOnce(() => new Promise(() => {}));
+    fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+    // No status shows it yet, and no visibility or reconnect event comes.
+    await pollAfter(32_000);
+    const calls = fetchSandboxImageStatus.mock.calls.length;
+    await pollAfter(2000);
+    expect(fetchSandboxImageStatus.mock.calls.length).toBe(calls + 1);
+    // A delayed pull starts, and is followed to its outcome.
+    fetchSandboxImageStatus.mockResolvedValue(status({ pull: { state: "running" } }));
+    await pollAfter(2000);
+    expect(banner()?.getAttribute("aria-label")).toBe("Downloading sandbox image");
+    fetchSandboxImageStatus.mockResolvedValue(status({ state: "current", pull: { state: "done" } } as never));
+    await pollAfter(2000);
+    expect(banner()?.getAttribute("aria-label")).toBe("Sandbox image updated");
+  });
+
+  it("shows a refusal that arrives after an older outcome was dismissed", async () => {
+    await mount(status());
+    let reply!: (r: { ok: boolean; message?: string }) => void;
+    pullSandboxImage.mockImplementationOnce(() => new Promise((resolve) => (reply = resolve)));
+    fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+    // Past the cap an older finished pull shows, and the user dismisses it.
+    fetchSandboxImageStatus.mockResolvedValue(status({ state: "current", pull: { state: "done" } } as never));
+    await pollAfter(32_000);
+    expect(banner()?.getAttribute("aria-label")).toBe("Sandbox image updated");
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss sandbox image notice" }));
+    expect(banner()).toBeNull();
+    // Then the Daemon refuses this click.
+    await act(async () => reply({ ok: false, message: "Pulling is off on this server." }));
+    expect(banner()?.getAttribute("aria-label")).toBe("Couldn't download the sandbox image");
+    expect(banner()?.textContent).toContain("Pulling is off on this server.");
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+  });
+
+  it("offers the image again rather than claim success for a done this click never saw", async () => {
+    await mount(status());
+    pullSandboxImage.mockImplementationOnce(() => new Promise(() => {}));
+    fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+    // An older pull's `done` while the image this click asked for is still on offer.
+    fetchSandboxImageStatus.mockResolvedValue(status({ pull: { state: "done" } }));
+    await pollAfter(32_000);
+    expect(banner()?.getAttribute("aria-label")).toBe("Sandbox image update available");
+  });
+
   it("hides an earlier available update once a check fails", async () => {
     await mount(status());
     expect(banner()).not.toBeNull();

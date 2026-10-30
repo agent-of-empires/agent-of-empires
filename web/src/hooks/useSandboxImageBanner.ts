@@ -41,6 +41,8 @@ export function useSandboxImageBanner(): SandboxImageBannerView | null {
   // pull can tell a newer image published since from the one it just pulled.
   const offeredDigest = useRef<string | null>(null);
   const [pulledDigest, setPulledDigest] = useState<string | null>(null);
+  // A status showed the current attempt's pull running, so its outcome is this attempt's.
+  const [sawRunning, setSawRunning] = useState(false);
   // The Daemon refuses checks and pulls while it can't read its configuration.
   const [configUnreadable, setConfigUnreadable] = useState(false);
   const [configNoticeDismissed, setConfigNoticeDismissed] = useState(false);
@@ -77,11 +79,13 @@ export function useSandboxImageBanner(): SandboxImageBannerView | null {
         setStatus(predatesPull ? { ...answer, pull: { state: "running" } } : answer);
         if (answer.pull.state === "running") {
           pullConfirmed.current = true;
+          setSawRunning(true);
           setWatchedPull(true);
           // The Daemon is pulling after all, e.g. the "Update now" reply was lost on the way.
           setRefusal(null);
         }
-        expectingPull.current = predatesPull || answer.pull.state === "running";
+        // The cap only limits what's shown: while the reply is out, keep watching for the pull.
+        expectingPull.current = predatesPull || answer.pull.state === "running" || since !== null;
       }
       if (timer) clearTimeout(timer);
       const pulling = expectingPull.current;
@@ -113,6 +117,7 @@ export function useSandboxImageBanner(): SandboxImageBannerView | null {
   const update = useCallback(() => {
     const mine = ++attempt.current;
     setPulledDigest(offeredDigest.current);
+    setSawRunning(false);
     setWatchedPull(true);
     setNoticeDismissed(false);
     setRefusal(null);
@@ -130,6 +135,8 @@ export function useSandboxImageBanner(): SandboxImageBannerView | null {
         setWatchedPull(false);
         setStatus((s) => s && (s.pull.state === "running" ? { ...s, pull: { state: "idle" } } : s));
         setRefusal(reply.message ?? "Couldn't reach the Daemon.");
+        // The user may have dismissed an older outcome shown meanwhile; this refusal is new.
+        setNoticeDismissed(false);
       }
       pollNow.current();
     });
@@ -154,7 +161,10 @@ export function useSandboxImageBanner(): SandboxImageBannerView | null {
     const onDismiss = () => setNoticeDismissed(true);
     // An image published since this pull is news again; the one it pulled isn't.
     const newer = status.state === "available" && status.remote_digest !== pulledDigest;
-    if (pull.state === "done" && !newer) return { kind: "done", onDismiss };
+    // A `done` no status tied to this attempt, while an image is still on offer, may be an older
+    // pull's: show the offer rather than success.
+    const unconfirmed = !sawRunning && status.state === "available";
+    if (pull.state === "done" && !newer && !unconfirmed) return { kind: "done", onDismiss };
     if (pull.state === "failed") return { kind: "failed", error: pull.error, onRetry: update, onDismiss };
   }
 
