@@ -207,10 +207,10 @@ describe("AuthStatusHint signed out", () => {
   });
 
   it.each([
-    ["a mouse", false, ["composer"]],
+    ["a mouse, focuses the composer", false, ["composer"]],
     // Focusing the composer would open the on-screen keyboard.
-    ["touch", true, []],
-  ])("closes once the restart is accepted, and with %s focuses the composer", async (_, coarse, focused) => {
+    ["touch, leaves focus alone", true, []],
+  ])("closes once the restart is accepted, and with %s", async (_, coarse, focused) => {
     vi.stubGlobal("matchMedia", (query: string) => ({ matches: coarse && query === "(pointer: coarse)" }));
     const targets: string[] = [];
     const onFocus = (e: Event) => targets.push((e as CustomEvent<FocusTerminalDetail>).detail.target);
