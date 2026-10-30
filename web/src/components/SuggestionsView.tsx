@@ -42,22 +42,26 @@ export function SuggestionsView({ readOnly = false, onPrepare }: Props) {
   const mounted = useRef(true);
   const loadSeq = useRef(0);
 
-  const load = useCallback(async () => {
-    const seq = ++loadSeq.current;
-    const data = await fetchSuggestions();
+  const apply = useCallback((data: SuggestionsSnapshot | null, seq: number) => {
     if (!mounted.current || seq !== loadSeq.current) return;
     if (data) setSnapshot(data);
     setLoadFailed(!data);
     setLoading(false);
   }, []);
 
+  const load = useCallback(async () => {
+    const seq = ++loadSeq.current;
+    apply(await fetchSuggestions(), seq);
+  }, [apply]);
+
   useEffect(() => {
     mounted.current = true;
-    void load();
+    const seq = ++loadSeq.current;
+    void fetchSuggestions().then((data) => apply(data, seq));
     return () => {
       mounted.current = false;
     };
-  }, [load]);
+  }, [apply]);
 
   const disabled = readOnly || offline;
   const unavailableTitle = readOnly ? "Read-only server" : offline ? OFFLINE_TITLE : undefined;
