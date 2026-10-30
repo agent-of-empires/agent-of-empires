@@ -845,6 +845,20 @@
       "components": ["web/src/components/SuggestionsView.tsx"]
     },
     {
+      "id": "settings.suggestions",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/settings/__tests__/SuggestionsSettings.test.tsx"],
+      "components": [
+        "web/src/components/settings/SuggestionsSettings.tsx",
+        "web/src/components/settings/SuggestionTemplates.tsx",
+        "web/src/components/settings/TemplateEditor.tsx",
+        "web/src/components/settings/suggestionsShared.tsx",
+        "web/src/components/settings/useHasSuggestionProviders.ts",
+        "web/src/lib/suggestionTemplate.ts"
+      ]
+    },
+    {
       "id": "settings.advanced-fold",
       "kind": "vitest",
       "risk": "medium",

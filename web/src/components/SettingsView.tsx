@@ -41,6 +41,8 @@ import {
 } from "../lib/settingsIntros";
 import { PluginSettingsSections } from "./settings/PluginSettingsSections";
 import { LogsSettings } from "./settings/LogsSettings";
+import { SuggestionsSettings } from "./settings/SuggestionsSettings";
+import { useHasSuggestionProviders } from "./settings/useHasSuggestionProviders";
 import { SettingsHeader } from "./settings/SettingsHeader";
 import { StructuredViewDisplaySettings } from "./settings/StructuredViewDisplaySettings";
 import { ProfilesSection } from "./profiles/ProfilesSection";
@@ -68,6 +70,7 @@ export type TabId =
   | "structured-view"
   | "mcp"
   | "skills"
+  | "suggestions"
   | "logging"
   | "logs"
   | "plugins"
@@ -100,7 +103,7 @@ const PROFILES_ICON = (
 // Dashboard settings lead, since the web is where they apply; tabs that only
 // tune the daemon, TUI, or host follow. Exported to test the order without the
 // duplicated list and sidebar in the DOM.
-export function buildSidebar(readOnly = false): SidebarItem[] {
+export function buildSidebar(readOnly = false, suggestions = false): SidebarItem[] {
   const items: SidebarItem[] = [
     { kind: "divider", label: "Dashboard" },
     { kind: "tab", id: "theme", label: "Theme" },
@@ -116,6 +119,7 @@ export function buildSidebar(readOnly = false): SidebarItem[] {
     { kind: "tab", id: "structured-view", label: "Structured view" },
     { kind: "tab", id: "mcp", label: "MCP servers" },
     { kind: "tab", id: "skills", label: "Skills" },
+    ...(suggestions ? [{ kind: "tab" as const, id: "suggestions" as const, label: "Suggestions" }] : []),
     { kind: "divider", label: "Environment" },
     { kind: "tab", id: "sandbox", label: "Sandbox" },
     { kind: "tab", id: "worktree", label: "Worktree" },
@@ -190,6 +194,8 @@ interface Props {
    *  advanced settings PATCH is closed server-side in this mode; theme and the
    *  surfaced fields write through their own endpoints. See #7. */
   cityhall?: boolean;
+  /** Opens the full Suggested sessions view, optionally on its Dismissed filter. */
+  onOpenSuggestions?: (dismissed: boolean) => void;
 }
 
 const LAST_TAB_KEY = "aoe-settings-last-tab";
@@ -214,6 +220,8 @@ const ALL_TAB_IDS = new Set<TabId>([
   "structured-view",
   "mcp",
   "skills",
+  "suggestions",
+  "suggestions",
   "logging",
   "logs",
   "plugins",
@@ -268,8 +276,10 @@ export function SettingsView({
   field,
   readOnly,
   cityhall = false,
+  onOpenSuggestions,
 }: Props) {
   const offline = useServerDown();
+  const hasSuggestionProviders = useHasSuggestionProviders();
   // Seed empty rather than "default" so the initial
   // useEffect-gated loadSettings doesn't fire a wasted
   // fetchSettings("default") against a profile that may not exist.
@@ -302,7 +312,7 @@ export function SettingsView({
     },
     [onSelectProfile],
   );
-  const sidebar: SidebarItem[] = cityhall ? CITYHALL_SIDEBAR : buildSidebar(readOnly);
+  const sidebar: SidebarItem[] = cityhall ? CITYHALL_SIDEBAR : buildSidebar(readOnly, hasSuggestionProviders);
   const tabs = sidebar.filter((s): s is { kind: "tab"; id: TabId; label: string } => s.kind === "tab");
   const allowedTab = (t: unknown): t is TabId =>
     isTabId(t) && (cityhall ? CITYHALL_TAB_IDS.has(t) : sidebar.some((s) => s.kind === "tab" && s.id === t));
@@ -766,6 +776,8 @@ export function SettingsView({
         return <McpServers readOnly={cityhall} />;
       case "skills":
         return <SkillsManager readOnly={readOnly || cityhall} />;
+      case "suggestions":
+        return <SuggestionsSettings readOnly={readOnly ?? false} onOpenSuggestions={onOpenSuggestions} />;
       case "structured-view": {
         if (!settings) {
           return <div className="text-sm text-text-dim">Loading settings...</div>;
