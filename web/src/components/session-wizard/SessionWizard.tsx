@@ -82,6 +82,7 @@ export interface WizardPrefill {
   scratch?: boolean;
   /** The registered project's worktree override for `path`; `undefined` means none. */
   worktreeEnabled?: boolean;
+  initialPrompt?: string;
 }
 
 function initialWizardData(prefill: WizardPrefill | undefined, nameOnly: boolean): WizardData {
@@ -102,6 +103,7 @@ function initialWizardData(prefill: WizardPrefill | undefined, nameOnly: boolean
     sandboxEnabled: prefill.sandboxEnabled ?? false,
     profile: prefill.profile || "",
     group: prefill.group || "",
+    initialPrompt: prefill.initialPrompt ?? "",
     scratch: prefill.scratch ?? false,
     useWorktree: prefill.scratch ? false : (prefill.worktreeEnabled ?? base.useWorktree),
     // Seeded here rather than dispatched so APPLY_PROFILE_DEFAULTS cannot clobber it.
@@ -876,6 +878,16 @@ export function SessionWizard({
             value={d.group}
             onChange={(v) => handleChange("group", v)}
             groups={state.groupsFor === groupsKey ? state.groups : NO_GROUPS}
+          />
+        </FieldRow>
+        <FieldRow label="Prompt" htmlFor="wizard-initial-prompt">
+          <textarea
+            id="wizard-initial-prompt"
+            value={d.initialPrompt}
+            onChange={(e) => handleChange("initialPrompt", e.target.value)}
+            placeholder="Sent to the agent once it is ready"
+            rows={2}
+            className={`${ROW_INPUT} resize-y`}
           />
         </FieldRow>
       </RowGroup>

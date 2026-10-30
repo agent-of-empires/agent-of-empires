@@ -376,6 +376,14 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
         </div>
       )}
 
+      {session.initial_prompt_error && (
+        <div role="alert" className="absolute left-0 right-0 top-12 z-20 flex justify-center px-3 pointer-events-none">
+          <span className="text-xs text-status-warning bg-surface-900/90 border border-surface-700/60 rounded-full px-4 py-2 max-w-md break-words text-center">
+            Initial prompt not sent: {session.initial_prompt_error}
+          </span>
+        </div>
+      )}
+
       {!readOnly && live.state.connected && live.state.ownerKnown && !live.state.isOwner && (
         <div className="absolute left-0 right-0 top-3 flex justify-center z-20 px-3">
           <button

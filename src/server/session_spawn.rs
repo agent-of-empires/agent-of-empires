@@ -259,6 +259,7 @@ pub(crate) async fn spawn_structured_session(
                 text,
                 attachments: Vec::new(),
                 synthesized: false,
+                error: None,
             });
         instance.acp_mode_id = acp_mode_id;
         instance.callback_url = callback_url;
@@ -869,6 +870,14 @@ pub(crate) async fn spawn_structured_session(
                         Err(error) => tracing::warn!(target: "acp.supervisor", session = %id,
                             "created session completion failed: {error}"),
                     }
+                });
+            } else if !response_instance.is_structured()
+                && response_instance.pending_initial_turn.is_some()
+            {
+                let id = response_instance.id.clone();
+                let service_for_drain = service.clone();
+                service.work.spawn("tmux.initial_turn", async move {
+                    service_for_drain.drain_terminal_initial_turn(&id).await;
                 });
             }
 
