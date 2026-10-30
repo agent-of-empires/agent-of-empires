@@ -352,7 +352,8 @@ pub(super) async fn agent_target_response(
                 body["prior_session_id"] = sid.into();
                 "fresh_after_failed_resume"
             }
-        }.into();
+        }
+        .into();
     }
     crate::server::runtime::mutation_response(&snapshot.value.cursor, Json(body))
 }
