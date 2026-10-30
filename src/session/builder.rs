@@ -2029,6 +2029,9 @@ mod tests {
     fn adapter_installed_counts_profile_preparation_hooks_only_when_asked() {
         use crate::session::HooksConfig;
         let _home = crate::session::test_support::isolate_app_dir();
+        // Absolute, so no PATH is searched: a relative entry in the caller's PATH would pass.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing-adapter");
         let hook = || vec!["npm install".to_string()];
         for (label, hooks, create_ready) in [
             ("no hooks", HooksConfig::default(), false),
@@ -2050,10 +2053,10 @@ mod tests {
             ),
         ] {
             let mut config = crate::session::Config::default();
-            config.session.agent_acp_cmd.insert(
-                "fake".into(),
-                format!("aoe-test-missing-adapter-{}", std::process::id()),
-            );
+            config
+                .session
+                .agent_acp_cmd
+                .insert("fake".into(), missing.display().to_string());
             config.hooks = hooks;
             assert!(
                 !structured::adapter_installed("fake", &config, &[], false),
