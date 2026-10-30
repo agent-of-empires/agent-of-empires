@@ -2,6 +2,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { DashboardSuggestions } from "../DashboardSuggestions";
+import { setServerDown } from "../../lib/connectionState";
 import type { SuggestionItem, SuggestionsSnapshot } from "../../lib/types";
 
 const { fetchSuggestions, prepareSuggestion, refreshSuggestions, dismissSuggestion, wide } = vi.hoisted(() => ({
@@ -39,6 +40,7 @@ afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   vi.restoreAllMocks();
+  setServerDown(false);
   wide.value = true;
 });
 
@@ -51,8 +53,9 @@ describe("DashboardSuggestions", () => {
     const onViewAll = vi.fn();
     const { unmount } = renderIt({ onViewAll });
     expect(await screen.findAllByRole("button", { name: "Start" })).toHaveLength(3);
-    fireEvent.click(screen.getByRole("button", { name: "View all (5)" }));
+    fireEvent.click(screen.getByRole("link", { name: "View all (5)" }));
     expect(onViewAll).toHaveBeenCalled();
+    expect(screen.getByRole("link", { name: "View all (5)" }).getAttribute("href")).toBe("/suggestions");
     unmount();
 
     wide.value = false;
@@ -137,5 +140,56 @@ describe("DashboardSuggestions", () => {
     expect(start.getAttribute("title")).toBe("Read-only: can't create Sessions");
     expect(screen.queryByRole("button", { name: "Dismiss" })).toBeNull();
     expect(screen.getByText(/This dashboard is read-only/)).toBeTruthy();
+  });
+
+  it("stays hidden when the first fetch fails, and retries on reconnect", async () => {
+    setServerDown(true);
+    fetchSuggestions.mockResolvedValueOnce(null).mockResolvedValue(snap([mk(1)]));
+    const { container } = renderIt();
+    await waitFor(() => expect(fetchSuggestions).toHaveBeenCalledTimes(1));
+    await act(async () => {});
+    expect(container.innerHTML).toBe("");
+
+    act(() => setServerDown(false));
+    expect(await screen.findByRole("button", { name: "Start" })).toBeTruthy();
+  });
+
+  it("shows the disconnected note and disables Start while offline", async () => {
+    fetchSuggestions.mockResolvedValue(snap([mk(1)]));
+    renderIt();
+    await screen.findByRole("button", { name: "Start" });
+    act(() => setServerDown(true));
+    expect(screen.getByText(/Disconnected\./)).toBeTruthy();
+    expect((screen.getByRole("button", { name: "Start" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("warns when a mutation succeeds but the reload fails", async () => {
+    fetchSuggestions.mockResolvedValueOnce(snap([mk(1)])).mockResolvedValue(null);
+    dismissSuggestion.mockResolvedValue(ok);
+    renderIt();
+    fireEvent.click(await screen.findByRole("button", { name: "Dismiss" }));
+    expect((await screen.findByRole("alert")).textContent).toBe("Could not load suggestions.");
+  });
+
+  it("keeps the undo bar when the restore fails", async () => {
+    fetchSuggestions.mockResolvedValueOnce(snap([mk(1)])).mockResolvedValue(snap([mk(1, { dismissed: true })]));
+    dismissSuggestion.mockResolvedValueOnce(ok).mockResolvedValueOnce({ ok: false, error: "boom", stale: false });
+    renderIt();
+    fireEvent.click(await screen.findByRole("button", { name: "Dismiss" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Undo" }));
+    expect((await screen.findByRole("alert")).textContent).toBe("boom");
+    expect(screen.getByRole("button", { name: "Undo" })).toBeTruthy();
+  });
+
+  it("clears a previous notice when Refresh starts", async () => {
+    fetchSuggestions.mockResolvedValue(snap([]));
+    refreshSuggestions
+      .mockResolvedValueOnce({ ok: false, error: "refresh failed", stale: false })
+      .mockResolvedValueOnce(ok);
+    renderIt();
+    fireEvent.click(await screen.findByRole("button", { name: "Refresh" }));
+    expect((await screen.findByRole("alert")).textContent).toBe("refresh failed");
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
   });
 });

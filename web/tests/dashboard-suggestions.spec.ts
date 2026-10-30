@@ -36,7 +36,7 @@ test("homepage shows 3 suggestions and View all opens the full view", async ({ p
   await page.goto("/");
   await expect(page.getByRole("button", { name: "Start" })).toHaveCount(3);
   await expect(page.getByText("GitHub · Review requested from you · agent-of-empires")).toBeVisible();
-  await page.getByRole("button", { name: "View all (4)" }).click();
+  await page.getByRole("link", { name: "View all (4)" }).click();
   await expect(page).toHaveURL(/\/suggestions$/);
 });
 
