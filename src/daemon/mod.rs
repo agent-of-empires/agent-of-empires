@@ -1732,7 +1732,7 @@ mod tests {
     #[tokio::test]
     async fn smart_rename_accepts_completed_and_supervised_receipts() {
         for status in [200, 202] {
-            let row = SessionResponse::from_instance(
+            let row = crate::server::api::sessions::session_response_from_instance(
                 &crate::session::Instance::new("named", "/tmp/named"),
                 false,
             );

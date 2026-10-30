@@ -184,7 +184,7 @@ fn a_cancellation_before_the_daemon_names_the_creation_is_delivered_later() {
 
     let mut other = Instance::new("Delayed", project_dir.to_str().unwrap());
     other.source_profile = "default".into();
-    let collision = crate::daemon::SessionResponse::from_instance(&other, false);
+    let collision = crate::server::api::sessions::session_response_from_instance(&other, false);
     assert!(!view.reconcile_in_flight_creation(&[collision]));
     assert!(view.pending_creation.as_ref().unwrap().daemon_id.is_none());
     let progress = CreationProgress {
@@ -280,9 +280,7 @@ fn unknown_create_outcome_waits_for_matching_canonical_row_across_profiles() {
         })
         .unwrap();
     view.session_feed.publish_for_test(creation_snapshot(
-        vec![crate::daemon::SessionResponse::from_instance(
-            &committed, false,
-        )],
+        vec![crate::server::api::sessions::session_response_from_instance(&committed, false)],
         "test",
         2,
     ));
@@ -367,7 +365,7 @@ fn creation_receipt_waits_for_applied_snapshot_and_retries_profile_loading_witho
         committed.source_profile = profile.into();
         committed.idempotency_key = Some(key.clone());
         committed.status = Status::Idle;
-        let row = crate::daemon::SessionResponse::from_instance(&committed, false);
+        let row = crate::server::api::sessions::session_response_from_instance(&committed, false);
         let storage = Storage::new_unwatched(profile).unwrap();
         storage
             .update(|rows, _| {
@@ -464,9 +462,7 @@ fn retrying_a_snapshot_preserves_one_creation_stub_and_never_resubmits_or_cancel
     seed_profile("default", std::slice::from_ref(&existing));
     view.reload().unwrap();
     view.session_feed.publish_for_test(creation_snapshot(
-        vec![crate::daemon::SessionResponse::from_instance(
-            &existing, false,
-        )],
+        vec![crate::server::api::sessions::session_response_from_instance(&existing, false)],
         "test",
         1,
     ));
@@ -492,8 +488,8 @@ fn retrying_a_snapshot_preserves_one_creation_stub_and_never_resubmits_or_cancel
     let unreadable_bytes = std::fs::read(&path).unwrap();
     view.session_feed.publish_for_test(creation_snapshot(
         vec![
-            crate::daemon::SessionResponse::from_instance(&existing, false),
-            crate::daemon::SessionResponse::from_instance(&reservation, false),
+            crate::server::api::sessions::session_response_from_instance(&existing, false),
+            crate::server::api::sessions::session_response_from_instance(&reservation, false),
         ],
         "test",
         2,
@@ -556,7 +552,7 @@ async fn unknown_creation_uses_current_canonical_authority_after_reconnection_no
         .unwrap();
     let path = storage.sessions_path().to_path_buf();
     let valid = std::fs::read(&path).unwrap();
-    let row = crate::daemon::SessionResponse::from_instance(&committed, false);
+    let row = crate::server::api::sessions::session_response_from_instance(&committed, false);
     std::fs::write(&path, b"{ invalid json ]").unwrap();
     let unreadable_bytes = std::fs::read(&path).unwrap();
     view.session_feed

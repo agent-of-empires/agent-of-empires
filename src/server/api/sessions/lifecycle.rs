@@ -1942,7 +1942,7 @@ pub(super) async fn apply_update_restart(
         // The reconciler terminates the worker once its turn drains and respawns it against the
         // stored conversation.
         state.acp_supervisor.mark_build_respawn_pending(&id);
-        let response = SessionResponse::from_instance(
+        let response = session_response_from_instance(
             &instance,
             crate::claude_settings::read_tui_fullscreen(),
         );
