@@ -268,15 +268,24 @@ pub async fn patch_suggestion_prefs(
     let Some(host) = state.plugin_host.clone() else {
         return unavailable();
     };
-    let result = tokio::task::spawn_blocking(move || {
-        let known: Vec<String> = suggestions::providers().into_iter().map(|p| p.id).collect();
-        host.with_suggestions_db(|conn, profile| {
-            suggestions::apply_prefs(conn, profile, &known, &patch)
-        })
+    let refresh_changed = patch.refresh_minutes.is_some();
+    let result = tokio::task::spawn_blocking({
+        let host = host.clone();
+        move || {
+            let known: Vec<String> = suggestions::providers().into_iter().map(|p| p.id).collect();
+            host.with_suggestions_db(|conn, profile| {
+                suggestions::apply_prefs(conn, profile, &known, &patch)
+            })
+        }
     })
     .await;
     match result {
-        Ok(Ok(Ok(()))) => Json(json!({ "ok": true })).into_response(),
+        Ok(Ok(Ok(()))) => {
+            if refresh_changed {
+                host.refresh_suggestions(None).await;
+            }
+            Json(json!({ "ok": true })).into_response()
+        }
         Ok(Ok(Err(message))) => api_error(StatusCode::BAD_REQUEST, "validation_failed", message),
         Ok(Err(error)) => internal(error),
         Err(error) => internal(error),

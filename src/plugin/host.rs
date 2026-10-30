@@ -175,10 +175,18 @@ impl PluginHost {
     }
 
     /// Ask the worker of `provider_id`, or of every suggestions provider, to
-    /// publish again. Returns how many workers were notified.
+    /// publish again, passing the user's `refresh_minutes` hint. Returns how
+    /// many workers were notified.
     pub async fn refresh_suggestions(&self, provider_id: Option<&str>) -> usize {
+        let minutes = self
+            .with_suggestions_db(crate::plugin::suggestions::refresh_minutes)
+            .unwrap_or_else(|error| {
+                tracing::warn!("suggestions: refresh_minutes unreadable: {error}");
+                crate::plugin::suggestions::DEFAULT_PREFS.2
+            });
         self.notify_suggestion_workers(
             aoe_plugin_api::suggestions::SUGGESTIONS_REFRESH,
+            serde_json::json!({ "refresh_minutes": minutes }),
             provider_id,
         )
         .await
@@ -187,11 +195,20 @@ impl PluginHost {
     /// Ask every suggestions worker to report its setup checks again.
     /// Returns how many workers were notified.
     pub async fn run_suggestion_checks(&self) -> usize {
-        self.notify_suggestion_workers(aoe_plugin_api::suggestions::SUGGESTIONS_CHECKS_RUN, None)
-            .await
+        self.notify_suggestion_workers(
+            aoe_plugin_api::suggestions::SUGGESTIONS_CHECKS_RUN,
+            serde_json::json!({}),
+            None,
+        )
+        .await
     }
 
-    async fn notify_suggestion_workers(&self, method: &str, provider_id: Option<&str>) -> usize {
+    async fn notify_suggestion_workers(
+        &self,
+        method: &str,
+        params: Value,
+        provider_id: Option<&str>,
+    ) -> usize {
         // An unreadable switch store notifies nobody rather than a provider the user turned off.
         let disabled =
             match self.with_suggestions_db(crate::plugin::suggestions::disabled_providers) {
@@ -209,7 +226,7 @@ impl PluginHost {
                 continue;
             }
             let notified = self
-                .notify_worker(&provider.id, method, serde_json::json!({}))
+                .notify_worker(&provider.id, method, params.clone())
                 .await;
             sent += usize::from(notified);
         }

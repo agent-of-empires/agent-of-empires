@@ -5,7 +5,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Host-to-worker notification asking the worker to discover again.
+/// Host-to-worker notification asking the worker to discover again. Params are
+/// `{ "refresh_minutes": u32 }`, the user's refresh interval hint.
 pub const SUGGESTIONS_REFRESH: &str = "suggestions.refresh";
 
 /// Host-to-worker notification asking the worker to run its setup checks again.

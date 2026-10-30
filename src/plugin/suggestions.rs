@@ -604,6 +604,10 @@ fn load_prefs(conn: &Connection, profile: &str) -> rusqlite::Result<(bool, bool,
         .unwrap_or(DEFAULT_PREFS))
 }
 
+pub(crate) fn refresh_minutes(conn: &Connection, profile: &str) -> rusqlite::Result<u32> {
+    load_prefs(conn, profile).map(|prefs| prefs.2)
+}
+
 /// Applies `patch` atomically; the inner `Err` is a validation message and
 /// nothing is stored.
 pub(crate) fn apply_prefs(
@@ -1793,6 +1797,7 @@ mod tests {
             json!(["acme.github", "acme.linear"])
         );
 
+        assert_eq!(refresh_minutes(&conn, "p").unwrap(), 15);
         apply(json!({ "sidebar": true })).unwrap();
         apply(json!({ "refresh_minutes": 60, "provider_order": ["acme.linear", "acme.github"] }))
             .unwrap();
@@ -1800,6 +1805,8 @@ mod tests {
         assert_eq!(prefs["sidebar"], true);
         assert_eq!(prefs["homepage"], true);
         assert_eq!(prefs["refresh_minutes"], 60);
+        assert_eq!(refresh_minutes(&conn, "p").unwrap(), 60);
+        assert_eq!(refresh_minutes(&conn, "other").unwrap(), 15);
         assert_eq!(
             prefs["provider_order"],
             json!(["acme.linear", "acme.github"])
