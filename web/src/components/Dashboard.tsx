@@ -23,6 +23,7 @@ interface Props {
   readOnly?: boolean;
   /** Both required to show the Suggested sessions section. */
   onPrepareSuggestion?: (prefill: WizardPrefill) => void;
+  onSuggestionStarted?: (session: SessionResponse | undefined) => void;
   onViewAllSuggestions?: () => void;
 }
 
@@ -35,6 +36,7 @@ export function Dashboard({
   readOnly,
   canManageProjects = true,
   onPrepareSuggestion,
+  onSuggestionStarted,
   onViewAllSuggestions,
 }: Props) {
   const idleDecayWindowMs = useIdleDecayWindowMs();
@@ -148,7 +150,12 @@ export function Dashboard({
       )}
 
       {onPrepareSuggestion && onViewAllSuggestions && (
-        <DashboardSuggestions readOnly={readOnly} onPrepare={onPrepareSuggestion} onViewAll={onViewAllSuggestions} />
+        <DashboardSuggestions
+          readOnly={readOnly}
+          onPrepare={onPrepareSuggestion}
+          onStarted={onSuggestionStarted}
+          onViewAll={onViewAllSuggestions}
+        />
       )}
 
       {/* The desktop sidebar is always available, but mobile starts at this dashboard. */}

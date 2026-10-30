@@ -1,14 +1,27 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { fetchSuggestions, prepareSuggestion, refreshSuggestions, type SuggestionResult } from "../lib/api";
+import {
+  createSession,
+  fetchSuggestions,
+  prepareSuggestion,
+  refreshSuggestions,
+  type SuggestionResult,
+} from "../lib/api";
 import { useServerDown } from "../lib/connectionState";
 import { STALE_NOTICE, toWizardPrefill } from "../lib/suggestionPrefill";
-import type { SuggestionItem, SuggestionsSnapshot } from "../lib/types";
+import type { SessionResponse, SuggestionItem, SuggestionsSnapshot } from "../lib/types";
 import type { WizardPrefill } from "../components/session-wizard/SessionWizard";
 
 export const suggestionKey = (item: SuggestionItem) => `${item.provider_id}:${item.id}`;
 
-/** Snapshot plus the mutations both suggestion views share. Every mutation reloads the snapshot. */
-export function useSuggestions(onPrepare: (prefill: WizardPrefill) => void) {
+/**
+ * Snapshot plus the mutations both suggestion views share. Every mutation reloads the snapshot.
+ * With "Start without review" on and a resolved draft, `start` creates the session and calls
+ * `onStarted`; anything unresolved or needing hook trust opens the wizard through `onPrepare`.
+ */
+export function useSuggestions(
+  onPrepare: (prefill: WizardPrefill) => void,
+  onStarted?: (session: SessionResponse | undefined) => void,
+) {
   const offline = useServerDown();
   const [snapshot, setSnapshot] = useState<SuggestionsSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
@@ -69,14 +82,41 @@ export function useSuggestions(onPrepare: (prefill: WizardPrefill) => void) {
   };
 
   const start = async (item: SuggestionItem) => {
-    setBusy(suggestionKey(item));
+    const key = suggestionKey(item);
+    setBusy(key);
     setNotice(null);
     const result = await prepareSuggestion(item.provider_id, item.id);
     if (!mounted.current) return;
     if (result.ok) {
-      setBusy(null);
       const label = snapshot?.providers.find((p) => p.id === item.provider_id)?.name ?? item.provider_id;
-      onPrepare(toWizardPrefill(result.data, { label, title: item.title, url: item.source_url }));
+      const prefill = toWizardPrefill(result.data, { label, title: item.title, url: item.source_url });
+      const draft = result.data;
+      if (onStarted && snapshot?.prefs.start_without_review && draft.project && draft.initial_prompt) {
+        const created = await createSession({
+          title: draft.title || undefined,
+          path: draft.project.path,
+          tool: draft.tool,
+          yolo_mode: draft.yolo,
+          sandbox: draft.sandbox,
+          worktree_enabled: draft.worktree,
+          initial_prompt: draft.initial_prompt,
+        });
+        if (!mounted.current) return;
+        if (created.ok) {
+          onStarted(created.session);
+          await load();
+          if (mounted.current) setBusy(null);
+          return;
+        }
+        // A create with no definite answer may still finish, so it is never retried or reopened.
+        if (created.network || created.outcomeUnknown || !(created.hooksNeedTrust || created.trustChanged)) {
+          setNotice(created.error ?? "Could not start the session.");
+          setBusy(null);
+          return;
+        }
+      }
+      setBusy(null);
+      onPrepare(prefill);
       return;
     }
     setNotice(result.stale ? STALE_NOTICE : result.error);

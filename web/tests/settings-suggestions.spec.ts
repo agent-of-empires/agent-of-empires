@@ -12,7 +12,13 @@ const source = (criterion: string, label: string, enabled: boolean, variables: s
 
 function store() {
   return {
-    prefs: { homepage: true, sidebar: false, refresh_minutes: 15, provider_order: ["github", "linear"] },
+    prefs: {
+      homepage: true,
+      sidebar: false,
+      refresh_minutes: 15,
+      start_without_review: false,
+      provider_order: ["github", "linear"],
+    },
     providers: [
       {
         id: "github",

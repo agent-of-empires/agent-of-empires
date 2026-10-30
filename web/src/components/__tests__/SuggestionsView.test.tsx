@@ -5,18 +5,22 @@ import { SuggestionsView } from "../SuggestionsView";
 import { setServerDown } from "../../lib/connectionState";
 import type { SuggestionItem, SuggestionsSnapshot } from "../../lib/types";
 
-const { fetchSuggestions, prepareSuggestion, refreshSuggestions, dismissSuggestion } = vi.hoisted(() => ({
-  fetchSuggestions: vi.fn(),
-  prepareSuggestion: vi.fn(),
-  refreshSuggestions: vi.fn(),
-  dismissSuggestion: vi.fn(),
-}));
+const { fetchSuggestions, prepareSuggestion, refreshSuggestions, dismissSuggestion, createSession } = vi.hoisted(
+  () => ({
+    createSession: vi.fn(),
+    fetchSuggestions: vi.fn(),
+    prepareSuggestion: vi.fn(),
+    refreshSuggestions: vi.fn(),
+    dismissSuggestion: vi.fn(),
+  }),
+);
 
 vi.mock("../../lib/api", () => ({
   fetchSuggestions,
   prepareSuggestion,
   refreshSuggestions,
   dismissSuggestion,
+  createSession,
 }));
 
 const item: SuggestionItem = {
@@ -46,7 +50,13 @@ const snapshot = (over: Partial<SuggestionsSnapshot> = {}): SuggestionsSnapshot 
       ],
     },
   ],
-  prefs: { homepage: true, sidebar: false, refresh_minutes: 15, provider_order: ["github"] },
+  prefs: {
+    homepage: true,
+    sidebar: false,
+    refresh_minutes: 15,
+    start_without_review: false,
+    provider_order: ["github"],
+  },
   ...over,
 });
 const ok = { ok: true, data: undefined };
@@ -63,6 +73,29 @@ async function open(snap: SuggestionsSnapshot | null, props: { readOnly?: boolea
   render(<SuggestionsView onPrepare={onPrepare} {...props} />);
   await waitFor(() => expect(fetchSuggestions).toHaveBeenCalled());
   return onPrepare;
+}
+
+const prepared = {
+  title: "Fix lifecycle",
+  initial_prompt: "Template prompt.",
+  source_ref: "example/1",
+  project: { name: "aoe", path: "/work/aoe" },
+  tool: "opencode",
+  yolo: true,
+  sandbox: false,
+  worktree: true,
+};
+
+async function startWithoutReview(data: Partial<typeof prepared> | { project: null }, created?: object) {
+  prepareSuggestion.mockResolvedValue({ ok: true, data: { ...prepared, ...data } });
+  if (created) createSession.mockResolvedValue(created);
+  const snap = snapshot();
+  fetchSuggestions.mockResolvedValue({ ...snap, prefs: { ...snap.prefs, start_without_review: true } });
+  const onPrepare = vi.fn();
+  const onStarted = vi.fn();
+  render(<SuggestionsView onPrepare={onPrepare} onStarted={onStarted} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+  return { onPrepare, onStarted };
 }
 
 describe("SuggestionsView", () => {
@@ -94,6 +127,53 @@ describe("SuggestionsView", () => {
       }),
     );
     expect(prepareSuggestion).toHaveBeenCalledWith("github", "issue-1");
+  });
+
+  it("Start without review creates the session from the prepared draft and skips the wizard", async () => {
+    const session = { id: "s1" };
+    const { onPrepare, onStarted } = await startWithoutReview({}, { ok: true, session });
+    await waitFor(() => expect(onStarted).toHaveBeenCalledWith(session));
+    expect(createSession).toHaveBeenCalledWith({
+      title: "Fix lifecycle",
+      path: "/work/aoe",
+      tool: "opencode",
+      yolo_mode: true,
+      sandbox: false,
+      worktree_enabled: true,
+      initial_prompt: "Template prompt.",
+    });
+    expect(onPrepare).not.toHaveBeenCalled();
+  });
+
+  it("Start without review falls back to the wizard when the draft is unresolved or hooks need trust", async () => {
+    for (const [data, created] of [
+      [{ project: null }, undefined],
+      [{ initial_prompt: "" }, undefined],
+      [{}, { ok: false, error: "hooks", hooksNeedTrust: {} }],
+      [{}, { ok: false, error: "changed", trustChanged: true }],
+    ] as const) {
+      cleanup();
+      vi.clearAllMocks();
+      const { onPrepare, onStarted } = await startWithoutReview(data, created);
+      await waitFor(() => expect(onPrepare).toHaveBeenCalled());
+      expect(onStarted).not.toHaveBeenCalled();
+      expect(createSession).toHaveBeenCalledTimes(created ? 1 : 0);
+    }
+  });
+
+  it("Start without review shows a notice and never reopens the wizard when the outcome is unknown or the create fails", async () => {
+    for (const created of [
+      { ok: false, error: "No answer from the server (502)", network: true },
+      { ok: false, error: "Unknown outcome", outcomeUnknown: true },
+      { ok: false, error: "Sandbox unavailable" },
+    ]) {
+      cleanup();
+      vi.clearAllMocks();
+      const { onPrepare, onStarted } = await startWithoutReview({}, created);
+      expect((await screen.findByRole("alert")).textContent).toBe(created.error);
+      expect(onPrepare).not.toHaveBeenCalled();
+      expect(onStarted).not.toHaveBeenCalled();
+    }
   });
 
   it("renders one compact row: title, then Source, reason and Project, with no preview or chip", async () => {

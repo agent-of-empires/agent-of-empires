@@ -4,6 +4,7 @@ import { OFFLINE_TITLE } from "../lib/connectionState";
 import { dismissSuggestion } from "../lib/api";
 import { suggestionKey, useSuggestions } from "../hooks/useSuggestions";
 import { SUGGESTION_NOTE_CLASS, SuggestionActions, SuggestionRow, SuggestionStatusNotes } from "./SuggestionRow";
+import type { SessionResponse } from "../lib/types";
 import type { WizardPrefill } from "./session-wizard/SessionWizard";
 
 interface Props {
@@ -11,11 +12,15 @@ interface Props {
   /** Opens on the Dismissed filter. */
   initialDismissed?: boolean;
   onPrepare: (prefill: WizardPrefill) => void;
+  /** Called when "Start without review" created the session directly. */
+  onStarted?: (session: SessionResponse | undefined) => void;
 }
 
-export function SuggestionsView({ readOnly = false, initialDismissed = false, onPrepare }: Props) {
-  const { snapshot, loading, loadFailed, refreshing, busy, notice, offline, act, refresh, start } =
-    useSuggestions(onPrepare);
+export function SuggestionsView({ readOnly = false, initialDismissed = false, onPrepare, onStarted }: Props) {
+  const { snapshot, loading, loadFailed, refreshing, busy, notice, offline, act, refresh, start } = useSuggestions(
+    onPrepare,
+    onStarted,
+  );
   const [showDismissed, setShowDismissed] = useState(initialDismissed);
 
   const disabled = readOnly || offline;

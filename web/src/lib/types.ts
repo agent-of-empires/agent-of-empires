@@ -577,6 +577,8 @@ export interface SuggestionPrefs {
   homepage: boolean;
   sidebar: boolean;
   refresh_minutes: number;
+  /** Start creates the session from the prepared draft instead of opening the wizard. */
+  start_without_review: boolean;
   /** Every provider id, in the order the user set. */
   provider_order: string[];
 }
