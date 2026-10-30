@@ -24,9 +24,11 @@
 #   [plugins."agent-of-empires.example"]
 #   source = "gh:agent-of-empires/example"
 #   versions = { "1.0" = "sha256:<hex>", "1.1" = "sha256:<hex>" }
+#   suggestions = true  # optional: manifest declares `[suggestions]`; marks it in the Marketplace
 
 [plugins."agent-of-empires.github"]
 source = "gh:agent-of-empires/plugin-github"
+suggestions = true
 # 1.1.0 is intentionally unpinned: its `.venv`-in-source-root build bricked at
 # load (load-time tree_hash trips over the venv symlink, so the reserved
 # namespace gate skips it). Dropping the pin downgrades it to community so the
