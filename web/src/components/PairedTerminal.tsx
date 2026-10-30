@@ -4,6 +4,11 @@ import type { SessionResponse } from "../lib/types";
 
 export type ShellMode = "host" | "container";
 
+/** The owner controls the mode with both, or the pane keeps its own with neither. */
+type ModeControl =
+  | { mode: ShellMode; onModeChange: (mode: ShellMode) => void }
+  | { mode?: undefined; onModeChange?: undefined };
+
 /** Host/container shell shared by desktop docks and the mobile paired view. */
 export function PairedShellPane({
   readOnly,
@@ -21,10 +26,7 @@ export function PairedShellPane({
   /** Which paired-terminal instance this tab renders (#2437). 0 is the
    *  primary shell shared with the native TUI. */
   terminalIndex?: number;
-  /** The owner's mode for this Session's shell; the pane keeps its own when omitted. */
-  mode?: ShellMode;
-  onModeChange?: (mode: ShellMode) => void;
-}) {
+} & ModeControl) {
   const [ownMode, setOwnMode] = useState<ShellMode>("host");
   const shellMode = mode ?? ownMode;
   const setShellMode = onModeChange ?? setOwnMode;
@@ -43,11 +45,19 @@ export function PairedShellPane({
     <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
       <div className="flex items-center gap-1 px-2 py-1 bg-surface-900 border-b border-surface-700/20 shrink-0">
         <span className="text-xs text-text-dim mr-1">Shell</span>
-        <button onClick={() => setShellMode("host")} className={shellTabClass(effectiveMode === "host")}>
+        <button
+          onClick={() => setShellMode("host")}
+          aria-pressed={effectiveMode === "host"}
+          className={shellTabClass(effectiveMode === "host")}
+        >
           Host
         </button>
         {isSandboxed && (
-          <button onClick={() => setShellMode("container")} className={shellTabClass(effectiveMode === "container")}>
+          <button
+            onClick={() => setShellMode("container")}
+            aria-pressed={effectiveMode === "container"}
+            className={shellTabClass(effectiveMode === "container")}
+          >
             Container
           </button>
         )}

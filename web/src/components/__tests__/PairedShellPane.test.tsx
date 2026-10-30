@@ -85,10 +85,17 @@ describe("PairedShellPane", () => {
         />,
       );
       expect(ensureTerminal).toHaveBeenLastCalledWith("sess-rp-1", 0, container);
+      expect(screen.getByRole("button", { name: /^Host$/ }).getAttribute("aria-pressed")).toBe(String(!container));
       fireEvent.click(screen.getByRole("button", { name: /^Host$/ }));
       expect(onModeChange).toHaveBeenCalledWith("host");
     },
   );
+
+  it("takes the mode and its setter together or not at all", () => {
+    // @ts-expect-error A mode the pane can't change would leave its buttons inert.
+    const halfControlled = <PairedShellPane readOnly session={null} sessionId={null} mode="host" />;
+    expect(halfControlled).toBeTruthy();
+  });
 });
 
 describe("usePairedShellModes", () => {
