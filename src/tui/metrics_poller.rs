@@ -1,8 +1,6 @@
 //! Background sampler for the diagnostics strip.
 //!
-//! Memory and process sampling forks `ps` or walks `/proc`, so it stays off
-//! the render loop. Like [`StatusPoller`](super::status_poller::StatusPoller),
-//! a [`Worker`] samples on request; the main loop drains results each frame.
+//! Sample memory and process counts on a worker thread, outside rendering.
 
 use crate::process::metrics::{MetricsSampler, MetricsSnapshot};
 use crate::session::Instance;

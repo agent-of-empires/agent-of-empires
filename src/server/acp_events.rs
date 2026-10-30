@@ -1,4 +1,5 @@
-//! The ACP event listener.
+//! The ACP event listener: turning agent events into session status,
+//! unread marks, and stored session ids.
 
 use crate::server::push::{publish_status_change, StatusChange};
 use crate::session::Instance;
@@ -9,14 +10,18 @@ use tokio::sync::{broadcast, RwLock};
 use super::state::{instance_lock_in, AppState};
 use crate::server::{acp_ws, api};
 
-/// One task instead of two halves the broadcast clone count and locks `state.instances`
-/// once per event instead of twice for the events (e.g.
+/// Applies live status, unread and session-id observations.
 pub(super) async fn acp_event_listener(state: Arc<AppState>) {
     let mut rx = state.acp_events_tx.subscribe();
     loop {
-        let frame = match rx.recv().await {
+        let received = tokio::select! {
+            biased;
+            _ = state.shutdown.cancelled() => return,
+            frame = rx.recv() => frame,
+        };
+        let frame = match received {
             Ok(f) => f,
-            // Lagged.
+            // Unread is edge-triggered; replay missed durable turn ends.
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                 tracing::warn!(
                     target: "acp.event_listener",
@@ -25,9 +30,8 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                 );
                 let recovered = recover_structured_unread_after_lag(
                     &state.instances,
-                    &state.acp_event_store,
+                    &state.session_service,
                     &state.instance_locks,
-                    &state.acp_control_cache,
                     state.file_watch.clone(),
                     &state.status_tx,
                 )
@@ -42,7 +46,6 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                 }
                 continue;
             }
-            // Closed: AppState dropped (shutdown). Exit cleanly.
             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                 tracing::debug!(
                     target: "acp.event_listener",
@@ -80,15 +83,18 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                         "wake-fire detected; dispatching push notification"
                     );
                     let state_for_push = state.clone();
-                    tokio::spawn(async move {
-                        crate::server::push::fire_wake_fired_push(
-                            state_for_push,
-                            &session_id,
-                            &session_title,
-                            reason.as_deref(),
-                        )
-                        .await;
-                    });
+                    state
+                        .runtime
+                        .work
+                        .spawn("server.acp_event_effect", async move {
+                            crate::server::push::fire_wake_fired_push(
+                                state_for_push,
+                                &session_id,
+                                &session_title,
+                                reason.as_deref(),
+                            )
+                            .await;
+                        });
                 }
                 None => {
                     tracing::trace!(
@@ -101,49 +107,59 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             }
         }
 
-        // Approval push.
+        // Approval pushes bypass active-session suppression.
         if let crate::acp::state::Event::ApprovalRequested { approval } = frame.event.as_ref() {
             let state_for_push = state.clone();
             let session_id = frame.session_id.clone();
             let approval_title = approval.tool_call.name.clone();
             let destructive = approval.destructive;
             let seq = frame.seq;
-            tokio::spawn(async move {
-                acp_ws::trigger_approval_push(
-                    &state_for_push,
-                    &session_id,
-                    &approval_title,
-                    destructive,
-                    seq,
-                )
-                .await;
-            });
+            state
+                .runtime
+                .work
+                .spawn("server.acp_event_effect", async move {
+                    acp_ws::trigger_approval_push(
+                        &state_for_push,
+                        &session_id,
+                        &approval_title,
+                        destructive,
+                        seq,
+                    )
+                    .await;
+                });
         }
 
-        // Clear push.
+        // Retract resolved approvals on every device.
         if let crate::acp::state::Event::ApprovalResolved { decision, .. } = frame.event.as_ref() {
             record_approval_decision(&state, *decision);
             let state_for_push = state.clone();
             let session_id = frame.session_id.clone();
             let seq = frame.seq;
-            tokio::spawn(async move {
-                acp_ws::trigger_approval_clear_push(&state_for_push, &session_id, seq).await;
-            });
+            state
+                .runtime
+                .work
+                .spawn("server.acp_event_effect", async move {
+                    acp_ws::trigger_approval_clear_push(&state_for_push, &session_id, seq).await;
+                });
         }
 
-        // Question push.
+        // Questions use the same push policy as approvals.
         if let crate::acp::state::Event::ElicitationRequested { elicitation } = frame.event.as_ref()
         {
             let state_for_push = state.clone();
             let session_id = frame.session_id.clone();
             let question = elicitation.message.clone();
             let seq = frame.seq;
-            tokio::spawn(async move {
-                acp_ws::trigger_question_push(&state_for_push, &session_id, &question, seq).await;
-            });
+            state
+                .runtime
+                .work
+                .spawn("server.acp_event_effect", async move {
+                    acp_ws::trigger_question_push(&state_for_push, &session_id, &question, seq)
+                        .await;
+                });
         }
 
-        // Clear push for an answered question, mirroring the approval clear above.
+        // Retract answered questions.
         if matches!(
             frame.event.as_ref(),
             crate::acp::state::Event::ElicitationResolved { .. }
@@ -151,12 +167,15 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             let state_for_push = state.clone();
             let session_id = frame.session_id.clone();
             let seq = frame.seq;
-            tokio::spawn(async move {
-                acp_ws::trigger_question_clear_push(&state_for_push, &session_id, seq).await;
-            });
+            state
+                .runtime
+                .work
+                .spawn("server.acp_event_effect", async move {
+                    acp_ws::trigger_question_clear_push(&state_for_push, &session_id, seq).await;
+                });
         }
 
-        // Recall cache.
+        // Retain advertised options for settings without a live session.
         if let crate::acp::state::Event::ConfigOptionsUpdated { options } = frame.event.as_ref() {
             if !options.is_empty() {
                 let agent = state
@@ -175,7 +194,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                 if let Some(agent) = agent {
                     let options = options.clone();
                     let now = chrono::Utc::now().to_rfc3339();
-                    tokio::task::spawn_blocking(move || {
+                    let recorded = tokio::task::spawn_blocking(move || {
                         if let Err(e) = crate::acp::option_catalog::record(&agent, &options, now) {
                             tracing::warn!(
                                 target: "acp.event_listener",
@@ -184,7 +203,11 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                                 "failed to record acp option catalog"
                             );
                         }
-                    });
+                    })
+                    .await;
+                    if let Err(error) = recorded {
+                        tracing::warn!(target: "acp.event_listener", %error, "option catalog task failed");
+                    }
                 }
             }
         }
@@ -222,23 +245,23 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                     &first_user_prompt,
                     &agent_prose,
                 );
-                tokio::spawn(async move {
-                    // Failures are logged in run_oneshot and retried on a later turn.
-                    let _ = crate::session::smart_rename::try_smart_rename(
-                        state_for_rename,
-                        session_id,
-                        crate::session::smart_rename::SmartRenameInput {
-                            first_user_prompt,
-                            context,
-                        },
-                        // Automatic turn-end trigger.
-                        false,
-                    )
-                    .await;
-                });
+                state
+                    .runtime
+                    .work
+                    .spawn("server.acp_event_effect", async move {
+                        let _ = crate::session::smart_rename::try_smart_rename(
+                            state_for_rename,
+                            session_id,
+                            crate::session::smart_rename::SmartRenameInput {
+                                first_user_prompt,
+                                context,
+                            },
+                            false,
+                        )
+                        .await;
+                    });
             } else {
-                // A `prompt_complete` Stopped without any persisted UserPromptSent is
-                // unexpected.
+                // The first prompt must be durable before its turn completes.
                 tracing::debug!(
                     target: "smart_rename",
                     session = %frame.session_id,
@@ -265,41 +288,51 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
         if should_summarize {
             let state_for_summary = state.clone();
             let session_id = frame.session_id.clone();
-            tokio::spawn(async move {
-                crate::session::conversation_summary::try_conversation_summary(
-                    state_for_summary,
-                    session_id,
-                    crate::session::conversation_summary::SummaryTrigger::Auto,
-                )
-                .await;
-            });
+            state
+                .runtime
+                .work
+                .spawn("server.acp_event_effect", async move {
+                    crate::session::conversation_summary::try_conversation_summary(
+                        state_for_summary,
+                        session_id,
+                        crate::session::conversation_summary::SummaryTrigger::Auto,
+                    )
+                    .await;
+                });
         }
 
-        // Gated on `reads_activity_flags`: a cold cache (nothing has
-        // hydrated this session since the daemon started, e.g. right after a
-        // restart with a reattached worker) must not cost every other arm a
-        // full log replay on this serial listener task. The replay picks up
-        // this frame's own event too, since it is persisted to the store
-        // before being broadcast, and `fold_control_state` hydrates through
-        // the cache's per-session lock, so a second frame for the same cold
-        // session waits for the first rather than double-hydrating (#4001).
-        if reads_activity_flags(frame.event.as_ref())
-            && !state.acp_control_cache.is_hydrated(&frame.session_id)
-        {
-            state
-                .session_service
-                .fold_control_state(&frame.session_id)
-                .await;
-        }
-        let turn_active_after = state.acp_control_cache.turn_active(&frame.session_id);
-        let background_agent_active_after = state
-            .acp_control_cache
-            .has_active_background_agent(&frame.session_id);
-        let status_intent = derive_acp_status(
-            frame.event.as_ref(),
-            turn_active_after,
-            background_agent_active_after,
-        );
+        // The sink folds before broadcasting, so a frame published to a warm
+        // cache carries its own status and no later reader depends on how far
+        // the fold has run. A frame published cold (right after a restart with
+        // a reattached worker) carries none and is rebuilt from the log. A
+        // startup error whose write failed is substituted by the sink and
+        // never reaches the log, so the frame itself says Error.
+        let status_policy = status_policy(frame.event.as_ref());
+        let status_update = match (status_policy, frame.event.as_ref()) {
+            (Some(policy), crate::acp::state::Event::AgentStartupError { .. }) => {
+                Some((policy, Status::Error))
+            }
+            (Some(policy), _) => match frame.sidebar_status {
+                Some(projected) => Some((policy, projected)),
+                None => {
+                    // Hydrates once; frames published after it carry a status.
+                    let fold = state
+                        .session_service
+                        .fold_control_state(&frame.session_id)
+                        .await;
+                    if fold.last_seq == frame.seq {
+                        Some(fold.sidebar_status())
+                    } else {
+                        state
+                            .session_service
+                            .sidebar_status_at(&frame.session_id, frame.seq)
+                            .await
+                    }
+                    .map(|projected| (policy, projected))
+                }
+            },
+            (None, _) => None,
+        };
         let acp_change = derive_acp_session_change(frame.event.as_ref());
         let load_session_capability = match (frame.event.as_ref(), frame.worker_generation) {
             (
@@ -311,105 +344,45 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             ) => Some((*capable, generation)),
             _ => None,
         };
-        if status_intent.is_none() && acp_change.is_none() && load_session_capability.is_none() {
+        if status_update.is_none() && acp_change.is_none() && load_session_capability.is_none() {
             continue;
         }
+        // Identity events share the per-session mutation lock with pollers and
+        // lifecycle callers. Hold it through the durable write so a concurrent
+        // SID publication cannot be overwritten by a stale ACP observation.
+        let identity_lock = if acp_change.is_some() {
+            Some(state.instance_lock(&frame.session_id).await)
+        } else {
+            None
+        };
+        let _identity_guard = match &identity_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
 
-        if acp_change.is_some() {
-            let lock = state.instance_lock(&frame.session_id).await;
-            let _identity_guard = lock.lock().await;
-            let profile = {
-                let instances = state.instances.read().await;
-                let Some(inst) = instances
-                    .iter()
-                    .find(|inst| inst.id == frame.session_id && inst.is_structured())
-                else {
-                    continue;
-                };
-                inst.source_profile.clone()
-            };
-            // #4127: the worker's own store is the only observation of the
-            // route this launch applied. Read it for the id the worker just
-            // assigned — the drain published the worker's handle before the
-            // frame reached here, so a fresh spawn and a respawn both
-            // answer, and a worker that never assigned an id attests nothing.
-            // A reattach answers nothing: `AcpClient::attach` has no native
-            // store to report, so such a session stays unattested until its
-            // next spawn. Read before the save so the closure and the
-            // in-memory mirror attest the same observation.
-            let observed = match acp_change.as_ref() {
-                Some(AcpSessionChange::Assigned(new_id)) => {
-                    state
-                        .acp_supervisor
-                        .native_handoff_store(&frame.session_id, new_id)
-                        .await
-                }
-                _ => None,
-            };
-            let observed_mirror = observed.clone();
-            let session_id = frame.session_id.clone();
-            let change = acp_change.clone();
-            let file_watch = state.file_watch.clone();
-            let saved = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-                let storage = crate::session::Storage::new(&profile, file_watch)?;
-                storage.update(|all, _| {
-                    let Some(inst) = all
-                        .iter_mut()
-                        .find(|inst| inst.id == session_id && inst.is_structured())
-                    else {
-                        return Ok(None);
-                    };
-                    // Stamped before `apply_acp_session_change`, whose
-                    // same-id arm returns without touching the row: a first
-                    // `session/load` reattaching a legacy session must still
-                    // attest the route its launch observed.
-                    inst.attest_launch_default_store(observed.as_ref());
-                    apply_acp_session_change(inst, &session_id, change.as_ref());
-                    Ok(Some((
-                        inst.acp_session_id.clone(),
-                        inst.idle_dormant_since,
-                        inst.import_pending,
-                        inst.fork_pending.clone(),
-                    )))
-                })
-            })
-            .await;
-            match saved {
-                Ok(Ok(Some((sid, dormant, import, fork)))) => {
-                    let mut instances = state.instances.write().await;
-                    if let Some(inst) = instances
-                        .iter_mut()
-                        .find(|inst| inst.id == frame.session_id && inst.is_structured())
-                    {
-                        inst.acp_session_id = sid;
-                        inst.idle_dormant_since = dormant;
-                        inst.import_pending = import;
-                        inst.fork_pending = fork;
-                        state
-                            .mutation_epoch
-                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        // The saved row is the durable one; the in-memory row
-                        // must attest the same route or the next save would
-                        // write a binding whose marker the launch already
-                        // settled. Idempotent, so the mirror is safe.
-                        inst.attest_launch_default_store(observed_mirror.as_ref());
-                    }
-                }
-                Ok(Ok(None)) => {}
-                Ok(Err(error)) => tracing::warn!(
-                    target: "acp.event_listener",
-                    "ACP identity was not saved for {}: {error}",
-                    frame.session_id
-                ),
-                Err(error) => tracing::warn!(
-                    target: "acp.event_listener",
-                    "ACP identity save task failed for {}: {error}",
-                    frame.session_id
-                ),
+        // #4127: the worker's own store is the only observation of the route
+        // this launch applied. Read it for the id the worker just assigned, and
+        // read it before the save so the durable row and the in-memory mirror
+        // attest the same thing. Awaited before `instances` is taken: the
+        // supervisor's worker map must never be reached under that lock.
+        // A reattach answers nothing, so such a session stays unattested until
+        // its next spawn.
+        let observed = match acp_change.as_ref() {
+            Some(AcpSessionChange::Assigned(new_id)) => {
+                state
+                    .acp_supervisor
+                    .native_handoff_store(&frame.session_id, new_id)
+                    .await
             }
-        }
+            _ => None,
+        };
+        let observed_for_save = observed.clone();
 
-        let unread_profile = {
+        let observed_mirror = observed.clone();
+        let mut canonical_changed = false;
+        // Acquire `instances` once for both branches. Releases before
+        // the (potentially blocking) sessions.json save.
+        let (profile_to_save, unread_profile, attested_profile) = {
             let mut instances = state.instances.write().await;
             let Some(inst) = instances.iter_mut().find(|i| i.id == frame.session_id) else {
                 continue;
@@ -417,21 +390,84 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             if !inst.is_structured() {
                 continue;
             }
+            // Check while holding the instance lock: teardown removes the worker
+            // before clearing this field, so either this write happens first and
+            // is cleared, or the stale generation is rejected.
+            //
+            // This awaits the supervisor's `workers` mutex with the `instances`
+            // write lock held. That ordering is only safe while `Supervisor`
+            // never reaches for `instances`; give it a path that does and this
+            // becomes a lock cycle.
             if let Some((capable, generation)) = load_session_capability {
                 if state
                     .acp_supervisor
                     .is_current_worker_generation(&frame.session_id, generation)
                     .await
+                    && inst.acp_load_session_capable != Some(capable)
                 {
                     inst.acp_load_session_capable = Some(capable);
+                    canonical_changed = true;
                 }
             }
-            let old_status = inst.status;
-            apply_status_intent(inst, status_intent, &state.status_tx);
-            should_mark_acp_unread(inst, old_status, crate::session::unread_enabled())
-                .then(|| inst.source_profile.clone())
-        };
 
+            // Snapshotting around the call is exactly "the transition
+            // `apply_status_intent` actually applied": it assigns `status` in
+            // one place and every rejected or no-op path (the trashed /
+            // Deleting / Creating guard, the Stopped guard, the ineligible
+            // HealError guard, `status == target`) leaves it untouched. We hold
+            // the write lock across both reads, so nothing else can move it in
+            // between. A future refactor that makes `apply_status_intent`
+            // assign `status` more than once has to revisit this.
+            let old_status = inst.status;
+            if let Some((policy, projected)) = status_update {
+                apply_status_intent(inst, policy, projected, &state.status_tx);
+            }
+            canonical_changed |= old_status != inst.status;
+            let unread_profile =
+                should_mark_acp_unread(inst, old_status, crate::session::unread_enabled())
+                    .then(|| inst.source_profile.clone());
+            let profile_to_save =
+                apply_acp_session_change(inst, &frame.session_id, acp_change.as_ref());
+            canonical_changed |= profile_to_save.is_some();
+            // An attestation alone still has to reach the disk: the durable
+            // write below stamps it, and the mirror is only allowed to show it
+            // once that write has landed.
+            let attested_profile = observed.as_ref().map(|_| inst.source_profile.clone());
+            (profile_to_save, unread_profile, attested_profile)
+        };
+        if canonical_changed {
+            state
+                .mutation_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        // Identity and turn-end are disjoint ACP events. If a future event ever
+        // combines them, release the identity guard before the unread helper takes it.
+        if unread_profile.is_some() {
+            drop(_identity_guard);
+        }
+
+        // The turn just finished, so the row takes the automatic unread mark.
+        // This is the sole producer of it for a structured row. The tmux poll
+        // loop has no authority over a paneless one, which is why #3162 stopped
+        // it reporting phantom transitions for them and so left this gap; the
+        // TUI's passive path is gated off them to keep the boolean single-writer.
+        //
+        // The write has to be durable. `reload_state_instances_from_disk` rebases
+        // every row on the disk row on each 2s tick and `merge_runtime_fields`
+        // does not carry `unread`, so an in-memory-only mark is gone within two
+        // seconds. Memory is mirrored only after the write lands, the same
+        // ordering `flush_passive_transition_writes` uses (#2755) and for the
+        // same reason: a mark that exists only in daemon memory is served over
+        // `/api/sessions`, mirrored into the TUI, and then silently dropped by
+        // the next reload.
+        //
+        // Deliberately not folded into the `profile_to_save` save below:
+        // `derive_acp_session_change` yields nothing for `Event::Stopped`, so an
+        // identity change and a turn-end can never arrive on the same event and
+        // there is no atomicity to win.
+        //
+        // `persist_and_mirror_unread` owns the lock and commit-check ordering;
+        // see its docstring for why both are load-bearing.
         if let Some(profile) = unread_profile {
             let lock = state.instance_lock(&frame.session_id).await;
             persist_and_mirror_unread(
@@ -443,10 +479,87 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             )
             .await;
         }
+
+        // Persist `acp_session_id` to disk if the field changed.
+        // Sync FS (file copy + JSON write) goes through spawn_blocking
+        // so the runtime stays responsive under large session lists.
+        if let Some(profile) = profile_to_save.or(attested_profile) {
+            let session_id_for_log = frame.session_id.clone();
+            let session_id_for_save = frame.session_id.clone();
+            let profile_for_save = profile.clone();
+            let acp_change_for_save = acp_change.clone();
+            let file_watch = state.file_watch.clone();
+            let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+                let storage = crate::session::Storage::new(&profile_for_save, file_watch)?;
+                storage.update(|all, _groups| {
+                    let found = all.iter().any(|i| i.id == session_id_for_save);
+                    if let Some(inst) = all.iter_mut().find(|i| i.id == session_id_for_save) {
+                        inst.attest_launch_default_store(observed_for_save.as_ref());
+                        apply_acp_session_change(
+                            inst,
+                            &session_id_for_save,
+                            acp_change_for_save.as_ref(),
+                        );
+                        if let Some(AcpSessionChange::Assigned(new_id)) =
+                            acp_change_for_save.as_ref()
+                        {
+                            inst.record_observed_acp_store(new_id, observed_for_save.as_ref());
+                        }
+                    }
+                    Ok(found)
+                })
+            })
+            .await;
+            match save_result {
+                Ok(Ok(row_saved)) => {
+                    // The saved row is the durable one; the mirror may only
+                    // attest what has actually been written, never a marker the
+                    // next reload would drop.
+                    let mut instances = state.instances.write().await;
+                    if let Some(inst) = instances.iter_mut().find(|i| i.id == frame.session_id) {
+                        inst.attest_launch_default_store(observed_mirror.as_ref());
+                        // A row that moved out of this profile was not written, and
+                        // the next reload would drop what the mirror recorded.
+                        if let (true, Some(AcpSessionChange::Assigned(new_id))) =
+                            (row_saved, acp_change.as_ref())
+                        {
+                            inst.record_observed_acp_store(new_id, observed_mirror.as_ref());
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        target: "acp.event_listener",
+                        session = %session_id_for_log,
+                        "save after acp_session_id update: {e}"
+                    );
+                }
+                Err(join_err) => {
+                    tracing::warn!(
+                        target: "acp.event_listener",
+                        session = %session_id_for_log,
+                        "spawn_blocking join error during acp_session_id save: {join_err}"
+                    );
+                }
+            }
+        }
+        if canonical_changed {
+            state.runtime.request_publish();
+        }
     }
 }
 
 /// Tally a resolved approval for the opt-in telemetry snapshot.
+///
+/// Counted here rather than at the HTTP endpoint because only the
+/// permission handler knows which option the user's answer resolved to:
+/// an answered option list posts an allow-shaped decision whatever the
+/// option means, and a stale option id cancels instead of resolving.
+/// This event carries the decision that actually reached the agent.
+///
+/// `Cancelled` is not a user decision (the daemon-restart sweep and the
+/// stale-option path both emit it), so it counts as nothing; it is
+/// matched explicitly so a new variant is a compile error here.
 fn record_approval_decision(state: &AppState, decision: crate::acp::approvals::ApprovalDecision) {
     use crate::acp::approvals::ApprovalDecision;
     use std::sync::atomic::Ordering::Relaxed;
@@ -459,8 +572,14 @@ fn record_approval_decision(state: &AppState, decision: crate::acp::approvals::A
     counter.fetch_add(1, Relaxed);
 }
 
-/// Seed each acp-enabled session's `Instance.status` from the most recent lifecycle event
-/// in the on-disk event log.
+/// Seed each acp-enabled session's `Instance.status` from the most
+/// recent lifecycle event in the on-disk event log. Runs once at
+/// daemon startup, before the status poll loop and the acp event
+/// listener start, so a session that was mid-turn when the previous
+/// daemon died doesn't render Idle until the next live event arrives.
+/// Acts via the same `apply_status_intent` path as the live listener
+/// so push subscribers and the broadcast channel see the seeded
+/// transitions as ordinary StatusChange events. See #1103 (B).
 pub(crate) async fn seed_acp_statuses(state: Arc<AppState>) {
     let acp_ids: Vec<String> = state
         .instances
@@ -470,32 +589,35 @@ pub(crate) async fn seed_acp_statuses(state: Arc<AppState>) {
         .filter(|i| i.is_structured())
         .map(|i| i.id.clone())
         .collect();
-    if acp_ids.is_empty() {
-        return;
-    }
     for id in acp_ids {
-        let Some(event) = state.acp_event_store.latest_seed_status_event(&id) else {
-            continue;
-        };
-        // No live control-state fold to consult at boot (the cache is
-        // cold and boot deliberately does not hydrate it), so a background
-        // sub-agent outstanding across a restart reads as Idle here; the
-        // reconciler and the next live event correct it once the tailer
-        // resumes (#4001).
-        let Some(intent) = derive_acp_status(&event, false, false) else {
+        let Some(projected) = folded_sidebar_status(&state.session_service, &id).await else {
             continue;
         };
         let mut instances = state.instances.write().await;
         if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            // At startup the on-disk event log is the whole truth.
-            if inst.status == Status::Stopped
-                && matches!(intent, StatusIntent::Set(Status::Running | Status::Waiting))
-            {
-                inst.status = Status::Idle;
-            }
-            apply_status_intent(inst, Some(intent), &state.status_tx);
+            apply_status_seed(inst, projected, &state.status_tx);
         }
     }
+}
+
+/// The folded sidebar status, or `None` for a session with no events yet.
+pub(crate) async fn folded_sidebar_status(
+    service: &crate::server::session_service::SessionService,
+    id: &str,
+) -> Option<Status> {
+    let fold = service.fold_control_state(id).await;
+    (fold.last_seq > 0).then(|| fold.sidebar_status())
+}
+
+pub(crate) fn apply_status_seed(
+    inst: &mut Instance,
+    projected: Status,
+    status_tx: &broadcast::Sender<StatusChange>,
+) {
+    if inst.status == Status::Stopped && matches!(projected, Status::Running | Status::Waiting) {
+        inst.status = Status::Idle;
+    }
+    apply_status_intent(inst, StatusPolicy::Authoritative, projected, status_tx);
 }
 
 /// Whether reaching `status` should release a plugin's `sessions.turn.send` pending mark:
@@ -517,49 +639,46 @@ fn revival_pending_clears_on(status: Status) -> bool {
     )
 }
 
-/// Fold a derived `StatusIntent` into an `Instance`.
+/// Fold a projected status into an `Instance` under `policy`. Pure mutation;
+/// callers hold the write lock. Sends a `StatusChange` on
+/// `status_tx` so push notifications and the dashboard see the
+/// transition like any tmux-driven one.
 pub(crate) fn apply_status_intent(
     inst: &mut Instance,
-    intent: Option<StatusIntent>,
+    policy: StatusPolicy,
+    target: Status,
     status_tx: &broadcast::Sender<StatusChange>,
 ) {
-    let Some(intent) = intent else { return };
     // Genuine in-flight terminal states: never fight them.
     if inst.is_trashed() || matches!(inst.status, Status::Deleting | Status::Creating) {
         return;
     }
-    let target = match intent {
-        StatusIntent::Set(s) => {
-            // A Stopped session must not be woken by a trailing worker event.
-            if inst.status == Status::Stopped {
-                return;
-            }
-            s
-        }
+    match policy {
+        // A Stopped session must not be woken by a trailing worker event.
+        StatusPolicy::Authoritative if inst.status == Status::Stopped => return,
+        StatusPolicy::Authoritative => {}
         // Background sub-agent events must not speak for the main turn: they
         // preserve its Waiting (a pending approval/elicitation) and Error (a
         // dead connection the supervisor is still respawning), and Stopped
         // likewise stays until the main turn's own lifecycle moves it. The
-        // main turn's own events (plain `Set`) resolve Waiting and Error;
-        // Error also heals on a fresh worker attach.
-        StatusIntent::SetUnlessHeld(s) => {
+        // main turn's own events resolve Waiting and Error; Error also heals
+        // on a fresh worker attach.
+        StatusPolicy::Background => {
             if matches!(
                 inst.status,
                 Status::Stopped | Status::Waiting | Status::Error
             ) {
                 return;
             }
-            s
         }
-        // HealError comes only from AcpSessionAssigned / RateLimitAuto Resumed, both
-        // emitted when a fresh worker attaches and never as trailing post-stop events.
-        StatusIntent::HealError => {
+        // Only from AcpSessionAssigned / RateLimitAutoResumed, both emitted
+        // when a fresh worker attaches and never as trailing post-stop events.
+        StatusPolicy::Heal => {
             if !matches!(inst.status, Status::Error | Status::Stopped) {
                 return;
             }
-            Status::Idle
         }
-    };
+    }
     // A plugin's sessions.turn.send marks a resting session pending right before waking it, so
     // the active-session cap counts it before this, its first real status report, lands.
     // Checked against `target` ahead of the no-op return below (not gated by it): a redundant
@@ -582,8 +701,24 @@ pub(crate) fn apply_status_intent(
     publish_status_change(status_tx, inst, prev);
 }
 
-/// Whether a structured row whose ACP status just moved should take the automatic unread
-/// mark, i.e. whether its turn just finished.
+/// Whether a structured row whose ACP status just moved should take the
+/// automatic unread mark, i.e. whether its turn just finished.
+///
+/// `inst` is the row *after* [`apply_status_intent`] ran and `old_status` is
+/// the snapshot taken before it. The predicate is deliberately byte-identical
+/// to the one in [`super::status_poll::decide_passive_transition`] and in the
+/// TUI's
+/// `apply_status_update`, so "a turn just finished" means the same thing on
+/// every surface.
+///
+/// `Running -> Idle` is the whole edge. An approval or elicitation excursion
+/// comes back through `Set(Running)` (`ApprovalResolved` /
+/// `ElicitationResolved`) before the turn's `Stopped`, so an answered-then-
+/// completed turn still ends on this edge and needs no case of its own. A
+/// direct `Waiting -> Idle` means the turn stopped while still blocked on the
+/// user, who is by construction present for it. Every `Stopped` reason maps to
+/// `Idle`, so a rate-limit park marks unread too; that is the same policy
+/// terminal sessions get, and a parked session does want attention.
 pub(super) fn should_mark_acp_unread(
     inst: &Instance,
     old_status: Status,
@@ -596,8 +731,8 @@ pub(super) fn should_mark_acp_unread(
         && !inst.unread
 }
 
-/// Write the automatic unread mark for `id` to its profile store, then mirror it into
-/// daemon memory.
+/// Serialize the durable unread mark and its mirror with explicit unread edits.
+/// A missing disk row must never produce a live mark.
 pub(super) async fn persist_and_mirror_unread(
     instances: &RwLock<Vec<Instance>>,
     instance_lock: &tokio::sync::Mutex<()>,
@@ -606,8 +741,6 @@ pub(super) async fn persist_and_mirror_unread(
     profile: String,
 ) -> bool {
     let _guard = instance_lock.lock().await;
-    let marked = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let marked_in_closure = marked.clone();
     let persist_id = id.to_string();
     let persisted = api::persist_session_update(
         profile.clone(),
@@ -616,15 +749,17 @@ pub(super) async fn persist_and_mirror_unread(
         move |instances| {
             if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
                 inst.mark_unread();
-                marked_in_closure.store(true, std::sync::atomic::Ordering::SeqCst);
+                true
+            } else {
+                false
             }
         },
     )
     .await;
-    if persisted.is_err() {
+    let Ok((marked, _, _)) = persisted else {
         return false;
-    }
-    if !marked.load(std::sync::atomic::Ordering::SeqCst) {
+    };
+    if !marked {
         tracing::debug!(
             target: "acp.event_listener",
             session = %id,
@@ -641,13 +776,36 @@ pub(super) async fn persist_and_mirror_unread(
     true
 }
 
-/// Re-derive every structured row's status from the durable event log after the ACP
-/// broadcast dropped frames, marking any row whose turn ended while we were not listening.
+/// Re-derive every structured row's status from the durable event log after the
+/// ACP broadcast dropped frames, marking any row whose turn ended while we were
+/// not listening. Returns the number of rows marked.
+///
+/// `acp_events_tx` is a `broadcast` of [`super::state::ACP_CHANNEL_CAPACITY`],
+/// and a lagged
+/// receiver is told only *how many* frames it missed, never which. Status
+/// tolerated that because it is level-triggered: any later event re-derives the
+/// right value. The unread mark is edge-triggered, so a dropped `Stopped` loses
+/// it permanently, and nothing else would ever produce it.
+///
+/// The events themselves are durable (recorded before broadcast), so the log is
+/// the recovery source: it hydrates the same fold `seed_acp_statuses` reads at
+/// boot.
+///
+/// This deliberately does NOT reuse `seed_acp_statuses`, despite the shared
+/// shape, because the two differ on both points that matter:
+///
+/// - **Boot must not mark.** Its replay re-reads history, so a `Stopped` from
+///   before the restart would re-mark a row the user has already read, on every
+///   restart. Here a `Stopped` under a still-`Running` memory status is evidence
+///   of a turn that ended during this daemon's life and was missed.
+/// - **Boot lifts a stale `Stopped`**, because a persisted `Stopped` from a
+///   daemon that died mid-turn would otherwise trap the dot grey. Mid-run a
+///   `Stopped` in memory is a deliberate stop, so `apply_status_intent`'s guard
+///   should keep it.
 pub(super) async fn recover_structured_unread_after_lag(
     instances: &RwLock<Vec<Instance>>,
-    event_store: &crate::acp::event_store::EventStore,
+    service: &crate::server::session_service::SessionService,
     instance_locks: &RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    control_cache: &crate::acp::control_cache::ControlStateCache,
     file_watch: Arc<crate::file_watch::FileWatchService>,
     status_tx: &broadcast::Sender<StatusChange>,
 ) -> usize {
@@ -661,21 +819,7 @@ pub(super) async fn recover_structured_unread_after_lag(
     let unread_enabled = crate::session::unread_enabled();
     let mut marked = 0usize;
     for id in ids {
-        let Some(event) = event_store.latest_seed_status_event(&id) else {
-            continue;
-        };
-        // Unlike boot's cold `(false, false)` seeding, this reads the live
-        // control cache (the boot-vs-lag contrast above): hydrated, it is
-        // at-or-ahead of this event's fold, so its activity flags are the
-        // best available verdict; a miss (never opened, evicted, or
-        // forgotten) degrades to boot's conservative verdict. The seed query
-        // excludes background events, so a `Stopped` under a still-running
-        // sub-agent needs this (#4001).
-        let turn_active_after = control_cache.turn_active(&id);
-        let background_agent_active_after = control_cache.has_active_background_agent(&id);
-        let Some(intent) =
-            derive_acp_status(&event, turn_active_after, background_agent_active_after)
-        else {
+        let Some(projected) = folded_sidebar_status(service, &id).await else {
             continue;
         };
         // Same snapshot-around-apply as the live path, so "the transition that
@@ -689,7 +833,7 @@ pub(super) async fn recover_structured_unread_after_lag(
                 continue;
             }
             let old_status = inst.status;
-            apply_status_intent(inst, Some(intent), status_tx);
+            apply_status_intent(inst, StatusPolicy::Authoritative, projected, status_tx);
             should_mark_acp_unread(inst, old_status, unread_enabled)
                 .then(|| inst.source_profile.clone())
         };
@@ -703,13 +847,20 @@ pub(super) async fn recover_structured_unread_after_lag(
     marked
 }
 
-/// Fold a derived `AcpSessionChange` into an `Instance`.
+/// Fold a derived `AcpSessionChange` into an `Instance`. Returns the
+/// owning profile when sessions.json needs to be re-saved (so the new
+/// `acp_session_id` survives daemon restart), or `None` if the
+/// change was a no-op or no change was emitted.
 pub(super) fn apply_acp_session_change(
     inst: &mut Instance,
     session_id: &str,
     change: Option<&AcpSessionChange>,
 ) -> Option<String> {
-    if !inst.is_structured() {
+    if !inst.is_structured()
+        || inst.terminal_handoff.as_ref().is_some_and(|intent| {
+            intent.stage != crate::session::TerminalHandoffStage::RetirementPending
+        })
+    {
         return None;
     }
     match change? {
@@ -780,15 +931,31 @@ pub(super) fn apply_acp_session_change(
             inst.import_pending = None;
         }
     }
+    if let Some(stale) = inst.resume_binding.as_ref().filter(|binding| {
+        binding.provenance == crate::session::ConversationProvenance::Asserted
+            && inst.acp_session_id.as_deref() != Some(binding.session_id.as_str())
+    }) {
+        tracing::info!(
+            target: "acp.event_listener",
+            session = %session_id,
+            stale_id = %stale.session_id,
+            "dropping asserted conversation binding that no longer matches the ACP id"
+        );
+        inst.resume_binding = None;
+    }
     Some(inst.source_profile.clone())
 }
 
-/// What an event tells the ACP-session-id listener to do.
+/// What an event tells the ACP-session-id listener to do. `None` means
+/// the event is irrelevant. Extracted so the JSON-shape parsing has a
+/// pure-function test surface.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub(super) enum AcpSessionChange {
     Assigned(String),
     Reset(String),
-    /// A user `/clear`.
+    /// A user `/clear`: drop the stored resume id so the next worker
+    /// restart starts a fresh `session/new` instead of resurrecting the
+    /// pre-clear conversation via `session/load`. See #3080.
     Cleared,
 }
 
@@ -804,108 +971,45 @@ pub(super) fn derive_acp_session_change(event: &crate::acp::Event) -> Option<Acp
     }
 }
 
-/// What an acp event implies for the sidebar status.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum StatusIntent {
-    Set(Status),
-    /// Like `Set`, but a no-op while the sidebar sits on a status only the
-    /// main turn may resolve: `Waiting` (a pending approval/elicitation),
-    /// `Stopped` (a deliberate stop), or `Error` (a dead connection awaiting
-    /// respawn). Background sub-agent lifecycle events must not speak for
-    /// the main turn; its own events (plain `Set`) and `HealError` resolve
-    /// those. Used only by the `BackgroundAgent*` arms (#4001).
-    SetUnlessHeld(Status),
-    HealError,
+/// How an event's projected sidebar status may overwrite the row's current
+/// one. The value itself always comes from the folded `AcpState`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatusPolicy {
+    Authoritative,
+    /// A no-op while the sidebar sits on a status only the main turn may
+    /// resolve: `Waiting`, `Stopped` or `Error`. Used only by the
+    /// `Background*` arms (#4001).
+    Background,
+    /// Only takes effect from `Error` or `Stopped`: a fresh worker attached.
+    Heal,
 }
 
-/// Whether `derive_acp_status` reads either activity flag for `event`,
-/// i.e. whether a caller must hydrate a cold control cache before calling
-/// it. Adjacent to the two flag-reading arms below, not structurally tied to
-/// them: nothing enforces the pairing at compile time.
-/// `derive_acp_status_ignores_the_flags_off_the_two_reading_arms` covers
-/// every arm named today and fails if one of those starts reading the flags
-/// without being added here; the two functions sit next to each other so a
-/// genuinely new `Event` variant with a flag-reading arm is still on the
-/// reviewer to catch in the diff, the test cannot see it.
-pub(super) fn reads_activity_flags(event: &crate::acp::Event) -> bool {
-    matches!(
-        event,
-        crate::acp::Event::Stopped { .. } | crate::acp::Event::BackgroundAgentCompleted { .. }
-    )
-}
-
-/// `turn_active_after` and `background_agent_active_after` are the session's
-/// post-event activity flags from the folded control state (`AcpState::
-/// turn_active` / `has_active_background_agent()`); misses read `false` and
-/// degrade to boot's conservative verdict. `turn_active` itself still gates
-/// prompt dispatch and the queue drain and tracks only the main turn. Both
-/// `Stopped` and `BackgroundAgentCompleted` resolve Idle only once neither
-/// flag is set; the former needs the flags because the cache can be ahead of
-/// a lagged frame (a newer turn already opened), the latter because a
-/// sub-agent can outlive its own completion event's ordering.
-/// `reads_activity_flags` above must name exactly these two arms. See #4001.
-pub(crate) fn derive_acp_status(
-    event: &crate::acp::Event,
-    turn_active_after: bool,
-    background_agent_active_after: bool,
-) -> Option<StatusIntent> {
+/// The events that move the sidebar status, and how.
+pub(crate) fn status_policy(event: &crate::acp::Event) -> Option<StatusPolicy> {
     use crate::acp::Event;
     match event {
         Event::UserPromptSent { .. }
+        | Event::ApprovalRequested { .. }
         | Event::ApprovalResolved { .. }
-        | Event::ElicitationResolved { .. } => Some(StatusIntent::Set(Status::Running)),
-        // Agent transcript output means a turn is live even when no UserPromptSent preceded
-        // it.
-        Event::ThinkingStarted
+        | Event::ElicitationRequested { .. }
+        | Event::ElicitationResolved { .. }
+        | Event::ThinkingStarted
         | Event::AgentMessageChunk { .. }
-        | Event::ToolCallStarted { .. } => Some(StatusIntent::Set(Status::Running)),
-        // A launched or still-working background sub-agent keeps the sidebar
-        // dot lit even while the main turn is between its own events. Must
-        // not override a pending approval/elicitation's Waiting dot, which
-        // speaks to the main turn, not the sub-agent (#4001).
-        Event::BackgroundAgentLaunched { .. } => Some(StatusIntent::SetUnlessHeld(Status::Running)),
-        Event::BackgroundAgentProgress {
+        | Event::ToolCallStarted { .. }
+        | Event::Stopped { .. }
+        | Event::AgentStartupError { .. }
+        | Event::IncompatibleAgent { .. } => Some(StatusPolicy::Authoritative),
+        Event::BackgroundAgentLaunched { .. }
+        | Event::BackgroundTaskStarted { .. }
+        | Event::BackgroundAgentProgress {
             status: crate::acp::state::BackgroundAgentStatus::Running,
             ..
-        } => Some(StatusIntent::SetUnlessHeld(Status::Running)),
-        // A pending approval or elicitation both block the turn on the
-        // user, so the sidebar dot goes yellow either way.
-        Event::ApprovalRequested { .. } | Event::ElicitationRequested { .. } => {
-            Some(StatusIntent::Set(Status::Waiting))
         }
-        // All Stopped reasons surface as Idle, including the rate-limit park.
-        //
-        // Unless something is still busy after this `Stopped`: a background
-        // sub-agent keeps working past its parent (#4001), and the cache can
-        // be ahead of a lagged frame (a newer turn already opened), so the
-        // arm consults both activity flags. Live, the event itself folds
-        // `turn_active` false, so ahead-ness is the only source of `true`.
-        Event::Stopped { .. } => Some(StatusIntent::Set(
-            if turn_active_after || background_agent_active_after {
-                Status::Running
-            } else {
-                Status::Idle
-            },
-        )),
-        // The last outstanding background agent finished. Only drops to Idle
-        // once neither the main turn nor a sibling agent is still active
-        // (`turn_active_after` covers a sub-agent launched mid-turn that
-        // outlives its own completion event's ordering; the `Stopped` arm
-        // consults the same flags). `SetUnlessHeld`
-        // because a sibling agent finishing must not clobber a pending
-        // approval/elicitation on the main turn (#4001).
-        Event::BackgroundAgentCompleted { .. } => Some(StatusIntent::SetUnlessHeld(
-            if turn_active_after || background_agent_active_after {
-                Status::Running
-            } else {
-                Status::Idle
-            },
-        )),
-        Event::AgentStartupError { .. } => Some(StatusIntent::Set(Status::Error)),
-        // A successful session/new or session/load means the agent is alive.
-        Event::AcpSessionAssigned { .. } => Some(StatusIntent::HealError),
-        // Auto-resume after a rate-limit park.
-        Event::RateLimitAutoResumed { .. } => Some(StatusIntent::HealError),
+        | Event::BackgroundAgentCompleted { .. }
+        | Event::BackgroundTaskFinished { .. } => Some(StatusPolicy::Background),
+        Event::AcpSessionAssigned { .. } | Event::RateLimitAutoResumed { .. } => {
+            Some(StatusPolicy::Heal)
+        }
         _ => None,
     }
 }
@@ -916,42 +1020,10 @@ mod tests {
     use crate::acp::protocol::AcpBroadcastFrame;
     use crate::server::test_support;
 
-    /// A broadcast only reaches receivers that subscribed before the send, and a spawned
-    /// listener subscribes as its first act.
-    async fn await_subscribed(state: &AppState) {
-        for _ in 0..500 {
-            if state.acp_events_tx.receiver_count() > 0 {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        }
-        panic!("listener never subscribed");
-    }
-
-    /// Poll the session row until `want` holds, bounded so a failure reports the reason.
-    async fn await_row(
-        state: &AppState,
-        id: &str,
-        want: fn(&Instance) -> bool,
-        why: &str,
-    ) -> Instance {
-        for _ in 0..500 {
-            let row = state
-                .instances
-                .read()
-                .await
-                .iter()
-                .find(|i| i.id == id)
-                .cloned();
-            if let Some(row) = row.filter(want) {
-                return row;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        }
-        panic!("{why}");
-    }
-
-    /// #3741.
+    /// #3741: the tally follows the decision that reached the agent, and
+    /// a cancellation is not a user decision, so it counts as nothing.
+    /// The endpoint cannot do this itself: an answered option list posts
+    /// an allow-shaped decision whatever the option turns out to mean.
     #[test]
     fn approval_tally_counts_the_effective_decision_and_skips_cancellations() {
         use crate::acp::approvals::ApprovalDecision;
@@ -978,42 +1050,113 @@ mod tests {
         assert_eq!(counts(), (1, 1, 2), "a cancellation is not a decision");
     }
 
-    /// #3181: only a structured row's own Running -> Idle turn end marks unread.
+    /// #3181: the automatic mark's predicate for a structured row, driven off
+    /// the live ACP turn-end event. One table rather than a test per case, per
+    /// the repo's compile-cost rule.
     #[test]
     fn should_mark_acp_unread_only_on_a_structured_running_to_idle_turn_end() {
-        // The helper reads the row *after* `apply_status_intent` ran, so `new` is its
-        // current status and `old` the one it moved from.
-        let mark = |structured: bool, old, new, enabled, already_unread| {
-            let mut inst = Instance::new("row", "/tmp/test");
+        // (name, structured, old_status, new_status, unread_enabled, already_unread, expected)
+        let cases = [
+            (
+                "turn finished",
+                true,
+                Status::Running,
+                Status::Idle,
+                true,
+                false,
+                true,
+            ),
+            // The turn stopped while still blocked on the user, who is by
+            // construction present for it; an answered approval comes back
+            // through Running first, so this is not the answered-then-completed
+            // path.
+            (
+                "still blocked on the user",
+                true,
+                Status::Waiting,
+                Status::Idle,
+                true,
+                false,
+                false,
+            ),
+            (
+                "crashed, not finished",
+                true,
+                Status::Running,
+                Status::Error,
+                true,
+                false,
+                false,
+            ),
+            (
+                "turn starting",
+                true,
+                Status::Idle,
+                Status::Running,
+                true,
+                false,
+                false,
+            ),
+            (
+                "no transition applied",
+                true,
+                Status::Running,
+                Status::Running,
+                true,
+                false,
+                false,
+            ),
+            (
+                "feature off",
+                true,
+                Status::Running,
+                Status::Idle,
+                false,
+                false,
+                false,
+            ),
+            // Re-marking would churn the flock once per turn, and would undo a
+            // read the user has not been given a new turn to earn.
+            (
+                "already unread",
+                true,
+                Status::Running,
+                Status::Idle,
+                true,
+                true,
+                false,
+            ),
+            // Terminal rows stay with the tmux poll loop's
+            // `decide_passive_transition`.
+            (
+                "terminal row, owned elsewhere",
+                false,
+                Status::Running,
+                Status::Idle,
+                true,
+                false,
+                false,
+            ),
+        ];
+        for (name, structured, old, new, enabled, already_unread, expected) in cases {
+            let mut inst = Instance::new(name, "/tmp/test");
             if structured {
                 inst.view = crate::session::View::Structured;
             }
+            // The helper reads the row *after* `apply_status_intent` ran.
             inst.status = new;
             inst.unread = already_unread;
-            should_mark_acp_unread(&inst, old, enabled)
-        };
-        use Status::{Error, Idle, Running, Waiting};
-
-        assert!(mark(true, Running, Idle, true, false), "turn finished");
-        // The turn stopped while still blocked on the user, who is by construction
-        // present for it; an answered approval comes back through Running first, so
-        // this is not the answered-then-completed path.
-        assert!(
-            !mark(true, Waiting, Idle, true, false),
-            "blocked on the user"
-        );
-        assert!(!mark(true, Running, Error, true, false), "crashed");
-        assert!(!mark(true, Idle, Running, true, false), "turn starting");
-        assert!(!mark(true, Running, Running, true, false), "no transition");
-        assert!(!mark(true, Running, Idle, false, false), "feature off");
-        // Re-marking would churn the flock once per turn, and would undo a read the
-        // user has not been given a new turn to earn.
-        assert!(!mark(true, Running, Idle, true, true), "already unread");
-        // Terminal rows stay with the tmux poll loop's `decide_passive_transition`.
-        assert!(!mark(false, Running, Idle, true, false), "terminal row");
+            assert_eq!(
+                should_mark_acp_unread(&inst, old, enabled),
+                expected,
+                "{name}"
+            );
+        }
     }
 
-    /// Seed `profile`'s store with `rows`, so a persist closure has a matching id to mark.
+    /// Seed `profile`'s store with `rows`, so a persist closure has a matching
+    /// id to mark. Mirrors the shape used by the `flush_passive_transition_*`
+    /// tests in `status_poll.rs`.
     fn seed_profile_store(profile: &str, rows: Vec<Instance>) {
         crate::session::Storage::new_unwatched(profile)
             .expect("storage")
@@ -1033,8 +1176,14 @@ mod tests {
             .find(|i| i.id == id)
     }
 
-    /// `persist_and_mirror_unread` mirrors a mark into memory only once it is
-    /// committed on disk.
+    /// The commit-check half of `persist_and_mirror_unread`: memory is mirrored
+    /// only when the write actually mutated the owning row.
+    ///
+    /// The second call is the profile-move case a reviewer raised on #3530.
+    /// `persist_session_update` reports `Ok` for a write whose closure matched
+    /// nothing, so mirroring on `is_ok()` alone would mark memory off a
+    /// successful no-op against a profile the row no longer lives in, and the
+    /// next disk reload would silently drop the notification.
     #[tokio::test]
     #[serial_test::serial]
     async fn persist_and_mirror_unread_mirrors_only_a_committed_mutation() {
@@ -1090,6 +1239,17 @@ mod tests {
             instances.read().await[0].unread,
             "memory must mirror the committed mark"
         );
+    }
+
+    /// A failed write must not strand a memory-only mark, the #2755 rule that
+    /// `flush_passive_transition_defers_unread_until_persist_ok` (in
+    /// `status_poll.rs`) locks for the tmux poller. Separate test rather than a
+    /// row in the one above because it needs the store deliberately broken.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn persist_and_mirror_unread_skips_the_mirror_on_a_failed_write() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
 
         // A failed write must not strand a memory-only mark (#2755), the rule
         // `flush_passive_transition_defers_unread_until_persist_ok` (in
@@ -1122,7 +1282,16 @@ mod tests {
         );
     }
 
-    /// Lag replay, the other finding on #3530.
+    /// Lag replay, the other finding on #3530: the ACP broadcast tells a lagged
+    /// receiver only how many frames it missed, never which, so a dropped
+    /// `Stopped` would lose the turn-end mark permanently (unlike status, which
+    /// is level-triggered and re-derives from any later event). The events are
+    /// durable, so recovery reads the log.
+    ///
+    /// Three rows in one pass, all with a durable `Stopped` as their latest
+    /// lifecycle event, so the discriminator is the row rather than the event:
+    /// only the structured row still sitting at `Running` represents a turn that
+    /// ended unobserved.
     #[tokio::test]
     #[serial_test::serial]
     async fn recover_structured_unread_after_lag_marks_only_a_missed_turn_end() {
@@ -1154,10 +1323,10 @@ mod tests {
         let rows = vec![missed.clone(), already.clone(), terminal.clone()];
         seed_profile_store(profile, rows.clone());
 
-        let db = temp.path().join("acp-events.db");
-        let store = crate::acp::event_store::EventStore::open(&db, 1000).expect("event store");
+        let state = test_support::build_test_app_state(vec![]);
         for id in [&missed_id, &already_id, &terminal_id] {
-            store
+            state
+                .acp_event_store
                 .record(
                     id,
                     1,
@@ -1167,21 +1336,14 @@ mod tests {
                 )
                 .expect("record stopped");
         }
-        // A cold control cache for these sessions: lag recovery never
-        // hydrates it, so the reads miss and degrade to boot's conservative
-        // `(false, false)` verdict, the Idle+unread behavior this test pins
-        // (#4001).
-        let control_cache = crate::acp::control_cache::ControlStateCache::new();
-
         let instances = RwLock::new(rows);
         let locks = RwLock::new(std::collections::HashMap::new());
         let (status_tx, _rx) = broadcast::channel(16);
 
         let marked = recover_structured_unread_after_lag(
             &instances,
-            &store,
+            &state.session_service,
             &locks,
-            &control_cache,
             crate::file_watch::FileWatchService::noop(),
             &status_tx,
         )
@@ -1216,15 +1378,13 @@ mod tests {
         assert!(!row(&terminal_id).unread);
     }
 
-    /// #4001: the lag-recovery replay must consult the live control cache. The
-    /// seed query excludes background events and `UserDiffCommentsPrompt`, so its
-    /// latest status event can be a `Stopped` while a background sub-agent is
-    /// still running or a newer turn is open; deriving from hardcoded inactivity
-    /// would resolve Idle under the live `Running` status and mark an unfinished
-    /// turn unread.
+    /// #4001: lag recovery projects the whole fold, so a background sub-agent
+    /// still running or a newer turn already open keeps the row `Running` even
+    /// when the latest lifecycle event is a `Stopped`; resolving Idle there
+    /// would mark an unfinished turn unread.
     #[tokio::test]
     #[serial_test::serial]
-    async fn recover_structured_unread_after_lag_keeps_running_for_work_past_the_seed() {
+    async fn recover_structured_unread_after_lag_keeps_running_for_work_past_the_stopped() {
         use crate::acp::Event;
         let prompt = || Event::UserPromptSent {
             text: "go".into(),
@@ -1236,8 +1396,7 @@ mod tests {
         let stopped = || Event::Stopped {
             reason: "prompt_complete".into(),
         };
-        type StillActive = fn(&crate::acp::control_cache::ControlStateCache, &str) -> bool;
-        let cases: [(&str, Vec<Event>, StillActive); 2] = [
+        let cases: [(&str, Vec<Event>); 2] = [
             (
                 "live background agent",
                 vec![
@@ -1253,10 +1412,9 @@ mod tests {
                     },
                     stopped(),
                 ],
-                |cache, id| cache.has_active_background_agent(id),
             ),
             (
-                "newer turn past the seed",
+                "newer turn past the stopped",
                 vec![
                     prompt(),
                     stopped(),
@@ -1268,10 +1426,9 @@ mod tests {
                         assembled_markdown: "diff".into(),
                     },
                 ],
-                |cache, id| cache.turn_active(id),
             ),
         ];
-        for (name, log, still_active) in cases {
+        for (name, log) in cases {
             let temp = tempfile::tempdir().expect("tempdir");
             let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
             crate::session::set_unread_enabled(true);
@@ -1285,31 +1442,13 @@ mod tests {
             let rows = vec![live];
             seed_profile_store(profile, rows.clone());
 
-            let db = temp.path().join("acp-events.db");
-            let store = crate::acp::event_store::EventStore::open(&db, 1000).expect("event store");
+            let state = test_support::build_test_app_state(vec![]);
             for (seq, event) in (1..).zip(&log) {
-                store.record(&live_id, seq, event).expect("record");
+                state
+                    .acp_event_store
+                    .record(&live_id, seq, event)
+                    .expect("record");
             }
-
-            // The daemon's control cache folded the same log.
-            let control_cache = crate::acp::control_cache::ControlStateCache::new();
-            control_cache.get_or_hydrate(&live_id, || {
-                let mut reduced = crate::acp::state::AcpState::new(
-                    crate::acp::state::AcpSessionId(live_id.clone()),
-                    crate::acp::state::AgentName("claude".into()),
-                    None,
-                );
-                let mut last_seq = 0;
-                for (seq, event) in store.replay_from(&live_id, 0) {
-                    let _ = reduced.apply_event(event);
-                    last_seq = seq;
-                }
-                (reduced, last_seq)
-            });
-            assert!(
-                still_active(&control_cache, &live_id),
-                "{name}: precondition: the folded cache still sees the live work"
-            );
 
             let instances = RwLock::new(rows);
             let locks = RwLock::new(std::collections::HashMap::new());
@@ -1317,9 +1456,8 @@ mod tests {
 
             let marked = recover_structured_unread_after_lag(
                 &instances,
-                &store,
+                &state.session_service,
                 &locks,
-                &control_cache,
                 crate::file_watch::FileWatchService::noop(),
                 &status_tx,
             )
@@ -1331,7 +1469,7 @@ mod tests {
             assert_eq!(
                 inst.status,
                 Status::Running,
-                "{name}: the seed's Stopped must not resolve Idle under live work"
+                "{name}: the Stopped must not resolve Idle under live work"
             );
             assert!(
                 !inst.unread,
@@ -1340,9 +1478,6 @@ mod tests {
         }
     }
 
-    /// A capability frame is only applied when it names the worker generation that is
-    /// still live, so an event queued by a replaced worker is dropped while the sentinel
-    /// event behind it still lands.
     #[tokio::test]
     async fn acp_event_listener_tracks_load_session_capability_updates() {
         let _app_dir = crate::session::test_support::isolate_app_dir();
@@ -1362,38 +1497,58 @@ mod tests {
         let first_generation = state.acp_supervisor.test_insert_worker(&id).await;
         let listener = tokio::spawn(acp_event_listener(state.clone()));
 
-        await_subscribed(&state).await;
+        for _ in 0..500 {
+            if state.acp_events_tx.receiver_count() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(state.acp_events_tx.receiver_count() > 0);
 
-        let send = |seq, event, worker_generation| {
+        let send_capability = |seq, capable, worker_generation| {
             state
                 .acp_events_tx
                 .send(AcpBroadcastFrame {
                     session_id: id.clone(),
                     seq,
-                    event: Arc::new(event),
-                    worker_generation,
+                    event: Arc::new(crate::acp::Event::PromptCapabilities {
+                        image: false,
+                        audio: false,
+                        embedded_context: false,
+                        load_session: Some(capable),
+                        steering: false,
+                    }),
+                    worker_generation: Some(worker_generation),
+                    sidebar_status: None,
                 })
                 .expect("listener is subscribed");
         };
-        let capability = |load_session| crate::acp::Event::PromptCapabilities {
-            image: false,
-            audio: false,
-            embedded_context: false,
-            load_session: Some(load_session),
-            steering: false,
-        };
 
-        send(1, capability(true), Some(first_generation));
-        await_row(
-            &state,
-            &id,
-            |i| i.acp_load_session_capable == Some(true),
-            "the active worker capability was not applied",
-        )
-        .await;
+        send_capability(1, true, first_generation);
+        for _ in 0..500 {
+            if state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|inst| inst.id == id)
+                .is_some_and(|inst| inst.acp_load_session_capable == Some(true))
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(
+            state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|inst| inst.id == id)
+                .is_some_and(|inst| inst.acp_load_session_capable == Some(true)),
+            "the active worker capability was not applied"
+        );
 
-        // Replace the worker, then publish a stale frame from the old generation with a
-        // generation-less sentinel behind it.
         state.acp_supervisor.test_remove_worker(&id).await;
         state
             .instances
@@ -1406,40 +1561,84 @@ mod tests {
         let second_generation = state.acp_supervisor.test_insert_worker(&id).await;
         assert_ne!(first_generation, second_generation);
 
-        send(2, capability(false), Some(first_generation));
-        send(
-            3,
-            crate::acp::Event::AcpSessionAssigned {
-                acp_session_id: "replacement-acp-id".to_string(),
-            },
-            None,
-        );
-        let row = await_row(
-            &state,
-            &id,
-            |i| i.acp_session_id.as_deref() == Some("replacement-acp-id"),
-            "the sentinel event behind the stale frame was not applied",
-        )
-        .await;
+        send_capability(2, false, first_generation);
+        state
+            .acp_events_tx
+            .send(AcpBroadcastFrame {
+                session_id: id.clone(),
+                seq: 3,
+                event: Arc::new(crate::acp::Event::AcpSessionAssigned {
+                    acp_session_id: "replacement-acp-id".to_string(),
+                }),
+                worker_generation: None,
+                sidebar_status: None,
+            })
+            .expect("listener is subscribed");
+        for _ in 0..500 {
+            if state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|inst| inst.id == id)
+                .is_some_and(|inst| inst.acp_session_id.as_deref() == Some("replacement-acp-id"))
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        let instance = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|inst| inst.id == id)
+            .cloned()
+            .expect("instance");
         assert_eq!(
-            row.acp_load_session_capable, None,
+            instance.acp_session_id.as_deref(),
+            Some("replacement-acp-id"),
+            "the sentinel event behind the stale frame was not applied"
+        );
+        assert_eq!(
+            instance.acp_load_session_capable, None,
             "a queued event from the replaced worker must be ignored"
         );
 
-        send(4, capability(false), Some(second_generation));
-        await_row(
-            &state,
-            &id,
-            |i| i.acp_load_session_capable == Some(false),
-            "the replacement worker capability was not applied",
-        )
-        .await;
+        send_capability(4, false, second_generation);
+        for _ in 0..500 {
+            if state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|inst| inst.id == id)
+                .is_some_and(|inst| inst.acp_load_session_capable == Some(false))
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(
+            state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|inst| inst.id == id)
+                .is_some_and(|inst| inst.acp_load_session_capable == Some(false)),
+            "the replacement worker capability was not applied"
+        );
 
         listener.abort();
         let _ = listener.await;
     }
-
-    /// End to end over `acp_event_listener` itself, the path that actually closes #3181.
+    /// End to end over `acp_event_listener` itself, the path that actually
+    /// closes #3181. The predicate table and the TUI ownership tests all pass
+    /// even if the snapshot is taken *after* `apply_status_intent`, the persist
+    /// is dropped, or the mirror is reordered, because none of them run the
+    /// listener. This one drives a real `Event::Stopped` frame through the
+    /// broadcast and asserts both halves of the write.
     #[tokio::test]
     #[serial_test::serial]
     async fn acp_event_listener_marks_a_finished_turn_unread_on_disk_and_in_memory() {
@@ -1457,9 +1656,30 @@ mod tests {
         seed_profile_store(profile, vec![inst.clone()]);
 
         let state = test_support::build_test_app_state(vec![inst]);
+        // Events are persisted before they are broadcast.
+        let stopped = crate::acp::Event::Stopped {
+            reason: "prompt_complete".into(),
+        };
+        state
+            .acp_event_store
+            .record(&id, 1, &stopped)
+            .expect("record");
         let listener = tokio::spawn(acp_event_listener(state.clone()));
 
-        await_subscribed(&state).await;
+        // A broadcast only reaches receivers that subscribed before the send,
+        // and the spawned listener subscribes as its first act. Wait for that
+        // rather than racing it; nothing else in this test subscribes, so the
+        // count reaching 1 is precisely "the listener is listening".
+        for _ in 0..500 {
+            if state.acp_events_tx.receiver_count() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(
+            state.acp_events_tx.receiver_count() > 0,
+            "listener never subscribed"
+        );
 
         // The turn ends.
         state
@@ -1467,35 +1687,1067 @@ mod tests {
             .send(AcpBroadcastFrame {
                 session_id: id.clone(),
                 seq: 1,
-                event: Arc::new(crate::acp::Event::Stopped {
-                    reason: "prompt_complete".into(),
+                event: Arc::new(stopped),
+                worker_generation: None,
+                sidebar_status: None,
+            })
+            .expect("listener is subscribed");
+
+        // The listener owns the write, so poll rather than sleeping a fixed
+        // interval: the persist is a real flock'd file write. Wait on the
+        // *mirror*, which is the last step, so this cannot abort the listener
+        // in between the disk write and the mirror and then blame the mirror.
+        let mut mirrored = false;
+        for _ in 0..500 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            if state
+                .instances
+                .read()
+                .await
+                .iter()
+                .any(|i| i.id == id && i.unread)
+            {
+                mirrored = true;
+                break;
+            }
+        }
+        listener.abort();
+        let _ = listener.await;
+
+        assert!(
+            mirrored,
+            "daemon memory must mirror the mark, so /api/sessions reports it"
+        );
+        assert!(
+            load_profile_row(profile, &id).is_some_and(|i| i.unread),
+            "and the mark must be durable, which is the #3181 fix; a memory-only \
+             mark is dropped by the next reload"
+        );
+        let instances = state.instances.read().await;
+        let row = instances.iter().find(|i| i.id == id).expect("row present");
+        assert_eq!(row.status, Status::Idle, "the Stopped applied");
+    }
+
+    /// The fold runs ahead of the listener, so a burst already folded to its
+    /// end must still replay each frame's own transition: Waiting -> Running on
+    /// the answer, then Running -> Idle on the stop, which is the edge the
+    /// unread mark needs.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn acp_event_listener_keeps_the_running_to_idle_edge_across_a_folded_burst() {
+        use crate::acp::approvals::ApprovalDecision;
+        use crate::acp::permissions::build_approval;
+        use crate::acp::state::ToolCall;
+        use crate::acp::Event;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+        crate::session::set_unread_enabled(true);
+
+        let profile = "acp-listener-burst";
+        let mut inst = Instance::new("acp-burst", "/tmp/acp");
+        inst.view = crate::session::View::Structured;
+        inst.source_profile = profile.to_string();
+        inst.status = Status::Waiting;
+        let id = inst.id.clone();
+        seed_profile_store(profile, vec![inst.clone()]);
+        let state = test_support::build_test_app_state(vec![inst]);
+
+        let approval = build_approval(
+            ToolCall {
+                id: "t".into(),
+                name: "shell".into(),
+                kind: "execute".into(),
+                args_preview: "{}".into(),
+                started_at: chrono::Utc::now(),
+                parent_tool_call_id: None,
+                memory_recall: None,
+                diffs: Vec::new(),
+            },
+            Vec::new(),
+        );
+        let answered = Event::ApprovalResolved {
+            nonce: approval.nonce.clone(),
+            decision: ApprovalDecision::Allow,
+        };
+        let stopped = Event::Stopped {
+            reason: "prompt_complete".into(),
+        };
+        let log = [
+            crate::acp::state::test_support::prompt("go"),
+            Event::ApprovalRequested { approval },
+            answered.clone(),
+            stopped.clone(),
+        ];
+        for (seq, event) in (1..).zip(&log) {
+            state
+                .acp_event_store
+                .record(&id, seq, event)
+                .expect("record");
+        }
+
+        let listener = tokio::spawn(acp_event_listener(state.clone()));
+        await_subscribed(&state).await;
+        // Both frames are queued behind a log that already holds the stop.
+        for (seq, event) in [(3, answered), (4, stopped)] {
+            state
+                .acp_events_tx
+                .send(AcpBroadcastFrame {
+                    session_id: id.clone(),
+                    seq,
+                    event: Arc::new(event),
+                    worker_generation: None,
+                    sidebar_status: None,
+                })
+                .expect("listener is subscribed");
+        }
+
+        let row = await_row(
+            &state,
+            &id,
+            |i| i.unread,
+            "the burst's turn end must mark the row unread",
+        )
+        .await;
+        listener.abort();
+        let _ = listener.await;
+        assert_eq!(row.status, Status::Idle);
+        assert!(load_profile_row(profile, &id).is_some_and(|i| i.unread));
+    }
+
+    /// A frame far behind the fold keeps its own transition: ApprovalResolved
+    /// at N is consumed after the content frames and the stop are already
+    /// folded, and must not read a later level. The status rides on the frame,
+    /// so it holds even when a finite retention cap has pruned the answer out
+    /// of the journal.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn acp_event_listener_keeps_the_edge_for_a_frame_far_behind_the_fold() {
+        use crate::acp::approvals::ApprovalDecision;
+        use crate::acp::permissions::build_approval;
+        use crate::acp::state::test_support::prompt;
+        use crate::acp::state::ToolCall;
+        use crate::acp::Event;
+        for (retained, content_frames) in [(2000usize, 255usize), (2000, 600), (42, 600)] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+            crate::session::set_unread_enabled(true);
+
+            let profile = "acp-listener-window";
+            let mut inst = Instance::new("acp-window", "/tmp/acp");
+            inst.view = crate::session::View::Structured;
+            inst.source_profile = profile.to_string();
+            inst.status = Status::Waiting;
+            let id = inst.id.clone();
+            seed_profile_store(profile, vec![inst.clone()]);
+            let store = Arc::new(
+                crate::acp::event_store::EventStore::open(&temp.path().join("acp.db"), retained)
+                    .expect("event store"),
+            );
+            let state = test_support::build_test_app_state_impl_with_event_store(
+                vec![inst],
+                Vec::new(),
+                Vec::new(),
+                None,
+                Some(store),
+                |_| {},
+                std::convert::identity,
+            );
+
+            let tool_call = ToolCall {
+                id: "t".into(),
+                name: "shell".into(),
+                kind: "execute".into(),
+                args_preview: "{}".into(),
+                started_at: chrono::Utc::now(),
+                parent_tool_call_id: None,
+                memory_recall: None,
+                diffs: Vec::new(),
+            };
+            let approval = build_approval(tool_call, Vec::new());
+            let answered = Event::ApprovalResolved {
+                nonce: approval.nonce.clone(),
+                decision: ApprovalDecision::Allow,
+            };
+            let stopped = Event::Stopped {
+                reason: "prompt_complete".into(),
+            };
+            // Hydrate, then fold the whole window ahead of the listener: the answer
+            // at seq 3, `content_frames` content frames, then the stop.
+            let mut log = vec![prompt("go"), Event::ApprovalRequested { approval }];
+            log.push(answered.clone());
+            log.extend((0..content_frames).map(|i| Event::ToolCallContent {
+                tool_call_id: "t".into(),
+                content: format!("out {i}"),
+            }));
+            log.push(stopped.clone());
+            for (seq, event) in (1..).zip(&log[..2]) {
+                state
+                    .acp_event_store
+                    .record(&id, seq, event)
+                    .expect("record");
+            }
+            state.session_service.fold_control_state(&id).await;
+            // What the sink does: record, fold, and keep the status after each seq.
+            let mut folded = Vec::new();
+            for (seq, event) in (3..).zip(&log[2..]) {
+                state
+                    .acp_event_store
+                    .record(&id, seq, event)
+                    .expect("record");
+                folded.push(state.acp_control_cache.apply_if_cached(&id, seq, event));
+            }
+            let last = log.len() as u64;
+            let answered_status = folded[0];
+            let stopped_status = *folded.last().expect("folded");
+            assert_eq!(answered_status, Some(Status::Running));
+            assert_eq!(stopped_status, Some(Status::Idle));
+
+            let listener = tokio::spawn(acp_event_listener(state.clone()));
+            await_subscribed(&state).await;
+            for (seq, event, sidebar_status) in [
+                (3, answered, answered_status),
+                (last, stopped, stopped_status),
+            ] {
+                state
+                    .acp_events_tx
+                    .send(AcpBroadcastFrame {
+                        session_id: id.clone(),
+                        seq,
+                        event: Arc::new(event),
+                        worker_generation: None,
+                        sidebar_status,
+                    })
+                    .expect("listener is subscribed");
+            }
+
+            let row = await_row(
+                &state,
+                &id,
+                |i| i.unread,
+                "the stop behind the fold must mark the row unread",
+            )
+            .await;
+            listener.abort();
+            let _ = listener.await;
+            assert_eq!(
+                row.status,
+                Status::Idle,
+                "{content_frames} frames, retention {retained}"
+            );
+            assert!(load_profile_row(profile, &id).is_some_and(|i| i.unread));
+        }
+    }
+
+    /// A startup error whose event-store write failed is substituted by the
+    /// sink and never reaches the log or the fold; the frame alone must still
+    /// move the row to Error.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn acp_event_listener_applies_a_startup_error_that_never_reached_the_log() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let mut inst = Instance::new("acp-unpersisted", "/tmp/acp");
+        inst.view = crate::session::View::Structured;
+        inst.status = Status::Idle;
+        let id = inst.id.clone();
+        let state = test_support::build_test_app_state(vec![inst]);
+
+        let listener = tokio::spawn(acp_event_listener(state.clone()));
+        await_subscribed(&state).await;
+        state
+            .acp_events_tx
+            .send(AcpBroadcastFrame {
+                session_id: id.clone(),
+                seq: 7,
+                event: Arc::new(crate::acp::Event::AgentStartupError {
+                    message: "event store write failed at seq 7".into(),
                 }),
                 worker_generation: None,
+                sidebar_status: None,
             })
             .expect("listener is subscribed");
 
         let row = await_row(
             &state,
             &id,
-            |i| i.unread,
-            "daemon memory must mirror the mark, so /api/sessions reports it",
+            |i| i.status == Status::Error,
+            "a non-persisted startup error must turn the row Error",
         )
         .await;
         listener.abort();
         let _ = listener.await;
+        assert_eq!(row.status, Status::Error);
+    }
 
-        assert_eq!(row.status, Status::Idle, "the Stopped applied");
-        assert!(
-            load_profile_row(profile, &id).is_some_and(|i| i.unread),
-            "and the mark must be durable, which is the #3181 fix; a memory-only \
-             mark is dropped by the next reload"
+    /// #4001: after a daemon restart the control cache is cold. A reattached
+    /// worker's first live frame is either its sub-agent's completion with the
+    /// main turn still open, or the main turn's `Stopped` with the sub-agent
+    /// still running. Projecting a cold fold would resolve Idle and mark the
+    /// still-open work unread, so the listener hydrates the whole log first
+    /// and the row stays Running.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn acp_event_listener_rebuilds_a_frame_published_to_a_cold_cache() {
+        use crate::acp::Event;
+        let completed = Event::BackgroundAgentCompleted {
+            agent_id: "bg-1".into(),
+            status: crate::acp::state::BackgroundAgentStatus::Completed,
+            tools: Vec::new(),
+            result: Some("done".into()),
+            warning: None,
+            ended_at: chrono::Utc::now(),
+        };
+        let stopped = Event::Stopped {
+            reason: "prompt_complete".into(),
+        };
+        let cases: [(&str, Event); 2] = [
+            ("mid-turn completion", completed),
+            ("stopped with an outstanding agent", stopped),
+        ];
+        for (name, live_frame) in cases {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+            crate::session::set_unread_enabled(true);
+
+            let profile = "acp-listener-cold";
+            let mut inst = Instance::new("acp-cold", "/tmp/acp");
+            inst.view = crate::session::View::Structured;
+            inst.source_profile = profile.to_string();
+            // Seeded Idle, so the poll below must observe the listener drive
+            // Idle -> Running; a Running seed would pass without the fix.
+            inst.status = Status::Idle;
+            let id = inst.id.clone();
+            seed_profile_store(profile, vec![inst.clone()]);
+
+            let state = test_support::build_test_app_state(vec![inst]);
+
+            // The pre-restart log, persisted but never folded into this cold cache.
+            let log = [
+                Event::UserPromptSent {
+                    text: "spawn and go".into(),
+                    attachments: Vec::new(),
+                    prompt_id: None,
+                    synthesized: false,
+                    origin_plugin: None,
+                },
+                Event::BackgroundAgentLaunched {
+                    agent_id: "bg-1".into(),
+                    tool_call_id: "tc-1".into(),
+                    description: "map backend".into(),
+                    prompt: "do it".into(),
+                    model: "claude-opus-4-8".into(),
+                    output_file: "/tmp/bg-1.output".into(),
+                    started_at: chrono::Utc::now(),
+                },
+                live_frame.clone(),
+            ];
+            for (seq, event) in (1..).zip(&log) {
+                state
+                    .acp_event_store
+                    .record(&id, seq, event)
+                    .expect("record");
+            }
+            assert!(
+                !state.acp_control_cache.is_hydrated(&id),
+                "{name}: precondition: a fresh process starts with a cold cache"
+            );
+
+            let listener = tokio::spawn(acp_event_listener(state.clone()));
+            // A broadcast only reaches receivers that subscribed before the send,
+            // and the spawned listener subscribes as its first act. Wait for that
+            // rather than racing it; nothing else in this test subscribes, so the
+            // count reaching 1 is precisely "the listener is listening".
+            for _ in 0..500 {
+                if state.acp_events_tx.receiver_count() > 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            assert!(
+                state.acp_events_tx.receiver_count() > 0,
+                "listener never subscribed"
+            );
+            state
+                .acp_events_tx
+                .send(AcpBroadcastFrame {
+                    session_id: id.clone(),
+                    seq: 3,
+                    event: Arc::new(live_frame),
+                    worker_generation: None,
+                    sidebar_status: None,
+                })
+                .expect("listener is subscribed");
+
+            // Status is the discriminating signal: `should_mark_acp_unread` only
+            // marks off an old Running, so unread cannot flip from the Idle seed.
+            let mut resolved = false;
+            for _ in 0..500 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                let instances = state.instances.read().await;
+                if instances
+                    .iter()
+                    .any(|i| i.id == id && i.status == Status::Running)
+                {
+                    resolved = true;
+                    break;
+                }
+            }
+            listener.abort();
+
+            assert!(
+                resolved,
+                "{name}: live work must not drop to Idle off a cold-cache miss"
+            );
+            assert!(
+                !state.instances.read().await[0].unread,
+                "{name}: a resolved live turn must not be unread"
+            );
+            assert!(state.acp_control_cache.is_hydrated(&id), "{name}");
+            assert_eq!(
+                state.acp_control_cache.sidebar_status(&id),
+                Some(Status::Running),
+                "{name}"
+            );
+        }
+    }
+
+    // #2237: a worker coming live (AcpSessionAssigned) must clear a stale
+    // idle-dormant marker, even when the acp_session_id is unchanged (a
+    // session/load reattach reuses it). Without this, a stale marker left by a
+    // non-user respawn keeps the reconciler's resume filter skipping the
+    // session forever once the worker dies, deadlocking a queued prompt.
+    #[test]
+    fn acp_session_assigned_clears_stale_dormant_marker_on_same_id() {
+        let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.view = crate::session::View::Structured;
+        inst.acp_session_id = Some("sid-1".to_string());
+        inst.idle_dormant_since = Some(chrono::Utc::now());
+
+        // Same id as already stored: the only reason to persist is the
+        // stale-dormant clear, so the function must return Some(profile).
+        let persist = apply_acp_session_change(
+            &mut inst,
+            "seed",
+            Some(&AcpSessionChange::Assigned("sid-1".to_string())),
         );
+        assert!(
+            inst.idle_dormant_since.is_none(),
+            "dormant marker must be cleared when a worker (re)assigns"
+        );
+        assert!(
+            persist.is_some(),
+            "clearing a stale marker must trigger a persist even on an unchanged id"
+        );
+    }
+
+    // A structured fork mints a brand-new child id on its first session/fork,
+    // so the assigned id differs from the (None) acp_session_id and we take the
+    // new-assignment path. That path must consume the one-shot fork_pending seed
+    // and persist, so a restart resumes the child via session/load rather than
+    // re-forking the parent.
+    #[test]
+    fn assigning_forked_id_clears_fork_pending_and_persists() {
+        let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.view = crate::session::View::Structured;
+        inst.acp_session_id = None;
+        inst.fork_pending = Some("parent-acp-id".into());
+        inst.import_pending = Some(true);
+
+        let profile = apply_acp_session_change(
+            &mut inst,
+            "sess-1",
+            Some(&AcpSessionChange::Assigned("forked-child-id".into())),
+        );
+
+        assert_eq!(inst.acp_session_id.as_deref(), Some("forked-child-id"));
+        assert_eq!(
+            inst.fork_pending, None,
+            "fork_pending cleared once the forked id is assigned"
+        );
+        assert_eq!(
+            inst.import_pending, None,
+            "import_pending consumed alongside fork_pending so a restart does not re-seed the transcript into the forked store"
+        );
+        assert!(
+            profile.is_some(),
+            "must persist so the forked id survives restart"
+        );
+    }
+
+    // A different-id assignment that is NOT consuming a fork (fork_pending is
+    // None) must leave import_pending alone: that marker belongs to the import
+    // flow, which lands on the same-id path, and clearing it here would block a
+    // legitimate import retry from re-seeding the transcript.
+    #[test]
+    fn non_fork_assignment_preserves_import_pending() {
+        let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.view = crate::session::View::Structured;
+        inst.acp_session_id = None;
+        inst.fork_pending = None;
+        inst.import_pending = Some(true);
+
+        let profile = apply_acp_session_change(
+            &mut inst,
+            "sess-1",
+            Some(&AcpSessionChange::Assigned("some-new-id".into())),
+        );
+
+        assert_eq!(inst.acp_session_id.as_deref(), Some("some-new-id"));
+        assert_eq!(
+            inst.import_pending,
+            Some(true),
+            "a non-fork different-id assignment must not consume import_pending"
+        );
+        assert!(
+            profile.is_some(),
+            "a new id assignment must persist regardless of markers"
+        );
+    }
+
+    // A SessionContextReset from a FAILED structured fork must clear the
+    // one-shot fork marker (and its paired import marker) so neither the
+    // reconciler nor the supervisor re-issues the same failing session/fork on
+    // the next reattach. This is the reducer side of the fork-failure retry-loop
+    // fix; the reset carries no new id, so acp_session_id is cleared too.
+    #[test]
+    fn reset_clears_fork_pending_and_import_pending() {
+        let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.view = crate::session::View::Structured;
+        inst.acp_session_id = Some("stale-parent-id".into());
+        inst.fork_pending = Some("parent-acp-id".into());
+        inst.import_pending = Some(true);
+
+        let profile = apply_acp_session_change(
+            &mut inst,
+            "sess-1",
+            Some(&AcpSessionChange::Reset("fork_failed: boom".into())),
+        );
+
+        assert_eq!(inst.acp_session_id, None, "reset clears the stored id");
+        assert_eq!(
+            inst.fork_pending, None,
+            "a failed fork's one-shot marker must clear so it is not retried"
+        );
+        assert_eq!(
+            inst.import_pending, None,
+            "import_pending is consumed alongside fork_pending on reset"
+        );
+        assert!(profile.is_some(), "the reset must persist");
+    }
+
+    // A SessionContextReset from a plain session/load failure (no fork pending)
+    // must clear the dead id but leave import_pending untouched: that marker
+    // belongs to the import flow, and clearing it here would block a legitimate
+    // import retry. Mirrors the non-fork assignment guard.
+    #[test]
+    fn reset_without_fork_pending_preserves_import_pending() {
+        let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.view = crate::session::View::Structured;
+        inst.acp_session_id = Some("dead-id".into());
+        inst.fork_pending = None;
+        inst.import_pending = Some(true);
+
+        let profile = apply_acp_session_change(
+            &mut inst,
+            "sess-1",
+            Some(&AcpSessionChange::Reset("session/load failed: gone".into())),
+        );
+
+        assert_eq!(inst.acp_session_id, None, "reset clears the dead id");
+        assert_eq!(
+            inst.import_pending,
+            Some(true),
+            "a non-fork reset must not consume import_pending"
+        );
+        assert!(profile.is_some(), "the reset must persist");
+    }
+
+    #[test]
+    fn acp_session_assigned_same_id_no_marker_is_noop() {
+        let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.acp_session_id = Some("sid-1".to_string());
+        inst.idle_dormant_since = None;
+        // Same id, nothing stale to clear: must stay a no-op (no rewrite).
+        let persist = apply_acp_session_change(
+            &mut inst,
+            "seed",
+            Some(&AcpSessionChange::Assigned("sid-1".to_string())),
+        );
+        assert!(
+            persist.is_none(),
+            "unchanged id with no stale marker is a no-op"
+        );
+    }
+
+    // #3080: a user /clear emits Event::SessionCleared. Before the fix this
+    // derived no session change, so the stale ACP id survived on disk and the
+    // next worker restart replayed the pre-clear conversation via session/load.
+    // It must now derive a Cleared change so the stored id is dropped.
+    #[test]
+    fn session_cleared_derives_cleared_change() {
+        assert_eq!(
+            derive_acp_session_change(&crate::acp::Event::SessionCleared),
+            Some(AcpSessionChange::Cleared),
+            "a /clear must invalidate the persisted ACP resume id"
+        );
+    }
+
+    // Applying Cleared must null the stored id and force a clean restart by
+    // dropping the paired fork/import markers too: a /clear issued before a
+    // pending fork/import resolves must still restart as session/new, not
+    // re-session/fork the parent. See #3080.
+    #[test]
+    fn cleared_nulls_stored_id_and_pending_markers() {
+        let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.view = crate::session::View::Structured;
+        inst.acp_session_id = Some("pre-clear-id".into());
+        inst.fork_pending = Some("parent-acp-id".into());
+        inst.import_pending = Some(true);
+
+        let profile =
+            apply_acp_session_change(&mut inst, "sess-1", Some(&AcpSessionChange::Cleared));
+
+        assert_eq!(inst.acp_session_id, None, "clear drops the stored id");
+        assert_eq!(
+            inst.fork_pending, None,
+            "clear drops fork_pending so restart does not re-fork the parent"
+        );
+        assert_eq!(
+            inst.import_pending, None,
+            "clear drops import_pending so restart is a clean session/new"
+        );
+        assert!(profile.is_some(), "the clear must persist");
+    }
+
+    #[test]
+    fn a_new_acp_id_drops_only_a_stale_asserted_binding() {
+        let binding = |provenance| crate::session::ConversationBinding {
+            session_id: "old-id".into(),
+            execution: None,
+            provenance,
+            transcript_path: None,
+        };
+        let new_id = AcpSessionChange::Assigned("new-id".into());
+        for (provenance, kept) in [
+            (crate::session::ConversationProvenance::Asserted, false),
+            (crate::session::ConversationProvenance::Observed, true),
+        ] {
+            let mut inst = Instance::new("seed", "/tmp/seed");
+            inst.view = crate::session::View::Structured;
+            inst.acp_session_id = Some("old-id".into());
+            inst.resume_binding = Some(binding(provenance));
+            apply_acp_session_change(&mut inst, "sess-1", Some(&new_id));
+            assert_eq!(inst.resume_binding.is_some(), kept);
+        }
+    }
+
+    // Regression for the event-ordering the listener sees: an id assigned at
+    // connect followed by a later /clear must end with no stored id. See #3080.
+    #[test]
+    fn assign_then_clear_leaves_no_stored_id() {
+        let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.view = crate::session::View::Structured;
+
+        apply_acp_session_change(
+            &mut inst,
+            "sess-1",
+            Some(&AcpSessionChange::Assigned("old-id".into())),
+        );
+        assert_eq!(inst.acp_session_id, Some("old-id".into()));
+
+        apply_acp_session_change(&mut inst, "sess-1", Some(&AcpSessionChange::Cleared));
+        assert_eq!(
+            inst.acp_session_id, None,
+            "a /clear after an assignment must not leave the old id on disk"
+        );
+
+        // A terminal conversation is not this listener's to mutate.
+        let mut inst = Instance::new("terminal", "/tmp/terminal");
+        inst.view = crate::session::View::Terminal;
+        inst.resume_intent = crate::session::ResumeIntent::Use("native-id".into());
+        let expected = inst.conversation_state();
+
+        assert_eq!(
+            apply_acp_session_change(
+                &mut inst,
+                "terminal",
+                Some(&AcpSessionChange::Assigned("acp-id".into())),
+            ),
+            None
+        );
+        assert!(expected.matches(&inst));
+        assert_eq!(inst.acp_session_id, None);
+    }
+
+    #[test]
+    fn derive_acp_session_change_extracts_assigned_id() {
+        use crate::acp::Event;
+        let ev = Event::AcpSessionAssigned {
+            acp_session_id: "uuid-1234".into(),
+        };
+        assert_eq!(
+            derive_acp_session_change(&ev),
+            Some(AcpSessionChange::Assigned("uuid-1234".into()))
+        );
+    }
+
+    #[test]
+    fn derive_acp_session_change_extracts_reset_reason() {
+        use crate::acp::Event;
+        let ev = Event::SessionContextReset {
+            reason: "session/load failed: bad id".into(),
+        };
+        assert_eq!(
+            derive_acp_session_change(&ev),
+            Some(AcpSessionChange::Reset(
+                "session/load failed: bad id".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn derive_acp_session_change_ignores_unrelated_events() {
+        use crate::acp::Event;
+        assert_eq!(
+            derive_acp_session_change(&Event::AgentMessageChunk {
+                text: "x".into(),
+                message_id: None
+            }),
+            None
+        );
+        assert_eq!(
+            derive_acp_session_change(&Event::Stopped {
+                reason: "prompt_complete".into()
+            }),
+            None
+        );
+        assert_eq!(derive_acp_session_change(&Event::ThinkingStarted), None);
+    }
+
+    #[test]
+    fn status_policy_classifies_the_events_that_move_the_sidebar() {
+        use crate::acp::approvals::{ApprovalDecision, Nonce};
+        use crate::acp::state::test_support::{chunk, prompt, stopped};
+        use crate::acp::state::BackgroundAgentStatus;
+        use crate::acp::Event;
+        use StatusPolicy::{Authoritative, Background, Heal};
+        let completed = Event::BackgroundAgentCompleted {
+            agent_id: "bg-1".into(),
+            status: BackgroundAgentStatus::Completed,
+            tools: Vec::new(),
+            result: None,
+            warning: None,
+            ended_at: chrono::Utc::now(),
+        };
+        let progress = |status| Event::BackgroundAgentProgress {
+            agent_id: "bg-1".into(),
+            status,
+            tool_count: 0,
+            tools: Vec::new(),
+            last_tool: None,
+            last_text: None,
+            at: chrono::Utc::now(),
+        };
+        let cases = [
+            (prompt("hi"), Some(Authoritative)),
+            (chunk("x"), Some(Authoritative)),
+            (Event::ThinkingStarted, Some(Authoritative)),
+            (stopped("prompt_complete"), Some(Authoritative)),
+            (
+                Event::AgentStartupError {
+                    message: "boom".into(),
+                },
+                Some(Authoritative),
+            ),
+            (
+                Event::ApprovalResolved {
+                    nonce: Nonce("x".into()),
+                    decision: ApprovalDecision::Allow,
+                },
+                Some(Authoritative),
+            ),
+            (completed, Some(Background)),
+            (
+                Event::BackgroundTaskFinished {
+                    task_id: "t".into(),
+                },
+                Some(Background),
+            ),
+            (progress(BackgroundAgentStatus::Running), Some(Background)),
+            (progress(BackgroundAgentStatus::Completed), None),
+            (
+                Event::AcpSessionAssigned {
+                    acp_session_id: "a".into(),
+                },
+                Some(Heal),
+            ),
+            (Event::ThinkingEnded, None),
+        ];
+        for (event, want) in cases {
+            assert_eq!(status_policy(&event), want, "{event:?}");
+        }
+    }
+
+    // --- #2248: a structured session must heal out of a stale Stopped ---
+
+    fn stopped_structured_instance() -> Instance {
+        let mut inst = Instance::new("s", "/tmp/s");
+        inst.view = crate::session::View::Structured;
+        inst.status = Status::Stopped;
+        inst
+    }
+
+    fn apply(inst: &mut Instance, policy: StatusPolicy, target: Status) {
+        let tx = broadcast::channel(8).0;
+        apply_status_intent(inst, policy, target, &tx);
+    }
+
+    /// Consumers scope a change by profile after the row may be gone, so the published change
+    /// carries the profile it was made under.
+    #[test]
+    fn apply_status_intent_publishes_the_effective_profile() {
+        let mut inst = stopped_structured_instance();
+        inst.source_profile = "work".to_string();
+        inst.status = Status::Idle;
+        let (tx, mut rx) = broadcast::channel(8);
+        apply_status_intent(&mut inst, StatusPolicy::Authoritative, Status::Running, &tx);
+        assert_eq!(rx.try_recv().unwrap().effective_profile, "work");
+    }
+
+    /// A `sessions.turn.send` revival marks the row pending before the wake; `HealError`'s
+    /// `Idle` hop must not release that mark; only the `UserPromptSent` that actually drives
+    /// it to `Running` may.
+    #[test]
+    fn heal_error_does_not_clear_a_pending_plugin_revival() {
+        let mut inst = stopped_structured_instance();
+        inst.plugin_revival_pending = true;
+
+        apply(&mut inst, StatusPolicy::Heal, Status::Idle);
+        assert_eq!(inst.status, Status::Idle);
+        assert!(
+            inst.plugin_revival_pending,
+            "the heal's Idle hop must not release the mark early"
+        );
+
+        apply(&mut inst, StatusPolicy::Authoritative, Status::Running);
+        assert_eq!(inst.status, Status::Running);
+        assert!(
+            !inst.plugin_revival_pending,
+            "reaching a counted status must release the mark"
+        );
+    }
+
+    /// A redundant intent that resolves to the row's current status is a no-op for `status`
+    /// itself, but must still release a stale pending mark rather than being silently skipped
+    /// by the same early return.
+    #[test]
+    fn a_noop_transition_still_clears_a_pending_plugin_revival() {
+        let mut inst = Instance::new("s", "/tmp/s");
+        inst.view = crate::session::View::Structured;
+        inst.status = Status::Running;
+        inst.plugin_revival_pending = true;
+
+        apply(&mut inst, StatusPolicy::Authoritative, Status::Running);
+
+        assert_eq!(inst.status, Status::Running);
+        assert!(
+            !inst.plugin_revival_pending,
+            "a no-op transition to an already-counted status must still release a stale mark"
+        );
+    }
+
+    #[test]
+    fn relayed_intent_stamp_wipes_concurrent_archive() {
+        // Full #3465 residual chain on structured rows.
+        let user_touch = chrono::Utc::now() - chrono::Duration::seconds(60);
+
+        let mut daemon_row = stopped_structured_instance();
+        daemon_row.status = Status::Idle;
+        daemon_row.last_accessed_at = Some(user_touch);
+        apply(
+            &mut daemon_row,
+            StatusPolicy::Authoritative,
+            Status::Running,
+        );
+
+        let mut disk = stopped_structured_instance();
+        disk.status = Status::Idle;
+        disk.last_accessed_at = Some(user_touch);
+        let pre = disk.clone();
+
+        disk.merge_from_tui(&daemon_row);
+
+        let mut post = pre.clone();
+        post.archive();
+        disk.merge_user_action_diff(&pre, &post);
+
+        assert!(
+            disk.archived_at.is_some(),
+            "relayed intent stamp must not wipe a concurrent archive (#3465)"
+        );
+    }
+
+    /// Which policies may move which statuses. Background sub-agent events
+    /// (`Background`) must not speak for the main turn's Waiting, Error, or
+    /// Stopped (#4001); trailing events never wake a Stopped or trashed row;
+    /// and no transition stamps `last_accessed_at` (#3465).
+    #[test]
+    fn apply_status_intent_matrix() {
+        use Status::{Creating, Deleting, Error, Idle, Running, Stopped, Waiting};
+        use StatusPolicy::{Authoritative, Background, Heal};
+        let user_touch = chrono::Utc::now() - chrono::Duration::seconds(60);
+        // (from, trashed, policy, target, want)
+        let cases = [
+            (Stopped, false, Heal, Idle, Idle),
+            (Error, false, Heal, Idle, Idle),
+            (Running, false, Heal, Idle, Running),
+            (Idle, false, Authoritative, Running, Running),
+            (Running, false, Authoritative, Idle, Idle),
+            (Waiting, false, Authoritative, Running, Running),
+            (Stopped, false, Authoritative, Running, Stopped),
+            (Stopped, false, Authoritative, Waiting, Stopped),
+            (Stopped, false, Authoritative, Idle, Stopped),
+            (Running, true, Authoritative, Error, Running),
+            (Idle, false, Background, Running, Running),
+            (Running, false, Background, Idle, Idle),
+            (Waiting, false, Background, Running, Waiting),
+            (Waiting, false, Background, Idle, Waiting),
+            (Error, false, Background, Running, Error),
+            (Error, false, Background, Idle, Error),
+            (Stopped, false, Background, Running, Stopped),
+            (Deleting, false, Authoritative, Running, Deleting),
+            (Deleting, false, Heal, Idle, Deleting),
+            (Creating, false, Authoritative, Running, Creating),
+            (Creating, false, Heal, Idle, Creating),
+        ];
+        for (from, trashed, policy, target, want) in cases {
+            let case = format!("{from:?} trashed={trashed} {policy:?} {target:?}");
+            let mut inst = stopped_structured_instance();
+            inst.status = from;
+            inst.last_accessed_at = Some(user_touch);
+            if trashed {
+                inst.trash();
+            }
+            apply(&mut inst, policy, target);
+            assert_eq!(inst.status, want, "{case}");
+            assert_eq!(inst.last_accessed_at, Some(user_touch), "{case}");
+            if want != from {
+                assert_eq!(inst.idle_entered_at.is_some(), want == Idle, "{case}");
+            }
+        }
+    }
+
+    /// Daemon restart: an in-flight turn unblocks a persisted Stopped, a
+    /// deliberate stop stays Stopped.
+    #[tokio::test]
+    async fn seed_acp_statuses_follows_the_folded_status() {
+        use crate::acp::Event;
+        let cases = [
+            (
+                Event::UserPromptSent {
+                    prompt_id: None,
+                    text: "go".into(),
+                    attachments: Vec::new(),
+                    synthesized: false,
+                    origin_plugin: None,
+                },
+                Status::Running,
+            ),
+            (
+                Event::Stopped {
+                    reason: "prompt_complete".into(),
+                },
+                Status::Stopped,
+            ),
+        ];
+        for (event, want) in cases {
+            let inst = stopped_structured_instance();
+            let id = inst.id.clone();
+            let state = test_support::build_test_app_state(vec![inst]);
+            state
+                .acp_event_store
+                .record(&id, 1, &event)
+                .expect("record");
+            seed_acp_statuses(state.clone()).await;
+            assert_eq!(state.instances.read().await[0].status, want, "{event:?}");
+        }
+
+        // A session with no events has nothing to project and keeps its row.
+        let mut fresh = stopped_structured_instance();
+        fresh.status = Status::Starting;
+        let state = test_support::build_test_app_state(vec![fresh]);
+        seed_acp_statuses(state.clone()).await;
+        assert_eq!(state.instances.read().await[0].status, Status::Starting);
+    }
+
+    #[tokio::test]
+    async fn seeded_task_activity_preserves_an_open_main_turn() {
+        for main_running in [false, true] {
+            let instance = stopped_structured_instance();
+            let id = instance.id.clone();
+            let state = test_support::build_test_app_state(vec![instance]);
+            let mut events = vec![
+                crate::acp::Event::UserPromptSent {
+                    prompt_id: None,
+                    text: "go".into(),
+                    attachments: Vec::new(),
+                    synthesized: false,
+                    origin_plugin: None,
+                },
+                crate::acp::Event::BackgroundTaskStarted {
+                    task_id: "task-1".into(),
+                    tool_call_id: Some("toolu_1".into()),
+                    description: "sleep".into(),
+                },
+            ];
+            if !main_running {
+                events.push(crate::acp::Event::Stopped {
+                    reason: "prompt_complete".into(),
+                });
+            }
+            for (index, event) in events.iter().enumerate() {
+                state
+                    .acp_event_store
+                    .record(&id, index as u64 + 1, event)
+                    .unwrap();
+            }
+            seed_acp_statuses(state.clone()).await;
+            assert_eq!(state.instances.read().await[0].status, Status::Running);
+            // The store write bypasses the cache; a reboot starts cold.
+            state.acp_control_cache.forget(&id);
+            state
+                .acp_event_store
+                .record(
+                    &id,
+                    events.len() as u64 + 1,
+                    &crate::acp::Event::BackgroundTaskFinished {
+                        task_id: "task-1".into(),
+                    },
+                )
+                .unwrap();
+            seed_acp_statuses(state.clone()).await;
+            assert_eq!(
+                state.instances.read().await[0].status,
+                if main_running {
+                    Status::Running
+                } else {
+                    Status::Idle
+                },
+            );
+        }
+    }
+    /// Whether the row's own agent binding carries the attested route.
+    fn attested_marker(row: &Instance) -> bool {
+        row.agent_session_binding
+            .as_ref()
+            .and_then(|binding| binding.execution.as_ref())
+            .is_some_and(|execution| execution.exported_default_store == Some(true))
     }
 
     /// #4127: a first `session/load` reattaching a legacy session re-assigns the
     /// very id the row already carries, so `apply_acp_session_change` takes its
     /// same-id arm and returns without persisting anything. The route the
-    /// launch applied must still be attested there — on disk and in memory — or
+    /// launch applied must still be attested there (on disk and in memory) or
     /// the legacy binding keeps deriving it from the configuration as it
     /// stands, which is the guess #4127 forbids.
     #[tokio::test]
@@ -1553,6 +2805,7 @@ mod tests {
                     acp_session_id: "attested-acp-id".to_string(),
                 }),
                 worker_generation: None,
+                sidebar_status: None,
             })
             .expect("listener is subscribed");
 
@@ -1573,715 +2826,38 @@ mod tests {
              route from the configuration again"
         );
     }
-
-    /// Whether the row's own agent binding carries the attested route.
-    fn attested_marker(row: &Instance) -> bool {
-        row.agent_session_binding
-            .as_ref()
-            .and_then(|binding| binding.execution.as_ref())
-            .is_some_and(|execution| execution.exported_default_store == Some(true))
-    }
-
-    /// #4001: after a daemon restart the control cache is cold, and the live
-    /// listener's own reads of it never hydrate. A reattached worker's first
-    /// live frame is either its sub-agent's completion with the main turn still
-    /// open, or the main turn's `Stopped` with the sub-agent still running.
-    /// Both arms read the activity flags; without hydrating first, both flags
-    /// read false, the frame wrongly derives Idle, and the still-open work is
-    /// marked unread. Hydrating must pick up the whole log and keep the row
-    /// Running.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn acp_event_listener_hydrates_a_cold_cache_before_deriving_a_flag_reading_frame() {
-        use crate::acp::Event;
-        let completed = Event::BackgroundAgentCompleted {
-            agent_id: "bg-1".into(),
-            status: crate::acp::state::BackgroundAgentStatus::Completed,
-            tools: Vec::new(),
-            result: Some("done".into()),
-            warning: None,
-            ended_at: chrono::Utc::now(),
-        };
-        let stopped = Event::Stopped {
-            reason: "prompt_complete".into(),
-        };
-        type StillActive = fn(&crate::acp::control_cache::ControlStateCache, &str) -> bool;
-        let cases: [(&str, Event, StillActive); 2] = [
-            ("mid-turn completion", completed, |cache, id| {
-                cache.turn_active(id)
-            }),
-            ("stopped with an outstanding agent", stopped, |cache, id| {
-                cache.has_active_background_agent(id)
-            }),
-        ];
-        for (name, live_frame, still_active) in cases {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
-            crate::session::set_unread_enabled(true);
-
-            let profile = "acp-listener-cold";
-            let mut inst = Instance::new("acp-cold", "/tmp/acp");
-            inst.view = crate::session::View::Structured;
-            inst.source_profile = profile.to_string();
-            // Seeded Idle, so the poll below must observe the listener drive
-            // Idle -> Running; a Running seed would pass without the fix.
-            inst.status = Status::Idle;
-            let id = inst.id.clone();
-            seed_profile_store(profile, vec![inst.clone()]);
-
-            let state = test_support::build_test_app_state(vec![inst]);
-
-            // The pre-restart log, persisted but never folded into this cold cache.
-            let log = [
-                Event::UserPromptSent {
-                    text: "spawn and go".into(),
-                    attachments: Vec::new(),
-                    prompt_id: None,
-                    synthesized: false,
-                    origin_plugin: None,
-                },
-                Event::BackgroundAgentLaunched {
-                    agent_id: "bg-1".into(),
-                    tool_call_id: "tc-1".into(),
-                    description: "map backend".into(),
-                    prompt: "do it".into(),
-                    model: "claude-opus-4-8".into(),
-                    output_file: "/tmp/bg-1.output".into(),
-                    started_at: chrono::Utc::now(),
-                },
-                live_frame.clone(),
-            ];
-            for (seq, event) in (1..).zip(&log) {
-                state
-                    .acp_event_store
-                    .record(&id, seq, event)
-                    .expect("record");
+    /// A broadcast only reaches receivers that subscribed before the send, and a spawned
+    /// listener subscribes as its first act.
+    async fn await_subscribed(state: &AppState) {
+        for _ in 0..500 {
+            if state.acp_events_tx.receiver_count() > 0 {
+                return;
             }
-            assert!(
-                !state.acp_control_cache.is_hydrated(&id),
-                "{name}: precondition: a fresh process starts with a cold cache"
-            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        panic!("listener never subscribed");
+    }
 
-            let listener = tokio::spawn(acp_event_listener(state.clone()));
-            await_subscribed(&state).await;
-            state
-                .acp_events_tx
-                .send(AcpBroadcastFrame {
-                    session_id: id.clone(),
-                    seq: 3,
-                    event: Arc::new(live_frame),
-                    worker_generation: None,
-                })
-                .expect("listener is subscribed");
-
-            // Status is the discriminating signal: `should_mark_acp_unread` only
-            // marks off an old Running, so unread cannot flip from the Idle seed.
-            let mut resolved = false;
-            for _ in 0..500 {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                let instances = state.instances.read().await;
-                if instances
-                    .iter()
-                    .any(|i| i.id == id && i.status == Status::Running)
-                {
-                    resolved = true;
-                    break;
-                }
+    /// Poll the session row until `want` holds, bounded so a failure reports the reason.
+    async fn await_row(
+        state: &AppState,
+        id: &str,
+        want: fn(&Instance) -> bool,
+        why: &str,
+    ) -> Instance {
+        for _ in 0..500 {
+            let row = state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|i| i.id == id)
+                .cloned();
+            if let Some(row) = row.filter(want) {
+                return row;
             }
-            listener.abort();
-
-            assert!(
-                resolved,
-                "{name}: live work must not drop to Idle off a cold-cache miss"
-            );
-            assert!(
-                !state.instances.read().await[0].unread,
-                "{name}: a resolved live turn must not be unread"
-            );
-            assert!(state.acp_control_cache.is_hydrated(&id), "{name}");
-            assert!(still_active(&state.acp_control_cache, &id), "{name}");
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
-    }
-
-    /// #2237 plus the one-shot fork/import markers: a reassignment clears a stale
-    /// dormant marker even when the id is unchanged, a consumed fork drops both markers
-    /// together so a restart neither re-forks nor re-seeds the transcript, and a change
-    /// that is not consuming a fork leaves `import_pending` for the restart that needs it.
-    #[test]
-    fn apply_acp_session_change_matrix() {
-        use AcpSessionChange::*;
-        type Row = (Option<String>, Option<String>, Option<bool>, bool);
-
-        fn applied(
-            id: Option<&str>,
-            fork: Option<&str>,
-            import: Option<bool>,
-            dormant: bool,
-            change: AcpSessionChange,
-        ) -> Row {
-            let mut inst = Instance::new("seed", "/tmp/seed");
-            inst.view = crate::session::View::Structured;
-            inst.acp_session_id = id.map(str::to_string);
-            inst.fork_pending = fork.map(str::to_string);
-            inst.import_pending = import;
-            inst.idle_dormant_since = dormant.then(chrono::Utc::now);
-            let persist = apply_acp_session_change(&mut inst, "sess-1", Some(&change));
-            (
-                inst.acp_session_id.clone(),
-                inst.fork_pending.clone(),
-                inst.import_pending,
-                persist.is_some(),
-            )
-        }
-        fn want(id: Option<&str>, fork: Option<&str>, import: Option<bool>, persists: bool) -> Row {
-            (
-                id.map(str::to_string),
-                fork.map(str::to_string),
-                import,
-                persists,
-            )
-        }
-
-        assert_eq!(
-            applied(Some("sid-1"), None, None, true, Assigned("sid-1".into())),
-            want(Some("sid-1"), None, None, true),
-            "a stale dormant marker must be cleared, and persisted, on an unchanged id"
-        );
-        assert_eq!(
-            applied(Some("sid-1"), None, None, false, Assigned("sid-1".into())),
-            want(Some("sid-1"), None, None, false),
-            "an unchanged id with nothing stale is a no-op"
-        );
-        assert_eq!(
-            applied(
-                None,
-                Some("parent"),
-                Some(true),
-                false,
-                Assigned("child".into())
-            ),
-            want(Some("child"), None, None, true),
-            "the forked id consumes both one-shot markers"
-        );
-        assert_eq!(
-            applied(None, None, Some(true), false, Assigned("new-id".into())),
-            want(Some("new-id"), None, Some(true), true),
-            "a non-fork assignment keeps import_pending"
-        );
-        assert_eq!(
-            applied(
-                Some("stale"),
-                Some("parent"),
-                Some(true),
-                false,
-                Reset("fork_failed: boom".into())
-            ),
-            want(None, None, None, true),
-            "a failed fork's markers must clear so the reconciler does not retry it"
-        );
-        assert_eq!(
-            applied(
-                Some("dead-id"),
-                None,
-                Some(true),
-                false,
-                Reset("session/load failed: gone".into())
-            ),
-            want(None, None, Some(true), true),
-            "a plain load failure clears the dead id only"
-        );
-        assert_eq!(
-            applied(
-                Some("pre-clear"),
-                Some("parent"),
-                Some(true),
-                false,
-                Cleared
-            ),
-            want(None, None, None, true),
-            "a clear forces a restart into a clean session/new"
-        );
-
-        // A terminal conversation is not this listener's to mutate.
-        let mut inst = Instance::new("terminal", "/tmp/terminal");
-        inst.view = crate::session::View::Terminal;
-        inst.resume_intent = crate::session::ResumeIntent::Use("native-id".into());
-        let expected = inst.conversation_state();
-
-        assert_eq!(
-            apply_acp_session_change(
-                &mut inst,
-                "terminal",
-                Some(&AcpSessionChange::Assigned("acp-id".into())),
-            ),
-            None
-        );
-        assert!(expected.matches(&inst));
-        assert_eq!(inst.acp_session_id, None);
-
-        use crate::acp::Event;
-        assert_eq!(
-            derive_acp_session_change(&Event::AcpSessionAssigned {
-                acp_session_id: "uuid-1234".into()
-            }),
-            Some(AcpSessionChange::Assigned("uuid-1234".into()))
-        );
-        assert_eq!(
-            derive_acp_session_change(&Event::SessionContextReset {
-                reason: "session/load failed: bad id".into()
-            }),
-            Some(AcpSessionChange::Reset(
-                "session/load failed: bad id".into()
-            ))
-        );
-        // #3080: a /clear must invalidate the persisted ACP resume id.
-        assert_eq!(
-            derive_acp_session_change(&Event::SessionCleared),
-            Some(AcpSessionChange::Cleared)
-        );
-        for unrelated in [
-            Event::AgentMessageChunk { text: "x".into() },
-            Event::Stopped {
-                reason: "prompt_complete".into(),
-            },
-            Event::ThinkingStarted,
-        ] {
-            assert_eq!(derive_acp_session_change(&unrelated), None);
-        }
-    }
-
-    #[test]
-    fn derive_acp_status_maps_events_to_status_intents() {
-        use crate::acp::approvals::{ApprovalDecision, Nonce};
-        use crate::acp::elicitations::{Elicitation, ElicitationOutcome};
-        use crate::acp::permissions::build_approval;
-        use crate::acp::state::{BackgroundAgentStatus, ToolCall};
-        use crate::acp::Event;
-
-        let tool_call = ToolCall {
-            id: "t".into(),
-            name: "shell".into(),
-            kind: "execute".into(),
-            args_preview: "{}".into(),
-            started_at: chrono::Utc::now(),
-            parent_tool_call_id: None,
-            memory_recall: None,
-            diffs: Vec::new(),
-        };
-        let elicitation = Elicitation {
-            nonce: Nonce("e-1".into()),
-            message: "Pick".into(),
-            title: None,
-            description: None,
-            tool_call_id: None,
-            questions: Vec::new(),
-            requested_at: chrono::Utc::now(),
-            resolved: None,
-        };
-        let set = |s: Status| Some(StatusIntent::Set(s));
-        let held = |s: Status| Some(StatusIntent::SetUnlessHeld(s));
-
-        // Arms that ignore both activity flags, asserted under both flag
-        // settings so one that starts reading them without being added to
-        // `reads_activity_flags` fails here. A brand-new `Event` variant with
-        // its own flag-reading arm is in neither this table nor the predicate,
-        // so extending both stays a reviewer-caught convention (#4001).
-        let flag_blind = [
-            // Agent-side activity drives Running on its own: a turn resumed by a fired
-            // wakeup or a background TaskOutput never sends a UserPromptSent.
-            (
-                Event::UserPromptSent {
-                    prompt_id: None,
-                    text: "hi".into(),
-                    attachments: Vec::new(),
-                    synthesized: false,
-                    origin_plugin: None,
-                },
-                set(Status::Running),
-            ),
-            (
-                Event::AgentMessageChunk { text: "x".into() },
-                set(Status::Running),
-            ),
-            (Event::ThinkingStarted, set(Status::Running)),
-            (
-                Event::ToolCallStarted {
-                    tool_call: tool_call.clone(),
-                },
-                set(Status::Running),
-            ),
-            // A pending approval or elicitation blocks the turn on the user, and both
-            // recover to Running once resolved.
-            (
-                Event::ApprovalRequested {
-                    approval: build_approval(tool_call, Vec::new()),
-                },
-                set(Status::Waiting),
-            ),
-            (
-                Event::ApprovalResolved {
-                    nonce: Nonce("x".into()),
-                    decision: ApprovalDecision::Allow,
-                },
-                set(Status::Running),
-            ),
-            (
-                Event::ElicitationRequested { elicitation },
-                set(Status::Waiting),
-            ),
-            (
-                Event::ElicitationResolved {
-                    nonce: Nonce("e-1".into()),
-                    outcome: ElicitationOutcome::Accepted,
-                    answers: Vec::new(),
-                },
-                set(Status::Running),
-            ),
-            // A launched or still-working sub-agent keeps the dot lit, but must
-            // not speak for the main turn's Waiting/Stopped/Error.
-            (
-                Event::BackgroundAgentLaunched {
-                    agent_id: "a-1".into(),
-                    tool_call_id: "t".into(),
-                    description: "desc".into(),
-                    prompt: "p".into(),
-                    model: "m".into(),
-                    output_file: "f".into(),
-                    started_at: chrono::Utc::now(),
-                },
-                held(Status::Running),
-            ),
-            (
-                Event::BackgroundAgentProgress {
-                    agent_id: "a-1".into(),
-                    status: BackgroundAgentStatus::Running,
-                    tool_count: 1,
-                    tools: Vec::new(),
-                    last_tool: None,
-                    last_text: None,
-                    at: chrono::Utc::now(),
-                },
-                held(Status::Running),
-            ),
-            (
-                Event::AgentStartupError {
-                    message: "boom".into(),
-                },
-                set(Status::Error),
-            ),
-            // A live session heals an Error banner but never an in-progress turn.
-            (
-                Event::AcpSessionAssigned {
-                    acp_session_id: "uuid".into(),
-                },
-                Some(StatusIntent::HealError),
-            ),
-            (
-                Event::RateLimitAutoResumed {
-                    resets_at: chrono::Utc::now(),
-                    manual: false,
-                },
-                Some(StatusIntent::HealError),
-            ),
-            // ThinkingEnded ends a sub-phase; ThinkingStarted already set Running.
-            (Event::ThinkingEnded, None),
-        ];
-        for (event, want) in flag_blind {
-            assert!(!reads_activity_flags(&event), "{event:?}");
-            assert_eq!(derive_acp_status(&event, false, false), want, "{event:?}");
-            assert_eq!(derive_acp_status(&event, true, true), want, "{event:?}");
-        }
-
-        // The two arms that do read the flags resolve Idle only once neither
-        // the main turn nor a background sub-agent is still active. Live, a
-        // `Stopped` folds `turn_active` false itself, so a true flag there
-        // means the cache is ahead of a lagged frame. See #4001.
-        let stopped = || Event::Stopped {
-            reason: "prompt_complete".into(),
-        };
-        let completed = || Event::BackgroundAgentCompleted {
-            agent_id: "a-1".into(),
-            status: BackgroundAgentStatus::Completed,
-            tools: Vec::new(),
-            result: None,
-            warning: None,
-            ended_at: chrono::Utc::now(),
-        };
-        // Every Stopped reason surfaces as Idle, the rate-limit park included.
-        let parked = || Event::Stopped {
-            reason: "rate_limited".into(),
-        };
-        let flag_reading = [
-            (stopped(), false, false, set(Status::Idle)),
-            (stopped(), false, true, set(Status::Running)),
-            (stopped(), true, false, set(Status::Running)),
-            (parked(), false, false, set(Status::Idle)),
-            (completed(), false, false, held(Status::Idle)),
-            (completed(), false, true, held(Status::Running)),
-            (completed(), true, false, held(Status::Running)),
-        ];
-        for (event, turn_active, background_active, want) in flag_reading {
-            assert!(reads_activity_flags(&event), "{event:?}");
-            assert_eq!(
-                derive_acp_status(&event, turn_active, background_active),
-                want,
-                "{event:?} turn={turn_active} background={background_active}"
-            );
-        }
-    }
-
-    /// #4001: stopping a session mid-sub-agent must not leave it reading
-    /// Running forever. `Supervisor::shutdown_with_reason`'s teardown path
-    /// now publishes a synthetic `BackgroundAgentCompleted { Detached }` for
-    /// every outstanding agent before its own `Stopped`; replay this exact
-    /// sequence through a real `AcpState` (not hand-fed booleans) to prove
-    /// the fold actually clears `has_active_background_agent`, and that the
-    /// resumed session's terminating `Stopped` derives Idle off it.
-    #[test]
-    fn derive_acp_status_resolves_idle_once_teardown_detaches_the_last_agent() {
-        use crate::acp::state::{AcpSessionId, AcpState, AgentName, BackgroundAgentStatus};
-        use crate::acp::Event;
-
-        let mut state = AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None);
-        state
-            .apply_event(Event::UserPromptSent {
-                prompt_id: None,
-                text: "spawn and go".into(),
-                attachments: Vec::new(),
-                synthesized: false,
-                origin_plugin: None,
-            })
-            .unwrap();
-        state
-            .apply_event(Event::BackgroundAgentLaunched {
-                agent_id: "bg-1".into(),
-                tool_call_id: "tc-1".into(),
-                description: "map backend".into(),
-                prompt: "do it".into(),
-                model: "claude-opus-4-8".into(),
-                output_file: "/tmp/bg-1.output".into(),
-                started_at: chrono::Utc::now(),
-            })
-            .unwrap();
-        assert!(
-            state.has_active_background_agent(),
-            "precondition: the launch is still outstanding"
-        );
-
-        // Without this event the fold below would still see the agent as
-        // outstanding and the final Stopped would derive Running: this is
-        // the bug (#4001), not a hypothetical.
-        state
-            .apply_event(Event::BackgroundAgentCompleted {
-                agent_id: "bg-1".into(),
-                status: BackgroundAgentStatus::Detached,
-                tools: Vec::new(),
-                result: None,
-                warning: None,
-                ended_at: chrono::Utc::now(),
-            })
-            .unwrap();
-        assert!(
-            !state.has_active_background_agent(),
-            "a Detached completion closes the record like any other terminal status"
-        );
-
-        state
-            .apply_event(Event::Stopped {
-                reason: "user_stopped".into(),
-            })
-            .unwrap();
-        assert_eq!(
-            derive_acp_status(
-                &Event::Stopped {
-                    reason: "user_stopped".into()
-                },
-                state.turn_active,
-                state.has_active_background_agent(),
-            ),
-            Some(StatusIntent::Set(Status::Idle)),
-            "the resumed session's turn-end must not read Running forever"
-        );
-    }
-
-    // --- #2248: a structured session must heal out of a stale Stopped ---
-
-    fn stopped_structured_instance() -> Instance {
-        let mut inst = Instance::new("s", "/tmp/s");
-        inst.view = crate::session::View::Structured;
-        inst.status = Status::Stopped;
-        inst
-    }
-
-    fn apply(inst: &mut Instance, intent: StatusIntent) {
-        let tx = broadcast::channel(8).0;
-        apply_status_intent(inst, Some(intent), &tx);
-    }
-
-    /// Consumers scope a change by profile after the row may be gone, so the published change
-    /// carries the profile it was made under.
-    #[test]
-    fn apply_status_intent_publishes_the_effective_profile() {
-        let mut inst = stopped_structured_instance();
-        inst.source_profile = "work".to_string();
-        inst.status = Status::Idle;
-        let (tx, mut rx) = broadcast::channel(8);
-        apply_status_intent(&mut inst, Some(StatusIntent::Set(Status::Running)), &tx);
-        assert_eq!(rx.try_recv().unwrap().effective_profile, "work");
-    }
-
-    /// A `sessions.turn.send` revival marks the row pending before the wake; `HealError`'s
-    /// `Idle` hop must not release that mark; only the `UserPromptSent` that actually drives
-    /// it to `Running` may.
-    #[test]
-    fn heal_error_does_not_clear_a_pending_plugin_revival() {
-        let mut inst = stopped_structured_instance();
-        inst.plugin_revival_pending = true;
-
-        apply(&mut inst, StatusIntent::HealError);
-        assert_eq!(inst.status, Status::Idle);
-        assert!(
-            inst.plugin_revival_pending,
-            "the heal's Idle hop must not release the mark early"
-        );
-
-        apply(&mut inst, StatusIntent::Set(Status::Running));
-        assert_eq!(inst.status, Status::Running);
-        assert!(
-            !inst.plugin_revival_pending,
-            "reaching a counted status must release the mark"
-        );
-    }
-
-    /// A redundant intent that resolves to the row's current status is a no-op for `status`
-    /// itself, but must still release a stale pending mark rather than being silently skipped
-    /// by the same early return.
-    #[test]
-    fn a_noop_transition_still_clears_a_pending_plugin_revival() {
-        let mut inst = Instance::new("s", "/tmp/s");
-        inst.view = crate::session::View::Structured;
-        inst.status = Status::Running;
-        inst.plugin_revival_pending = true;
-
-        apply(&mut inst, StatusIntent::Set(Status::Running));
-
-        assert_eq!(inst.status, Status::Running);
-        assert!(
-            !inst.plugin_revival_pending,
-            "a no-op transition to an already-counted status must still release a stale mark"
-        );
-    }
-
-    #[test]
-    fn relayed_intent_stamp_wipes_concurrent_archive() {
-        // Full #3465 residual chain on structured rows.
-        let user_touch = chrono::Utc::now() - chrono::Duration::seconds(60);
-
-        let mut daemon_row = stopped_structured_instance();
-        daemon_row.status = Status::Idle;
-        daemon_row.last_accessed_at = Some(user_touch);
-        apply(&mut daemon_row, StatusIntent::Set(Status::Running));
-
-        let mut disk = stopped_structured_instance();
-        disk.status = Status::Idle;
-        disk.last_accessed_at = Some(user_touch);
-        let pre = disk.clone();
-
-        disk.merge_from_tui(&daemon_row);
-
-        let mut post = pre.clone();
-        post.archive();
-        disk.merge_user_action_diff(&pre, &post);
-
-        assert!(
-            disk.archived_at.is_some(),
-            "relayed intent stamp must not wipe a concurrent archive (#3465)"
-        );
-    }
-
-    /// Which intents may move which statuses. Background sub-agent intents
-    /// (`SetUnlessHeld`) must not speak for the main turn's Waiting, Error, or
-    /// Stopped (#4001); trailing events never wake a Stopped or trashed row;
-    /// and no transition stamps `last_accessed_at` (#3465).
-    #[test]
-    fn apply_status_intent_matrix() {
-        use Status::{Creating, Deleting, Error, Idle, Running, Stopped, Waiting};
-        use StatusIntent::{HealError, Set, SetUnlessHeld};
-        let user_touch = chrono::Utc::now() - chrono::Duration::seconds(60);
-        // (from, trashed, intent, want)
-        let cases = [
-            (Stopped, false, HealError, Idle),
-            (Error, false, HealError, Idle),
-            (Running, false, HealError, Running),
-            (Idle, false, Set(Running), Running),
-            (Running, false, Set(Idle), Idle),
-            (Waiting, false, Set(Running), Running),
-            (Stopped, false, Set(Running), Stopped),
-            (Stopped, false, Set(Waiting), Stopped),
-            (Stopped, false, Set(Idle), Stopped),
-            (Running, true, Set(Error), Running),
-            (Idle, false, SetUnlessHeld(Running), Running),
-            (Running, false, SetUnlessHeld(Idle), Idle),
-            (Waiting, false, SetUnlessHeld(Running), Waiting),
-            (Waiting, false, SetUnlessHeld(Idle), Waiting),
-            (Error, false, SetUnlessHeld(Running), Error),
-            (Error, false, SetUnlessHeld(Idle), Error),
-            (Stopped, false, SetUnlessHeld(Running), Stopped),
-            (Deleting, false, Set(Running), Deleting),
-            (Deleting, false, HealError, Deleting),
-            (Creating, false, Set(Running), Creating),
-            (Creating, false, HealError, Creating),
-        ];
-        for (from, trashed, intent, want) in cases {
-            let case = format!("{from:?} trashed={trashed} {intent:?}");
-            let mut inst = stopped_structured_instance();
-            inst.status = from;
-            inst.last_accessed_at = Some(user_touch);
-            if trashed {
-                inst.trash();
-            }
-            apply(&mut inst, intent);
-            assert_eq!(inst.status, want, "{case}");
-            assert_eq!(inst.last_accessed_at, Some(user_touch), "{case}");
-            if want != from {
-                assert_eq!(inst.idle_entered_at.is_some(), want == Idle, "{case}");
-            }
-        }
-    }
-
-    /// Daemon restart: an in-flight turn unblocks a persisted Stopped, a
-    /// deliberate stop stays Stopped.
-    #[tokio::test]
-    async fn seed_acp_statuses_follows_the_latest_status_event() {
-        use crate::acp::Event;
-        let cases = [
-            (
-                Event::UserPromptSent {
-                    prompt_id: None,
-                    text: "go".into(),
-                    attachments: Vec::new(),
-                    synthesized: false,
-                    origin_plugin: None,
-                },
-                Status::Running,
-            ),
-            (
-                Event::Stopped {
-                    reason: "prompt_complete".into(),
-                },
-                Status::Stopped,
-            ),
-        ];
-        for (event, want) in cases {
-            let inst = stopped_structured_instance();
-            let id = inst.id.clone();
-            let state = test_support::build_test_app_state(vec![inst]);
-            state
-                .acp_event_store
-                .record(&id, 1, &event)
-                .expect("record");
-            seed_acp_statuses(state.clone()).await;
-            assert_eq!(state.instances.read().await[0].status, want, "{event:?}");
-        }
+        panic!("{why}");
     }
 }

@@ -16,7 +16,7 @@ pub fn run() -> Result<()> {
         let rows: Vec<serde_json::Value> = match serde_json::from_str(&content) {
             Ok(rows) => rows,
             Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "Skipping unreadable sessions while seeding tip count");
+                tracing::warn!(target: "migrations.v036", path = %path.display(), %error, "Skipping unreadable sessions while seeding tip count");
                 continue;
             }
         };
@@ -41,7 +41,7 @@ pub fn run() -> Result<()> {
         true
     })?;
     if seeded {
-        tracing::info!(
+        tracing::info!(target: "migrations.v036",
             "v036: seeded session creation count from {} retained sessions",
             ids.len()
         );

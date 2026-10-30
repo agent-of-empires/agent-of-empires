@@ -1,8 +1,10 @@
-// Trash, restore, and delete loops with aggregate toasts, extracted from App for unit testing.
+// Trash, restore, and confirmed-deletion transitions.
 
 import { deleteWorkspace, restoreSession, trashSession } from "./api";
-import type { DeleteSessionOptions } from "./api";
+import type { DeleteSessionOptions, DeleteWorkspaceResult, TrashPurgeConsent } from "./api";
 import type { SessionResponse, SessionStatus, Workspace } from "./types";
+
+const BUSY_MESSAGE = "Some sessions are busy with another operation and were not changed; retry them when it finishes";
 
 /** A workspace is only trashed as a whole, so restore every session of the workspace containing `sessionId`. */
 export function trashedWorkspaceRestoreIds(workspaces: Workspace[], sessionId: string): string[] {
@@ -54,6 +56,7 @@ export async function trashSessions(
     const res = await trashSession(id);
     if (res) {
       deps.applySession(res);
+      res.warnings?.forEach((warning) => deps.notify?.info?.(warning));
     } else {
       anyFailed = true;
       deps.onError(id);
@@ -69,6 +72,7 @@ export async function trashSessions(
 
 interface DeleteWorkspaceDeps {
   setStatus: (id: string, status: SessionStatus) => void;
+  clearDeleting: (sessions: SessionResponse[]) => void;
   /** Runs only after the server confirms the delete. */
   purgeLocal: (id: string) => void;
   navigateHome: () => void;
@@ -78,26 +82,53 @@ interface DeleteWorkspaceDeps {
 /** Atomic delete of `sessions`; the server keeps a worktree any other session still uses. Local cleanup and the redirect home only follow confirmed deletions. */
 export async function deleteWorkspaceSessions(
   sessions: SessionResponse[],
-  options: DeleteSessionOptions,
+  options: Omit<DeleteSessionOptions, "trash_consents">,
   activeSessionId: string | null,
   deps: DeleteWorkspaceDeps,
-): Promise<void> {
-  if (sessions.length === 0) return;
+): Promise<DeleteWorkspaceResult> {
+  if (sessions.length === 0) return { ok: true, deleted: [], kept: [] };
   const ids = sessions.map((s) => s.id);
   const activeInWorkspace = activeSessionId != null && ids.includes(activeSessionId);
+  const trash_consents: Record<string, TrashPurgeConsent> = {};
+  for (const session of sessions) {
+    if (!session.trashed_at && !options.expected_trash) continue;
+    if (
+      !session.trashed_at ||
+      !session.trash_lifecycle_id ||
+      !Number.isSafeInteger(session.lifecycle_generation) ||
+      session.lifecycle_generation < 0
+    ) {
+      const error = "The original trash lifecycle is unavailable. Refresh before selecting sessions to purge.";
+      deps.notify?.error?.(error);
+      return { ok: false, error };
+    }
+    trash_consents[session.id] = {
+      expected_trashed_at: session.trashed_at,
+      expected_trash_lifecycle_id: session.trash_lifecycle_id,
+      expected_generation: session.lifecycle_generation,
+    };
+  }
 
   for (const id of ids) deps.setStatus(id, "Deleting");
 
-  const result = await deleteWorkspace(ids, options);
+  const result = await deleteWorkspace(ids, { ...options, trash_consents });
+  if (!result.ok && result.busy?.length) {
+    deps.clearDeleting(sessions);
+    deps.notify?.error?.(BUSY_MESSAGE);
+    return result;
+  }
   if (!result.ok) {
     for (const id of ids) deps.setStatus(id, "Error");
     deps.notify?.error?.(result.error || "Failed to delete session");
-    return;
+    return result;
   }
 
-  // Ids in neither set (e.g. restored concurrently) are left for the next poll.
   const deleted = new Set(result.deleted ?? []);
   const failed = new Set((result.failed ?? []).map((f) => f.id));
+  const busy = new Set((result.busy ?? []).map((b) => b.id));
+  const retained = sessions.filter((session) => !deleted.has(session.id) && !failed.has(session.id));
+  const kept = retained.filter((session) => !busy.has(session.id)).map((session) => session.id);
+  deps.clearDeleting(retained);
   for (const id of ids) {
     if (deleted.has(id)) {
       deps.purgeLocal(id);
@@ -109,11 +140,23 @@ export async function deleteWorkspaceSessions(
   if (activeInWorkspace && deleted.has(activeSessionId!)) deps.navigateHome();
 
   if (result.failed && result.failed.length > 0) {
-    deps.notify?.error?.("Some sessions could not be deleted");
-    return;
+    deps.notify?.error?.(
+      busy.size > 0
+        ? "Some sessions could not be deleted, and some are busy with another operation; retry the busy ones when it finishes"
+        : "Some sessions could not be deleted",
+    );
+    return { ...result, kept };
   }
-  // `messages` carries notes like a kept scratch path.
-  deps.notify?.info?.(result.messages?.[0] ?? (ids.length > 1 ? "Sessions deleted" : "Session deleted"));
+  if (busy.size > 0) {
+    deps.notify?.error?.(BUSY_MESSAGE);
+    return { ...result, kept };
+  }
+  deps.notify?.info?.(
+    retained.length > 0
+      ? "Some selected sessions changed and were not deleted"
+      : (result.messages?.[0] ?? (ids.length > 1 ? "Sessions deleted" : "Session deleted")),
+  );
+  return { ...result, kept };
 }
 
 /** Returns true iff all succeeded. */
@@ -123,6 +166,7 @@ export async function restoreSessions(ids: string[], deps: TrashDeps): Promise<b
     const res = await restoreSession(id);
     if (res) {
       deps.applySession(res);
+      res.warnings?.forEach((warning) => deps.notify?.info?.(warning));
     } else {
       anyFailed = true;
     }

@@ -17,10 +17,10 @@ afterEach(() => {
   mockKeyboard.current = { isMobile: false, keyboardOpen: false, keyboardHeight: 0 };
 });
 
-function renderRoot(keyboardHeight: number) {
+function renderRoot(keyboardHeight: number, active = true) {
   mockKeyboard.current = { isMobile: true, keyboardOpen: keyboardHeight > 0, keyboardHeight };
   render(
-    <StructuredViewRoot>
+    <StructuredViewRoot active={active}>
       <div>child</div>
     </StructuredViewRoot>,
   );
@@ -34,6 +34,10 @@ describe("StructuredViewRoot", () => {
     [-12, ""],
   ])("reserves keyboard height %s as bottom padding", (height, padding) => {
     expect(renderRoot(height).style.paddingBottom).toBe(padding);
+  });
+
+  it("reserves no keyboard height while inactive", () => {
+    expect(renderRoot(280, false).style.paddingBottom).toBe("");
   });
 
   // rem, not px, so the transcript still follows the browser's root font size.

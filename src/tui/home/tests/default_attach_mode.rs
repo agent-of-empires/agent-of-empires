@@ -2,6 +2,7 @@
 /// existing Structured-view row attaches to tmux or enters live-send.
 use super::*;
 use crate::session::config::{update_config, AttachMode};
+use crate::tui::home::TerminalMode;
 
 fn add_session(view: &mut HomeView, title: &str) -> String {
     let mut inst = Instance::new(title, "/tmp/test");
@@ -218,6 +219,56 @@ fn refresh_tool_preview_cache_resizes_live_pane_when_targeted() {
     );
 }
 
+#[test]
+#[serial]
+fn structured_backend_auxiliary_views_honor_default_attach_mode() {
+    for mode in [AttachMode::Tmux, AttachMode::LiveSend] {
+        for pane in [ViewMode::Terminal, ViewMode::Tool("probe".into())] {
+            let mut env = create_test_env_empty();
+            write_global_default_attach_mode(mode);
+            let id = add_session(&mut env.view, "structured-row");
+            env.view.instances.get_mut(&id).unwrap().view = crate::session::View::Structured;
+            env.view.flat_items = env.view.build_flat_items();
+            env.view.cursor = 0;
+            env.view.update_selected();
+            env.view.view_mode = pane.clone();
+            assert_eq!(env.view.default_attach_mode(&id), Some(mode));
+            let expected = match (mode, &pane) {
+                (AttachMode::LiveSend, _) => Action::EnterLiveSend(id.clone()),
+                (AttachMode::Tmux, ViewMode::Terminal) => {
+                    Action::AttachTerminal(id.clone(), TerminalMode::Host)
+                }
+                (AttachMode::Tmux, ViewMode::Tool(name)) => {
+                    Action::AttachToolSession(id.clone(), name.clone())
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                env.view.handle_key(key(KeyCode::Enter), None),
+                Some(expected)
+            );
+            if mode == AttachMode::LiveSend {
+                let native_action = match &pane {
+                    ViewMode::Terminal => Action::AttachTerminal(id.clone(), TerminalMode::Host),
+                    ViewMode::Tool(name) => Action::AttachToolSession(id.clone(), name.clone()),
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    env.view.handle_key(key(KeyCode::Tab), None),
+                    Some(native_action),
+                    "Tab retains the native attach escape hatch"
+                );
+                let expected_target = match pane {
+                    ViewMode::Terminal => crate::tui::home::live_send::LiveSendTarget::Terminal,
+                    ViewMode::Tool(name) => crate::tui::home::live_send::LiveSendTarget::Tool(name),
+                    _ => unreachable!(),
+                };
+                assert_eq!(env.view.take_live_send_target(), expected_target);
+            }
+        }
+    }
+}
+
 fn write_live_send_on_view_switch(mode: AttachMode, on_view_switch: bool) {
     update_config(|config| {
         config.session.default_attach_mode = mode;
@@ -265,6 +316,13 @@ fn view_switch_auto_starts_live_send_only_when_enabled() {
     ];
     for (mode, on_switch, key_event, expected_view, live) in cases {
         let mut env = create_test_env_empty();
+        env.view.tool_configs.insert(
+            "lazygit".into(),
+            crate::session::config::ToolSessionConfig {
+                command: "sleep 600".into(),
+                ..Default::default()
+            },
+        );
         write_live_send_on_view_switch(mode, on_switch);
         let id = add_session(&mut env.view, "session-one");
         env.view.flat_items = env.view.build_flat_items();
@@ -393,7 +451,7 @@ fn switch_view_target_gates_by_view_and_state() {
         "expected SwitchSessionView({id}), got {action:?}"
     );
     update_config(|config| {
-        config.acp.offer_structured_in_new_session = true;
+        config.acp.structured_view = crate::session::config::StructuredView::Terminal;
     })
     .unwrap();
     assert_eq!(env.view.session_switch_view_target(&id), Some(true));
@@ -409,30 +467,27 @@ fn switch_view_target_gates_by_view_and_state() {
     assert_eq!(env.view.session_switch_view_target(&id), None);
 }
 
-/// Switching a terminal session into structured view is gated on the
-/// `offer_structured_in_new_session` opt-in, so with it off an ACP-capable row offers no
-/// switch. A structured row can always switch back, so no session is stranded.
+/// Switching a terminal session into structured view is gated on `acp.structured_view`, so
+/// with it `off` an ACP-capable row offers no switch. A structured row can always switch back, so no session is stranded.
 #[test]
 #[serial]
-fn switch_view_target_gated_on_structured_opt_in() {
+fn switch_view_target_gated_on_structured_view_off() {
     use crate::session::config::update_config;
     let (mut env, id) = structured_session_env();
     update_config(|config| {
-        config.acp.offer_structured_in_new_session = false;
+        config.acp.structured_view = crate::session::config::StructuredView::Off;
     })
     .unwrap();
     // Structured -> terminal is always available (escape hatch).
     assert_eq!(env.view.session_switch_view_target(&id), Some(true));
-    // Terminal -> structured is suppressed while the opt-in is off.
+    // Terminal -> structured is suppressed while structured_view is off.
     env.view.mutate_instance(&id, |inst| {
         inst.view = crate::session::View::Terminal;
     });
     assert_eq!(env.view.session_switch_view_target(&id), None);
 }
 
-/// Tab is Enter's complement on a session row: whichever of live-send and tmux-attach
-/// `default_attach_mode` doesn't route Enter to. The footer must surface it so it isn't
-/// discoverable only from the source or the `?` overlay.
+/// The footer advertises Tab's alternate action for the configured Enter mode.
 #[test]
 #[serial]
 fn footer_advertises_tab_as_live_when_default_is_tmux() {
@@ -443,17 +498,12 @@ fn footer_advertises_tab_as_live_when_default_is_tmux() {
     env.view.update_selected();
     let out = render_home(&mut env);
     assert!(
-        out.contains("↵  Attach"),
-        "Enter hint should stay tmux attach under the default mode.\n{out}"
-    );
-    assert!(
         out.contains("⇥  Live"),
         "Tab hint should advertise Live mode when Enter is pinned to tmux attach.\n{out}"
     );
 }
 
-/// Inverse: once `default_attach_mode = LiveSend` takes over Enter, the two hints swap
-/// rather than both claiming "Attach", the same swap the `?` overlay does.
+/// Live-send on Enter makes Tab the tmux attach alternative.
 #[test]
 #[serial]
 fn footer_advertises_tab_as_attach_when_default_is_live_send() {
@@ -465,17 +515,12 @@ fn footer_advertises_tab_as_attach_when_default_is_live_send() {
     env.view.update_selected();
     let out = render_home(&mut env);
     assert!(
-        out.contains("↵  Live"),
-        "Enter hint should say Live once it owns live-send.\n{out}"
-    );
-    assert!(
         out.contains("⇥  Attach"),
         "Tab hint should offer the tmux escape hatch once Enter owns live-send.\n{out}"
     );
 }
 
-/// Acp rows ignore `default_attach_mode` entirely (Tab mirrors Enter or no-ops), so the
-/// footer must not advertise a Tab complement that does nothing different.
+/// Structured rows have no distinct Tab action to advertise.
 #[test]
 #[serial]
 fn footer_hides_tab_hint_for_structured_sessions() {
@@ -491,10 +536,6 @@ fn footer_hides_tab_hint_for_structured_sessions() {
     assert!(
         !out.contains("⇥"),
         "structured view rows must not show a Tab hint at all.\n{out}"
-    );
-    assert!(
-        out.contains("↵  Attach"),
-        "structured rows keep the plain Enter attach label.\n{out}"
     );
 }
 

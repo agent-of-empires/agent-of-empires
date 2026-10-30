@@ -428,25 +428,31 @@ fn yolo_toggles_on_its_own_row_independently_of_the_sandbox() {
 }
 
 #[test]
+#[serial_test::serial]
 fn the_sandbox_image_always_submits_whatever_the_field_holds() {
-    let default_image = crate::containers::get_container_runtime().effective_default_image();
-    // (sandbox on?, image field, submitted image)
-    let cases: &[(bool, Option<&str>, &str)] = &[
-        (true, Some("custom/image:tag"), "custom/image:tag"),
-        (true, None, &default_image),
-        (true, Some(""), ""),
-        (false, Some("custom/image:tag"), "custom/image:tag"),
-    ];
-    for (sandbox, image, want) in cases {
-        let mut dialog = sandboxed_dialog();
-        dialog.sandbox_enabled = *sandbox;
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let project = temp_home.path().join("project");
+    fs::create_dir(&project).expect("project directory");
+    for (sandbox, image, want) in [
+        (true, "custom/image:tag", "custom/image:tag"),
+        (true, "  custom/image:tag  ", "custom/image:tag"),
+        (true, "", ""),
+        (false, "custom/image:tag", "custom/image:tag"),
+    ] {
+        let mut dialog = NewSessionDialog::new_with_config(
+            vec!["claude"],
+            project.display().to_string(),
+            Config::default(),
+        );
+        dialog.docker_available = true;
+        dialog.sandbox_enabled = sandbox;
         dialog.sandbox_dirty = true;
-        if let Some(image) = image {
-            dialog.sandbox_image = Input::new(image.to_string());
-        }
+        dialog.sandbox_image = Input::new(image.to_string());
         let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
-        assert_eq!(data.sandbox, *sandbox);
-        assert_eq!(data.sandbox_image, *want);
+        assert_eq!(data.path, project.display().to_string());
+        assert_eq!(data.sandbox, sandbox);
+        assert_eq!(data.sandbox_image, want);
     }
 }
 
@@ -462,8 +468,8 @@ fn the_sandbox_config_overlay_opens_on_ctrl_p_and_edits_the_image() {
     assert!(dialog.sandbox_config_mode);
     assert_eq!(dialog.sandbox_focused_field, 0);
 
-    // Tab wraps the two rows; Esc and Enter both return to the main form.
-    for expected in [1, 0] {
+    // Tab wraps the three rows; Esc and Enter both return to the main form.
+    for expected in [1, 2, 0] {
         dialog.handle_key(key(KeyCode::Tab));
         assert_eq!(dialog.sandbox_focused_field, expected);
     }
@@ -718,6 +724,8 @@ fn the_profile_row_cycles_and_rides_along_on_submit() {
 
     let mut dialog = with_profiles(&["default", "work"]);
     dialog.handle_key(key(KeyCode::Right));
+    // Structured is preselected by default, and its adapter check is not under test.
+    dialog.structured_enabled = false;
     assert_eq!(
         submitted(dialog.handle_key(key(KeyCode::Enter))).profile,
         "work"
@@ -837,6 +845,85 @@ fn editing_the_env_list_does_submit_a_session_override() {
         submitted(dialog.build_submit_result()).extra_env,
         vec!["THING=$NEW_THING".to_string(), "EXTRA=1".to_string()]
     );
+}
+
+#[test]
+fn hook_env_is_submitted_only_with_sandbox_and_stays_out_of_container_env() {
+    for (sandbox, expected) in [(true, vec!["TOKEN=abc".to_string()]), (false, Vec::new())] {
+        let mut dialog = single_tool_dialog();
+        dialog.docker_available = true;
+        dialog.sandbox_enabled = sandbox;
+        dialog.sandbox_config_mode = true;
+        dialog.sandbox_focused_field = SANDBOX_HOOK_ENV_FIELD;
+        dialog.hook_env.expanded = true;
+
+        dialog.handle_hook_env_list_key(key(KeyCode::Char('a')));
+        for ch in "TOKEN=abc".chars() {
+            dialog.handle_hook_env_list_key(key(KeyCode::Char(ch)));
+        }
+        dialog.handle_hook_env_list_key(key(KeyCode::Enter));
+
+        let data = submitted(dialog.build_submit_result());
+        assert_eq!(data.hook_env, expected);
+        assert!(data.extra_env.is_empty());
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn hook_env_does_not_survive_a_profile_switch() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let mut dialog = single_tool_dialog();
+    dialog.available_profiles = vec!["default".to_string(), "other".to_string()];
+    dialog.profile_descriptions = vec![None, None];
+    dialog.docker_available = true;
+    dialog.sandbox_enabled = true;
+    dialog.hook_env.entries = vec!["TOKEN=from-default".to_string()];
+
+    dialog.focused_field = 0;
+    dialog.handle_key(key(KeyCode::Right));
+    assert_eq!(dialog.selected_profile(), "other");
+
+    dialog.sandbox_enabled = true;
+    assert!(dialog.hook_env.entries.is_empty());
+    assert!(submitted(dialog.build_submit_result()).hook_env.is_empty());
+}
+
+#[test]
+fn an_unset_hook_env_variable_warns_about_the_host_hook_not_the_container() {
+    let mut dialog = single_tool_dialog();
+    dialog.sandbox_config_mode = true;
+    dialog.sandbox_focused_field = SANDBOX_HOOK_ENV_FIELD;
+    dialog.hook_env.expanded = true;
+
+    dialog.handle_hook_env_list_key(key(KeyCode::Char('a')));
+    for ch in "AOE_TEST_UNSET_HOOK_VAR".chars() {
+        dialog.handle_hook_env_list_key(key(KeyCode::Char(ch)));
+    }
+    dialog.handle_hook_env_list_key(key(KeyCode::Enter));
+
+    let warning = dialog.error_message.expect("warning for unset variable");
+    assert!(warning.contains("skipped by the host hook"), "{warning}");
+    assert!(!warning.contains("container"), "{warning}");
+}
+
+#[test]
+fn structured_view_setting_gates_the_offer_and_sets_the_default() {
+    use crate::session::config::StructuredView;
+    for (view, offered, starts_structured) in [
+        (StructuredView::Off, false, false),
+        (StructuredView::Terminal, true, false),
+        (StructuredView::Structured, true, true),
+    ] {
+        let mut config = Config::default();
+        config.acp.structured_view = view;
+        assert_eq!(compute_structured_capable("claude", &config), offered);
+        assert_eq!(
+            config.acp.structured_view.starts_structured(),
+            starts_structured
+        );
+    }
 }
 
 #[test]
@@ -1561,6 +1648,8 @@ fn test_unreadable_registry_keeps_a_held_resolution_for_the_same_path() {
     assert!(dialog.sandbox_enabled, "the project's override resolved");
 
     fs::write(&registry, "{ not json").expect("break registry");
+    // Structured is preselected by default, and its adapter check is not under test.
+    dialog.structured_enabled = false;
     let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
     assert!(
         data.sandbox,
@@ -1598,6 +1687,8 @@ fn test_scratch_round_trip_does_not_count_an_unreadable_registry_as_resolved() {
     );
 
     fs::write(&registry, valid).expect("repair registry");
+    // Structured is preselected by default, and its adapter check is not under test.
+    dialog.structured_enabled = false;
     let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
     assert!(
         data.sandbox,
@@ -1629,6 +1720,8 @@ fn test_unreadable_registry_blocks_submission_until_the_path_resolves() {
 
     // A missing registry file is genuinely empty, and a repaired one resolves the override.
     fs::write(&registry, valid).expect("repair registry");
+    // Structured is preselected by default, and its adapter check is not under test.
+    dialog.structured_enabled = false;
     let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
     assert!(
         data.sandbox,
@@ -1739,6 +1832,7 @@ fn source_session(tool: &str, sandboxed: bool, yolo: bool) -> Instance {
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         });
     }
@@ -1788,7 +1882,7 @@ fn a_selected_session_carries_its_view() {
     fs::create_dir_all(app_dir.join("profiles").join("default")).expect("default profile");
     fs::write(
         app_dir.join("config.toml"),
-        "[acp]\noffer_structured_in_new_session = true\n",
+        "[acp]\nstructured_view = \"structured\"\n",
     )
     .expect("global config");
 
@@ -1824,7 +1918,7 @@ fn a_carried_agent_is_judged_by_the_repo_config() {
     fs::create_dir_all(app_dir.join("profiles").join("default")).expect("default profile");
     fs::write(
         app_dir.join("config.toml"),
-        "[acp]\noffer_structured_in_new_session = true\n",
+        "[acp]\nstructured_view = \"structured\"\n",
     )
     .expect("global config");
     let repo = tempfile::tempdir().expect("repo");

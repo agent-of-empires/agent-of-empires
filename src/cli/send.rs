@@ -4,8 +4,8 @@ use anyhow::{bail, Result};
 use clap::Args;
 
 use crate::acp::client::http::PromptDispositionWire;
-use crate::acp::client::{require_daemon, HttpClient};
-use crate::session::{EnsureReadyOutcome, Storage};
+use crate::acp::client::{require_daemon, HttpClient, HttpError};
+use crate::session::{StartBlocked, View};
 
 #[derive(Args)]
 pub struct SendArgs {
@@ -24,203 +24,132 @@ pub struct SendArgs {
 
 #[tracing::instrument(target = "cli.send", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
-    let storage = Storage::open_unwatched(profile)?;
-    let (mut instances, _) = storage.load_with_groups()?;
-    for inst in &mut instances {
-        inst.source_profile = profile.to_string();
-    }
-
     if args.message.trim().is_empty() {
         bail!("Message cannot be empty");
     }
 
-    let inst = super::resolve_session(&args.identifier, &instances)?;
-    let session_id = inst.id.clone();
-    let session_title = inst.title.clone();
-    let tool = inst.tool.clone();
-    let is_structured = inst.is_structured();
+    let client = HttpClient::new(require_daemon().await?)?;
+    let profile = resolve_profile(&client, profile).await?;
+    let mut sessions = client.list_sessions(None).await?.sessions;
+    sessions.retain(|s| s.profile == profile);
+    let session = super::resolve_session(&args.identifier, &sessions)?;
 
-    // Refuse before any revive; the terminal path rechecks under the lock right before sending.
-    inst.ensure_startable()?;
-    if is_structured {
-        return send_structured(&session_id, &session_title, &args.message, args.no_revive).await;
-    }
-
-    if !args.no_revive {
-        if let Some(target) = instances.iter_mut().find(|i| i.id == session_id) {
-            match target.ensure_pane_ready() {
-                Ok(EnsureReadyOutcome::Respawned) => {
-                    eprintln!("  (respawned dead pane before send)");
-                }
-                Ok(EnsureReadyOutcome::Started) => {
-                    eprintln!("  (started stopped session before send)");
-                }
-                Ok(EnsureReadyOutcome::ResumeFailed { sid }) => {
-                    bail!("Resume failed for sid {sid}; preserved for explicit retry")
-                }
-                Ok(EnsureReadyOutcome::AlreadyAlive) => {}
-                Err(e) => bail!("{e}"),
-            }
-        }
-    }
-
-    let tmux_session = crate::tmux::Session::new(&session_id, &session_title)?;
-    if !tmux_session.exists() {
-        bail!(
-            "Session is not running. Start it first with: aoe session start {}",
-            args.identifier
-        );
-    }
-
-    tmux_session.wait_until_ready(
-        std::time::Duration::from_secs(5),
-        crate::agents::ready_marker(&tool),
-    );
-
-    let target = instances
-        .iter()
-        .find(|i| i.id == session_id)
-        .expect("resolved above");
-    let _input_lock = target.lock_for_input()?;
-    let delay = crate::agents::send_keys_enter_delay(&tool);
-    tmux_session.send_keys_with_delay(&args.message, delay)?;
-
-    let id_for_save = session_id.clone();
-    if let Err(err) = storage.update(|instances, _groups| {
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == id_for_save) {
-            inst.touch_after_input();
-            inst.status = crate::session::Status::Running;
-        }
-        Ok(())
-    }) {
-        tracing::warn!(
-            ?err,
-            "send: failed to persist status remap after successful send"
-        );
-    }
-
-    println!("Sent message to '{}'", session_title);
+    let result = if session.view == View::Structured {
+        client
+            .prompt(&session.id, &args.message, args.no_revive)
+            .await
+            .map(|dispatch| match dispatch.disposition {
+                PromptDispositionWire::Sent => "Sent",
+                PromptDispositionWire::Steered => "Steered into",
+                PromptDispositionWire::Queued => "Queued",
+            })
+    } else {
+        client
+            .send_message(&session.id, &args.message, args.no_revive)
+            .await
+            .map(|()| "Sent")
+    };
+    let verb = result.map_err(|e| refusal(e, &args.identifier))?;
+    println!("{verb} message to '{}'", session.title);
     Ok(())
 }
 
-/// ACP/structured-view sessions have no tmux pane; delivering a message means
-/// hitting the running daemon's prompt endpoint instead, the same path the
-/// web composer's send button uses. `no_revive` is enforced by the daemon
-/// itself (atomically, at admission), not checked here first, since a
-/// separate client-side liveness probe would race the daemon's own decision.
-async fn send_structured(
-    session_id: &str,
-    session_title: &str,
-    message: &str,
-    no_revive: bool,
-) -> Result<()> {
-    let endpoint = require_daemon().await?;
-    let client = HttpClient::new(endpoint)?;
-    let dispatch = client.prompt(session_id, message, no_revive).await?;
-    let verb = match dispatch.disposition {
-        PromptDispositionWire::Sent => "Sent",
-        PromptDispositionWire::Steered => "Steered into",
-        PromptDispositionWire::Queued => "Queued",
+/// Validate against and default from the daemon, through the client that carries its credentials.
+pub(super) async fn resolve_profile(client: &HttpClient, profile: &str) -> Result<String> {
+    let daemon = client.daemon_client().await?;
+    if profile.is_empty() {
+        return Ok(daemon.default_profile().await?);
+    }
+    if !daemon
+        .runtime_info()
+        .await?
+        .profiles
+        .iter()
+        .any(|p| p == profile)
+    {
+        bail!("Profile '{profile}' does not exist");
+    }
+    Ok(profile.to_string())
+}
+
+/// The client carries only a validated refusal code, so the wording lives here.
+fn refusal(error: HttpError, identifier: &str) -> anyhow::Error {
+    let HttpError::Server { body, .. } = &error else {
+        return error.into();
     };
-    println!("{verb} message to '{session_title}'");
-    Ok(())
+    match body.as_str() {
+        "session_not_running" => anyhow::anyhow!(
+            "Session is not running. Start it first with: aoe session start {identifier}"
+        ),
+        "session_archived" => anyhow::anyhow!(StartBlocked::Archived),
+        "session_trashed" => anyhow::anyhow!(StartBlocked::Trashed),
+        _ => error.into(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::Instance;
-    use serial_test::serial;
+    use crate::acp::client::DaemonEndpoint;
+    use crate::daemon::ApiErrorCode;
+    use crate::server::api::{api_error_with_code_header, start_blocked_response};
+    use axum::{extract::Path, routing::post, Router};
 
-    /// #4116: auto-revive refuses to start an archived or trashed session, terminal or structured.
+    /// Drives the real client against the refusals the daemon actually emits.
     #[tokio::test]
-    #[serial]
-    async fn send_does_not_revive_archived_or_trashed_session() {
-        let shelves: [(fn(&mut Instance), &str); 2] = [
-            (Instance::archive, "session is archived; unarchive it first"),
-            (Instance::trash, "session is in trash; restore it first"),
-        ];
-        for ((shelve, message), structured) in
-            shelves.into_iter().flat_map(|d| [(d, false), (d, true)])
-        {
-            let temp = tempfile::tempdir().unwrap();
-            let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
-            let profile = "send-blocked";
-            let mut inst = Instance::new("shelved", "/tmp/x");
-            if structured {
-                inst.view = crate::session::View::Structured;
-            }
-            shelve(&mut inst);
-            let id = inst.id.clone();
-            Storage::new_unwatched(profile)
-                .unwrap()
-                .update(|rows, _| {
-                    *rows = vec![inst.clone()];
-                    Ok(())
-                })
-                .unwrap();
+    async fn refusals_survive_the_real_client() {
+        let app = Router::new().route(
+            "/api/sessions/{id}/send",
+            post(|Path(id): Path<String>| async move {
+                match id.as_str() {
+                    "archived" => start_blocked_response(StartBlocked::Archived),
+                    "trashed" => start_blocked_response(StartBlocked::Trashed),
+                    "dead" => api_error_with_code_header(
+                        ApiErrorCode::SessionNotRunning,
+                        "Terminal session is not running",
+                    ),
+                    _ => api_error_with_code_header(ApiErrorCode::StartFailed, "boom"),
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = HttpClient::new(DaemonEndpoint::new(
+            format!("http://{address}"),
+            Some("secret".to_string()),
+            crate::acp::client::discovery::Source::Env,
+        ))
+        .unwrap();
 
-            let args = SendArgs {
-                identifier: id.clone(),
-                message: "hello".to_string(),
-                no_revive: false,
-            };
-            let err = run(profile, args).await.unwrap_err();
-            assert_eq!(err.to_string(), message, "structured={structured}");
-            let tmux = crate::tmux::Session::new(&id, &inst.title).unwrap();
-            assert!(!tmux.exists());
+        for (id, expected) in [
+            (
+                "dead",
+                "Session is not running. Start it first with: aoe session start dead",
+            ),
+            ("archived", "session is archived; unarchive it first"),
+            ("trashed", "session is in trash; restore it first"),
+        ] {
+            let error = client.send_message(id, "hi", true).await.unwrap_err();
+            assert_eq!(refusal(error, id).to_string(), expected);
         }
+        let error = client.send_message("other", "hi", true).await.unwrap_err();
+        assert!(refusal(error, "other").to_string().contains("start_failed"));
+        server.abort();
     }
 
-    /// #4116: an archived session with a live pane (`archive --no-kill`) takes no input and
-    /// stays archived, with or without `--no-revive`.
     #[tokio::test]
-    #[serial]
-    async fn send_refuses_a_live_archived_pane() {
-        if crate::tmux::tmux_command().arg("-V").output().is_err() {
-            eprintln!("tmux not available; skipping");
-            return;
-        }
-        for no_revive in [false, true] {
-            let temp = tempfile::tempdir().unwrap();
-            let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
-            let profile = "send-live-archived";
-            let mut inst = Instance::new("live-archived", "/tmp/x");
-            inst.archive();
-            let id = inst.id.clone();
-            Storage::new_unwatched(profile)
-                .unwrap()
-                .update(|rows, _| {
-                    *rows = vec![inst.clone()];
-                    Ok(())
-                })
-                .unwrap();
-            let pane = crate::tmux::Session::generate_name(&id, &inst.title);
-            let created = crate::tmux::tmux_command()
-                .args(["new-session", "-d", "-s", &pane, "sleep", "60"])
-                .status();
-            if !created.map(|s| s.success()).unwrap_or(false) {
-                eprintln!("tmux new-session failed; skipping");
-                return;
-            }
-            crate::tmux::refresh_session_cache();
+    #[serial_test::serial]
+    async fn profile_lookup_keeps_passphrase_credentials() {
+        use crate::acp::client::passphrase_session::test_daemon::{TestDaemon, PASSPHRASE};
 
-            let args = SendArgs {
-                identifier: id.clone(),
-                message: "hello".to_string(),
-                no_revive,
-            };
-            let err = run(profile, args).await.unwrap_err();
-            let stored = Storage::new_unwatched(profile).unwrap().load().unwrap();
-            let _ = crate::tmux::tmux_command()
-                .args(["kill-session", "-t", &pane])
-                .output();
-            assert_eq!(
-                err.to_string(),
-                "session is archived; unarchive it first",
-                "no_revive={no_revive}"
-            );
-            assert!(stored[0].is_archived(), "no_revive={no_revive}");
-        }
+        let daemon = TestDaemon::start(PASSPHRASE).await;
+        let client = HttpClient::new(daemon.endpoint.clone()).unwrap();
+
+        assert_eq!(resolve_profile(&client, "").await.unwrap(), "default");
+        assert_eq!(resolve_profile(&client, "work").await.unwrap(), "work");
+        let error = resolve_profile(&client, "nope").await.unwrap_err();
+        assert_eq!(error.to_string(), "Profile 'nope' does not exist");
+        assert_eq!(daemon.logins(), 1);
     }
 }

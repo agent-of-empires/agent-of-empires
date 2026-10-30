@@ -14,6 +14,7 @@ vi.mock("../../lib/api", () => ({
   fetchUpdateStatus: (...args: unknown[]) => fetchUpdateStatus(...args),
   fetchAbout: (...args: unknown[]) => fetchAbout(...args),
   dismissUpdate: () => Promise.resolve(true),
+  fetchSandboxImageStatus: () => Promise.resolve(null),
 }));
 
 let pushHealth: PushHealth = "healthy";
@@ -22,7 +23,12 @@ vi.mock("../../hooks/usePushSubscription", () => ({
 }));
 
 // Null means the real hook runs.
-let forced: { connection: ConnectionBannerState | null; dashboard: boolean; update: boolean } | null = null;
+let forced: {
+  connection: ConnectionBannerState | null;
+  dashboard: boolean;
+  update: boolean;
+  sandbox?: boolean;
+} | null = null;
 vi.mock("../../hooks/useConnectionBanner", async (importOriginal) => {
   const mod = await importOriginal<typeof import("../../hooks/useConnectionBanner")>();
   return { ...mod, useConnectionBanner: () => (forced ? forced.connection : mod.useConnectionBanner()) };
@@ -37,6 +43,19 @@ vi.mock("../../hooks/useUpdateBanner", async (importOriginal) => {
     ...mod,
     useUpdateBanner: () =>
       forced ? (forced.update ? { status: status(), dismiss: () => {} } : null) : mod.useUpdateBanner(),
+  };
+});
+
+vi.mock("../../hooks/useSandboxImageBanner", async (importOriginal) => {
+  const mod = await importOriginal<typeof import("../../hooks/useSandboxImageBanner")>();
+  return {
+    ...mod,
+    useSandboxImageBanner: () =>
+      forced
+        ? forced.sandbox
+          ? { kind: "available", image: "img", onUpdate: () => {}, onDismiss: () => {} }
+          : null
+        : mod.useSandboxImageBanner(),
   };
 });
 
@@ -63,12 +82,14 @@ const NAMES: [RegExp, string][] = [
   [/Server unreachable/, "disconnected"],
   [/Dashboard updated/, "dashboard updated"],
   [/Reconnected/, "reconnected"],
+  [/Sandbox image/, "sandbox image"],
   [/Update available/, "update available"],
   [/Notifications stopped/, "push"],
 ];
 
 function shown(container: HTMLElement): string[] {
-  return Array.from(container.querySelectorAll('[role="alert"], [role="status"]')).map((el) => {
+  // Top-level banners only; a banner's own copy feedback is a status region inside it.
+  return Array.from(container.querySelectorAll(':scope > [role="alert"], :scope > [role="status"]')).map((el) => {
     const text = `${el.getAttribute("aria-label") ?? ""} ${el.textContent ?? ""}`;
     return NAMES.find(([re]) => re.test(text))?.[1] ?? text;
   });
@@ -94,20 +115,23 @@ afterEach(() => {
 
 describe("BannerStack", () => {
   it("shows one connection or update banner, most urgent first, and push only while connected", () => {
-    // (connection, dashboard updated, update available, push unhealthy, banners shown top to bottom)
-    const cases: [ConnectionBannerState | null, boolean, boolean, boolean, string[]][] = [
-      [null, false, false, false, []],
-      [null, false, true, true, ["update available", "push"]],
-      ["down", true, true, true, ["disconnected"]],
-      ["reconnected", false, true, true, ["reconnected", "push"]],
-      ["reconnected", true, true, false, ["dashboard updated"]],
-      [null, true, true, true, ["dashboard updated", "push"]],
+    // (connection, dashboard updated, update available, sandbox image, push unhealthy, banners top to bottom)
+    const cases: [ConnectionBannerState | null, boolean, boolean, boolean, boolean, string[]][] = [
+      [null, false, false, false, false, []],
+      [null, false, true, false, true, ["update available", "push"]],
+      // The sandbox image banner waits behind the AoE update, as in the TUI.
+      [null, false, true, true, false, ["update available"]],
+      [null, false, false, true, true, ["sandbox image", "push"]],
+      ["down", true, true, true, true, ["disconnected"]],
+      ["reconnected", false, true, false, true, ["reconnected", "push"]],
+      ["reconnected", true, true, false, false, ["dashboard updated"]],
+      [null, true, true, true, true, ["dashboard updated", "push"]],
     ];
-    for (const [connection, dashboard, update, pushUnhealthy, want] of cases) {
-      forced = { connection, dashboard, update };
+    for (const [connection, dashboard, update, sandbox, pushUnhealthy, want] of cases) {
+      forced = { connection, dashboard, update, sandbox };
       pushHealth = pushUnhealthy ? "revoked" : "healthy";
       const { container, unmount } = render(<BannerStack />);
-      expect(shown(container), JSON.stringify({ connection, dashboard, update, pushUnhealthy })).toEqual(want);
+      expect(shown(container), JSON.stringify({ connection, dashboard, update, sandbox, pushUnhealthy })).toEqual(want);
       unmount();
     }
   });

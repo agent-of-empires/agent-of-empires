@@ -14,6 +14,8 @@ vi.mock("../../hooks/useShikiTheme", () => ({
   useShikiTheme: () => ({ theme: "dark-plus", appearance: "dark" }),
 }));
 
+vi.mock("../../lib/clipboard", () => ({ writeClipboard: vi.fn().mockResolvedValue(true) }));
+
 const { skillIndexRef } = vi.hoisted(() => ({
   skillIndexRef: { current: { labelsByKey: new Map<string, Set<string>>() } as SkillIndex },
 }));
@@ -22,6 +24,7 @@ vi.mock("../../hooks/useSkillIndex", () => ({
 }));
 
 import type { ActivityRow, BackgroundAgent, ToolCall, ToolOutputBlock } from "../../lib/acpTypes";
+import { writeClipboard } from "../../lib/clipboard";
 import { highlightSnippet } from "../../lib/snippetHighlighter";
 import { AgentProfileProvider } from "../../lib/agentProfileContext";
 import type { FileRef, FileRefSession } from "../../lib/fileRef";
@@ -338,6 +341,65 @@ describe("ToolCard expanded bodies", () => {
     expect(container.querySelectorAll('[data-testid="string-diff"]').length).toBe(2);
   });
 
+  it("renders a memory edit from its structured diff when the args carry no text", () => {
+    const path = `${MEMORY_DIR}/feedback_x.md`;
+    const { container, text, toggle } = renderCard(
+      makeToolCall({
+        name: "Edit",
+        kind: "edit",
+        args_preview: args({ file_path: path }),
+        diffs: [
+          { path, old_text: "---\nname: x\n---\nold line", new_text: "---\nname: x\n---\nnew line", created_at: "" },
+        ],
+      }),
+    );
+    expect(text()).toContain("updated");
+    expect(text()).toContain("+1");
+    toggle();
+    expect(container.querySelectorAll('[data-testid="string-diff"]').length).toBe(1);
+  });
+
+  it.each([
+    ["picks the diff matching the memory path", "old line", 1],
+    ["treats an emptied previous file as an edit", "", 1],
+  ])("memory edit %s", (_label, oldText, expectedDiffs) => {
+    const path = `${MEMORY_DIR}/feedback_z.md`;
+    const other = `${MEMORY_DIR}/other.md`;
+    const { container, toggle } = renderCard(
+      makeToolCall({
+        name: "Edit",
+        kind: "edit",
+        args_preview: args({ file_path: path }),
+        diffs: [
+          { path: other, old_text: "unrelated before", new_text: "unrelated after", created_at: "" },
+          { path, old_text: oldText, new_text: "new line", created_at: "" },
+        ],
+      }),
+    );
+    toggle();
+    expect(container.querySelectorAll('[data-testid="string-diff"]').length).toBe(expectedDiffs);
+    expect(container.textContent).toContain("new line");
+    expect(container.textContent).not.toContain("unrelated after");
+  });
+
+  it("renders a newly written memory file as content, not a diff", () => {
+    const path = `${MEMORY_DIR}/feedback_y.md`;
+    const { container, text, toggle } = renderCard(
+      makeToolCall({
+        name: "Write",
+        kind: "edit",
+        args_preview: args({ file_path: path }),
+        diffs: [
+          { path, old_text: null, new_text: "---\nname: y\ndescription: a note\n---\nfresh body", created_at: "" },
+        ],
+      }),
+    );
+    toggle();
+    expect(text()).toContain("saved");
+    expect(text()).toContain("fresh body");
+    expect(container.querySelector('[data-testid="string-diff"]')).toBeNull();
+  });
+
   it("renders synthesized memory as markdown with the envelope and line numbers stripped", () => {
     const { getByTestId, toggle } = renderCard(fixtures.memoryRecallSynthesize);
     toggle();
@@ -449,6 +511,16 @@ describe("structured output media", () => {
     expect(text()).toContain(visible);
   });
 
+  it("keeps a failed Read's output under the attempted action, not outside the card", () => {
+    const { container, getByText } = renderCard(
+      fixtures.read,
+      makeError({ output: [{ kind: "text", text: "partial output" }] }),
+    );
+    const details = container.querySelector("details");
+    expect(details).not.toBeNull();
+    expect(getByText("partial output").closest("details")).toBe(details);
+  });
+
   // Agent-controlled uris never reach a sink; unusable blocks degrade to a placeholder.
   it.each<[string, ToolOutputBlock, string, string]>([
     ["image without data", { kind: "image", mime_type: "image/png" }, "img", "image (image/png)"],
@@ -546,11 +618,17 @@ describe("TodoGroupCard", () => {
     expect(container.textContent).toContain("Step Charlie");
     expect(container.textContent).toContain("1 active");
     expect(container.textContent).not.toContain("Step Alpha");
-    fireEvent.click(getByRole("button"));
+    fireEvent.click(getByRole("button", { name: /updated 3 times/ }));
     const text = container.textContent ?? "";
     expect(text.indexOf("Step Alpha")).toBeGreaterThan(-1);
     expect(text.indexOf("Step Alpha")).toBeLessThan(text.indexOf("Step Bravo"));
     expect(text).toContain("1 items");
+  });
+
+  it("copies the previewed list as a markdown checklist", () => {
+    const { getByRole } = renderGroup(items);
+    fireEvent.click(getByRole("button", { name: "Copy todos" }));
+    expect(writeClipboard).toHaveBeenCalledWith("- [ ] Step Charlie (in progress)");
   });
 
   it.each([

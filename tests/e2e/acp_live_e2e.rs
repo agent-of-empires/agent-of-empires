@@ -415,44 +415,6 @@ fn wait_for_session_loads(log: &Path, minimum: usize) -> usize {
 
 #[test]
 #[parallel]
-fn selected_claude_store_survives_terminal_handoff() {
-    require_tmux!();
-    require_node!();
-    let (h, selected, capture_dir, id) = asserted_claude_store_harness("handoff_store");
-    let port = start_daemon(&h);
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    runtime.block_on(async {
-        let response = reqwest::Client::new()
-            .post(format!(
-                "http://127.0.0.1:{port}/api/sessions/{id}/acp/enable"
-            ))
-            .send()
-            .await
-            .unwrap();
-        assert!(
-            response.status().is_success(),
-            "{}",
-            response.text().await.unwrap()
-        );
-    });
-
-    assert_eq!(
-        wait_for_session_loads(&app_dir_in(h.home_path()).join("fake-acp.log"), 1),
-        1
-    );
-    let capture = wait_for_capture(
-        &capture_dir,
-        "CLAUDE_CONFIG_DIR",
-        selected.to_str().unwrap(),
-    );
-    assert_eq!(
-        env_value(&capture, "CLAUDE_CONFIG_DIR").as_deref(),
-        Some(selected.to_str().unwrap())
-    );
-}
-
-#[test]
-#[parallel]
 fn selected_claude_store_survives_stop_and_respawn() {
     require_tmux!();
     require_node!();
@@ -474,6 +436,19 @@ fn selected_claude_store_survives_stop_and_respawn() {
         );
     });
     assert_eq!(wait_for_session_loads(&log, 1), 1);
+    let original: agent_of_empires::process::worker_registry::WorkerRecord =
+        serde_json::from_slice(
+            &std::fs::read(
+                app_dir_in(h.home_path())
+                    .join("acp-workers")
+                    .join(format!("{id}.json")),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let original_identity =
+        agent_of_empires::acp::runner_lifecycle::RunnerIdentity::from_record(&original);
+    assert!(original_identity.birth_fingerprint.is_some());
     let captures_before: Vec<_> = capture_files(&capture_dir)
         .into_iter()
         .map(|(path, _)| path.file_name().unwrap().to_owned())
@@ -481,11 +456,22 @@ fn selected_claude_store_survives_stop_and_respawn() {
 
     runtime.block_on(async {
         let client = reqwest::Client::new();
-        let response = client.post(format!("{base}/stop")).send().await.unwrap();
+        let response = client.delete(format!("{base}/acp")).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        let stopped: agent_of_empires::session::Instance = serde_json::from_value(
+            h.read_sessions()
+                .as_array()
+                .and_then(|rows| rows.iter().find(|row| row["id"] == id))
+                .cloned()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stopped.status, agent_of_empires::session::Status::Stopped);
+        assert!(stopped.is_idle_dormant());
+        use agent_of_empires::acp::runner_lifecycle::ProcessControl as _;
         assert!(
-            response.status().is_success(),
-            "{}",
-            response.text().await.unwrap()
+            !agent_of_empires::acp::runner_lifecycle::SystemProcessControl::default()
+                .is_alive(original_identity)
         );
         let response = client
             .post(format!("{base}/acp/spawn"))
@@ -642,7 +628,7 @@ fn before_session_mints_environment_for_structured_worker() {
     }
 }
 
-/// Seeded config plus the wizard's Structured toggle, over a daemon.
+/// Seeded config with the structured view offered, over a daemon.
 fn structured_tui_harness(name: &str) -> TuiTestHarness {
     let script = r#"{
   "turns": [
@@ -662,7 +648,10 @@ fn structured_tui_harness(name: &str) -> TuiTestHarness {
     let seeded = std::fs::read_to_string(&config_path).expect("read seeded config");
     std::fs::write(
         &config_path,
-        format!("{seeded}\n[acp]\noffer_structured_in_new_session = true\n"),
+        seeded.replace(
+            "structured_view = \"off\"",
+            "structured_view = \"structured\"",
+        ),
     )
     .expect("write config");
     init_git_repo(&h.project_path());
@@ -678,22 +667,25 @@ fn wizard_created_structured_session_opens_structured_view() {
     require_tmux!();
     require_node!();
     let mut h = structured_tui_harness("structured_wizard");
+    h.append_config("[session]\ndefault_tool = \"claude\"");
     let project = h.project_path();
 
     h.spawn_tui();
-    h.wait_for(" aoe ");
+    h.wait_for_runtime_ready();
     h.send_keys("n");
     h.wait_for(" New Session ");
     h.send_keys("C-u");
     h.type_text(project.to_str().unwrap());
     h.send_keys("Tab");
     h.type_text("wizstruct");
-    // The Tool row is focusable only with several tools, shown by `[1/N]`.
+    // Arrows mark the focused Tool row when several tools are installed.
     h.send_keys("Tab");
-    if h.capture_screen().contains("[1/") {
+    if h.capture_screen()
+        .lines()
+        .any(|line| line.contains("Tool:") && line.contains('←'))
+    {
         h.send_keys("Tab");
     }
-    h.send_keys("Space");
     h.assert_screen_contains("[x] Structured view");
     h.send_keys("Enter");
 

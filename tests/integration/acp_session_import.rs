@@ -13,6 +13,7 @@ use crate::common::{shim_node, shim_path, shim_ready};
 
 fn spawn_config(env: Vec<(String, String)>) -> SpawnConfig {
     SpawnConfig {
+        launch_lease: None,
         wrapper_substitution: None,
         agent_key: "pi".into(),
         tool: "pi".into(),
@@ -104,7 +105,7 @@ async fn listed_session_imports_in_its_listed_cwd_and_replays_history() {
             .await
             .expect("history replay before deadline")
             .expect("event stream open");
-        if matches!(&event, Event::AgentMessageChunk { text } if text == "from history") {
+        if matches!(&event, Event::AgentMessageChunk { text, .. } if text == "from history") {
             break;
         }
     }

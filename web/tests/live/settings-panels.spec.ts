@@ -3,7 +3,14 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Page } from "@playwright/test";
-import { test, expect, authHeaders, bootDashboard, type ServeHandle } from "../helpers/liveTest";
+import {
+  test,
+  expect,
+  authHeaders,
+  bootDashboard,
+  confirmPassphraseElevation,
+  type ServeHandle,
+} from "../helpers/liveTest";
 
 test.describe("MCP servers", () => {
   test("MCP panel shows native servers with provenance and redacts secrets", async ({ page, spawnServe }) => {
@@ -133,8 +140,10 @@ test("skills panel adopts, edits, creates, and deletes skills", async ({ page, s
   await page.getByRole("button", { name: "+ New skill" }).click();
   await page.getByLabel("New skill directory").fill("new-skill");
   await page.getByLabel("New skill description").fill("Use for new work");
+  // The notice can be replaced before it is observed; assert the response and durable state instead.
+  const created = page.waitForResponse((r) => r.url().endsWith("/api/skills") && r.request().method() === "POST");
   await page.getByRole("button", { name: "Create" }).click();
-  await expect(notice("created")).toBeVisible();
+  expect((await created).ok()).toBe(true);
   await expect(content).toHaveValue(/name: new-skill/);
 
   page.once("dialog", (dialog) => void dialog.accept());
@@ -175,27 +184,29 @@ test.describe("plugins", () => {
     await expect(webToggle(page)).not.toBeChecked({ timeout: 10_000 });
   });
 
-  test("loopback plugin toggle needs no passphrase elevation", async ({ servePreauthed, page }) => {
-    // #2610: loopback plugin mutations used to 403 and loop the passphrase prompt.
+  test("authenticated TCP plugin changes require passphrase elevation and persist after retry", async ({
+    servePreauthed,
+    page,
+  }) => {
     expect(await webEnabled(servePreauthed)).toBe(true);
     await bootDashboard(page, servePreauthed, "/settings/plugins");
-    await page.evaluate(() => {
-      const w = window as unknown as { __elevationFired?: boolean };
-      w.__elevationFired = false;
-      window.addEventListener("aoe:elevation-required", () => {
-        w.__elevationFired = true;
-      });
-    });
     await expect(webToggle(page)).toBeVisible({ timeout: 10_000 });
     await expect(webToggle(page)).toBeChecked();
     await turnOffWeb(page);
-    await expect(async () => {
-      expect(await webEnabled(servePreauthed)).toBe(false);
-    }).toPass({ timeout: 5_000 });
-    await expect(page.locator('[role="dialog"]').filter({ hasText: /Confirm passphrase/i })).toHaveCount(0);
-    expect(
-      await page.evaluate(() => (window as unknown as { __elevationFired?: boolean }).__elevationFired ?? false),
-    ).toBe(false);
+    const prompt = page.getByRole("dialog").filter({ hasText: "Confirm passphrase" });
+    await expect(prompt).toBeVisible({ timeout: 5_000 });
+    expect(await webEnabled(servePreauthed)).toBe(true);
+    await expect(webToggle(page)).toBeChecked();
+
+    await confirmPassphraseElevation(page, servePreauthed);
+    expect(await webEnabled(servePreauthed)).toBe(true);
+    await turnOffWeb(page);
+    await expect.poll(() => webEnabled(servePreauthed)).toBe(false);
+    await expect(webToggle(page)).not.toBeChecked();
+    await expect(prompt).toHaveCount(0);
+    // Re-open the SPA through its authenticated root; deep document navigations lack the binding header.
+    await bootDashboard(page, servePreauthed, "/settings/plugins");
+    await expect(webToggle(page)).not.toBeChecked({ timeout: 10_000 });
   });
 });
 

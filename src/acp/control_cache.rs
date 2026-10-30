@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use super::state::{AcpState, Event};
+use crate::session::Status;
 
 /// A session's folded control state and how far it has been folded.
 #[derive(Debug, Clone)]
@@ -42,60 +43,33 @@ impl ControlStateCache {
         )
     }
 
-    /// Fold `event` into the session's cached state, if it has one.
-    pub fn apply_if_cached(&self, session_id: &str, seq: u64, event: &Event) {
+    /// Fold `event` into the session's cached state, if it has one. Returns the
+    /// sidebar status right after this event, so the caller can carry it with
+    /// the frame instead of a later reader finding the fold already ahead.
+    pub fn apply_if_cached(&self, session_id: &str, seq: u64, event: &Event) -> Option<Status> {
         let slot = self.slot(session_id);
         let mut guard = lock(&slot);
-        let Some(cached) = guard.as_mut() else {
-            return;
-        };
+        let cached = guard.as_mut()?;
         if seq == cached.last_seq {
             // Exact repeat of the seq we already folded: a benign publish
             // retry (the store reports these as primary-key collisions).
-            return;
+            return None;
         }
-        if seq != cached.last_seq + 1 {
+        if seq != cached.last_seq + 1 || cached.state.apply_event(seq, event.clone()).is_err() {
             *guard = None;
-            return;
-        }
-        if cached.state.apply_event(event.clone()).is_err() {
-            *guard = None;
-            return;
+            return None;
         }
         cached.last_seq = seq;
+        Some(cached.state.sidebar_status())
     }
 
-    /// Whether the session's cached state has an outstanding background
-    /// sub-agent, or `false` if nothing is cached. Used right after
-    /// `apply_if_cached` folds a `Stopped` or `BackgroundAgentCompleted`
-    /// event, to tell the sidebar status derivation whether a background
-    /// sub-agent is still keeping the session busy (#4001), and by live lag
-    /// recovery to override a stale seed event. This accessor itself never
-    /// hydrates: the live listener checks `is_hydrated` and calls
-    /// `SessionService::fold_control_state` on a miss before calling this, so
-    /// by the time it reads, a session the listener has seen an event for is
-    /// always hydrated. Lag recovery stays read-only and asks arbitrary
-    /// sessions, so a miss there may just mean the session was never opened.
-    /// Either way `false` is the same conservative verdict the derivation
-    /// fell back to before any of this existed.
-    pub fn has_active_background_agent(&self, session_id: &str) -> bool {
+    /// The cached fold's sidebar status, or `None` if nothing is cached. Never
+    /// hydrates; callers that need a verdict hydrate through
+    /// `SessionService::fold_control_state` first.
+    pub fn sidebar_status(&self, session_id: &str) -> Option<crate::session::Status> {
         let slot = self.slot(session_id);
         let guard = lock(&slot);
-        guard
-            .as_ref()
-            .is_some_and(|c| c.state.has_active_background_agent())
-    }
-
-    /// Whether the session's cached state has an active main turn, or
-    /// `false` if nothing is cached. Same rationale as
-    /// `has_active_background_agent`: this accessor never hydrates; the live
-    /// listener hydrates a cold session before calling it, lag recovery
-    /// stays read-only, and either way a miss reads as the same
-    /// quiet-session verdict as boot.
-    pub fn turn_active(&self, session_id: &str) -> bool {
-        let slot = self.slot(session_id);
-        let guard = lock(&slot);
-        guard.as_ref().is_some_and(|c| c.state.turn_active)
+        guard.as_ref().map(|c| c.state.sidebar_status())
     }
 
     /// Drop a session's fold.
@@ -216,6 +190,28 @@ mod tests {
         // Forget drops the fold so a reused id starts clean.
         cache.forget("s-1");
         assert!(!cache.is_hydrated("s-1"));
+    }
+
+    /// Each fold reports the status right after its own event, which is what
+    /// rides on the broadcast frame; a cold session or a retry reports none.
+    #[test]
+    fn apply_if_cached_reports_the_status_after_its_own_event() {
+        let cache = ControlStateCache::new();
+        assert_eq!(cache.apply_if_cached("s-1", 1, &prompt("go")), None);
+        cache.get_or_hydrate("s-1", || (seed(), 0));
+        assert_eq!(
+            cache.apply_if_cached("s-1", 1, &prompt("go")),
+            Some(Status::Running)
+        );
+        assert_eq!(
+            cache.apply_if_cached("s-1", 1, &prompt("go")),
+            None,
+            "retry"
+        );
+        assert_eq!(
+            cache.apply_if_cached("s-1", 2, &stopped("end_turn")),
+            Some(Status::Idle)
+        );
     }
 
     /// Anything that does not continue the sequence evicts rather than folds.

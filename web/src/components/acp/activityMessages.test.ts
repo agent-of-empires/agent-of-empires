@@ -8,6 +8,7 @@ import {
   type ToolCall,
   type ToolOutputBlock,
   type TranscriptRow,
+  transcriptRowToActivity,
 } from "../../lib/acpTypes";
 import { resolveAgentProfile } from "../../lib/agentProfiles";
 import {
@@ -77,6 +78,49 @@ const toolParts = (rows: ActivityRow[], ...opts: [boolean?, boolean?]) =>
   assistantParts([...rows, message("Done.", "m-close")], ...opts).filter((p) => p.type === "tool-call");
 const names = (parts: Part[]) => parts.map((p) => p.toolName);
 const payload = (part: Part) => JSON.parse(part.argsText!);
+
+// Rows are streamed chunks, so only a server-marked message start breaks the text.
+describe("agent message boundaries", () => {
+  const texts = (rows: ActivityRow[]) => assistantParts(rows).map((p) => p.text);
+  const start = { messageStart: true };
+  it.each([
+    [
+      "one streamed message stays whole",
+      [message("…for #4656 a", "m1"), message("nd #4757.", "m2")],
+      ["…for #4656 and #4757."],
+    ],
+    [
+      "a new message starts a paragraph",
+      [message("…for #4656.", "m1"), row("m2", "message", "The waiter has the lock.", start)],
+      ["…for #4656.\n\nThe waiter has the lock."],
+    ],
+    [
+      "the empty opener carries the break",
+      [message("First.", "m1"), row("m2", "message", "", start), message("Sec", "m3"), message("ond", "m4")],
+      ["First.\n\nSecond"],
+    ],
+    [
+      "a tool call already separates the text",
+      [message("Before.", "m1"), toolStart("t1"), row("m2", "message", "After.", start)],
+      ["Before.", undefined, "After."],
+    ],
+  ])("%s", (_label, rows, expected) => {
+    expect(texts(rows)).toEqual(expected);
+  });
+
+  it("carries the server's message_start onto the activity row", () => {
+    const wire: TranscriptRow = {
+      id: "msg-2",
+      group_id: "g2",
+      kind: "message",
+      at: AT,
+      text: "x",
+      message_start: true,
+    };
+    expect(transcriptRowToActivity(wire, "s").messageStart).toBe(true);
+    expect(transcriptRowToActivity({ ...wire, message_start: undefined }, "s")).not.toHaveProperty("messageStart");
+  });
+});
 
 describe("clearFoldGeneration", () => {
   const TURNS = [user("q1"), message("a1"), user("q2", "u2"), message("a2", "m2")];
@@ -323,6 +367,11 @@ describe("subagents", () => {
       "_aoe_memory_recall",
       { memory_recall: { mode: "synthesize" as const, synthesized_text: "remembered" } },
       { mode: "synthesize", synthesized_text: "remembered" },
+    ],
+    [
+      "_aoe_diffs",
+      { diffs: [{ path: "/a.md", old_text: null, new_text: "x", created_at: AT }] },
+      [{ path: "/a.md", old_text: null, new_text: "x", created_at: AT }],
     ],
   ])("smuggles %s through argsText", (key, over, expected) => {
     const [part] = toolParts([toolStart("x", over)]);

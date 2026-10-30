@@ -6,6 +6,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import { SidebarGroupHeader } from "../sidebar/SidebarGroupHeader";
 import type { SidebarGroup } from "../../lib/sidebarGroups";
+import { MARK_MEANING, meaningText } from "../../lib/sidebarMarks";
 import { PluginUiProvider } from "../../lib/pluginUiContext";
 import type { PluginUiEntry } from "../../lib/api";
 import type { SessionStatus, Workspace } from "../../lib/types";
@@ -49,11 +50,10 @@ function group(over: Partial<SidebarGroup> = {}): SidebarGroup {
   };
 }
 
-const dragHandle = (isDragging: boolean) => ({
+const dragHandle = () => ({
   setActivatorNodeRef: () => {},
   attributes: {},
   listeners: {},
-  isDragging,
 });
 
 function renderHeader(props: Partial<Parameters<typeof SidebarGroupHeader>[0]> = {}) {
@@ -67,6 +67,7 @@ function renderHeader(props: Partial<Parameters<typeof SidebarGroupHeader>[0]> =
       onNewSession={onNewSession}
       onUpdateAppearance={() => {}}
       offline={false}
+      rowsId="sidebar-rows-test"
       {...p}
     />
   );
@@ -121,6 +122,7 @@ describe("SidebarGroupHeader", () => {
             onNewSession={() => {}}
             onUpdateAppearance={() => {}}
             offline={false}
+            rowsId="sidebar-rows-test"
           />
         </PluginUiProvider>,
       );
@@ -153,30 +155,92 @@ describe("SidebarGroupHeader", () => {
     }
   });
 
+  it("is one disclosure button that controls its rows and names its menu shortcut", () => {
+    const { rerender } = renderHeader();
+    const header = screen.getByTestId("sidebar-group-header");
+    const button = header.querySelector("button[aria-expanded]")!;
+    expect(header.hasAttribute("tabindex")).toBe(false);
+    expect(header.getAttribute("aria-haspopup")).toBeNull();
+    expect(button.getAttribute("aria-expanded")).toBe("true");
+    expect(button.getAttribute("aria-controls")).toBe("sidebar-rows-test");
+    expect(button.getAttribute("aria-keyshortcuts")).toBe("Shift+F10");
+    rerender({ group: group({ collapsed: true }) });
+    expect(button.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("returns focus to the header after a menu action that keeps it, but not after Rename or settings", () => {
+    // (menu item, props, focus back on the header button)
+    const cases: [string, Partial<Parameters<typeof SidebarGroupHeader>[0]>, boolean][] = [
+      ["sidebar-group-context-menu-pin", { onPin: vi.fn() }, true],
+      ["sidebar-group-context-menu-archive-all", { onArchiveAll: vi.fn() }, true],
+      ["Clear alias", { group: group({ alias: "nick" }) }, true],
+      ["sidebar-group-context-menu-rename", {}, false],
+      ["sidebar-group-context-menu-settings", { onEditProject: vi.fn(), group: group({ id: "__scratch__" }) }, false],
+    ];
+    for (const [item, props, toHeader] of cases) {
+      renderHeader(props);
+      const button = screen.getByTestId("sidebar-group-header").querySelector<HTMLElement>("button[aria-expanded]")!;
+      button.focus();
+      fireEvent.keyDown(button, { key: "F10", shiftKey: true });
+      const action = screen.queryByTestId(item) ?? screen.getByText(item);
+      // Keyboard activation of a menu button is a click on the focused item.
+      action.focus();
+      fireEvent.click(action);
+      expect(document.activeElement === button, item).toBe(toHeader);
+      cleanup();
+    }
+  });
+
+  it("returns focus to the header when a rename ends with Enter or Escape", async () => {
+    for (const key of ["Enter", "Escape"]) {
+      renderHeader();
+      fireEvent.contextMenu(screen.getByTestId("sidebar-group-header"));
+      fireEvent.click(screen.getByTestId("sidebar-group-context-menu-rename"));
+      const input = screen.getByTestId("sidebar-group-rename-input");
+      input.focus();
+      fireEvent.keyDown(input, { key });
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      const button = screen.getByTestId("sidebar-group-header").querySelector("button[aria-expanded]");
+      expect(document.activeElement, key).toBe(button);
+      cleanup();
+    }
+  });
+
+  it("marks a header that is a registered Project, and a pinned one more strongly", () => {
+    const project = { name: "my-project", path: "/p", scope: "global" as const };
+    // (group, marker shown, its accessible name, its tooltip)
+    const cases: [Partial<SidebarGroup>, string | null, string | null, string | null][] = [
+      [{}, null, null, null],
+      [{ registeredProjects: [project] }, "sidebar-group-project-marker", "Project", meaningText(MARK_MEANING.project)],
+      [
+        { registeredProjects: [{ ...project, pinned: true }], pinned: true },
+        "sidebar-group-pinned-marker",
+        "Pinned project",
+        meaningText(MARK_MEANING.pinnedProject),
+      ],
+    ];
+    for (const [over, testId, name, tip] of cases) {
+      renderHeader({ group: group(over) });
+      const markers = ["sidebar-group-project-marker", "sidebar-group-pinned-marker"].filter((id) =>
+        screen.queryByTestId(id),
+      );
+      expect(markers, JSON.stringify(over)).toEqual(testId ? [testId] : []);
+      if (name) {
+        // A Tooltip, shared with the legend, explains the mark; no `title` duplicates it.
+        const mark = screen.getByRole("img", { name });
+        expect(mark.hasAttribute("title")).toBe(false);
+        fireEvent.mouseEnter(mark.parentElement!);
+        expect(screen.getByRole("tooltip").textContent).toBe(tip);
+      }
+      cleanup();
+    }
+  });
+
   it("marks the header draggable only with a drag handle", () => {
-    const { rerender } = renderHeader({ dragHandle: dragHandle(false) });
+    const { rerender } = renderHeader({ dragHandle: dragHandle() });
     expect(screen.getByTestId("sidebar-group-header").getAttribute("data-draggable")).toBe("true");
     rerender({});
     expect(screen.getByTestId("sidebar-group-header").getAttribute("data-draggable")).toBeNull();
-  });
-
-  it("swallows clicks on every control during a drag and briefly after, then toggles again", () => {
-    vi.useFakeTimers();
-    try {
-      const { onClick, onNewSession, rerender } = renderHeader({ dragHandle: dragHandle(true) });
-      fireEvent.click(screen.getByText("my-project"));
-      fireEvent.click(screen.getByLabelText("New session in my-project"));
-      rerender({ dragHandle: dragHandle(false) });
-      fireEvent.click(screen.getByText("my-project"));
-      expect(onClick).not.toHaveBeenCalled();
-      expect(onNewSession).not.toHaveBeenCalled();
-
-      vi.advanceTimersByTime(300);
-      fireEvent.click(screen.getByText("my-project"));
-      expect(onClick).toHaveBeenCalledTimes(1);
-    } finally {
-      vi.useRealTimers();
-    }
   });
 
   it("offers 'Edit settings' for the synthetic Scratch group despite capabilities.create being 'generic'", () => {

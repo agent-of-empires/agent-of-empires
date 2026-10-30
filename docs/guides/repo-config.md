@@ -1,8 +1,8 @@
 # Repository Configuration & Hooks
 
-A repo can carry its own `.agent-of-empires/config.toml`, so every team member using AoE on it gets the same project defaults and lifecycle hooks. `aoe init` writes a commented template. The legacy `.aoe/config.toml` path is still read, but rename it (`mv .aoe .agent-of-empires`); if both exist, the new one wins.
+A repo can carry `.agent-of-empires/config.toml` so team members share project defaults and lifecycle hooks. Run `aoe init` for a commented template and commit it. The legacy `.aoe/config.toml` path is still read; rename it with `mv .aoe .agent-of-empires`. If both exist, the new path wins.
 
-The file is meant to be committed. The [hook trust](#hook-trust) system is what makes that safe: each developer approves the commands before they run.
+The [hook trust system](#hook-trust-system) requires each developer to approve commands before they run.
 
 ## Hooks
 
@@ -15,7 +15,11 @@ on_destroy = ["docker-compose down"]
 
 - **`on_create`** runs once, when the session is first created. A failing command aborts creation, so use it for one-time setup.
 - **`on_launch`** runs on every start, including restarts. Failures are logged as warnings and do not prevent a user-initiated start, though during startup recovery a timed-out hook marks the recovered session as errored rather than launching with partial setup.
-- **`on_destroy`** runs when a session is deleted, before worktree and sandbox cleanup, so teardown commands can still reach running containers. Failures never prevent deletion. For a host-side equivalent that always runs outside the container, see [`host_hooks.before_destroy`](configuration.md#host-hooks).
+
+Native starts release their API locks while pre-launch hooks run, so hooks can call the daemon. The session keeps its lifecycle reservation: a competing start or stop returns a conflict rather than taking ownership. The launcher revalidates that reservation after the hook, before spawning the agent.
+
+- **`on_destroy`** runs before worktree and sandbox cleanup, while their resources remain available. Failures warn without preventing deletion.
+For a host-side equivalent that always runs outside the container, see [`host_hooks.before_destroy`](configuration.md#host-hooks).
 
 Hooks run inside the container for a sandboxed session and in your host shell otherwise, so a path can resolve in one mode and not the other. An absolute host path fails in the container unless `sandbox.extra_volumes` mounts it, and a repo cannot set that key. Guard optional scripts on their presence only, so a real failure still aborts creation:
 
@@ -26,7 +30,9 @@ on_create = ["sh -c '[ -x /opt/setup.sh ] || exit 0; exec /opt/setup.sh'"]
 
 Keep environment-specific hooks out of global config. A global `on_create` applies to every repo that does not declare its own, so one unresolvable path there blocks session creation in projects that never mention it. When `on_create` fails, the TUI and `aoe add` name the config file that declared it; the web dashboard shows a generic error and logs the file to the `aoe serve` log.
 
-Each hook receives the session's metadata as environment variables: `AOE_SESSION_ID`, `AOE_SESSION_TITLE` (also the worktree branch name), `AOE_PROJECT_PATH` (equals `$PWD` in `on_create` and `on_launch`), `AOE_PROFILE`, `AOE_TOOL`, `AOE_GROUP_PATH`, and `AOE_SESSION_BRANCH` on worktree sessions. Container hooks get the same set. Quote any expansion that may contain spaces, since titles often do:
+#### Available environment variables
+
+Lifecycle hooks receive `AOE_SESSION_ID`, `AOE_SESSION_TITLE`, `AOE_PROJECT_PATH` (equals `$PWD` in `on_create` and `on_launch`), `AOE_PROFILE`, `AOE_TOOL`, `AOE_GROUP_PATH`, and `AOE_SESSION_BRANCH` for worktrees. Container hooks receive the same variables. Quote expansions that may contain spaces:
 
 ```toml
 [hooks]
@@ -34,7 +40,7 @@ on_create  = ["port \"$AOE_SESSION_TITLE\""]
 on_destroy = ["port rm \"$AOE_SESSION_TITLE\""]
 ```
 
-Status-transition hooks are configured separately, in [`[status_hooks]`](configuration.md#status-hooks), and are global or profile only.
+[Status-transition hooks](configuration.md#status-hooks) are global/profile-only and add `AOE_OLD_STATUS`, `AOE_NEW_STATUS`, and `AOE_STATUS_CHANGED_AT`.
 
 ## What a repo may override
 
@@ -65,10 +71,10 @@ volume_ignores = ["node_modules", ".next"]
 auto_cleanup = true
 ```
 
-## Hook trust
+## Hook trust system
 
-The first time AoE sees hooks in a repo it prompts you to review and approve them, so an untrusted repo cannot run arbitrary commands. Trust decisions are stored globally, shared across profiles, and keyed to the commands themselves, so a change to `.agent-of-empires/config.toml` re-prompts. The same gate covers a repo's [project-local MCP servers](mcp-servers.md#project-local-servers-need-repo-trust).
+AoE prompts before running repo hooks and stores trust decisions globally, shared across profiles. Changed commands require approval again. The same gate covers [project-local MCP servers](mcp-servers.md#project-local-servers-need-repo-trust).
 
-`aoe add --trust-hooks .` skips the prompt, for CI or repos you control. It covers this gate only. The hooks AoE writes into the *agent's own* config, not the ones a repo declares, are a separate approval: see [Agent hook approval](configuration.md#agent-hook-approval).
+`aoe add --trust-hooks .` skips this gate for CI or repos you control. It does not grant [agent hook approval](configuration.md#agent-hook-approval), which covers hooks AoE writes into the agent's own config.
 
-Repo values are the last layer of the [configuration precedence](configuration.md), overriding global and profile values field by field.
+Repo values override global and profile values field by field; unset fields inherit. See [Configuration](configuration.md) for precedence and the full reference.

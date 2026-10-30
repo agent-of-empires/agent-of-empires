@@ -67,6 +67,9 @@ async fn attach_in_flight_synthesizes_reattach_idle_stopped() {
         None,
         "claude".into(),
         None,
+        None,
+        None,
+        None,
     )
     .await
     .expect("attach in_flight=true");
@@ -109,6 +112,9 @@ async fn attach_idle_session_does_not_synthesize_stopped() {
         AcpSessionId("midturn-false".into()),
         None,
         "claude".into(),
+        None,
+        None,
+        None,
         None,
     )
     .await
@@ -173,6 +179,9 @@ async fn attach_in_flight_disarms_after_first_inbound_notification() {
         None,
         "claude".into(),
         None,
+        None,
+        None,
+        None,
     )
     .await
     .expect("attach in_flight=true");
@@ -181,7 +190,9 @@ async fn attach_in_flight_disarms_after_first_inbound_notification() {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             match client.next_event().await.expect("reattached stream open") {
-                Event::AgentMessageChunk { text } if text == "mid-turn chunk after reattach" => {
+                Event::AgentMessageChunk { text, .. }
+                    if text == "mid-turn chunk after reattach" =>
+                {
                     break
                 }
                 Event::Stopped { reason } => panic!("stopped before notification: {reason}"),
@@ -324,6 +335,9 @@ async fn replay_completion_after_disconnect(session: &str, in_flight_turn: bool)
         None,
         "claude".into(),
         None,
+        None,
+        None,
+        None,
     )
     .await
     .expect("resume after detached completion");
@@ -345,6 +359,9 @@ async fn replay_completion_after_disconnect(session: &str, in_flight_turn: bool)
         AcpSessionId(session.into()),
         None,
         "claude".into(),
+        None,
+        None,
+        None,
         None,
     )
     .await

@@ -1,8 +1,10 @@
 import { lazy, Suspense } from "react";
 
+import { StructuredSessionStack } from "./StructuredSessionStack";
 import { TerminalSessionStack } from "./TerminalSessionStack";
 import { PairedShellPane } from "./PairedTerminal";
 import { BackgroundAgentsPanel } from "./acp/BackgroundAgentsPanel";
+import { hasStartedBefore } from "./acp/startupWait";
 import { FilesPane } from "./FilesPane";
 import { DiffFileList } from "./diff/DiffFileList";
 import { DiffFileViewer } from "./diff/DiffFileViewer";
@@ -13,20 +15,29 @@ import type { RightPanelView } from "../lib/rightPanelView";
 import { isPluginPaneId, type PluginPane } from "../lib/pluginPanes";
 import type { RepoBase, RichDiffFile, SessionResponse } from "../lib/types";
 import type { useDiffComments } from "../hooks/useDiffComments";
+import type { WebSettings } from "../hooks/useWebSettings";
 import type { FileRef } from "../lib/fileRef";
+import type { ServerAbout } from "../lib/api";
+import { autoResumeSettingsHref } from "../lib/autoResumeSettingsHref";
 
 const StructuredView = lazy(() => import("./acp/StructuredView").then((m) => ({ default: m.StructuredView })));
 
 interface Props {
+  readOnly: boolean;
   view: RightPanelView;
   pluginPanes: PluginPane[];
   onBackToAgent: () => void;
   onOpenAgentsPane: () => void;
+  /** Opens the switch-view confirmation for that Session; omitted where it can't switch. */
+  onSwitchToTerminal?: (sessionId: string) => void;
   pairedMounted: boolean;
   activeSession: SessionResponse | null;
   activeSessionId: string | null;
   sessions: SessionResponse[];
-  webSettings: { persistentTerminals: boolean; maxPersistentTerminals: number };
+  webSettings: Pick<
+    WebSettings,
+    "persistentTerminals" | "maxPersistentTerminals" | "persistentStructuredViews" | "maxPersistentStructuredViews"
+  >;
   selectedFilePath: string | null;
   selectedRepoName: string | undefined;
   selectedFileLine: number | undefined;
@@ -48,6 +59,8 @@ interface Props {
   onOpenSendDialog: () => void;
   onCloseSendDialog: () => void;
   onClearSelectedFile: () => void;
+  /** Decides whether the usage-limit banner links to Settings. */
+  serverAbout: ServerAbout | null;
 }
 
 function layerClass(active: boolean): string {
@@ -58,10 +71,12 @@ function layerClass(active: boolean): string {
 /** Keep terminal geometry and scrollback across switches; only the visible
  *  surface owns keyboard input. */
 export function MobileMainPane({
+  readOnly,
   view,
   pluginPanes,
   onBackToAgent,
   onOpenAgentsPane,
+  onSwitchToTerminal,
   pairedMounted,
   activeSession,
   activeSessionId,
@@ -88,6 +103,7 @@ export function MobileMainPane({
   onOpenSendDialog,
   onCloseSendDialog,
   onClearSelectedFile,
+  serverAbout,
 }: Props) {
   const activePluginPane = isPluginPaneId(view) ? (pluginPanes.find((p) => p.id === view) ?? null) : null;
   const viewLabel =
@@ -118,29 +134,43 @@ export function MobileMainPane({
       <div className="relative flex-1 flex flex-col min-h-0 overflow-hidden">
         <div className={layerClass(view === "agent")} inert={view !== "agent"}>
           {activeSession?.view === "structured" ? (
-            <Suspense fallback={null}>
-              <StructuredView
-                key={activeSessionId}
-                sessionId={activeSessionId!}
-                acpWorkerState={activeSession.acp_worker_state ?? "absent"}
-                rateLimitAutoResume={activeSession.rate_limit_auto_resume}
-                tool={activeSession.tool}
-                acpAgent={activeSession.acp_agent ?? null}
-                acpProvider={activeSession.acp_provider ?? null}
-                clearAliases={activeSession.clear_aliases}
-                archivedAt={activeSession.archived_at ?? null}
-                snoozedUntil={activeSession.snoozed_until ?? null}
-                trashedAt={activeSession.trashed_at ?? null}
-                onOpenFileRef={onOpenFileRef}
-                fileRefSession={activeSession}
-                onOpenAgentsPane={onOpenAgentsPane}
-                isSandboxed={activeSession.is_sandboxed}
-              />
-            </Suspense>
+            <StructuredSessionStack
+              active={view === "agent"}
+              activeSessionId={activeSessionId!}
+              sessions={sessions.filter((session) => session.view === "structured")}
+              persistent={webSettings.persistentStructuredViews}
+              maxPersistentViews={webSettings.maxPersistentStructuredViews}
+              renderSession={(session, active, selected) => (
+                <Suspense fallback={null}>
+                  <StructuredView
+                    active={active}
+                    selected={selected}
+                    sessionId={session.id}
+                    acpWorkerState={session.acp_worker_state ?? "absent"}
+                    rateLimitAutoResume={session.rate_limit_auto_resume}
+                    settingsHref={autoResumeSettingsHref(session.profile, serverAbout)}
+                    tool={session.tool}
+                    acpAgent={session.acp_agent ?? null}
+                    startedBefore={hasStartedBefore(session)}
+                    acpProvider={session.acp_provider ?? null}
+                    clearAliases={session.clear_aliases}
+                    archivedAt={session.archived_at ?? null}
+                    snoozedUntil={session.snoozed_until ?? null}
+                    trashedAt={session.trashed_at ?? null}
+                    onOpenFileRef={onOpenFileRef}
+                    fileRefSession={session}
+                    onOpenAgentsPane={onOpenAgentsPane}
+                    isSandboxed={session.is_sandboxed}
+                    onSwitchToTerminal={onSwitchToTerminal ? () => onSwitchToTerminal(session.id) : undefined}
+                  />
+                </Suspense>
+              )}
+            />
           ) : (
             // Clear the home indicator without changing the keyboard-open lift.
             <div className="home-indicator-clearance flex-1 flex flex-col min-h-0 overflow-hidden">
               <TerminalSessionStack
+                readOnly={readOnly}
                 active={view === "agent"}
                 activeSessionId={activeSessionId!}
                 sessions={sessions.filter((session) => session.view !== "structured")}
@@ -158,7 +188,12 @@ export function MobileMainPane({
             inert={view !== "paired"}
             data-testid="mobile-paired-layer"
           >
-            <PairedShellPane session={activeSession} sessionId={activeSessionId} active={view === "paired"} />
+            <PairedShellPane
+              session={activeSession}
+              sessionId={activeSessionId}
+              readOnly={readOnly}
+              active={view === "paired"}
+            />
           </div>
         )}
 

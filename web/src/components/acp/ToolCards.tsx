@@ -45,14 +45,16 @@ interface Props {
 export function ToolCard({ tool, result, nested }: Props) {
   const profile = useAgentProfile();
   const card = renderToolCard(tool, result, profile);
-  const content = result?.output?.length ? (
-    <>
-      {card}
-      <ToolOutputMedia blocks={result.output} />
-    </>
-  ) : (
-    card
-  );
+  // The read card shows its own output media inside its body.
+  const content =
+    result?.output?.length && card.type !== ReadToolCard ? (
+      <>
+        {card}
+        <ToolOutputMedia blocks={result.output} />
+      </>
+    ) : (
+      card
+    );
   const wrapped =
     !nested && pickStr(parseJsonObject(tool.args_preview), "_aoe_parent_tool_call_id") ? (
       <SubagentChildWrap>{content}</SubagentChildWrap>

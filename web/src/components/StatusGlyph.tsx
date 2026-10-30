@@ -2,19 +2,7 @@ import { useEffect, useState } from "react";
 import type { SessionStatus } from "../lib/types";
 import { isFreshIdle } from "../lib/session";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
-
-/** Animated spinner frames from rattles (https://github.com/vyfor/rattles) */
-const RATTLES: Record<string, { frames: string[]; interval: number }> = {
-  dots: {
-    frames: ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
-    interval: 220,
-  },
-  orbit: { frames: ["⠃", "⠉", "⠘", "⠰", "⢠", "⣀", "⡄", "⠆"], interval: 400 },
-  breathe: {
-    frames: ["⠀", "⠂", "⠌", "⡑", "⢕", "⢝", "⣫", "⣟", "⣿", "⣟", "⣫", "⢝", "⢕", "⡑", "⠌", "⠂", "⠀"],
-    interval: 180,
-  },
-};
+import { RATTLES } from "../lib/rattles";
 
 /** Which statuses get animated spinners vs static glyphs */
 const STATUS_RATTLE: Partial<Record<SessionStatus, keyof typeof RATTLES>> = {
@@ -41,7 +29,7 @@ const STATIC_GLYPH: Record<SessionStatus, string> = {
 const DORMANT_GLYPH = "⠶";
 
 /** Slowed-down `breathe` rattle for a freshly-stopped Idle session. */
-const FRESH_IDLE_RATTLE = { frames: RATTLES.breathe!.frames, interval: 280 };
+const FRESH_IDLE_RATTLE = { frames: RATTLES.breathe.frames, interval: 280 };
 
 /** Animated status glyph that cycles through rattles frames. */
 export function StatusGlyph({
@@ -49,15 +37,23 @@ export function StatusGlyph({
   createdAt,
   idleEnteredAt,
   dormant = false,
+  fresh = false,
+  animate = true,
 }: {
   status: SessionStatus;
   createdAt: string | null;
   idleEnteredAt?: string | null;
   dormant?: boolean;
+  /** Draws the just-finished Idle variant whatever the decay window says, for the legend's sample. */
+  fresh?: boolean;
+  /** Off for reduced motion: an animated glyph holds one frame. */
+  animate?: boolean;
 }) {
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const isFresh =
-    !dormant && status === "Idle" && isFreshIdle({ status, idle_entered_at: idleEnteredAt ?? null }, idleDecayWindowMs);
+    !dormant &&
+    status === "Idle" &&
+    (fresh || isFreshIdle({ status, idle_entered_at: idleEnteredAt ?? null }, idleDecayWindowMs));
   const rattleKey = STATUS_RATTLE[status];
   // A dormant worker is a resting state: no rattle, and its own static glyph.
   const rattle = dormant ? undefined : isFresh ? FRESH_IDLE_RATTLE : rattleKey ? RATTLES[rattleKey] : undefined;
@@ -69,7 +65,7 @@ export function StatusGlyph({
   });
 
   useEffect(() => {
-    if (!rattle) return;
+    if (!rattle || !animate) return;
     const r = rattle;
     const computeFrame = () => Math.floor((Date.now() - epoch) / r.interval) % r.frames.length;
     const initial = setTimeout(() => setFrame(computeFrame()), 0);
@@ -78,10 +74,11 @@ export function StatusGlyph({
       clearTimeout(initial);
       clearInterval(id);
     };
-  }, [rattle, epoch]);
+  }, [rattle, epoch, animate]);
 
   if (!rattle) {
     return <>{dormant ? DORMANT_GLYPH : STATIC_GLYPH[status]}</>;
   }
-  return <>{rattle.frames[frame]}</>;
+  // Held mid-cycle: some rattles, like breathe, start on a blank frame.
+  return <>{rattle.frames[animate ? frame : Math.floor(rattle.frames.length / 2)]}</>;
 }

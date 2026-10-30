@@ -259,6 +259,7 @@ done
                     title: Some("t1".into()),
                     updated_at: Some("2026-01-01T00:00:00Z".into()),
                     cwd_exists: false,
+                    conversation_binding: None,
                 },
                 "{case}"
             );

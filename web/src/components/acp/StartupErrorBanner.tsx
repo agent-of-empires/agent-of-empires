@@ -1,18 +1,38 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { useRespawnSession } from "../../hooks/useRespawnSession";
+import { fetchAgentInstallInfo, type AgentInstallInfo } from "../../lib/api";
+import { splitInstallHint, startupErrorCause, useAdapterInstall } from "./adapterRecovery";
+import { CommandBlock, RecoveryActionRow, type RecoveryAction } from "./RecoveryActionRow";
 
 function Code({ children }: { children: React.ReactNode }) {
-  return <code className="rounded bg-rose-900/60 px-1">{children}</code>;
+  return <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">{children}</code>;
 }
 
-function Remediation({ message }: { message: string }) {
+/** Copy for the failures a reinstall won't fix, keyed off the message text. */
+function specificRemediation(message: string, agent: string | undefined, name: string): React.ReactNode {
   if (/authentic|login|api[_ -]?key/i.test(message)) {
+    if (agent === "claude" || agent === "claude-code") {
+      return (
+        <>
+          The adapter is installed but has no Claude credentials. Either set <Code>ANTHROPIC_API_KEY</Code> in the env
+          that runs <Code>aoe serve</Code>, or run <Code>claude /login</Code> in a terminal to write credentials to{" "}
+          <Code>~/.claude</Code>, then restart aoe.
+        </>
+      );
+    }
+    if (agent === "codex") {
+      return (
+        <>
+          The adapter is installed but has no Codex credentials. Either set <Code>OPENAI_API_KEY</Code> in the env that
+          runs <Code>aoe serve</Code>, or run <Code>codex login</Code> on the host, then restart aoe.
+        </>
+      );
+    }
     return (
       <>
-        The adapter is installed but has no Claude credentials. Either set <Code>ANTHROPIC_API_KEY</Code> in the env
-        that runs <Code>aoe serve</Code>, or run <Code>claude /login</Code> in a terminal to write credentials to{" "}
-        <Code>~/.claude</Code>, then restart aoe.
+        The adapter is installed but {name} isn't signed in. Sign in to {name} or set its API key in the env that runs{" "}
+        <Code>aoe serve</Code>, then restart aoe.
       </>
     );
   }
@@ -26,6 +46,27 @@ function Remediation({ message }: { message: string }) {
       </>
     );
   }
+  // The Daemon refuses a stale bundled copy or one its Node can't run; npm can't fix either.
+  // Both match the Display of `unresolved_adapter_spawn_error` (src/acp/acp_client/errors.rs).
+  const stale = /bundled ACP adapter `([^`]+)` predates this aoe build/.exec(message);
+  if (stale) {
+    return (
+      <>
+        aoe's bundled copy of the ACP adapter is older than this aoe build, so the Daemon won't run it. Run{" "}
+        <Code>aoe acp doctor --fix --adapter {stale[1]}</Code> where the Daemon runs, then click <strong>Retry</strong>.
+      </>
+    );
+  }
+  const oldNode = /needs Node (\S+) or newer to run its sources; found (.+?)\. Upgrade/.exec(message);
+  if (oldNode) {
+    return (
+      <>
+        The ACP adapter needs Node {oldNode[1]} or newer, and the Daemon found <Code>{oldNode[2]}</Code>. Upgrade Node,
+        or point <Code>AOE_ACP_NODE</Code> at a newer one, then click <strong>Retry</strong>. Reinstalling the adapter
+        won't help.
+      </>
+    );
+  }
   // Matches the Display of `AcpError::ProjectPathMissing`.
   const missing = /project path no longer exists:\s*(\S.*)$/im.exec(message);
   if (missing) {
@@ -34,7 +75,9 @@ function Remediation({ message }: { message: string }) {
       <>
         The session's working directory no longer exists on disk:
         {missingPath && (
-          <pre className="mt-1 whitespace-pre-wrap break-all rounded bg-rose-900/40 p-2 text-xs">{missingPath}</pre>
+          <pre className="mt-1 whitespace-pre-wrap break-all rounded-md bg-surface-950 p-2 font-mono text-xs">
+            {missingPath}
+          </pre>
         )}
         Reinstalling the adapter won't help; the adapter is fine, the cwd is gone. Two paths forward:
         <ol className="mt-1 list-decimal space-y-0.5 pl-5">
@@ -51,7 +94,7 @@ function Remediation({ message }: { message: string }) {
       </>
     );
   }
-  if (/native binary at .* exists but failed to launch/i.test(message)) {
+  if (/native binary (?:at .* exists but )?failed to launch/i.test(message)) {
     return (
       <>
         The adapter is installed but its bundled Claude Code native sub-binary couldn't launch. The binary exists on
@@ -72,7 +115,7 @@ function Remediation({ message }: { message: string }) {
           href="https://agent-of-empires.com/docs/structured-view/troubleshooting/#native-binary-launch-failure"
           target="_blank"
           rel="noreferrer"
-          className="underline hover:text-rose-100"
+          className="underline hover:text-text-primary"
         >
           the troubleshooting guide
         </a>
@@ -80,46 +123,163 @@ function Remediation({ message }: { message: string }) {
       </>
     );
   }
+  return null;
+}
+
+/** The Agent named in a spawn failure ("Failed to start structured view agent \"x\""). */
+const AGENT_IN_MESSAGE = /structured view agent "([^"]+)"/;
+/** The Daemon's missing-adapter error, which names its cause. */
+const ADAPTER_NOT_FOUND = /binary `[^`]+` not found/;
+
+export function StartupErrorBanner({
+  sessionId,
+  message,
+  onSwitchToTerminal,
+}: {
+  sessionId: string;
+  message: string;
+  /** Opens the switch-view confirmation; omitted where the Session can't switch. */
+  onSwitchToTerminal?: () => void;
+}) {
+  const [info, setInfo] = useState<AgentInstallInfo | null>(null);
+  const [infoRequest, setInfoRequest] = useState(0);
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const { state: retryState, detail: retryDetail, respawn } = useRespawnSession(sessionId);
+  // A failed respawn opens Details, where its failure line is, whichever button started it.
+  const respawnOrShow = async () => {
+    const ok = await respawn();
+    if (!ok) setDetailsOpen(true);
+    return ok;
+  };
+  const install = useAdapterInstall(sessionId, respawnOrShow);
+
+  useEffect(() => {
+    let alive = true;
+    void fetchAgentInstallInfo(sessionId).then((next) => {
+      if (alive && next) setInfo(next);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [sessionId, infoRequest]);
+
+  const name = info?.display_name ?? AGENT_IN_MESSAGE.exec(message)?.[1] ?? "The agent";
+  const specific = specificRemediation(message, info?.agent ?? AGENT_IN_MESSAGE.exec(message)?.[1], name);
+  const canInstall = !specific && info?.install_allowed === true && info.npm_installable;
+  const busy = retryState === "retrying" || install.state === "installing";
+
+  const retry = async () => {
+    // A setting changed in the TUI shows up on the next attempt.
+    setInfoRequest((n) => n + 1);
+    await respawnOrShow();
+  };
+  const retryAction: RecoveryAction = {
+    label: retryState === "retrying" ? "Retrying…" : "Retry",
+    onClick: () => void retry(),
+    testId: "startup-error-banner-retry",
+    disabled: busy,
+  };
+  const installAction: RecoveryAction = {
+    label:
+      install.state === "installing"
+        ? "Installing…"
+        : info?.sandboxed
+          ? "Install in sandbox and retry"
+          : "Install and retry",
+    onClick: () => void install.install(),
+    testId: "startup-error-banner-install",
+    disabled: busy,
+  };
+  const switchAction: RecoveryAction[] = onSwitchToTerminal
+    ? [{ label: "Use Terminal view", onClick: onSwitchToTerminal, testId: "startup-error-banner-terminal" }]
+    : [];
+
+  const retryFailure =
+    retryState === "failed" && retryDetail !== null
+      ? startupErrorCause(retryDetail) === startupErrorCause(message)
+        ? "Retry failed: same error"
+        : `Retry failed: ${startupErrorCause(retryDetail)}`
+      : null;
+
   return (
-    <>
-      Run <Code>aoe acp doctor --fix</Code> from a terminal, or install the adapter manually:
-      <pre className="mt-1 whitespace-pre-wrap rounded bg-rose-900/40 p-2 text-xs">
-        npm install -g @agentclientprotocol/claude-agent-acp@latest
-      </pre>
-    </>
+    <section
+      aria-label="Structured view startup error"
+      data-testid="startup-error-banner"
+      className="border-b border-status-error/40 bg-status-error/10 px-4 py-3 text-text-primary"
+    >
+      <div role="alert">
+        <h2 className="text-sm font-semibold">{name} couldn't start in Structured view</h2>
+        <div className="mt-1 text-xs text-text-subtle">
+          {specific ??
+            (ADAPTER_NOT_FOUND.test(message) ? (
+              <>{name}'s ACP adapter isn't installed where the Daemon runs.</>
+            ) : (
+              <>
+                The ACP adapter, the program that connects AoE to {name}, didn't start. It's usually missing or out of
+                date.
+              </>
+            ))}
+        </div>
+      </div>
+      {!specific && !canInstall && <InstallSteps info={info} />}
+      <RecoveryActionRow
+        primary={canInstall ? installAction : retryAction}
+        secondary={[...(canInstall ? [retryAction] : []), ...switchAction]}
+        install={install}
+      />
+      {retryState === "ok" && (
+        <div className="mt-2 text-xs text-text-subtle">Retrying. Events will appear when {name} starts.</div>
+      )}
+      <div className="mt-3 border-t border-status-error/30 pt-2">
+        <button
+          type="button"
+          data-testid="startup-error-banner-details"
+          aria-expanded={detailsOpen}
+          onClick={() => setDetailsOpen(!detailsOpen)}
+          className="text-xs font-medium text-text-primary underline-offset-2 hover:underline"
+        >
+          Details
+        </button>
+        {detailsOpen && (
+          <div className="mt-2" data-testid="startup-error-banner-details-body">
+            <pre className="whitespace-pre-wrap break-all font-mono text-xs text-text-subtle">{message}</pre>
+            {retryFailure && <div className="mt-1 font-mono text-xs text-text-subtle">{retryFailure}</div>}
+            <AgentLogDisclosure sessionId={sessionId} />
+          </div>
+        )}
+      </div>
+    </section>
   );
 }
 
-export function StartupErrorBanner({ sessionId, message }: { sessionId: string; message: string }) {
-  const { state: retryState, error: retryError, respawn: handleRetry } = useRespawnSession(sessionId);
+/** What to run where, for an adapter the dashboard can't install itself. */
+function InstallSteps({ info }: { info: AgentInstallInfo | null }) {
+  if (!info?.install_command) {
+    return (
+      <p className="mt-2 text-xs text-text-subtle">
+        Run <Code>aoe acp doctor --fix</Code> where the Daemon runs, then Retry.
+      </p>
+    );
+  }
+  const hint = splitInstallHint(info.install_command);
+  if (info.sandboxed) {
+    return (
+      <div className="mt-2 text-xs text-text-subtle" data-testid="startup-error-banner-sandbox-note">
+        <p>The ACP adapter lives inside the sandbox container, so installing it on the host won't reach it.</p>
+        <p className="mt-2">Run this inside the container, then Retry:</p>
+        <CommandBlock {...hint} testId="startup-error-banner-command" />
+        <p className="mt-2 text-text-subtle">
+          This updates the running container only. To keep new Sessions from hitting this, refresh the sandbox image:
+          the aoe TUI shows a "sandbox image update available" banner that pulls the right image with your configured
+          container runtime.
+        </p>
+      </div>
+    );
+  }
   return (
-    <div className="border-b border-rose-900/60 bg-rose-950/40 px-4 py-3 text-rose-200">
-      <div className="flex items-start justify-between gap-3">
-        <div className="flex-1 min-w-0">
-          <div className="text-sm font-medium">Structured view agent failed to start</div>
-          <pre className="mt-1 whitespace-pre-wrap text-xs text-rose-100/90">{message}</pre>
-        </div>
-        <button
-          type="button"
-          onClick={handleRetry}
-          disabled={retryState === "retrying"}
-          className="shrink-0 rounded-md border border-rose-800/60 bg-rose-900/40 px-3 py-1 text-xs font-medium text-rose-100 hover:bg-rose-900/60 disabled:cursor-not-allowed disabled:opacity-60"
-        >
-          {retryState === "retrying" ? "Retrying…" : "Retry"}
-        </button>
-      </div>
-      {retryState === "ok" && (
-        <div className="mt-2 text-xs text-emerald-200/90">
-          Spawn requested. New events should start streaming in shortly.
-        </div>
-      )}
-      {retryState === "failed" && retryError && (
-        <div className="mt-2 text-xs text-rose-100/90">Retry failed: {retryError}</div>
-      )}
-      <div className="mt-2 text-xs text-rose-200/80">
-        <Remediation message={message} />
-      </div>
-      <AgentLogDisclosure sessionId={sessionId} />
+    <div className="mt-2 text-xs text-text-subtle">
+      <CommandBlock {...hint} testId="startup-error-banner-command" />
+      <p className="mt-2">Run this where the Daemon runs, then Retry.</p>
     </div>
   );
 }
@@ -162,14 +322,14 @@ function AgentLogDisclosure({ sessionId }: { sessionId: string }) {
   };
 
   return (
-    <div className="mt-3 border-t border-rose-900/60 pt-2">
+    <div className="mt-2">
       <div className="flex items-center justify-between gap-2">
         <button
           type="button"
           onClick={handleToggle}
           data-testid="acp-agent-log-toggle"
           aria-expanded={open}
-          className="text-xs font-medium text-rose-100 underline-offset-2 hover:underline"
+          className="text-xs font-medium text-text-primary underline-offset-2 hover:underline"
         >
           {open ? "Hide agent log" : "Open agent log"}
         </button>
@@ -179,7 +339,7 @@ function AgentLogDisclosure({ sessionId }: { sessionId: string }) {
             onClick={() => void fetchLog()}
             disabled={log.kind === "loading"}
             data-testid="acp-agent-log-refresh"
-            className="rounded-md border border-rose-800/60 bg-rose-900/40 px-2 py-0.5 text-[10px] font-medium text-rose-100 hover:bg-rose-900/60 disabled:cursor-not-allowed disabled:opacity-60"
+            className="rounded-md border border-surface-700 bg-surface-800 px-2 py-0.5 text-[10px] font-medium text-text-primary hover:bg-surface-700 disabled:cursor-not-allowed disabled:opacity-60"
           >
             {log.kind === "loading" ? "Loading…" : "Refresh"}
           </button>
@@ -187,26 +347,26 @@ function AgentLogDisclosure({ sessionId }: { sessionId: string }) {
       </div>
       {open && (
         <div className="mt-2" data-testid="acp-agent-log-body">
-          {log.kind === "loading" && <div className="text-xs text-rose-200/80">Loading log…</div>}
+          {log.kind === "loading" && <div className="text-xs text-text-subtle">Loading log…</div>}
           {log.kind === "failed" && log.error && (
-            <div className="text-xs text-rose-100/90">Could not load log: {log.error}</div>
+            <div className="text-xs text-text-subtle">Could not load log: {log.error}</div>
           )}
           {log.kind === "ok" && !log.exists && (
-            <div className="text-xs text-rose-200/80">
+            <div className="text-xs text-text-subtle">
               No log output yet. The worker may not have written anything before exiting.
             </div>
           )}
           {log.kind === "ok" && log.exists && log.tail.length === 0 && (
-            <div className="text-xs text-rose-200/80">Log file exists but is empty.</div>
+            <div className="text-xs text-text-subtle">Log file exists but is empty.</div>
           )}
           {log.kind === "ok" && log.exists && log.tail.length > 0 && (
             <>
               {log.truncated && (
-                <div className="mb-1 text-[10px] text-rose-200/70">Log is large; showing the tail.</div>
+                <div className="mb-1 text-[10px] text-text-subtle">Log is large; showing the tail.</div>
               )}
               <pre
                 data-testid="acp-agent-log-pre"
-                className="max-h-64 overflow-auto whitespace-pre-wrap break-all rounded bg-rose-950/70 p-2 font-mono text-[11px] text-rose-100/90"
+                className="max-h-64 overflow-auto whitespace-pre-wrap break-all rounded bg-surface-950 p-2 font-mono text-[11px] text-text-subtle"
               >
                 {log.tail}
               </pre>

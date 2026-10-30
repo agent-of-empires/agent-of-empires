@@ -6,6 +6,10 @@
 aoe
 ```
 
+The TUI starts or reuses the local Daemon through its private Unix socket and reads canonical session rows from it. Starting the TUI does not open a web listener. The shared Daemon keeps running when you quit the TUI; `aoe serve --stop` stops it.
+
+If startup or connection fails, the TUI shows the diagnostic and masks daemon-owned session state. Press `r` to reconnect or retry local startup after fixing the cause, or `q` to quit.
+
 | Key | Action |
 |-----|--------|
 | `n` | New session |
@@ -27,6 +31,12 @@ aoe
 Press `n` and fill in the path to your project (or leave `.`), or run `aoe add /path/to/project`. The session appears in the dashboard as **Idle**. Select it and press `Enter` to attach; you are now inside a tmux session running the agent. `Ctrl+b d` detaches back to the TUI. If aoe itself runs inside tmux, attaching switches your client to the agent's session and `Ctrl+b L` switches back.
 
 Press `t` to toggle between the structured view and the paired shell terminal, where you can run builds and git commands without interrupting the agent.
+
+Drag the border between the session list and preview to resize the list. In terminals
+narrower than 80 columns, the list moves above the preview: drag their horizontal border
+up or down to change its height, including in live mode. Width and height are remembered
+separately across restarts. A shorter window temporarily limits the height to leave room
+for the preview; enlarging it restores your chosen height.
 
 ## Projects and groups
 

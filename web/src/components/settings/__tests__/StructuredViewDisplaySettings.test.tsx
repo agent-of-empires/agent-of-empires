@@ -19,6 +19,20 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("StructuredViewDisplaySettings localStorage contract", () => {
+  it("keeps conversations alive off by default and clamps the limit once enabled", () => {
+    const { getByTestId, queryByLabelText, getByLabelText } = render(<StructuredViewDisplaySettings />);
+    expect(queryByLabelText("Conversation keep-alive limit")).toBeNull();
+
+    fireEvent.click(getByTestId("persistent-structured-views-toggle"));
+    expect(readStored().persistentStructuredViews).toBe(true);
+
+    const limit = getByLabelText("Conversation keep-alive limit");
+    fireEvent.change(limit, { target: { value: "4" } });
+    expect(readStored().maxPersistentStructuredViews).toBe(4);
+    fireEvent.change(limit, { target: { value: "99" } });
+    expect(readStored().maxPersistentStructuredViews).toBe(5);
+  });
+
   it("writes each axis independently and leaves the terminal sizes alone", () => {
     const { getByTestId } = render(<StructuredViewDisplaySettings />);
 

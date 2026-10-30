@@ -194,34 +194,17 @@ impl GroupDeleteOptionsDialog {
         match key.code {
             KeyCode::Esc => DialogResult::Cancel,
             KeyCode::Enter => DialogResult::Submit(self.options.clone()),
-            KeyCode::Tab => {
-                self.focused_field = (self.focused_field + 1) % self.max_field();
+            KeyCode::Tab | KeyCode::Down | KeyCode::Char('j') => {
+                self.focused_field =
+                    super::cycle_focus(self.focused_field, self.max_field(), false);
                 DialogResult::Continue
             }
-            KeyCode::BackTab => {
-                let max = self.max_field();
-                self.focused_field = if self.focused_field == 0 {
-                    max - 1
-                } else {
-                    self.focused_field - 1
-                };
+            KeyCode::BackTab | KeyCode::Up | KeyCode::Char('k') => {
+                self.focused_field = super::cycle_focus(self.focused_field, self.max_field(), true);
                 DialogResult::Continue
             }
             KeyCode::Char(' ') => {
                 self.toggle_focused_field();
-                DialogResult::Continue
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                let max = self.max_field();
-                self.focused_field = if self.focused_field == 0 {
-                    max - 1
-                } else {
-                    self.focused_field - 1
-                };
-                DialogResult::Continue
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.focused_field = (self.focused_field + 1) % self.max_field();
                 DialogResult::Continue
             }
             _ => DialogResult::Continue,

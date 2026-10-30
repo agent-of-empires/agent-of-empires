@@ -265,13 +265,11 @@ mod tests {
             .unwrap()
             .to_path_buf();
         std::os::unix::fs::symlink(external.path(), root.join("hung")).unwrap();
-        Storage::open_unwatched("hung")
-            .unwrap()
-            .update(|rows, _| {
-                rows.push(Instance::new("remote", "/tmp/remote"));
-                Ok(())
-            })
-            .unwrap();
+        std::fs::write(
+            external.path().join("sessions.json"),
+            serde_json::to_vec(&vec![Instance::new("remote", "/tmp/remote")]).unwrap(),
+        )
+        .unwrap();
         (home, external)
     }
 
@@ -314,6 +312,71 @@ mod tests {
         let recovered = load();
         assert!(recovered.cache.health.unreadable_profiles.is_empty());
         assert_eq!(recovered.cache.alias_only_instances.len(), 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn same_path_replacement_never_relabels_cached_rows_as_the_new_store() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let external = tempfile::tempdir().unwrap();
+        let target = external.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let old = Instance::new("old store", "/tmp/old");
+        std::fs::write(
+            target.join("sessions.json"),
+            serde_json::to_vec(&vec![old]).unwrap(),
+        )
+        .unwrap();
+        let link = crate::session::get_profile_dir_path("same-path").unwrap();
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let primed = load();
+        assert_eq!(primed.cache.alias_only_instances[0].title, "old store");
+
+        std::fs::rename(&target, external.path().join("retired")).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        let replacement = Instance::new("new store", "/tmp/new");
+        std::fs::write(
+            target.join("sessions.json"),
+            serde_json::to_vec(&vec![replacement]).unwrap(),
+        )
+        .unwrap();
+        let hold = Hold::install("same-path", "sessions");
+        let pending = load();
+        hold.wait_entered();
+        let identity = |loaded: &LoadedInstances| {
+            loaded
+                .cache
+                .inventory
+                .iter()
+                .find(|profile| profile.name == "same-path")
+                .unwrap()
+                .identity
+        };
+        assert_ne!(identity(&pending), identity(&primed));
+        assert!(pending
+            .cache
+            .health
+            .unreadable_profiles
+            .contains("same-path"));
+        assert!(
+            pending.cache.alias_only_instances.is_empty(),
+            "old rows must not acquire a replacement store's identity"
+        );
+
+        hold.release();
+        wait_idle_for_test("same-path");
+        let accepted = load();
+        assert!(accepted.cache.health.unreadable_profiles.is_empty());
+        assert_eq!(
+            accepted
+                .cache
+                .alias_only_instances
+                .iter()
+                .map(|row| row.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["new store"]
+        );
     }
 
     #[tokio::test]
@@ -372,13 +435,11 @@ mod tests {
         let link = crate::session::get_profile_dir_path("hung").unwrap();
         std::fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(healthy.path(), &link).unwrap();
-        Storage::open_unwatched("hung")
-            .unwrap()
-            .update(|rows, _| {
-                rows.push(Instance::new("repointed", "/tmp/repointed"));
-                Ok(())
-            })
-            .unwrap();
+        std::fs::write(
+            healthy.path().join("sessions.json"),
+            serde_json::to_vec(&vec![Instance::new("repointed", "/tmp/repointed")]).unwrap(),
+        )
+        .unwrap();
         let repointed = load();
         assert!(repointed.cache.health.unreadable_profiles.is_empty());
         assert_eq!(repointed.cache.alias_only_instances.len(), 1);

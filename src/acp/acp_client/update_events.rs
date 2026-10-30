@@ -19,7 +19,7 @@ use super::lifecycle::{detect_off_protocol_work_completed, OffProtocolWorkKind};
 use super::plan::{extract_plan_from_switch_mode, map_plan_status, plan_status_to_str};
 use super::raw_input::{
     background_agent_launched_from_value, background_command_launched_from_value,
-    monitor_event_from_raw, wakeup_event_from_raw,
+    background_task_started_from_value, monitor_event_from_raw, wakeup_event_from_raw,
 };
 use super::tool_output::{
     extract_diffs_from_content, extract_memory_recall, extract_tool_content_text,
@@ -316,6 +316,7 @@ pub(super) fn map_update_to_events(
             ContentBlock::Text(text) => {
                 let mut events = vec![Event::AgentMessageChunk {
                     text: text.text.clone(),
+                    message_id: chunk.message_id.map(|id| id.0.to_string()),
                 }];
                 if is_compact_start(&text.text) {
                     events.push(Event::ConversationCompactionStarted);
@@ -479,6 +480,7 @@ pub(super) fn map_update_to_events(
                     None => {
                         if profile.supports_wakeup_tools {
                             events.extend(background_command_launched_from_value(&payload));
+                            events.extend(background_task_started_from_value(&payload));
                         }
                         events.push(Event::RawAgentUpdate { payload });
                     }
@@ -672,6 +674,30 @@ mod tests {
         map_update_to_events(update, &agent_profiles::CLAUDE)
     }
 
+    /// The ACP message id survives into the stored event, and history
+    /// stored before the field existed still loads.
+    #[test]
+    fn agent_message_chunk_keeps_its_message_id() {
+        use super::super::test_helpers::text_chunk;
+        for id in [Some("m-1"), None] {
+            let events = claude(text_chunk("hi", id));
+            assert!(
+                matches!(events.as_slice(), [Event::AgentMessageChunk { text, message_id }] if text == "hi" && message_id.as_deref() == id),
+                "{id:?}: {events:?}"
+            );
+            let stored = serde_json::to_string(&events[0]).unwrap();
+            assert_eq!(stored.contains("message_id"), id.is_some(), "{stored}");
+        }
+        let old: Event = serde_json::from_str(r#"{"AgentMessageChunk":{"text":"hi"}}"#).unwrap();
+        assert!(matches!(
+            old,
+            Event::AgentMessageChunk {
+                message_id: None,
+                ..
+            }
+        ));
+    }
+
     fn tool_update(id: &'static str, fields: ToolCallUpdateFields) -> SessionUpdate {
         SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id, fields))
     }
@@ -731,6 +757,27 @@ mod tests {
                 };
                 assert_eq!(tool_call.parent_tool_call_id.as_deref(), want);
             }
+        }
+    }
+
+    /// EnterPlanMode is a `switch_mode` tool with no plan: a tool card only.
+    #[test]
+    fn switch_mode_emits_a_plan_only_when_the_input_carries_one() {
+        for (raw_input, want) in [
+            (
+                serde_json::json!({ "mode": "plan" }),
+                vec!["tool_call_started"],
+            ),
+            (
+                serde_json::json!({ "plan": "- a\n- b" }),
+                vec!["tool_call_started", "plan_updated"],
+            ),
+        ] {
+            let mut tc = AcpToolCall::new("tc-plan", "EnterPlanMode");
+            tc.kind = agent_client_protocol::schema::v1::ToolKind::SwitchMode;
+            tc.raw_input = Some(raw_input.clone());
+            let events = claude(SessionUpdate::ToolCall(tc));
+            assert_eq!(kinds(&events), want, "{raw_input}");
         }
     }
 
@@ -1158,6 +1205,7 @@ mod tests {
             (
                 Event::AgentMessageChunk {
                     text: "Compacting...".into(),
+                    message_id: None,
                 },
                 true,
             ),
@@ -1534,14 +1582,22 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Event::MonitorArmed { description: None }))
         };
+        let started = |events: &[Event]| {
+            events.iter().any(|e| {
+                matches!(e, Event::BackgroundTaskStarted { task_id, tool_call_id, .. }
+                    if task_id == "byiee4aex" && tool_call_id.as_deref() == Some("tc-1"))
+            })
+        };
         let claude_events = claude(launch());
         assert!(armed(&claude_events));
+        assert!(started(&claude_events));
         assert!(matches!(
             claude_events.last(),
             Some(Event::RawAgentUpdate { .. })
         ));
         let codex = map_update_to_events(launch(), &agent_profiles::CODEX);
         assert!(!armed(&codex));
+        assert!(!started(&codex));
         assert_eq!(kinds(&codex), ["raw_agent_update"]);
     }
 }

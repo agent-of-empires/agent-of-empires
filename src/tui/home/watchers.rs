@@ -456,6 +456,8 @@ impl Eq for WatcherInitError {}
 /// Tick-driven reload failures, aggregated into one dialog per failure burst.
 #[derive(Default)]
 pub(in crate::tui) struct ReloadFailureState {
+    canonical_error: Option<String>,
+    daemon_error: Option<String>,
     storage_error: Option<String>,
     config_error: Option<String>,
     pub(super) disk_watcher_init_error: Option<WatcherInitError>,
@@ -465,6 +467,14 @@ pub(in crate::tui) struct ReloadFailureState {
 }
 
 impl ReloadFailureState {
+    pub(in crate::tui) fn record_canonical(&mut self, result: &anyhow::Result<()>) -> bool {
+        self.record(|state| &mut state.canonical_error, result)
+    }
+
+    pub(in crate::tui) fn record_daemon(&mut self, result: &anyhow::Result<()>) -> bool {
+        self.record(|state| &mut state.daemon_error, result)
+    }
+
     /// Returns true on a failed-to-healthy transition.
     fn record(
         &mut self,
@@ -492,11 +502,19 @@ impl ReloadFailureState {
     }
 
     pub(in crate::tui) fn record_storage(&mut self, result: &anyhow::Result<()>) -> bool {
-        self.record(|s| &mut s.storage_error, result)
+        let safe = result
+            .as_ref()
+            .map(|_| ())
+            .map_err(|error| anyhow::anyhow!(crate::session::sanitized_load_failure(error)));
+        self.record(|s| &mut s.storage_error, &safe)
     }
 
     pub(in crate::tui) fn record_config(&mut self, result: &anyhow::Result<()>) -> bool {
-        self.record(|s| &mut s.config_error, result)
+        let safe = result
+            .as_ref()
+            .map(|_| ())
+            .map_err(|error| anyhow::anyhow!(crate::session::sanitized_load_failure(error)));
+        self.record(|s| &mut s.config_error, &safe)
     }
 
     /// Apply one rewire pass's outcome; only a changed failure re-arms the dialog.
@@ -546,7 +564,9 @@ impl ReloadFailureState {
     }
 
     pub(in crate::tui) fn has_any_failure(&self) -> bool {
-        self.storage_error.is_some()
+        self.daemon_error.is_some()
+            || self.canonical_error.is_some()
+            || self.storage_error.is_some()
             || self.config_error.is_some()
             || self.disk_watcher_init_error.is_some()
             || self.config_watcher_init_error.is_some()
@@ -558,6 +578,12 @@ impl ReloadFailureState {
 
     pub(in crate::tui) fn build_dialog_body(&self) -> String {
         let mut lines = vec!["The following reload sources are degraded:".to_string()];
+        if let Some(error) = &self.canonical_error {
+            lines.push(format!("- Canonical projection: {error}"));
+        }
+        if let Some(error) = &self.daemon_error {
+            lines.push(format!("- Runtime: {error}"));
+        }
         if let Some(e) = &self.storage_error {
             lines.push(format!("- Storage: {e}"));
         }

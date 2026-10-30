@@ -151,6 +151,7 @@ export interface ElicitationOption {
   value: string;
   label: string;
   description?: string | null;
+  preview?: string | null;
 }
 
 /** Mirror of the untagged Rust `AnswerValue`. */
@@ -398,7 +399,7 @@ export type AcpEvent =
         ended_at: string;
       };
     }
-  | { AgentMessageChunk: { text: string } }
+  | { AgentMessageChunk: { text: string; message_id?: string } }
   | { CancelRequested: { escalates_at: string } }
   | { Stopped: { reason: string } }
   | { AgentStartupError: { message: string } }
@@ -434,6 +435,8 @@ export type AcpEvent =
   | { SessionContextReset: { reason: string } }
   | { WakeupScheduled: { at: string; reason: string | null } }
   | { MonitorArmed: { description: string | null } }
+  | { BackgroundTaskStarted: { task_id: string; tool_call_id?: string; description: string } }
+  | { BackgroundTaskFinished: { task_id: string } }
   | { PromptRejected: { reason: string; text: string } }
   | { AgentSwitched: { from: string; to: string; reason: string } }
   | { ConversationSummary: { text: string; summarized_until_seq: number } };
@@ -512,6 +515,8 @@ export interface ReducedState {
   compacting: boolean;
   /** Absent on a daemon that predates session notices. */
   session_notices?: SessionNotice[];
+  /** Open background task ids; the daemon omits the field when none are open. */
+  background_tasks?: string[];
 }
 
 export interface AcpState {
@@ -609,6 +614,8 @@ export interface AcpState {
   agentOrphaned: boolean;
   /** Async sub-agents launched this session, oldest first. */
   backgroundAgents: BackgroundAgent[];
+  /** Ids of running background tasks that are not sub-agents (backgrounded commands). */
+  backgroundTasks: string[];
   /** Agent-pushed advisories for the current turn, oldest first. */
   sessionNotices: SessionNotice[];
   /** Ids dismissed in this tab. Local, so it never clears another client. */
@@ -704,6 +711,8 @@ export interface ActivityRow {
   output?: ToolOutputBlock[];
   elicitationAnswers?: ElicitationAnswer[];
   asyncSubagent?: boolean;
+  /** A `message` row that opens a new agent message, so its text starts a new paragraph. */
+  messageStart?: boolean;
   at: string; // ISO-8601
 }
 
@@ -727,6 +736,7 @@ export interface TranscriptRow {
   };
   elicitation_answers?: ElicitationAnswer[];
   async_subagent?: boolean;
+  message_start?: boolean;
 }
 
 export type TranscriptDelta =
@@ -783,6 +793,7 @@ export function transcriptRowToActivity(row: TranscriptRow, sessionId: string): 
       ? { elicitationAnswers: row.elicitation_answers }
       : {}),
     ...(row.async_subagent ? { asyncSubagent: true } : {}),
+    ...(row.message_start ? { messageStart: true } : {}),
   };
 }
 
@@ -882,6 +893,7 @@ export function emptyAcpState(): AcpState {
     agentUnresponsive: false,
     agentOrphaned: false,
     backgroundAgents: [],
+    backgroundTasks: [],
     modeSwitchFailed: null,
     lastAgentSwitch: null,
     configOptions: [],
@@ -1285,6 +1297,16 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     );
     return next;
   }
+  if ("BackgroundTaskStarted" in event) {
+    const id = event.BackgroundTaskStarted.task_id;
+    if (!next.backgroundTasks.includes(id)) next.backgroundTasks = [...next.backgroundTasks, id];
+    return next;
+  }
+  if ("BackgroundTaskFinished" in event) {
+    const id = event.BackgroundTaskFinished.task_id;
+    next.backgroundTasks = next.backgroundTasks.filter((t) => t !== id);
+    return next;
+  }
   // Remaining events carry no client control state.
   return next;
 }
@@ -1330,6 +1352,9 @@ export function applyReducedState(state: AcpState, reduced: ReducedState, unchan
     // The daemon's list is authoritative: a cold open whose replay window
     // starts after the notice would otherwise miss it, while the TUI shows it.
     sessionNotices: reduced.session_notices ?? [],
+    // Likewise authoritative: a task that started before the replay window
+    // has no start event here, yet the session is still busy.
+    backgroundTasks: reduced.background_tasks ?? [],
     locallyResolved,
   };
 }
@@ -1406,16 +1431,17 @@ export function deriveTurnActive(state: Pick<AcpState, "serverTurnActive" | "inf
   return state.serverTurnActive || state.inflightPromptIds.length > 0;
 }
 
-/** Outstanding background sub-agent (async Task), mirroring
- *  `AcpState::has_active_background_agent`: keyed on `endedAt` rather than
- *  status, since a stalled agent's own terminal completion counts as done. */
-export function hasActiveBackgroundAgent(state: Pick<AcpState, "backgroundAgents">): boolean {
-  return state.backgroundAgents.some((a) => a.endedAt === null);
+/** Outstanding background sub-agent (async Task) or task, mirroring
+ *  `AcpState::has_active_background_agent`: agents are keyed on `endedAt`
+ *  rather than status, since a stalled agent's own terminal completion counts
+ *  as done. */
+export function hasActiveBackgroundAgent(state: Pick<AcpState, "backgroundAgents" | "backgroundTasks">): boolean {
+  return state.backgroundTasks.length > 0 || state.backgroundAgents.some((a) => a.endedAt === null);
 }
 
 /** Display-only busy signal for the runtime spinner. Distinct from `turnActive`,
  *  which tracks only the main turn because send-vs-queue composer gating reads it. */
-export function isVisiblyBusy(state: Pick<AcpState, "turnActive" | "backgroundAgents">): boolean {
+export function isVisiblyBusy(state: Pick<AcpState, "turnActive" | "backgroundAgents" | "backgroundTasks">): boolean {
   return state.turnActive || hasActiveBackgroundAgent(state);
 }
 

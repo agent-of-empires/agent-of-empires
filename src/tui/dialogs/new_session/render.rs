@@ -4,8 +4,6 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 use tui_input::Input;
 
-use rattles::presets::prelude as spinners;
-
 use super::{NewSessionDialog, FIELD_HELP, HELP_DIALOG_WIDTH};
 use crate::tui::components::{
     focused_input_spans, input_scroll, profile_cycler_spans, render_text_field,
@@ -60,11 +58,6 @@ impl NewSessionDialog {
         self.list_entry_rects.clear();
         self.confirm_create_rects.clear();
         self.hover_rects.clear();
-
-        if self.loading {
-            self.render_loading(frame, area, theme);
-            return;
-        }
 
         if self.sandbox_config_mode {
             self.render_sandbox_config(frame, area, theme);
@@ -700,13 +693,19 @@ impl NewSessionDialog {
         } else {
             2
         };
+        let hook_env_list_height: u16 = if self.hook_env.expanded {
+            (2 + self.hook_env.entries.len() as u16).clamp(4, 8)
+        } else {
+            2
+        };
         let inherited_height: u16 = 2 + self.inherited_settings.len().max(1) as u16;
 
         let constraints = vec![
-            Constraint::Length(2),                // Image
-            Constraint::Length(env_list_height),  // Environment
-            Constraint::Length(inherited_height), // Inherited settings
-            Constraint::Min(1),                   // Hints
+            Constraint::Length(2),                    // Image
+            Constraint::Length(env_list_height),      // Environment
+            Constraint::Length(hook_env_list_height), // Host hook env
+            Constraint::Length(inherited_height),     // Inherited settings
+            Constraint::Min(1),                       // Hints
         ];
 
         let fields_height: u16 = constraints
@@ -771,6 +770,31 @@ impl NewSessionDialog {
         self.sandbox_config_rects.push((1, chunks[ci]));
         ci += 1;
 
+        // Host hook env; at most one list is expanded, so at most one has entry rects.
+        let hook_entry_rects = self.render_list_field(
+            frame,
+            chunks[ci],
+            theme,
+            ListField {
+                label: "Host hook env",
+                unit: "items",
+                hint: " before_start hook only (a)dd (d)el (Enter)edit (Esc)close",
+                empty_hint: "    (press 'a' to add KEY or KEY=VALUE)",
+                entries: &self.hook_env.entries,
+                selected: self.hook_env.selected_index,
+                expanded: self.hook_env.expanded,
+                editing: self.hook_env.editing_input.as_ref(),
+                adding_new: self.hook_env.adding_new,
+                ghost: None,
+                focused: self.sandbox_focused_field == 2,
+            },
+        );
+        if !hook_entry_rects.is_empty() {
+            self.list_entry_rects = hook_entry_rects;
+        }
+        self.sandbox_config_rects.push((2, chunks[ci]));
+        ci += 1;
+
         // Inherited settings (always visible, not focusable)
         self.render_inherited_field(frame, chunks[ci], theme);
         ci += 1;
@@ -786,7 +810,7 @@ impl NewSessionDialog {
         ];
         frame.render_widget(Paragraph::new(Line::from(hint_spans)), chunks[ci]);
 
-        let rects = if self.env_editing_input.is_some() {
+        let rects = if self.env_editing_input.is_some() || self.hook_env.editing_input.is_some() {
             Vec::new()
         } else {
             overlay_hover_rects(&self.list_entry_rects, &self.sandbox_config_rects)
@@ -1221,7 +1245,7 @@ impl NewSessionDialog {
                 "Tool" => has_tool_selection,
                 "YOLO Mode" => !self.selected_tool_always_yolo(),
                 "Sandbox" => has_sandbox,
-                "Image" | "Environment" => show_sandbox_options_help,
+                "Image" | "Environment" | "Host hook env" => show_sandbox_options_help,
                 _ => true,
             };
             if !show {
@@ -1247,134 +1271,5 @@ impl NewSessionDialog {
         ]));
 
         frame.render_widget(Paragraph::new(lines), inner);
-    }
-
-    fn render_loading(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let needs_extra_line = self.sandbox_enabled;
-        let show_hook_output = self.has_hooks;
-        let max_output_lines: usize = 6;
-
-        let dialog_width: u16 = if show_hook_output {
-            70
-        } else if needs_extra_line {
-            55
-        } else {
-            50
-        };
-        let dialog_height: u16 = if show_hook_output {
-            (6 + max_output_lines as u16).min(area.height)
-        } else if needs_extra_line {
-            9
-        } else {
-            7
-        };
-
-        let dialog_area = crate::tui::dialogs::centered_rect(area, dialog_width, dialog_height);
-
-        frame.render_widget(Clear, dialog_area);
-
-        let title = if show_hook_output {
-            " Running Hooks "
-        } else {
-            " Creating Session "
-        };
-
-        let block = crate::tui::dialogs::dialog_block(title, theme);
-
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
-
-        let spinner = spinners::orbit()
-            .set_interval(std::time::Duration::from_millis(400))
-            .current_frame();
-
-        if show_hook_output {
-            let mut lines = vec![];
-
-            let status_text = if let Some(ref cmd) = self.current_hook {
-                let max_cmd_len = (dialog_width as usize).saturating_sub(12);
-                if cmd.len() > max_cmd_len {
-                    let truncated: String =
-                        cmd.chars().take(max_cmd_len.saturating_sub(3)).collect();
-                    format!("{}...", truncated)
-                } else {
-                    cmd.clone()
-                }
-            } else {
-                "Preparing...".to_string()
-            };
-
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!(" {} ", spinner),
-                    Style::default().fg(theme.accent).bold(),
-                ),
-                Span::styled(status_text, Style::default().fg(theme.text)),
-            ]));
-
-            let output_start = self.hook_output.len().saturating_sub(max_output_lines);
-            let visible_lines = &self.hook_output[output_start..];
-            let inner_width = (dialog_width as usize).saturating_sub(6);
-
-            for line in visible_lines {
-                let truncated = if line.len() > inner_width {
-                    let t: String = line.chars().take(inner_width.saturating_sub(3)).collect();
-                    format!("{}...", t)
-                } else {
-                    line.clone()
-                };
-                lines.push(Line::from(Span::styled(
-                    format!("  {}", truncated),
-                    Style::default().fg(theme.dimmed),
-                )));
-            }
-
-            let used = 1 + visible_lines.len();
-            let available = dialog_height.saturating_sub(4) as usize;
-            for _ in used..available {
-                lines.push(Line::from(""));
-            }
-
-            lines.push(Line::from(vec![
-                Span::styled(" Press ", Style::default().fg(theme.dimmed)),
-                Span::styled("Esc", Style::default().fg(theme.hint)),
-                Span::styled(" to cancel", Style::default().fg(theme.dimmed)),
-            ]));
-
-            frame.render_widget(Paragraph::new(lines), inner);
-        } else {
-            let loading_text = if self.sandbox_enabled {
-                "Setting up sandbox..."
-            } else {
-                "Creating session..."
-            };
-
-            let mut lines = vec![
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled(
-                        format!("  {} ", spinner),
-                        Style::default().fg(theme.accent).bold(),
-                    ),
-                    Span::styled(loading_text, Style::default().fg(theme.text)),
-                ]),
-            ];
-
-            if needs_extra_line {
-                lines.push(Line::from(Span::styled(
-                    "    (first time may take a few minutes)",
-                    Style::default().fg(theme.dimmed),
-                )));
-            }
-
-            lines.push(Line::from(""));
-            lines.push(Line::from(vec![
-                Span::styled("  Press ", Style::default().fg(theme.dimmed)),
-                Span::styled("Esc", Style::default().fg(theme.hint)),
-                Span::styled(" to cancel", Style::default().fg(theme.dimmed)),
-            ]));
-
-            frame.render_widget(Paragraph::new(lines), inner);
-        }
     }
 }

@@ -168,10 +168,36 @@ id = "nolabel"
 }
 
 #[test]
+fn runtime_requires_worker_capability() {
+    let runtimes = [
+        "[runtime]\nkind = \"command\"\ncommand = [\"./worker\"]\n",
+        "[runtime]\nkind = \"command\"\nsystem = true\ncommand = [\"worker\"]\n",
+        "[runtime]\nkind = \"release-binary\"\nasset = \"worker-${target}.tar.gz\"\n",
+    ];
+    for version in [2, aoe_plugin_api::API_VERSION] {
+        for runtime in runtimes {
+            for capabilities in ["", "capabilities = []\n", "capabilities = [\"net\"]\n"] {
+                let errors = invalid(version, &format!("{capabilities}{runtime}"));
+                assert!(
+                    errors.iter().any(|error| error.contains("runtime.worker")),
+                    "version {version}, {capabilities}{runtime}: {errors:?}"
+                );
+            }
+            parse(
+                version,
+                &format!("capabilities = [\"runtime.worker\"]\n{runtime}"),
+            );
+        }
+    }
+    parse(2, "capabilities = [\"runtime.worker\"]\n");
+}
+
+#[test]
 fn runtime_specs_parse() {
     let m = parse(
         2,
-        r#"[runtime]
+        r#"capabilities = ["runtime.worker"]
+[runtime]
 kind = "command"
 command = [".venv/bin/worker"]
 
@@ -199,7 +225,7 @@ platforms = ["linux", "macos"]
 
     let m = parse(
         2,
-        "[runtime]\nkind = \"release-binary\"\nasset = \"thing-${target}.tar.gz\"\nbin = \"thing\"\n",
+        "capabilities = [\"runtime.worker\"]\n[runtime]\nkind = \"release-binary\"\nasset = \"thing-${target}.tar.gz\"\nbin = \"thing\"\n",
     );
     let Some(RuntimeSpec::ReleaseBinary { asset, bin }) = m.runtime else {
         panic!("expected release-binary runtime");
@@ -209,7 +235,7 @@ platforms = ["linux", "macos"]
 
     parse(
         2,
-        "[runtime]\nkind = \"command\"\ncommand = [\"uv\", \"run\", \"worker\"]\nsystem = true\n",
+        "capabilities = [\"runtime.worker\"]\n[runtime]\nkind = \"command\"\ncommand = [\"uv\", \"run\", \"worker\"]\nsystem = true\n",
     );
     let m = parse(
         5,

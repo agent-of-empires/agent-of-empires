@@ -359,25 +359,38 @@ function sendButtonClass(disabled: boolean, extra = "") {
   ].join(" ");
 }
 
-/** Stays clickable while disconnected: `sendPrompt` queues until the session resumes. */
+/** Remains clickable while disconnected so `sendPrompt` can queue the message. */
 export function SendButton({
   connected = true,
   disabled = false,
+  waitingFor = null,
+  connecting = false,
   onSend,
 }: {
   connected?: boolean;
   disabled?: boolean;
+  /** For a Session that has never started: the Agent it waits for. */
+  waitingFor?: string | null;
+  /** The Worker is running; only the connection is down. */
+  connecting?: boolean;
   onSend: () => void;
 }) {
+  const disconnectedLabel = waitingFor
+    ? `Pending until ${waitingFor} is ready`
+    : connecting
+      ? "Send while disconnected"
+      : "Queue message until session resumes";
   const title = disabled
     ? "Type a message to send"
     : connected
       ? "Send, Enter"
-      : "Session not active, will send on resume";
+      : waitingFor || connecting
+        ? disconnectedLabel
+        : "Session not active, will send on resume";
   return (
     <button
       type="button"
-      aria-label={connected ? "Send message" : "Queue message until session resumes"}
+      aria-label={connected ? "Send message" : disconnectedLabel}
       title={title}
       onClick={onSend}
       disabled={disabled}
@@ -415,25 +428,38 @@ export function StopButton() {
 export function QueueSendButton({
   connected,
   steering,
+  waitingFor = null,
+  connecting = false,
   disabled = false,
   onSend,
 }: {
   connected: boolean;
   steering: boolean;
+  waitingFor?: string | null;
+  connecting?: boolean;
   disabled?: boolean;
   onSend: () => void;
 }) {
+  const pendingLabel = connected
+    ? null
+    : waitingFor
+      ? `Pending until ${waitingFor} is ready`
+      : connecting
+        ? "Queue follow-up while disconnected, Enter"
+        : null;
   const title = disabled
     ? "Type a message to queue"
     : !connected
-      ? "Queue follow-up, will send on resume, Enter"
+      ? (pendingLabel ?? "Queue follow-up, will send on resume, Enter")
       : steering
         ? "Send into the current turn, Enter"
         : "Queue follow-up (sent when current turn ends), Enter";
   return (
     <button
       type="button"
-      aria-label={connected && steering ? "Send message into the current turn" : "Queue follow-up message"}
+      aria-label={
+        connected && steering ? "Send message into the current turn" : (pendingLabel ?? "Queue follow-up message")
+      }
       {...tourAnchor(TOUR_ANCHORS.queueSend)}
       title={title}
       onClick={onSend}

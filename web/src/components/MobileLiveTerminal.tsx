@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, RefObject } from "react";
 import type { AnsiSegment } from "../lib/ansi";
-import { LineParseCache, lineText, textWidth, wrapLine } from "../lib/liveTermLines";
+import { LineParseCache, linkifyLine, lineText, textWidth, wrapLine } from "../lib/liveTermLines";
 import { cursorLineIndex, pointerPaneCell, unwrapPointer } from "../lib/liveMouse";
 import type { LiveFrame, LiveStats } from "../hooks/useLiveTerminal";
 import { useWebSettings } from "../hooks/useWebSettings";
@@ -16,6 +16,8 @@ import {
   type RowLayout,
 } from "./live-terminal/pacing";
 import { FORWARD_TOUCH_GAIN, useForwardInput } from "./live-terminal/useForwardInput";
+import { ForwardScrollbar } from "./live-terminal/ForwardScrollbar";
+import { FORWARD_SCROLLBAR_WIDTH_PX, forwardPageNotches } from "../lib/forwardScrollbar";
 import { Row } from "./live-terminal/TermRow";
 import { LIVE_WINDOW_SCREENS, useLiveEdgeScroll } from "./live-terminal/useLiveEdgeScroll";
 import { useTerminalInput } from "./live-terminal/useTerminalInput";
@@ -45,6 +47,7 @@ const TAP_MAX_MS = 350;
 const LIVE_DEBUG = typeof location !== "undefined" && new URLSearchParams(location.search).has("livedebug");
 
 export interface MobileLiveTerminalProps {
+  readOnly: boolean;
   frame: LiveFrame | null;
   /** Wire counters for the `?livedebug=1` overlay. */
   liveStats?: LiveStats;
@@ -64,7 +67,9 @@ export interface MobileLiveTerminalProps {
   sendData: (data: string) => boolean;
   sendPaste: (text: string, submit: boolean) => boolean;
   /** Uploads a pasted image and resolves to a path the pane can read, or null. */
-  uploadPastedImage: (file: File) => Promise<string | null>;
+  uploadPastedImage: (file: File, canWrite: () => boolean) => Promise<string | null>;
+  /** Captures this gesture's policy/terminal identity before any asynchronous work. */
+  captureWriteAdmission: () => () => boolean;
   forwardWheel: (up: boolean, sgr: boolean, col: number, row: number) => void;
   forwardButton: (
     baseButton: number,
@@ -110,6 +115,7 @@ function pushFlickSample(samples: FlickSample[], sample: FlickSample) {
 }
 
 export function MobileLiveTerminal({
+  readOnly,
   frame: streamFrame,
   liveStats,
   transport,
@@ -125,6 +131,7 @@ export function MobileLiveTerminal({
   sendData: sendDataRaw,
   sendPaste,
   uploadPastedImage,
+  captureWriteAdmission,
   forwardWheel,
   forwardButton,
   ctrlActiveRef,
@@ -207,7 +214,7 @@ export function MobileLiveTerminal({
       let wrapped = wrapCache.get(line);
       if (!wrapped || wrapped.cols !== cols) {
         // Plain text, so the anchor matches a line whichever producer encoded its style.
-        wrapped = { cols, rows: wrapLine(line, cols), key: lineText(line).trimEnd() };
+        wrapped = { cols, rows: wrapLine(linkifyLine(line), cols), key: lineText(line).trimEnd() };
         wrapCache.set(line, wrapped);
       }
       lineStartRow[i] = rows.length;
@@ -224,7 +231,7 @@ export function MobileLiveTerminal({
   const spacerLines = Math.max(0, (frame?.history ?? 0) - Math.max(0, lines.length - screenRows));
   // A full-screen mouse app's scrollback is not capturable: no spacer, no native scroll, wheels go to the app.
   const altScreen = frame?.altScreen ?? false;
-  const forwardMode = altScreen && (frame?.mouse ?? false);
+  const forwardMode = !readOnly && altScreen && (frame?.mouse ?? false);
   const effectiveSpacerLines = forwardMode ? 0 : spacerLines;
   // Gestures yield to a selection so WebKit can drag its handles; the layout keeps `forwardMode` so row keys hold.
   const { forwardModeRef, mouseSgrRef } = useTerminalGestureBoundary({
@@ -233,6 +240,8 @@ export function MobileLiveTerminal({
     mouseSgr: frame?.mouseSgr ?? false,
   });
   const forwardGestures = forwardMode && !selectionHeld;
+  // Reserved on `forwardMode`, not `forwardGestures`, so a selection never resizes the pane.
+  const showScrollbar = settings.showForwardScrollbar && forwardMode && !coarse;
   const touchForwardYRef = useRef<number | null>(null);
   // WebKit may synthesize a click after a custom forward-mode drag; a moved touch must not raise the keyboard.
   const touchStartRef = useRef<{ x: number; y: number; t: number } | null>(null);
@@ -338,6 +347,7 @@ export function MobileLiveTerminal({
 
   // A tap raises the keyboard; focus() must stay synchronous for iOS. A click ending a selection is left alone.
   const focusInputOnTap = useCallback(() => {
+    if (readOnly) return;
     if (suppressTouchClickRef.current) {
       suppressTouchClickRef.current = false;
       return;
@@ -346,7 +356,7 @@ export function MobileLiveTerminal({
     const sel = window.getSelection();
     if (sel && !sel.isCollapsed) return;
     inputRef.current?.focus();
-  }, [inputRef]);
+  }, [inputRef, readOnly]);
 
   // A viewport point as a 1-based pane-0 cell, measured from the (possibly bottom-aligned) rendered content.
   const pointerCell = useCallback(
@@ -381,6 +391,11 @@ export function MobileLiveTerminal({
     [frame?.pane0?.rows],
   );
 
+  const inputPaneMiddleCol = useCallback(
+    () => Math.max(1, Math.round((frame?.pane0?.cols ?? renderCols) / 2)),
+    [frame?.pane0?.cols, renderCols],
+  );
+
   const forward = useForwardInput({
     streamFrame,
     lineH,
@@ -389,12 +404,17 @@ export function MobileLiveTerminal({
     mouseSgrRef,
     pointerCell,
     inputPaneMiddleRow,
+    inputPaneMiddleCol,
     forwardWheel,
     forwardButton,
     inputRef,
     armAgentClipboard,
   });
   const { wheelAccumRef, enqueueTouchWheelDelta, cancelTouchWheelQueue, startMomentum, stopMomentum } = forward;
+  const pageNotches = useCallback(
+    () => forwardPageNotches(frame?.pane0?.rows ?? rowsRef.current),
+    [frame?.pane0?.rows],
+  );
   // Recent drag samples for the release velocity.
   const flickSamplesRef = useRef<FlickSample[]>([]);
   // Every input path funnels through here, so typing interrupts a coast instead of queueing behind it.
@@ -662,6 +682,7 @@ export function MobileLiveTerminal({
     sendData,
     sendPaste,
     uploadPastedImage,
+    captureWriteAdmission,
   });
 
   const cursorRow = connected && !reading ? live.row : -1;
@@ -690,11 +711,12 @@ export function MobileLiveTerminal({
         onTouchCancel={onTouchCancel}
         // Insets, not padding: padding would inflate clientWidth/clientHeight and over-count the grid sent to tmux.
         // The desktop side inset keeps column 0 clear of the parent's 1px pane frame; touch draws no frame.
-        className={`absolute ${coarse ? "inset-x-[2px]" : "inset-x-[6px]"} top-0 bottom-[8px] font-mono flex flex-col ${
+        className={`absolute ${coarse ? "inset-x-[2px]" : showScrollbar ? "left-[6px]" : "inset-x-[6px]"} top-0 bottom-[8px] font-mono flex flex-col ${
           forwardMode ? "overflow-hidden" : "overflow-y-auto overflow-x-clip"
         }`}
         style={
           {
+            right: showScrollbar ? 6 + FORWARD_SCROLLBAR_WIDTH_PX + 2 : undefined,
             fontSize: `${fontSize}px`,
             fontFamily,
             lineHeight: `${lineH}px`,
@@ -747,6 +769,15 @@ export function MobileLiveTerminal({
         </div>
       </div>
 
+      {showScrollbar && (
+        <ForwardScrollbar
+          disabled={selectionHeld}
+          pageNotches={pageNotches}
+          scrollNotches={forward.scrollNotches}
+          cancelScroll={cancelTouchWheelQueue}
+        />
+      )}
+
       {LIVE_DEBUG && (
         <div
           aria-hidden="true"
@@ -789,6 +820,7 @@ export function MobileLiveTerminal({
       <textarea
         ref={inputRef}
         aria-label="Live terminal input"
+        readOnly={readOnly}
         className="absolute bottom-2 left-2 w-px h-px opacity-0"
         // iOS draws the caret ignoring opacity; caret-color hides it.
         style={{ fontSize: "16px", caretColor: "transparent", color: "transparent" }}

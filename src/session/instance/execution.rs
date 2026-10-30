@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use super::Held;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConversationProvenance {
@@ -192,6 +194,47 @@ pub(crate) fn attest_observed_default_store(
     true
 }
 
+/// A Claude `--store` must be the config root holding the transcript. When it
+/// does not, a `projects` directory (or `projects/<encoded cwd>`) is the likely
+/// mistake, so the error names the root to use instead.
+fn ensure_claude_store_root(
+    store: &std::path::Path,
+    cwd: &std::path::Path,
+    sid: &str,
+) -> Result<()> {
+    let store = crate::session::capture::canonicalize_or_raw(store);
+    let store = store.as_path();
+    if !crate::session::capture::claude_host_transcript_confirmed_absent(
+        &cwd.to_string_lossy(),
+        sid,
+        &[],
+        Some(store),
+    ) {
+        return Ok(());
+    }
+    let named_projects = |p: Option<&std::path::Path>| {
+        p.and_then(std::path::Path::file_name)
+            .is_some_and(|n| n == "projects")
+    };
+    let root = if named_projects(Some(store)) {
+        store.parent()
+    } else if named_projects(store.parent()) {
+        store.parent().and_then(std::path::Path::parent)
+    } else {
+        None
+    };
+    match root {
+        Some(root) => anyhow::bail!(
+            "--store must be the Claude config root (the directory containing projects/), not a projects subdirectory; use {}",
+            root.display()
+        ),
+        None => anyhow::bail!(
+            "no transcript for this conversation under {}/projects; --store must be the Claude config root (the directory containing projects/)",
+            store.display()
+        ),
+    }
+}
+
 /// Whether a reserved (`Preallocated`) Claude id has its transcript in the
 /// binding's own store, which proves it names a resumable conversation.
 ///
@@ -353,7 +396,7 @@ pub(crate) enum CaptureContext {
     PrimeStatus(crate::process::prime::PrimeRuntime),
 }
 
-use super::{Instance, ResumeIntent};
+use super::{Instance, ManagedResumeCause, ResumeIntent};
 use crate::agents::{AgentDef, AGENTS};
 use crate::session::fork::ForkParentRef;
 use anyhow::{bail, Context, Result};
@@ -1686,9 +1729,13 @@ impl Instance {
         command: &str,
         config: &crate::session::config::SessionConfig,
     ) -> Result<&'static AgentDef> {
-        anyhow::ensure!(!Self::contains_active_shell_syntax(command),
-            "managed conversation requires a direct native command or an explicitly declared wrapper");
-        let words = shell_words::split(command)?;
+        if Self::contains_active_shell_syntax(command) {
+            return Err(anyhow::anyhow!(
+                "managed conversation requires a direct native command or an explicitly declared wrapper"
+            ).context(ManagedResumeCause::UnsupportedManagedArguments));
+        }
+        let words =
+            shell_words::split(command).context(ManagedResumeCause::UnsupportedManagedArguments)?;
         let program = words.first().context("empty agent command")?;
         let direct = AGENTS.iter().find(|agent| agent.binary == program);
         let declared = config
@@ -1701,7 +1748,8 @@ impl Instance {
             .transpose()?;
         let logical = crate::agents::get_agent(tool);
         let actual = direct.or(declared).context(
-            "wrapper execution identity is unknown: set session.agent_execution_as and session.agent_config_dir; agent_detect_as is only status detection")?;
+            "wrapper execution identity is unknown: set session.agent_execution_as and session.agent_config_dir; agent_detect_as is only status detection")
+            .context(ManagedResumeCause::WrapperContractRequired)?;
         anyhow::ensure!(
             logical.is_none_or(|logical| logical.name == actual.name)
                 && declared.is_none_or(|declared| declared.name == actual.name),
@@ -1717,10 +1765,12 @@ impl Instance {
                     .any(|agent| Some(agent.binary) == basename && agent.name != actual.name),
                 "wrapper command names a different native agent"
             );
-            anyhow::ensure!(
-                config.agent_config_dir.contains_key(tool),
-                "wrapper requires an explicit session.agent_config_dir namespace"
-            );
+            if !config.agent_config_dir.contains_key(tool) {
+                return Err(anyhow::anyhow!(
+                    "wrapper requires an explicit session.agent_config_dir namespace"
+                )
+                .context(ManagedResumeCause::WrapperContractRequired));
+            }
         }
         Ok(actual)
     }
@@ -1731,13 +1781,19 @@ impl Instance {
         } else {
             self.extra_args.clone()
         };
-        anyhow::ensure!(
-            !Self::contains_active_shell_syntax(&extra),
-            "managed conversation cannot use active shell syntax in arguments"
+        if Self::contains_active_shell_syntax(&extra) {
+            return Err(anyhow::anyhow!(
+                "managed conversation cannot use active shell syntax in arguments"
+            )
+            .context(ManagedResumeCause::UnsupportedManagedArguments));
+        }
+        let mut words = shell_words::split(self.get_tool_command())
+            .context(ManagedResumeCause::UnsupportedManagedArguments)?;
+        words.extend(
+            shell_words::split(&extra).context(ManagedResumeCause::UnsupportedManagedArguments)?,
         );
-        let mut words = shell_words::split(self.get_tool_command())?;
-        words.extend(shell_words::split(&extra)?);
         validate_managed_arguments(agent, &words[1..])
+            .context(ManagedResumeCause::UnsupportedManagedArguments)
     }
 
     pub(super) fn resolve_native_execution(
@@ -2004,30 +2060,35 @@ impl Instance {
                 })?;
                 let mut store = root.clone();
                 if let Some((sid, binding, explicit)) = target {
-                    if let Some(binding) = binding.filter(|binding| binding.session_id == sid) {
-                        if let Some(file) = &binding.transcript_path {
-                            anyhow::ensure!(binding.execution.as_ref().is_some_and(|source| source.filesystem == "host"), "Pi transcript filesystem is unsupported");
-                            let native = inputs.native_transcript_path(file, &root)?;
-                            let parent = native.parent().context("Pi transcript has no parent directory")?;
-                            anyhow::ensure!(native.starts_with(&root) && (!custom || parent == root), "Pi transcript does not belong to the configured session directory");
-                            let directory = crate::session::AnchoredDir::open(file.parent().context("Pi transcript has no parent")?)?;
-                            match directory.regular_lookup(std::path::Path::new(file.file_name().context("Pi transcript has no filename")?))? {
-                                Some(true) => {
-                                    let (header_sid, _) = crate::session::capture::extract_pi_header_fields(file).context("Pi transcript has no readable session header")?;
-                                    anyhow::ensure!(header_sid.as_deref() == Some(sid), "Pi transcript names a different conversation");
-                                    pi_transcript_path = Some(native.to_str().context("Pi transcript path is not UTF-8")?.to_owned());
-                                }
-                                None => anyhow::ensure!(!explicit && file.file_name().and_then(|name| name.to_str()).and_then(|name| name.rsplit_once('_')).and_then(|(_, tail)| tail.strip_suffix(".jsonl")) == Some(sid), "explicit Pi resume requires a materialized transcript"),
-                                Some(false) => anyhow::bail!("Pi transcript is not a regular file"),
+                    let binding = binding.filter(|binding| binding.session_id == sid);
+                    let bound = binding.and_then(|binding| binding.transcript_path.clone());
+                    let file = bound.clone().or_else(|| {
+                        (!explicit && inputs.container.is_none())
+                            .then(|| crate::session::capture::find_pi_transcript(&root, sid, !custom))
+                            .flatten()
+                    });
+                    if let Some(file) = &file {
+                        anyhow::ensure!(bound.is_none() || binding.is_some_and(|binding| binding.execution.as_ref().is_some_and(|source| source.filesystem == "host")), "Pi transcript filesystem is unsupported");
+                        let native = inputs.native_transcript_path(file, &root)?;
+                        let parent = native.parent().context("Pi transcript has no parent directory")?;
+                        anyhow::ensure!(native.starts_with(&root) && (!custom || parent == root), "Pi transcript does not belong to the configured session directory");
+                        let directory = crate::session::AnchoredDir::open(file.parent().context("Pi transcript has no parent")?)?;
+                        match directory.regular_lookup(std::path::Path::new(file.file_name().context("Pi transcript has no filename")?))? {
+                            Some(true) => {
+                                let (header_sid, _) = crate::session::capture::extract_pi_header_fields(file).context("Pi transcript has no readable session header")?;
+                                anyhow::ensure!(header_sid.as_deref() == Some(sid), "Pi transcript names a different conversation");
+                                pi_transcript_path = Some(native.to_str().context("Pi transcript path is not UTF-8")?.to_owned());
                             }
-                            store = parent.to_path_buf();
-                            if session_dir.is_none() {
-                                namespace_arguments.extend(["--session-dir".into(), store.to_str().context("Pi store path is not UTF-8")?.into()]);
-                            }
-                        } else {
-                            anyhow::ensure!(!explicit && binding.provenance == ConversationProvenance::Preallocated,
-                                "Pi resume requires its exact transcript path; rebind with aoe session set-session-id and --store pointing to the transcript");
+                            None => anyhow::ensure!(!explicit && file.file_name().and_then(|name| name.to_str()).and_then(|name| name.rsplit_once('_')).and_then(|(_, tail)| tail.strip_suffix(".jsonl")) == Some(sid), "explicit Pi resume requires a materialized transcript"),
+                            Some(false) => anyhow::bail!("Pi transcript is not a regular file"),
                         }
+                        store = parent.to_path_buf();
+                        if session_dir.is_none() {
+                            namespace_arguments.extend(["--session-dir".into(), store.to_str().context("Pi store path is not UTF-8")?.into()]);
+                        }
+                    } else if let Some(binding) = binding {
+                        anyhow::ensure!(!explicit && binding.provenance == ConversationProvenance::Preallocated,
+                            "Pi resume requires its exact transcript path; rebind with aoe session set-session-id and --store pointing to the transcript");
                     }
                 }
                 pi_root = Some(if namespace_arguments.is_empty() { root } else { store.clone() });
@@ -2537,6 +2598,7 @@ pub(super) fn validate_managed_arguments(
                     "--dangerously-skip-permissions",
                     "--allow-dangerously-skip-permissions",
                     "--verbose",
+                    "--strict-mcp-config",
                 ],
             ),
             "codex" => (
@@ -2556,6 +2618,7 @@ pub(super) fn validate_managed_arguments(
                     "--yolo",
                     "--search",
                     "--no-alt-screen",
+                    "--no-daemon",
                     "--verbose",
                 ],
             ),
@@ -2617,7 +2680,19 @@ pub(super) fn validate_managed_arguments(
                 ],
             ),
         };
-        if values.contains(&key) {
+        if agent.name == "claude" && key == "--mcp-config" {
+            anyhow::ensure!(
+                inline.is_none_or(|value| !value.is_empty() && !value.starts_with('-')),
+                "Claude MCP configuration is missing its value"
+            );
+            let mut has_value = inline.is_some();
+            while let Some(value) = words.get(index + 1).filter(|value| !value.starts_with('-')) {
+                anyhow::ensure!(!value.is_empty(), "Claude MCP configuration is empty");
+                index += 1;
+                has_value = true;
+            }
+            anyhow::ensure!(has_value, "Claude MCP configuration is missing its value");
+        } else if values.contains(&key) {
             anyhow::ensure!(
                 agent.name != "prime-agent" || inline.is_none(),
                 "Prime options require a separate value"
@@ -2763,7 +2838,7 @@ impl Instance {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ConversationState {
     pub(crate) tool: String,
     pub(crate) session_id: Option<String>,
@@ -2925,6 +3000,7 @@ impl Instance {
                 store.is_absolute(),
                 "--store must be an absolute native store path"
             );
+            ensure_claude_store_root(store, &execution.cwd, sid)?;
             *primary = crate::session::capture::canonicalize_or_raw(
                 store.to_str().context("store path must be UTF-8")?,
             );
@@ -2945,7 +3021,8 @@ impl Instance {
     }
 
     pub(crate) fn adopt_conversation_state(&mut self, state: ConversationState) {
-        self.settle_poller_for(state.active.as_ref());
+        self.capture_poller
+            .settle(Held::new(&self.tool, state.active.as_ref()));
         self.set_agent_conversation(state.session_id, state.binding, state.pi_session_path);
         self.resume_intent = state.intent;
         self.resume_binding = state.resume_binding;
@@ -2959,7 +3036,8 @@ impl Instance {
     /// other launch's file. A poller for another execution is stopped here; the repair walk
     /// installs one for this pane once the relaunch that stamped it says the pane is new.
     pub(crate) fn adopt_active_execution(&mut self, src: &Self) {
-        self.settle_poller_for(src.active_execution.as_ref());
+        self.capture_poller
+            .settle(Held::new(&self.tool, src.active_execution.as_ref()));
         self.active_execution = src.active_execution.clone();
     }
 
@@ -2984,6 +3062,53 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_store_must_be_the_config_root_holding_the_transcript() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let sid = "11111111-2222-3333-4444-555555555555";
+        let encoded = crate::session::capture::encode_claude_project_path(
+            &crate::session::capture::canonicalize_or_raw(cwd.path()).to_string_lossy(),
+        );
+        let canonical = crate::session::capture::canonicalize_or_raw(root.path());
+        let projects = root.path().join("projects");
+        let project_dir = projects.join(&encoded);
+        let check = |store: &std::path::Path| ensure_claude_store_root(store, cwd.path(), sid);
+
+        let missing = check(root.path()).unwrap_err().to_string();
+        assert!(missing.contains("no transcript"), "{missing}");
+
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(project_dir.join(format!("{sid}.jsonl")), "{}\n").unwrap();
+        check(root.path()).unwrap();
+
+        for wrong in [&projects, &project_dir] {
+            let err = check(wrong).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("use {}", canonical.display())),
+                "{err}"
+            );
+        }
+
+        // A symlink to the projects dir is judged by where it resolves.
+        #[cfg(unix)]
+        {
+            let link = root.path().join("link");
+            std::os::unix::fs::symlink(&projects, &link).unwrap();
+            let err = check(&link).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("use {}", canonical.display())),
+                "{err}"
+            );
+        }
+
+        // A projects dir that really holds the transcript is a working root.
+        let nested = project_dir.join("projects").join(&encoded);
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join(format!("{sid}.jsonl")), "{}\n").unwrap();
+        check(&project_dir).unwrap();
+    }
 
     #[cfg(unix)]
     #[test]
@@ -3352,6 +3477,66 @@ mod tests {
             opencode_session_row(&store, "legacy-only", SessionV2).is_err(),
             "a missing active table must not select the surviving inactive one"
         );
+    }
+
+    #[test]
+    fn claude_mcp_arguments_preserve_native_selector_admission() {
+        let claude = crate::agents::get_agent("claude").unwrap();
+        for (args, accepted) in [
+            ("--mcp-config first.json", true),
+            ("--mcp-config first.json second.json --model sonnet", true),
+            ("--mcp-config=first.json second.json", true),
+            ("--mcp-config first.json --mcp-config second.json", true),
+            (
+                "--strict-mcp-config --mcp-config '{\"mcpServers\":{}}'",
+                true,
+            ),
+            ("--mcp-config", false),
+            ("--mcp-config --model sonnet", false),
+            ("--mcp-config=", false),
+            ("--mcp-config first.json --resume foreign", false),
+            ("--mcp-config first.json --session-id foreign", false),
+            ("--mcp-config first.json --settings foreign.json", false),
+            ("--mcp-config first.json -- --resume foreign", false),
+            ("--strict-mcp-config=true", false),
+        ] {
+            assert_eq!(
+                validate_managed_arguments(claude, &shell_words::split(args).unwrap()).is_ok(),
+                accepted,
+                "{args}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn claude_mcp_resume_keeps_the_recorded_execution_namespace() {
+        use crate::session::instance::test_helpers::{seed_claude_transcript, tool_instance};
+        let root = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(root.path());
+        let _env = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        let _agent = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "claude",
+            "#!/bin/sh\nexit 97\n",
+        );
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let sid = "11111111-2222-4333-8444-555555555555";
+        let mut instance = tool_instance("claude", project.to_str().unwrap());
+        seed_claude_transcript(&mut instance, sid);
+        let original = instance.agent_session_binding.clone().unwrap();
+        instance.extra_args =
+            "--strict-mcp-config --mcp-config first.json '{\"mcpServers\":{}}'".into();
+        let execution = instance
+            .resolve_native_execution(instance.conversation_target())
+            .unwrap();
+        assert!(Instance::execution_identity_matches(
+            original.execution.as_ref().unwrap(),
+            &execution.binding,
+        ));
+        assert_eq!(execution.target_session_id.as_deref(), Some(sid));
+        assert_eq!(instance.agent_session_binding, Some(original));
     }
 
     #[test]
@@ -3774,6 +3959,33 @@ mod tests {
     }
 
     #[test]
+    fn hermes_yaml_aliases_and_merges_preserve_namespace_refusals() {
+        let (root, mut inputs, _database) = hermes_fixture();
+        inputs.environment.insert(
+            "HERMES_MANAGED_DIR".into(),
+            root.path().join("managed").display().to_string(),
+        );
+        for (config, accepted) in [
+            ("terminal: {backend: local, cwd: '.'}\n", true),
+            ("remote: &remote {backend: ssh}\nterminal: *remote\n", false),
+            ("remote: &remote {backend: ssh}\nterminal: {<<: *remote}\n", false),
+            ("remote: &remote {backend: ssh}\nterminal: {<<: *remote, backend: local}\n", true),
+            ("local: &local {backend: local}\nremote: &remote {backend: ssh}\nterminal: {<<: [*local, *remote]}\n", true),
+            ("local: &local {backend: local}\nremote: &remote {backend: ssh}\nterminal: {<<: [*remote, *local]}\n", false),
+            ("outside: &outside {cwd: /foreign-store}\nterminal: {<<: *outside, backend: local}\n", false),
+            ("external: &external {enabled: true}\nsecrets: {vault: *external}\n", false),
+            ("secrets: {vault: {enabled: True}}\n", false),
+            ("secrets: {vault: {enabled: 'true'}}\n", true),
+            ("secrets: {vault: {enabled: false}}\n", true),
+            ("terminal: {<<: 17}\n", false),
+            ("terminal: [", false),
+        ] {
+            std::fs::write(root.path().join("config.yaml"), config).unwrap();
+            assert_eq!(inputs.validate_hermes_namespace(root.path()).is_ok(), accepted, "{config:?}");
+        }
+    }
+
+    #[test]
     fn hermes_native_lineage_preserves_selection_and_conversation_boundaries() {
         for (name, requested, sql, expected) in [
             ("compression priority", "S", "INSERT INTO sessions(id,parent_session_id,end_reason,started_at) VALUES ('S',NULL,'compression',1),('A','S','compression',2),('B','S',NULL,4),('T','A',NULL,3),('foreign',NULL,NULL,100); INSERT INTO messages VALUES ('B',99),('T',3),('foreign',100);", Some("T")),
@@ -3932,6 +4144,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn managed_codex_no_daemon_does_not_admit_context_overrides() {
+        let agent = crate::agents::get_agent("codex").unwrap();
+        for (arguments, allowed) in [
+            ("--no-daemon", true),
+            ("--no-daemon=true", false),
+            ("-- 'prompt'", false),
+            ("resume --last", false),
+            ("fork --last", false),
+            ("-C outside", false),
+            ("--remote=ws://localhost:9000", false),
+        ] {
+            let words = shell_words::split(arguments).unwrap();
+            assert_eq!(
+                validate_managed_arguments(agent, &words).is_ok(),
+                allowed,
+                "{arguments}"
+            );
+        }
+    }
+
     /// A recorded id must reach `terminal_fork_seed` whatever evidence stands
     /// behind it: a binding a migration left unattributed forks on the row's
     /// own agent, while a binding a degraded launch dropped is still refused as
@@ -4055,5 +4288,73 @@ mod tests {
             .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
             .map(|(_, value)| value.as_deref());
         assert_eq!(routed, Some(resolved.to_str()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pi_row_without_a_recorded_path_resumes_from_the_transcript_found_by_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _pi = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "pi",
+            "#!/bin/sh\nexit 0\n",
+        );
+        std::fs::create_dir_all(temp.path().join("pi-agent")).unwrap();
+        let agent_dir = temp.path().join("pi-agent").canonicalize().unwrap();
+        let sid = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+        let store = agent_dir.join("sessions/--moved-project--");
+        std::fs::create_dir_all(&store).unwrap();
+        let transcript = store.join(format!("2026-01-01T00-00-00-000Z_{sid}.jsonl"));
+        std::fs::write(
+            &transcript,
+            format!("{}\n", serde_json::json!({"type": "session", "id": sid})),
+        )
+        .unwrap();
+        let profile = "pi-transcript-by-id";
+        let path =
+            crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "[session.agent_config_dir]\npi = {:?}\n",
+                agent_dir.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(profile);
+        let mut inst = Instance::new("pi-by-id", temp.path().to_str().unwrap());
+        inst.source_profile = profile.into();
+        inst.tool = "pi".into();
+
+        let native = inst
+            .resolve_native_execution(Some((sid, None, false)))
+            .unwrap();
+        assert_eq!(
+            native.pi_transcript_path.as_deref(),
+            transcript.to_str(),
+            "the row owns an id and no path: the transcript is found by id"
+        );
+        assert!(native
+            .namespace_arguments
+            .windows(2)
+            .any(|pair| pair[0] == "--session-dir" && pair[1] == store.to_str().unwrap()));
+
+        let migrated = ConversationBinding::unknown(sid);
+        let native = inst
+            .resolve_native_execution(Some((sid, Some(&migrated), false)))
+            .unwrap();
+        assert_eq!(
+            native.pi_transcript_path.as_deref(),
+            transcript.to_str(),
+            "a migrated id-only binding has no execution; the discovered host transcript still resumes"
+        );
+
+        let unknown = "bbbbbbbb-1111-4111-8111-bbbbbbbbbbbb";
+        let fresh = inst
+            .resolve_native_execution(Some((unknown, None, false)))
+            .unwrap();
+        assert_eq!(fresh.pi_transcript_path, None, "no transcript, no selector");
     }
 }

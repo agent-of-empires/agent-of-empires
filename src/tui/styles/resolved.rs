@@ -257,14 +257,21 @@ fn web_projection(theme: &Theme, appearance: ThemeAppearance) -> CssVarProjectio
     css.insert("--color-text-secondary".into(), hex(theme.hint));
     css.insert("--color-text-muted".into(), hex(theme.hint));
     css.insert("--color-text-dim".into(), hex(theme.dimmed));
-    // Dimmed lifted to body-text AA on surface-900, -850 and the modal surface-800,
-    // for small text that cannot use the raw slot.
+    // Dimmed lifted to body-text AA on surface-900, -850, the modal surface-800, the
+    // code-block surface-950 and the startup error banner's tint, for small text that
+    // cannot use the raw slot.
     css.insert(
         "--color-text-subtle".into(),
         hex(lift_until(
             theme.dimmed,
             bg,
-            &[bg, elevated_1, elevated_2],
+            &[
+                bg,
+                elevated_1,
+                elevated_2,
+                deeper,
+                composite(theme.error, bg, 0.1),
+            ],
             TEXT_CONTRAST_RATIO,
         )),
     );
@@ -280,13 +287,18 @@ fn web_projection(theme: &Theme, appearance: ThemeAppearance) -> CssVarProjectio
     css.insert("--color-status-idle".into(), hex(theme.idle));
     css.insert("--color-status-unread".into(), hex(theme.unread));
     css.insert("--color-status-error".into(), hex(theme.error));
-    // Some theme reds are a hue, not readable text, on the surfaces below.
+    css.insert(
+        "--color-text-on-status-error".into(),
+        hex(readable_on(theme.error)),
+    );
+    // Some theme reds are a hue, not readable text, on the surfaces below. The
+    // last is the startup error banner's `bg-status-error/10` tint.
     css.insert(
         "--color-status-error-text".into(),
         hex(lift_until(
             theme.error,
             bg,
-            &[bg, elevated_1],
+            &[bg, elevated_1, composite(theme.error, bg, 0.1)],
             TEXT_CONTRAST_RATIO,
         )),
     );
@@ -597,6 +609,15 @@ mod tests {
                 contrast_ratio(var("--color-text-on-brand"), var("--color-brand-600")) >= 4.5,
                 "{name}: color-text-on-brand must remain readable on brand-600"
             );
+            // The startup error surfaces' primary button: label on a solid error fill,
+            // the same at rest and on hover.
+            assert!(
+                contrast_ratio(
+                    var("--color-text-on-status-error"),
+                    var("--color-status-error")
+                ) >= TEXT_CONTRAST_RATIO,
+                "{name}: color-text-on-status-error must remain readable on status-error"
+            );
             // Status error text, and the session notices strip's body text, sit on
             // these solid surfaces.
             for fg in [
@@ -612,6 +633,29 @@ mod tests {
                     );
                 }
             }
+            // The startup error banner's text, on its tint and on its code and log blocks.
+            let tint = composite(var("--color-status-error"), var("--color-surface-900"), 0.1);
+            for (fg, surface, label) in [
+                ("--color-text-primary", tint, "bg-status-error/10"),
+                ("--color-text-subtle", tint, "bg-status-error/10"),
+                ("--color-status-error-text", tint, "bg-status-error/10"),
+                (
+                    "--color-text-primary",
+                    var("--color-surface-950"),
+                    "surface-950",
+                ),
+                (
+                    "--color-text-subtle",
+                    var("--color-surface-950"),
+                    "surface-950",
+                ),
+            ] {
+                let ratio = contrast_ratio(var(fg), surface);
+                assert!(
+                    ratio >= TEXT_CONTRAST_RATIO,
+                    "{name}: {fg} on {label} is {ratio:.2}, below body-text AA"
+                );
+            }
             // Dialog hints, such as the onboarding footer and the tour's Skip button, sit on the
             // modal surface.
             let subtle_on_modal =
@@ -626,6 +670,19 @@ mod tests {
                 picker >= TEXT_CONTRAST_RATIO,
                 "{name}: text-primary on surface-800 is {picker:.2}, below body-text AA"
             );
+            // Selected list and menu items: `bg-brand-600/20 text-text-primary`.
+            for surface in [
+                "--color-surface-900",
+                "--color-surface-850",
+                "--color-surface-800",
+            ] {
+                let selected = composite(var("--color-brand-600"), var(surface), 0.2);
+                let ratio = contrast_ratio(var("--color-text-primary"), selected);
+                assert!(
+                    ratio >= TEXT_CONTRAST_RATIO,
+                    "{name}: text-primary on selected fill over {surface} is {ratio:.2}, below body-text AA"
+                );
+            }
             let frame = var("--color-session-active");
             let fill = var("--color-surface-800");
             // The third surface is the fill an open row takes while it is also

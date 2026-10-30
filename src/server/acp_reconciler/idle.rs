@@ -25,7 +25,11 @@ pub(super) async fn repair_missing_terminal(state: &Arc<AppState>) {
         let instances = state.instances.read().await;
         instances
             .iter()
-            .filter(|i| i.is_structured() && i.status == crate::session::Status::Running)
+            .filter(|i| {
+                i.is_structured()
+                    && i.terminal_handoff.is_none()
+                    && i.status == crate::session::Status::Running
+            })
             .map(|i| i.id.clone())
             .collect()
     };
@@ -170,14 +174,18 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
     let mut live = Vec::new();
     for (id, profile) in candidates {
         let idle_secs = idle_by_profile.get(&profile).copied().unwrap_or(0);
-        if idle_secs > 0 && state.acp_supervisor.is_running(&id).await {
-            live.push((id, profile, idle_secs));
+        if idle_secs == 0 {
+            continue;
+        }
+        // Only a running epoch; the lease pins the stop to the worker observed here.
+        if let Some(lease) = state.acp_supervisor.running_lease(&id) {
+            live.push((id, profile, idle_secs, lease));
         }
     }
     if live.is_empty() {
         return;
     }
-    let ids: Vec<String> = live.iter().map(|(id, _, _)| id.clone()).collect();
+    let ids: Vec<String> = live.iter().map(|(id, ..)| id.clone()).collect();
     let store = Arc::clone(&state.acp_event_store);
     let latest = match tokio::task::spawn_blocking(move || store.last_event_at_for_sessions(&ids))
         .await
@@ -189,8 +197,9 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
         }
     };
     let now_ms = chrono::Utc::now().timestamp_millis();
-    for (id, profile, idle_secs) in live {
-        let last_ms = latest.get(&id).copied();
+    for (id, profile, idle_secs, lease) in live {
+        // A resume is activity: its prompt is recorded only after the worker is ready.
+        let last_ms = latest.get(&id).map(|&ms| ms.max(lease.idle_baseline_ms()));
         if !should_auto_stop(now_ms, last_ms, idle_secs, false) {
             continue;
         }
@@ -213,7 +222,7 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
             tracing::warn!(target: "acp.supervisor", session = %id, "idle-reap persist failed; leaving worker alive");
             continue;
         }
-        match state.acp_supervisor.shutdown_idle(&id).await {
+        match state.acp_supervisor.shutdown_idle(&id, Some(&lease)).await {
             Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {
                 tracing::info!(target: "acp.supervisor", session = %id, idle_secs, "auto-stopped idle structured view worker");
             }
@@ -267,6 +276,107 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// A prompt resuming a long-quiet session has no newer event until its
+    /// worker is ready, so neither the start nor a fresh epoch reads as idle,
+    /// and a stop claims only the epoch the reaper observed (#4990).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reaper_stops_only_an_idle_running_epoch() {
+        use crate::daemon::AcpWorkerState::{Resuming, Running};
+        #[derive(Debug)]
+        enum Worker {
+            Starting,
+            /// Admitted an hour ago, installed just now.
+            SlowStart,
+            Running {
+                admitted_secs_ago: i64,
+            },
+        }
+        // (worker, reaped)
+        let cases = [
+            (Worker::Starting, false),
+            (Worker::SlowStart, false),
+            (
+                Worker::Running {
+                    admitted_secs_ago: 0,
+                },
+                false,
+            ),
+            (
+                Worker::Running {
+                    admitted_secs_ago: 3600,
+                },
+                true,
+            ),
+        ];
+        for (worker, reaped) in cases {
+            let id = "resuming-session";
+            let (_home, state, _project) = super::super::test_fixtures::test_state(id);
+            let app_dir = crate::session::get_app_dir().unwrap();
+            std::fs::write(
+                app_dir.join("config.toml"),
+                "[acp]\nauto_stop_idle_secs = 60\n",
+            )
+            .unwrap();
+            let stale_ms = Utc::now().timestamp_millis() - 3_600_000;
+            state
+                .acp_event_store
+                .record_at(
+                    id,
+                    1,
+                    &Event::Stopped {
+                        reason: "rate_limited".into(),
+                    },
+                    stale_ms,
+                )
+                .unwrap();
+            let sup = &state.acp_supervisor;
+            let (_hold, before) = match worker {
+                Worker::Starting => (Some(sup.test_hold_starting(id)), Resuming),
+                Worker::SlowStart => {
+                    let lease = sup.test_hold_starting(id);
+                    lease.test_backdate_idle_baseline(Utc::now().timestamp_millis() - 3_600_000);
+                    sup.test_finish_starting(&lease);
+                    (None, Running)
+                }
+                Worker::Running { admitted_secs_ago } => {
+                    sup.test_insert_worker(id).await;
+                    let lease = sup.running_lease(id).unwrap();
+                    lease.test_backdate_idle_baseline(
+                        Utc::now().timestamp_millis() - admitted_secs_ago * 1000,
+                    );
+                    (None, Running)
+                }
+            };
+
+            reap_idle_workers(&state).await;
+
+            let dormant = {
+                let instances = state.instances.read().await;
+                instances
+                    .iter()
+                    .find(|i| i.id == id)
+                    .unwrap()
+                    .is_idle_dormant()
+            };
+            assert_eq!(dormant, reaped, "{worker:?}");
+            assert_eq!(sup.worker_state(id).await == before, !reaped, "{worker:?}");
+        }
+
+        // An epoch replaced after the reaper observed it is not stopped.
+        let id = "respawned-session";
+        let (_home, state, _project) = super::super::test_fixtures::test_state(id);
+        let sup = &state.acp_supervisor;
+        sup.test_insert_worker(id).await;
+        let observed = sup.running_lease(id).unwrap();
+        sup.test_respawn_worker(id).await;
+        assert!(matches!(
+            sup.shutdown_idle(id, Some(&observed)).await,
+            Err(crate::acp::supervisor::SupervisorError::Superseded(_))
+        ));
+        assert_eq!(sup.worker_state(id).await, Running);
     }
 
     /// Case 0 replays the real occurrence: an agent-initiated turn after the
@@ -326,6 +436,7 @@ mod tests {
                 },
                 Event::AgentMessageChunk {
                     text: "Done.".to_string(),
+                    message_id: None,
                 },
             ];
             evs.extend(extra);

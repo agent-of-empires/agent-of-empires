@@ -3,8 +3,7 @@
 
 use serde_saphyr::{MergeKeyPolicy, Options, SerializerOptions};
 
-/// YAML 1.2 booleans, `<<` kept as an ordinary key, and errors without input
-/// snippets, which could echo secrets into logs.
+/// YAML 1.2 booleans, ordinary merge keys, and diagnostics without input snippets.
 pub(crate) fn options() -> Options {
     let mut options = Options::default();
     options.strict_booleans = true;
@@ -39,10 +38,10 @@ mod tests {
         let keys: Vec<_> = parsed.as_object().unwrap().keys().collect();
         assert_eq!(keys, ["z", "a", "base", "terminal"]);
 
-        let mut merged = options();
-        merged.merge_keys = MergeKeyPolicy::Merge;
-        let parsed: Value = serde_saphyr::from_str_with_options(input, merged).unwrap();
-        assert_eq!(parsed["terminal"], json!({"backend": "docker"}));
+        let mut merge_options = options();
+        merge_options.merge_keys = MergeKeyPolicy::Merge;
+        let merged: Value = serde_saphyr::from_str_with_options(input, merge_options).unwrap();
+        assert_eq!(merged["terminal"], json!({"backend": "docker"}));
 
         let command = format!(
             "sh -c 'case \"$X\" in *) {} ;; esac' # aoe",
@@ -52,5 +51,23 @@ mod tests {
         assert_eq!(written.lines().count(), 1, "{written}");
         let reread: Value = serde_saphyr::from_str_with_options(&written, options()).unwrap();
         assert_eq!(reread["command"], command);
+    }
+
+    #[test]
+    fn typed_document_duplicate_policy_and_parse_diagnostics_are_preserved() {
+        let input = "key: first\nkey: second\n";
+        let mut last_wins = options();
+        last_wins.duplicate_keys = serde_saphyr::DuplicateKeyPolicy::LastWins;
+        assert_eq!(
+            serde_saphyr::from_str_with_options::<Value>(input, last_wins).unwrap()["key"],
+            "second"
+        );
+        let error = serde_saphyr::from_str_with_options::<Value>(
+            "secret: PRIVATE_INPUT_SENTINEL\nbroken: [\n",
+            options(),
+        )
+        .unwrap_err();
+        assert!(!error.to_string().contains("PRIVATE_INPUT_SENTINEL"));
+        assert!(!format!("{error:?}").contains("PRIVATE_INPUT_SENTINEL"));
     }
 }

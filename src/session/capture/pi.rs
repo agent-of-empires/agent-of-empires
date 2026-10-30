@@ -67,11 +67,52 @@ pub(super) fn parse_pi_header_json(line: &str) -> Option<(Option<String>, Option
     Some((session_id, cwd))
 }
 
-pub(super) fn extract_pi_uuid_from_filename(path: &Path) -> Option<String> {
+pub(crate) fn extract_pi_uuid_from_filename(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;
     let uuid_part = stem.rsplit('_').next()?;
     Uuid::parse_str(uuid_part).ok()?;
     Some(uuid_part.to_string())
+}
+
+/// The transcript `<timestamp>_<sid>.jsonl` under a Pi sessions root: directly in it, or, for the
+/// default layout, in one per-cwd directory below it. Symlinks are never followed. A copied store
+/// can hold the id twice; then nothing is returned rather than an arbitrary one.
+pub(crate) fn find_pi_transcript(
+    root: &Path,
+    sid: &str,
+    nested: bool,
+) -> Option<std::path::PathBuf> {
+    let suffix = format!("_{sid}.jsonl");
+    let in_dir = |dir: &Path| -> Vec<std::path::PathBuf> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter(|entry| {
+                entry.file_type().is_ok_and(|kind| kind.is_file())
+                    && entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.ends_with(&suffix))
+            })
+            .map(|entry| entry.path())
+            .filter(|path| {
+                extract_pi_header_fields(path).is_some_and(|(id, _)| id.as_deref() == Some(sid))
+            })
+            .collect()
+    };
+    let mut matches = in_dir(root);
+    if nested {
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    matches.extend(in_dir(&entry.path()));
+                }
+            }
+        }
+    }
+    (matches.len() == 1).then(|| matches.remove(0))
 }
 
 pub(crate) fn read_pi_session_observation(
@@ -233,6 +274,53 @@ mod tests {
             .as_deref(),
             Some("019342ab-1234-7def-8901-abcdef012345")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_pi_transcript_matches_id_in_either_layout_and_never_follows_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+        let other = "bbbbbbbb-1111-4111-8111-bbbbbbbbbbbb";
+        let leaf = |id: &str| format!("2026-01-01T00-00-00-000Z_{id}.jsonl");
+        let write = |dir: &Path, name: String, header_id: &str| {
+            std::fs::create_dir_all(dir).unwrap();
+            let path = dir.join(name);
+            std::fs::write(
+                &path,
+                format!(
+                    "{}\n",
+                    serde_json::json!({"type": "session", "id": header_id})
+                ),
+            )
+            .unwrap();
+            path
+        };
+
+        let nested = tmp.path().join("nested");
+        write(&nested.join("--proj-a--"), leaf(other), other);
+        let wanted = write(&nested.join("--proj-b--"), leaf(sid), sid);
+        assert_eq!(find_pi_transcript(&nested, sid, true), Some(wanted));
+        assert_eq!(find_pi_transcript(&nested, sid, false), None);
+
+        let flat = tmp.path().join("flat");
+        let wanted = write(&flat, leaf(sid), sid);
+        assert_eq!(find_pi_transcript(&flat, sid, false), Some(wanted));
+
+        let mismatched = tmp.path().join("mismatched");
+        write(&mismatched.join("--p--"), leaf(sid), other);
+        assert_eq!(find_pi_transcript(&mismatched, sid, true), None);
+
+        let linked = tmp.path().join("linked");
+        let real = write(&tmp.path().join("elsewhere"), leaf(sid), sid);
+        std::fs::create_dir_all(linked.join("--p--")).unwrap();
+        std::os::unix::fs::symlink(&real, linked.join("--p--").join(leaf(sid))).unwrap();
+        assert_eq!(find_pi_transcript(&linked, sid, true), None);
+
+        let copied = tmp.path().join("copied");
+        write(&copied.join("--old--"), leaf(sid), sid);
+        write(&copied.join("--new--"), leaf(sid), sid);
+        assert_eq!(find_pi_transcript(&copied, sid, true), None, "ambiguous");
     }
 
     #[test]

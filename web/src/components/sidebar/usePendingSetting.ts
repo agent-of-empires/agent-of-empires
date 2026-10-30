@@ -1,48 +1,54 @@
-import { useRef, useState } from "react";
-import { startedReads, useAppliedRead } from "../../lib/sessionReads";
+import { createContext, useContext } from "react";
+import type { SessionResponse } from "../../lib/types";
 
-interface Pending<T> {
-  value: T;
-  /** The server value when the first pick was made. */
-  from: T;
-  /** Every pick since the overlay opened; consulted only while a save is in flight. */
-  sent: T[];
-  /** Read ordinal at the moment every save had settled; null while any is in flight. */
-  settledAt: number | null;
+export interface SettingValues {
+  color: string | null;
+  notifications: "off" | "default" | "all";
 }
 
-/** Shows a picked value until the server reports a change, reverting if the latest save fails. */
-export function usePendingSetting<T>(server: T, save: (next: T) => Promise<boolean>, onError: () => void) {
-  const [pending, setPending] = useState<Pending<T> | null>(null);
-  const latest = useRef(0);
-  const inflight = useRef(0);
-  const appliedRead = useAppliedRead(pending?.settledAt != null);
-  if (pending) {
-    const done =
-      pending.settledAt !== null
-        ? // Reads that began before the saves settled may be stale; only a later one can override the pick.
-          Object.is(server, pending.value) || appliedRead > pending.settledAt
-        : // In flight, the server echoing our own picks is not another writer.
-          !Object.is(server, pending.from) &&
-          (Object.is(server, pending.value) || !pending.sent.some((v) => Object.is(v, server)));
-    if (done) setPending(null);
-  }
+export interface SessionActionTarget {
+  id: string;
+  profile: string;
+  createdAt: string;
+  epoch: string;
+}
 
-  const value = pending ? pending.value : server;
-  const set = (next: T) => {
-    if (Object.is(next, value)) return;
-    const seq = ++latest.current;
-    inflight.current++;
-    setPending((p) => ({ value: next, from: p?.from ?? server, sent: [...(p?.sent ?? []), next], settledAt: null }));
-    void save(next).then((ok) => {
-      inflight.current--;
-      if (seq === latest.current && !ok) {
-        setPending(null);
-        onError();
-      } else if (inflight.current === 0) {
-        setPending((p) => (p ? { ...p, settledAt: startedReads() } : p));
-      }
-    });
-  };
-  return [value, set] as const;
+export function sessionActionTarget(row: SessionResponse, epoch: string | null): SessionActionTarget {
+  return { id: row.id, profile: row.profile, createdAt: row.created_at, epoch: epoch ?? "" };
+}
+
+export interface SessionActionsOwner {
+  openAttach: (session: SessionResponse) => void;
+  value: <K extends keyof SettingValues>(
+    kind: K,
+    targets: SessionActionTarget[],
+    server: SettingValues[K],
+  ) => SettingValues[K];
+  set: <K extends keyof SettingValues>(
+    kind: K,
+    targets: SessionActionTarget[],
+    next: SettingValues[K],
+    server: SettingValues[K],
+  ) => void;
+}
+
+export const SessionActionContext = createContext<SessionActionsOwner | null>(null);
+
+export function useSessionActions(): SessionActionsOwner {
+  const owner = useContext(SessionActionContext);
+  if (!owner) throw new Error("Session actions require their App-owned provider");
+  return owner;
+}
+
+/** Visual rows bind to accepted work; unmounting a row does not revoke its targets. */
+export function usePendingSetting<K extends keyof SettingValues>(
+  kind: K,
+  targets: SessionActionTarget[],
+  server: SettingValues[K],
+) {
+  const owner = useSessionActions();
+  return [
+    owner.value(kind, targets, server),
+    (next: SettingValues[K]) => owner.set(kind, targets, next, server),
+  ] as const;
 }

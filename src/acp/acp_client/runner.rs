@@ -3,7 +3,7 @@
 use tracing::{info, warn};
 
 use super::errors::AcpError;
-use super::resolve_command::{resolve_agent_command, Unresolved};
+use super::resolve_command::{on_agent_path, resolve_agent_command, Unresolved};
 use super::session_sandbox::{build_sandbox_docker_argv, SessionSandbox};
 use super::spawn::{
     apply_claude_store_route, apply_env_filter, host_environment_denyreason, prepend_path_dirs,
@@ -124,9 +124,7 @@ fn append_to_log(path: &std::path::Path) -> std::process::Stdio {
 /// A Worker started for a bare adapter name that resolved nowhere can only exit
 /// before its Hello, which loses the cause (#4576). `unresolved` is `None` when
 /// the name resolved or a sandbox resolves it inside its container; paths and
-/// `${placeholder}` commands resolve elsewhere. The adapter searches the last
-/// `PATH` in `agent_environment`, else the inherited one, from its cwd, so
-/// relative entries resolve against the project.
+/// `${placeholder}` commands resolve elsewhere.
 fn refuse_unresolved_adapter(
     config: &SpawnConfig,
     unresolved: Option<&Unresolved>,
@@ -136,22 +134,33 @@ fn refuse_unresolved_adapter(
     let Some(reason) = unresolved.filter(|reason| **reason != Unresolved::NotBare) else {
         return Ok(());
     };
-    let path = agent_environment
-        .iter()
-        .rev()
-        .find(|(key, _)| key == "PATH")
-        .map(|(_, path)| std::ffi::OsStr::new(path))
-        .or(inherited_path);
-    if path
-        .is_some_and(|path| which::which_in(&config.spec.command, Some(path), &config.cwd).is_ok())
-    {
+    if on_agent_path(
+        &config.spec.command,
+        &config.cwd,
+        agent_environment,
+        inherited_path,
+    ) {
         return Ok(());
     }
     Err(AcpError::unresolved_adapter_spawn_error(
         &std::io::Error::from(std::io::ErrorKind::NotFound),
-        &config.spec.command,
+        config,
         reason,
     ))
+}
+
+/// `current_exe()` keeps returning the original path after the binary is
+/// unlinked, so the spawn would otherwise fail with a bare ENOENT.
+fn ensure_runner_exe(exe: &std::path::Path) -> Result<(), AcpError> {
+    // A stat failure is not proof of removal; spawn reports the real error.
+    if exe.try_exists().unwrap_or(true) {
+        return Ok(());
+    }
+    Err(AcpError::Spawn(format!(
+        "aoe binary `{}` no longer exists; the running `aoe serve` was started from a \
+         build that was removed. Rebuild or reinstall aoe and restart `aoe serve`",
+        exe.display()
+    )))
 }
 
 /// The runner owns the agent subprocess and outlives the daemon, so no `Child`
@@ -165,8 +174,9 @@ pub(super) async fn spawn_runner_detached(
 ) -> Result<(u32, Option<crate::session::ExecutionBinding>), AcpError> {
     let current_exe =
         std::env::current_exe().map_err(|e| AcpError::Spawn(format!("current_exe: {e}")))?;
+    ensure_runner_exe(&current_exe)?;
     let log_path = crate::process::worker_registry::log_path_for(&session_id)
-        .map_err(|e| AcpError::Spawn(format!("log path: {e}")))?;
+        .map_err(|e| AcpError::Spawn(format!("log path: {e:#}")))?;
     if let Some(parent) = log_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -261,6 +271,21 @@ pub(super) async fn spawn_runner_detached(
             (None, None) => (config.spec.command.clone(), Vec::new()),
         };
 
+    let prefix = {
+        let id = session_id.clone();
+        let profile = config.source_profile.clone().unwrap_or_default();
+        tokio::task::spawn_blocking(move || {
+            crate::process::systemd::scope_prefix_for(&id, &profile)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+    .filter(|_| !current_exe.to_string_lossy().contains('='));
+    let scope = prefix.as_ref().map_or(
+        crate::process::worker_registry::ScopeOwnership::Unscoped,
+        |prefix| prefix.ownership(),
+    );
     let mut cmd = tokio::process::Command::new(&current_exe);
     cmd.arg("__acp-runner")
         .arg("--socket")
@@ -298,6 +323,17 @@ pub(super) async fn spawn_runner_detached(
         cmd.arg("--stored-acp-session-id").arg(stored);
     }
     cmd.arg("--generation").arg(config.generation.to_string());
+    if let Some(admission) = config
+        .launch_lease
+        .as_ref()
+        .and_then(|lease| lease.admission())
+    {
+        cmd.arg("--lifecycle-generation")
+            .arg(admission.generation.to_string());
+    }
+    if let crate::process::worker_registry::ScopeOwnership::Owned { unit } = &scope {
+        cmd.arg("--systemd-scope").arg(unit);
+    }
     cmd.arg("--");
     if let Some(s) = &sandbox_argv {
         cmd.arg(&s.docker_binary);
@@ -339,6 +375,11 @@ pub(super) async fn spawn_runner_detached(
         // fixed container mount in build_sandbox_docker_argv (#2587).
         cmd.env(crate::session::artifacts::ARTIFACT_DIR_ENV, dir);
     }
+    if !config.uses_native_prime() {
+        if let Some(lease) = &config.launch_lease {
+            lease.record_prime(crate::acp::runner_lifecycle::PrimeOwnership::NotPrime);
+        }
+    }
     if config.uses_native_prime() {
         let mut snapshot = std::process::Command::new(&spawn_command);
         snapshot.envs(
@@ -354,6 +395,11 @@ pub(super) async fn spawn_runner_detached(
             sandbox_argv.as_ref(),
         )?
         .ok_or_else(|| AcpError::Spawn("Prime runtime missing".into()))?;
+        if let Some(lease) = &config.launch_lease {
+            lease.record_prime(crate::acp::runner_lifecycle::PrimeOwnership::Owned {
+                runtime: Box::new(runtime.clone()),
+            });
+        }
         let encoded =
             serde_json::to_string(&runtime).map_err(|e| AcpError::Spawn(e.to_string()))?;
         let original: Vec<_> = cmd
@@ -396,16 +442,6 @@ pub(super) async fn spawn_runner_detached(
 
     // Reads the runner env, so it runs before the scope wrapper adds its own.
     let native_store = super::spawn::native_store_snapshot(config, cmd.as_std(), &host_environment);
-    let prefix = {
-        let id = session_id.clone();
-        let profile = config.source_profile.clone().unwrap_or_default();
-        tokio::task::spawn_blocking(move || {
-            crate::process::systemd::scope_prefix_for(&id, &profile)
-        })
-        .await
-        .ok()
-        .flatten()
-    };
     let mut cmd = match &prefix {
         Some(prefix) => wrap_in_scope(cmd, prefix),
         None => cmd,
@@ -445,22 +481,55 @@ pub(super) async fn spawn_runner_detached(
         "spawning detached structured view runner"
     );
 
-    let mut child = cmd.spawn().map_err(|e| {
-        warn!(
-            target: "acp.protocol.spawn",
-            session = %session_id,
-            "runner spawn failed: {e}"
-        );
-        AcpError::Spawn(format!("spawn runner: {e}"))
-    })?;
-    let pid = child
-        .id()
-        .ok_or_else(|| AcpError::Spawn("runner exited before it could be identified".into()))?;
-    // Reap it, so a finished runner does not linger as a zombie that still
-    // answers `kill(pid, 0)` and keeps a teardown from proving it gone.
-    tokio::spawn(async move {
-        let _ = child.wait().await;
-    });
+    let lease = config.launch_lease.clone();
+    let admission = lease.as_ref().and_then(|lease| lease.admission());
+    let generation = config.generation;
+    let pid = crate::acp::supervisor::with_durable_launch(admission, session_id, move || {
+        let mut birth = lease.as_ref().map(|lease| lease.lock_birth());
+        if lease
+            .as_ref()
+            .is_some_and(|lease| lease.cancellation().is_cancelled())
+        {
+            return Err(AcpError::Spawn(
+                "launch cancelled before physical spawn".into(),
+            ));
+        }
+        if let Some(scopes) = birth.as_mut() {
+            if !scopes.contains(&scope) {
+                scopes.push(scope);
+            }
+        }
+        let mut child = cmd
+            .spawn()
+            .map_err(|error| match ensure_runner_exe(&current_exe) {
+                Err(missing) if error.kind() == std::io::ErrorKind::NotFound => missing,
+                _ => AcpError::Spawn(format!("spawn runner: {error}")),
+            })?;
+        let pid = child
+            .id()
+            .ok_or_else(|| AcpError::Spawn("runner exited before it could be identified".into()))?;
+        // Transfer reaping before the blocking result can be dropped.
+        if let Some(lease) = &lease {
+            lease.record_spawned_child(
+                child,
+                crate::acp::runner_lifecycle::RunnerIdentity {
+                    pid,
+                    generation,
+                    birth_fingerprint: crate::process::process_birth_identity(pid)
+                        .ok()
+                        .flatten()
+                        .map(|identity| identity.fingerprint()),
+                },
+            );
+        } else {
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+            });
+        }
+        Ok(pid)
+    })
+    .await
+    .map_err(|error| AcpError::Spawn(error.to_string()))?;
     Ok((pid, native_store))
 }
 
@@ -474,6 +543,21 @@ mod tests {
     const XDG: &str = "XDG_RUNTIME_DIR";
     const BUS: &str = "DBUS_SESSION_BUS_ADDRESS";
     const ENV: &str = "/usr/bin/env";
+
+    #[test]
+    fn missing_runner_exe_names_path_and_remedy() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("aoe");
+        let Err(AcpError::Spawn(message)) = ensure_runner_exe(&gone) else {
+            panic!("missing exe must fail with AcpError::Spawn");
+        };
+        assert!(message.contains(&gone.display().to_string()), "{message}");
+        assert!(message.contains("restart `aoe serve`"), "{message}");
+
+        assert!(ensure_runner_exe(&std::env::current_exe().unwrap()).is_ok());
+        // A stat error other than absence must not claim the build was removed.
+        assert!(ensure_runner_exe(std::path::Path::new("a\0b")).is_ok());
+    }
 
     fn prefix() -> ScopePrefix {
         ScopePrefix {
@@ -762,6 +846,9 @@ mod tests {
                 .iter()
                 .map(|path| ("PATH".to_string(), path.to_string()))
                 .collect();
+            // The runner hands the adapter this list; the error reads the same config.
+            config.base_host_environment = environment.clone();
+            config.host_environment = environment.clone();
             let got = refuse_unresolved_adapter(
                 &config,
                 unresolved.as_ref(),
@@ -776,6 +863,16 @@ mod tests {
             match (&got, expected) {
                 (Some(msg), Some(want)) => assert!(msg.contains(want), "{label}: {msg}"),
                 _ => assert_eq!(got.is_some(), expected.is_some(), "{label}: {got:?}"),
+            }
+            // With a configured PATH, the advice is about that PATH.
+            if let (Some(msg), Some(Unresolved::NotFound)) = (&got, &unresolved) {
+                if !configured.is_empty() {
+                    assert!(
+                        msg.contains("`environment` sets for the agent"),
+                        "{label}: {msg}"
+                    );
+                    assert!(!msg.contains("restart `aoe serve`"), "{label}: {msg}");
+                }
             }
             if matches!(
                 unresolved,
@@ -808,6 +905,11 @@ mod tests {
             super::super::test_helpers::env_test_spawn_config(cwd.path().to_path_buf());
         config.spec.command = format!("aoe-test-no-such-adapter-{}", std::process::id());
         config.socket_path = Some(socket.clone());
+        let mut lifecycle = crate::acp::runner_lifecycle::LifecycleTable::new(1);
+        let lease = lifecycle
+            .admit(&session, crate::acp::runner_lifecycle::ResumeKind::Spawn)
+            .unwrap();
+        config.launch_lease = Some(lease.clone());
 
         let err = super::super::AcpClient::spawn(
             config,
@@ -828,5 +930,9 @@ mod tests {
         ] {
             assert!(!path.exists(), "left behind: {}", path.display());
         }
+        assert!(lifecycle.abandon(&lease), "the failed producer must settle");
+        lifecycle
+            .admit(&session, crate::acp::runner_lifecycle::ResumeKind::Spawn)
+            .expect("adapter refusal must not strand the session reservation");
     }
 }

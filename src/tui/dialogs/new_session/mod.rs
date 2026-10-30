@@ -12,10 +12,9 @@ use std::time::Instant;
 use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
-use super::DialogResult;
+use super::{cycle_focus, DialogResult};
 use crate::containers;
 use crate::session::config::profile_config::resolve_config_or_warn;
-use crate::session::config::repo_config::HookProgress;
 use crate::session::config::{load_config, update_app_state, DefaultTerminalMode, SandboxConfig};
 #[cfg(test)]
 use crate::session::Config;
@@ -40,6 +39,7 @@ const WT_BASE_BRANCH_FIELD: usize = 2;
 const WT_EXTRA_REPOS_FIELD: usize = 3;
 const SANDBOX_IMAGE_FIELD: usize = 0;
 const SANDBOX_ENV_FIELD: usize = 1;
+const SANDBOX_HOOK_ENV_FIELD: usize = 2;
 
 pub(super) const FIELD_HELP: &[FieldHelp] = &[
     FieldHelp {
@@ -90,6 +90,10 @@ pub(super) const FIELD_HELP: &[FieldHelp] = &[
         description: "Env vars: bare KEY passes host value, KEY=VALUE sets explicitly",
     },
     FieldHelp {
+        name: "Host hook env",
+        description: "Env for the host before_start hook only; never enters the container",
+    },
+    FieldHelp {
         name: "Group",
         description: "Optional grouping for organization (Ctrl+P to browse existing groups)",
     },
@@ -114,6 +118,8 @@ pub struct NewSessionData {
     pub yolo_mode: bool,
     /// Container env: `KEY` passes through from the host, `KEY=VALUE` sets.
     pub extra_env: Vec<String>,
+    /// Env for the host `before_start` hook only; never enters the container.
+    pub hook_env: Vec<String>,
     pub extra_args: String,
     pub command_override: String,
     /// Provision a fresh `<app_dir>/scratch/<id>/` directory. Mutually
@@ -148,6 +154,7 @@ impl From<NewSessionData> for crate::session::builder::InstanceParams {
             sandbox_image: data.sandbox_image,
             yolo_mode: data.yolo_mode,
             extra_env: data.extra_env,
+            before_start_hook_env: data.hook_env,
             extra_args: data.extra_args,
             command_override: data.command_override,
             extra_repo_paths: data.extra_repo_paths,
@@ -195,7 +202,7 @@ pub struct NewSessionDialog {
     pub(super) yolo_mode: bool,
     pub(super) yolo_mode_default: bool,
     pub(super) structured_enabled: bool,
-    /// Configured opening state (`acp.default_new_session_view`), re-applied
+    /// Configured opening state (`acp.structured_view`), re-applied
     /// when a tool change makes the structured view available again.
     pub(super) structured_default: bool,
     /// The user's own toggle choice, restored instead of the configured
@@ -224,6 +231,7 @@ pub struct NewSessionDialog {
     pub(super) env_selected_index: usize,
     pub(super) env_editing_input: Option<Input>,
     pub(super) env_adding_new: bool,
+    pub(super) hook_env: HookEnvList,
     pub(super) inherited_settings: Vec<(String, String)>,
     pub(super) sandbox_config_mode: bool,
     pub(super) sandbox_focused_field: usize,
@@ -243,10 +251,6 @@ pub struct NewSessionDialog {
     pub(super) dir_picker: DirPicker,
     pub(super) error_message: Option<String>,
     pub(super) show_help: bool,
-    pub(super) loading: bool,
-    pub(super) has_hooks: bool,
-    pub(super) current_hook: Option<String>,
-    pub(super) hook_output: Vec<String>,
     pub(super) path_invalid_flash_until: Option<Instant>,
     /// Ghost text completion for the path field (fish-shell style).
     path_ghost: Option<PathGhostCompletion>,
@@ -279,6 +283,16 @@ pub struct NewSessionDialog {
     /// Rows the pointer can highlight on the visible panel, rebuilt per frame.
     pub(super) hover_rects: Vec<ratatui::layout::Rect>,
     pub(super) hover: HoverState,
+}
+
+/// Editor state for the host-hook-only env list.
+#[derive(Default)]
+pub(super) struct HookEnvList {
+    pub(super) entries: Vec<String>,
+    pub(super) expanded: bool,
+    pub(super) selected_index: usize,
+    pub(super) editing_input: Option<Input>,
+    pub(super) adding_new: bool,
 }
 
 /// Key handling shared by the editable lists.
@@ -378,7 +392,7 @@ fn project_overrides(
 
 /// Key identifying a typed path the way the registry lookup does.
 fn path_key(path: &str) -> String {
-    crate::session::projects::canonical_key(&path_input::expand_tilde(path.trim()))
+    crate::session::projects::canonical_key(path_input::expand_tilde(path.trim()))
 }
 
 /// What the registry says about the form's project.
@@ -393,8 +407,8 @@ const OVERRIDES_UNRESOLVED_ERROR: &str = "Could not load this project's settings
 /// Whether `tool` can back a structured-view (ACP) session, judged against
 /// the resolved config.
 fn compute_structured_capable(tool: &str, config: &crate::session::Config) -> bool {
-    // Opt-in setting, shared with `session_switch_view_target`.
-    config.acp.offer_structured_in_new_session
+    // Shared with `session_switch_view_target`.
+    config.acp.structured_view.is_offered()
         && crate::session::builder::structured::tool_acp_capable(tool, config)
 }
 
@@ -514,8 +528,7 @@ impl NewSessionDialog {
             .unwrap_or_default();
         let command_override_value = config.session.resolve_tool_command(selected_tool);
         let structured_capable = compute_structured_capable(selected_tool, &config);
-        let structured_default = config.acp.default_new_session_view
-            == crate::session::config::NewSessionView::Structured;
+        let structured_default = config.acp.structured_view.starts_structured();
 
         let (extra_env, inherited_settings) = if sandbox_enabled {
             let inherited = build_inherited_settings(&config.sandbox);
@@ -589,6 +602,7 @@ impl NewSessionDialog {
             env_selected_index: 0,
             env_editing_input: None,
             env_adding_new: false,
+            hook_env: HookEnvList::default(),
             inherited_settings,
             sandbox_config_mode: false,
             sandbox_focused_field: 0,
@@ -598,10 +612,6 @@ impl NewSessionDialog {
             command_override: Input::new(command_override_value),
             error_message: None,
             show_help: false,
-            loading: false,
-            has_hooks: false,
-            current_hook: None,
-            hook_output: Vec::new(),
             path_invalid_flash_until: None,
             path_ghost: None,
             group_ghost: None,
@@ -714,6 +724,7 @@ impl NewSessionDialog {
             self.extra_env_overridden = false;
             self.env_list_expanded = false;
             self.env_editing_input = None;
+            self.hook_env = HookEnvList::default();
             self.inherited_settings.clear();
             self.sandbox_config_mode = false;
         }
@@ -785,38 +796,10 @@ impl NewSessionDialog {
             .unwrap_or("")
     }
 
-    pub fn push_hook_progress(&mut self, progress: HookProgress) {
-        match progress {
-            HookProgress::Started(cmd) => {
-                self.current_hook = Some(cmd);
-            }
-            HookProgress::Output(line) => {
-                self.hook_output.push(line);
-            }
-        }
-    }
-
-    pub fn set_loading(&mut self, loading: bool) {
-        self.loading = loading;
-        if loading {
-            self.error_message = None;
-        }
-    }
-
-    pub fn is_loading(&self) -> bool {
-        self.loading
-    }
-
     /// Advance dialog timers (spinner and transient highlights).
     /// Returns true when visual state changed and the UI should redraw.
     pub fn tick(&mut self) -> bool {
         let mut changed = false;
-
-        if self.loading {
-            // rattles computes the frame from elapsed time; just redraw.
-            changed = true;
-        }
-
         if let Some(until) = self.path_invalid_flash_until {
             if Instant::now() >= until {
                 self.path_invalid_flash_until = None;
@@ -1014,8 +997,7 @@ impl NewSessionDialog {
 
         self.yolo_mode_default = config.session.yolo_mode_default;
         self.yolo_mode = self.yolo_mode_default;
-        self.structured_default = config.acp.default_new_session_view
-            == crate::session::config::NewSessionView::Structured;
+        self.structured_default = config.acp.structured_view.starts_structured();
         // Each profile has its own registry, so an earlier resolution says nothing about this one. A
         // scratch session belongs to no project, so a retained path's overrides do not apply.
         self.overrides_resolved_for = None;
@@ -1070,6 +1052,7 @@ impl NewSessionDialog {
 
         self.env_list_expanded = false;
         self.env_editing_input = None;
+        self.hook_env = HookEnvList::default();
         self.sandbox_config_mode = false;
         self.sandbox_focused_field = 0;
         self.worktree_config_mode = false;
@@ -1134,6 +1117,7 @@ impl NewSessionDialog {
             env_selected_index: 0,
             env_editing_input: None,
             env_adding_new: false,
+            hook_env: HookEnvList::default(),
             inherited_settings: Vec::new(),
             sandbox_config_mode: false,
             sandbox_focused_field: 0,
@@ -1143,10 +1127,6 @@ impl NewSessionDialog {
             command_override: Input::default(),
             error_message: None,
             show_help: false,
-            loading: false,
-            has_hooks: false,
-            current_hook: None,
-            hook_output: Vec::new(),
             path_invalid_flash_until: None,
             path_ghost: None,
             group_ghost: None,
@@ -1218,6 +1198,7 @@ impl NewSessionDialog {
             env_selected_index: 0,
             env_editing_input: None,
             env_adding_new: false,
+            hook_env: HookEnvList::default(),
             inherited_settings: Vec::new(),
             sandbox_config_mode: false,
             sandbox_focused_field: 0,
@@ -1227,10 +1208,6 @@ impl NewSessionDialog {
             command_override: Input::default(),
             error_message: None,
             show_help: false,
-            loading: false,
-            has_hooks: false,
-            current_hook: None,
-            hook_output: Vec::new(),
             path_invalid_flash_until: None,
             path_ghost: None,
             group_ghost: None,
@@ -1247,10 +1224,6 @@ impl NewSessionDialog {
             hover_rects: Vec::new(),
             hover: HoverState::default(),
         }
-    }
-
-    pub fn set_error(&mut self, error: String) {
-        self.error_message = Some(error);
     }
 }
 
@@ -1332,18 +1305,29 @@ impl NewSessionDialog {
     /// While an entry is being typed the list owns every key, so clicks wait
     /// for Enter or Esc rather than strand the edit.
     fn click_sandbox_config(&mut self, col: u16, row: u16) {
-        if self.env_editing_input.is_some() {
+        if self.env_editing_input.is_some() || self.hook_env.editing_input.is_some() {
             return;
         }
         if let Some(entry) = super::hit(&self.list_entry_rects, col, row) {
-            self.sandbox_focused_field = SANDBOX_ENV_FIELD;
-            self.env_selected_index = entry;
+            if self.hook_env.expanded {
+                self.sandbox_focused_field = SANDBOX_HOOK_ENV_FIELD;
+                self.hook_env.selected_index = entry;
+            } else {
+                self.sandbox_focused_field = SANDBOX_ENV_FIELD;
+                self.env_selected_index = entry;
+            }
         } else if let Some(field) = super::hit(&self.sandbox_config_rects, col, row) {
             if field != SANDBOX_ENV_FIELD {
                 self.env_list_expanded = false;
             } else if !self.env_list_expanded {
                 self.env_list_expanded = true;
                 self.env_selected_index = 0;
+            }
+            if field != SANDBOX_HOOK_ENV_FIELD {
+                self.hook_env.expanded = false;
+            } else if !self.hook_env.expanded {
+                self.hook_env.expanded = true;
+                self.hook_env.selected_index = 0;
             }
             self.sandbox_focused_field = field;
         }
@@ -1430,14 +1414,6 @@ impl NewSessionDialog {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<NewSessionData> {
-        if self.loading {
-            if matches!(key.code, KeyCode::Esc) {
-                self.loading = false;
-                return DialogResult::Cancel;
-            }
-            return DialogResult::Continue;
-        }
-
         if self.show_help {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
                 self.show_help = false;
@@ -1585,7 +1561,7 @@ impl NewSessionDialog {
                 if self.focused_field == fields.group {
                     self.clear_group_ghost();
                 }
-                self.focused_field = (self.focused_field + 1) % fields.count;
+                self.focused_field = cycle_focus(self.focused_field, fields.count, false);
                 if self.focused_field == self.path_field() {
                     self.recompute_path_ghost();
                 }
@@ -1602,11 +1578,7 @@ impl NewSessionDialog {
                 if self.focused_field == fields.group {
                     self.clear_group_ghost();
                 }
-                self.focused_field = if self.focused_field == 0 {
-                    fields.count - 1
-                } else {
-                    self.focused_field - 1
-                };
+                self.focused_field = cycle_focus(self.focused_field, fields.count, true);
                 if self.focused_field == self.path_field() {
                     self.recompute_path_ghost();
                 }
@@ -1718,10 +1690,13 @@ impl NewSessionDialog {
 
     fn handle_sandbox_config_key(&mut self, key: KeyEvent) -> DialogResult<NewSessionData> {
         // Inherited settings are not focusable.
-        const SANDBOX_MAX: usize = 2;
+        const SANDBOX_MAX: usize = 3;
 
         if self.env_list_expanded && self.sandbox_focused_field == SANDBOX_ENV_FIELD {
             return self.handle_env_list_key(key);
+        }
+        if self.hook_env.expanded && self.sandbox_focused_field == SANDBOX_HOOK_ENV_FIELD {
+            return self.handle_hook_env_list_key(key);
         }
 
         match key.code {
@@ -1738,20 +1713,23 @@ impl NewSessionDialog {
                 self.env_selected_index = 0;
                 DialogResult::Continue
             }
+            KeyCode::Enter if self.sandbox_focused_field == SANDBOX_HOOK_ENV_FIELD => {
+                self.hook_env.expanded = true;
+                self.hook_env.selected_index = 0;
+                DialogResult::Continue
+            }
             KeyCode::Enter => {
                 self.sandbox_config_mode = false;
                 DialogResult::Continue
             }
             KeyCode::Tab | KeyCode::Down => {
-                self.sandbox_focused_field = (self.sandbox_focused_field + 1) % SANDBOX_MAX;
+                self.sandbox_focused_field =
+                    cycle_focus(self.sandbox_focused_field, SANDBOX_MAX, false);
                 DialogResult::Continue
             }
             KeyCode::BackTab | KeyCode::Up => {
-                self.sandbox_focused_field = if self.sandbox_focused_field == 0 {
-                    SANDBOX_MAX - 1
-                } else {
-                    self.sandbox_focused_field - 1
-                };
+                self.sandbox_focused_field =
+                    cycle_focus(self.sandbox_focused_field, SANDBOX_MAX, true);
                 DialogResult::Continue
             }
             _ => {
@@ -1961,15 +1939,12 @@ impl NewSessionDialog {
             }
             KeyCode::Tab | KeyCode::Down => {
                 self.worktree_config_focused_field =
-                    (self.worktree_config_focused_field + 1) % WT_MAX;
+                    cycle_focus(self.worktree_config_focused_field, WT_MAX, false);
                 DialogResult::Continue
             }
             KeyCode::BackTab | KeyCode::Up => {
-                self.worktree_config_focused_field = if self.worktree_config_focused_field == 0 {
-                    WT_MAX - 1
-                } else {
-                    self.worktree_config_focused_field - 1
-                };
+                self.worktree_config_focused_field =
+                    cycle_focus(self.worktree_config_focused_field, WT_MAX, true);
                 DialogResult::Continue
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
@@ -2014,6 +1989,30 @@ impl NewSessionDialog {
                 .and_then(|entry| crate::session::validate_env_entry(entry));
         }
 
+        result
+    }
+
+    fn handle_hook_env_list_key(&mut self, key: KeyEvent) -> DialogResult<NewSessionData> {
+        let validate =
+            |value: &str, list: &[String]| !value.is_empty() && !list.contains(&value.to_string());
+        let list = &mut self.hook_env;
+        let snapshot = list.entries.clone();
+        let result = handle_editable_list_key(
+            key,
+            &mut list.entries,
+            &mut list.expanded,
+            &mut list.selected_index,
+            &mut list.editing_input,
+            &mut list.adding_new,
+            validate,
+        );
+        if list.entries != snapshot {
+            self.error_message = list
+                .entries
+                .get(list.selected_index)
+                .and_then(|entry| crate::session::validate_env_entry(entry))
+                .map(|w| w.replace("empty in the container", "skipped by the host hook"));
+        }
         result
     }
 
@@ -2166,6 +2165,8 @@ impl NewSessionDialog {
     pub fn handle_paste(&mut self, text: &str) {
         let target: &mut Input = if let Some(ref mut input) = self.env_editing_input {
             input
+        } else if let Some(ref mut input) = self.hook_env.editing_input {
+            input
         } else if let Some(ref mut input) = self.workspace_repo_editing_input {
             input
         } else if self.tool_config_mode {
@@ -2193,12 +2194,29 @@ impl NewSessionDialog {
         }
         let profile = self.selected_profile().to_string();
         let config = self.resolve_config_for_path(&profile);
-        if let Err(msg) = crate::session::builder::structured::validate_structured_choice(
-            &self.available_tools[self.tool_index],
-            self.command_override.value(),
-            &config,
-        ) {
-            self.error_message = Some(msg);
+        let path = path_input::expand_tilde(self.path.value().trim());
+        let choice = crate::session::builder::structured::StructuredChoice {
+            tool: &self.available_tools[self.tool_index],
+            agent_name: None,
+            command_override: self.command_override.value(),
+            sandboxed: self.sandbox_enabled,
+            // A worktree or scratch session launches in a directory created later.
+            project_path: (!self.scratch && !self.worktree_enabled)
+                .then(|| std::path::Path::new(&path)),
+            // The dialog asks for hook trust itself, so an unapproved hook still counts here.
+            preparation_hooks: &|| {
+                crate::session::builder::structured::preparation_hooks_apply(
+                    &crate::session::config::profile_config::resolve_config_or_warn(&profile).hooks,
+                    std::path::Path::new(&path),
+                    self.scratch,
+                    None,
+                )
+            },
+        };
+        if let Err(e) =
+            crate::session::builder::structured::validate_structured_choice(&choice, &config)
+        {
+            self.error_message = Some(e.to_string());
             return false;
         }
         true
@@ -2247,6 +2265,11 @@ impl NewSessionDialog {
             yolo_mode: self.yolo_mode || self.selected_tool_always_yolo(),
             extra_env: if self.sandbox_enabled && self.extra_env_overridden {
                 self.extra_env.clone()
+            } else {
+                Vec::new()
+            },
+            hook_env: if self.sandbox_enabled {
+                self.hook_env.entries.clone()
             } else {
                 Vec::new()
             },

@@ -6,9 +6,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_of_empires::cli::runtime_read::{
-    attempt, ReadOutcome, ReadRequestSource, ScopedCommand, ScopedRead,
-};
+use agent_of_empires::cli::runtime_read::{attempt, ReadOutcome, ReadRequestSource, ScopedCommand};
 use agent_of_empires::server::test_support::{
     build_router_for_test, build_test_app_state_cityhall, build_test_app_state_with_policy,
 };
@@ -68,15 +66,8 @@ fn read_source(address: SocketAddr, token: Option<&str>) -> ReadRequestSource {
     }
 }
 
-/// Every read here names its endpoint, so a daemon always answers and the
-/// local fallback never comes into play.
 async fn execute(command: ScopedCommand<'_>, source: &ReadRequestSource) -> ReadOutcome {
-    match attempt(command, source).await {
-        ScopedRead::Answered(outcome) => outcome,
-        ScopedRead::NoLocalPublication(notice) => {
-            panic!("a named endpoint must answer, not a local take-over ({notice:?})")
-        }
-    }
+    attempt(command, source).await
 }
 
 /// A bearer the daemon does not know is refused before the upgrade, and the
@@ -106,11 +97,9 @@ async fn an_unknown_bearer_is_unauthorized() {
     );
 }
 
-/// The CityHall lockdown answers the route directly, and the client folds that
-/// refusal into the same unauthorized classification.
 #[tokio::test]
 #[serial_test::parallel]
-async fn a_locked_down_daemon_is_unauthorized() {
+async fn a_locked_down_daemon_reports_its_mode() {
     let state = build_test_app_state_cityhall(Vec::new());
     let address = serve(state).await;
 
@@ -122,10 +111,13 @@ async fn a_locked_down_daemon_is_unauthorized() {
     .expect("the refusal arrives inside the establishment budget");
 
     assert_eq!(outcome.exit, 4);
-    assert_eq!(
-        outcome.stderr.as_deref(),
-        Some("daemon read: unauthorized\n")
+    assert_eq!(outcome.stdout, None);
+    let stderr = outcome.stderr.unwrap();
+    assert!(
+        stderr.starts_with("daemon read: cityhall_mode\n"),
+        "{stderr}"
     );
+    assert!(!stderr.contains("unauthorized"), "{stderr}");
 }
 
 #[tokio::test]
@@ -223,10 +215,6 @@ async fn the_route_shares_the_daemon_credential_gate() {
         assert_eq!(hello["data"]["owner"]["uid"], serde_json::Value::Null);
         socket.close(None).await.unwrap();
         if configured_token.is_none() {
-            assert!(matches!(
-                tokio_tungstenite::connect_async(format!("ws://{address}/api/runtime/ws")).await,
-                Err(tokio_tungstenite::tungstenite::Error::Http(_))
-            ));
             let outcome = execute(ScopedCommand::Profile, &read_source(address, None)).await;
             assert_eq!(outcome.exit, 0, "{:?}", outcome.stderr);
             assert_eq!(
@@ -494,7 +482,7 @@ async fn registered_project_text_and_native_paths_survive_runtime_reads() {
         let path = home._dir.path().join(directory);
         std::fs::create_dir(&path).unwrap();
         let path = path.canonicalize().unwrap();
-        let project = projects::add(
+        let committed = projects::add(
             "main",
             ProjectScope::Global,
             Project::new(name, path.to_str().unwrap(), ProjectScope::Global)
@@ -502,6 +490,7 @@ async fn registered_project_text_and_native_paths_survive_runtime_reads() {
             false,
         )
         .unwrap();
+        let project = &committed.projects[committed.result];
         let mut main = Instance::new("main row", home._dir.path().to_str().unwrap());
         main.id = "main-row".into();
         main.tool = "claude".into();

@@ -4,9 +4,10 @@
 import { describe, expect, it } from "vitest";
 import { render } from "@testing-library/react";
 import { Row } from "../live-terminal/TermRow";
+import { linkifyLine } from "../../lib/liveTermLines";
 
 const renderRow = (text: string, cursorCol: number | null = null) =>
-  render(<Row segs={[{ text, style: {} }]} cursorCol={cursorCol} />).container;
+  render(<Row segs={linkifyLine([{ text, style: {} }])} cursorCol={cursorCol} />).container;
 
 describe("Row URL linkification", () => {
   it("renders a URL in output as a new-tab anchor", () => {

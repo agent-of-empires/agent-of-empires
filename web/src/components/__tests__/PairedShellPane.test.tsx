@@ -57,11 +57,11 @@ describe("PairedShellPane", () => {
   it("shows the pending placeholder with Host preselected, or a prompt with no session", () => {
     // Never-resolving promise pins ensureState at "pending".
     ensureTerminal.mockReturnValue(new Promise(() => {}));
-    render(<PairedShellPane session={makeSession()} sessionId="sess-rp-1" />);
+    render(<PairedShellPane readOnly={false} session={makeSession()} sessionId="sess-rp-1" />);
     expect(screen.getByText(/Starting session/i)).toBeDefined();
     expect(screen.getAllByRole("button", { name: /^Host$/ }).length).toBeGreaterThan(0);
     cleanup();
-    render(<PairedShellPane session={null} sessionId={null} />);
+    render(<PairedShellPane readOnly={false} session={null} sessionId={null} />);
     expect(screen.getByText(/Select a session/i)).toBeDefined();
   });
 });

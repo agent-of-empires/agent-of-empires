@@ -1,14 +1,18 @@
-//! Live-send wiring at the home-view level; translation correctness is covered by unit
-//! tests in src/tui/home/live_send.rs. Here: keys are captured while live mode is active,
-//! Ctrl+q clears the state, the per-keystroke liveness check auto-exits on drift, and the
-//! predicate plumbing treats live mode like a modal capture.
+//! Live-send wiring at the home view level. Translation correctness
+//! is covered by unit tests in src/tui/home/live_send.rs. Here we
+//! verify the integration points: keys are captured while live mode
+//! is active, Ctrl+q clears the state, the per-keystroke liveness
+//! check auto-exits on drift, and the predicate plumbing treats
+//! live mode like a modal capture so the rest of the TUI suspends
+//! underneath it.
 
 use super::super::live_send::LiveSendState;
 use super::*;
 
-/// Seed live-send state pointing at the first instance in the env, with a matching
-/// tmux_name so the drift check passes. Drift tests install a missing id or mutate the
-/// title afterwards.
+/// Seed live-send state pointing at the first instance in the test
+/// env, with a matching tmux_name so the drift check passes. Tests
+/// that want to trigger drift either install pointing at a missing
+/// id or mutate the instance's title after installing.
 fn install_live_for_first_session(env: &mut TestEnv) -> String {
     let id = env
         .view
@@ -39,8 +43,9 @@ fn install_live_for_first_session(env: &mut TestEnv) -> String {
     id
 }
 
-/// Install live-send state pointing at a session id the env does not contain, to verify the
-/// drift check auto-exits with an info dialog when the instance has vanished.
+/// Install live-send state pointing at a session id the env does
+/// NOT contain; used to verify the drift check fires (auto-exit
+/// + info dialog) when the underlying instance has vanished.
 fn install_live_orphan(env: &mut TestEnv) {
     env.view.live_send = Some(LiveSendState {
         session_id: "missing-id".to_string(),
@@ -54,16 +59,66 @@ fn install_live_orphan(env: &mut TestEnv) {
     });
 }
 
-/// A lock-loss flag from the worker (another surface stole the size-owner lock) exits live
-/// mode from the main-loop poll with no keystroke, drops the worker and explains the
-/// takeover. The sizing reset is skipped so the thief's grid stands.
+#[test]
+#[serial]
+fn degraded_snapshot_closes_live_send_without_disconnecting_sidebar() {
+    use crate::tui::session_feed::{SessionFeedResult, SidebarSource};
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    let _command_driver = env.view.session_feed.terminal_driver_for_test();
+    env.view
+        .session_feed
+        .publish_for_test(super::session_feed_tests::daemon_snapshot(
+            &env.view, &id, "Running",
+        ));
+    env.view.apply_session_feed();
+    assert!(env.view.session_feed.native_interaction_available());
+    install_live_for_first_session(&mut env);
+    assert!(env.view.live_send.is_some());
+
+    let SessionFeedResult::Snapshot(snapshot) =
+        super::session_feed_tests::daemon_snapshot(&env.view, &id, "Running")
+    else {
+        unreachable!()
+    };
+    let mut snapshot = (*snapshot).clone();
+    snapshot.cursor.revision += 1;
+    snapshot.contents.health = crate::daemon::RuntimeHealth::Degraded {
+        code: crate::daemon::ReloadFailureCode::ProfileData,
+        profiles: vec!["test".into()],
+    };
+    snapshot.contents.capabilities.native_interaction = false;
+    env.view.session_feed.set_native_permission_for_test(false);
+    env.view
+        .session_feed
+        .publish_for_test(SessionFeedResult::Snapshot(std::sync::Arc::new(snapshot)));
+    env.view.apply_session_feed();
+
+    assert_eq!(env.view.sidebar_source, SidebarSource::Daemon);
+    assert!(env.view.live_send.is_none());
+    assert!(!env.view.session_feed.native_interaction_available());
+    env.view
+        .execute_permission_response(&id, crate::tui::dialogs::PermissionResponseChoice::Allow);
+    assert!(env.view.info_dialog.is_some());
+}
+
+/// A lock-loss flag from the live-send worker (another surface stole
+/// the size-owner lock) exits live mode from the main-loop poll, with
+/// no keystroke needed, drops the worker, and explains the takeover in
+/// an info dialog. The sizing reset is skipped so the thief's grid
+/// stands; only the shared teardown runs.
 #[test]
 #[serial]
 fn poll_live_send_takeover_exits_live_mode_with_dialog() {
     use crate::tui::home::live_send::LiveSendWorker;
     let mut env = create_test_env_with_sessions(1);
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
     install_live_for_first_session(&mut env);
-    env.view.live_send_worker = Some(LiveSendWorker::spawn("fake".to_string(), None));
+    env.view.live_send_worker = Some(LiveSendWorker::spawn(
+        "fake".to_string(),
+        None,
+        crate::tui::session_feed::NativeLease::valid_for_test(),
+    ));
 
     // Flag not set: the poll is a no-op and live mode stays.
     assert!(!env.view.poll_live_send_takeover());
@@ -115,6 +170,9 @@ fn live_mode_keys_exit_on_chord_or_drift() {
             install_live_for_first_session(&mut env);
             env
         };
+        // The TUI is a thin daemon client: forwarding a live keystroke needs the
+        // native driver mounted, or every case here would exercise the refusal path.
+        let _native_driver = env.view.session_feed.terminal_driver_for_test();
         let action = env.view.handle_key(key_event, None);
         let case = format!("orphan={orphan} key={key_event:?}");
         if stays_live {
@@ -132,6 +190,7 @@ fn live_mode_keys_exit_on_chord_or_drift() {
 fn page_keys_in_live_mode() {
     use std::cmp::Ordering;
     let mut env = create_test_env_with_sessions(1);
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
     install_live_for_first_session(&mut env);
     for (code, mods, start, moves) in [
         (KeyCode::PageUp, KeyModifiers::SHIFT, 0, Ordering::Greater),
@@ -156,6 +215,7 @@ fn drift_check_auto_exits_when_session_renamed() {
     // no longer has, so the next keystroke auto-exits. Force the cache to the post-rename
     // state so the id-anchored resolution has nothing stale to adopt.
     let mut env = create_test_env_with_sessions(1);
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
     let id = install_live_for_first_session(&mut env);
     env.view.mutate_instance(&id, |inst| {
         inst.title = "renamed-after-entry".to_string();
@@ -178,6 +238,7 @@ fn drift_check_stays_when_retitle_did_not_rename_the_tmux_session() {
     // The worker still holds this session's pane, so that is not drift and auto-exiting
     // would kick the user out of a correct pane.
     let mut env = create_test_env_with_sessions(1);
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
     let id = install_live_for_first_session(&mut env);
     let created = env.view.live_send.as_ref().unwrap().tmux_name.clone();
     env.view.mutate_instance(&id, |inst| {
@@ -198,12 +259,9 @@ fn drift_check_stays_when_retitle_did_not_rename_the_tmux_session() {
 #[test]
 #[serial]
 fn drift_check_does_not_exit_for_tool_target_named_via_tool_session() {
-    // The Tool arm of the drift check must resolve the current name the way
-    // `prepare_live_send` computed `tmux_name` at entry, through
-    // `ToolSession::new(..).session_name()`. Re-deriving it through
-    // `Session::generate_name`, the agent-pane scheme, made every Tool-view live-send look
-    // renamed on its first keystroke.
+    // A tool's transport name must not be confused with the agent-pane name.
     let mut env = create_test_env_with_sessions(1);
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
     let id = env
         .view
         .flat_items
@@ -218,6 +276,20 @@ fn drift_check_does_not_exit_for_tool_target_named_via_tool_session() {
         .session_name()
         .to_string();
     crate::tmux::test_inject_session_into_cache(&tmux_name);
+    env.view.mutate_instance(&id, |instance| {
+        instance
+            .auxiliary
+            .push(crate::session::AuxiliaryObservation {
+                target: crate::session::AuxiliaryTarget::Tool {
+                    tool_name: "lazygit".to_owned(),
+                },
+                pane: crate::session::PaneObservation {
+                    state: crate::session::PanePresence::Alive,
+                    tmux_session: Some("tool".into()),
+                    legacy_tool: None,
+                },
+            });
+    });
     env.view.live_send = Some(LiveSendState {
         session_id: inst.id.clone(),
         title: inst.title,
@@ -249,6 +321,7 @@ fn live_mode_counts_as_dialog_and_wants_paste_burst() {
     assert!(!env.view.has_dialog());
     install_live_orphan(&mut env);
     assert!(env.view.has_dialog());
+
     assert!(env.view.wants_paste_burst());
 }
 
@@ -269,7 +342,15 @@ fn tab_enters_live_send_only_for_a_selected_session() {
     let mut env = create_test_env_with_sessions(1);
     env.view.cursor = 0;
     env.view.update_selected();
-    let id = cursor_session_id(&env.view).expect("test env has one session");
+    let id = env
+        .view
+        .flat_items
+        .iter()
+        .find_map(|item| match item {
+            crate::session::Item::Session { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .expect("test env has one session");
     env.view.mutate_instance(&id, |inst| {
         inst.status = crate::session::Status::Stopped;
     });
@@ -359,9 +440,11 @@ fn paste_routes_to_rename_dialog_opened_over_live_send() {
     );
 }
 
-/// Companion pin: with live-send active and no overlay on top, paste keeps streaming to the
-/// pane. The fixture has no worker attached, so the observable contract is that the
-/// live-send branch consumes it, buffering nothing into a dialog or pending_paste.
+/// Companion pin: with live-send active and NO overlay on top, paste
+/// keeps streaming to the pane. The unit fixture has no worker
+/// attached, so the observable contract is that the live-send branch
+/// consumes the paste: nothing buffers into a compose dialog or
+/// pending_paste.
 #[test]
 #[serial]
 fn paste_in_pure_live_mode_is_consumed_by_live_send() {
@@ -375,10 +458,12 @@ fn paste_in_pure_live_mode_is_consumed_by_live_send() {
     assert!(env.view.pending_paste.is_none());
 }
 
-/// A finalized preview highlight installed via a mouse drag, which never runs through
-/// `handle_key`, must be dropped when the user pastes into a dialog opened over live-send.
-/// Before the clear was hoisted to the top of `handle_paste`, only the pane-streaming branch
-/// cleared it and the highlight repainted over stale cells.
+/// A finalized preview highlight (installed via a mouse drag, which
+/// never runs through `handle_key`) must be dropped when the user
+/// pastes into a dialog opened over live-send. Before the clear was
+/// hoisted to the top of `handle_paste`, only the pane-streaming
+/// branch cleared it, so the highlight survived a dialog-routed paste
+/// and kept repainting over stale cells after the dialog closed.
 #[test]
 #[serial]
 fn paste_into_dialog_over_live_send_clears_preview_selection() {
@@ -522,9 +607,7 @@ fn accepted_capture_keeps_content_and_cursor_in_one_cache_frame() {
 #[test]
 #[serial]
 fn warm_predicates_stay_cold_without_a_live_pane() {
-    // The toast is skipped only when the target pane is provably warm; every uncertain case
-    // stays cold so a real revive keeps its feedback. The fixture has no tmux server, so
-    // even a live-status row reports cold, since pane existence is the load-bearing half.
+    // Only a confirmed live target may skip revival feedback.
     let mut env = create_test_env_with_sessions(1);
     let id = env
         .view
@@ -559,12 +642,33 @@ fn warm_predicates_stay_cold_without_a_live_pane() {
         );
     }
 
-    // Terminal-target warmth is keyed on the paired terminal pane, which
-    // the fixture also lacks: cold.
+    use crate::session::{AuxiliaryObservation, AuxiliaryTarget, PanePresence};
     env.view
-        .set_instance_status(&id, crate::session::Status::Idle);
+        .set_instance_status(&id, crate::session::Status::Stopped);
     env.view.pending_live_send_target = crate::tui::home::live_send::LiveSendTarget::Terminal;
     assert!(!env.view.live_entry_is_warm(&id));
+    for state in [
+        PanePresence::Absent,
+        PanePresence::Dead,
+        PanePresence::Unknown,
+        PanePresence::Alive,
+    ] {
+        env.view.mutate_instance(&id, |instance| {
+            instance.auxiliary = vec![AuxiliaryObservation {
+                target: AuxiliaryTarget::Host { index: 0 },
+                pane: crate::session::PaneObservation {
+                    state,
+                    tmux_session: Some("host".into()),
+                    legacy_tool: None,
+                },
+            }];
+        });
+        assert_eq!(
+            env.view.live_entry_is_warm(&id),
+            state == PanePresence::Alive,
+            "{state:?}"
+        );
+    }
 }
 
 #[test]
@@ -946,11 +1050,14 @@ fn refresh_terminal_cache_overwrites_on_empty_capture() {
 }
 
 mod paste_splitting {
-    //! `split_paste_for_live_send` decomposes a pasted string into tmux operations the
-    //! worker can deliver. Single-line pastes stay on the `Literal` + `Named("Tab")` path so
-    //! raw shells and bracketed-paste-unaware agents keep working; multi-line pastes go as
-    //! one `TmuxKey::Paste` without markers, leaving bracketed-paste to `paste-buffer -p`,
-    //! so the agent sees one paste instead of one `Enter` per line.
+    //! `split_paste_for_live_send` decomposes a pasted string into
+    //! tmux operations the live-send worker can actually deliver.
+    //! Single-line pastes stay on the simple `Literal` + `Named("Tab")`
+    //! path so raw shells and bracketed-paste-unaware agents keep
+    //! working. Multi-line pastes are dispatched as one `TmuxKey::Paste`
+    //! payload without escape markers; tmux delegates bracketed-paste
+    //! handling to `paste-buffer -p`, so the agent sees one paste instead
+    //! of one `Enter` per line.
 
     use crate::tui::home::input::split_paste_for_live_send;
     use crate::tui::home::live_send::TmuxKey;
@@ -962,9 +1069,13 @@ mod paste_splitting {
         TmuxKey::Named(name.to_string())
     }
 
-    /// Expected shape for a multi-line paste: one `Paste` carrying the payload verbatim,
-    /// with no bracketed-paste markers. tmux adds those via `paste-buffer -p` only for panes
-    /// that set DECSET 2004. Interior newlines stay `\n`; tmux translates them to CR.
+    /// Expected shape for a multi-line paste: one `Paste` action
+    /// carrying the payload verbatim. No bracketed-paste markers
+    /// appear here on purpose. tmux adds them via `paste-buffer -p`
+    /// only for panes that set DECSET 2004, so a raw shell or SQL
+    /// REPL no longer receives markers it would render as literal
+    /// `00~` / `01~` text. Interior newlines stay `\n`; tmux
+    /// translates them to CR when it performs the paste.
     fn paste(body: &str) -> Vec<TmuxKey> {
         vec![TmuxKey::Paste(body.to_string())]
     }
@@ -1022,6 +1133,7 @@ fn leader_t_swaps_live_target_between_agent_and_terminal() {
     use crate::tui::home::live_send::{parse_chord, LiveSendTarget};
 
     let mut env = create_test_env_with_sessions(1);
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
     let id = install_live_for_first_session(&mut env);
     let cases = [
         (
@@ -1089,4 +1201,115 @@ fn leader_t_swaps_live_target_between_agent_and_terminal() {
             "{name}: the view follows only once prepare_live_send succeeds"
         );
     }
+}
+
+#[test]
+fn tool_admission_rejects_reserved_rows_and_uses_fresh_configuration() {
+    use std::process::Command;
+    if std::env::var_os("AOE_TEST_TOOL_ADMISSION_CHILD").is_none() {
+        if !Command::new("tmux")
+            .arg("-V")
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return;
+        }
+        let home = TempDir::new().unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tui::home::tests::live_send_mode::tool_admission_rejects_reserved_rows_and_uses_fresh_configuration", "--nocapture"])
+            .env("AOE_TEST_TOOL_ADMISSION_CHILD", "1")
+            .env("AOE_TMUX_SOCKET", home.path().join("tmux.sock"))
+            .env("HOME", home.path())
+            .env("SHELL", "/bin/sh")
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let mut env = create_test_env_empty();
+    let project = env._temp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let mut instance = Instance::new("tool admission", project.to_str().unwrap());
+    instance.source_profile = "test".into();
+    let id = instance.id.clone();
+    env.view.add_instance(instance.clone());
+    let storage = Storage::open_unwatched("test").unwrap();
+    instance
+        .try_acquire_lifecycle_reservation(
+            LifecycleOperation::Purge,
+            Instance::LIFECYCLE_RESERVATION_TTL,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+    storage
+        .update(|rows, _| {
+            rows.push(instance.clone());
+            Ok(())
+        })
+        .unwrap();
+    let stale_marker = project.join("stale-command");
+    let fresh_marker = project.join("fresh-command");
+    env.view.tool_configs.insert(
+        "probe".into(),
+        crate::session::config::ToolSessionConfig {
+            command: format!(
+                "printf stale > {}; exec sleep 120",
+                crate::session::environment::shell_escape(&stale_marker.to_string_lossy())
+            ),
+            ..Default::default()
+        },
+    );
+    crate::session::config::update_config(|config| {
+        config.tools.insert(
+            "probe".into(),
+            crate::session::config::ToolSessionConfig {
+                command: format!(
+                    "printf fresh > {}; exec sleep 120",
+                    crate::session::environment::shell_escape(&fresh_marker.to_string_lossy())
+                ),
+                ..Default::default()
+            },
+        );
+    })
+    .unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    let name = crate::tmux::ToolSession::generate_name(&id, &instance.title, "probe");
+    let _tool = crate::tmux::test_helpers::TmuxTestSession::from_name(name.clone());
+    // The daemon prepares panes through `start_tool_with_size_in`, so the
+    // reservation guard is asserted on that entry point.
+    let mut reserved = env.view.get_instance(&id).cloned().expect("instance");
+    assert!(
+        reserved
+            .start_tool_with_size_in("probe", None, &storage, None, None)
+            .is_err(),
+        "a reserved purge admitted a tool"
+    );
+    assert!(!crate::tmux::Session::from_name(&name).exists());
+    storage
+        .update(|rows, _| {
+            rows[0].lifecycle_reservation = None;
+            Ok(())
+        })
+        .unwrap();
+    let mut released = env.view.get_instance(&id).cloned().expect("instance");
+    released
+        .start_tool_with_size_in("probe", None, &storage, None, None)
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !fresh_marker.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the freshly configured command did not run"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(std::fs::read(fresh_marker).unwrap(), b"fresh");
+    assert!(
+        !stale_marker.exists(),
+        "the cached command ran instead of durable configuration"
+    );
 }

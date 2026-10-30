@@ -482,7 +482,13 @@ pub(crate) fn session_summary(i: &crate::session::Instance) -> Value {
         "workspace_repos": i
             .all_repos()
             .iter()
-            .map(|r| json!({ "source_path": r.source_path, "branch": r.branch }))
+            .map(|r| {
+                json!({
+                    "source_path": r.source_path,
+                    "branch": r.branch,
+                    "worktree_path": r.worktree_path,
+                })
+            })
             .collect::<Vec<_>>(),
     });
     if let Some(w) = &i.worktree_info {
@@ -1219,8 +1225,8 @@ mod tests {
         assert_eq!(
             multi["workspace_repos"],
             json!([
-                {"source_path": "/src/api", "branch": "feat/x"},
-                {"source_path": "/src/web", "branch": "feat/x"},
+                {"source_path": "/src/api", "branch": "feat/x", "worktree_path": "/ws/api"},
+                {"source_path": "/src/web", "branch": "feat/x", "worktree_path": "/ws/web"},
             ])
         );
         assert_eq!(

@@ -17,6 +17,7 @@ import { validateProfileName } from "./profileName";
 
 interface Props {
   readOnly?: boolean;
+  onRenamed: () => Promise<void> | void;
 }
 
 // Per-section editing stays in those Settings tabs, scoped via ?profile=.
@@ -31,7 +32,7 @@ const SECONDARY_BUTTON =
   "px-3 py-1.5 rounded-md border border-surface-700 text-xs text-text-secondary hover:bg-surface-800 cursor-pointer";
 const LINK_BUTTON = "text-xs text-text-dim hover:text-text-primary cursor-pointer";
 
-export function ProfilesSection({ readOnly }: Props) {
+export function ProfilesSection({ readOnly, onRenamed }: Props) {
   const navigate = useNavigate();
   const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
   const [selected, setSelected] = useState<string>("");
@@ -106,6 +107,7 @@ export function ProfilesSection({ readOnly }: Props) {
     if (err) return setError(err);
     const ok = mode === "create" ? await createProfile(trimmed) : await renameProfile(selected, trimmed);
     if (!ok) return setError(`Failed to ${mode} profile`);
+    if (mode === "rename") await onRenamed();
     closeInput();
     selectProfile(trimmed);
     await reload();
@@ -197,7 +199,7 @@ export function ProfilesSection({ readOnly }: Props) {
               type="button"
               onClick={() => selectProfile(p.name)}
               className={`flex items-center justify-between rounded-md px-3 py-2 text-sm text-left cursor-pointer ${
-                p.name === selected ? "bg-surface-700 text-text-primary" : "text-text-secondary hover:bg-surface-800"
+                p.name === selected ? "bg-brand-600/20 text-text-primary" : "text-text-secondary hover:bg-surface-800"
               }`}
             >
               <span className="truncate">{p.name}</span>

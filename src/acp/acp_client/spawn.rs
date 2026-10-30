@@ -62,6 +62,8 @@ pub struct SpawnConfig {
     pub wrapper_substitution: Option<(String, String)>,
     /// Lifecycle epoch stamped on the runner's registry record.
     pub generation: u64,
+    /// Producer cancellation and pre-publication runner identity for the admitted epoch.
+    pub launch_lease: Option<crate::acp::runner_lifecycle::Lease>,
     pub claude_store_pin: Option<crate::session::capture::ClaudeStorePin>,
     /// Trusted environment before the current hook overlay or Claude routing.
     pub base_host_environment: Vec<(String, String)>,
@@ -528,7 +530,7 @@ pub(super) fn spawn_subprocess(
         // ProjectPathMissing (#1089) before the unresolved-binary hint (#1048).
         match &resolved {
             Err(reason) if e.kind() == std::io::ErrorKind::NotFound && config.cwd.exists() => {
-                AcpError::unresolved_adapter_spawn_error(&e, &config.spec.command, reason)
+                AcpError::unresolved_adapter_spawn_error(&e, config, reason)
             }
             _ => AcpError::classify_spawn_error(e, &config.cwd, &spawn_command),
         }
@@ -616,6 +618,24 @@ mod tests {
         let result = AcpClient::spawn(config, AcpSessionId("s-1".into())).await;
         assert!(matches!(result, Err(AcpError::Spawn(_))));
 
+        // A bare adapter missing from a configured PATH names that PATH.
+        let empty = tempfile::tempdir().unwrap();
+        let mut config = env_test_spawn_config(std::env::temp_dir());
+        config.spec.command = format!("aoe-test-no-such-adapter-{}", std::process::id());
+        config.base_host_environment = vec![("PATH".into(), empty.path().display().to_string())];
+        config.host_environment = config.base_host_environment.clone();
+        match AcpClient::spawn(config, AcpSessionId("s-1".into())).await {
+            Err(AcpError::Spawn(msg)) => {
+                assert!(
+                    msg.contains("the PATH `environment` sets for the agent"),
+                    "{msg}"
+                );
+                assert!(!msg.contains("restart `aoe serve`"), "{msg}");
+            }
+            Err(other) => panic!("expected a missing-adapter error, got {other:?}"),
+            Ok(_) => panic!("expected a missing-adapter error, got Ok"),
+        }
+
         // #1089: a renamed project path is typed, not a bare ENOENT.
         let missing =
             std::env::temp_dir().join(format!("aoe-test-missing-cwd-{}", std::process::id()));
@@ -694,6 +714,7 @@ mod tests {
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         });
         assert!(inherited_host_env_pairs(&config).is_empty());

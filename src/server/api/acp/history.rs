@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::acp::protocol::{
     ContextPrimerQuery, ContextPrimerResponse, FilesResponse, ReplayQuery, ReplayResponse,
 };
+use crate::server::api::sessions::cityhall_block_non_structured;
 use crate::server::api::{find_instance, instance_exists};
 
 use super::*;
@@ -199,6 +200,9 @@ pub async fn acp_context_primer(
     Path(id): Path<String>,
     axum::extract::Query(q): axum::extract::Query<ContextPrimerQuery>,
 ) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     let events = state.acp_event_store.replay_before(&id, q.before_seq);
     let primer = crate::acp::context_primer::build_context_primer(
         &events,
@@ -218,6 +222,60 @@ pub async fn acp_context_primer(
     .into_response()
 }
 
+/// Events read per batch when looking below a `view=rows` page.
+const ROWS_PRIOR_BATCH: usize = 256;
+
+/// Only an identified chunk before the page's first user turn can use an older marker.
+fn prior_message_marker_for_page(
+    events: &[(u64, crate::acp::state::Event)],
+    lookup: impl FnOnce(u64) -> Option<crate::acp::state::Event>,
+) -> Option<crate::acp::state::Event> {
+    use crate::acp::state::Event;
+    for (_, event) in events {
+        match event {
+            Event::AgentMessageChunk {
+                message_id: Some(_),
+                ..
+            } => return lookup(events[0].0),
+            Event::UserPromptSent { .. } | Event::UserDiffCommentsPrompt { .. } => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The latest event below `before` that says which agent message a page
+/// continues: a chunk with a message id, or a user turn, which resets it.
+/// Walks retained history backward in batches until one is found.
+fn prior_message_marker(
+    store: &crate::acp::event_store::EventStore,
+    session_id: &str,
+    before: u64,
+    batch: usize,
+) -> Option<crate::acp::state::Event> {
+    let mut cursor = before;
+    loop {
+        let page = store.replay_page_before(session_id, cursor, Some(batch));
+        let marker = page.events.iter().rev().find(|(_, event)| {
+            matches!(
+                event,
+                crate::acp::state::Event::AgentMessageChunk {
+                    message_id: Some(_),
+                    ..
+                } | crate::acp::state::Event::UserPromptSent { .. }
+                    | crate::acp::state::Event::UserDiffCommentsPrompt { .. }
+            )
+        });
+        if let Some((_, event)) = marker {
+            return Some(event.clone());
+        }
+        match page.last_scanned_seq {
+            Some(next) if page.has_more && next < cursor => cursor = next,
+            _ => return None,
+        }
+    }
+}
+
 /// Paged transcript replay from the durable event store. `before` pages
 /// backward; `view=rows` returns the page folded into transcript rows with
 /// identical paging metadata.
@@ -226,6 +284,9 @@ pub async fn acp_replay(
     Path(id): Path<String>,
     axum::extract::Query(q): axum::extract::Query<ReplayQuery>,
 ) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     let limit = q
         .limit
         .map(|l| l as usize)
@@ -247,6 +308,11 @@ pub async fn acp_replay(
     );
     let (frames, rows) = if q.view.as_deref() == Some("rows") {
         let mut model = crate::acp::transcript::TranscriptModel::new();
+        if let Some(prior) = prior_message_marker_for_page(&page.events, |lowest| {
+            prior_message_marker(&state.acp_event_store, &id, lowest, ROWS_PRIOR_BATCH)
+        }) {
+            model.observe_prior(&prior);
+        }
         for (seq, event) in &page.events {
             model.apply_event(*seq, event);
         }
@@ -260,6 +326,7 @@ pub async fn acp_replay(
                 seq,
                 event: Arc::new(event),
                 worker_generation: None,
+                sidebar_status: None,
             })
             .collect();
         (frames, None)
@@ -340,14 +407,23 @@ pub async fn list_importable_sessions(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(q): axum::extract::Query<ImportableSessionsQuery>,
 ) -> impl IntoResponse {
+    // Native session discovery exposes titles and paths outside this mode's scope.
+    if let Some(resp) = cityhall_block(&state) {
+        return resp;
+    }
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
-    let profile = q.profile.as_deref().filter(|p| !p.is_empty());
-    if let Some(resp) = profile.and_then(crate::server::api::unknown_profile_response) {
+    let _namespace = state.profile_namespace.read().await;
+    let profile = q.profile.filter(|p| !p.is_empty());
+    if let Some(resp) = profile
+        .as_deref()
+        .and_then(crate::server::api::unknown_profile_response)
+    {
         return resp;
     }
-    match importable_sessions(&state, &q.agent, profile.unwrap_or(&state.profile)).await {
+    let profile = profile.unwrap_or_else(|| state.served_profile().clone());
+    match importable_sessions(&state, &q.agent, &profile).await {
         Ok(list) => Json(list).into_response(),
         Err(e) => list_error_response(e),
     }
@@ -472,6 +548,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn import_discovery_refuses_cityhall_and_read_only_before_listing() {
+        for cityhall in [false, true] {
+            for agent in ["claude", "codex"] {
+                let state = crate::server::test_support::build_test_app_state_configured(
+                    Vec::new(),
+                    |state| {
+                        state.cityhall_mode = cityhall;
+                        state.read_only = !cityhall;
+                    },
+                );
+                let response = list_importable_sessions(
+                    State(state),
+                    axum::extract::Query(ImportableSessionsQuery {
+                        agent: agent.into(),
+                        profile: Some("missing-profile".into()),
+                    }),
+                )
+                .await
+                .into_response();
+                assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(
+                    body["error"],
+                    if cityhall {
+                        "cityhall_mode"
+                    } else {
+                        "read_only"
+                    },
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     #[serial_test::serial]
     async fn importable_sessions_lists_the_selected_profile_and_never_launches_a_denied_agent() {
         let tmp = tempfile::tempdir().unwrap();
@@ -517,10 +630,10 @@ done
         }
 
         let state = crate::server::test_support::build_test_app_state(Vec::new());
-        let get = |profile: &str| {
+        let get = |profile: Option<&str>| {
             let q = ImportableSessionsQuery {
                 agent: "pi".into(),
-                profile: Some(profile.into()),
+                profile: profile.map(str::to_owned),
             };
             let state = state.clone();
             async move {
@@ -536,11 +649,22 @@ done
             }
         };
         for name in ["a", "b"] {
-            let (status, body) = get(name).await;
+            let (status, body) = get(Some(name)).await;
             assert_eq!(status, StatusCode::OK, "{body}");
             assert_eq!(body["sessions"][0]["cwd"], format!("/stores/{name}"));
         }
-        let (status, body) = get("missing").await;
+        let served_profile = state.served_profile().to_string();
+        state.rename_served_profile(&served_profile, "b");
+        for profile in [None, Some("")] {
+            let (status, body) = get(profile).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["sessions"][0]["cwd"], "/stores/b");
+        }
+        state.rename_served_profile("b", "a");
+        let (status, body) = get(None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["sessions"][0]["cwd"], "/stores/a");
+        let (status, body) = get(Some("missing")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"], "profile_not_found");
 
@@ -550,10 +674,206 @@ done
         })
         .unwrap();
         std::fs::remove_file(&ran).unwrap();
-        let (status, body) = get("a").await;
+        let (status, body) = get(Some("a")).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["error"], "agent_not_allowed");
         assert!(!ran.exists(), "a denied adapter must not be spawned");
+    }
+
+    /// A rows page that opens on a new agent message marks it, from the
+    /// events just below the page.
+    #[tokio::test]
+    async fn acp_replay_view_rows_marks_a_message_that_continues_the_previous_page() {
+        let chunk = |text: &str, message_id: &str| Event::AgentMessageChunk {
+            text: text.into(),
+            message_id: Some(message_id.into()),
+        };
+        let prompt = || Event::UserPromptSent {
+            text: "status".into(),
+            attachments: Vec::new(),
+            prompt_id: None,
+            synthesized: false,
+            origin_plugin: None,
+        };
+        // More invisible events between the messages than a fixed lookback
+        // would have read, within the test store's retention.
+        let thoughts = || std::iter::repeat_n(Event::ThinkingStarted, 70);
+        // (events before the page, page events, message_start per page row)
+        let cases: [(Vec<Event>, Vec<Event>, Vec<bool>); 6] = [
+            (
+                vec![prompt(), chunk("for #4656.", "m-a")],
+                vec![chunk("", "m-b"), chunk("The waiter has the lock.", "m-b")],
+                vec![true, false],
+            ),
+            (
+                std::iter::once(prompt())
+                    .chain([chunk("for #4656.", "m-a")])
+                    .chain(thoughts())
+                    .collect(),
+                vec![chunk("", "m-b"), chunk("The waiter has the lock.", "m-b")],
+                vec![true, false],
+            ),
+            (
+                std::iter::once(prompt())
+                    .chain([chunk("Still ", "m-a")])
+                    .chain(thoughts())
+                    .collect(),
+                vec![chunk("going.", "m-a")],
+                vec![false],
+            ),
+            (
+                vec![chunk("earlier turn", "m-a"), prompt()],
+                vec![chunk("", "m-b"), chunk("New turn.", "m-b")],
+                vec![false, false],
+            ),
+            (
+                vec![chunk("earlier message", "m-a")],
+                vec![
+                    Event::AgentMessageChunk {
+                        text: "id-less prefix".into(),
+                        message_id: None,
+                    },
+                    chunk("new message", "m-b"),
+                ],
+                vec![false, true],
+            ),
+            (
+                vec![chunk("earlier turn", "m-a")],
+                vec![prompt(), chunk("new turn", "m-b")],
+                vec![false],
+            ),
+        ];
+        for (before, page, expected) in cases {
+            let inst = crate::session::Instance::new("t", "/tmp");
+            let id = inst.id.clone();
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            let since = before.len() as u64;
+            for (i, ev) in before.iter().chain(&page).enumerate() {
+                state
+                    .acp_event_store
+                    .record(&id, i as u64 + 1, ev)
+                    .expect("record");
+            }
+            let q = ReplayQuery {
+                since,
+                limit: None,
+                before: None,
+                view: Some("rows".into()),
+            };
+            let resp = acp_replay(State(state), Path(id), axum::extract::Query(q))
+                .await
+                .into_response();
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let rows = serde_json::from_slice::<ReplayResponse>(&bytes)
+                .unwrap()
+                .rows
+                .expect("rows present");
+            let starts: Vec<bool> = rows
+                .iter()
+                .filter(|r| r.kind == crate::acp::transcript::TranscriptRowKind::Message)
+                .map(|r| r.message_start)
+                .collect();
+            assert_eq!(starts, expected, "{} events before the page", before.len());
+        }
+    }
+
+    #[test]
+    fn rows_page_reads_prior_history_only_before_an_identified_chunk() {
+        let identified = Event::AgentMessageChunk {
+            text: "identified".into(),
+            message_id: Some("m-b".into()),
+        };
+        let idless = Event::AgentMessageChunk {
+            text: "id-less".into(),
+            message_id: None,
+        };
+        let prompt = Event::UserPromptSent {
+            text: "go".into(),
+            attachments: Vec::new(),
+            prompt_id: None,
+            synthesized: false,
+            origin_plugin: None,
+        };
+        let diff_prompt = Event::UserDiffCommentsPrompt {
+            intro: String::new(),
+            outro: String::new(),
+            is_multi_repo: false,
+            comments: Vec::new(),
+            assembled_markdown: "review".into(),
+        };
+        for (label, events, reads) in [
+            ("empty", vec![], 0),
+            ("id-less", vec![idless.clone()], 0),
+            ("invisible", vec![Event::ThinkingStarted], 0),
+            ("new turn", vec![prompt.clone(), identified.clone()], 0),
+            ("diff turn", vec![diff_prompt, identified.clone()], 0),
+            (
+                "id-less then identified",
+                vec![idless.clone(), identified.clone()],
+                1,
+            ),
+            (
+                "invisible then identified",
+                vec![Event::ThinkingStarted, identified.clone()],
+                1,
+            ),
+            ("identified before reset", vec![identified, prompt], 1),
+        ] {
+            let page: Vec<_> = events
+                .into_iter()
+                .enumerate()
+                .map(|(i, e)| (i as u64 + 20, e))
+                .collect();
+            let mut calls = 0;
+            let prior = prior_message_marker_for_page(&page, |before| {
+                calls += 1;
+                assert_eq!(before, 20, "{label}");
+                Some(Event::AgentMessageChunk {
+                    text: "earlier".into(),
+                    message_id: Some("m-a".into()),
+                })
+            });
+            assert_eq!(calls, reads, "{label}");
+            assert_eq!(prior.is_some(), reads == 1, "{label}");
+        }
+    }
+
+    /// The marker search walks back batch by batch past invisible events, and
+    /// stops at a user turn.
+    #[test]
+    fn prior_message_marker_walks_back_through_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::acp::event_store::EventStore::open(&dir.path().join("e.db"), 1000)
+            .expect("event store");
+        let chunk = Event::AgentMessageChunk {
+            text: "A".into(),
+            message_id: Some("m-a".into()),
+        };
+        let prompt = Event::UserPromptSent {
+            text: "go".into(),
+            attachments: Vec::new(),
+            prompt_id: None,
+            synthesized: false,
+            origin_plugin: None,
+        };
+        for (session, head) in [("s-chunk", &chunk), ("s-prompt", &prompt)] {
+            let events =
+                std::iter::once(head).chain(std::iter::repeat_n(&Event::ThinkingStarted, 70));
+            for (i, event) in events.enumerate() {
+                store.record(session, i as u64 + 1, event).expect("record");
+            }
+        }
+        assert!(matches!(
+            prior_message_marker(&store, "s-chunk", 72, 8),
+            Some(Event::AgentMessageChunk { message_id: Some(id), .. }) if id == "m-a"
+        ));
+        assert!(matches!(
+            prior_message_marker(&store, "s-prompt", 72, 8),
+            Some(Event::UserPromptSent { .. })
+        ));
+        assert!(prior_message_marker(&store, "s-none", 72, 8).is_none());
     }
 
     #[tokio::test]
@@ -571,9 +891,13 @@ done
                 synthesized: false,
                 origin_plugin: None,
             },
-            Event::AgentMessageChunk { text: "hi".into() },
+            Event::AgentMessageChunk {
+                text: "hi".into(),
+                message_id: None,
+            },
             Event::AgentMessageChunk {
                 text: " there".into(),
+                message_id: None,
             },
             Event::Stopped {
                 reason: "prompt_complete".into(),

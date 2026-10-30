@@ -39,29 +39,89 @@ A source build leaves the binary at `target/release/aoe`. Verify any install wit
 aoe update
 ```
 
-`aoe update` detects how aoe was installed (Homebrew, the install script, Nix, or Cargo) and dispatches to the right mechanism. For Nix and Cargo it prints the manual command instead, since those need external tooling. In the TUI, press `u` while the update bar is visible to run the same flow, or `Ctrl+x` to dismiss the bar.
+`aoe update` detects how aoe was installed (Homebrew, the install script, Nix, or Cargo) and dispatches to the right mechanism. For Nix and Cargo it prints the manual command instead, since those need external tooling. A Nix profile install updates with `nix profile upgrade agent-of-empires` (see `nix profile list` for the entry name); if aoe comes from a flake input, run `nix flake update <input>` (your flake's name for aoe) and rebuild your system or home-manager configuration. In the TUI, press `u` while the update bar is visible to run the same flow, or `Ctrl+x` to dismiss the bar.
+
+A schema upgrade refuses to run while a daemon is still writing the old data layout. The TUI and ordinary commands stop before migration and tell you how to continue. With the new binary installed, run `aoe serve --restart` to retain the managed daemon's launch settings and authentication, stop its original process, migrate under exclusion, and start its replacement. Alternatively, run `aoe serve --stop`, then reopen the TUI. Stop a service-supervised daemon through its service manager before migrating and restart it there afterwards. Do not remove PID files or schema markers to bypass this gate.
+
+A daemon from an older build may not expose the local Unix runtime transport, even when a previous attempt already advanced the schema marker. The TUI asks you to restart that daemon rather than trying to use an incompatible transport. Stop and restart capture the original process incarnation before signaling; an exited but unreaped daemon does not require unsafe PID-based escalation.
 
 If you installed shell completions as a static file, regenerate it afterwards so it picks up new commands and flags; see [Shell completions](guides/shell-completions.md) for the always-fresh setup that avoids this.
 
+Local Unix transport requires a current-user-owned `daemon/` directory with mode
+`0700` and trusted ancestors. AoE creates missing application ancestors without
+group-write bits, including under umask `002`; it does not change existing
+`~/.config` permissions. On each daemon start, AoE removes group and other write
+permissions from an existing application directory owned by the current user.
+Follow the recovery advice for the refused directory:
+set `daemon/` to mode `0700`, or remove both group and other write permissions from
+another refused ancestor, then retry. A directory owned by another user also
+requires ownership recovery; changing its mode alone is not sufficient.
+
+Daemon directory refusals report escaped paths and recovery guidance. Paths containing non-UTF-8 bytes, control characters, bidirectional formatting characters, or backticks receive an escaped path and manual repair instructions instead of a shell command.
+
 ## Downgrading
 
-Downgrades are not supported: the older build refuses to start when `.schema_version` records a newer data schema, and that refusal is the safe outcome, because a migration that retypes a persisted field writes a shape the previous release cannot read.
+Downgrades are unsupported. An older build refuses a newer `.schema_version`; preserve that refusal. Never lower or delete the marker to force startup. Older commands and clients are not safe readability probes against current application data.
 
-### Finding out whether an older build can read your data
+Before upgrading, stop the daemon normally and quiesce clients and other publishers. Keep a consistent backup of the complete [application directory](guides/configuration.md#file-locations), including the schema marker, every profile, ownership journals, worker and launch records, credentials and conversation bindings. Include external registry targets, native conversation stores and other referenced data that the application directory does not contain. Restoring only session rows can separate resources from their original authority.
 
-1. Copy every `profiles/<name>/sessions.json` and the `groups.json` beside it out of the [app directory](guides/configuration.md#file-locations), plus the top-level `sessions.json` if the pre-profiles layout left one. A retype migration rewrites no other file; `groups.json` comes along so a return trip restores a matching pair.
-2. With that same older build, run `aoe ps` and read the number it prints when it refuses, its own schema version. A command that returns before the migration gate prints nothing, so `aoe update` and `aoe uninstall` are no use here. Then copy `.schema_version` as a record and edit it in place down to that number. Deleting it is not the safer variant: a missing file reads as version 0, so the older build re-runs every migration it has.
-3. Move any `sessions.corrupt.jsonl` or `groups.corrupt.jsonl` aside rather than deleting it, so step 4 can tell a new one from an old one.
-4. With that same older build, run `aoe ps`. It lists the running sessions, not every row in the registry, so read it for nothing: what matters is what it leaves on disk. The only file it adds beside a `sessions.json` is a quarantine file, and a pending sandbox-store transition, which the migrations reconcile on start, can also leave a `.storage.lock` beside it; neither file is created by reading, and only the quarantine one says anything about readability. Look for `sessions.corrupt.jsonl` or `groups.corrupt.jsonl` beside each `sessions.json`: one appears as soon as that build reads a row it cannot decode, and a `sessions.json` it cannot parse at all leaves nothing behind either. A profile whose directory is a symlink is skipped by a bare `aoe ps`, so run `aoe ps -p <name>`, or set `AGENT_OF_EMPIRES_PROFILE`, once more for each of those. The top-level `sessions.json` from step 1 gets no verdict: the session list only ever reads `profiles/<name>/sessions.json`, so nothing quarantines it, but the sandbox migrations do read and rewrite it, so treat it as unchecked by this procedure. The TUI is not a probe: it reconciles duplicates and rewrites the registry on start.
-5. If either quarantine file appeared, put your copies back and stay on the current release.
+Per-file `sessions.json.pre-migration-<stamp>` backups preserve bytes before individual rewrites, not a complete installation snapshot. Retention is bounded and later rewrites can evict the old shape. Quarantine files preserve damaged evidence, not a downgrade backup or proof of readability. Do not combine older rows with newer journals or manufacture missing receipts. Keep the current release unless a consistent pre-upgrade installation and its referenced data can be restored; such restoration is not a supported in-place downgrade.
 
-### When an older build could not read your sessions
+## Ownership recovery
 
-The quarantine file is a copy of those rows, and it holds one load's worth of them: that load writes the whole batch it could not decode, and a later load replaces the file, so whatever that later load no longer saw is gone from it.
+Stop the daemon with `aoe serve --stop` and quiesce every publisher before recovery. Resolve ambiguous daemon identity first. Do not delete PID records, locks, rows, tokens or credentials to force admission. Future schemas remain refused. Recovery uses serve, lifetime and state exclusion; a torn inactive historical launch record can be quarantined without removing a healthy peer record or its credentials.
 
-A migration that retypes a persisted field also leaves a `sessions.json.pre-migration-<stamp>` beside the file, holding the bytes from just before that rewrite. When one upgrade retypes more than one field each rewrite leaves its own, and only the first one still holds a shape the older release reads, so restore that one. Rank them by stamp: each copy is named above every sibling that existed when it was taken, so the lowest stamp is the oldest, and the one exception is a sibling at `u128::MAX`, which no real clock produces. Three are kept per file in all, counting the one just taken and counting an entry the prune could not remove, and the oldest goes first, so a fourth retype landing in one upgrade evicts the copy the older release reads. Anything else carrying one of those names spends one of the three and does the same. They are the only copies a downgrade is served from: repairing an interrupted session move keeps its own `sessions.json.pre-recovery-<stamp>` set, and a repair never evicts a migration backup.
+### Restore an ownership journal
 
-Check that the backup is there rather than assuming it: an upgrade that could not take one says so in its startup output and in the log. These retypes shipped in 1.17.0, so an install that already ran them has no backup of the older shape, and one only helps an install still on 1.16.x that upgrades into a build carrying them. Using it means editing `.schema_version` as in step 2.
+A missing or corrupt `pending-purge-owners.json` or `tool-retirements.json` fences cleanup. Restore only a complete original journal from a consistent backup of this application namespace. It must contain every outstanding original owner, frozen request, protection path, process birth and scope receipt. Valid JSON alone does not prove completeness.
+
+```sh
+aoe migrate --restore-purge-journal /backup/pending-purge-owners.json --confirm-complete-original-authority
+# Alternatively, restore original tool retirement receipts:
+aoe migrate --restore-tool-journal /backup/tool-retirements.json --confirm-complete-original-authority
+```
+
+Run only the matching restore command. Restore modes are mutually exclusive and require explicit confirmation. They restore authority only: no startup, process stop, cleanup, row removal or schema-marker update. Healthy or unsupported destinations are refused. Corrupt destination bytes remain in private quarantine files. A durability error can occur after publication; inspect the result rather than overwriting a now-healthy journal. Without a complete original backup, retain the fence. Never initialize an empty journal or manufacture missing proof.
+
+### Resolve legacy unknown scopes
+
+Stop, remove, purge and start resolve a pre-upgrade terminal session's scopes themselves. Units in the naming format earlier releases used, `aoe-session-<id>-<start_ms>.scope`, are adopted and stopped as those releases did. Any other live unknown unit is retained, not adopted or stopped. For worker and journal-held debt, repair unreadable components, restore required journals and run `aoe migrate`; a current schema marker is not proof.
+
+On Linux with a local systemd user manager, scope recovery authenticates that manager through its kernel-identified private socket. It binds the manager's reported cgroup root to its reader-relative procfs path and verifies the same physical manager in that directory's kernel membership. Recovery scans the complete manager subtree on a root-mounted cgroup2 filesystem without descendant overmounts. It does not require access to root's or the manager's protected namespace links. Unreadable or partial evidence, a changing manager, and live unknown units still refuse recovery. The runtime namespace comes from the effective user, not a caller-selected recovery identity.
+
+Managerless Linux operation resolves legacy rows to no scopes when `/run/user` or `/run/user/<euid>` is positively absent beneath validated canonical ancestors. If the canonical runtime exists but its `systemd/` directory is absent, recovery additionally requires a complete physical cgroup2 hierarchy with no populated scope matching that session. This supports elogind-style hosts without trusting missing user-owned sockets alone.
+
+The kernel-only proof checks the cgroup2 filesystem, complete mount boundary, physical-root interfaces and namespace stability, then scans the full hierarchy without exempting captured units. A populated matching scope, unreadable or partial inventory, symlink, or changing boundary retains unresolved authority and resources. Existing `systemd/` with an unavailable private socket still refuses recovery. Kernel discovery never grants retirement authority or changes original captured receipts. Caller-selected `XDG_RUNTIME_DIR`, disabling scope creation and a failed capability probe are not absence proof.
+
+Disappearance reported by a child-directory open does not block the scan. Missing or unreadable population evidence for an opened scope still blocks recovery.
+
+Unsupported or incomplete evidence remains protected: cgroup v1, hybrid layouts without the required root-mounted cgroup2 view, and views exposing only a delegated subtree do not establish absence. If the caller's namespace restricts that view, retry from the original host and context exposing the complete original hierarchy. Do not reboot, switch cgroup modes or manufacture receipts to make unknown authority disappear. Without supported original evidence, retain the resources; automatic v1 recovery and operator-attestation overrides are not provided.
+
+On macOS, recovery verifies the native Darwin kernel, which cannot host Linux systemd cgroups. This resolves only missing Linux-scope evidence. Explicit captured Linux unit receipts remain refused on macOS; recover those original resources on their Linux host. Worker PID, birth, generation, native runtime, producer and tmux authority are not adopted or replaced. Their own stop and cleanup guards still apply.
+
+Explicit recovery preserves original worker records and opaque fields, changing only an unresolved scope to proven unscoped status. A missing ownership journal must be restored from complete original authority, never recreated empty.
+
+If a live unknown unit blocks recovery:
+
+1. Keep a consistent original backup and keep all candidate-unit publishers quiescent. Discover units without changing them:
+   ```sh
+   systemctl --user list-units --all --plain --no-legend --full --type=scope
+   ```
+2. Select one literal candidate name as `UNIT` and inspect its identity:
+   ```sh
+   systemctl --user show --property=Id --property=InvocationID --property=ActiveState --property=ControlGroup -- "$UNIT"
+   ```
+   Inspect surviving original launch evidence and the complete cgroup and process-birth inventory. A matching session ID, pane PID, absent pane or current configuration alone does not prove ownership.
+3. Independently establish that this exact current unit incarnation is the original intended cohort. If original ownership or incarnation cannot be proved, or another application may own or recreate it, stop here. Do not retire it or clear unknown debt.
+4. Only after establishing that authority, retire that literal original unit:
+   ```sh
+   systemctl --user stop -- "$UNIT"
+   systemctl --user show --property=ActiveState --property=ControlGroup -- "$UNIT"
+   ```
+   Require inactive or failed state and an empty cgroup. Command success alone is not proof. Never use a glob or a destructive list derived only from session-ID matching.
+5. Run `aoe migrate` again for fresh complete manager and kernel proof. Only proven absence resolves unknown scope debt. Captured owned units and all process-birth, native-runtime, producer and filesystem authority remain unchanged.
+
+If complete absence or original ownership cannot be established, recovery remains fenced. Do not remove evidence to make it pass.
 
 ## Uninstalling
 

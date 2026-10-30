@@ -160,7 +160,7 @@ export function activityToThreadMessages(
       (currentAssistant ??= new AssistantBuilder(row.id, row.at)).appendText(`_${row.text}_`);
     } else if (row.kind !== "thinking") {
       // Thinking shows in the spinner; message and unknown kinds render as text.
-      (currentAssistant ??= new AssistantBuilder(row.id, row.at)).appendText(row.text);
+      (currentAssistant ??= new AssistantBuilder(row.id, row.at)).appendText(row.text, row.messageStart);
     }
   }
   flushAssistant();
@@ -203,17 +203,21 @@ class AssistantBuilder {
   private parts: DraftPart[] = [];
   /** Subagent children, kept out of `parts` so they never split the text around them. */
   private children: ToolPart[] = [];
+  /** A new agent message opened, possibly on an empty row, so the next text starts a paragraph. */
+  private paragraphBreak = false;
 
   constructor(id: string, createdAtIso: string) {
     this.id = `assistant-${id}`;
     this.createdAt = parseDate(createdAtIso);
   }
 
-  appendText(text: string) {
+  appendText(text: string, messageStart = false) {
+    if (messageStart) this.paragraphBreak = true;
     if (!text) return;
     const last = this.parts[this.parts.length - 1];
-    if (last && last.type === "text") last.text += text;
+    if (last && last.type === "text") last.text += this.paragraphBreak ? `\n\n${text}` : text;
     else this.parts.push({ type: "text", text });
+    this.paragraphBreak = false;
   }
 
   /** assistant-ui parts carry no timestamps or titles, so they travel as namespaced args. */
@@ -225,6 +229,7 @@ class AssistantBuilder {
     // The wire name survives later retitles, so subagent launches stay recognisable.
     if (tool.raw_name) argsObj._aoe_raw_tool_name = tool.raw_name;
     if (tool.memory_recall) argsObj._aoe_memory_recall = tool.memory_recall;
+    if (tool.diffs?.length) argsObj._aoe_diffs = tool.diffs;
     const part: ToolPart = {
       type: "tool-call",
       toolCallId: tool.id,

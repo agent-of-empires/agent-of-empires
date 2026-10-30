@@ -5,15 +5,19 @@ import type { SchemaSettings } from "./generated/settingsKeys";
 
 export interface SessionResponse {
   id: string;
+  idempotency_key?: string | null;
+  parent_session_id?: string | null;
   title: string;
   project_path: string;
   /** Host path of the session's managed artifact directory. */
   artifact_dir: string;
   group_path: string;
+  sort_index?: number | null;
   tool: string;
   status: SessionStatus;
   /** Worker auto-stopped for inactivity (resumable), unlike a deliberate Stop. */
   dormant: boolean;
+  lifecycle_generation: number;
   yolo_mode: boolean;
   created_at: string;
   last_accessed_at: string | null;
@@ -45,6 +49,7 @@ export interface SessionResponse {
   /** Null once the snooze expires, so any non-null value is an active snooze. */
   snoozed_until?: string | null;
   trashed_at?: string | null;
+  trash_lifecycle_id?: string | null;
   /** Needs attention (unreviewed finished turn or manual flag). */
   unread?: boolean;
   has_managed_worktree: boolean;
@@ -75,6 +80,8 @@ export interface SessionResponse {
   acp_capable?: boolean;
   /** Captured ACP session id; required for a structured fork. */
   acp_session_id?: string;
+  /** An import whose history arrives once its Agent loads it; its `acp_session_id` is set from creation. */
+  import_pending?: boolean;
   /** Resolved ACP registry key, used as the current agent before any `AgentSwitched`. */
   acp_agent?: string;
   /** Pinned LLM backend ("api" | "bedrock" | "vertex"); absent means the host decides. */
@@ -85,10 +92,14 @@ export interface SessionResponse {
   clear_aliases?: string[];
   /** The agent implements ACP `session/fork` (resume-only agents do not). */
   acp_can_fork?: boolean;
+  /** The agent binary was replaced after launch and a restart is safe to offer now. */
+  update_restart?: boolean;
+  /** `acp.structured_view = off` for this session: a terminal session cannot switch to structured. */
+  structured_view_off?: boolean;
   /** Claude's fullscreen renderer is on, so mobile skips copy-mode scrollback workarounds. */
   claude_fullscreen: boolean;
   workspace_repos: WorkspaceRepoSummary[];
-  /** Only on the create-session response. */
+  /** Non-fatal notes: on create, rename, trash and restore responses. */
   warnings?: string[];
   plan_summary?: PlanSummary;
   /** When the agent's pending `ScheduleWakeup` fires. */
@@ -282,6 +293,8 @@ export interface Workspace {
 
 export interface AgentInfo {
   name: string;
+  /** How copy names the agent; the registry id for custom agents. */
+  display_name: string;
   kind: "builtin" | "custom" | "plugin";
   binary: string;
   host_only: boolean;
@@ -334,7 +347,9 @@ export interface BrowseResponse {
 
 export interface GroupInfo {
   path: string;
+  /** Sessions directly in this group, not in its children. */
   session_count: number;
+  archived?: boolean;
 }
 
 export interface ProjectOverrides {
@@ -361,6 +376,13 @@ export interface DockerStatusResponse {
   runtime: string | null;
 }
 
+export interface CreationTrustFingerprint {
+  project_path: string;
+  base_hooks_hash: string;
+  hooks_hash: string | null;
+  mcp_hash: string | null;
+}
+
 export interface CreateSessionRequest {
   title?: string;
   path: string;
@@ -377,6 +399,8 @@ export interface CreateSessionRequest {
   extra_args?: string;
   sandbox_image?: string;
   extra_env?: string[];
+  /** Host-only env for `host_hooks.before_start`; sandbox only, never enters the container. */
+  hook_env?: string[];
   extra_repo_paths?: string[];
   /** Per-repo base (`repo` is a directory name or path); outranks `base_branch`. */
   repo_bases?: { repo: string; base_branch: string }[];
@@ -391,6 +415,8 @@ export interface CreateSessionRequest {
   scratch?: boolean;
   /** Approve repo lifecycle hooks, like CLI `--trust-hooks`. */
   trust_hooks?: boolean;
+  /** Fingerprint of the exact hook/MCP configuration reviewed before approval. */
+  trust_review?: CreationTrustFingerprint;
   /** Claude Code session id to import; `path` must be its original cwd. */
   import_acp_session_id?: string;
   /** Agent or ACP session id to fork from. */

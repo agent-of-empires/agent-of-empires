@@ -1,6 +1,10 @@
 import { useCallback, useSyncExternalStore } from "react";
 
 import { DEFAULT_CONVERSATION_FONT_SIZE, normalizeConversationFontSize } from "../lib/conversationFontSize";
+import {
+  DEFAULT_PERSISTENT_STRUCTURED_VIEWS,
+  normalizePersistentStructuredViewLimit,
+} from "../lib/persistentStructuredViews";
 import { DEFAULT_PERSISTENT_TERMINALS, normalizePersistentTerminalLimit } from "../lib/persistentTerminals";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 import { DEFAULT_TOOLBAR_KEYS, normalizeToolbarKeys, type ToolbarKeyId } from "../lib/terminalToolbarKeys";
@@ -16,6 +20,8 @@ export interface WebSettings {
   autoOpenKeyboard: boolean;
   persistentTerminals: boolean;
   maxPersistentTerminals: number;
+  persistentStructuredViews: boolean;
+  maxPersistentStructuredViews: number;
   diffViewMode: "flat" | "tree";
   diffViewLayout: "unified" | "split";
   markdownPreview: "rendered" | "raw";
@@ -28,6 +34,8 @@ export interface WebSettings {
   /** Ordered key row above the soft keyboard in the live terminal. */
   mobileToolbarKeys: ToolbarKeyId[];
   showArrowJoystick: boolean;
+  /** Scroll control beside a full-screen mouse app, which has no scrollbar of its own. */
+  showForwardScrollbar: boolean;
 }
 
 function getDefaults(): WebSettings {
@@ -40,6 +48,8 @@ function getDefaults(): WebSettings {
     autoOpenKeyboard: true,
     persistentTerminals: false,
     maxPersistentTerminals: DEFAULT_PERSISTENT_TERMINALS,
+    persistentStructuredViews: false,
+    maxPersistentStructuredViews: DEFAULT_PERSISTENT_STRUCTURED_VIEWS,
     diffViewMode: window.innerWidth < 768 ? "flat" : "tree",
     diffViewLayout: "unified",
     markdownPreview: "rendered",
@@ -51,6 +61,7 @@ function getDefaults(): WebSettings {
     autoOpenPluginPanes: false,
     mobileToolbarKeys: [...DEFAULT_TOOLBAR_KEYS],
     showArrowJoystick: true,
+    showForwardScrollbar: false,
   };
 }
 
@@ -64,6 +75,8 @@ function normalizeSnapshot(settings: WebSettings): WebSettings {
     ...settings,
     persistentTerminals: normalizeBool(settings.persistentTerminals, defaults.persistentTerminals),
     maxPersistentTerminals: normalizePersistentTerminalLimit(settings.maxPersistentTerminals),
+    persistentStructuredViews: normalizeBool(settings.persistentStructuredViews, defaults.persistentStructuredViews),
+    maxPersistentStructuredViews: normalizePersistentStructuredViewLimit(settings.maxPersistentStructuredViews),
     structuredMobileFontSize: normalizeConversationFontSize(settings.structuredMobileFontSize),
     structuredDesktopFontSize: normalizeConversationFontSize(settings.structuredDesktopFontSize),
     sidebarCompact: normalizeBool(settings.sidebarCompact, defaults.sidebarCompact),
@@ -72,6 +85,7 @@ function normalizeSnapshot(settings: WebSettings): WebSettings {
     autoOpenPluginPanes: normalizeBool(settings.autoOpenPluginPanes, defaults.autoOpenPluginPanes),
     mobileToolbarKeys: normalizeToolbarKeys(settings.mobileToolbarKeys),
     showArrowJoystick: normalizeBool(settings.showArrowJoystick, defaults.showArrowJoystick),
+    showForwardScrollbar: normalizeBool(settings.showForwardScrollbar, defaults.showForwardScrollbar),
     markdownPreview:
       settings.markdownPreview === "rendered" || settings.markdownPreview === "raw"
         ? settings.markdownPreview

@@ -1,5 +1,4 @@
-//! Web CRUD for the project registry. Backs the dashboard's Projects page
-//! and feeds the session-creation wizard's multi-select picker.
+//! Canonical project reads and explicitly scoped registry commits.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -7,374 +6,461 @@ use std::sync::Arc;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     Json,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-use crate::server::auth::{handler_elevated, AuthenticatedSession, LoopbackTrusted};
+use super::{api_error, AppState};
+use crate::daemon::{
+    CreateProjectBody, ProfileSnapshot, ProjectResponse, ReloadFailureCode, RuntimeHealth,
+};
+use crate::server::auth::{handler_elevated, AuthenticatedSession};
+use crate::server::principal::{authorize, Capability, Principal};
 use crate::session::config::settings_schema::validate_project_plugin_setting;
-use crate::session::projects::{self, RegistryError};
-use crate::session::{Project, ProjectOverrides, ProjectScope};
-
-use super::AppState;
-use super::{api_error, read_only_response, validate_profile_name};
-
-#[derive(Serialize)]
-pub struct ProjectResponse {
-    pub name: String,
-    pub path: String,
-    pub scope: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub default_base_branch: Option<String>,
-    /// Whether the project shows as a sessionless sidebar header, which drives
-    /// the pin marker and empty-header visibility (#2208).
-    pub pinned: bool,
-    #[serde(skip_serializing_if = "ProjectOverrides::is_empty")]
-    pub overrides: ProjectOverrides,
-}
+use crate::session::projects::{self, ProjectPatch, RegistryError};
+use crate::session::{Project, ProjectScope};
 
 impl From<Project> for ProjectResponse {
-    fn from(p: Project) -> Self {
+    fn from(project: Project) -> Self {
         Self {
-            name: p.name,
-            path: p.path,
-            scope: p.scope.as_str().to_string(),
-            default_base_branch: p.default_base_branch,
-            pinned: p.pinned,
-            overrides: p.overrides,
+            name: project.name,
+            path: projects::canonical_key(project.path),
+            scope: project.scope,
+            default_base_branch: project.default_base_branch,
+            pinned: project.pinned,
+            overrides: project.overrides,
         }
     }
 }
 
 #[derive(Deserialize)]
-pub struct ListQuery {
-    /// Optional scope filter: "global", "profile", or omitted (= all).
-    #[serde(default)]
+pub struct ProjectQuery {
     pub scope: Option<String>,
     /// Profile whose registry entries to resolve; defaults to the served profile.
     #[serde(default)]
     pub profile: Option<String>,
 }
 
-#[tracing::instrument(target = "http.api.projects", skip_all, fields(scope = q.scope.as_deref().unwrap_or("merged")))]
-pub async fn list_projects(
-    State(state): State<Arc<AppState>>,
-    Query(q): Query<ListQuery>,
-) -> impl IntoResponse {
-    let profile = match q.profile.as_deref() {
-        Some(name) => {
-            if let Err(e) = validate_profile_name(name) {
-                return api_error(StatusCode::BAD_REQUEST, "bad_profile", e);
-            }
-            name
-        }
-        None => state.profile.as_str(),
-    };
-    let result: anyhow::Result<Vec<Project>> = match q.scope.as_deref() {
-        Some("global") => projects::load_global(),
-        Some("profile") => projects::load_profile(profile),
-        Some(other) => {
-            tracing::warn!(target: "http.api.projects", scope = other, "rejected bad scope");
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "bad_scope",
-                format!(
-                    "Unknown scope '{}'. Use 'global', 'profile', or omit.",
-                    other
-                ),
-            );
-        }
-        // The wizard derives sandbox and worktree defaults from this, so an unreadable registry must
-        // fail the request instead of reading as "no overrides".
-        None => projects::load_merged_strict(profile),
-    };
+fn project_error(status: StatusCode, code: &str, message: &str) -> Response {
+    (
+        status,
+        Json(serde_json::json!({"error": code, "message": message})),
+    )
+        .into_response()
+}
 
-    match result {
-        Ok(list) => {
-            tracing::debug!(target: "http.api.projects", count = list.len(), "listed projects");
-            Json(
-                list.into_iter()
-                    .map(ProjectResponse::from)
-                    .collect::<Vec<_>>(),
-            )
-            .into_response()
-        }
-        Err(e) => {
-            tracing::error!(target: "http.api.projects", error = %e, "load_failed");
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "load_failed",
-                e.to_string(),
-            )
-        }
+fn write_scope(scope: Option<&str>) -> Result<ProjectScope, Response> {
+    match scope {
+        Some("global") => Ok(ProjectScope::Global),
+        Some("profile") => Ok(ProjectScope::Profile),
+        _ => Err(project_error(
+            StatusCode::BAD_REQUEST,
+            "bad_scope",
+            "An explicit global or profile scope is required",
+        )),
     }
 }
 
-#[derive(Deserialize)]
-pub struct CreateProjectBody {
-    pub path: String,
-    #[serde(default)]
-    pub name: Option<String>,
-    /// "global" (default) or "profile".
-    #[serde(default)]
-    pub scope: Option<String>,
-    /// Allow registering this path even when it already exists in the other
-    /// scope. Cross-scope path collisions otherwise return 409.
-    #[serde(default)]
-    pub allow_override: bool,
-    /// Default base branch for new worktree branches created against this
-    /// project. Empty or whitespace is treated as unset.
-    #[serde(default)]
-    pub default_base_branch: Option<String>,
-    /// Pin the project as a sessionless sidebar header. The Projects view just
-    /// saves a project; the sidebar "Pin project" action sends `true` (#2208).
-    #[serde(default)]
-    pub pinned: bool,
-    /// Per-project overrides for otherwise-global settings. Absent/empty
-    /// means "don't override anything".
-    #[serde(default)]
-    pub overrides: ProjectOverrides,
+fn profile_index(profiles: &[ProfileSnapshot], name: Option<&str>) -> Result<usize, Response> {
+    let name = name.ok_or_else(|| {
+        project_error(
+            StatusCode::BAD_REQUEST,
+            "profile_required",
+            "An explicit profile is required",
+        )
+    })?;
+    profiles
+        .iter()
+        .position(|profile| profile.name == name)
+        .ok_or_else(|| {
+            project_error(
+                StatusCode::NOT_FOUND,
+                "profile_not_found",
+                "Profile not found",
+            )
+        })
 }
 
-#[tracing::instrument(
-    target = "http.api.projects",
-    skip_all,
-    fields(
-        path = tracing::field::Empty,
-        scope = tracing::field::Empty,
-        allow_override = tracing::field::Empty,
-    ),
-)]
+#[tracing::instrument(target = "http.api.projects", skip_all)]
+pub async fn list_projects(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ProjectQuery>,
+) -> Response {
+    if query
+        .scope
+        .as_deref()
+        .is_some_and(|scope| scope != "global" && scope != "profile")
+    {
+        return project_error(
+            StatusCode::BAD_REQUEST,
+            "bad_scope",
+            "Use global, profile, or omit the scope for merged projects",
+        );
+    }
+    if let Some(profile) = query.profile.as_deref() {
+        if let Err(message) = super::validate_profile_name(profile) {
+            return project_error(StatusCode::BAD_REQUEST, "bad_profile", &message);
+        }
+    }
+    let _namespace = state.profile_namespace.read().await;
+    let snapshot = match state.runtime.publish(&state).await {
+        Ok(snapshot) => snapshot,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let contents = &snapshot.value.contents;
+    if query.scope.as_deref() == Some("global") {
+        return Json(&contents.global_projects).into_response();
+    }
+    let served = state.served_profile();
+    let index = match profile_index(
+        &contents.profiles,
+        Some(query.profile.as_deref().unwrap_or(&served)),
+    ) {
+        Ok(index) => index,
+        Err(response) => return response,
+    };
+    let profile = &contents.profiles[index];
+    if query.scope.as_deref() == Some("profile") {
+        return Json(&profile.projects).into_response();
+    }
+    Json(projects::merge_project_scopes(
+        &contents.global_projects,
+        &profile.projects,
+        |project| project.path.as_str(),
+    ))
+    .into_response()
+}
+
+enum ProjectChange<T> {
+    Current(T),
+    Removed(ProjectResponse),
+}
+
+async fn commit_project(
+    state: Arc<AppState>,
+    scope: ProjectScope,
+    profile: Option<String>,
+    status: StatusCode,
+    mutate: impl FnOnce(
+            &str,
+            ProjectScope,
+        ) -> Result<projects::ProjectCommit<ProjectChange<usize>>, RegistryError>
+        + Send
+        + 'static,
+) -> Response {
+    let namespace = state.profile_namespace.read().await;
+    let publication = state.publication.write().await;
+    if *state.canonical_health.read().await != RuntimeHealth::Healthy {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let selected_profile = if profile.is_some() || scope == ProjectScope::Profile {
+        match profile_index(
+            &state.canonical_metadata.read().await.profiles,
+            profile.as_deref(),
+        ) {
+            Ok(index) => Some(index),
+            Err(response) => return response,
+        }
+    } else {
+        None
+    };
+    let worker_state = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let result = (|| -> Result<_, RegistryError> {
+            let commit = mutate(profile.as_deref().unwrap_or(""), scope)?;
+            let metadata = worker_state.canonical_metadata.blocking_read();
+            let shared_global = commit.target.same_target(&projects::open_registry(None)?)?;
+            let mut shared_profiles = Vec::new();
+            for (index, candidate) in metadata.profiles.iter().enumerate() {
+                if commit
+                    .target
+                    .same_target(&projects::open_registry(Some(&candidate.name))?)?
+                {
+                    shared_profiles.push(index);
+                }
+            }
+            if match scope {
+                ProjectScope::Global => !shared_global,
+                ProjectScope::Profile => {
+                    !shared_profiles.contains(&selected_profile.expect("validated profile"))
+                }
+            } {
+                return Err(
+                    anyhow::anyhow!("project registry identity changed during commit").into(),
+                );
+            }
+            Ok((
+                commit.result,
+                commit.effect,
+                commit
+                    .projects
+                    .into_iter()
+                    .map(ProjectResponse::from)
+                    .collect::<Vec<_>>(),
+                shared_global,
+                shared_profiles,
+            ))
+        })();
+        (profile, result)
+    })
+    .await;
+    let (profile, result) = match result {
+        Ok(result) => result,
+        Err(error) => (None, Err(RegistryError::Other(error.into()))),
+    };
+    let (change, effect, mut committed, shared_global, shared_profiles) = match result {
+        Ok(committed) => committed,
+        Err(RegistryError::Conflict(message)) => {
+            return project_error(StatusCode::CONFLICT, "conflict", &message)
+        }
+        Err(RegistryError::NotFound(message)) => {
+            return project_error(StatusCode::NOT_FOUND, "not_found", &message)
+        }
+        Err(RegistryError::Forbidden(_)) => return elevation_required(),
+        Err(RegistryError::Other(error)) => {
+            tracing::error!(target: "http.api.projects", %error, "project registry commit failed");
+            *state.canonical_health.write().await = RuntimeHealth::Degraded {
+                code: ReloadFailureCode::Metadata,
+                profiles: if scope == ProjectScope::Profile {
+                    profile.into_iter().collect()
+                } else {
+                    Vec::new()
+                },
+            };
+            state.runtime.request_publish();
+            return project_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "save_failed",
+                "Failed to persist the project registry",
+            );
+        }
+    };
+    let change = match change {
+        ProjectChange::Current(index) => ProjectChange::Current(committed[index].path.clone()),
+        ProjectChange::Removed(project) => ProjectChange::Removed(project),
+    };
+    {
+        let mut metadata = state.canonical_metadata.write().await;
+        match shared_profiles.split_last() {
+            None => metadata.global_projects = committed,
+            Some((&last, rest)) => {
+                if shared_global {
+                    let mut global = committed.clone();
+                    if scope == ProjectScope::Profile {
+                        for project in &mut global {
+                            project.scope = ProjectScope::Global;
+                        }
+                    }
+                    metadata.global_projects = global;
+                }
+                if scope == ProjectScope::Global {
+                    for project in &mut committed {
+                        project.scope = ProjectScope::Profile;
+                    }
+                }
+                for &index in rest {
+                    metadata.profiles[index].projects = committed.clone();
+                }
+                metadata.profiles[last].projects = committed;
+            }
+        }
+    }
+    state
+        .mutation_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    state.runtime.request_publish();
+    drop(publication);
+    drop(namespace);
+    if let Some(effect) = &effect {
+        emit_effective_changes(&state, effect).await;
+    }
+    let snapshot = match state.runtime.publish(&state).await {
+        Ok(snapshot) => snapshot,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let response = match change {
+        ProjectChange::Removed(project) => (status, Json(project)).into_response(),
+        ProjectChange::Current(path) => {
+            let projects = match scope {
+                ProjectScope::Global => Some(snapshot.value.contents.global_projects.as_slice()),
+                ProjectScope::Profile => snapshot
+                    .value
+                    .contents
+                    .profiles
+                    .iter()
+                    .find(|candidate| Some(candidate.name.as_str()) == profile.as_deref())
+                    .map(|profile| profile.projects.as_slice()),
+            };
+            let Some(project) =
+                projects.and_then(|projects| projects.iter().find(|project| project.path == path))
+            else {
+                return project_error(
+                    StatusCode::CONFLICT,
+                    "project_gone_after_commit",
+                    "Project changed before its commit could be acknowledged",
+                );
+            };
+            (status, Json(project)).into_response()
+        }
+    };
+    crate::server::runtime::mutation_response(&snapshot.value.cursor, response)
+}
+
+#[tracing::instrument(target = "http.api.projects", skip_all)]
 pub async fn create_project(
     State(state): State<Arc<AppState>>,
     session: Option<axum::Extension<AuthenticatedSession>>,
-    loopback: Option<axum::Extension<LoopbackTrusted>>,
+    loopback: Option<axum::Extension<Principal>>,
     body: Result<Json<CreateProjectBody>, axum::extract::rejection::JsonRejection>,
-) -> impl IntoResponse {
-    if let Some(resp) = super::cityhall_block(&state) {
-        tracing::warn!(target: "http.api.projects", reason = "cityhall_mode", "rejected create");
-        return resp;
+) -> Response {
+    if let Some(response) = super::cityhall_block(&state) {
+        return response;
     }
     if state.read_only {
-        tracing::warn!(target: "http.api.projects", reason = "read_only", "rejected create");
-        return read_only_response();
+        return super::read_only_response();
     }
     let Json(mut body) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
-    // A null clears a value, as in PATCH, so it is dropped rather than stored as an override.
     body.overrides.plugin_settings.retain(|_, settings| {
         settings.retain(|_, value| !value.is_null());
         !settings.is_empty()
     });
-    let span = tracing::Span::current();
-    span.record("path", body.path.as_str());
-    span.record("scope", body.scope.as_deref().unwrap_or("global"));
-    span.record("allow_override", body.allow_override);
-
-    let scope = match body.scope.as_deref() {
-        Some("profile") => ProjectScope::Profile,
-        Some("global") | None => ProjectScope::Global,
-        Some(other) => {
-            tracing::warn!(target: "http.api.projects", scope = other, "rejected bad scope");
-            return api_error(
+    if *state.canonical_health.read().await != RuntimeHealth::Healthy {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let scope = body.scope;
+    let allow_override = body.allow_override;
+    let preflight = tokio::task::spawn_blocking(move || {
+        let profile = body.profile;
+        let path = std::path::PathBuf::from(body.path);
+        let canonical = path.canonicalize().unwrap_or(path);
+        if !canonical.is_dir() {
+            return Err(project_error(
                 StatusCode::BAD_REQUEST,
-                "bad_scope",
-                format!("Unknown scope '{}'. Use 'global' or 'profile'.", other),
+                "not_a_directory",
+                "Path does not exist or is not a directory",
+            ));
+        }
+        let name = match body.name {
+            Some(name) => name,
+            None => {
+                let base = canonical
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "project".to_owned());
+                projects::unique_name(&profile, scope, &base)
+            }
+        };
+        let project = Project::new(name, canonical.to_string_lossy(), scope)
+            .with_base_branch(body.default_base_branch)
+            .with_pinned(body.pinned)
+            .with_overrides(body.overrides);
+        Ok((profile, project))
+    })
+    .await;
+    let (profile, project) = match preflight {
+        Ok(Ok(preflight)) => preflight,
+        Ok(Err(response)) => return response,
+        Err(error) => {
+            tracing::error!(target: "http.api.projects", %error, "project preflight failed");
+            return project_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "create_failed",
+                "Failed to prepare the project",
             );
         }
     };
-
-    let path_buf = std::path::PathBuf::from(&body.path);
-    let canonical = path_buf.canonicalize().unwrap_or_else(|_| path_buf.clone());
-
-    let name = match body.name {
-        Some(n) => n,
-        None => {
-            let base = canonical
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "project".to_string());
-            projects::unique_name(&state.profile, scope, &base)
-        }
-    };
-
-    // Non-git directories are allowed: their sessions run in place. A path that
-    // does not resolve to a directory is still rejected.
-    if !canonical.is_dir() {
-        tracing::warn!(target: "http.api.projects", path = %canonical.display(), "rejected non-directory path");
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "not_a_directory",
-            format!(
-                "Path does not exist or is not a directory: {}",
-                canonical.display()
-            ),
-        );
-    }
-
-    let plugin_settings: PluginSettingsPatch = body
+    let plugin_settings: PluginSettingsPatch = project
         .overrides
         .plugin_settings
         .iter()
-        .map(|(plugin_id, settings)| {
-            let settings = settings
-                .iter()
-                .map(|(key, value)| (key.clone(), Some(value.clone())))
-                .collect();
-            (plugin_id.clone(), settings)
+        .map(|(plugin, settings)| {
+            (
+                plugin.clone(),
+                settings
+                    .iter()
+                    .map(|(key, value)| (key.clone(), Some(value.clone())))
+                    .collect(),
+            )
         })
         .collect();
-    let elevated = handler_elevated(&state, session.as_deref(), loopback.is_some()).await;
+    let elevated = handler_elevated(
+        &state,
+        session.as_deref(),
+        authorize(loopback.as_deref(), Capability::SkipElevation),
+    )
+    .await;
     if !elevated && !plugin_settings.values().all(BTreeMap::is_empty) {
         return elevation_required();
     }
-    if let Err(msg) = validate_plugin_settings(&plugin_settings) {
-        tracing::warn!(target: "http.api.projects", reason = "bad_plugin_setting", message = %msg, "rejected create");
-        return api_error(StatusCode::BAD_REQUEST, "bad_plugin_setting", msg);
+    if let Err(message) = validate_plugin_settings(&plugin_settings) {
+        return project_error(StatusCode::BAD_REQUEST, "bad_plugin_setting", &message);
     }
-
-    let project = Project::new(name, canonical.to_string_lossy(), scope)
-        .with_base_branch(body.default_base_branch)
-        .with_pinned(body.pinned)
-        .with_overrides(body.overrides);
-    // A new entry can hide the values of one it shadows. That is decided under the registry locks,
-    // together with the write, so no concurrent writer can slip in between.
-    let added = projects::add_guarded(
-        &state.profile,
+    commit_project(
+        state,
         scope,
-        project,
-        body.allow_override,
-        |effect| {
-            if elevated || effect.is_noop() {
-                Ok(())
-            } else {
-                Err(RegistryError::Forbidden(PLUGIN_SETTINGS_ELEVATION.into()))
-            }
+        Some(profile),
+        StatusCode::CREATED,
+        move |profile, scope| {
+            projects::add_guarded(profile, scope, project, allow_override, |effect| {
+                if elevated || effect.is_noop() {
+                    Ok(())
+                } else {
+                    Err(RegistryError::Forbidden(PLUGIN_SETTINGS_ELEVATION.into()))
+                }
+            })
+            .map(|commit| commit.map_result(ProjectChange::Current))
         },
-    );
-    match added {
-        Ok((saved, effect)) => {
-            tracing::info!(target: "http.api.projects", name = %saved.name, path = %saved.path, scope = saved.scope.as_str(), "created project");
-            emit_effective_changes(&state, &effect).await;
-            (StatusCode::CREATED, Json(ProjectResponse::from(saved))).into_response()
-        }
-        Err(RegistryError::Forbidden(_)) => elevation_required(),
-        Err(RegistryError::Conflict(msg)) => {
-            tracing::warn!(target: "http.api.projects", reason = "conflict", message = %msg, "rejected create");
-            api_error(StatusCode::CONFLICT, "conflict", msg)
-        }
-        Err(RegistryError::NotFound(msg)) => {
-            tracing::warn!(target: "http.api.projects", reason = "not_found", message = %msg, "rejected create");
-            api_error(StatusCode::NOT_FOUND, "not_found", msg)
-        }
-        Err(RegistryError::Other(e)) => {
-            tracing::error!(target: "http.api.projects", error = %e, "add_failed");
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "add_failed",
-                e.to_string(),
-            )
-        }
-    }
+    )
+    .await
 }
 
-#[derive(Deserialize)]
-pub struct DeleteQuery {
-    /// "global" (default) or "profile".
-    #[serde(default)]
-    pub scope: Option<String>,
-}
-
-#[tracing::instrument(target = "http.api.projects", skip_all, fields(name = %name, scope = q.scope.as_deref().unwrap_or("global")))]
+#[tracing::instrument(target = "http.api.projects", skip_all)]
 pub async fn delete_project(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-    Query(q): Query<DeleteQuery>,
+    Query(query): Query<ProjectQuery>,
     session: Option<axum::Extension<AuthenticatedSession>>,
-    loopback: Option<axum::Extension<LoopbackTrusted>>,
-) -> impl IntoResponse {
-    if let Some(resp) = super::cityhall_block(&state) {
-        tracing::warn!(target: "http.api.projects", reason = "cityhall_mode", "rejected delete");
-        return resp;
+    loopback: Option<axum::Extension<Principal>>,
+) -> Response {
+    if let Some(response) = super::cityhall_block(&state) {
+        return response;
     }
     if state.read_only {
-        tracing::warn!(target: "http.api.projects", reason = "read_only", "rejected delete");
-        return read_only_response();
+        return super::read_only_response();
     }
-
-    let scope = match q.scope.as_deref() {
-        Some("profile") => ProjectScope::Profile,
-        Some("global") | None => ProjectScope::Global,
-        Some(other) => {
-            tracing::warn!(target: "http.api.projects", scope = other, "rejected bad scope");
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "bad_scope",
-                format!("Unknown scope '{}'. Use 'global' or 'profile'.", other),
-            );
-        }
+    let scope = match write_scope(query.scope.as_deref()) {
+        Ok(scope) => scope,
+        Err(response) => return response,
     };
-
-    // Removing an entry drops its own values and can reveal those of an entry it shadows. That is
-    // decided under the registry locks, together with the write, so no concurrent writer can slip
-    // in between.
-    let elevated = handler_elevated(&state, session.as_deref(), loopback.is_some()).await;
-    let removed = projects::remove_guarded(&state.profile, scope, &name, |entry, effect| {
-        if elevated || (entry.overrides.plugin_settings.is_empty() && effect.is_noop()) {
-            Ok(())
-        } else {
-            Err(RegistryError::Forbidden(PLUGIN_SETTINGS_ELEVATION.into()))
-        }
-    });
-    match removed {
-        Ok((removed, effect)) => {
-            tracing::info!(target: "http.api.projects", name = %removed.name, path = %removed.path, scope = removed.scope.as_str(), "deleted project");
-            emit_effective_changes(&state, &effect).await;
-            (StatusCode::OK, Json(ProjectResponse::from(removed))).into_response()
-        }
-        Err(RegistryError::Forbidden(_)) => elevation_required(),
-        Err(RegistryError::NotFound(msg)) => {
-            tracing::warn!(target: "http.api.projects", reason = "not_found", message = %msg, "rejected delete");
-            api_error(StatusCode::NOT_FOUND, "not_found", msg)
-        }
-        Err(RegistryError::Conflict(msg)) => {
-            tracing::warn!(target: "http.api.projects", reason = "conflict", message = %msg, "rejected delete");
-            api_error(StatusCode::CONFLICT, "conflict", msg)
-        }
-        Err(RegistryError::Other(e)) => {
-            tracing::error!(target: "http.api.projects", error = %e, "remove_failed");
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "remove_failed",
-                e.to_string(),
-            )
-        }
-    }
+    let elevated = handler_elevated(
+        &state,
+        session.as_deref(),
+        authorize(loopback.as_deref(), Capability::SkipElevation),
+    )
+    .await;
+    commit_project(
+        state,
+        scope,
+        query.profile,
+        StatusCode::OK,
+        move |profile, scope| {
+            projects::remove_guarded(profile, scope, &name, |entry, effect| {
+                if elevated || (entry.overrides.plugin_settings.is_empty() && effect.is_noop()) {
+                    Ok(())
+                } else {
+                    Err(RegistryError::Forbidden(PLUGIN_SETTINGS_ELEVATION.into()))
+                }
+            })
+            .map(|commit| commit.map_result(|removed| ProjectChange::Removed(removed.into())))
+        },
+    )
+    .await
 }
-
-/// Parsed PATCH body for a project. The raw JSON is inspected rather than
-/// deserialized because a missing `default_base_branch` key must be
-/// distinguishable from an explicit `null` (which clears the value), and serde
-/// folds both to `None`. At least one recognized key must be present.
-#[derive(Debug, PartialEq)]
-struct ProjectPatch {
-    /// `None`: key absent. `Some(None)`: clear. `Some(Some(s))`: set to `s`
-    /// (empty/whitespace normalized to unset downstream).
-    base_branch: Option<Option<String>>,
-    /// `None`: key absent. `Some(b)`: set the pin flag to `b`.
-    pinned: Option<bool>,
-    /// `None`: `overrides` key absent (leave untouched). `Some(patch)`: apply
-    /// each present sub-field of `patch` (same absent/null/value semantics as
-    /// the top-level fields, scoped per override).
-    overrides: Option<OverridesPatch>,
-}
-
-/// Per-sub-field absent/null/value patch for `overrides`, mirroring
-/// [`ProjectPatch`]'s semantics one level deeper.
-#[derive(Debug, PartialEq)]
+#[derive(Default)]
 struct OverridesPatch {
     worktree_enabled: Option<Option<bool>>,
     smart_rename: Option<Option<bool>>,
@@ -462,23 +548,23 @@ fn parse_overrides_patch(
     let worktree_enabled = match body.get("worktree_enabled") {
         None => None,
         Some(serde_json::Value::Null) => Some(None),
-        Some(serde_json::Value::Bool(b)) => Some(Some(*b)),
+        Some(serde_json::Value::Bool(value)) => Some(Some(*value)),
         Some(_) => {
             return Err((
                 "bad_field",
                 "overrides.worktree_enabled must be a boolean or null",
-            ))
+            ));
         }
     };
     let smart_rename = match body.get("smart_rename") {
         None => None,
         Some(serde_json::Value::Null) => Some(None),
-        Some(serde_json::Value::Bool(b)) => Some(Some(*b)),
+        Some(serde_json::Value::Bool(value)) => Some(Some(*value)),
         Some(_) => {
             return Err((
                 "bad_field",
                 "overrides.smart_rename must be a boolean or null",
-            ))
+            ));
         }
     };
     let sandbox_enabled = match body.get("sandbox_enabled") {
@@ -501,32 +587,28 @@ fn parse_overrides_patch(
 }
 
 fn parse_project_patch(
-    body: &serde_json::Value,
+    mut body: serde_json::Value,
 ) -> Result<ProjectPatch, (&'static str, &'static str)> {
-    let base_branch = match body.get("default_base_branch") {
+    let base_branch = match body
+        .get_mut("default_base_branch")
+        .map(serde_json::Value::take)
+    {
         None => None,
         Some(serde_json::Value::Null) => Some(None),
-        Some(serde_json::Value::String(s)) => Some(Some(s.clone())),
+        Some(serde_json::Value::String(value)) => Some(Some(value)),
         Some(_) => return Err(("bad_field", "default_base_branch must be a string or null")),
     };
     let pinned = match body.get("pinned") {
         None => None,
-        Some(serde_json::Value::Bool(b)) => Some(*b),
+        Some(serde_json::Value::Bool(value)) => Some(*value),
         Some(_) => return Err(("bad_field", "pinned must be a boolean")),
     };
     let overrides = match body.get("overrides") {
-        None => None,
-        Some(v @ serde_json::Value::Object(_)) => {
-            let patch = parse_overrides_patch(v)?;
-            if patch.is_empty() {
-                None
-            } else {
-                Some(patch)
-            }
-        }
+        None => OverridesPatch::default(),
+        Some(value @ serde_json::Value::Object(_)) => parse_overrides_patch(value)?,
         Some(_) => return Err(("bad_field", "overrides must be an object")),
     };
-    if base_branch.is_none() && pinned.is_none() && overrides.is_none() {
+    if base_branch.is_none() && pinned.is_none() && overrides.is_empty() {
         return Err((
             "no_fields",
             "provide at least one of: default_base_branch, pinned, overrides",
@@ -535,155 +617,70 @@ fn parse_project_patch(
     Ok(ProjectPatch {
         base_branch,
         pinned,
-        overrides,
+        worktree_enabled: overrides.worktree_enabled,
+        smart_rename: overrides.smart_rename,
+        sandbox_enabled: overrides.sandbox_enabled,
+        plugin_settings: overrides.plugin_settings,
     })
 }
 
-#[tracing::instrument(target = "http.api.projects", skip_all, fields(name = %name, scope = q.scope.as_deref().unwrap_or("global")))]
+#[tracing::instrument(target = "http.api.projects", skip_all)]
 pub async fn update_project(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-    Query(q): Query<DeleteQuery>,
+    Query(query): Query<ProjectQuery>,
     session: Option<axum::Extension<AuthenticatedSession>>,
-    loopback: Option<axum::Extension<LoopbackTrusted>>,
+    loopback: Option<axum::Extension<Principal>>,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
-) -> impl IntoResponse {
-    if let Some(resp) = super::cityhall_block(&state) {
-        tracing::warn!(target: "http.api.projects", reason = "cityhall_mode", "rejected update");
-        return resp;
+) -> Response {
+    if let Some(response) = super::cityhall_block(&state) {
+        return response;
     }
     if state.read_only {
-        tracing::warn!(target: "http.api.projects", reason = "read_only", "rejected update");
-        return read_only_response();
+        return super::read_only_response();
     }
-
     let Json(body) = match body {
-        Ok(b) => b,
-        Err(rej) => return rej.into_response(),
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
-
-    let scope = match q.scope.as_deref() {
-        Some("profile") => ProjectScope::Profile,
-        Some("global") | None => ProjectScope::Global,
-        Some(other) => {
-            tracing::warn!(target: "http.api.projects", scope = other, "rejected bad scope");
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "bad_scope",
-                format!("Unknown scope '{}'. Use 'global' or 'profile'.", other),
-            );
-        }
+    let scope = match write_scope(query.scope.as_deref()) {
+        Ok(scope) => scope,
+        Err(response) => return response,
     };
-
-    let patch = match parse_project_patch(&body) {
+    let patch = match parse_project_patch(body) {
         Ok(patch) => patch,
-        Err((err, msg)) => {
-            tracing::warn!(target: "http.api.projects", reason = err, "rejected update");
-            return api_error(StatusCode::BAD_REQUEST, err, msg);
-        }
+        Err((code, message)) => return project_error(StatusCode::BAD_REQUEST, code, message),
     };
-
-    let plugin_settings = patch
-        .overrides
-        .as_ref()
-        .map(|o| o.plugin_settings.clone())
-        .unwrap_or_default();
-    let writes_plugin_settings = !plugin_settings.values().all(BTreeMap::is_empty);
-    if writes_plugin_settings
-        && !handler_elevated(&state, session.as_deref(), loopback.is_some()).await
+    if !patch.plugin_settings.values().all(BTreeMap::is_empty)
+        && !handler_elevated(
+            &state,
+            session.as_deref(),
+            authorize(loopback.as_deref(), Capability::SkipElevation),
+        )
+        .await
     {
         return elevation_required();
     }
-    if let Err(msg) = validate_plugin_settings(&plugin_settings) {
-        tracing::warn!(target: "http.api.projects", reason = "bad_plugin_setting", message = %msg, "rejected update");
-        return api_error(StatusCode::BAD_REQUEST, "bad_plugin_setting", msg);
+    if let Err(message) = validate_plugin_settings(&patch.plugin_settings) {
+        return project_error(StatusCode::BAD_REQUEST, "bad_plugin_setting", &message);
     }
-
-    // The change in effect at the path, committed with the write (a shadowed entry's edit
-    // changes nothing in effect).
-    let mut effect: Option<projects::EffectiveChange> = None;
-
-    // Apply each present field in turn. Both are read-modify-write over the
-    // same registry file, so the last call's returned project reflects every
-    // change. `parse_project_patch` guarantees at least one field.
-    let mut result: Option<std::result::Result<Project, RegistryError>> = None;
-    if let Some(base) = patch.base_branch {
-        result = Some(projects::update_base_branch(
-            &state.profile,
-            scope,
-            &name,
-            base,
-        ));
-    }
-    if let Some(pinned) = patch.pinned {
-        // Skip the pinned write if a prior base-branch write failed, so its
-        // error is surfaced rather than masked.
-        if !matches!(&result, Some(Err(_))) {
-            result = Some(projects::set_pinned(&state.profile, scope, &name, pinned));
-        }
-    }
-    if let Some(overrides) = patch.overrides {
-        if !matches!(&result, Some(Err(_))) {
-            let apply = |ov: &mut ProjectOverrides| {
-                if let Some(w) = overrides.worktree_enabled {
-                    ov.worktree_enabled = w;
-                }
-                if let Some(s) = overrides.smart_rename {
-                    ov.smart_rename = s;
-                }
-                if let Some(c) = overrides.sandbox_enabled {
-                    ov.sandbox_enabled = c;
-                }
-                for (plugin_id, settings) in overrides.plugin_settings {
-                    for (key, value) in settings {
-                        ov.set_plugin_setting(&plugin_id, &key, value);
-                    }
-                }
-            };
-            result = Some(if plugin_settings.is_empty() {
-                projects::update_overrides(&state.profile, scope, &name, apply)
-            } else {
-                projects::update_overrides_with_effect(&state.profile, scope, &name, apply).map(
-                    |(project, change)| {
-                        effect = Some(change);
-                        project
-                    },
-                )
-            });
-        }
-    }
-
-    match result.expect("parse_project_patch guarantees at least one field") {
-        Ok(updated) => {
-            tracing::info!(target: "http.api.projects", name = %updated.name, path = %updated.path, scope = updated.scope.as_str(), "updated project");
-            if let Some(change) = &effect {
-                emit_effective_changes(&state, change).await;
-            }
-            (StatusCode::OK, Json(ProjectResponse::from(updated))).into_response()
-        }
-        Err(RegistryError::NotFound(msg)) => {
-            tracing::warn!(target: "http.api.projects", reason = "not_found", message = %msg, "rejected update");
-            api_error(StatusCode::NOT_FOUND, "not_found", msg)
-        }
-        Err(RegistryError::Conflict(msg)) => {
-            tracing::warn!(target: "http.api.projects", reason = "conflict", message = %msg, "rejected update");
-            api_error(StatusCode::CONFLICT, "conflict", msg)
-        }
-        Err(RegistryError::Forbidden(_)) => elevation_required(),
-        Err(RegistryError::Other(e)) => {
-            tracing::error!(target: "http.api.projects", error = %e, "update_failed");
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "update_failed",
-                e.to_string(),
-            )
-        }
-    }
+    commit_project(
+        state,
+        scope,
+        query.profile,
+        StatusCode::OK,
+        move |profile, scope| {
+            projects::update(profile, scope, &name, patch)
+                .map(|commit| commit.map_result(ProjectChange::Current))
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_project_patch, OverridesPatch, ProjectPatch};
+    use super::parse_project_patch;
+    use crate::session::ProjectOverrides;
     use serde_json::json;
 
     #[tokio::test]
@@ -692,6 +689,7 @@ mod tests {
         use super::*;
         let home = tempfile::TempDir::new().unwrap();
         let _home = crate::session::test_support::isolate_home(home.path());
+        crate::server::test_support::seed_instances_on_disk_for_test("test", Vec::new());
         let repo = home.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         projects::add(
@@ -701,9 +699,11 @@ mod tests {
             false,
         )
         .unwrap();
-        let mut state = crate::server::test_support::build_test_app_state(Vec::new());
-        Arc::get_mut(&mut state).expect("fresh state").login_manager =
-            Arc::new(crate::server::login::LoginManager::new(Some("pw")));
+        let state =
+            crate::server::test_support::build_test_app_state_configured(Vec::new(), |state| {
+                state.login_manager = Arc::new(crate::server::login::LoginManager::new(Some("pw")));
+            });
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
         let session = state
             .login_manager
             .create_session(b"bind", "127.0.0.1", "t")
@@ -715,7 +715,10 @@ mod tests {
                 let resp = update_project(
                     State(state),
                     Path("demo".to_string()),
-                    Query(DeleteQuery { scope: None }),
+                    Query(ProjectQuery {
+                        scope: Some("global".into()),
+                        profile: Some("test".into()),
+                    }),
                     Some(axum::Extension(AuthenticatedSession(session))),
                     None,
                     Ok(Json(body)),
@@ -759,6 +762,7 @@ mod tests {
         use super::*;
         let home = tempfile::TempDir::new().unwrap();
         let _home = crate::session::test_support::isolate_home(home.path());
+        crate::server::test_support::seed_instances_on_disk_for_test("test", Vec::new());
         let repo = home.path().join("repo");
         let plain = home.path().join("plain");
         std::fs::create_dir_all(&repo).unwrap();
@@ -776,9 +780,11 @@ mod tests {
             ov.set_plugin_setting("acme.kit", "depth", Some(json!(1)))
         })
         .unwrap();
-        let mut state = crate::server::test_support::build_test_app_state(Vec::new());
-        Arc::get_mut(&mut state).expect("fresh state").login_manager =
-            Arc::new(crate::server::login::LoginManager::new(Some("pw")));
+        let state =
+            crate::server::test_support::build_test_app_state_configured(Vec::new(), |state| {
+                state.login_manager = Arc::new(crate::server::login::LoginManager::new(Some("pw")));
+            });
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
         let session = state
             .login_manager
             .create_session(b"bind", "127.0.0.1", "t")
@@ -788,7 +794,10 @@ mod tests {
             delete_project(
                 State(state.clone()),
                 Path(name.to_string()),
-                Query(DeleteQuery { scope: None }),
+                Query(ProjectQuery {
+                    scope: Some("global".into()),
+                    profile: Some("test".into()),
+                }),
                 ext(),
                 None,
             )
@@ -801,7 +810,8 @@ mod tests {
                 Ok(Json(CreateProjectBody {
                     path: path.to_string_lossy().to_string(),
                     name: Some("shadow".into()),
-                    scope: Some("profile".into()),
+                    profile: "test".into(),
+                    scope: ProjectScope::Profile,
                     allow_override: true,
                     default_base_branch: None,
                     pinned: false,
@@ -839,6 +849,7 @@ mod tests {
         use super::*;
         let home = tempfile::TempDir::new().unwrap();
         let _home = crate::session::test_support::isolate_home(home.path());
+        crate::server::test_support::seed_instances_on_disk_for_test("test", Vec::new());
         let repo = home.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         projects::add(
@@ -859,9 +870,11 @@ mod tests {
             true,
         )
         .unwrap();
-        let mut state = crate::server::test_support::build_test_app_state(Vec::new());
-        Arc::get_mut(&mut state).expect("fresh state").login_manager =
-            Arc::new(crate::server::login::LoginManager::new(Some("pw")));
+        let state =
+            crate::server::test_support::build_test_app_state_configured(Vec::new(), |state| {
+                state.login_manager = Arc::new(crate::server::login::LoginManager::new(Some("pw")));
+            });
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
         let session = state
             .login_manager
             .create_session(b"bind", "127.0.0.1", "t")
@@ -870,8 +883,9 @@ mod tests {
             delete_project(
                 State(state.clone()),
                 Path("shadow".to_string()),
-                Query(DeleteQuery {
+                Query(ProjectQuery {
                     scope: Some("profile".into()),
+                    profile: Some("test".into()),
                 }),
                 Some(axum::Extension(AuthenticatedSession(session.clone()))),
                 None,
@@ -897,17 +911,22 @@ mod tests {
         use crate::session::config::settings_schema::resolve_plugin_setting;
         let home = tempfile::TempDir::new().unwrap();
         let _home = crate::session::test_support::isolate_home(home.path());
+        crate::server::test_support::seed_instances_on_disk_for_test("test", Vec::new());
         let repo = home.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        let mut state = crate::server::test_support::build_test_app_state(Vec::new());
-        Arc::get_mut(&mut state).expect("fresh state").login_manager =
-            Arc::new(crate::server::login::LoginManager::new(Some("pw")));
+        let state =
+            crate::server::test_support::build_test_app_state_configured(Vec::new(), |state| {
+                state.login_manager = Arc::new(crate::server::login::LoginManager::new(Some("pw")));
+            });
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
         let session = state
             .login_manager
             .create_session(b"bind", "127.0.0.1", "t")
             .await;
         let body: CreateProjectBody = serde_json::from_value(json!({
             "path": repo.to_string_lossy(),
+            "profile": "test",
+            "scope": "profile",
             "overrides": { "plugin_settings": { "acme.kit": { "verbose": null } } },
         }))
         .unwrap();
@@ -951,6 +970,7 @@ mod tests {
         use super::*;
         let home = tempfile::TempDir::new().unwrap();
         let _home = crate::session::test_support::isolate_home(home.path());
+        crate::server::test_support::seed_instances_on_disk_for_test("test", Vec::new());
         let repo = home.path().join("repo");
         let other = home.path().join("other");
         std::fs::create_dir_all(&repo).unwrap();
@@ -962,19 +982,21 @@ mod tests {
             false,
         )
         .unwrap();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
         // The global registry is the unreadable one; the writes below only touch the profile one.
         std::fs::write(
             crate::session::get_app_dir().unwrap().join("projects.json"),
             "{ not json",
         )
         .unwrap();
-        let state = crate::server::test_support::build_test_app_state(Vec::new());
 
         let resp = delete_project(
             State(state.clone()),
             Path("p".to_string()),
-            Query(DeleteQuery {
+            Query(ProjectQuery {
                 scope: Some("profile".into()),
+                profile: Some("test".into()),
             }),
             None,
             None,
@@ -982,6 +1004,10 @@ mod tests {
         .await
         .into_response();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(matches!(
+            *state.canonical_health.read().await,
+            RuntimeHealth::Degraded { .. }
+        ));
         let resp = create_project(
             State(state.clone()),
             None,
@@ -989,7 +1015,8 @@ mod tests {
             Ok(Json(CreateProjectBody {
                 path: other.to_string_lossy().to_string(),
                 name: None,
-                scope: Some("profile".into()),
+                profile: "test".into(),
+                scope: ProjectScope::Profile,
                 allow_override: false,
                 default_base_branch: None,
                 pinned: false,
@@ -998,7 +1025,11 @@ mod tests {
         )
         .await
         .into_response();
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "native mutations stay closed after the registry failure"
+        );
 
         let names: Vec<String> = projects::load_profile("test")
             .unwrap()
@@ -1010,11 +1041,11 @@ mod tests {
 
     #[test]
     fn project_patch_parses_plugin_settings() {
-        let parsed = parse_project_patch(&json!({
+        let parsed = parse_project_patch(json!({
             "overrides": { "plugin_settings": { "acme.kit": { "depth": 3, "gone": null } } }
         }))
         .unwrap();
-        let settings = &parsed.overrides.unwrap().plugin_settings["acme.kit"];
+        let settings = &parsed.plugin_settings["acme.kit"];
         assert_eq!(settings["depth"], Some(json!(3)));
         assert_eq!(settings["gone"], None);
 
@@ -1023,125 +1054,370 @@ mod tests {
             json!({"overrides": {"plugin_settings": {"acme.kit": 1}}}),
         ] {
             assert_eq!(
-                parse_project_patch(&bad).unwrap_err().0,
+                parse_project_patch(bad.clone()).unwrap_err().0,
                 "bad_field",
                 "{bad}"
             );
         }
     }
 
-    #[test]
-    fn project_patch_requires_at_least_one_field() {
-        // An empty body is a no-op, not an intent to clear: this stops a `{}`
-        // body from silently wiping the default base branch (#2208).
-        assert_eq!(
-            parse_project_patch(&json!({})),
-            Err((
-                "no_fields",
-                "provide at least one of: default_base_branch, pinned, overrides"
-            ))
-        );
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn shared_registry_commit_reflects_every_scope() -> anyhow::Result<()> {
+        use crate::session::{projects, Project, ProjectScope, Storage};
+        use axum::{body::Body, http::Request, routing::patch, Router};
+        use tower::ServiceExt;
+
+        let temp = tempfile::tempdir()?;
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+
+        projects::add(
+            "alpha",
+            ProjectScope::Global,
+            Project::new(
+                "shared",
+                temp.path().to_string_lossy(),
+                ProjectScope::Global,
+            ),
+            false,
+        )?;
+        for profile in ["alpha", "beta"] {
+            Storage::new(profile, state.file_watch.clone())?;
+            std::os::unix::fs::symlink(
+                crate::session::get_app_dir()?.join("projects.json"),
+                crate::session::get_profile_dir_path(profile)?.join("projects.json"),
+            )?;
+        }
+        *state.canonical_metadata.write().await =
+            crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+        state.runtime.publish(&state).await?;
+        let router = Router::new()
+            .route(
+                "/api/projects/{name}",
+                patch(super::update_project).delete(super::delete_project),
+            )
+            .with_state(state.clone());
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/projects/shared?scope=profile&profile=alpha")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"pinned":true}"#))?,
+            )
+            .await?;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let snapshot = state.runtime.snapshot(&state).await?;
+        assert!(snapshot.value.contents.global_projects[0].pinned);
+        for name in ["alpha", "beta"] {
+            let profile = snapshot
+                .value
+                .contents
+                .profiles
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap();
+            assert!(profile.projects[0].pinned);
+            assert_eq!(profile.projects[0].scope, ProjectScope::Profile);
+        }
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/projects/shared?scope=global")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let snapshot = state.runtime.snapshot(&state).await?;
+        assert!(snapshot.value.contents.global_projects.is_empty());
+        for name in ["alpha", "beta"] {
+            assert!(snapshot
+                .value
+                .contents
+                .profiles
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap()
+                .projects
+                .is_empty());
+        }
+        Ok(())
     }
 
-    #[test]
-    fn project_patch_parses_each_field() {
-        // null clears, a string sets; the key being present is what matters.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn project_commit_publishes_its_complete_explicit_scope() -> anyhow::Result<()> {
+        use crate::session::projects;
+        use crate::session::{Project, ProjectScope, Storage};
+        use axum::{
+            body::Body,
+            http::Request,
+            routing::{get, patch},
+            Router,
+        };
+        use tower::ServiceExt;
+        let temp = tempfile::tempdir()?;
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+
+        for profile in ["alpha", "beta"] {
+            Storage::new(profile, state.file_watch.clone())?;
+            let path = temp.path().join(profile);
+            std::fs::create_dir_all(&path)?;
+            projects::add(
+                profile,
+                ProjectScope::Profile,
+                Project::new("target", path.to_string_lossy(), ProjectScope::Profile),
+                false,
+            )?;
+        }
+        *state.canonical_metadata.write().await =
+            crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+        state.runtime.publish(&state).await?;
+        projects::add(
+            "beta",
+            ProjectScope::Profile,
+            Project::new(
+                "peer",
+                temp.path().join("peer").to_string_lossy(),
+                ProjectScope::Profile,
+            ),
+            false,
+        )?;
+        let router = Router::new()
+            .route("/api/projects", get(super::list_projects))
+            .route("/api/projects/{name}", patch(super::update_project))
+            .with_state(state.clone());
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/projects/target?scope=profile&profile=beta")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&projects::ProjectPatch {
+                        base_branch: Some(Some(" release ".into())),
+                        pinned: Some(true),
+                        worktree_enabled: Some(Some(true)),
+                        smart_rename: Some(Some(false)),
+                        sandbox_enabled: Some(Some(true)),
+                        plugin_settings: std::collections::BTreeMap::new(),
+                    })?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert!(
+            !projects::load_profile("alpha")?[0].pinned,
+            "explicit profile mutated the default profile"
+        );
+        let published = state.runtime.snapshot(&state).await?;
         assert_eq!(
-            parse_project_patch(&json!({"default_base_branch": null})),
-            Ok(ProjectPatch {
-                base_branch: Some(None),
-                pinned: None,
-                overrides: None,
-            })
+            response.headers()[crate::daemon::RUNTIME_EPOCH_HEADER].to_str()?,
+            published.value.cursor.epoch
         );
         assert_eq!(
-            parse_project_patch(&json!({"default_base_branch": "develop"})),
-            Ok(ProjectPatch {
-                base_branch: Some(Some("develop".to_string())),
-                pinned: None,
-                overrides: None,
-            })
+            response.headers()[crate::daemon::RUNTIME_REVISION_HEADER]
+                .to_str()?
+                .parse::<u64>()?,
+            published.value.cursor.revision
         );
+        let profile = published
+            .value
+            .contents
+            .profiles
+            .iter()
+            .find(|profile| profile.name == "beta")
+            .unwrap();
         assert_eq!(
-            parse_project_patch(&json!({"default_base_branch": 42})),
-            Err(("bad_field", "default_base_branch must be a string or null"))
+            profile
+                .projects
+                .iter()
+                .map(|project| project.name.as_str())
+                .collect::<Vec<_>>(),
+            ["target", "peer"]
         );
-        // The unpin path sends only `pinned`, with no base-branch key.
+        assert!(profile.projects[0].pinned);
         assert_eq!(
-            parse_project_patch(&json!({"pinned": false})),
-            Ok(ProjectPatch {
-                base_branch: None,
-                pinned: Some(false),
-                overrides: None,
-            })
+            profile.projects[0].default_base_branch.as_deref(),
+            Some("release")
         );
+        assert_eq!(profile.projects[0].overrides.worktree_enabled, Some(true));
+        assert_eq!(profile.projects[0].overrides.smart_rename, Some(false));
+        assert_eq!(profile.projects[0].overrides.sandbox_enabled, Some(true));
+        projects::add(
+            "beta",
+            ProjectScope::Profile,
+            Project::new(
+                "late",
+                temp.path().join("late").to_string_lossy(),
+                ProjectScope::Profile,
+            ),
+            false,
+        )?;
+        let listed = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/projects?scope=profile&profile=beta")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(listed.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(listed.into_body(), 16 * 1024 * 1024).await?;
         assert_eq!(
-            parse_project_patch(&json!({"pinned": "yes"})),
-            Err(("bad_field", "pinned must be a boolean"))
+            serde_json::from_slice::<serde_json::Value>(&bytes)?,
+            serde_json::to_value(&profile.projects)?
         );
-        assert_eq!(
-            parse_project_patch(&json!({"overrides": {"worktree_enabled": true}})),
-            Ok(ProjectPatch {
-                base_branch: None,
-                pinned: None,
-                overrides: Some(OverridesPatch {
-                    worktree_enabled: Some(Some(true)),
-                    smart_rename: None,
-                    sandbox_enabled: None,
-                    plugin_settings: Default::default(),
-                }),
-            })
-        );
-        assert_eq!(
-            parse_project_patch(&json!({"overrides": {"smart_rename": null}})),
-            Ok(ProjectPatch {
-                base_branch: None,
-                pinned: None,
-                overrides: Some(OverridesPatch {
-                    worktree_enabled: None,
+        for (patch, expected_base, expected_smart_rename, expected_sandbox) in [
+            (
+                projects::ProjectPatch {
+                    pinned: Some(false),
+                    ..Default::default()
+                },
+                Some("release"),
+                Some(false),
+                Some(true),
+            ),
+            (
+                projects::ProjectPatch {
+                    base_branch: Some(None),
+                    ..Default::default()
+                },
+                None,
+                Some(false),
+                Some(true),
+            ),
+            (
+                projects::ProjectPatch {
                     smart_rename: Some(None),
-                    sandbox_enabled: None,
-                    plugin_settings: Default::default(),
-                }),
-            })
-        );
-        assert_eq!(
-            parse_project_patch(&json!({"overrides": {"sandbox_enabled": false}})),
-            Ok(ProjectPatch {
-                base_branch: None,
-                pinned: None,
-                overrides: Some(OverridesPatch {
-                    worktree_enabled: None,
-                    smart_rename: None,
+                    ..Default::default()
+                },
+                None,
+                None,
+                Some(true),
+            ),
+            (
+                projects::ProjectPatch {
                     sandbox_enabled: Some(Some(false)),
-                    plugin_settings: Default::default(),
-                }),
-            })
-        );
-        assert_eq!(
-            parse_project_patch(&json!({"overrides": {"sandbox_enabled": 1}})),
-            Err((
-                "bad_field",
-                "overrides.sandbox_enabled must be a boolean or null"
-            ))
-        );
-        assert_eq!(
-            parse_project_patch(&json!({"overrides": {}})),
-            Err((
-                "no_fields",
-                "provide at least one of: default_base_branch, pinned, overrides"
-            ))
-        );
-        assert_eq!(
-            parse_project_patch(&json!({"overrides": {"worktree_enabled": "yes"}})),
-            Err((
-                "bad_field",
-                "overrides.worktree_enabled must be a boolean or null"
-            ))
-        );
-        assert_eq!(
-            parse_project_patch(&json!({"overrides": "nope"})),
-            Err(("bad_field", "overrides must be an object"))
-        );
+                    ..Default::default()
+                },
+                None,
+                None,
+                Some(false),
+            ),
+            (
+                projects::ProjectPatch {
+                    sandbox_enabled: Some(None),
+                    ..Default::default()
+                },
+                None,
+                None,
+                None,
+            ),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PATCH")
+                        .uri("/api/projects/target?scope=profile&profile=beta")
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&patch)?))?,
+                )
+                .await?;
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let receipt_epoch = response.headers()[crate::daemon::RUNTIME_EPOCH_HEADER]
+                .to_str()?
+                .to_owned();
+            let receipt_revision = response.headers()[crate::daemon::RUNTIME_REVISION_HEADER]
+                .to_str()?
+                .parse::<u64>()?;
+            let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024 * 1024).await?;
+            let project: crate::daemon::ProjectResponse = serde_json::from_slice(&bytes)?;
+            assert!(!project.pinned);
+            assert_eq!(project.default_base_branch.as_deref(), expected_base);
+            assert_eq!(project.overrides.worktree_enabled, Some(true));
+            assert_eq!(project.overrides.smart_rename, expected_smart_rename);
+            assert_eq!(project.overrides.sandbox_enabled, expected_sandbox);
+            let persisted = projects::load_profile("beta")?;
+            assert_eq!(persisted[0].overrides, project.overrides);
+            let snapshot = state.runtime.snapshot(&state).await?;
+            assert_eq!(receipt_epoch, snapshot.value.cursor.epoch);
+            assert_eq!(receipt_revision, snapshot.value.cursor.revision);
+            assert_eq!(
+                projects::load_profile("alpha")?[0].overrides,
+                crate::session::ProjectOverrides::default()
+            );
+            assert_eq!(
+                persisted
+                    .iter()
+                    .map(|p| p.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["target", "peer", "late"]
+            );
+            assert!(persisted[1..]
+                .iter()
+                .all(|p| !p.pinned && p.default_base_branch.is_none() && p.overrides.is_empty()));
+            let profile = snapshot
+                .value
+                .contents
+                .profiles
+                .iter()
+                .find(|p| p.name == "beta")
+                .unwrap();
+            assert_eq!(profile.projects[0].overrides, project.overrides);
+        }
+        let before = projects::load_profile("beta")?;
+        for body in [
+            r#"{"default_base_branch":"trunk","pinned":"false"}"#,
+            r#"{"overrides":{"worktree_enabled":"yes"}}"#,
+            r#"{"default_base_branch":"trunk","overrides":{"sandbox_enabled":1}}"#,
+            r#"{"overrides":"nope"}"#,
+            "{}",
+        ] {
+            let rejected = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PATCH")
+                        .uri("/api/projects/target?scope=profile&profile=beta")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))?,
+                )
+                .await?;
+            assert_eq!(rejected.status(), axum::http::StatusCode::BAD_REQUEST);
+            assert_eq!(
+                serde_json::to_value(projects::load_profile("beta")?)?,
+                serde_json::to_value(&before)?
+            );
+        }
+
+        for (uri, status) in [
+            (
+                "/api/projects/target?scope=profile",
+                axum::http::StatusCode::BAD_REQUEST,
+            ),
+            (
+                "/api/projects/target?scope=profile&profile=missing",
+                axum::http::StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let rejected = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PATCH")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"pinned":false}"#))?,
+                )
+                .await?;
+            assert_eq!(rejected.status(), status);
+        }
+        assert!(!crate::session::get_profile_dir_path("missing")?.exists());
+        Ok(())
     }
 }

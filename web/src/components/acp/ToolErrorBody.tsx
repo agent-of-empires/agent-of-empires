@@ -4,6 +4,7 @@
 import type { ReactNode } from "react";
 
 import { describeToolErrorTag, parseToolError } from "../../lib/toolErrorParse";
+import { CopyMarkdownButton } from "./CopyMarkdownButton";
 
 interface Props {
   status: "running" | "ok" | "err" | "stopped";
@@ -26,6 +27,11 @@ export function ToolErrorBody({ status, errorText, children }: Props) {
           {label && (
             <span className="rounded border border-rose-800/60 bg-rose-900/40 px-1 py-px font-mono normal-case tracking-normal text-[10px] text-rose-200/90">
               {label}
+            </span>
+          )}
+          {body && (
+            <span className="ml-auto">
+              <CopyMarkdownButton compact source={body} label="Copy error" />
             </span>
           )}
         </div>

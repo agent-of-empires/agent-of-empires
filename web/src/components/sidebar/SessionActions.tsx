@@ -2,12 +2,12 @@ import { useState, type ReactNode, type RefObject } from "react";
 import { createPortal } from "react-dom";
 import type { SessionResponse, Workspace } from "../../lib/types";
 import {
-  attachSessionProject,
   createSession,
   setWorktreeName,
   smartRenameSession,
   summarizeSession,
   updateSessionGroup,
+  type SessionMutation,
 } from "../../lib/api";
 import { useUnreadIndicatorEnabled } from "../../lib/unreadIndicator";
 import { useSessionColorsEnabled } from "../../lib/sessionColors";
@@ -17,22 +17,25 @@ import { reportError, reportInfo } from "../../lib/toastBus";
 import { ContextMenu } from "../ContextMenu";
 import { SessionGroupModal } from "../SessionGroupModal";
 import { StatusGlyph } from "../StatusGlyph";
-import { AddProjectModal } from "./AddProjectModal";
 import type { RowModel } from "./rowModel";
 import { BulkTriageMenuItems, SingleRowMenuItems, type SingleRowActions } from "./SessionRowMenu";
 import type { SessionAction } from "./sessionActionTargets";
+import { RecreateContainerDialog } from "./RecreateContainerDialog";
 import { SnoozeModal } from "./SnoozeModal";
 import type { RowBulkApi, RowContextScope } from "./types";
 import { WorkdirNameModal } from "./WorkdirNameModal";
+import { useSessionActions } from "./usePendingSetting";
 
-type Modal = "snooze" | "workdir" | "addProject" | "group" | null;
+type Modal = "snooze" | "workdir" | "group" | null;
 
 /** What a session's actions call back into; the sidebar and a plugin page's host menu both supply them. */
 export interface SessionActionHandlers {
+  onSessionMutation: (mutation: SessionMutation) => void;
   /** Receives the row's sessions, which a group slice narrows to a subset of the workspace. */
   onDelete?: (sessionIds: string[]) => void;
   onStop?: (sessionId: string) => void;
   onStart?: (sessionId: string) => void;
+  onRestartForUpdate?: (sessionId: string) => void;
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
   /** Opens the wizard prefilled from this row's project, like the group header's "+". */
   onCreateSession?: (repoPath: string) => void;
@@ -76,11 +79,15 @@ export function SessionActionsMenu({
   extraItems?: ReactNode;
 }) {
   const [modal, setModal] = useState<Modal>(null);
+  const [recreating, setRecreating] = useState<SessionResponse | null>(null);
+  const owner = useSessionActions();
   const colorsEnabled = useSessionColorsEnabled();
   const unreadEnabled = useUnreadIndicatorEnabled();
   const { label } = model;
   const actions = {
-    ...buildRowActions(workspace, handlers, model, closeMenu, setModal),
+    ...buildRowActions(workspace, handlers, model, closeMenu, setModal, setRecreating, () => {
+      if (model.firstSession) owner.openAttach(model.firstSession);
+    }),
     rename: onRename,
     notify: setNotify,
     color: setColor,
@@ -139,12 +146,22 @@ export function SessionActionsMenu({
         modal={modal}
         setModal={setModal}
         model={model}
+        onSessionMutation={handlers.onSessionMutation}
         onSnooze={(minutes) => {
           closeMenu();
           setModal(null);
           handlers.onSnooze(workspace, minutes);
         }}
       />
+      {recreating &&
+        createPortal(
+          <RecreateContainerDialog
+            sessionId={recreating.id}
+            sessionTitle={recreating.title}
+            onClose={() => setRecreating(null)}
+          />,
+          document.body,
+        )}
     </>
   );
 }
@@ -157,6 +174,8 @@ function buildRowActions(
   model: RowModel,
   closeMenu: () => void,
   setModal: (m: Modal) => void,
+  setRecreating: (session: SessionResponse) => void,
+  openAttach: () => void,
 ): Omit<SingleRowActions, "rename" | "notify" | "color"> {
   const after = (fn: () => unknown) => () => {
     closeMenu();
@@ -178,7 +197,7 @@ function buildRowActions(
         ? after(() => props.onCreateSession!(model.newSessionRepoPath!))
         : undefined,
     editWorkdir: after(() => setModal("workdir")),
-    addProject: after(() => setModal("addProject")),
+    addProject: after(openAttach),
     editGroup: after(() => setModal("group")),
     switchView: afterTarget("switchView", (s) => props.onSwitchView?.(s.id, s.view !== "structured")),
     // The dialog lives in the session's Composer, so navigate first; a pending latch opens it on mount.
@@ -208,6 +227,8 @@ function buildRowActions(
     }),
     stop: afterTarget("stop", (s) => props.onStop?.(s.id)),
     start: afterTarget("start", (s) => props.onStart?.(s.id)),
+    restartUpdate: afterTarget("restartUpdate", (s) => props.onRestartForUpdate?.(s.id)),
+    recreateContainer: afterTarget("recreateContainer", setRecreating),
     pin: () => props.onPinToggle(workspace, !model.effectivePinned),
     archive: after(() => props.onArchiveToggle(workspace, !model.effectiveArchived)),
     openSnooze: after(() => setModal("snooze")),
@@ -225,11 +246,13 @@ function RowModals({
   setModal,
   model,
   onSnooze,
+  onSessionMutation,
 }: {
   modal: Modal;
   setModal: (m: Modal) => void;
   model: RowModel;
   onSnooze: (minutes: number) => void;
+  onSessionMutation: SessionActionHandlers["onSessionMutation"];
 }) {
   const { label, sessionId } = model;
   const close = () => setModal(null);
@@ -241,7 +264,13 @@ function RowModals({
       <SessionGroupModal
         sessionTitle={model.sessionTitle || label}
         currentGroup={model.firstSession?.group_path ?? ""}
-        onSave={async (group) => (sessionId ? updateSessionGroup(sessionId, group) : false)}
+        onSave={async (group) => {
+          if (!sessionId) return false;
+          const mutation = await updateSessionGroup(sessionId, group);
+          if (!mutation) return false;
+          onSessionMutation(mutation);
+          return true;
+        }}
         onClose={close}
       />,
       document.body,
@@ -256,20 +285,13 @@ function RowModals({
         onCancel={close}
         onSubmit={async (name, renameBranch) => {
           const res = await setWorktreeName(sessionId, name, renameBranch);
-          if (res.ok) close();
+          if (res.ok) {
+            onSessionMutation(res);
+            res.warnings?.forEach((warning) => reportInfo(warning));
+            close();
+          }
           return res;
         }}
-      />,
-      document.body,
-    );
-  }
-  if (modal === "addProject") {
-    return createPortal(
-      <AddProjectModal
-        title={label}
-        onCancel={close}
-        onDone={close}
-        onSubmit={(project, attachExistingBranch) => attachSessionProject(sessionId, project, { attachExistingBranch })}
       />,
       document.body,
     );

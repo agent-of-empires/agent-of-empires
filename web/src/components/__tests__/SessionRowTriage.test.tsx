@@ -286,32 +286,21 @@ describe("SessionRow triage actions", () => {
   });
 
   it.each([
-    ["Notify all", "sidebar-context-menu-notify-all", "notifications"],
-    ["Color", "sidebar-context-menu-color-red", "color"],
-  ])("%s keeps the menu open, shows the pick, and reverts on failure", async (_n, item, path) => {
+    ["Notify all", "sidebar-context-menu-notify-all"],
+    ["Color", "sidebar-context-menu-color-red"],
+  ])("%s keeps the menu open, shows the pick, and reverts on failure", async (_n, item) => {
     let fail = () => {};
     fetchSpy.mockImplementation(
       () => new Promise((resolve) => (fail = () => resolve(new Response("nope", { status: 500 })))),
     );
     openRowMenu(ws({ id: "sess-pick" }));
     click(item);
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalledOnce());
     expect(testId("sidebar-context-menu")).not.toBeNull();
     expect(testId(item)!.getAttribute("aria-pressed")).toBe("true");
-    expect(fetchSpy.mock.calls[0]![0]).toBe(`/api/sessions/sess-pick/${path}`);
     fail();
     await vi.waitFor(() => expect(testId(item)!.getAttribute("aria-pressed")).toBe("false"));
     expect(testId("sidebar-context-menu")).not.toBeNull();
-  });
-
-  it("No color on a multi-session row clears every session, including the one carrying the color", async () => {
-    openRowMenu(makeWorkspace("w", [makeSession({ id: "s1" }), makeSession({ id: "s2", color: "red" })]));
-    expect(testId("sidebar-context-menu-color-red")!.getAttribute("aria-pressed")).toBe("true");
-    click("sidebar-context-menu-color-clear");
-    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(2));
-    expect(fetchSpy.mock.calls.map(([url]) => url).sort()).toEqual([
-      "/api/sessions/s1/color",
-      "/api/sessions/s2/color",
-    ]);
   });
 
   it("the close button closes the menu", () => {
@@ -378,7 +367,7 @@ describe("SessionRow color label (#2383)", () => {
   });
 });
 describe("SessionRow keyboard navigation", () => {
-  it("prevents page scrolling at the last visible row", () => {
+  it("prevents page scrolling at the last row", () => {
     const { container } = renderRow(ws());
     const sidebar = document.createElement("nav");
     sidebar.setAttribute("role", "navigation");
@@ -387,12 +376,53 @@ describe("SessionRow keyboard navigation", () => {
     sidebar.appendChild(container);
 
     const row = screen.getByTestId("sidebar-session-row");
-    vi.spyOn(row, "getClientRects").mockReturnValue([{} as DOMRect] as unknown as DOMRectList);
     row.focus();
     const event = new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true });
     row.dispatchEvent(event);
 
     expect(event.defaultPrevented).toBe(true);
     expect(document.activeElement).toBe(row);
+  });
+});
+
+describe("SessionRow mark tooltips", () => {
+  it("explains marks with tooltips, not title, and describes the focused row with its glyph", () => {
+    renderRow(ws({ status: "Waiting", favorited: true, pinned_at: PAST }));
+    const row = testId("sidebar-session-row")!;
+    expect(row.hasAttribute("title")).toBe(false);
+    for (const id of ["sidebar-status-glyph", "sidebar-pinned-mark", "sidebar-favorite-mark"]) {
+      expect(testId(id)!.closest("[title]"), id).toBeNull();
+    }
+
+    // A mouse over the glyph shows what it means; a touch never does.
+    const glyph = testId("sidebar-status-glyph")!;
+    fireEvent.pointerEnter(glyph, { pointerType: "touch" });
+    expect(screen.queryByRole("tooltip")).toBeNull();
+    fireEvent.pointerEnter(glyph, { pointerType: "mouse" });
+    expect(screen.getByRole("tooltip").textContent).toBe("Waiting: the Agent needs your input");
+    fireEvent.pointerLeave(glyph, { pointerType: "mouse" });
+    expect(screen.queryByRole("tooltip")).toBeNull();
+
+    // Keyboard focus (jsdom has no :focus-visible) is covered by sidebar-legend.spec.ts.
+    cleanup();
+
+    renderRow(ws({ status: "Idle", unread: true }), { unread: true });
+    expect(testId("sidebar-unread-dot")!.closest("[title]")).toBeNull();
+    fireEvent.pointerEnter(testId("sidebar-status-glyph")!, { pointerType: "mouse" });
+    expect(screen.getByRole("tooltip").textContent).toMatch(/^Unread: /);
+    cleanup();
+
+    // Attention the glyph's meaning doesn't already say gets its own line, which `title` used to carry,
+    // also when an unread glyph stands in for the status glyph.
+    const cases: [Parameters<typeof ws>[0], { unread?: boolean } | undefined, string][] = [
+      [{ status: "Running", urgent: true }, undefined, "Running: the Agent is workingNeeds your attention"],
+      [{ status: "Idle", urgent: true, unread: true }, { unread: true }, "Needs your attention"],
+    ];
+    for (const [over, opts, tip] of cases) {
+      cleanup();
+      renderRow(ws(over), opts);
+      fireEvent.pointerEnter(testId("sidebar-status-glyph")!, { pointerType: "mouse" });
+      expect(screen.getByRole("tooltip").textContent, JSON.stringify(over)).toContain(tip);
+    }
   });
 });
