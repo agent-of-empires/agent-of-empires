@@ -44,9 +44,12 @@ impl ImageState {
             Ok(ImageCheck::Unknown(reason)) => ImageState::Unknown {
                 reason: reason.code(),
             },
-            Err(error) => ImageState::CheckFailed {
-                error: format!("{error:#}"),
-            },
+            Err(error) => {
+                tracing::warn!(target: "http.api.sandbox_image", "image check failed: {error:#}");
+                ImageState::CheckFailed {
+                    error: image_update::error_code(&error).to_string(),
+                }
+            }
         }
     }
 }
@@ -148,8 +151,11 @@ where
         state
     })
     .await
-    .unwrap_or_else(|e| ImageState::CheckFailed {
-        error: format!("image check task failed: {e}"),
+    .unwrap_or_else(|e| {
+        tracing::error!(target: "http.api.sandbox_image", "image check task failed: {e}");
+        ImageState::CheckFailed {
+            error: "registry_bad_response".into(),
+        }
     })
 }
 
@@ -539,10 +545,10 @@ mod tests {
                 Ok(ImageCheck::Unknown(UnknownReason::RuntimeUnavailable)),
                 serde_json::json!({"state": "unknown", "reason": "runtime_unavailable"}),
             ),
-            // A registry or network error is never reported as current.
+            // A registry or network error is never reported as current, and the chain stays out.
             (
-                Err(anyhow::anyhow!("registry timed out")),
-                serde_json::json!({"state": "check_failed", "error": "registry timed out"}),
+                Err(anyhow::anyhow!("registry timed out at 10.0.0.5")),
+                serde_json::json!({"state": "check_failed", "error": "registry_bad_response"}),
             ),
         ];
         for (result, expected) in cases {

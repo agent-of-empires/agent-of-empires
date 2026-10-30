@@ -2,9 +2,8 @@ import { useEffect, useState } from "react";
 
 import { useRespawnSession } from "../../hooks/useRespawnSession";
 import { fetchAgentInstallInfo, type AgentInstallInfo } from "../../lib/api";
-import { writeClipboard } from "../../lib/clipboard";
 import { splitInstallHint, startupErrorCause, useAdapterInstall } from "./adapterRecovery";
-import { RecoveryActionRow, type RecoveryAction } from "./RecoveryActionRow";
+import { CommandBlock, RecoveryActionRow, type RecoveryAction } from "./RecoveryActionRow";
 
 function Code({ children }: { children: React.ReactNode }) {
   return <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">{children}</code>;
@@ -268,7 +267,7 @@ function InstallSteps({ info }: { info: AgentInstallInfo | null }) {
       <div className="mt-2 text-xs text-text-subtle" data-testid="startup-error-banner-sandbox-note">
         <p>The ACP adapter lives inside the sandbox container, so installing it on the host won't reach it.</p>
         <p className="mt-2">Run this inside the container, then Retry:</p>
-        <CommandBlock {...hint} />
+        <CommandBlock {...hint} testId="startup-error-banner-command" />
         <p className="mt-2 text-text-subtle">
           This updates the running container only. To keep new Sessions from hitting this, refresh the sandbox image:
           the aoe TUI shows a "sandbox image update available" banner that pulls the right image with your configured
@@ -279,33 +278,9 @@ function InstallSteps({ info }: { info: AgentInstallInfo | null }) {
   }
   return (
     <div className="mt-2 text-xs text-text-subtle">
-      <CommandBlock {...hint} />
+      <CommandBlock {...hint} testId="startup-error-banner-command" />
       <p className="mt-2">Run this where the Daemon runs, then Retry.</p>
     </div>
-  );
-}
-
-function CommandBlock({ command, note }: { command: string; note: string | null }) {
-  const [copied, setCopied] = useState(false);
-  return (
-    <>
-      <div className="mt-1 flex items-start gap-2 rounded-md border border-surface-700 bg-surface-950 p-2">
-        <code
-          data-testid="startup-error-banner-command"
-          className="min-w-0 flex-1 whitespace-pre-wrap break-all font-mono text-[12px] text-text-primary"
-        >
-          {command}
-        </code>
-        <button
-          type="button"
-          onClick={() => void writeClipboard(command).then(setCopied)}
-          className="shrink-0 rounded-md px-2 text-[11px] text-text-subtle hover:text-text-primary"
-        >
-          {copied ? "Copied" : "Copy"}
-        </button>
-      </div>
-      {note && <p className="mt-1 text-text-subtle">{note}</p>}
-    </>
   );
 }
 
