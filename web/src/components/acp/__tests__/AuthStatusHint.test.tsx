@@ -108,6 +108,27 @@ describe("AuthStatusHint signed out", () => {
     expect(dialog()!.textContent).toContain("Sign in to OpenCode, then restart the Agent.");
   });
 
+  // A daemon restart keeps the running Agent and its old environment, so the key needs both restarts.
+  // A Container gets the adapter's provider keys from the Daemon's environment too, so its route is the same.
+  it.each([
+    ["a host Session", signIn(), "Or set ANTHROPIC_API_KEY in the environment that runs aoe serve, restart"],
+    [
+      "a sandboxed Session",
+      signIn({ sandboxed: true }),
+      "Or set ANTHROPIC_API_KEY in the environment that runs aoe serve, restart",
+    ],
+    [
+      "an Agent aoe has no steps for",
+      signIn({ agent: "opencode", agentName: "OpenCode" }),
+      "Or set its API key in the environment that runs aoe serve, restart",
+    ],
+  ])("with %s, the API key route restarts aoe serve and then the Agent", (_, context, route) => {
+    renderSignedOut(context);
+    fireEvent.click(trigger());
+    expect(dialog()!.textContent).toContain(`${route} aoe serve, then restart the Agent.`);
+    expect(dialog()!.textContent).not.toContain("[sandbox] environment");
+  });
+
   it.each([
     ["Escape", true],
     ["an outside click", false],

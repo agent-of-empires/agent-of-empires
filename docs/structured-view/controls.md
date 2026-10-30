@@ -64,7 +64,7 @@ The chip keeps the previous value until the adapter confirms, so it never snaps 
 
 ## Sign-in
 
-When the Agent reports it isn't signed in, the composer footer shows **Not logged in**. Clicking it shows the Agent's sign-in command with **Copy command**, **Open Terminal** (the host shell, or the Container shell for a sandboxed Session) and **Restart Agent**, which the Agent needs to read a new sign-in. Setting an API key instead (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) takes effect only after you restart `aoe serve`, which reads its environment at start.
+When the Agent reports it isn't signed in, the composer footer shows **Not logged in**. Clicking it shows the Agent's sign-in command with **Copy command**, **Open Terminal** (the host shell, or the Container shell for a sandboxed Session) and **Restart Agent**, which the Agent needs to read a new sign-in. To use an API key instead, set it (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) where `aoe serve` runs, restart `aoe serve`, which reads its environment only at start, then click **Restart Agent**: the running Agent keeps the environment it started with across a daemon restart. [Provider credentials](../structured-view.md#provider-credentials) lists the keys each adapter receives, in a Container too.
 
 ## Session persistence
 

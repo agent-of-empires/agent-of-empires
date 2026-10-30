@@ -241,8 +241,12 @@ describe("StartupErrorBanner auth remediation", () => {
     {
       agent: "claude",
       info: claude(),
-      present: ["claude auth login", "host terminal", "ANTHROPIC_API_KEY", "restart aoe serve"],
-      absent: ["codex login", "claude /login"],
+      present: [
+        "claude auth login",
+        "host terminal",
+        "Or set ANTHROPIC_API_KEY in the environment that runs aoe serve, restart aoe serve, then click Retry.",
+      ],
+      absent: ["codex login", "claude /login", "[sandbox] environment"],
     },
     {
       agent: "codex",
@@ -253,8 +257,12 @@ describe("StartupErrorBanner auth remediation", () => {
     {
       agent: "codex",
       info: claude({ agent: "codex", display_name: "Codex", sandboxed: true }),
-      present: ["codex login --device-auth", "Container terminal"],
-      absent: ["host terminal"],
+      present: [
+        "codex login --device-auth",
+        "Container terminal",
+        "Or set OPENAI_API_KEY in the environment that runs aoe serve, restart aoe serve, then click Retry.",
+      ],
+      absent: ["host terminal", "[sandbox] environment"],
     },
     {
       agent: "opencode",

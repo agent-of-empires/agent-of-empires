@@ -5,11 +5,18 @@ import { fetchAgentInstallInfo, type AgentInstallInfo } from "../../lib/api";
 import { writeClipboard } from "../../lib/clipboard";
 import { splitInstallHint, startupErrorCause, useAdapterInstall } from "./adapterRecovery";
 import { RecoveryActionRow, type RecoveryAction } from "./RecoveryActionRow";
+import { ApiKeyAlternative } from "./SignInPopover";
 import { signInSteps } from "./signInSteps";
 
 function Code({ children }: { children: React.ReactNode }) {
   return <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">{children}</code>;
 }
+
+const RETRY = (
+  <>
+    click <strong>Retry</strong>
+  </>
+);
 
 /** Copy for the failures a reinstall won't fix, keyed off the message text. */
 function specificRemediation(
@@ -21,20 +28,18 @@ function specificRemediation(
 ): React.ReactNode {
   if (/authentic|login|api[_ -]?key/i.test(message)) {
     const steps = signInSteps(sandboxed === undefined ? null : agent, name, sandboxed === true);
-    // Retry respawns the Agent, which reads a new sign-in; the Daemon reads its env only at start.
+    // Retry respawns the Agent, which reads a new sign-in.
     return (
       <>
         The adapter is installed but {name} isn't signed in.{" "}
         {steps.command ? (
           <>
             Run <Code>{steps.command}</Code> in a {sandboxed ? "Container" : "host"} terminal, then click{" "}
-            <strong>Retry</strong>. Or set <Code>{steps.apiKeyEnv}</Code> in the env that runs <Code>aoe serve</Code>{" "}
-            and restart <Code>aoe serve</Code>.
+            <strong>Retry</strong>. <ApiKeyAlternative apiKeyEnv={steps.apiKeyEnv} then={RETRY} />
           </>
         ) : (
           <>
-            Sign in to {name}, then click <strong>Retry</strong>. Or set its API key in the env that runs{" "}
-            <Code>aoe serve</Code> and restart <Code>aoe serve</Code>.
+            Sign in to {name}, then click <strong>Retry</strong>. <ApiKeyAlternative apiKeyEnv={null} then={RETRY} />
           </>
         )}
       </>

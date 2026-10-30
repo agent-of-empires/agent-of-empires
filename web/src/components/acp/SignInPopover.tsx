@@ -28,6 +28,19 @@ function Code({ children }: { children: React.ReactNode }) {
   return <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">{children}</code>;
 }
 
+/**
+ * The API key route. `aoe serve` reads its environment only at start, and a running Agent keeps
+ * the one it started with across that restart, so the Agent must restart after it too.
+ */
+export function ApiKeyAlternative({ apiKeyEnv, then }: { apiKeyEnv: string | null; then: React.ReactNode }) {
+  return (
+    <>
+      Or set {apiKeyEnv ? <Code>{apiKeyEnv}</Code> : "its API key"} in the environment that runs <Code>aoe serve</Code>,
+      restart <Code>aoe serve</Code>, then {then}.
+    </>
+  );
+}
+
 /** The composer's Not logged in label: a button that opens the Agent's sign-in steps. */
 export function SignInButton({
   label,
@@ -141,14 +154,13 @@ function SignInPanel({ id, signIn, onLeave }: { id: string; signIn?: SignInConte
             </button>
           </div>
           <p className="mt-2">
-            Then restart the Agent so it reads the new sign-in. Or set <Code>{steps.apiKeyEnv}</Code> in the environment
-            that runs <Code>aoe serve</Code> and restart <Code>aoe serve</Code>.
+            Then restart the Agent so it reads the new sign-in.{" "}
+            <ApiKeyAlternative apiKeyEnv={steps.apiKeyEnv} then="restart the Agent" />
           </p>
         </>
       ) : (
         <p className="mt-2">
-          Sign in to {name}, then restart the Agent. Or set its API key in the environment that runs{" "}
-          <Code>aoe serve</Code> and restart <Code>aoe serve</Code>.
+          Sign in to {name}, then restart the Agent. <ApiKeyAlternative apiKeyEnv={null} then="restart the Agent" />
         </p>
       )}
       {(signIn?.onOpenTerminal || signIn?.canRestart) && (
