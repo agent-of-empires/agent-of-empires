@@ -161,6 +161,11 @@ impl PluginHost {
         }))
     }
 
+    /// The profile workers publish suggestions under; takes no lock.
+    pub(crate) fn suggestions_profile(&self) -> String {
+        self.api.suggestions_profile()
+    }
+
     /// Run `f` on the suggestions store, keyed by the profile workers publish under.
     pub(crate) fn with_suggestions_db<T>(
         &self,

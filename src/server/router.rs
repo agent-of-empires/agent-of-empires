@@ -305,6 +305,12 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
                 .delete(api::delete_suggestion_template),
         )
         .route("/api/suggestions/prepare", post(api::prepare_suggestion))
+        .route(
+            "/api/suggestions/mappings",
+            get(api::list_suggestion_mappings)
+                .put(api::put_suggestion_mapping)
+                .delete(api::delete_suggestion_mapping),
+        )
         .route("/api/plugins/commands", get(api::plugin_commands))
         .route(
             "/api/plugins/commands/{fqid}/invoke",

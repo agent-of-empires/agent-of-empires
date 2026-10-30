@@ -11,7 +11,7 @@ pub const SUGGESTIONS_REFRESH: &str = "suggestions.refresh";
 /// Host-to-worker notification asking the worker to run its setup checks again.
 pub const SUGGESTIONS_CHECKS_RUN: &str = "suggestions.checks.run";
 
-/// Upper bound on `criterion` and `Suggestion::id`, in bytes.
+/// Upper bound on `criterion`, `Suggestion::id` and `Suggestion::mapping_key`, in bytes.
 pub const MAX_KEY_BYTES: usize = 256;
 
 /// One suggestion from a plugin provider.
@@ -26,6 +26,9 @@ pub struct Suggestion {
     pub preview: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// Opaque key (a repository, a team) the user can map to projects in core.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mapping_key: Option<String>,
     /// Which declared [`SuggestionSource`] produced this item.
     pub criterion: String,
     /// Values for the placeholders the source declared; untrusted provider

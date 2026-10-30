@@ -552,3 +552,49 @@ export interface SettingsFieldDescriptor {
   /** Plugin field that can also be set per registered project. */
   per_project?: boolean;
 }
+
+export interface SuggestionSource {
+  criterion: string;
+  label: string;
+  description: string;
+  enabled: boolean;
+}
+
+export interface SuggestionProvider {
+  id: string;
+  name: string;
+  status: "pending" | "ok" | "error";
+  error?: string;
+  sources: SuggestionSource[];
+}
+
+/** `preview` and `reason` are provider text and untrusted; only `draft` seeds a prompt. */
+export interface SuggestionItem {
+  id: string;
+  provider_id: string;
+  title: string;
+  reason: string;
+  source_url: string;
+  source_ref: string;
+  preview: string;
+  project?: string | null;
+  criterion: string;
+  draft: { title: string; prompt: string };
+  dismissed: boolean;
+}
+
+export interface SuggestionsSnapshot {
+  providers: SuggestionProvider[];
+  items: SuggestionItem[];
+}
+
+export interface SuggestionPrepared {
+  title: string;
+  initial_prompt: string;
+  source_ref: string;
+  project: { name: string; path: string } | null;
+  tool: string;
+  yolo: boolean;
+  sandbox: boolean;
+  worktree: boolean;
+}
