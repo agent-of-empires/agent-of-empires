@@ -3,6 +3,7 @@
 import type { Page } from "@playwright/test";
 import { test, expect } from "./helpers/mockedTest";
 import { installSidebarMocks, type MockSessionInput } from "./helpers/sidebarMocks";
+import { sessionResponse } from "./helpers/sessions";
 
 const SIDEBAR = '[role="navigation"][aria-label="Sessions sidebar"]';
 
@@ -82,6 +83,75 @@ test("Show only this Session turns this tab into a focus window until All Sessio
   await expect.poll(() => reports.at(-1)).toBeNull();
   await expect.poll(() => workerFocusSessions(page)).toEqual([null]);
   expect(popups).toHaveLength(0);
+});
+
+/** Clicks `trigger` and returns the path of the window it opens. */
+async function popupPath(page: Page, trigger: () => Promise<void>): Promise<string> {
+  const [popup] = await Promise.all([page.waitForEvent("popup"), trigger()]);
+  await popup.waitForURL((url) => url.pathname !== "blank");
+  const url = new URL(popup.url());
+  await popup.close();
+  return url.pathname + url.search;
+}
+
+test("a focus window opens other sessions, plugin pages and settings beside it and keeps its own URL", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1280, height: 720 });
+  await installSidebarMocks(page, { sessions: SESSIONS });
+  const board = { plugin_id: "acme.kit", id: "board", title: "Board", icon: "kanban", capabilities: [] };
+  // A header badge linking to another session, which a plugin may show in any window.
+  const link = {
+    plugin_id: "acme.kit",
+    slot: "header-start",
+    id: "goths",
+    payload: { text: "acme: goths", href: "/session/s-2" },
+  };
+  await page.route("**/api/plugins/ui-state", (r) =>
+    r.fulfill({ json: { entries: [link], notifications: [], pages: [board] } }),
+  );
+  await page.goto("/session/s-1?focus=1");
+  await expect(page.getByRole("button", { name: /^All Sessions/ })).toBeVisible();
+
+  expect(await popupPath(page, () => page.getByRole("link", { name: "acme: goths", exact: true }).click())).toBe(
+    "/session/s-2",
+  );
+  expect(await popupPath(page, () => page.getByRole("button", { name: "Board", exact: true }).click())).toBe(
+    "/plugins/acme.kit/board",
+  );
+  expect(await popupPath(page, () => page.keyboard.press("s"))).toBe("/settings");
+  await expect(page).toHaveURL("/session/s-1?focus=1");
+  await expect(page.getByRole("button", { name: /^All Sessions/ })).toBeVisible();
+});
+
+test("a focus window names its session once it is gone and leads back to all Sessions", async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 720 });
+  let sessions = SESSIONS;
+  await installSidebarMocks(page, { sessions: SESSIONS });
+  await page.route("**/api/sessions", (r) =>
+    r.fulfill({
+      headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
+      json: {
+        sessions: sessions.map((s, i) => ({
+          ...sessionResponse({ id: s.id, title: s.title, project_path: s.project_path, branch: s.branch }),
+          created_at: new Date(Date.UTC(2025, 0, 1 + i)).toISOString(),
+        })),
+        workspace_ordering: [],
+      },
+    }),
+  );
+  await page.goto("/session/s-1?focus=1");
+  await expect(page).toHaveTitle("Mongols");
+
+  sessions = SESSIONS.filter((s) => s.id !== "s-1");
+  const gone = page.getByTestId("focus-session-gone");
+  await expect(gone).toContainText("Mongols no longer exists.");
+  await expect(page).toHaveURL("/session/s-1?focus=1");
+
+  await gone.getByRole("button", { name: "Show all Sessions" }).click();
+  await expect(page).toHaveURL("/");
+  await expect(page.locator(SIDEBAR)).toBeVisible();
+  await expect(gone).toHaveCount(0);
 });
 
 test("Open in its own window pops the session out and leaves this tab as it was", async ({ page }) => {

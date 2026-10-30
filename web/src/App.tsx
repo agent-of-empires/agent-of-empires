@@ -116,7 +116,7 @@ import { toastBus, reportError } from "./lib/toastBus";
 import { restartForUpdate } from "./lib/restartForUpdate";
 import { startPendingCreates } from "./lib/pendingCreates";
 import { isAbsolutePath, resolveToRepoRelative, type FileRef } from "./lib/fileRef";
-import { NAVIGATE_EVENT, OPEN_SESSION_EVENT, openFocusWindow } from "./lib/sessionRoute";
+import { NAVIGATE_EVENT, OPEN_SESSION_EVENT, openFocusWindow, replaceDocument } from "./lib/sessionRoute";
 import { dispatchFocusTerminal, requestSessionInputFocus, setPendingTerminalFocus } from "./lib/terminalFocus";
 import {
   bindHiddenInput,
@@ -2253,8 +2253,13 @@ function AppContent({
     }
 
     if (focusSession.gone) {
+      // The session's own route would only show it gone again, so this leads to the dashboard.
       return (
-        <FocusSessionGone title={focusSession.title} trashed={focusSession.gone === "trashed"} onExit={exitFocusMode} />
+        <FocusSessionGone
+          title={focusSession.title}
+          trashed={focusSession.gone === "trashed"}
+          onExit={() => replaceDocument("/")}
+        />
       );
     }
 

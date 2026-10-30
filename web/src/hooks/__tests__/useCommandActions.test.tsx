@@ -78,6 +78,13 @@ describe("useCommandActions focus mode", () => {
     expect(onEnterFocusMode).toHaveBeenCalledTimes(1);
   });
 
+  it("offers neither command for a trashed session", () => {
+    const trashed = { ...sessions[0]!, trashed_at: "2026-01-01T00:00:00Z" } as SessionResponse;
+    const ids = actionsFor({ sessions, activeSessionId: "a", activeSession: trashed }).map((a) => a.id);
+    expect(ids).not.toContain("action:enter-focus-mode");
+    expect(ids).not.toContain("action:open-focus-window");
+  });
+
   it("leaves out the own-window command where a second window cannot open", () => {
     const ids = actionsFor({ sessions, activeSessionId: "a", onOpenFocusWindow: undefined }).map((a) => a.id);
     expect(ids).toContain("action:enter-focus-mode");
