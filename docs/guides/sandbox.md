@@ -204,6 +204,7 @@ the existing ensure, start or restart operation; the TUI displays its progress
 and attaches only after the canonical result. An unavailable Daemon never
 triggers a local copy or launch. Cancelling an attachment does not roll back a
 copy already in flight, and reconnecting does not repeat the operation.
+Other sessions remain controllable while preparation runs.
 `aoe migrate` moves every eligible session at once. Trashed and archived
 sessions keep the shared store until they are started again.
 
@@ -214,9 +215,9 @@ continues with other sessions and retries later. A running sandbox whose mounts
 AoE cannot prove clear of `.aoe-sandbox-recovery` holds back moving any original
 there, and `aoe migrate` names it; launches that retire no original proceed.
 In the Daemon's environment, `AOE_DEFER_SANDBOX_MIGRATION=1` skips the move for
-that launch. A running sandbox
-carries on on the shared store; a stopped one cannot start until its store has
-moved, so drop the variable or run `aoe migrate` before launching it.
+that launch. A running sandbox carries on on the shared store; a stopped one
+cannot start until its store has moved. Relaunch the Daemon without this variable,
+or stop it and run `aoe migrate` before launching the session.
 
 ### Shared credentials
 

@@ -370,6 +370,7 @@ async fn run_command_writer(
     #[cfg(test)] creation_count: Option<tokio::sync::watch::Sender<usize>>,
 ) {
     let mut creations = tokio::task::JoinSet::new();
+    let mut preparations = tokio::task::JoinSet::new();
     loop {
         let request = tokio::select! {
             request = requests.recv() => match request {
@@ -383,12 +384,14 @@ async fn run_command_writer(
                 }
                 continue;
             }
+            _ = preparations.join_next(), if !preparations.is_empty() => continue,
         };
-        let allowed = request.native.as_ref().map_or_else(
-            || grant.load(Ordering::SeqCst) == request.lease,
-            NativeLease::is_valid,
-        );
-        if allowed && matches!(&request.request, CommandRequest::Create(_)) {
+        if matches!(&request.request, CommandRequest::Create(_))
+            && request.native.as_ref().map_or_else(
+                || grant.load(Ordering::SeqCst) == request.lease,
+                NativeLease::is_valid,
+            )
+        {
             let SessionCommand {
                 request: CommandRequest::Create(body),
                 result,
@@ -413,177 +416,214 @@ async fn run_command_writer(
             }
             continue;
         }
-        let result = if !allowed {
-            Err(CommandFailure::Rejected(
-                "Request not submitted: runtime permission changed or continuation was cancelled"
-                    .into(),
-            ))
+        let is_preparation = matches!(
+            &request.request,
+            CommandRequest::Session {
+                request: SessionRequest::EnsureAgent { .. }
+                    | SessionRequest::StartAgent { .. }
+                    | SessionRequest::EnsureAuxiliary { .. }
+                    | SessionRequest::Mutation(
+                        SessionMutation::Start(_) | SessionMutation::Restart(_)
+                    ),
+                ..
+            }
+        );
+        if is_preparation {
+            let client = client.clone();
+            let epoch = epoch.clone();
+            let grant = grant.clone();
+            preparations.spawn(async move {
+                run_queued_command(&client, &epoch, &grant, request).await;
+            });
         } else {
-            match request.request {
-                CommandRequest::Create(_) => unreachable!(),
-                CommandRequest::Namespace(mutation) => run_namespace(&client, mutation, &epoch)
-                    .await
-                    .map(CommandReply::Namespace),
-                CommandRequest::Session { id, request } => match request {
-                    SessionRequest::SmartRename => client
-                        .smart_rename_session(&id, &epoch)
+            run_queued_command(&client, &epoch, &grant, request).await;
+        }
+    }
+    creations.shutdown().await;
+    preparations.shutdown().await;
+}
+
+async fn run_queued_command(
+    client: &crate::daemon::DaemonClient,
+    epoch: &str,
+    grant: &AtomicU64,
+    request: SessionCommand,
+) {
+    let allowed = request.native.as_ref().map_or_else(
+        || grant.load(Ordering::SeqCst) == request.lease,
+        NativeLease::is_valid,
+    );
+    let result = if !allowed {
+        Err(CommandFailure::Rejected(
+            "Request not submitted: runtime permission changed or continuation was cancelled"
+                .into(),
+        ))
+    } else {
+        match request.request {
+            CommandRequest::Create(_) => unreachable!(),
+            CommandRequest::Namespace(mutation) => run_namespace(client, mutation, epoch)
+                .await
+                .map(CommandReply::Namespace),
+            CommandRequest::Session { id, request } => match request {
+                SessionRequest::SmartRename => {
+                    client
+                        .smart_rename_session(&id, epoch)
                         .await
                         .map(|receipt| {
                             CommandReply::SmartRename(MutationReceipt {
                                 cursor: receipt.cursor,
                                 outcome: (),
                             })
-                        }),
-                    SessionRequest::Trash(body) => client
-                        .trash_session(&id, &body, &epoch)
-                        .await
-                        .map(CommandReply::Trash),
-                    SessionRequest::Purge(body) => client
-                        .purge_session(&id, &body, &epoch)
-                        .await
-                        .map(CommandReply::Purge),
-                    SessionRequest::Restore => client
-                        .restore_session(&id, &epoch)
-                        .await
-                        .map(CommandReply::Restore),
-                    SessionRequest::Rename(body) => client
-                        .rename_session(&id, &body, &epoch)
-                        .await
-                        .map(CommandReply::Rename),
-                    SessionRequest::SetWorktreeName(body) => client
-                        .set_worktree_name(&id, &body, &epoch)
-                        .await
-                        .map(CommandReply::WorktreeName),
-                    SessionRequest::AttachProject(body) => client
-                        .attach_session_project(&id, &body, &epoch)
-                        .await
-                        .map(CommandReply::AttachProject),
-                    SessionRequest::Mutation(SessionMutation::Restart(body)) => client
-                        .restart_session(&id, &body, &epoch)
-                        .await
-                        .map(CommandReply::Restart),
-                    SessionRequest::Mutation(mutation) => client
-                        .mutate_session(&id, &mutation, &epoch)
-                        .await
-                        .map(CommandReply::Mutation),
-                    SessionRequest::EnsureAuxiliary {
-                        target,
-                        size,
-                        adoption,
-                    } => {
-                        let receipt = match target {
-                            AuxiliaryTarget::Host { index } => {
-                                client
-                                    .ensure_terminal(&id, index, &StartSessionBody { size }, &epoch)
-                                    .await
-                            }
-                            AuxiliaryTarget::Container { index } => {
-                                client
-                                    .ensure_container_terminal(
-                                        &id,
-                                        index,
-                                        &StartSessionBody { size },
-                                        &epoch,
-                                    )
-                                    .await
-                            }
-                            AuxiliaryTarget::Tool { tool_name } => {
-                                client
-                                    .ensure_tool(
-                                        &id,
-                                        &EnsureToolBody {
-                                            tool_name,
-                                            size,
-                                            adoption,
-                                        },
-                                        &epoch,
-                                    )
-                                    .await
-                            }
-                        };
-                        receipt.map(CommandReply::Terminal)
-                    }
-                    SessionRequest::EnsureAgent { size } => client
-                        .ensure_agent(&id, &StartSessionBody { size }, &epoch)
-                        .await
-                        .map(CommandReply::Terminal),
-                    SessionRequest::StartAgent { size } => match client
-                        .mutate_session(
-                            &id,
-                            &SessionMutation::Start(StartSessionBody { size }),
-                            &epoch,
-                        )
+                        })
+                }
+                SessionRequest::Trash(body) => client
+                    .trash_session(&id, &body, epoch)
+                    .await
+                    .map(CommandReply::Trash),
+                SessionRequest::Purge(body) => client
+                    .purge_session(&id, &body, epoch)
+                    .await
+                    .map(CommandReply::Purge),
+                SessionRequest::Restore => client
+                    .restore_session(&id, epoch)
+                    .await
+                    .map(CommandReply::Restore),
+                SessionRequest::Rename(body) => client
+                    .rename_session(&id, &body, epoch)
+                    .await
+                    .map(CommandReply::Rename),
+                SessionRequest::SetWorktreeName(body) => client
+                    .set_worktree_name(&id, &body, epoch)
+                    .await
+                    .map(CommandReply::WorktreeName),
+                SessionRequest::AttachProject(body) => client
+                    .attach_session_project(&id, &body, epoch)
+                    .await
+                    .map(CommandReply::AttachProject),
+                SessionRequest::Mutation(SessionMutation::Restart(body)) => client
+                    .restart_session(&id, &body, epoch)
+                    .await
+                    .map(CommandReply::Restart),
+                SessionRequest::Mutation(mutation) => client
+                    .mutate_session(&id, &mutation, epoch)
+                    .await
+                    .map(CommandReply::Mutation),
+                SessionRequest::EnsureAuxiliary {
+                    target,
+                    size,
+                    adoption,
+                } => {
+                    let receipt = match target {
+                        AuxiliaryTarget::Host { index } => {
+                            client
+                                .ensure_terminal(&id, index, &StartSessionBody { size }, epoch)
+                                .await
+                        }
+                        AuxiliaryTarget::Container { index } => {
+                            client
+                                .ensure_container_terminal(
+                                    &id,
+                                    index,
+                                    &StartSessionBody { size },
+                                    epoch,
+                                )
+                                .await
+                        }
+                        AuxiliaryTarget::Tool { tool_name } => {
+                            client
+                                .ensure_tool(
+                                    &id,
+                                    &EnsureToolBody {
+                                        tool_name,
+                                        size,
+                                        adoption,
+                                    },
+                                    epoch,
+                                )
+                                .await
+                        }
+                    };
+                    receipt.map(CommandReply::Terminal)
+                }
+                SessionRequest::EnsureAgent { size } => client
+                    .ensure_agent(&id, &StartSessionBody { size }, epoch)
+                    .await
+                    .map(CommandReply::Terminal),
+                SessionRequest::StartAgent { size } => match client
+                    .mutate_session(
+                        &id,
+                        &SessionMutation::Start(StartSessionBody { size }),
+                        epoch,
+                    )
+                    .await
+                {
+                    Ok(cursor) => match client
+                        .ensure_agent(&id, &StartSessionBody::default(), epoch)
                         .await
                     {
-                        Ok(cursor) => match client
-                            .ensure_agent(&id, &StartSessionBody::default(), &epoch)
-                            .await
-                        {
-                            Ok(mut receipt) => {
-                                receipt.cursor.revision =
-                                    receipt.cursor.revision.max(cursor.revision);
-                                Ok(CommandReply::Terminal(receipt))
+                        Ok(mut receipt) => {
+                            receipt.cursor.revision = receipt.cursor.revision.max(cursor.revision);
+                            Ok(CommandReply::Terminal(receipt))
+                        }
+                        Err(error) => {
+                            let mut cursor = cursor;
+                            if let crate::daemon::DaemonClientError::Committed {
+                                cursor: committed,
+                                ..
+                            } = &error
+                            {
+                                cursor.revision = cursor.revision.max(committed.revision);
                             }
-                            Err(error) => {
-                                let mut cursor = cursor;
-                                if let crate::daemon::DaemonClientError::Committed {
-                                    cursor: committed,
+                            let mut failure = match error {
+                                error @ crate::daemon::DaemonClientError::Committed {
+                                    code: crate::daemon::ApiErrorCode::ManagedResumeRefused(_),
                                     ..
-                                } = &error
-                                {
-                                    cursor.revision = cursor.revision.max(committed.revision);
+                                } => CommandFailure::Rejected(error.to_string()),
+                                error => CommandFailure::submitted(error),
+                            };
+                            match &mut failure {
+                                CommandFailure::Rejected(message)
+                                | CommandFailure::Unknown(message) => {
+                                    message.insert_str(
+                                        0,
+                                        "Session started; pane preparation failed: ",
+                                    );
                                 }
-                                let mut failure = match error {
-                                    error @ crate::daemon::DaemonClientError::Committed {
-                                        code: crate::daemon::ApiErrorCode::ManagedResumeRefused(_),
-                                        ..
-                                    } => CommandFailure::Rejected(error.to_string()),
-                                    error => CommandFailure::submitted(error),
-                                };
-                                match &mut failure {
-                                    CommandFailure::Rejected(message)
-                                    | CommandFailure::Unknown(message) => {
-                                        message.insert_str(
-                                            0,
-                                            "Session started; pane preparation failed: ",
-                                        );
-                                    }
-                                }
-                                Ok(CommandReply::CommittedFailure { cursor, failure })
                             }
-                        },
-                        Err(error) => Err(error),
+                            Ok(CommandReply::CommittedFailure { cursor, failure })
+                        }
                     },
-                    SessionRequest::CancelCreation => client
-                        .cancel_creation(&id, &epoch)
-                        .await
-                        .map(CommandReply::Mutation),
+                    Err(error) => Err(error),
                 },
+                SessionRequest::CancelCreation => client
+                    .cancel_creation(&id, epoch)
+                    .await
+                    .map(CommandReply::Mutation),
+            },
+        }
+        .or_else(|error| match error {
+            error @ crate::daemon::DaemonClientError::Committed { .. } => {
+                let message = error.to_string();
+                let crate::daemon::DaemonClientError::Committed { cursor, code } = error else {
+                    unreachable!();
+                };
+                let failure = if matches!(
+                    code,
+                    crate::daemon::ApiErrorCode::PurgeFailed
+                        | crate::daemon::ApiErrorCode::ManagedResumeRefused(_)
+                ) {
+                    CommandFailure::Rejected(message)
+                } else {
+                    CommandFailure::Unknown(message)
+                };
+                Ok(CommandReply::CommittedFailure { cursor, failure })
             }
-            .or_else(|error| match error {
-                error @ crate::daemon::DaemonClientError::Committed { .. } => {
-                    let message = error.to_string();
-                    let crate::daemon::DaemonClientError::Committed { cursor, code } = error else {
-                        unreachable!();
-                    };
-                    let failure = if matches!(
-                        code,
-                        crate::daemon::ApiErrorCode::PurgeFailed
-                            | crate::daemon::ApiErrorCode::ManagedResumeRefused(_)
-                    ) {
-                        CommandFailure::Rejected(message)
-                    } else {
-                        CommandFailure::Unknown(message)
-                    };
-                    Ok(CommandReply::CommittedFailure { cursor, failure })
-                }
-                error => Err(CommandFailure::submitted(error)),
-            })
-        };
-        let _ = request.result.send(result);
-    }
-    creations.shutdown().await;
+            error => Err(CommandFailure::submitted(error)),
+        })
+    };
+    let _ = request.result.send(result);
 }
+
 #[derive(Clone)]
 struct QuitCancellationHandle {
     client: crate::daemon::DaemonClient,
@@ -2948,6 +2988,111 @@ mod tests {
             panic!("expected the queued row");
         };
         assert_eq!(id, format!("row-{COMMAND_CAPACITY}"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_sandbox_preparation_does_not_block_another_sessions_stop() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let started = entered.clone();
+        let gate = release.clone();
+        let app = axum::Router::new()
+            .route(
+                "/api/sessions/slow/ensure",
+                axum::routing::post(move || {
+                    let started = started.clone();
+                    let gate = gate.clone();
+                    async move {
+                        started.notify_one();
+                        gate.notified().await;
+                        (
+                            [
+                                (crate::daemon::RUNTIME_EPOCH_HEADER, "test"),
+                                (crate::daemon::RUNTIME_REVISION_HEADER, "3"),
+                            ],
+                            axum::Json(serde_json::json!({
+                                "tmux_session": "ready", "status": "alive",
+                                "profile": "work", "lifecycle_generation": 1,
+                            })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/api/sessions/other/stop",
+                axum::routing::post(|| async {
+                    [
+                        (crate::daemon::RUNTIME_EPOCH_HEADER, "test"),
+                        (crate::daemon::RUNTIME_REVISION_HEADER, "2"),
+                    ]
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = crate::daemon::DaemonClient::new(&format!("http://{address}"), None).unwrap();
+        let (requests, receiver) = tokio::sync::mpsc::channel(COMMAND_CAPACITY);
+        let writer = tokio::spawn(run_command_writer(
+            client,
+            "test".into(),
+            Arc::new(AtomicU64::new(1)),
+            receiver,
+            None,
+        ));
+        let lease = NativeLease {
+            grant: Arc::new(AtomicU64::new(1)),
+            generation: 1,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        let (slow_result, mut slow_reply) = tokio::sync::oneshot::channel();
+        requests
+            .send(SessionCommand {
+                request: CommandRequest::Session {
+                    id: "slow".into(),
+                    request: SessionRequest::EnsureAgent { size: None },
+                },
+                lease: 1,
+                native: Some(lease.clone()),
+                result: slow_result,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified())
+            .await
+            .unwrap();
+        lease.cancel_continuation();
+        let (stop_result, stop_reply) = tokio::sync::oneshot::channel();
+        requests
+            .send(SessionCommand {
+                request: CommandRequest::Session {
+                    id: "other".into(),
+                    request: SessionRequest::Mutation(SessionMutation::Stop),
+                },
+                lease: 1,
+                native: None,
+                result: stop_result,
+            })
+            .await
+            .unwrap();
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(3), stop_reply)
+            .await
+            .expect("stop must not wait behind the held sandbox copy")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(stopped, CommandReply::Mutation(cursor) if cursor.revision == 2));
+        assert!(matches!(
+            slow_reply.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        release.notify_one();
+        let prepared = slow_reply.await.unwrap().unwrap();
+        assert!(
+            matches!(prepared, CommandReply::Terminal(receipt) if receipt.cursor.revision == 3 && receipt.outcome.tmux_session == "ready")
+        );
+        drop(requests);
+        writer.await.unwrap();
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
