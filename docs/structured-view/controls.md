@@ -62,6 +62,10 @@ When the adapter advertises them, the composer footer shows a model dropdown and
 
 The chip keeps the previous value until the adapter confirms, so it never snaps back on a slow connection. The effort dropdown's `Default` option drops any session-level pin so the model uses its own budget. A rejected switch (rate limit, transient error) shows an amber non-blocking notice with the adapter's reason, which clears when a later snapshot reports the requested value. The selector list clears when you switch agents but survives `/clear`. How the two underlying ACP channels are normalized is in [Structured View Internals](../development/internals/structured-view.md#permission-modes-and-model-channels).
 
+## Sign-in
+
+When the Agent reports it isn't signed in, the composer footer shows **Not logged in**. Clicking it shows the Agent's sign-in command with **Copy command**, **Open Terminal** (the host shell, or the Container shell for a sandboxed Session) and **Restart Agent**, which the Agent needs to read a new sign-in. Setting an API key instead (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) takes effect only after you restart `aoe serve`, which reads its environment at start.
+
 ## Session persistence
 
 Workers and transcripts outlive an `aoe serve` restart, a closed laptop, and a reconnect: in-flight turns continue and the next daemon reattaches. To actually terminate a worker, use `aoe acp stop <session>` (graceful) or `aoe acp kill` (force). For agents that support session restoration (Claude today) the model keeps its context across restarts too, so a follow-up like "what did we just decide?" still works. The mechanics are in [Structured View Internals](../development/internals/structured-view.md#worker-lifecycle).
