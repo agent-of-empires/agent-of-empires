@@ -8,6 +8,7 @@ use serde::Deserialize;
 const EMBEDDED: &str = include_str!("../../plugins/featured.toml");
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FeaturedEntry {
     pub source: String,
     pub versions: BTreeMap<String, String>,
@@ -93,6 +94,13 @@ versions = { "1.0" = "sha256:aaa", "1.1" = "sha256:bbb" }
         assert!(!index.is_featured_source("gh:someone/else"));
 
         assert!(!entry.suggestions, "suggestions defaults to off");
+        assert!(
+            FeaturedIndex::from_toml_str(
+                "[plugins.\"a.b\"]\nsource = \"gh:acme/x\"\nversions = {}\nsuggestion = true\n"
+            )
+            .is_err(),
+            "a typoed key must fail the parse, not default off"
+        );
         assert!(!index.declares_suggestions("gh:agent-of-empires/example"));
         let flagged = FeaturedIndex::from_toml_str(
             "[plugins.\"a.b\"]\nsource = \"gh:Acme/Tracker\"\nsuggestions = true\nversions = {}\n",
