@@ -627,11 +627,20 @@ fn validate_item(spec: &SuggestionsSpec, item: &Suggestion) -> Result<(), String
     Ok(())
 }
 
+/// An http(s) URL whose displayed host is the host a browser opens: ASCII
+/// only, and an authority that is non-empty, has no userinfo, and names a host.
 fn is_http_url(url: &str) -> bool {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"));
-    rest.is_some_and(|r| !r.is_empty() && !r.chars().any(|c| c.is_whitespace() || c.is_control()))
+    if !url.is_ascii() || url.contains(|c: char| c.is_whitespace() || c.is_control() || c == '\\') {
+        return false;
+    }
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    !authority.is_empty() && !authority.contains('@') && !authority.starts_with(':')
 }
 
 fn check_mapping_key(key: &str) -> Result<(), String> {
@@ -907,11 +916,20 @@ mod tests {
     #[test]
     fn contract_violations_are_rejected() {
         type Mutate = fn(&mut Suggestion);
-        let cases: [(&str, Mutate); 11] = [
+        let cases: [(&str, Mutate); 16] = [
             ("undeclared", |i| i.criterion = "nope".into()),
             ("must not be empty", |i| i.title = " ".into()),
             ("http(s)", |i| i.source_url = "javascript:alert(1)".into()),
             ("http(s)", |i| i.source_url = "https://".into()),
+            ("http(s)", |i| i.source_url = "https:///x".into()),
+            ("http(s)", |i| i.source_url = "https://#f".into()),
+            ("http(s)", |i| i.source_url = "https://:80/x".into()),
+            ("http(s)", |i| {
+                i.source_url = "https://real.com@evil.com/".into()
+            }),
+            ("http(s)", |i| {
+                i.source_url = "https://exam\u{200b}ple.com/".into()
+            }),
             ("limited to 256", |i| i.id = "x".repeat(257)),
             ("limited to 16384", |i| {
                 i.preview = "x".repeat(16 * 1024 + 1)
@@ -935,6 +953,11 @@ mod tests {
             mutate(&mut bad);
             let err = validate_items(&spec(), &HashMap::new(), vec![bad]).unwrap_err();
             assert!(err.contains(expected), "{expected:?} not in {err:?}");
+        }
+        for url in ["HTTPS://example.com/x", "http://host:8080/p?q#f"] {
+            let mut ok = item("a", "assigned");
+            ok.source_url = url.into();
+            assert!(validate_items(&spec(), &HashMap::new(), vec![ok]).is_ok());
         }
         let dup = validate_items(
             &spec(),

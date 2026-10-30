@@ -347,7 +347,7 @@ An item is `{ id, title, reason, source_url, source_ref, preview, project?, mapp
 `suggestions.set` fails with invalid-params, and publishes nothing, when:
 
 - an item names an undeclared `criterion`, or its `variables` differ from the source's declaration;
-- `source_url` is not an http(s) URL;
+- `source_url` is not an http(s) URL, or has an empty host, userinfo, or non-ASCII characters;
 - `id`, `title` or `source_ref` is empty, `mapping_key` is present but empty, or an `id` repeats;
 - there are more than 500 items, or a string exceeds its bound (`id` and `mapping_key` 256 bytes, `title` and `draft.title` 512, `reason`, `source_url`, `source_ref` and each variable value 2 KiB, `preview` 16 KiB, `draft.prompt` 64 KiB, `project` 4 KiB).
 
