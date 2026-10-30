@@ -14,6 +14,27 @@ use crate::server::{acp_ws, api};
 /// Applies live status, unread and session-id observations.
 /// One line per lifecycle frame. Approval lines carry the call id, never the
 /// title: for Bash-style tools the title is the full command.
+/// `Failed` carries the one-shot's last output line, which the one-shot already logged at debug;
+/// the warning names only the outcome so child text never reaches the default level.
+fn log_smart_rename_outcome(
+    session: &str,
+    result: &Result<(), crate::session::smart_rename::SmartRenameError>,
+) {
+    use crate::session::smart_rename::SmartRenameError;
+    match result {
+        Ok(()) => {}
+        Err(SmartRenameError::Skipped(reason)) => {
+            tracing::debug!(target: "smart_rename", session = %session, reason = %reason, "smart rename skipped")
+        }
+        Err(SmartRenameError::TimedOut) => {
+            tracing::warn!(target: "smart_rename", session = %session, "smart rename timed out")
+        }
+        Err(SmartRenameError::Failed(_)) => {
+            tracing::warn!(target: "smart_rename", session = %session, "smart rename failed")
+        }
+    }
+}
+
 fn log_frame(frame: &crate::acp::protocol::AcpBroadcastFrame) {
     match frame.event.as_ref() {
         Event::ApprovalRequested { approval } => tracing::info!(
@@ -346,8 +367,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                     .runtime
                     .work
                     .spawn("server.acp_event_effect", async move {
-                        use crate::session::smart_rename::SmartRenameError;
-                        match crate::session::smart_rename::try_smart_rename(
+                        let result = crate::session::smart_rename::try_smart_rename(
                             state_for_rename,
                             session_id.clone(),
                             crate::session::smart_rename::SmartRenameInput {
@@ -356,22 +376,8 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                             },
                             false,
                         )
-                        .await
-                        {
-                            Ok(()) => {}
-                            Err(SmartRenameError::Skipped(reason)) => tracing::debug!(
-                                target: "smart_rename",
-                                session = %session_id,
-                                reason,
-                                "smart rename skipped"
-                            ),
-                            Err(error) => tracing::warn!(
-                                target: "smart_rename",
-                                session = %session_id,
-                                %error,
-                                "smart rename failed"
-                            ),
-                        }
+                        .await;
+                        log_smart_rename_outcome(&session_id, &result);
                     });
             } else {
                 // The first prompt must be durable before its turn completes.
@@ -2978,23 +2984,6 @@ mod tests {
     /// full command), so an inline credential must never reach the log.
     #[test]
     fn approval_request_log_carries_the_call_id_and_never_the_title() {
-        use std::io::Write;
-        use tracing_subscriber::layer::SubscriberExt as _;
-        struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl Write for Buf {
-            fn write(&mut self, src: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(src);
-                Ok(src.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let buf = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-        let writer = buf.clone();
-        let layer = tracing_subscriber::fmt::layer()
-            .with_writer(move || Buf(writer.clone()))
-            .with_ansi(false);
         let frame = AcpBroadcastFrame {
             session_id: "sess1".into(),
             seq: 1,
@@ -3021,14 +3010,38 @@ mod tests {
             worker_generation: None,
             sidebar_status: None,
         };
-        tracing::subscriber::with_default(
-            tracing_subscriber::registry::Registry::default().with(layer),
-            || log_frame(&frame),
-        );
-        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        let out = test_support::capture_log(|| log_frame(&frame));
         assert!(out.contains("approval requested"), "{out}");
         assert!(out.contains("call=call-7"), "{out}");
         assert!(out.contains("kind=execute"), "{out}");
         assert!(!out.contains("SECRET_SENTINEL_9f3"), "{out}");
+    }
+
+    /// A failed one-shot's message is its last stderr/stdout line, which can echo
+    /// prompt text or credentials; the warning must name the outcome only.
+    #[test]
+    fn smart_rename_failure_log_never_carries_child_output() {
+        use crate::session::smart_rename::SmartRenameError;
+        let cases = [
+            (
+                Err(SmartRenameError::Failed(
+                    "`claude` failed: token=SECRET_SENTINEL_c41".into(),
+                )),
+                "smart rename failed",
+            ),
+            (Err(SmartRenameError::TimedOut), "smart rename timed out"),
+            (
+                Err(SmartRenameError::Skipped("Session not found".into())),
+                "smart rename skipped",
+            ),
+        ];
+        for (result, expected) in cases {
+            let out = test_support::capture_log(|| log_smart_rename_outcome("sess1", &result));
+            assert!(out.contains(expected), "{out}");
+            assert!(out.contains("session=sess1"), "{out}");
+            assert!(!out.contains("SECRET_SENTINEL_c41"), "{out}");
+        }
+        let out = test_support::capture_log(|| log_smart_rename_outcome("sess1", &Ok(())));
+        assert!(out.is_empty(), "{out}");
     }
 }
