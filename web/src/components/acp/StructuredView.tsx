@@ -400,6 +400,8 @@ function ComposerDock({
   const { state, status } = ctx;
   const connecting =
     acpWorkerState === "running" && status !== "open" && !state.workerStopped && !state.workerRestarting;
+  const agentName = useAgentDisplayNames();
+  const signInAgent = state.agent ?? acpAgent ?? view.tool;
   return (
     <>
       <UsageLimitSection
@@ -490,8 +492,8 @@ function ComposerDock({
           authStatus={state.authStatus}
           signIn={{
             sessionId,
-            agent: state.agent ?? acpAgent ?? view.tool,
-            agentName: agent,
+            agent: signInAgent,
+            agentName: agentName(signInAgent),
             sandboxed: !!view.isSandboxed,
             onOpenTerminal: view.onOpenTerminal,
             canRestart: !!view.canRestartAgent,

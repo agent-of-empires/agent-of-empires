@@ -28,6 +28,8 @@ test("the keyboard opens the steps, Copy takes the command, Open Terminal opens 
   await page.keyboard.press("Enter");
   const steps = page.getByRole("dialog", { name: /isn't signed in/ });
   await expect(steps).toBeVisible();
+  // Named from the same Agent that picks the steps, not "the Agent".
+  await expect(steps.getByRole("heading")).toHaveText("Claude Code isn't signed in");
   await page.keyboard.press("Escape");
   await expect(steps).toBeHidden();
   await expect(label).toBeFocused();
