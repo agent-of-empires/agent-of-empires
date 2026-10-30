@@ -174,6 +174,8 @@ mod tests {
                     1,
                     &Event::AcpSessionAssigned {
                         acp_session_id: "native-history".into(),
+                        connection_ready: false,
+                        native_subject: None,
                     },
                 )
                 .unwrap();

@@ -13,12 +13,14 @@
         "src/hooks/useAcpSession.test.ts",
         "src/components/acp/__tests__/SessionBanners.test.tsx",
         "src/components/acp/ApprovalCard.test.tsx",
-        "src/components/acp/AskUserQuestionCard.test.tsx"
+        "src/components/acp/AskUserQuestionCard.test.tsx",
+        "src/components/acp/SessionConfigControls.test.tsx"
       ],
       "components": [
         "web/src/lib/acpTypes.ts",
         "web/src/hooks/acpSession/reducer.ts",
         "web/src/hooks/acpSession/stateCache.ts",
+        "web/src/hooks/acpSession/useAcpConnection.ts",
         "web/src/hooks/useAcpSession.ts",
         "web/src/components/acp/SessionBanners.tsx",
         "web/src/components/acp/ApprovalCard.tsx",
@@ -26,7 +28,22 @@
         "web/src/lib/types.ts",
         "web/src/components/acp/SystemNotices.tsx"
       ],
-      "notes": "Request-local prompt failure preserves the canonical diagnostic without a startup failure or stopped-worker claim. Typed and legacy missing/null failures survive retained-card resolution and A-to-transient-B-to-resolution compound failures. Hook/card consumers cover HTTP and network rejection, enabled retry of the same nonce, and success or named-404 resolution revealing the canonical banner; destructive approval retries require a fresh full hold. HTTP errors are not relabelled as network failures. Matching request errors clear independently and reveal the canonical banner; transient errors are not persisted. Reattach and optimistic retry retain diagnostics; accepted prompts and intentional clear/switch retire them. Session responses forward optional terminal evidence without a new retry policy."
+      "notes": "Request-local prompt failure preserves the canonical diagnostic without a startup failure or stopped-worker claim. Typed and legacy missing/null failures survive retained-card resolution and A-to-transient-B-to-resolution compound failures. Hook/card consumers cover HTTP and network rejection, enabled retry of the same nonce, and success or named-404 resolution revealing the canonical banner; destructive approval retries require a fresh full hold. HTTP errors are not relabelled as network failures. Matching request errors clear independently and reveal the canonical banner; transient errors are not persisted. Reattach and optimistic retry retain diagnostics; accepted prompts and intentional clear/switch retire them. Session responses forward optional terminal evidence without a new retry policy. Current wrapper receipts, including same-seq refresh and seq zero, are distinct from raw history/socket/cache authority. Cache reopen and disconnect revoke native authority without erasing diagnostics; generic Unknown/refused/lost owners cannot queue or wake, while explicit current governed wake eligibility remains separate from native config/actionability. Header-before-catch-up regressions retain configuration results, usage baselines, capability/park state, diagnostics and client-only history without replacing current controls. Safe queue listing preserves unconfirmed cached intent; migration waits for current native or explicit governed eligibility, including an eligibility change after refusal. A runner-record management refusal preserves retained turn/tool/callback history and raw replay turn context while native controls remain unavailable; actual native loss still retires impossible controls."
+    },
+    {
+      "id": "acp.current-native-authority",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/acp-structured-view.spec.ts"],
+      "components": [
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/Composer.tsx",
+        "web/src/components/acp/ComposerControls.tsx",
+        "web/src/components/acp/SessionConfigControls.tsx",
+        "web/src/components/acp/SessionBanners.tsx",
+        "web/src/components/acp/startupWait.ts"
+      ],
+      "notes": "Browser regressions specify socket/history refusal, a current healthy receipt without historical readiness, stale covered raw loss, same-seq healthy/lost/Unknown refreshes, preserved request diagnostics and explicit next-request delivery. A separate current-governor case permits an existing managed queue intent without enabling native model/config controls. Fixtures emit explicit daemon snapshots instead of granting readiness from socket-open; historical context remains visible across authority withdrawal."
     },
     {
       "id": "settings.dialog-escape",

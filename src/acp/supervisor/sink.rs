@@ -17,7 +17,14 @@ pub trait BroadcastSink: Send + Sync + 'static {
         true
     }
     /// Publish an event pumped from a worker, tagged with that worker's generation.
-    fn publish_from_worker(&self, session_id: &str, seq: u64, event: &Event, _generation: u64) {
+    fn publish_from_worker(
+        &self,
+        session_id: &str,
+        seq: u64,
+        event: &Event,
+        _generation: u64,
+        _native_subject: Option<crate::acp::state::NativeEventSubject>,
+    ) {
         self.publish(session_id, seq, event);
     }
     /// Drop all stored events for a session (import retry).
@@ -73,8 +80,15 @@ impl BroadcastSink for ChannelSink {
         let _ = self.publish_persisted(session_id, seq, event);
     }
 
-    fn publish_from_worker(&self, session_id: &str, seq: u64, event: &Event, generation: u64) {
-        self.publish_tagged(session_id, seq, event, Some(generation));
+    fn publish_from_worker(
+        &self,
+        session_id: &str,
+        seq: u64,
+        event: &Event,
+        generation: u64,
+        native_subject: Option<crate::acp::state::NativeEventSubject>,
+    ) {
+        self.publish_tagged(session_id, seq, event, Some(generation), native_subject);
     }
 
     fn clear_session_events(&self, session_id: &str) {
@@ -83,7 +97,7 @@ impl BroadcastSink for ChannelSink {
     }
 
     fn publish_persisted(&self, session_id: &str, seq: u64, event: &Event) -> bool {
-        self.publish_tagged(session_id, seq, event, None)
+        self.publish_tagged(session_id, seq, event, None, None)
     }
 
     fn unresolved_approval_nonces(&self, session_id: &str) -> Vec<Nonce> {
@@ -147,6 +161,7 @@ impl ChannelSink {
         seq: u64,
         event: &Event,
         worker_generation: Option<u64>,
+        native_subject: Option<crate::acp::state::NativeEventSubject>,
     ) -> bool {
         let inherited = match event {
             Event::RateLimit { info } if info.resets_at.is_none() => inheritable_rate_limit_reset(
@@ -164,6 +179,7 @@ impl ChannelSink {
             _ => None,
         };
         let event = inherited.as_ref().unwrap_or(event);
+        let native_subject = native_subject.or_else(|| event.native_subject());
         let failure;
         let (event, persisted) = match blocking_io(|| {
             self.event_store.record(session_id, seq, event)
@@ -178,6 +194,7 @@ impl ChannelSink {
                 );
                 failure = Event::AgentStartupError {
                     message: format!("event store write failed at seq {seq}: {e}"),
+                    native_subject,
                 };
                 (&failure, false)
             }
@@ -187,10 +204,12 @@ impl ChannelSink {
         let sidebar_status = if persisted {
             self.control_cache.apply_if_cached(session_id, seq, event)
         } else {
-            self.control_cache.forget(session_id);
+            self.control_cache
+                .record_failed_observation(session_id, seq, native_subject);
             None
         };
         let _ = self.tx.send(crate::server::AcpBroadcastFrame {
+            native_subject,
             session_id: session_id.to_string(),
             seq,
             event: Arc::new(event.clone()),

@@ -9,9 +9,12 @@ use std::sync::Arc;
 use std::sync::Mutex as StateMutex;
 use tokio::sync::{oneshot, Notify, RwLock, RwLockReadGuard};
 
-use super::errors::acp_internal_error;
+use super::connection::ConnectionState;
+use super::errors::{acp_internal_error, AcpError};
 use crate::acp::control_protocol::{
-    PromptCompletedMarker, SessionReplayed, MAX_CONTROL_QUEUE_BYTES, MAX_CONTROL_QUEUE_FRAMES,
+    AdoptedPromptCompletion, NativeChannelLostMarker, PromptCompletedMarker, SessionReplayed,
+    MAX_COMPLETION_MARKER_BYTES, MAX_CONTROL_QUEUE_BYTES, MAX_CONTROL_QUEUE_FRAMES,
+    MAX_NATIVE_LOSS_FRAME_BYTES,
 };
 use crate::acp::state::{AuthStatus, AUTH_STATUS_UPDATE_METHOD};
 
@@ -42,6 +45,7 @@ pub(super) enum SessionIngressNotification {
     Replayed(SessionReplayed),
     /// Daemon-minted barrier committing a local or adopted prompt outcome.
     PromptCompleted(PromptCompletedMarker),
+    NativeLost(NativeChannelLostMarker),
     /// `_auth/status_update`: the agent's own identity. Connection-scoped, so
     /// it carries no session id and never passes the ingress fence (#4241).
     AuthStatus(AuthStatus),
@@ -60,6 +64,7 @@ impl JsonRpcMessage for SessionIngressNotification {
         SessionNotification::matches_method(method)
             || SessionReplayed::matches_method(method)
             || PromptCompletedMarker::matches_method(method)
+            || NativeChannelLostMarker::matches_method(method)
             || method == AUTH_STATUS_UPDATE_METHOD
     }
 
@@ -68,6 +73,7 @@ impl JsonRpcMessage for SessionIngressNotification {
             Self::Update(_) => "session/update",
             Self::Replayed(marker) => marker.method(),
             Self::PromptCompleted(marker) => marker.method(),
+            Self::NativeLost(marker) => marker.method(),
             Self::AuthStatus(_) => AUTH_STATUS_UPDATE_METHOD,
         }
     }
@@ -77,6 +83,7 @@ impl JsonRpcMessage for SessionIngressNotification {
             Self::Update(params) => UntypedMessage::new(self.method(), params),
             Self::Replayed(marker) => marker.to_untyped_message(),
             Self::PromptCompleted(marker) => marker.to_untyped_message(),
+            Self::NativeLost(marker) => marker.to_untyped_message(),
             Self::AuthStatus(status) => {
                 UntypedMessage::new(self.method(), serde_json::json!({ "authStatus": status }))
             }
@@ -94,6 +101,11 @@ impl JsonRpcMessage for SessionIngressNotification {
         }
         if PromptCompletedMarker::matches_method(method) {
             return Ok(Self::PromptCompleted(PromptCompletedMarker::parse_message(
+                method, params,
+            )?));
+        }
+        if NativeChannelLostMarker::matches_method(method) {
+            return Ok(Self::NativeLost(NativeChannelLostMarker::parse_message(
                 method, params,
             )?));
         }
@@ -157,8 +169,19 @@ struct IdentityState {
 struct Establishment {
     generation: u64,
     candidate: Option<SessionId>,
-    updates: Vec<SessionNotification>,
+    updates: Vec<PendingIngress>,
     encoded_bytes: usize,
+}
+
+/// Bootstrap updates and private barriers share one ordered, bounded replay.
+/// A callback buffers rather than blocking the SDK dispatcher on a commit
+/// whose handshake response may still be behind it in the same shim.
+#[derive(Debug, serde::Serialize)]
+pub(super) enum PendingIngress {
+    Update(Box<SessionNotification>),
+    Auth(AuthStatus),
+    PromptCompleted(Box<AdoptedPromptCompletion>),
+    NativeLost,
 }
 
 /// Count encoded pending payload without retaining a second copy.
@@ -234,7 +257,7 @@ impl SessionIngress {
     pub(super) fn finish(
         &self,
         id: Option<SessionId>,
-    ) -> agent_client_protocol::Result<Vec<SessionNotification>> {
+    ) -> agent_client_protocol::Result<Vec<PendingIngress>> {
         let mut state = self.state.lock().unwrap();
         if state.failed {
             return Err(Self::overflow_error());
@@ -244,11 +267,56 @@ impl SessionIngress {
             .take()
             .map(|pending| pending.updates)
             .unwrap_or_default();
-        updates.retain(|notification| Some(&notification.session_id) == id.as_ref());
+        updates.retain(|entry| match entry {
+            PendingIngress::Update(notification) => Some(&notification.session_id) == id.as_ref(),
+            PendingIngress::PromptCompleted(_)
+            | PendingIngress::NativeLost
+            | PendingIngress::Auth(_) => true,
+        });
         state.current = id;
         drop(state);
         self.changed.notify_waiters();
         Ok(updates)
+    }
+
+    /// Return a marker only when the initial identity is already committed.
+    /// Synthetic payloads are charged too, within the producer's shared replay
+    /// reservation; overflow retains no partially applicable replay.
+    pub(super) fn marker(
+        &self,
+        marker: PendingIngress,
+    ) -> agent_client_protocol::Result<Option<PendingIngress>> {
+        let mut state = self.state.lock().unwrap();
+        if state.failed {
+            return Err(Self::overflow_error());
+        }
+        let Some(pending) = state.pending.as_mut() else {
+            return Ok(Some(marker));
+        };
+        let marker_limit = match &marker {
+            PendingIngress::PromptCompleted(_) => MAX_COMPLETION_MARKER_BYTES,
+            PendingIngress::NativeLost => MAX_NATIVE_LOSS_FRAME_BYTES,
+            PendingIngress::Auth(_) => MAX_PENDING_BYTES,
+            PendingIngress::Update(_) => unreachable!("updates use scoped admission"),
+        };
+        let mut count = PendingByteCount {
+            written: 0,
+            limit: marker_limit.min(MAX_PENDING_BYTES - pending.encoded_bytes),
+        };
+        if pending.updates.len() >= MAX_PENDING_UPDATES
+            || serde_json::to_writer(&mut count, &marker).is_err()
+        {
+            pending.updates.clear();
+            pending.encoded_bytes = 0;
+            state.failed = true;
+            drop(state);
+            self.changed.notify_waiters();
+            self.failure.notify_one();
+            return Err(Self::overflow_error());
+        }
+        pending.encoded_bytes += count.written;
+        pending.updates.push(marker);
+        Ok(None)
     }
 
     /// Share admission through effects; identity transitions require exclusive access.
@@ -301,7 +369,9 @@ impl SessionIngress {
                 return Err(Self::overflow_error());
             };
             pending.encoded_bytes += size;
-            pending.updates.push(notification);
+            pending
+                .updates
+                .push(PendingIngress::Update(Box::new(notification)));
             return Ok(None);
         }
         Ok((state.current.as_ref() == Some(&notification.session_id)).then_some(notification))
@@ -369,24 +439,215 @@ impl SessionIngress {
     }
 }
 
-struct CancelOrderedRequest {
-    connection: ConnectionTo<Agent>,
-    id: RequestId,
-    settled: Arc<AtomicBool>,
+struct OrderedRequestCompletion {
+    settled: AtomicBool,
+    // 0: untracked/finished, 1: waiting, 2: correlated application outcome.
+    application: std::sync::atomic::AtomicU8,
+    state: Arc<ConnectionState>,
+}
+
+impl OrderedRequestCompletion {
+    fn correlated(&self) {
+        if self.application.load(Ordering::Acquire) != 1 {
+            return;
+        }
+        // Increment before publishing phase 2 so a racing task drop cannot
+        // decrement a counter whose increment is still outstanding.
+        self.state.begin_completed_outcome();
+        if self
+            .application
+            .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            self.state.finish_completed_outcome();
+        }
+    }
+
+    fn finish(&self) {
+        if self.application.swap(0, Ordering::AcqRel) == 2 {
+            self.state.finish_completed_outcome();
+        }
+    }
+}
+
+struct ApplicationOutcome(Arc<OrderedRequestCompletion>);
+
+impl Drop for ApplicationOutcome {
+    fn drop(&mut self) {
+        self.0.finish();
+    }
+}
+
+pub(super) struct CancelOrderedRequest {
+    pub(super) connection: ConnectionTo<Agent>,
+    pub(super) id: RequestId,
+    completion: Arc<OrderedRequestCompletion>,
 }
 
 impl Drop for CancelOrderedRequest {
     fn drop(&mut self) {
-        if !self.settled.swap(true, Ordering::AcqRel) {
+        if !self.completion.settled.swap(true, Ordering::AcqRel) {
             let _ = self.connection.send_cancel_request(self.id.clone());
         }
     }
+}
+
+pub(super) enum OrderedRequestResult<T> {
+    Correlated(agent_client_protocol::Result<T>),
+    Refused(agent_client_protocol::Error),
+    Unavailable(crate::acp::state::AcpConnectionUnavailability),
+    Abandoned,
+}
+
+impl<T> OrderedRequestResult<T> {
+    pub(super) fn into_result(self) -> agent_client_protocol::Result<T> {
+        match self {
+            Self::Correlated(result) => result,
+            Self::Refused(error) => Err(error),
+            Self::Unavailable(_) => Err(acp_internal_error("ACP connection unavailable".into())),
+            Self::Abandoned => Err(acp_internal_error(
+                "Request response was not observed".into(),
+            )),
+        }
+    }
+}
+
+pub(super) struct OrderedRequest<T> {
+    receiver: oneshot::Receiver<OrderedRequestResult<T>>,
+    cancel: CancelOrderedRequest,
+    registration: agent_client_protocol::Result<()>,
+}
+
+impl<T> OrderedRequest<T> {
+    pub(super) async fn wait(self) -> OrderedRequestResult<T> {
+        let _cancel = self.cancel;
+        if let Err(error) = self.registration {
+            return OrderedRequestResult::Refused(error);
+        }
+        tokio::select! {
+            biased;
+            result = self.receiver => result.unwrap_or(OrderedRequestResult::Abandoned),
+            observation = _cancel.completion.state.wait_ordered_unavailable() => {
+                OrderedRequestResult::Unavailable(observation)
+            }
+        }
+    }
+}
+
+fn register_ordered_request<Req, Before>(
+    connection: &ConnectionTo<Agent>,
+    state: &Arc<ConnectionState>,
+    request: Req,
+    before_result: Before,
+    track_application: bool,
+) -> OrderedRequest<Req::Response>
+where
+    Req: JsonRpcRequest,
+    Req::Response: Send + 'static,
+    Before: FnOnce(&agent_client_protocol::Result<Req::Response>) + Send + 'static,
+{
+    let completion = Arc::new(OrderedRequestCompletion {
+        settled: AtomicBool::new(false),
+        application: std::sync::atomic::AtomicU8::new(u8::from(track_application)),
+        state: Arc::clone(state),
+    });
+    let sent = connection.send_request(request);
+    let cancel = CancelOrderedRequest {
+        connection: connection.clone(),
+        id: sent.id().clone(),
+        completion: Arc::clone(&completion),
+    };
+    let (sender, receiver) = oneshot::channel();
+    let registration = sent.on_receiving_result(move |result| {
+        completion.settled.store(true, Ordering::Release);
+        let result = if completion.state.sdk_is_closing() {
+            match completion.state.loss() {
+                Some(observation) => OrderedRequestResult::Unavailable(observation),
+                None => OrderedRequestResult::Abandoned,
+            }
+        } else {
+            completion.correlated();
+            before_result(&result);
+            OrderedRequestResult::Correlated(result)
+        };
+        let _ = sender.send(result);
+        std::future::ready(Ok(()))
+    });
+    OrderedRequest {
+        receiver,
+        cancel,
+        registration,
+    }
+}
+
+pub(super) fn ordered_native_request<Req>(
+    connection: &ConnectionTo<Agent>,
+    state: &Arc<ConnectionState>,
+    request: Req,
+) -> Result<OrderedRequest<Req::Response>, AcpError>
+where
+    Req: JsonRpcRequest,
+    Req::Response: Send + 'static,
+{
+    state.admit(|| register_ordered_request(connection, state, request, |_| {}, false))
+}
+
+/// Reverse callbacks belong to the SDK connection and cancel on actual loss.
+/// A refused callback makes no peer decision: the closed-admission shim drops
+/// any SDK cleanup response from its responder.
+pub(super) fn spawn_native_callback<Handled>(
+    connection: &ConnectionTo<Agent>,
+    state: &Arc<ConnectionState>,
+    handled: Handled,
+) -> agent_client_protocol::Result<()>
+where
+    Handled: std::future::Future<Output = agent_client_protocol::Result<()>> + Send + 'static,
+{
+    match state.admit(|| {
+        let cancellation = state.clone();
+        connection.spawn(async move {
+            tokio::select! {
+                biased;
+                _ = cancellation.wait_unavailable() => Ok(()),
+                result = handled => result,
+            }
+        })
+    }) {
+        Ok(result) => result,
+        Err(_) => Ok(()),
+    }
+}
+
+pub(super) fn spawn_native_request<Req, Handle, Handled>(
+    connection: &ConnectionTo<Agent>,
+    state: &Arc<ConnectionState>,
+    request: Req,
+    handle: Handle,
+) -> Result<(), AcpError>
+where
+    Req: JsonRpcRequest,
+    Req::Response: Send + 'static,
+    Handle: FnOnce(OrderedRequest<Req::Response>) -> Handled + Send + 'static,
+    Handled: std::future::Future<Output = ()> + Send + 'static,
+{
+    state.admit(|| {
+        let request = register_ordered_request(connection, state, request, |_| {}, true);
+        let outcome = ApplicationOutcome(Arc::clone(&request.cancel.completion));
+        connection
+            .spawn(async move {
+                let _outcome = outcome;
+                handle(request).await;
+                Ok(())
+            })
+            .map_err(|error| AcpError::Protocol(super::errors::public_error_message(&error)))
+    })?
 }
 
 /// Preserve response-before-callback ordering and the foreground waiter's cancellation.
 pub(super) async fn ordered_session_request<Req>(
     connection: &ConnectionTo<Agent>,
     ingress: &Arc<SessionIngress>,
+    state: &Arc<ConnectionState>,
     generation: u64,
     request: Req,
     native_id: fn(&Req::Response) -> SessionId,
@@ -395,25 +656,32 @@ where
     Req: JsonRpcRequest,
     Req::Response: Send + 'static,
 {
-    let sent = connection.send_request(request);
-    let settled = Arc::new(AtomicBool::new(false));
-    let _cancel = CancelOrderedRequest {
-        connection: connection.clone(),
-        id: sent.id().clone(),
-        settled: settled.clone(),
-    };
     let ingress = ingress.clone();
-    let (tx, rx) = oneshot::channel();
-    sent.on_receiving_result(move |result| async move {
-        settled.store(true, Ordering::Release);
-        if let Ok(response) = result.as_ref() {
-            ingress.resolve(Some(generation), native_id(response));
+    let request = state
+        .admit(|| {
+            register_ordered_request(
+                connection,
+                state,
+                request,
+                move |result| {
+                    if let Ok(response) = result {
+                        ingress.resolve(Some(generation), native_id(response));
+                    }
+                },
+                false,
+            )
+        })
+        .map_err(|_| acp_internal_error("ACP connection unavailable".into()))?;
+    match request.wait().await {
+        OrderedRequestResult::Correlated(result) => result,
+        OrderedRequestResult::Refused(error) => Err(error),
+        OrderedRequestResult::Unavailable(_) => {
+            Err(acp_internal_error("ACP connection unavailable".into()))
         }
-        let _ = tx.send(result);
-        Ok(())
-    })?;
-    rx.await
-        .map_err(|_| acp_internal_error("session response waiter closed".into()))?
+        OrderedRequestResult::Abandoned => {
+            Err(acp_internal_error("session response waiter closed".into()))
+        }
+    }
 }
 
 #[cfg(test)]

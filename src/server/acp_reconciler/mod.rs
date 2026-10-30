@@ -59,12 +59,12 @@ fn forget_session_budget(
     attempted: &mut HashSet<String>,
     parked: &mut HashSet<String>,
     respawn_history: &mut HashMap<String, Vec<Instant>>,
-    capacity_deferred: &mut HashSet<String>,
+    resume_deferred: &mut HashMap<String, ResumeDeferral>,
 ) {
     attempted.remove(id);
     parked.remove(id);
     respawn_history.remove(id);
-    capacity_deferred.remove(id);
+    resume_deferred.remove(id);
 }
 
 /// Banner for a parked session. A missing project path embeds the
@@ -83,6 +83,29 @@ fn park_message(project_path: &str) -> String {
 }
 
 #[derive(Debug, Clone)]
+pub struct ResumeDeferral {
+    entry: DeferredResume,
+}
+
+#[derive(Debug, Clone)]
+enum DeferredResume {
+    Capacity,
+    Unavailable {
+        scope: crate::acp::state::NativeObservationScope,
+        refusal: crate::process::worker_registry::ControlAdmissionRefusal,
+        originating_epoch: Option<u64>,
+    },
+}
+
+impl ResumeDeferral {
+    pub(crate) fn capacity() -> Self {
+        Self {
+            entry: DeferredResume::Capacity,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 enum ResumeOutcome {
     Attached,
     /// Attachment, retirement or launch prep lost a race; retry next tick unless parked.
@@ -97,6 +120,55 @@ enum ResumeOutcome {
         source_profile: String,
         lifecycle_generation: u64,
     },
+    Unavailable {
+        scope: Option<crate::acp::state::NativeObservationScope>,
+        refusal: crate::process::worker_registry::ControlAdmissionRefusal,
+        originating_epoch: Option<u64>,
+    },
+}
+
+fn refund_tick_budget(respawn_history: &mut HashMap<String, Vec<Instant>>, id: &str) {
+    if let Some(entries) = respawn_history.get_mut(id) {
+        entries.pop();
+        if entries.is_empty() {
+            respawn_history.remove(id);
+        }
+    }
+}
+
+async fn defer_control_refusal(
+    state: &Arc<AppState>,
+    id: &str,
+    scope: crate::acp::state::NativeObservationScope,
+    refusal: crate::process::worker_registry::ControlAdmissionRefusal,
+    originating_epoch: Option<u64>,
+    deferred: &mut HashMap<String, ResumeDeferral>,
+) {
+    let same = deferred.get(id).is_some_and(|entry| match &entry.entry {
+        DeferredResume::Unavailable {
+            scope: previous,
+            refusal: previous_refusal,
+            ..
+        } => previous.context == scope.context && *previous_refusal == refusal,
+        DeferredResume::Capacity => false,
+    });
+    if !same
+        && state
+            .acp_supervisor
+            .publish_control_refusal(id, &scope, refusal, originating_epoch)
+            .await
+    {
+        deferred.insert(
+            id.to_owned(),
+            ResumeDeferral {
+                entry: DeferredResume::Unavailable {
+                    scope,
+                    refusal,
+                    originating_epoch,
+                },
+            },
+        );
+    }
 }
 
 /// When each cadence-gated pass last ran.
@@ -173,7 +245,7 @@ pub async fn reconcile_acp_workers(
     cadence: &mut ReapCadence,
     respawn_history: &mut HashMap<String, Vec<Instant>>,
     parked: &mut HashSet<String>,
-    capacity_deferred: &mut HashSet<String>,
+    resume_deferred: &mut HashMap<String, ResumeDeferral>,
 ) {
     let supervisor = &state.acp_supervisor;
     supervisor.retry_pending_teardowns().await;
@@ -189,7 +261,7 @@ pub async fn reconcile_acp_workers(
     // `aoe acp stop|kill|restart` runs out of process; the reaper surfaces it
     // and returns restart ids, which, like respawn requests (#2109), get a clean slate.
     for id in supervisor.reap_user_stopped().await {
-        forget_session_budget(&id, attempted, parked, respawn_history, capacity_deferred);
+        forget_session_budget(&id, attempted, parked, respawn_history, resume_deferred);
     }
     for id in supervisor.take_respawn_requests() {
         // A teardown in flight settles later; the request waits for it, or the
@@ -201,7 +273,7 @@ pub async fn reconcile_acp_workers(
             supervisor.request_respawn(&id);
             continue;
         }
-        forget_session_budget(&id, attempted, parked, respawn_history, capacity_deferred);
+        forget_session_budget(&id, attempted, parked, respawn_history, resume_deferred);
     }
     // Pre-session startup failures re-arm under the ordinary budget.
     for id in supervisor.take_startup_failures() {
@@ -249,7 +321,7 @@ pub async fn reconcile_acp_workers(
     attempted.retain(|id| live.contains(id));
     parked.retain(|id| live.contains(id));
     respawn_history.retain(|id, _| live.contains(id));
-    capacity_deferred.retain(|id| live.contains(id));
+    resume_deferred.retain(|id, _| live.contains(id));
 
     // Must precede scheduling: capacity counts registry entries, so dead
     // entries would block legitimate spawns.
@@ -261,6 +333,67 @@ pub async fn reconcile_acp_workers(
     let mut tasks = Vec::new();
     for mut target in targets {
         let id = target.id.clone();
+        let worker_state = supervisor.worker_state(&id).await;
+        let previous = resume_deferred
+            .get(&id)
+            .and_then(|entry| match &entry.entry {
+                DeferredResume::Unavailable {
+                    scope,
+                    refusal,
+                    originating_epoch,
+                } => Some((scope.clone(), *refusal, *originating_epoch)),
+                DeferredResume::Capacity => None,
+            });
+        if worker_state == AcpWorkerState::Absent
+            || (worker_state == AcpWorkerState::Resuming && previous.is_some())
+        {
+            if let Err(error) = target
+                .freeze_native_scope(previous.as_ref().map(|(scope, _, _)| scope.clone()))
+                .await
+            {
+                tracing::debug!(target: "acp.supervisor", session = %id, %error,
+                    "native scope changed before resume admission");
+                continue;
+            }
+            let scope = target
+                .native_scope
+                .as_ref()
+                .expect("frozen native scope")
+                .clone();
+            let previous = previous.filter(|(old, _, _)| old.context == scope.context);
+            let probe_id = id.clone();
+            let refusal = tokio::task::spawn_blocking(move || {
+                if let Some((_, refusal, epoch)) = previous {
+                    if crate::process::worker_registry::refusal_still_applies(&probe_id, &refusal) {
+                        return Some((refusal, epoch));
+                    }
+                }
+                crate::process::worker_registry::control_admission(&probe_id)
+                    .err()
+                    .map(|refusal| (refusal, None))
+            })
+            .await;
+            match refusal {
+                Ok(Some((refusal, epoch))) => {
+                    defer_control_refusal(state, &id, scope, refusal, epoch, resume_deferred).await;
+                    attempted.remove(&id);
+                    continue;
+                }
+                Ok(None) => {
+                    if resume_deferred.get(&id).is_some_and(|entry| {
+                        matches!(&entry.entry, DeferredResume::Unavailable { .. })
+                    }) {
+                        resume_deferred.remove(&id);
+                        attempted.remove(&id);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(target: "acp.supervisor", session = %id, %error,
+                        "control admission observation failed");
+                    continue;
+                }
+            }
+        }
         if attempted.contains(&id) {
             // A restart marker can land after the reaper ran: add-project (#3103)
             // writes it only once the moved workspace is durable.
@@ -269,12 +402,12 @@ pub async fn reconcile_acp_workers(
             {
                 continue;
             }
-            forget_session_budget(&id, attempted, parked, respawn_history, capacity_deferred);
+            forget_session_budget(&id, attempted, parked, respawn_history, resume_deferred);
         }
         match supervisor.worker_state(&id).await {
             AcpWorkerState::Running | AcpWorkerState::Resuming => {
                 // Already owned; a live worker is also the user's retry, so un-park.
-                forget_session_budget(&id, attempted, parked, respawn_history, capacity_deferred);
+                forget_session_budget(&id, attempted, parked, respawn_history, resume_deferred);
                 attempted.insert(id);
                 continue;
             }
@@ -385,16 +518,15 @@ pub async fn reconcile_acp_workers(
                 },
             )) => {
                 // Refund only this tick's budget entry so prior crash history survives.
-                if let Some(entries) = respawn_history.get_mut(&id) {
-                    entries.pop();
-                    if entries.is_empty() {
-                        respawn_history.remove(&id);
-                    }
-                }
+                refund_tick_budget(respawn_history, &id);
                 // Never pin: `attempted` would skip the session forever.
                 attempted.remove(&id);
                 // `publish_startup_error` does not dedup, so publish once per transition.
-                if capacity_deferred.insert(id.clone()) {
+                if !resume_deferred
+                    .get(&id)
+                    .is_some_and(|entry| matches!(&entry.entry, DeferredResume::Capacity))
+                {
+                    resume_deferred.insert(id.clone(), ResumeDeferral::capacity());
                     crate::server::api::publish_startup_error_if_current(
                         state,
                         &id,
@@ -405,8 +537,30 @@ pub async fn reconcile_acp_workers(
                     .await;
                 }
             }
+            Ok((
+                id,
+                ResumeOutcome::Unavailable {
+                    scope,
+                    refusal,
+                    originating_epoch,
+                },
+            )) => {
+                refund_tick_budget(respawn_history, &id);
+                attempted.remove(&id);
+                if let Some(scope) = scope {
+                    defer_control_refusal(
+                        state,
+                        &id,
+                        scope,
+                        refusal,
+                        originating_epoch,
+                        resume_deferred,
+                    )
+                    .await;
+                }
+            }
             Ok((id, ResumeOutcome::Attached | ResumeOutcome::SpawnFinished)) => {
-                capacity_deferred.remove(&id);
+                resume_deferred.remove(&id);
             }
             Err(e) => {
                 tracing::error!(target: "acp.supervisor", "resume task panicked: {e}");
@@ -561,6 +715,7 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
 mod tests {
     use super::test_fixtures::{capacity_startup_errors, startup_errors, test_state, Tick};
     use super::*;
+    use crate::acp::Event;
 
     #[test]
     #[serial_test::serial]
@@ -732,6 +887,136 @@ mod tests {
         assert!(!record_and_check_respawn_budget(&mut history, "other", now));
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn retained_legacy_refusal_never_dials_or_spends_reconciler_budget() {
+        use crate::process::worker_registry::{self, WorkerRecord};
+        for shape in ["missing", "null", "v3"] {
+            let id = "s-retained-legacy";
+            let (_home, state, project) = test_state(id);
+            crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            test_fixtures::enable_auto_resume(true);
+            let long_ago = chrono::Utc::now() - chrono::Duration::days(3);
+            for (seq, event) in [
+                (
+                    1,
+                    crate::acp::state::test_support::prompt("interrupted explicit intent"),
+                ),
+                (
+                    2,
+                    Event::RateLimit {
+                        info: crate::acp::state::RateLimitInfo {
+                            status: "limited".into(),
+                            resets_at: Some(long_ago),
+                            kind: "usage".into(),
+                        },
+                    },
+                ),
+                (
+                    3,
+                    Event::Stopped {
+                        reason: "rate_limited".into(),
+                    },
+                ),
+            ] {
+                state
+                    .acp_event_store
+                    .record_at(id, seq, &event, long_ago.timestamp_millis())
+                    .unwrap();
+            }
+            state.acp_supervisor.hydrate_seqs([(id.into(), 3)]);
+            let socket = worker_registry::socket_path_for(id).unwrap();
+            let mut record = WorkerRecord::new(
+                id.into(),
+                std::process::id(),
+                socket.clone(),
+                "retained-agent".into(),
+                "claude".into(),
+                project.path().into(),
+                None,
+                vec![],
+                vec![],
+                Some("retained-native-history".into()),
+                Some("default".into()),
+            )
+            .with_generation(19);
+            record.control_protocol_version = (shape == "v3").then_some(3);
+            worker_registry::save(&record).unwrap();
+            let path = worker_registry::record_path(id).unwrap();
+            if shape == "null" {
+                let mut legacy = serde_json::to_value(&record).unwrap();
+                legacy["control_protocol_version"] = serde_json::Value::Null;
+                crate::session::atomic_write(&path, &serde_json::to_vec(&legacy).unwrap()).unwrap();
+            }
+            let before = std::fs::read(&path).unwrap();
+            let listener = std::os::unix::net::UnixListener::bind(
+                crate::process::worker::control_socket_sibling(&socket),
+            )
+            .unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let prior = vec![Instant::now()];
+            let mut tick = Tick::default();
+            tick.respawn_history.insert(id.into(), prior.clone());
+            tick.attempted.insert(id.into());
+            let released =
+                rate_limit::reap_rate_limit_resumes(&state, &mut tick.attempted, &tick.parked)
+                    .await;
+            assert!(
+                released.is_empty(),
+                "qualified refusal cannot spend a provider redelivery"
+            );
+            assert_eq!(state.acp_event_store.replay_from(id, 0).len(), 3);
+            assert!(state.instances.read().await[0]
+                .pending_initial_turn
+                .is_none());
+            for _ in 0..RECONCILER_MAX_RESPAWNS_IN_WINDOW + 2 {
+                tick.run(&state).await;
+                assert_eq!(tick.respawn_history.get(id), Some(&prior), "{shape}");
+                assert!(
+                    !tick.attempted.contains(id) && !tick.parked.contains(id),
+                    "{shape}"
+                );
+                assert!(tick.resume_deferred.contains_key(id), "{shape}");
+                assert_eq!(
+                    std::fs::read(&path).unwrap(),
+                    before,
+                    "legacy metadata is not rewritten"
+                );
+                assert_eq!(
+                    listener.accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock,
+                    "metadata refusal must precede any connected-peer or RPC attempt"
+                );
+            }
+            let events = state.acp_event_store.replay_from(id, 0);
+            assert_eq!(
+                events.len(),
+                4,
+                "one stable refusal and no automatic redelivery breadcrumb"
+            );
+            assert!(matches!(
+                &events[3].1,
+                Event::AcpConnectionUnavailable { .. }
+            ));
+            assert_eq!(
+                state
+                    .session_service
+                    .fold_control_state(id)
+                    .await
+                    .connection_unavailable
+                    .unwrap()
+                    .cause,
+                if shape == "v3" {
+                    crate::acp::state::AcpConnectionCause::ControlProtocolIncompatible
+                } else {
+                    crate::acp::state::AcpConnectionCause::ControlProtocolUnknown
+                }
+            );
+        }
+    }
+
     /// A late restart marker (#3103) re-arms and is consumed; without one an
     /// attempted id stays pinned, or the crash-loop budget would be void.
     #[tokio::test]
@@ -791,7 +1076,7 @@ mod tests {
         for _ in 0..3 {
             tick.run(&state).await;
             assert!(!tick.attempted.contains("s-cap"));
-            assert!(tick.capacity_deferred.contains("s-cap"));
+            assert!(tick.resume_deferred.contains_key("s-cap"));
             assert!(!tick.parked.contains("s-cap"));
         }
         assert_eq!(tick.respawn_history.get("s-cap").map(Vec::len), Some(2));
@@ -809,7 +1094,7 @@ mod tests {
             state.acp_supervisor.test_insert_worker("occupant").await;
             let mut tick = Tick::default();
             tick.run(&state).await;
-            assert!(tick.capacity_deferred.contains(id), "precondition");
+            assert!(tick.resume_deferred.contains_key(id), "precondition");
 
             if slot_freed {
                 state.acp_supervisor.test_remove_worker("occupant").await;
@@ -818,7 +1103,7 @@ mod tests {
             }
             tick.run(&state).await;
             assert!(
-                !tick.capacity_deferred.contains(id),
+                !tick.resume_deferred.contains_key(id),
                 "slot_freed={slot_freed}"
             );
             assert_eq!(capacity_startup_errors(&state, id), 1);

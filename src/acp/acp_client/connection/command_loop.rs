@@ -27,13 +27,15 @@ use crate::acp::acp_client::config_options::{
 };
 use crate::acp::acp_client::control::DaemonControlClient;
 use crate::acp::acp_client::delete::handle_delete_session_cmd;
-use crate::acp::acp_client::errors::acp_internal_error;
+use crate::acp::acp_client::errors::{acp_internal_error, public_error_message};
 use crate::acp::acp_client::lifecycle::LifecycleEnvelope;
 use crate::acp::acp_client::rate_limit::take_rate_limit_from_captured_rejection;
 use crate::acp::acp_client::reset::{
     await_reset_request, ResetRequestError, ResetSessionOutcome, SESSION_RESET_IN_TASK_TIMEOUT,
 };
-use crate::acp::acp_client::session_identity::ordered_session_request;
+use crate::acp::acp_client::session_identity::{
+    ordered_native_request, ordered_session_request, OrderedRequestResult,
+};
 
 pub(super) struct Session {
     pub(super) connection: ConnectionTo<Agent>,
@@ -42,9 +44,6 @@ pub(super) struct Session {
     /// Mirrors the ingress's committed identity, refreshed each iteration so
     /// a reset's swap cannot be missed.
     pub(super) acp_session_id: SessionId,
-    /// The id came from storage rather than this agent, so a prompt
-    /// rejection may mean the agent dropped it (#3560).
-    pub(super) session_from_storage: bool,
     pub(super) channels: SessionChannels,
     pub(super) steering_capable: bool,
     pub(super) close_capable: bool,
@@ -70,8 +69,13 @@ impl Session {
                 Ok(())
             }
             None => self
-                .connection
-                .send_notification(CancelNotification::new(self.acp_session_id.clone())),
+                .shared
+                .connection_state
+                .admit(|| {
+                    self.connection
+                        .send_notification(CancelNotification::new(self.acp_session_id.clone()))
+                })
+                .map_err(|_| acp_internal_error("ACP connection unavailable".into()))?,
         }
     }
 
@@ -87,6 +91,7 @@ impl Session {
         }
         dispatch_set_config_option(
             &self.connection,
+            &self.shared.connection_state,
             &self.acp_session_id,
             config_id,
             value,
@@ -98,12 +103,53 @@ impl Session {
     pub(super) fn dispatch_mode(&self, mode_id: String, while_prompting: bool) {
         dispatch_set_mode(
             &self.connection,
+            &self.shared.connection_state,
             &self.acp_session_id,
             mode_id,
             &self.channels,
             self.shared.event_tx.clone(),
             while_prompting,
         );
+    }
+
+    pub(super) fn refuse_unavailable_command(&self, command: &mut Option<ClientCmd>) -> bool {
+        if self.shared.connection_state.loss().is_none()
+            && !self.shared.connection_state.is_stopping()
+        {
+            return false;
+        }
+        let Some(command_value) = command.take() else {
+            return false;
+        };
+        match command_value {
+            ClientCmd::ResetSession { respond_to, .. } => {
+                let _ = respond_to.send(ResetSessionOutcome::Failed {
+                    message: "ACP connection unavailable".into(),
+                });
+            }
+            ClientCmd::CloseSession(respond_to) => {
+                let _ =
+                    respond_to.send(crate::acp::acp_client::close::CloseSessionOutcome::Failed(
+                        "ACP connection unavailable".into(),
+                    ));
+            }
+            ClientCmd::DeleteSession { respond_to, .. } => {
+                let _ = respond_to.send(
+                    crate::acp::acp_client::delete::DeleteSessionOutcome::Failed(
+                        "ACP connection unavailable".into(),
+                    ),
+                );
+            }
+            ClientCmd::Prompt(_)
+            | ClientCmd::Cancel
+            | ClientCmd::SetMode(_)
+            | ClientCmd::SetConfigOption { .. } => {}
+            independent_or_stop => {
+                *command = Some(independent_or_stop);
+                return false;
+            }
+        }
+        true
     }
 
     pub(super) async fn run(mut self) -> Result<(), agent_client_protocol::Error> {
@@ -118,9 +164,22 @@ impl Session {
                     acp_internal_error("native session is not established".into())
                 })?;
             // Fallback prompts go first so later messages cannot overtake them.
-            let cmd = match self.pending_prompts.pop_front() {
+            let mut cmd = match self
+                .shared
+                .connection_state
+                .loss()
+                .is_none()
+                .then(|| self.pending_prompts.pop_front())
+                .flatten()
+            {
                 Some(blocks) => Some(ClientCmd::Prompt(blocks)),
                 None => tokio::select! {
+                    _ = self.shared.connection_state.wait_ordered_unavailable() => {
+                        // EOF must wake an idle established session too. The
+                        // ordered boundary preserves earlier replay/outcomes;
+                        // outer cleanup owns the one qualified loss event.
+                        return Err(acp_internal_error("agent connection unavailable".into()));
+                    }
                     cmd = self.cmd_rx.recv() => cmd,
                     _ = idle_tick.tick() => {
                         if self.between_prompt_idle_tick().await {
@@ -130,6 +189,9 @@ impl Session {
                     }
                 },
             };
+            if self.refuse_unavailable_command(&mut cmd) {
+                continue;
+            }
             match cmd {
                 Some(ClientCmd::Prompt(blocks)) => {
                     if self.run_prompt(blocks).await? {
@@ -149,9 +211,9 @@ impl Session {
                     }
                     if self.stand_down_idle_completion() {
                         self.shared
-                            .emit(Event::Stopped {
+                            .emit_while_available([Event::Stopped {
                                 reason: "cancelled".into(),
-                            })
+                            }])
                             .await;
                     }
                 }
@@ -165,7 +227,12 @@ impl Session {
                 Some(ClientCmd::DeleteSession {
                     acp_session_id,
                     respond_to,
-                }) => handle_delete_session_cmd(&self.connection, acp_session_id, respond_to),
+                }) => handle_delete_session_cmd(
+                    &self.connection,
+                    &self.shared.connection_state,
+                    acp_session_id,
+                    respond_to,
+                ),
                 Some(ClientCmd::SetConfigOption { config_id, value }) => {
                     self.dispatch_config_option(config_id, value)
                 }
@@ -189,6 +256,7 @@ impl Session {
                 Some(ClientCmd::CloseSession(respond_to)) => {
                     crate::acp::acp_client::close::dispatch_close(
                         &self.connection,
+                        &self.shared.connection_state,
                         self.acp_session_id.clone(),
                         self.close_capable,
                         respond_to,
@@ -205,18 +273,26 @@ impl Session {
 
     /// Claim an idle terminal without overriding an already-completed turn.
     fn stand_down_idle_completion(&self) -> bool {
-        let claimed = self.shared.terminal_claim.claim();
         self.shared
-            .adopted_turn_active
-            .store(false, Ordering::Relaxed);
-        self.shared.between_prompt.deactivate();
-        claimed
+            .connection_state
+            .admit(|| {
+                let claimed = self.shared.terminal_claim.claim();
+                self.shared
+                    .adopted_turn_active
+                    .store(false, Ordering::Relaxed);
+                self.shared.between_prompt.deactivate();
+                claimed
+            })
+            .unwrap_or(false)
     }
 
     /// Returns true when the turn ended on a rate limit: the connection must
     /// then end so the drain loop drops the worker and the reaper can resume it.
     async fn between_prompt_idle_tick(&self) -> bool {
         let shared = &self.shared;
+        if shared.connection_state.loss().is_some() {
+            return false;
+        }
         let Some(cost_seen) = shared.between_prompt.take_idle_fire(now_ms()) else {
             return false;
         };
@@ -239,13 +315,14 @@ impl Session {
                 resets_at = ?info.resets_at,
                 "agent-initiated turn ended on a rejected rate-limit window; emitting RateLimit + Stopped"
             );
-            shared.emit(Event::RateLimit { info }).await;
-            shared
-                .emit(Event::Stopped {
-                    reason: "rate_limited".into(),
-                })
+            return shared
+                .emit_while_available([
+                    Event::RateLimit { info },
+                    Event::Stopped {
+                        reason: "rate_limited".into(),
+                    },
+                ])
                 .await;
-            return true;
         }
         let reason = between_prompt_stop_reason(adopted, cost_seen);
         info!(
@@ -255,9 +332,9 @@ impl Session {
             "between-prompt idle watchdog: synthesizing Stopped for completed turn"
         );
         shared
-            .emit(Event::Stopped {
+            .emit_while_available([Event::Stopped {
                 reason: reason.into(),
-            })
+            }])
             .await;
         false
     }
@@ -316,6 +393,7 @@ impl Session {
             ordered_session_request(
                 &connection,
                 &ingress,
+                &self.shared.connection_state,
                 generation,
                 req,
                 |resp: &NewSessionResponse| resp.session_id.clone(),
@@ -333,12 +411,18 @@ impl Session {
         if retained_id == self.acp_session_id {
             self.shared.apply_replay(std::mem::take(&mut replay)).await;
         }
+        if result.is_err() && self.shared.connection_state.loss().is_some() {
+            drop(commit_guard);
+            let _ = respond_to.send(ResetSessionOutcome::Failed {
+                message: "ACP connection unavailable".into(),
+            });
+            return Ok(());
+        }
         let message = match result {
             Ok(new_session) if new_session.session_id.0 != self.acp_session_id.0 => {
                 let new_id = new_session.session_id.clone();
                 // session/new is the irreversible commit; the loop picks the
                 // id back up from the ingress on its next iteration.
-                self.session_from_storage = false;
                 self.channels = SessionChannels::new(
                     new_session.modes.as_ref(),
                     new_session.config_options.as_deref(),
@@ -359,6 +443,8 @@ impl Session {
                 self.shared
                     .emit(Event::AcpSessionAssigned {
                         acp_session_id: new_id.0.to_string(),
+                        connection_ready: true,
+                        native_subject: None,
                     })
                     .await;
                 self.shared.apply_replay(replay).await;
@@ -405,6 +491,7 @@ impl Session {
                     crate::session::ErrorEvidenceSource::LocalPromptResult,
                     crate::session::ErrorOperation::ContextReset,
                 )),
+                native_subject: None,
             })
             .await;
         self.shared
@@ -484,14 +571,27 @@ impl Session {
         deadline: tokio::time::Instant,
     ) -> Option<Result<Vec<SessionConfigOption>, String>> {
         let label = &self.shared.session_label;
-        let request = || {
-            self.connection
-                .send_request(SetSessionConfigOptionRequest::new(
+        let request = || async {
+            let request = ordered_native_request(
+                &self.connection,
+                &self.shared.connection_state,
+                SetSessionConfigOptionRequest::new(
                     new_id.clone(),
                     config_id,
                     SessionConfigValueId::new(value.to_string()),
-                ))
-                .block_task()
+                ),
+            )
+            .map_err(|_| acp_internal_error("ACP connection unavailable".into()))?;
+            match request.wait().await {
+                OrderedRequestResult::Correlated(result) => result,
+                OrderedRequestResult::Refused(error) => Err(error),
+                OrderedRequestResult::Unavailable(_) => {
+                    Err(acp_internal_error("ACP connection unavailable".into()))
+                }
+                OrderedRequestResult::Abandoned => Err(acp_internal_error(
+                    "Config response was not observed".into(),
+                )),
+            }
         };
         match await_reset_request(deadline, request).await {
             Ok(resp) => {
@@ -505,9 +605,9 @@ impl Session {
                     target: "acp.protocol",
                     session = %label,
                     value,
-                    "re-applying structured view default after reset failed: {e}"
+                    error = ?e, "re-applying structured view default after reset failed"
                 );
-                Some(Err(e.to_string()))
+                Some(Err(public_error_message(&e)))
             }
             Err(ResetRequestError::TimedOut) => {
                 warn!(

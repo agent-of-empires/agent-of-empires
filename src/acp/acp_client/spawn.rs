@@ -944,8 +944,8 @@ mod tests {
         }
     }
 
-    /// A stdio agent that answers `initialize` with `load_session`, and `reply`
-    /// for its matching method.
+    /// A stdio agent with configured replies; after its first prompt response,
+    /// later explicit prompts complete on the same native session.
     #[cfg(unix)]
     async fn scripted_agent(
         dir: &std::path::Path,
@@ -957,9 +957,15 @@ mod tests {
             "    *'\"method\":\"initialize\"'*)\n      printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{{\"protocolVersion\":1,\"agentCapabilities\":{{\"loadSession\":{load_session}}}}}}}\\n' \"$id\" ;;\n"
         );
         for (method, body) in replies {
-            cases.push_str(&format!(
-                "    *'\"method\":\"{method}\"'*)\n      printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,{body}}}\\n' \"$id\" ;;\n"
-            ));
+            if *method == "session/prompt" {
+                cases.push_str(&format!(
+                    "    *'\"method\":\"{method}\"'*)\n      if [ \"$prompted\" = 1 ]; then\n        printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{{\"stopReason\":\"end_turn\"}}}}\\n' \"$id\"\n      else\n        prompted=1\n        printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,{body}}}\\n' \"$id\"\n      fi ;;\n"
+                ));
+            } else {
+                cases.push_str(&format!(
+                    "    *'\"method\":\"{method}\"'*)\n      printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,{body}}}\\n' \"$id\" ;;\n"
+                ));
+            }
         }
         let script = format!(
             "#!/bin/sh\nwhile IFS= read -r line; do\n  id=$(printf '%s' \"$line\" | sed -En 's/.*\"id\":(\"[^\"]*\"|[0-9]+).*/\\1/p')\n  case $line in\n{cases}  esac\ndone\n"
@@ -989,7 +995,7 @@ mod tests {
                 Event::SessionContextReset { reason } => kinds.push(format!("reset:{reason}")),
                 Event::RateLimit { info } => kinds.push(format!("rate_limit:{}", info.kind)),
                 Event::Stopped { reason } => kinds.push(format!("stopped:{reason}")),
-                Event::AgentStartupError { message } => {
+                Event::AgentStartupError { message, .. } => {
                     panic!("recoverable failure surfaced a startup error: {message}")
                 }
                 _ => {}
@@ -998,8 +1004,8 @@ mod tests {
         kinds
     }
 
-    /// #3560: a prompt rejected because the agent dropped the resumed session
-    /// resets context before the connection ends on a soft stop.
+    /// Unsupported-session prose on a prompt is not permission to drop identity.
+    /// A subsequent explicit prompt uses the same SDK connection and native PID.
     #[cfg(unix)]
     #[tokio::test]
     async fn recoverable_startup_failures_do_not_surface_startup_errors() {
@@ -1019,14 +1025,42 @@ mod tests {
             Some("sid-stored"),
         )
         .await;
-        client.send_prompt("continue", &[]).await.unwrap();
-        let kinds = terminal_events(&mut client).await;
-        assert_eq!(kinds.len(), 2, "{kinds:?}");
-        assert!(
-            kinds[0].contains("resumed session no longer available"),
-            "{kinds:?}"
+        let pid = client._child.as_ref().unwrap().lock().await.id().unwrap();
+        let mut events = Vec::new();
+        for (text, reason) in [
+            ("continue", "prompt_failed"),
+            ("next explicit input", "prompt_complete"),
+        ] {
+            client.send_prompt(text, &[]).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let event = client
+                        .next_event()
+                        .await
+                        .expect("SDK connection remains open");
+                    let stopped = matches!(&event, Event::Stopped { reason: got } if got == reason);
+                    events.push(event);
+                    if stopped {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("explicit turn ends");
+            assert_eq!(client._child.as_ref().unwrap().lock().await.id(), Some(pid));
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::PromptRuntimeError { .. }))
+                .count(),
+            1
         );
-        assert_eq!(kinds[1], "stopped:stored_session_rejected");
+        assert!(events.iter().any(|event| matches!(event, Event::AcpSessionAssigned { acp_session_id, .. } if acp_session_id == "sid-stored")));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            Event::SessionContextReset { .. } | Event::AgentStartupError { .. }
+        )));
         let _ = client.shutdown().await;
 
         // #3514: a limit hit at `session/new` parks the session instead of

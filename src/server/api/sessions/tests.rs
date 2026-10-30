@@ -350,6 +350,7 @@ async fn committed_purge_settles_only_its_live_preconfiguration_producer() -> an
             store: Arc::new(Storage::open_unwatched(&row.source_profile)?),
             generation: row.lifecycle_generation,
             namespace: Some(state.profile_namespace.clone()),
+            native_scope: None,
         }));
         let retirement = state.acp_supervisor.capture_retirement(&row.id)?;
         assert!(retirement.identity.is_none());
@@ -415,6 +416,7 @@ async fn committed_purge_settles_only_its_live_preconfiguration_producer() -> an
                     store: storage.clone(),
                     generation: newer_row.lifecycle_generation,
                     namespace: Some(state.profile_namespace.clone()),
+                    native_scope: None,
                 }));
             let mut current = state.acp_supervisor.capture_retirement(&row.id)?;
             assert!(
@@ -8765,14 +8767,16 @@ async fn list_sessions_projects_pending_approvals_only_for_running_workers() {
         .expect("record pending approval");
 
     // A durable nonce without a live worker cannot be resolved.
-    let response = project_sessions(&state).await;
+    let workers = state.acp_supervisor.worker_states_snapshot().await;
+    let response = project_sessions(&state, &workers).await;
     assert!(
         response[0].pending_approvals.is_empty(),
         "a pending approval on a non-running worker must not be projected"
     );
 
     state.acp_supervisor.test_insert_worker(&id).await;
-    let response = project_sessions(&state).await;
+    let workers = state.acp_supervisor.worker_states_snapshot().await;
+    let response = project_sessions(&state, &workers).await;
     assert_eq!(
         response[0].pending_approvals,
         vec![PendingApproval {

@@ -166,6 +166,7 @@ pub async fn spawn_acp(
             store: native,
             generation: instance.lifecycle_generation,
             namespace: Some(state.profile_namespace.clone()),
+            native_scope: None,
         }),
         additional_dirs: req.additional_dirs,
         provider_env: req
@@ -491,6 +492,7 @@ pub async fn switch_acp_agent(
             store: native.clone(),
             generation: instance.lifecycle_generation,
             namespace: Some(state.profile_namespace.clone()),
+            native_scope: None,
         }),
         model: model.clone(),
         effort: None,
@@ -771,6 +773,7 @@ pub async fn switch_acp_provider(
             store: native,
             generation: instance.lifecycle_generation,
             namespace: Some(state.profile_namespace.clone()),
+            native_scope: None,
         }),
         ..spawn_request_for(&updated, agent, sandbox_info)
     };
@@ -812,6 +815,7 @@ mod tests {
     use super::*;
     use crate::acp::agent_policy::AgentPolicy;
     use crate::acp::state::RateLimitInfo;
+    use crate::session::SessionStore as _;
 
     async fn durable_stop_state(row: crate::session::Instance) -> Arc<AppState> {
         crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
@@ -842,7 +846,7 @@ mod tests {
             &mut crate::server::acp_reconciler::ReapCadence::default(),
             &mut std::collections::HashMap::new(),
             &mut std::collections::HashSet::new(),
-            &mut std::collections::HashSet::new(),
+            &mut std::collections::HashMap::new(),
         )
         .await;
         assert_eq!(starts.load(Ordering::SeqCst), 0);
@@ -932,6 +936,7 @@ mod tests {
                 store: Arc::new(Storage::open_unwatched("default").unwrap()),
                 generation: resumed.lifecycle_generation,
                 namespace: None,
+                native_scope: None,
             };
             let mut child = crate::acp::supervisor::with_durable_launch(
                 Some(admission),
@@ -1009,6 +1014,9 @@ mod tests {
             )
             .await
             .unwrap();
+            let native_scope = Some(
+                crate::acp::state::NativeObservationScope::capture(&row, native.storage()).unwrap(),
+            );
             state
                 .acp_supervisor
                 .running_lease(&row.id)
@@ -1017,6 +1025,7 @@ mod tests {
                     store: native,
                     generation: row.lifecycle_generation,
                     namespace: Some(state.profile_namespace.clone()),
+                    native_scope,
                 }));
             let gate = crate::server::acp_events::pause_assignment_listener_for_test(&row.id, 1);
             let listener =
@@ -1028,13 +1037,31 @@ mod tests {
             })
             .await
             .expect("listener subscribed");
-            let event = crate::acp::Event::AcpSessionAssigned {
+            let mut event = crate::acp::Event::AcpSessionAssigned {
                 acp_session_id: sid.into(),
+                connection_ready: false,
+                native_subject: None,
             };
+            let subject = crate::acp::state::NativeEventSubject::channel(
+                state
+                    .acp_supervisor
+                    .running_lease(&row.id)
+                    .unwrap()
+                    .native_scope()
+                    .unwrap()
+                    .unwrap()
+                    .context,
+                Some(crate::acp::runner_lifecycle::RunnerIdentity::from_record(
+                    &record,
+                )),
+                &event,
+            );
+            event.set_native_subject(subject);
             state.acp_event_store.record(&row.id, 1, &event).unwrap();
             state
                 .acp_events_tx
                 .send(AcpBroadcastFrame {
+                    native_subject: Some(subject),
                     session_id: row.id.clone(),
                     seq: 1,
                     event: Arc::new(event),
@@ -1046,12 +1073,10 @@ mod tests {
                 .await
                 .expect("original tagged assignment reached listener")
                 .unwrap();
-            assert!(
-                state
-                    .acp_supervisor
-                    .is_current_worker_generation(&row.id, old_epoch)
-                    .await
-            );
+            assert!(state
+                .acp_supervisor
+                .running_lease(&row.id)
+                .is_some_and(|lease| lease.epoch() == old_epoch));
 
             let storage = Storage::open_unwatched("default").unwrap();
             let expected_status = if retire {
@@ -1091,12 +1116,10 @@ mod tests {
                     .find(|instance| instance.id == row.id)
                     .unwrap()
                     .mark_idle_dormant();
-                assert!(
-                    state
-                        .acp_supervisor
-                        .is_current_worker_generation(&row.id, old_epoch)
-                        .await
-                );
+                assert!(state
+                    .acp_supervisor
+                    .running_lease(&row.id)
+                    .is_some_and(|lease| lease.epoch() == old_epoch));
                 assert!(runner.try_wait().unwrap().is_none());
                 Status::Running
             };
@@ -1184,6 +1207,7 @@ mod tests {
                     store: Arc::new(Storage::open_unwatched("default").unwrap()),
                     generation: resumed.lifecycle_generation,
                     namespace: None,
+                    native_scope: None,
                 }),
                 row.id.clone(),
                 || {
@@ -1271,6 +1295,7 @@ mod tests {
                 store: Arc::new(Storage::open_unwatched("default").unwrap()),
                 generation: old_generation,
                 namespace: None,
+                native_scope: None,
             };
             let late_birth = crate::acp::supervisor::with_durable_launch(
                 Some(admission),
@@ -1498,7 +1523,7 @@ mod tests {
                 &mut crate::server::acp_reconciler::ReapCadence::default(),
                 &mut std::collections::HashMap::new(),
                 &mut std::collections::HashSet::new(),
-                &mut std::collections::HashSet::new(),
+                &mut std::collections::HashMap::new(),
             )
             .await;
             assert_eq!(
@@ -1511,6 +1536,7 @@ mod tests {
                     store: Arc::new(Storage::open_unwatched("default").unwrap()),
                     generation: row.lifecycle_generation,
                     namespace: None,
+                    native_scope: None,
                 };
                 let rejected = crate::acp::supervisor::with_durable_launch(
                     Some(admission),

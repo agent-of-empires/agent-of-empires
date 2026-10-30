@@ -77,23 +77,37 @@ pub fn is_process_group_alive(_pid: u32) -> bool {
 /// See #2102, #2621.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn peer_pid_from_socket(path: &Path) -> Option<u32> {
-    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
-    let stream = connect_with_timeout(path)?;
-    let creds = getsockopt(&stream, PeerCredentials).ok()?;
-    let pid = creds.pid();
-    (pid > 0).then_some(pid as u32)
+    connected_peer_pid(&connect_with_timeout(path)?)
 }
 
 #[cfg(target_os = "macos")]
 pub fn peer_pid_from_socket(path: &Path) -> Option<u32> {
-    use nix::sys::socket::{getsockopt, sockopt::LocalPeerPid};
-    let stream = connect_with_timeout(path)?;
-    let pid = getsockopt(&stream, LocalPeerPid).ok()?;
-    (pid > 0).then_some(pid as u32)
+    connected_peer_pid(&connect_with_timeout(path)?)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
 pub fn peer_pid_from_socket(_path: &Path) -> Option<u32> {
+    None
+}
+
+/// Inspect the actual connection carrying control traffic, not a second
+/// pathname connection which might belong to a replacement.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn connected_peer_pid(stream: &impl std::os::fd::AsFd) -> Option<u32> {
+    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+    let pid = getsockopt(stream, PeerCredentials).ok()?.pid();
+    (pid > 0).then_some(pid as u32)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn connected_peer_pid(stream: &impl std::os::fd::AsFd) -> Option<u32> {
+    use nix::sys::socket::{getsockopt, sockopt::LocalPeerPid};
+    let pid = getsockopt(stream, LocalPeerPid).ok()?;
+    (pid > 0).then_some(pid as u32)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+pub(crate) fn connected_peer_pid(_stream: &impl std::os::fd::AsFd) -> Option<u32> {
     None
 }
 
@@ -104,6 +118,38 @@ pub fn peer_pid_from_socket(_path: &Path) -> Option<u32> {
 /// [`peer_pid_from_socket`]. See #2621.
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 pub(crate) fn connect_with_timeout(path: &Path) -> Option<std::os::unix::net::UnixStream> {
+    connect_with_timeout_result(path).ok()
+}
+
+/// Distinguish a missing listener from an inconclusive socket observation.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+pub(crate) fn observe_socket_peer(path: &Path) -> std::io::Result<Option<u32>> {
+    match connect_with_timeout_result(path) {
+        Ok(stream) => connected_peer_pid(&stream)
+            .map(Some)
+            .ok_or_else(|| std::io::Error::other("socket peer identity is unavailable")),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+pub(crate) fn observe_socket_peer(_path: &Path) -> std::io::Result<Option<u32>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "socket peer observation is unsupported",
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn connect_with_timeout_result(path: &Path) -> std::io::Result<std::os::unix::net::UnixStream> {
     use std::os::fd::{AsFd, AsRawFd};
     use std::os::unix::net::UnixStream;
 
@@ -115,17 +161,16 @@ pub(crate) fn connect_with_timeout(path: &Path) -> Option<std::os::unix::net::Un
         UnixAddr,
     };
 
-    let addr = UnixAddr::new(path).ok()?;
+    let addr = UnixAddr::new(path)?;
     let fd = socket(
         AddressFamily::Unix,
         SockType::Stream,
         SockFlag::empty(),
         None,
-    )
-    .ok()?;
+    )?;
     // `SOCK_NONBLOCK`/`SOCK_CLOEXEC` are Linux/BSD-only in nix, so set them via fcntl.
-    fcntl(fd.as_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).ok()?;
-    fcntl(fd.as_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).ok()?;
+    fcntl(fd.as_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+    fcntl(fd.as_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))?;
 
     match connect(fd.as_raw_fd(), &addr) {
         Ok(()) => {}
@@ -136,18 +181,22 @@ pub(crate) fn connect_with_timeout(path: &Path) -> Option<std::os::unix::net::Un
             // against a healthy listener; this cap tolerates light
             // scheduler contention while bounding the pathological case
             // (hung accept loop, kernel memory pressure).
-            if poll(&mut pfds, 100u16).ok()? == 0 {
-                return None;
+            if poll(&mut pfds, 100u16)? == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "socket connection observation timed out",
+                ));
             }
             // POLLOUT also fires on connect failure; check `SO_ERROR`.
-            if getsockopt(&fd, SocketError).ok()? != 0 {
-                return None;
+            let error = getsockopt(&fd, SocketError)?;
+            if error != 0 {
+                return Err(std::io::Error::from_raw_os_error(error));
             }
         }
-        Err(_) => return None,
+        Err(error) => return Err(error.into()),
     }
 
-    Some(UnixStream::from(fd))
+    Ok(UnixStream::from(fd))
 }
 
 /// Signal the group and its leader, including workers whose group setup failed.

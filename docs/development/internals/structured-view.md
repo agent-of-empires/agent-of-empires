@@ -13,10 +13,10 @@ Each runner registers at `<app_dir>/acp-workers/<session_id>.json` (pid, socket 
 Invariants worth knowing before touching this code:
 
 - **One owner per generation.** Every spawn, attach and respawn has a local lease epoch tied to its captured runner generation. Shutdown, the reaper, the drain task and the reconciler refuse stale authority. A spawn completing after a stop tears its own runner down instead of installing it. Stop remains pending until physical runner and scope retirement is proven, holding prompts and refusing resumes while the reconciler retries.
-- **`runner_version` is an attachment-compatibility generation**, separate from liveness and `build_version`. Generation 4 requires the runner to announce authoritative native identity before session callbacks; the control wire version stays 3. An incompatible live runner is reaped before replacement, and an in-flight turn gets an explicit `Stopped { reason: "runner_protocol_upgraded" }`, since the daemon cannot truthfully drain a protocol it cannot attach to. Same-generation build changes stay attachable: idle workers are replaced immediately and busy ones respawn at the next idle boundary (`aoe ps --acp` marks them `(stale)`).
+- **Compatibility is not liveness.** `runner_version` is 7 and the control wire is v4. The optional registry `control_protocol_version` is a prerequisite, not proof of native usability; missing/null stays Unknown without rewriting old records. Unknown, incompatible or unconfirmed live ownership is refused before adoption, replacement, budget or queue effects. The actual connected Unix peer must match the captured PID and kernel birth before Attach. Compatible v4 workers retain the existing build-staleness replacement policy.
 - **Process-group termination.** Runners are group leaders via `setsid`, and every termination path signals the group, so the node wrapper and SDK child die with the runner rather than reparenting to PID 1. Prefer the verbs over `kill -9`, which leaves the runner no chance to clean up.
 - **Self-termination watchdog.** A runner polls its own registry record and exits when abandoned: record gone, superseded, or detached from any daemon past a 48h retention window (reset on reattach). This is the backstop for a daemon that dies without killing its runners.
-- **Detach buffer.** Only agent notifications and `PromptCompleted` survive a detach, in a queue bounded by frame count and encoded bytes that sheds the oldest first. Delivery is best effort, not durable or exactly once. Reverse calls outstanding at detach are cancelled toward the agent and queued replies are dropped; within the admitted native session `terminal/release` is idempotent cleanup, so it needs no tombstone.
+- **Detach buffer.** Notifications, retained `PromptCompleted` and the non-sheddable FIFO `NativeLost` observation share a 4096-frame / 128 MiB replay ceiling. Admission charges the actual retained completion wire bytes, prefix included, and reserves the loss frame separately; a large error completion cannot overfill the consumer by refilling notifications. Ordinary notification delivery remains best effort. Reverse calls outstanding at detach are cancelled toward the agent and queued replies are dropped; `terminal/release` remains idempotent cleanup.
 - **Native-session admission.** Only lifecycle results select native identity; notification and callback metadata never do. Unrelated updates are ignored and unrelated session callbacks are rejected before any transcript, permission, filesystem, or terminal effect. While identity is pending, retained notifications are bounded by the runner's detach-queue ceiling, so a reattach admits the whole flushed backlog and an overflow fails the connection rather than publishing a partial replay. Stored history is never rewritten by the guard.
 - **Launch authority.** Preparation pins the native profile, title, lifecycle generation and provider under owned namespace, submission and instance exclusion. Startup is reserved before those preparation guards are released; hooks and readiness never run while holding them. Blocking admission owns its namespace guard through native checkpoints, including caller cancellation.
 - **Producer-owned cancellation.** Spawn records exact process identity before awaiting readiness; attach captures original identity and scope at admission. Cancellation wakes connection and handshake work. Abort closes the captured control socket and bounds task join; the supervisor retains physical retirement.
@@ -43,17 +43,39 @@ response alone does not prove closure; real transport closure remains fatal.
 | Ordinary local prompt result | Emits `PromptRuntimeError` then one `Stopped("prompt_failed")`. SDK result provenance and reported code do not establish provider origin. The connection, native identity and history remain available for the next explicit request. |
 | Ordinary adopted runner completion | Preserves the same diagnostic and failed terminal, ordered before a new local turn. Aborted completion is not success. |
 | ACP transport or control closure | Remains a connection failure, including idle EOF and closure after a request error. It is not relabelled as a provider response or automatically retryable evidence. |
-| Rate limit / rejected stored session | Retains its existing distinct parking or `SessionContextReset` path. Error ingestion does not authorize a fresh conversation. |
+| Rate limit / lifecycle load rejection | Retains its existing distinct parking or `SessionContextReset` path. Error ingestion does not authorize a fresh conversation. |
 | State, Status and clients | Failed completion closes the turn and projects Error independently of the running worker. Transcript, usage and pending approvals/elicitations survive. No implicit prompt replay occurs. |
 
-An already-queued explicit follow-up may run after `prompt_failed`; it is not a
-redelivery of the failed request. A failed runtime or context reset still blocks
-that drain. The folded terminal phase owns this distinction, not optional error
-metadata. A late cancel cannot replace an already-published failed terminal.
-Retained permission and elicitation callbacks run in the SDK connection's task
-scope. An ordinary prompt error does not cancel them; a real connection close
-does. Request, resolution and synthetic tool-card events alone do not reopen the
-failed main operation or strand an explicit queued follow-up.
+`prompt_failed` never replays the failed request. A distinct already-explicit
+queued intent may follow under the existing governor only while the same current
+native channel is genuinely Available. Unknown/refused/lost ownership cannot wake,
+spend a retry budget or deliver that intent. A late cancel cannot replace the
+already-published failed terminal.
+Unsupported-session prose in an ordinary prompt error cannot discard the native
+SID or authorize reset; the next explicit input uses the same available runtime.
+Ordinary request failure preserves actual approval and elicitation responders.
+Qualified channel unavailability instead retires impossible owned controls and
+folded/SQL pending metadata without synthesizing approval decisions or nonce
+resolutions. Historical diagnostics and transcript content remain intact.
+A refused management attachment, including a borrowed pre-Hello timeout, does
+not establish native-channel loss. Its current controls remain unavailable,
+while retained turn/tool/monitor state, callback history and retry-budget
+boundaries remain intact. Only actual qualified native loss closes those
+durable boundaries; no synthetic prompt completion or permission answer is emitted.
+An SDK-private pre-loss pending-request set can remain frozen until explicit
+teardown; this is not permission for new native I/O or callback effects.
+An already correlated completion remains its genuine outcome even if its SDK
+relay marker, or a later relay, fails. The separate connection loss fences
+further native controls; it cannot rewrite a completed result as `NativeLost`.
+An idle established command loop observes the ordered loss boundary so SDK
+close cannot wait forever for that foreground to finish. Pending-ingress
+overflow fails closed, discards its uncommitted replay and establishes its own
+ordered protocol-failure boundary; it does not wait for the SDK close that
+depends on foreground completion.
+Shared turn delivery, pending-initial-turn drains, dormant queue wakes and the
+existing rate-limit auto-resume admission consult qualified unavailability
+before resume, publication, redelivery-budget or mutation effects. Refusal
+retains queued and pending intent; it is not a startup failure.
 Admitted requests and notifications share the identity fence for their effects.
 A pending human response therefore does not block native progress, a later
 prompt error, or EOF dispatch. Identity begin and commit/replay take exclusive
@@ -86,10 +108,10 @@ publication does not mutate an absent worker or replacement configuration.
 Adopted completions claim their captured turn before waiting for event capacity.
 Their enqueue and the resume-idle fallback recheck that turn under the same short
 publication exclusion used by local activation. No synchronous guard crosses an
-await. SDK EOF first fails pending requests; its close callback then lets only a
-locally-owned prompt settle before applying fatal connection policy. The SDK
-request future remains owned by that prompt, so early abandonment still cancels
-it. An adopted turn has no local owner and never enters this close wait.
+await. SDK EOF first fails pending requests. Its close callback drains the local
+prompt and already-observed correlated nonprompt outcomes through publication
+before fatal connection handling. It never waits indefinitely for unresolved
+native requests. Early abandonment still cancels the prompt's owned future.
 An adopted completion uses the existing private SDK completion-marker lane.
 Its self-contained payload holds only the bounded classified diagnostic and
 captured turn, not arbitrary ACP data or another local outcome's waiter.
@@ -127,6 +149,100 @@ Approval and elicitation resolution hooks reject failed HTTP and network
 submissions so their cards restore controls for retry of the same nonce.
 HTTP failures retain HTTP diagnostics, not a network-error label. Retrying a
 destructive approval still requires a fresh complete hold.
+
+### Current native-input projection
+
+Physical worker liveness, sidebar Status, operation diagnostics and native-input
+availability are separate facts. `AcpConnectionUnavailable` exposes only bounded
+source/cause/local-phase fields; neither EOF nor a banner asserts process death.
+Original event semantics and the captured owner/native context stay private,
+including when journal failure substitutes an `AgentStartupError`. The common
+projection rechecks physical profile, instance lifecycle generation, original
+worker epoch and the live connection latch after waits. A stale producer cannot
+allocate a sequence, persist, fold or mutate the current instance.
+
+Cold replay, warm folds, status/list consumers, lag recovery and WebSocket
+snapshots use that projection. Historical readiness is never current health;
+a genuine current owned Available receipt is sufficient without a historical
+ready event. Current loss dominates an earlier ready receipt. An unreadable or
+refused owner remains unavailable or Unknown, not permission to replace it.
+An actual new positive owned channel receipt can heal a stale connection-error
+Status from its current folded projection, under the same identity/epoch fences.
+It preserves operation diagnostics and history; cached identity, a superseded
+subject or a sticky live loss cannot perform that repair. A typed channel loss
+at final delivery still returns `unavailable` (HTTP 409), preserves pending and
+named queued intent, and never becomes retryable worker-not-ready permission.
+
+Publication samples supervisor worker state before taking publication or instance
+exclusion. Producers and native-control admission try the native flock/cache
+without blocking under workers/lifecycle guards. On contention, they release both
+global guards, wait outside them and recheck every current lease/actor/native fence
+before effects or sequence allocation. The original pending event is retained
+exactly once. Read-only current-availability projection is nonblocking and returns
+Unknown rather than creating an inverse publication/native-lock dependency.
+The existing attach deadline also bounds the control Hello exchange, not just
+socket connection and runner registration.
+A timeout while observing an attested retained runner releases only the borrowed
+attachment and re-arms the existing reconciler tick. It does not manufacture a
+persistent ownership refusal, terminate native work or authorize replacement.
+
+Stop can preserve a private, qualified binding receipt already journaled by its
+exact original lease/actor/native context before incrementing the stop generation.
+It does not accept an unqualified trailing frame or change the selected native store.
+Keep handoff may explicitly capture a metadata-only publisher capability in its
+existing original retirement resources, under the promoted root generation,
+physical profile, row creation, exact runner birth/lease and selected conversation/store.
+Only correlated SID observations survive that capability, with readiness false;
+old turn/status/callback traffic consumes no new-root sequence. The original
+native-control fence remains unchanged and cannot gain input or fresh-conversation
+permission from metadata custody. Replacement or a newer choice supersedes it.
+
+The live `reduced_state` wrapper sequence qualifies `connection_ready` and
+`connection_unavailable`. A same-sequence refresh is meaningful; an older
+snapshot or covered raw frame cannot overwrite newer authority. Socket-open,
+session IDs, cached views and optimistic rows grant no controls. Disconnect and
+view reopen withdraw authority without discarding the previous diagnostic.
+Only actual current Available enables native mode/config/cancel/responders.
+The runtime-only `prompt_wake_eligible` snapshot field separately represents the
+existing explicit WorkerDown queue/wake and initial-start governor, including ordinary known
+absence, dormancy, snooze and rate-limit parks. It is not native health, generic
+unreadable/ambiguous-owner admission, automatic replay or fresh-conversation permission.
+TUI consumers accept the live wrapper at sequence zero and same-sequence
+refreshes too. They retain wake eligibility separately from native readiness;
+the optional wake field is deserializable live metadata but is omitted from
+`AcpState` serialization, never cached/history authority. Both full-screen and
+embedded management disconnects withdraw the accepted receipt. Submission and
+native responder/mode/cancel effects check it before consuming a composer,
+recall edit or picker selection. Existing named queue edits/deletes, link opening
+and read-only picker inspection remain management/local actions. Refused new
+intent cannot silently become a queue write; a retained ordinary request failure
+alone does not withdraw a genuine current Available receipt.
+
+Current work and current actionability stay distinct in the WebSocket projection:
+a RunnerRecord management admission refusal disables native controls but preserves
+the observed active/cancelling/compacting turn, tool/thinking state and historical
+pending responder metadata. Actual qualified SDK/control/native channel loss
+retires impossible current controls and work; neither projection fabricates a
+human response or rewrites the original event history.
+
+A header can precede raw catch-up. Covered raw frames still restore fields absent
+from the reduced snapshot: configuration/results, usage and cost baselines,
+capabilities, diagnostic text, cap/park bookkeeping, wake/monitor/primer state
+and background-agent history. They cannot replace current native availability,
+turn or responder authority, and only a matching prompt echo settles its local POST.
+Replay tracks turn context at its own raw cursor separately: an old stop followed
+by a new prompt must reset cap/park metadata even when the newer visible snapshot
+is already active and steering is enabled. Actual same-turn steering retains that
+turn's metadata; neither case rewrites current turn or callback authority.
+Queue listing is safe on socket-open, but unconfirmed cached intent remains local
+until a current Available or explicitly governed wake receipt permits migration.
+An empty queue listing preserves unconfirmed cached rows; confirmed drained rows
+are never re-created.
+A queue GET may reconcile only the unchanged local queue it began reading.
+Acknowledged delivery settles the named row again, and retained-row replies
+upsert by ID, so a delayed list cannot erase new intent, duplicate a refused row
+or resurrect an already-claimed row.
+
 
 
 ## Terminal handoff

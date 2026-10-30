@@ -84,6 +84,16 @@ impl<S: BroadcastSink> Supervisor<S> {
             .epoch()
     }
 
+    pub(crate) async fn test_observe_native_ready(&self, session_id: &str) {
+        self.workers
+            .lock()
+            .await
+            .get(session_id)
+            .expect("installed test worker")
+            .client
+            .test_observe_native_ready();
+    }
+
     /// Occupy a slot with a fake worker already carrying what a real drain
     /// publishes before the assigned frame reaches the listener: the
     /// agent-assigned id, and the store the launch observed (#4127).
@@ -546,7 +556,7 @@ pub(crate) struct HeldAttachRunner {
     pub(crate) identity: RunnerIdentity,
     entered: Option<tokio::sync::oneshot::Receiver<()>>,
     disconnected: Option<tokio::sync::oneshot::Receiver<()>>,
-    completion: Option<tokio::sync::oneshot::Sender<()>>,
+    completion: Option<std::process::ChildStdin>,
     resumed: mpsc::Receiver<String>,
     peer: tokio::task::JoinHandle<()>,
     child: std::process::Child,
@@ -554,46 +564,117 @@ pub(crate) struct HeldAttachRunner {
 }
 
 impl HeldAttachRunner {
-    pub(crate) fn new(
+    pub(crate) async fn new(
         session_id: &str,
         cwd: &std::path::Path,
         generation: u64,
         profile: Option<&str>,
     ) -> Self {
-        Self::with_initialize_hold(session_id, cwd, generation, profile, true)
+        Self::with_initialize_hold(session_id, cwd, generation, profile, true, None).await
     }
 
     /// Complete both real attach handshakes without an outstanding native prompt.
-    pub(crate) fn ready(
+    pub(crate) async fn ready(
         session_id: &str,
         cwd: &std::path::Path,
         generation: u64,
         profile: Option<&str>,
+        native_id: Option<&str>,
     ) -> Self {
-        Self::with_initialize_hold(session_id, cwd, generation, profile, false)
+        Self::with_initialize_hold(session_id, cwd, generation, profile, false, native_id).await
     }
 
-    fn with_initialize_hold(
+    async fn with_initialize_hold(
         session_id: &str,
         cwd: &std::path::Path,
         generation: u64,
         profile: Option<&str>,
         hold_first_initialize: bool,
+        native_id: Option<&str>,
     ) -> Self {
-        use crate::acp::control_protocol::{self, ControlBody, PromptOutcome};
         use std::os::unix::process::CommandExt as _;
-
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt as _, BufReader};
         let socket_dir = tempfile::TempDir::with_prefix_in("aoe-attach-", "/tmp").unwrap();
         let socket = socket_dir.path().join("runner.sock");
-        let listener =
-            tokio::net::UnixListener::bind(crate::process::worker::control_socket_sibling(&socket))
-                .unwrap();
-        let child = std::process::Command::new("sleep")
-            .arg("60")
+        let native_id = native_id
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("native-{session_id}-{generation}"));
+        // The child binds and serves the socket: its actual peer credentials,
+        // not an unrelated sleeper, must match the retained registry owner.
+        let script = r#"
+import json, socket, struct, sys
+path, sid, native, version, hold = sys.argv[1:]
+version, hold = int(version), hold == "true"
+def read_exact(s, count):
+    data = b""
+    while len(data) < count:
+        part = s.recv(count - len(data))
+        if not part:
+            assert not data, "partial fixture frame"
+            return None
+        data += part
+    return data
+def receive(s):
+    size = read_exact(s, 4)
+    if size is None:
+        return None
+    count = struct.unpack(">I", size)[0]
+    assert count <= 64 * 1024 * 1024
+    return json.loads(read_exact(s, count))
+def send(s, body):
+    data = json.dumps(body).encode()
+    s.sendall(struct.pack(">I", len(data)) + data)
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+listener.bind(path)
+listener.listen(2)
+print("ready", flush=True)
+for attempt in range(2):
+    s, _ = listener.accept()
+    with s:
+        send(s, {"kind": "hello", "control_protocol_version": version, "session_id": sid})
+        while True:
+            frame = receive(s)
+            if frame is None:
+                break
+            kind = frame["kind"]
+            if kind == "attach":
+                assert frame["control_protocol_version"] == version
+            elif kind == "initialize" and attempt == 0 and hold:
+                print("entered", flush=True)
+                assert receive(s) is None, "observer retirement sent native management input"
+                print("disconnected", flush=True)
+                break
+            elif kind == "initialize":
+                send(s, {"kind": "initialized", "result": {"protocolVersion": 1, "agentCapabilities": {}}})
+            elif kind == "resume_session":
+                send(s, {"kind": "session_ready", "acp_session_id": native,
+                         "result": {}, "native_channel": {"state": "available"}})
+                send(s, {"kind": "notify", "method": "_aoe/session_replayed", "params": {}})
+                print("resumed", flush=True)
+                if hold:
+                    assert sys.stdin.readline() == "complete\n"
+                    send(s, {"kind": "notify", "method": "session/update", "params": {
+                        "sessionId": native, "update": {"sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "original producer completed"}}}})
+                    send(s, {"kind": "prompt_completed", "prompt_req_id": 77,
+                             "outcome": {"status": "completed", "stop_reason": "end_turn"}})
+            else:
+                raise AssertionError("unexpected attach request: " + kind)
+"#;
+        let mut child = std::process::Command::new("python3")
+            .args(["-u", "-c", script])
+            .arg(crate::process::worker::control_socket_sibling(&socket))
+            .args([session_id, &native_id])
+            .arg(crate::acp::control_protocol::CONTROL_PROTOCOL_VERSION.to_string())
+            .arg(hold_first_initialize.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
             .process_group(0)
             .spawn()
             .unwrap();
-        let native_id = format!("native-{session_id}-{generation}");
+        let completion = child.stdin.take();
+        let stdout = tokio::process::ChildStdout::from_std(child.stdout.take().unwrap()).unwrap();
         let mut record = WorkerRecord::new(
             session_id.into(),
             child.id(),
@@ -608,127 +689,57 @@ impl HeldAttachRunner {
             profile.map(str::to_owned),
         )
         .with_generation(generation);
+        record.control_protocol_version =
+            Some(crate::acp::control_protocol::CONTROL_PROTOCOL_VERSION);
         record.scope = worker_registry::ScopeOwnership::Owned {
             unit: format!("aoe-attach-{session_id}-{generation}.scope"),
         };
         let identity = RunnerIdentity::from_record(&record);
         assert!(identity.birth_fingerprint.is_some());
-        worker_registry::save(&record).unwrap();
+        let (ready_tx, ready) = tokio::sync::oneshot::channel();
         let (entered_tx, entered) = tokio::sync::oneshot::channel();
         let (disconnected_tx, disconnected) = tokio::sync::oneshot::channel();
-        let (completion, completion_rx) = tokio::sync::oneshot::channel();
         let (resumed_tx, resumed) = mpsc::channel(2);
-        let id = session_id.to_owned();
         let peer = tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            let mut ready_tx = Some(ready_tx);
             let mut entered_tx = Some(entered_tx);
             let mut disconnected_tx = Some(disconnected_tx);
-            let mut completion_rx = Some(completion_rx);
-            for attempt in 0..2 {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                control_protocol::write_frame(
-                    &mut stream,
-                    &ControlBody::Hello {
-                        control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
-                        session_id: id.clone(),
-                    },
-                )
-                .await
-                .unwrap();
-                while let Some(frame) = control_protocol::read_frame(&mut stream).await.unwrap() {
-                    match frame {
-                        ControlBody::Attach {
-                            control_protocol_version,
-                        } => {
-                            assert_eq!(
-                                control_protocol_version,
-                                control_protocol::CONTROL_PROTOCOL_VERSION
-                            );
-                        }
-                        ControlBody::Initialize { .. } if attempt == 0 && hold_first_initialize => {
-                            entered_tx.take().unwrap().send(()).unwrap();
-                            // A failed observation may close only this connection.
-                            assert_eq!(
-                                control_protocol::read_frame(&mut stream).await.unwrap(),
-                                None,
-                                "timeout/drop must not cancel, close, or delete the producer turn"
-                            );
-                            disconnected_tx.take().unwrap().send(()).unwrap();
-                            break;
-                        }
-                        ControlBody::Initialize { .. } => {
-                            control_protocol::write_frame(
-                                &mut stream,
-                                &ControlBody::Initialized {
-                                    result: serde_json::json!({
-                                        "protocolVersion": 1,
-                                        "agentCapabilities": {}
-                                    }),
-                                },
-                            )
-                            .await
-                            .unwrap();
-                        }
-                        ControlBody::ResumeSession => {
-                            control_protocol::write_frame(
-                                &mut stream,
-                                &ControlBody::SessionReady {
-                                    acp_session_id: native_id.clone(),
-                                    result: serde_json::json!({}),
-                                },
-                            )
-                            .await
-                            .unwrap();
-                            resumed_tx.send(native_id.clone()).await.unwrap();
-                            if !hold_first_initialize {
-                                continue;
-                            }
-                            completion_rx.take().unwrap().await.unwrap();
-                            control_protocol::write_frame(
-                                &mut stream,
-                                &ControlBody::Notify {
-                                    method: "session/update".into(),
-                                    params: serde_json::json!({
-                                        "sessionId": native_id,
-                                        "update": {
-                                            "sessionUpdate": "agent_message_chunk",
-                                            "content": {
-                                                "type": "text",
-                                                "text": "original producer completed"
-                                            }
-                                        }
-                                    }),
-                                },
-                            )
-                            .await
-                            .unwrap();
-                            control_protocol::write_frame(
-                                &mut stream,
-                                &ControlBody::PromptCompleted {
-                                    prompt_req_id: 77,
-                                    outcome: PromptOutcome::Completed {
-                                        stop_reason: Some("end_turn".into()),
-                                    },
-                                },
-                            )
-                            .await
-                            .unwrap();
-                        }
-                        frame => panic!("unexpected attach request: {frame:?}"),
+            while let Some(line) = lines.next_line().await.unwrap() {
+                match line.as_str() {
+                    "ready" => {
+                        ready_tx.take().unwrap().send(()).unwrap();
                     }
+                    "entered" => {
+                        entered_tx.take().unwrap().send(()).unwrap();
+                    }
+                    "disconnected" => {
+                        disconnected_tx.take().unwrap().send(()).unwrap();
+                    }
+                    "resumed" => {
+                        resumed_tx.send(native_id.clone()).await.unwrap();
+                    }
+                    _ => panic!("unexpected fixture observation: {line}"),
                 }
             }
         });
-        Self {
+        let runner = Self {
             record,
             identity,
             entered: Some(entered),
             disconnected: Some(disconnected),
-            completion: Some(completion),
+            completion,
             resumed,
             peer,
             child,
             _socket_dir: socket_dir,
-        }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), ready)
+            .await
+            .expect("fixture bound its actual child-owned socket")
+            .unwrap();
+        worker_registry::save(&runner.record).unwrap();
+        runner
     }
 
     pub(crate) async fn entered(&mut self) {
@@ -745,7 +756,12 @@ impl HeldAttachRunner {
     }
 
     pub(crate) fn complete_turn(&mut self) {
-        self.completion.take().unwrap().send(()).unwrap();
+        use std::io::Write as _;
+        self.completion
+            .take()
+            .unwrap()
+            .write_all(b"complete\n")
+            .unwrap();
     }
 }
 

@@ -909,3 +909,107 @@ test.describe("tool run folding", () => {
     await expect(page.locator('[data-tool-id="fold-1"]')).toHaveCount(0);
   });
 });
+
+test.describe("current native control authority", () => {
+  const modelOption = {
+    id: "model",
+    name: "Model",
+    category: "model",
+    current_value: "one",
+    options: [
+      { value: "one", name: "One" },
+      { value: "two", name: "Two" },
+    ],
+  };
+  const loss = { source: "native", cause: "stdout_eof", phase: "established" } as const;
+
+  test("socket/history do not grant native controls; current same-seq receipts dominate delayed raw loss", async ({
+    page,
+  }) => {
+    const mock = await mockAcpSession(page, {
+      title: "story-native-receipt",
+      emitNativeSnapshot: false,
+      initialEvents: [
+        configOptionsUpdated([modelOption]),
+        { PromptRuntimeError: { message: "Earlier request failed" } },
+        stopped("prompt_failed"),
+        { AcpSessionAssigned: { acp_session_id: "historical-only", connection_ready: true } },
+      ],
+      onPrompt: () => [agentMessageChunk("Same retained conversation answered."), stopped("prompt_complete")],
+    });
+    await openStructuredSession(page, mock);
+    const composer = composerBox(page);
+    await composer.fill("explicit next request");
+    const send = page.getByTestId("composer-actions").getByRole("button").last();
+    const model = page.getByTestId("config-option-model");
+    await expect(send).toBeDisabled();
+    await expect(model).toBeDisabled();
+    await expect(page.getByText("Earlier request failed", { exact: true })).toBeVisible();
+    await composer.press("Enter");
+    await expect(composer).toHaveValue("explicit next request");
+    expect(mock.promptBodies).toEqual([]);
+
+    mock.setNativeState({ ready: true }, 5);
+    await expect(send).toBeEnabled();
+    await expect(model).toBeEnabled();
+    // This independent replay delivery was already covered by the current snapshot.
+    mock.sendRawFrame(5, { AcpConnectionUnavailable: loss });
+    await expect(send).toBeEnabled();
+    await expect(model).toBeEnabled();
+
+    mock.setNativeState({ ready: false, unavailable: loss }, 5);
+    await expect(page.getByTestId("native-channel-unavailable")).toBeVisible();
+    await expect(send).toBeDisabled();
+    await expect(model).toBeDisabled();
+    await expect(page.getByText("Earlier request failed", { exact: true })).toBeVisible();
+    expect(mock.promptBodies).toEqual([]);
+    mock.setNativeState({ ready: false }, 5);
+    await expect(send).toBeDisabled();
+    mock.setNativeState({ ready: true }, 5);
+    await expect(send).toBeEnabled();
+    await expect(page.getByTestId("native-channel-diagnostic")).toBeVisible();
+    await expect(page.getByText("Earlier request failed", { exact: true })).toBeVisible();
+    await send.click();
+    await expect(page.getByText("Same retained conversation answered.")).toBeVisible();
+    expect(mock.promptBodies.map((body) => body.text)).toEqual(["explicit next request"]);
+  });
+
+  test("only an explicit current dormant governor admits a wake intent; it does not enable native config", async ({
+    page,
+  }) => {
+    const mock = await mockAcpSession(page, {
+      title: "story-governed-wake",
+      nativeAvailable: false,
+      initialEvents: [configOptionsUpdated([modelOption]), stopped("idle_auto_stop")],
+    });
+    await openStructuredSession(page, mock);
+    await composerBox(page).fill("one governed wake intent");
+    const send = page.getByTestId("composer-actions").getByRole("button").last();
+    await expect(send).toBeDisabled();
+    await expect(page.getByTestId("config-option-model")).toBeDisabled();
+    expect(mock.promptBodies).toEqual([]);
+    mock.setNativeState({ ready: false, wakeEligible: true });
+    await expect(send).toBeEnabled();
+    await expect(page.getByTestId("config-option-model")).toBeDisabled();
+    const accepted = page.waitForResponse(
+      (response) => response.request().method() === "POST" && response.url().endsWith("/acp/prompt"),
+    );
+    await send.click();
+    const response = await accepted;
+    expect(response.status()).toBe(202);
+    const acknowledgement = await response.json();
+    expect(acknowledgement.disposition).toBe("queued");
+    expect(typeof acknowledgement.queued_id).toBe("string");
+    // A queued acknowledgement removes the optimistic chat echo. The named
+    // retained queue card, not that transient echo, is the durable outcome.
+    const queued = page.getByRole("button", { name: "one governed wake intent", exact: true });
+    await expect(queued).toHaveCount(1);
+    await expect(queued).toBeVisible();
+    await expect(page.getByTestId("acp-viewport").getByText("one governed wake intent", { exact: true })).toHaveCount(
+      0,
+    );
+    await expect(page.getByTestId("config-option-model")).toBeDisabled();
+    expect(mock.promptBodies.map((body) => body.text)).toEqual(["one governed wake intent"]);
+    expect(mock.configOptionBodies).toEqual([]);
+  });
+});

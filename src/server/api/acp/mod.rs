@@ -86,6 +86,15 @@ fn supervisor_error_response(context: &str, err: &SupervisorError) -> Response {
             StatusCode::SERVICE_UNAVAILABLE,
             format!("worker_not_ready: {context}: {err}"),
         ),
+        SupervisorError::Acp(AcpError::ConnectionUnavailable(unavailability)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(crate::acp::dispatch::PromptDispatch::Unavailable {
+                    unavailability: *unavailability,
+                }),
+            )
+                .into_response();
+        }
         SupervisorError::Acp(AcpError::RateLimited(_)) => (
             StatusCode::TOO_MANY_REQUESTS,
             format!("rate_limited: {context}: {err}"),
@@ -304,6 +313,16 @@ mod tests {
             (
                 SupervisorError::Acp(AcpError::Protocol("bad frame".into())),
                 StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                SupervisorError::Acp(AcpError::ConnectionUnavailable(
+                    crate::acp::state::AcpConnectionUnavailability {
+                        source: crate::acp::state::AcpConnectionSource::Native,
+                        cause: crate::acp::state::AcpConnectionCause::StdoutEof,
+                        phase: crate::acp::state::AcpConnectionPhase::Established,
+                    },
+                )),
+                StatusCode::CONFLICT,
             ),
             (
                 SupervisorError::UnknownSession("s-1".into()),
@@ -886,6 +905,8 @@ mod tests {
         for (seq, event) in [
             crate::acp::Event::AcpSessionAssigned {
                 acp_session_id: "late".into(),
+                connection_ready: false,
+                native_subject: None,
             },
             crate::acp::Event::SessionContextReset {
                 reason: "late".into(),
@@ -898,6 +919,7 @@ mod tests {
             state
                 .acp_events_tx
                 .send(crate::server::AcpBroadcastFrame {
+                    native_subject: None,
                     session_id: id.clone(),
                     seq: seq as u64 + 1,
                     event: Arc::new(event),
@@ -944,10 +966,13 @@ mod tests {
         state
             .acp_events_tx
             .send(crate::server::AcpBroadcastFrame {
+                native_subject: None,
                 session_id: other_id.clone(),
                 seq: 1,
                 event: Arc::new(crate::acp::Event::AcpSessionAssigned {
                     acp_session_id: "drained".into(),
+                    connection_ready: false,
+                    native_subject: None,
                 }),
                 worker_generation: None,
                 sidebar_status: None,

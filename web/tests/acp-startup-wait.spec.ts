@@ -19,7 +19,12 @@ test("one startup line names the Agent and counts", async ({ page }) => {
 });
 
 test("a never-started Session that isn't starting waits to resume, not for its Agent", async ({ page }) => {
-  const mock = await mockAcpSession(page, { title: "story-absent", workerState: "absent" });
+  const mock = await mockAcpSession(page, {
+    title: "story-absent",
+    workerState: "absent",
+    nativeAvailable: false,
+    promptWakeEligible: false,
+  });
   const at = new Date().toISOString();
   await page.route("**/api/sessions/*/queue", (r) =>
     r.fulfill({
@@ -30,9 +35,21 @@ test("a never-started Session that isn't starting waits to resume, not for its A
     }),
   );
   await openStructuredSession(page, mock);
-  await expect(page.getByText("Pending until session resumes (2)")).toBeVisible();
-  await expect(page.getByText(/Pending until .* is ready/)).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "first", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "second", exact: true })).toBeVisible();
+  const queuedSend = page.getByRole("button", { name: "Send this queued message now", exact: true });
+  await expect(queuedSend).toHaveCount(2);
+  await expect(queuedSend.nth(0)).toBeDisabled();
+  await expect(queuedSend.nth(1)).toBeDisabled();
   await expect(page.getByTestId("startup-wait-line")).toHaveCount(0);
+  expect(mock.promptBodies).toEqual([]);
+  // Absent worker presentation is not authority. Only the current explicit
+  // dormant governor can permit submitting these already-retained intents.
+  mock.setNativeState({ ready: false, wakeEligible: true });
+  await expect(queuedSend.nth(0)).toBeEnabled();
+  await expect(queuedSend.nth(1)).toBeEnabled();
+  await expect(page.getByTestId("startup-wait-line")).toHaveCount(0);
+  expect(mock.promptBodies).toEqual([]);
 });
 
 test("an older Session resuming never shows the startup line, even before its events load", async ({ page }) => {

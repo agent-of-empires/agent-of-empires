@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 /// Registry generation and kernel birth identity of one runner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct RunnerIdentity {
     pub pid: u32,
     pub generation: u64,
@@ -458,11 +458,14 @@ impl Lease {
     }
 
     pub(crate) fn set_admission(&self, admission: Option<crate::acp::supervisor::LaunchAdmission>) {
-        *self
+        let mut captured = self
             .construction
             .admission
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = admission;
+            .unwrap_or_else(|error| error.into_inner());
+        if captured.is_none() {
+            *captured = admission;
+        }
     }
 
     pub(crate) fn admission(&self) -> Option<crate::acp::supervisor::LaunchAdmission> {
@@ -471,6 +474,20 @@ impl Lease {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone()
+    }
+
+    pub(crate) fn native_scope(
+        &self,
+    ) -> Result<Option<crate::acp::state::NativeObservationScope>, ()> {
+        let admission = self
+            .construction
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        match admission.as_ref() {
+            None => Ok(None),
+            Some(admission) => admission.native_scope.clone().map(Some).ok_or(()),
+        }
     }
 
     pub(crate) fn record_scope(&self, scope: crate::process::worker_registry::ScopeOwnership) {

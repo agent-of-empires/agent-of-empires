@@ -65,12 +65,79 @@ impl<S: BroadcastSink> Supervisor<S> {
         &self,
         session_id: &str,
     ) -> Result<Arc<AcpClient>, SupervisorError> {
-        self.workers
-            .lock()
-            .await
-            .get(session_id)
-            .map(|h| Arc::clone(&h.client))
-            .ok_or_else(|| SupervisorError::UnknownSession(session_id.into()))
+        loop {
+            let wait = {
+                let workers = self.workers.lock().await;
+                let handle = workers
+                    .get(session_id)
+                    .ok_or_else(|| SupervisorError::UnknownSession(session_id.into()))?;
+                let lifecycle = lock_recover(&self.lifecycle);
+                if lifecycle.current_lease(session_id).as_ref() != Some(&handle.lease)
+                    || lifecycle.phase(session_id) != WorkerPhase::Running
+                {
+                    return Err(SupervisorError::SpawnCancelled(session_id.into()));
+                }
+                let scope = handle
+                    .lease
+                    .native_scope()
+                    .map_err(|()| SupervisorError::NativeStoreUnavailable)?;
+                match scope {
+                    Some(scope) => {
+                        match scope
+                            .fence
+                            .try_lock_observation_matching(|_| true)
+                            .map_err(|_| SupervisorError::SpawnCancelled(session_id.into()))?
+                        {
+                            Some(_native) => {
+                                handle.client.ensure_available()?;
+                                return Ok(Arc::clone(&handle.client));
+                            }
+                            None => Arc::clone(&scope.fence),
+                        }
+                    }
+                    None => {
+                        handle.client.ensure_available()?;
+                        return Ok(Arc::clone(&handle.client));
+                    }
+                }
+            };
+            tokio::task::spawn_blocking(move || wait.lock_observation().map(drop))
+                .await
+                .map_err(|_| SupervisorError::NativeStoreUnavailable)?
+                .map_err(|_| SupervisorError::SpawnCancelled(session_id.into()))?;
+            // Reacquire and recheck the actual current actor after contention.
+        }
+    }
+
+    /// A current owned receipt, independent of historical assignment events.
+    pub(crate) async fn current_native_availability(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::acp::state::CurrentNativeAvailability> {
+        let workers = self.workers.lock().await;
+        let handle = workers.get(session_id)?;
+        let lifecycle = lock_recover(&self.lifecycle);
+        if lifecycle.current_lease(session_id).as_ref() != Some(&handle.lease)
+            || lifecycle.phase(session_id) != WorkerPhase::Running
+        {
+            return None;
+        }
+        let scope = handle.lease.native_scope().ok()??;
+        let _native_lifecycle = scope.fence.try_lock_observation_matching(|_| true).ok()??;
+        let unavailable = handle.client.connection_unavailable();
+        let ready = handle.client.connection_ready();
+        if !ready && unavailable.is_none() {
+            return None;
+        }
+        Some(crate::acp::state::CurrentNativeAvailability {
+            context: scope.context,
+            owner: handle.client.connected_runner(),
+            unavailable,
+            ready,
+            client: Arc::clone(&handle.client),
+            lifecycle: Arc::clone(&self.lifecycle),
+            epoch: handle.lease.epoch(),
+        })
     }
 
     /// The session's client, after waiting out a mid-resume worker.
@@ -151,9 +218,15 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     /// Cancel the current turn; an already-exited agent has no turn to cancel.
     pub async fn cancel_prompt(&self, session_id: &str) -> Result<(), SupervisorError> {
-        let client = self.ready_client(session_id).await?;
+        let client = match self.ready_client(session_id).await {
+            Ok(client) => client,
+            Err(SupervisorError::Acp(AcpError::AgentExited | AcpError::NotRunning)) => {
+                return Ok(())
+            }
+            Err(error) => return Err(error),
+        };
         match client.cancel_prompt().await {
-            Ok(()) | Err(AcpError::AgentExited) => Ok(()),
+            Ok(()) | Err(AcpError::AgentExited | AcpError::NotRunning) => Ok(()),
             Err(e) => Err(SupervisorError::Acp(e)),
         }
     }
@@ -353,7 +426,7 @@ mod tests {
         assert!(
             matches!(
                 sup.send_prompt("s-3401", "hi", &[]).await,
-                Err(SupervisorError::Acp(AcpError::AgentExited))
+                Err(SupervisorError::Acp(AcpError::NotRunning))
             ),
             "a prompt that did not land keeps its typed reason"
         );

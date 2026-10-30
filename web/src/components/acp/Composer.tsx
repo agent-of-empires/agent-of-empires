@@ -78,8 +78,10 @@ interface Props {
   sessionUsage: AcpState["sessionUsage"];
   authStatus: AcpState["authStatus"];
   availableCommands: AcpState["availableCommands"];
-  /** WS open and worker healthy. Sends still work when false; they queue until resume. */
+  /** Current live daemon snapshot permits native input; a socket alone is insufficient. */
   connected: boolean;
+  /** Explicit managed wake/queue intent; the daemon still rechecks admission. */
+  canSubmit: boolean;
   /** For a Session that has never started: the Agent it waits for. */
   waitingFor?: string | null;
   /** The Worker is running; only the connection is down. */
@@ -103,7 +105,7 @@ const POPOVER_CLASS =
   "absolute bottom-full left-0 right-0 mb-2 z-30 overflow-hidden rounded-lg border border-surface-700 bg-surface-850 shadow-xl";
 
 export function Composer(props: Props) {
-  const { sessionId, turnActive, connected, promptCapabilities, queuedPrompts } = props;
+  const { sessionId, turnActive, connected, canSubmit, promptCapabilities, queuedPrompts } = props;
   const taRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const { client, composerText, draftTextRef } = useComposerClient();
@@ -116,10 +118,11 @@ export function Composer(props: Props) {
   // Regular iOS Safari already lifts the composer by keyboardHeight; only the PWA needs this.
   const iosPwa = useMemo(() => isIOS() && isStandalone(), []);
   const recall = useQueueRecall(queuedPrompts, client, loadText);
-  const canSend = composerText.trim().length > 0 || attachments.supported.length > 0;
+  const canSend = canSubmit && (composerText.trim().length > 0 || attachments.supported.length > 0);
   const provider = useProviderSwitch(sessionId, props.currentAgent, props.currentProvider);
 
   const submitComposer = useCallback(() => {
+    if (!canSubmit) return;
     const cur = recall.recallRef.current;
     if (cur) {
       recall.applyRecall(null);
@@ -135,7 +138,7 @@ export function Composer(props: Props) {
     sendFromTextarea(taRef, client, props.enqueuePrompt, sessionId, attachments.supported, () =>
       props.setPendingAttachments([]),
     );
-  }, [client, props, sessionId, attachments.supported, queuedPrompts, recall]);
+  }, [canSubmit, client, props, sessionId, attachments.supported, queuedPrompts, recall]);
 
   usePluginDraftOperations(sessionId, client, taRef);
   usePrimerPrefill(props.primerPrefill, loadText);
@@ -178,6 +181,17 @@ export function Composer(props: Props) {
       e.preventDefault();
       e.stopPropagation();
       recall.recall(recallAction);
+      return;
+    }
+    if (
+      !canSubmit &&
+      e.key === "Enter" &&
+      !e.shiftKey &&
+      !e.nativeEvent.isComposing &&
+      (!isMobile || e.ctrlKey || e.metaKey)
+    ) {
+      e.preventDefault();
+      e.stopPropagation();
       return;
     }
     if (decideEnterAction(keys, { isMobile, turnActive }) === "default") return;
@@ -339,17 +353,20 @@ export function Composer(props: Props) {
                   }}
                 />
                 <span className="mx-1 h-4 w-px bg-surface-700" aria-hidden />
-                <ModePicker
-                  sessionId={sessionId}
-                  availableModes={props.availableModes}
-                  currentModeId={props.currentModeId}
-                  legacyMode={props.legacyMode}
-                  configOptions={props.configOptions}
-                  pendingConfigOption={props.pendingConfigOption}
-                  setConfigOption={props.setConfigOption}
-                />
+                <fieldset disabled={!connected} className="contents">
+                  <ModePicker
+                    sessionId={sessionId}
+                    availableModes={props.availableModes}
+                    currentModeId={props.currentModeId}
+                    legacyMode={props.legacyMode}
+                    configOptions={props.configOptions}
+                    pendingConfigOption={props.pendingConfigOption}
+                    setConfigOption={props.setConfigOption}
+                  />
+                </fieldset>
                 <SessionConfigControls
                   configOptions={props.configOptions}
+                  nativeAvailable={connected}
                   pendingConfigOption={props.pendingConfigOption}
                   onSetConfigOption={props.setConfigOption}
                   provider={provider.current}

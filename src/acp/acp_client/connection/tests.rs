@@ -108,6 +108,7 @@ async fn cancel_under_flood() {
         winner: Some(winner_tx),
     });
     let params = ConnectionParams {
+        connection_state: Arc::default(),
         claude_home: None,
         shutdown: tokio_util::sync::CancellationToken::new(),
         cancellation: tokio_util::sync::CancellationToken::new(),
@@ -228,20 +229,49 @@ async fn auth_status_is_cleared_per_adapter_process() {
         ("reattach to the surviving process", reattach, false, vec![]),
     ];
     for (name, mode, reports, want) in cases {
-        assert_eq!(auth_events(mode, reports).await, want, "{name}");
+        assert_eq!(
+            auth_events(mode, usize::from(reports)).await,
+            want,
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn auth_bootstrap_exceeding_public_and_shim_capacity_reaches_ready_before_drain() {
+    for mode in [
+        ConnectMode::Fresh {
+            stored_acp_session_id: None,
+            seed_history_replay: false,
+            prior_conversation: false,
+            fork_from: None,
+        },
+        ConnectMode::Resume {
+            acp_session_id: "s-auth".into(),
+            in_flight_turn: false,
+        },
+    ] {
+        let fresh = matches!(&mode, ConnectMode::Fresh { .. });
+        let reports = auth_events(mode, 96).await;
+        assert_eq!(reports.iter().filter(|present| **present).count(), 96);
+        assert_eq!(
+            reports.iter().filter(|present| !**present).count(),
+            usize::from(fresh)
+        );
     }
 }
 
 /// `AuthStatusUpdated` events up to session commit, as "carries a report".
-async fn auth_events(mode: ConnectMode, reports: bool) -> Vec<bool> {
+async fn auth_events(mode: ConnectMode, report_count: usize) -> Vec<bool> {
     let (daemon_write, agent_read) = tokio::io::duplex(64 * 1024);
     let (mut agent_write, daemon_read) = tokio::io::duplex(64 * 1024);
     let (event_tx, mut event_rx) = mpsc::channel(64);
     let (_cmd_tx, cmd_rx) = mpsc::channel::<ClientCmd>(1);
-    let (ready_tx, _ready_rx) = oneshot::channel();
+    let (ready_tx, ready_rx) = oneshot::channel();
     let temp = tempfile::tempdir().unwrap();
     let cwd = temp.path().to_path_buf();
     let params = ConnectionParams {
+        connection_state: Arc::default(),
         claude_home: None,
         shutdown: tokio_util::sync::CancellationToken::new(),
         cancellation: tokio_util::sync::CancellationToken::new(),
@@ -269,13 +299,26 @@ async fn auth_events(mode: ConnectMode, reports: bool) -> Vec<bool> {
     };
     let transport = ByteStreams::new(daemon_write.compat_write(), daemon_read.compat());
     let connection = tokio::spawn(run_connection_task(transport, params));
-    // Reports right after answering `initialize`, the earliest it can.
+    // More than a shim's bytes and public queue's frames can precede initialize.
     let agent = tokio::spawn(async move {
         let mut lines = BufReader::new(agent_read).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             let msg: serde_json::Value = serde_json::from_str(&line).unwrap();
             let id = &msg["id"];
-            let mut out = match msg["method"].as_str() {
+            if msg["method"] == "initialize" && report_count != 0 {
+                let report = serde_json::json!({
+                    "jsonrpc": "2.0", "method": "_auth/status_update",
+                    "params": {"authStatus": {
+                        "kind": "account", "label": "x".repeat(1024),
+                    }},
+                })
+                .to_string();
+                for _ in 0..report_count {
+                    agent_write.write_all(report.as_bytes()).await.unwrap();
+                    agent_write.write_all(b"\n").await.unwrap();
+                }
+            }
+            let out = match msg["method"].as_str() {
                 Some("initialize") => vec![format!(
                     r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":1,"agentCapabilities":{{"_meta":{{"authStatus":{{}}}}}}}}}}"#
                 )],
@@ -284,9 +327,6 @@ async fn auth_events(mode: ConnectMode, reports: bool) -> Vec<bool> {
                 )],
                 _ => vec![],
             };
-            if reports && msg["method"] == "initialize" {
-                out.push(r#"{"jsonrpc":"2.0","method":"_auth/status_update","params":{"authStatus":{"kind":"account","label":"Claude Max"}}}"#.into());
-            }
             for line in out {
                 agent_write
                     .write_all(format!("{line}\n").as_bytes())
@@ -295,12 +335,20 @@ async fn auth_events(mode: ConnectMode, reports: bool) -> Vec<bool> {
             }
         }
     });
+    tokio::time::timeout(Duration::from_secs(10), ready_rx)
+        .await
+        .expect("initialize must not require a public event consumer")
+        .expect("ready sender remains owned")
+        .expect("initialize succeeds");
 
-    let (mut seen, mut committed) = (Vec::new(), false);
+    let (mut seen, mut committed, mut reports_seen) = (Vec::new(), false, 0);
     tokio::time::timeout(Duration::from_secs(10), async {
-        while !committed || (reports && seen.last() != Some(&true)) {
+        while !committed || reports_seen < report_count {
             match event_rx.recv().await.expect("connection remains open") {
-                Event::AuthStatusUpdated { status } => seen.push(status.is_some()),
+                Event::AuthStatusUpdated { status } => {
+                    reports_seen += usize::from(status.is_some());
+                    seen.push(status.is_some());
+                }
                 Event::AcpSessionAssigned { .. } => committed = true,
                 _ => {}
             }
@@ -323,6 +371,7 @@ struct FakeConnection {
     pending_responders: super::super::pending::PendingResponders,
     replies: mpsc::UnboundedReceiver<serde_json::Value>,
     event_queue: mpsc::WeakSender<Event>,
+    connection_state: Arc<ConnectionState>,
     connection: tokio::task::JoinHandle<()>,
     agent: tokio::task::JoinHandle<()>,
     _cwd: tempfile::TempDir,
@@ -345,7 +394,9 @@ async fn spawn_fake_connection(
     let (reply_tx, replies_rx) = mpsc::unbounded_channel();
     let temp = tempfile::tempdir().unwrap();
     let cwd = temp.path().to_path_buf();
+    let connection_state = Arc::new(ConnectionState::default());
     let params = ConnectionParams {
+        connection_state: Arc::clone(&connection_state),
         claude_home: None,
         event_tx,
         cmd_rx,
@@ -406,6 +457,7 @@ async fn spawn_fake_connection(
                     ]
                 }
                 Some("session/prompt") => on_prompt(id),
+                Some("session/set_config_option") => on_prompt(id),
                 _ => continue,
             };
             for reply in replies {
@@ -428,10 +480,88 @@ async fn spawn_fake_connection(
         pending_responders,
         replies: replies_rx,
         event_queue,
+        connection_state,
         connection,
         agent,
         _cwd: temp,
     }
+}
+
+#[tokio::test]
+async fn correlated_config_result_survives_eof_while_public_queue_is_full() {
+    let mut fake = spawn_fake_connection("s-config-eof", None, false, |id| {
+        vec![serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "result": { "configOptions": [] },
+        })
+        .to_string()]
+    })
+    .await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !matches!(
+            fake.event_rx.recv().await.expect("connection remains live"),
+            Event::AcpSessionAssigned { .. }
+        ) {}
+    })
+    .await
+    .expect("session commits");
+    let sender = fake.event_queue.upgrade().unwrap();
+    while sender
+        .try_send(Event::AuthStatusUpdated { status: None })
+        .is_ok()
+    {}
+    fake.cmd_tx
+        .send(ClientCmd::SetConfigOption {
+            config_id: "model".into(),
+            value: "selected".into(),
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while fake
+            .connection_state
+            .completed_outcomes
+            .load(Ordering::Acquire)
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("correlated config result reaches its blocked application scope");
+    fake.agent_write.lock().await.shutdown().await.unwrap();
+    drop(sender);
+    let events = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut events = Vec::new();
+        while let Some(event) = fake.event_rx.recv().await {
+            let unavailable = matches!(event, Event::AcpConnectionUnavailable { .. });
+            events.push(event);
+            if unavailable {
+                break;
+            }
+        }
+        events
+    })
+    .await
+    .expect("completed config result drains before EOF");
+    let config = events
+        .iter()
+        .position(
+            |event| matches!(event, Event::ConfigOptionsUpdated { options } if options.is_empty()),
+        )
+        .expect("completed native configuration outcome survives SDK closure");
+    let unavailable = events
+        .iter()
+        .position(|event| matches!(event, Event::AcpConnectionUnavailable { .. }))
+        .expect("real EOF remains visible");
+    assert!(config < unavailable);
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, Event::AgentStartupError { .. })));
+    tokio::time::timeout(Duration::from_secs(10), fake.connection)
+        .await
+        .unwrap()
+        .unwrap();
+    fake.agent.abort();
 }
 
 /// A limit that ends an agent-initiated turn must end the connection, or the
@@ -640,7 +770,9 @@ async fn request_errors_fail_the_turn_without_replacing_the_connection() {
             let failures: Vec<_> = events
                 .iter()
                 .filter_map(|event| match event {
-                    Event::PromptRuntimeError { message, evidence } => Some((message, evidence)),
+                    Event::PromptRuntimeError {
+                        message, evidence, ..
+                    } => Some((message, evidence)),
                     _ => None,
                 })
                 .collect();
@@ -750,10 +882,20 @@ async fn transport_and_protocol_failure_remain_fatal_across_turn_ownership() {
             events.push(event);
         }
         assert!(
-            events
+            events.iter().any(|event| matches!(
+                event,
+                Event::AcpConnectionUnavailable {
+                    phase: crate::acp::state::AcpConnectionPhase::Established,
+                    ..
+                }
+            )),
+            "{mode}: {events:?}"
+        );
+        assert!(
+            !events
                 .iter()
                 .any(|event| matches!(event, Event::AgentStartupError { .. })),
-            "{mode}: {events:?}"
+            "post-ready closure is not startup failure: {mode}: {events:?}"
         );
         if mode == "after_error" {
             assert_eq!(
@@ -784,7 +926,9 @@ async fn transport_and_protocol_failure_remain_fatal_across_turn_ownership() {
 }
 
 #[tokio::test]
-async fn resumed_session_rejection_keeps_its_distinct_terminal() {
+async fn unsupported_session_prompt_prose_preserves_identity_and_the_next_explicit_input() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let native_calls = calls.clone();
     let mut fake = spawn_fake_connection(
         "s-rejected",
         Some(ConnectMode::Resume {
@@ -792,13 +936,19 @@ async fn resumed_session_rejection_keeps_its_distinct_terminal() {
             in_flight_turn: false,
         }),
         false,
-        |id| {
-            vec![serde_json::json!({
-                "jsonrpc": "2.0", "id": id,
-                "error": {"code": -32603, "message": "unknown session",
-                    "data": {"privateTokenMarker": "must-not-leak"}}
-            })
-            .to_string()]
+        move |id| {
+            let reply = if native_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32603, "message": "unknown session",
+                        "data": {"privateTokenMarker": "must-not-leak"}}
+                })
+            } else {
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": id, "result": {"stopReason": "end_turn"}
+                })
+            };
+            vec![reply.to_string()]
         },
     )
     .await;
@@ -806,23 +956,36 @@ async fn resumed_session_rejection_keeps_its_distinct_terminal() {
         .send(ClientCmd::Prompt(Vec::new()))
         .await
         .unwrap();
-    let events = collect_terminal(&mut fake).await;
+    let mut events = collect_terminal(&mut fake).await;
+    assert!(matches!(events.last(), Some(Event::Stopped { reason }) if reason == "prompt_failed"));
     assert!(events
         .iter()
-        .any(|event| matches!(event, Event::SessionContextReset { .. })));
-    assert!(
-        matches!(events.last(), Some(Event::Stopped { reason }) if reason == "stored_session_rejected")
-    );
-    assert!(!events
-        .iter()
         .any(|event| matches!(event, Event::PromptRuntimeError { .. })));
-    assert!(!serde_json::to_string(&events)
-        .unwrap()
-        .contains("privateTokenMarker"));
-    tokio::time::timeout(Duration::from_secs(10), fake.connection)
+    assert!(!fake.connection.is_finished());
+    fake.cmd_tx
+        .send(ClientCmd::Prompt(Vec::new()))
         .await
-        .unwrap()
         .unwrap();
+    let next = collect_terminal(&mut fake).await;
+    assert!(matches!(next.last(), Some(Event::Stopped { reason }) if reason == "prompt_complete"));
+    events.extend(next);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let assigned: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::AcpSessionAssigned { acp_session_id, .. } => Some(acp_session_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(assigned, vec!["s-rejected"]);
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        Event::SessionContextReset { .. } | Event::AgentStartupError { .. }
+    )));
+    let public = serde_json::to_string(&events).unwrap();
+    assert!(!public.contains("privateTokenMarker") && !public.contains("must-not-leak"));
+    fake.connection.abort();
+    let _ = fake.connection.await;
     fake.agent.abort();
     let _ = fake.agent.await;
 }
@@ -1090,9 +1253,12 @@ async fn request_error_then_eof_survives_public_event_backpressure() {
         .unwrap();
     let closure = events
         .iter()
-        .position(|event| matches!(event, Event::AgentStartupError { .. }))
+        .position(|event| matches!(event, Event::AcpConnectionUnavailable { .. }))
         .unwrap();
     assert!(failure < terminal && terminal < closure);
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, Event::AgentStartupError { .. })));
     assert_eq!(
         events
             .iter()
@@ -1419,6 +1585,9 @@ async fn transport_eof_cancels_unanswered_callbacks_after_intervening_progress()
             .unwrap();
         assert!(events.iter().any(|event| matches!(event, Event::AgentMessageChunk { text, .. } if text == "progress before EOF")));
         assert!(events
+            .iter()
+            .any(|event| matches!(event, Event::AcpConnectionUnavailable { .. })));
+        assert!(!events
             .iter()
             .any(|event| matches!(event, Event::AgentStartupError { .. })));
         assert!(!events.iter().any(

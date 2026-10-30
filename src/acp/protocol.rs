@@ -37,6 +37,9 @@ pub struct AcpBroadcastFrame {
     /// Which installed worker produced this frame, for in-process
     /// consumers that must reject a replaced worker's queued frames. Never serialized.
     pub worker_generation: Option<u64>,
+    /// Original native semantics and owner, including append-error substitution.
+    /// In-process only: the public frame serializer deliberately omits it.
+    pub(crate) native_subject: Option<crate::acp::state::NativeEventSubject>,
     /// The sidebar status right after this frame's event was folded, when the
     /// control cache was warm at publish. Never serialized.
     pub sidebar_status: Option<crate::session::Status>,
@@ -64,6 +67,7 @@ impl<'de> Deserialize<'de> for AcpBroadcastFrame {
         }
         let w = Wire::deserialize(deserializer)?;
         Ok(AcpBroadcastFrame {
+            native_subject: None,
             session_id: w.session_id,
             seq: w.seq,
             event: Arc::new(w.event),
@@ -312,6 +316,7 @@ mod tests {
     #[test]
     fn broadcast_frame_strips_background_agent_output_file() {
         let frame = AcpBroadcastFrame {
+            native_subject: None,
             session_id: "s-1".into(),
             seq: 1,
             event: Arc::new(Event::BackgroundAgentLaunched {

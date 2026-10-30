@@ -6,7 +6,14 @@ import { applyEvent, emptyAcpState } from "../../../lib/acpTypes";
 import type { AcpState, Approval, Elicitation, ReducedState } from "../../../lib/acpTypes";
 import { setServerDown } from "../../../lib/connectionState";
 import { clearAcpCache, useAcpSession } from "../../../hooks/useAcpSession";
-import { flushAsync, installAcpFakes, json, lastSocket, profileWrapper } from "../../../hooks/__tests__/acpHarness";
+import {
+  currentControlSnapshot,
+  flushAsync,
+  installAcpFakes,
+  json,
+  lastSocket,
+  profileWrapper,
+} from "../../../hooks/__tests__/acpHarness";
 import { ApprovalCard } from "../ApprovalCard";
 import { AskUserQuestionCard } from "../AskUserQuestionCard";
 import { reducer } from "../../../hooks/acpSession/reducer";
@@ -133,6 +140,7 @@ describe("interaction card retries through the session hook", () => {
           await flushAsync();
           lastSocket().open();
           await flushAsync();
+          lastSocket().message(currentControlSnapshot(latest, { ready: true }));
           const approval: Approval = {
             nonce,
             destructive: false,
@@ -187,6 +195,7 @@ describe("interaction card retries through the session hook", () => {
             cancelling: false,
             compacting: false,
             operation_error: null,
+            connection_ready: true,
           };
           const buttonName = kind === "approval" ? "Allow" : "Submit";
           lastSocket().message({ session_id: sessionId, seq: 1, event: { UserPromptSent: { text: "request A" } } });
@@ -198,7 +207,7 @@ describe("interaction card retries through the session hook", () => {
           });
           // Pending cards are daemon-folded control state, not a client fold
           // of the raw request event. Establish the actual card before failure.
-          lastSocket().message({ kind: "reduced_state", state: requested });
+          lastSocket().message({ kind: "reduced_state", seq: 2, state: requested });
           await flushAsync();
           expect((screen.getByRole("button", { name: buttonName }) as HTMLButtonElement).disabled).toBe(false);
           expect(latest.pendingApprovals.map((card) => card.nonce)).toEqual(kind === "approval" ? [nonce] : []);
@@ -212,6 +221,7 @@ describe("interaction card retries through the session hook", () => {
           lastSocket().message({ session_id: sessionId, seq: 4, event: { Stopped: { reason: "prompt_failed" } } });
           lastSocket().message({
             kind: "reduced_state",
+            seq: 4,
             state: { ...requested, turn_active: false, operation_error: evidence },
           });
           await flushAsync();

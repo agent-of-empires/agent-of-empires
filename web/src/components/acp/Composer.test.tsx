@@ -44,6 +44,7 @@ function Harness({
       <Composer
         sessionId="sess"
         currentAgent="claude"
+        currentProvider={null}
         availableModes={[]}
         currentModeId={null}
         legacyMode="Default"
@@ -51,8 +52,10 @@ function Harness({
         pendingConfigOption={null}
         setConfigOption={() => {}}
         sessionUsage={null}
+        authStatus={null}
         availableCommands={[]}
         connected
+        canSubmit
         turnActive={isRunning}
         enqueuePrompt={() => {}}
         promptCapabilities={null}

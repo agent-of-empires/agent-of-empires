@@ -3,7 +3,7 @@
 use super::jsonrpc::read_frame_bounded;
 use super::shared::{RunnerShared, CONTROL_ATTACH_TIMEOUT, CONTROL_WRITE_TIMEOUT};
 use super::STDOUT_READ_BUF;
-use crate::acp::control_protocol::{self, ControlBody};
+use crate::acp::control_protocol::{self, ControlBody, NativeChannelLossCause};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::io::BufReader;
@@ -19,10 +19,20 @@ pub(super) async fn fanout_agent_stdout(
 ) {
     let mut reader = BufReader::with_capacity(STDOUT_READ_BUF, stdout);
     let mut line = Vec::with_capacity(4096);
+    let mut retain_reader = false;
     loop {
-        match read_frame_bounded(&mut reader, &mut line).await {
+        let frame = tokio::select! {
+            biased;
+            _ = shared.wait_native_loss() => {
+                retain_reader = true;
+                break;
+            }
+            frame = read_frame_bounded(&mut reader, &mut line) => frame,
+        };
+        match frame {
             Ok(0) => {
                 debug!(target: "acp.runner", session = %session_id, "agent stdout EOF");
+                shared.observe_native_loss(NativeChannelLossCause::StdoutEof);
                 break;
             }
             Ok(_) => {
@@ -30,11 +40,26 @@ pub(super) async fn fanout_agent_stdout(
             }
             Err(e) => {
                 warn!(target: "acp.runner", session = %session_id, "stdout read error: {e}");
+                retain_reader = true;
+                shared.observe_native_loss(if e.kind() == std::io::ErrorKind::InvalidData {
+                    NativeChannelLossCause::ProtocolEnded
+                } else {
+                    NativeChannelLossCause::ReadFailed
+                });
                 break;
             }
         }
     }
-    shared.abort_agent_calls(&session_id).await;
+    shared.retire_native_waiters().await;
+    if retain_reader {
+        // Closing a still-live native stdout here could SIGPIPE the child.
+        // Retain only its descriptor until this runner-owned task is aborted
+        // by the existing explicit shutdown/process-exit lifecycle.
+        drop(line);
+        let native_stdout = reader.into_inner();
+        std::future::pending::<()>().await;
+        drop(native_stdout);
+    }
 }
 
 /// The queue keeps the front entry until a full write and flush succeeds.
@@ -212,6 +237,7 @@ pub(super) async fn handle_control_connection(
                             Ok((acp_session_id, result)) => ControlBody::SessionReady {
                                 acp_session_id,
                                 result,
+                                native_channel: handshake_shared.native_availability(),
                             },
                             Err(error) => ControlBody::HandshakeFailed { error },
                         }
@@ -232,6 +258,7 @@ pub(super) async fn handle_control_connection(
                                 ControlBody::SessionReady {
                                     acp_session_id,
                                     result,
+                                    native_channel: handshake_shared.native_availability(),
                                 }
                             }
                             Err(error) => {
@@ -247,7 +274,12 @@ pub(super) async fn handle_control_connection(
                 return;
             };
             handshake_shared
-                .enqueue_handshake(attachment_id, frame, established)
+                .enqueue_handshake(
+                    attachment_id,
+                    frame,
+                    established,
+                    dispatch_release.is_some(),
+                )
                 .await;
             drop(dispatch_release);
         }
@@ -262,10 +294,12 @@ pub(super) async fn handle_control_connection(
             }
             result = control_protocol::read_frame(&mut read_half) => match result {
                 Ok(Some(frame)) => frame,
-                Ok(None) => break 'connection !handshake_complete.load(Ordering::Acquire),
+                Ok(None) => break 'connection shared.native_loss().is_none()
+                    && !handshake_complete.load(Ordering::Acquire),
                 Err(error) => {
                     warn!(target: "acp.runner", session = %session_id, "control read error: {error}");
-                    break 'connection !handshake_complete.load(Ordering::Acquire);
+                    break 'connection shared.native_loss().is_none()
+                        && !handshake_complete.load(Ordering::Acquire);
                 }
             }
         };

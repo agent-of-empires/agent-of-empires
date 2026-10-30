@@ -1398,12 +1398,46 @@ fn commit_structured_user_stop(
     let _lifecycle = native.storage().acquire_instance_lifecycle_lock(id)?;
     // Capture after the birth flock: a child born before this fence is ours to settle.
     let target = state.acp_supervisor.capture_retirement(id)?;
+    // The original producer can have persisted its binding before the async
+    // listener obtains instance exclusion. Preserve that qualified observation
+    // while we still own its native incarnation, before Stop supersedes it.
+    let through = state.acp_event_store.highest_seq_checked(id)?;
+    let observed = state
+        .acp_event_store
+        .handoff_context_event(id, 0, through)?;
     let mut generation = None;
     let publication = match (&native as &dyn SessionStore).update(|rows, _| {
         let row = rows
             .iter_mut()
             .find(|row| row.id == id)
             .ok_or(crate::session::SessionGone)?;
+        if let Some((_, event @ crate::acp::Event::AcpSessionAssigned { .. })) = &observed {
+            let context = crate::acp::state::NativeEventContext::capture(row, native.storage())?;
+            let captured_scope = target
+                .lease
+                .as_ref()
+                .and_then(|lease| lease.native_scope().ok().flatten());
+            if event.native_subject().is_some_and(|subject| {
+                subject.context == context
+                    && subject.owner == target.identity
+                    && captured_scope
+                        .as_ref()
+                        .is_some_and(|scope| scope.context == context)
+                    && matches!(
+                        subject.kind,
+                        crate::acp::state::NativeSubjectEvent::BindingObserved
+                            | crate::acp::state::NativeSubjectEvent::ChannelReady
+                    )
+            }) {
+                let change = crate::server::acp_events::derive_acp_session_change(event);
+                crate::server::acp_events::apply_acp_session_change(
+                    row,
+                    id,
+                    change.as_ref(),
+                    false,
+                );
+            }
+        }
         generation = Some(reserve_structured_user_stop(row)?);
         Ok(())
     }) {
@@ -2301,11 +2335,7 @@ async fn finish_structured_restart(
             agent,
             started.sandbox_info.clone(),
         );
-        request.launch_admission = Some(crate::acp::supervisor::LaunchAdmission {
-            store: native.clone(),
-            generation,
-            namespace: Some(state.profile_namespace.clone()),
-        });
+        request.launch_admission = Some(crate::acp::supervisor::LaunchAdmission { store: native.clone(), generation, namespace: Some(state.profile_namespace.clone()), native_scope: None });
         let profile = started.source_profile.clone();
         drop(guard);
         drop(submission);
@@ -2341,10 +2371,9 @@ async fn finish_structured_restart(
                         .prompt_dispatch_under_submission(&id, &wake, false, true)
                         .await;
                     if matches
-                        && !matches!(
-                            dispatch,
-                            crate::acp::dispatch::PromptDispatch::Queued { .. }
-                        )
+                        && matches!(dispatch,
+                            crate::acp::dispatch::PromptDispatch::Sent
+                                | crate::acp::dispatch::PromptDispatch::Steered)
                     {
                         let result = state
                             .session_service
@@ -3767,6 +3796,7 @@ mod durable_stop_tests {
                 store: Arc::new(Storage::open_unwatched("default").unwrap()),
                 generation: stored.lifecycle_generation,
                 namespace: None,
+                native_scope: None,
             };
             let mut child = crate::acp::supervisor::with_durable_launch(
                 Some(admission),

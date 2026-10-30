@@ -834,6 +834,7 @@ pub(crate) async fn spawn_structured_session(
                                             store: launch_native,
                                             generation,
                                             namespace: Some(spawn_state.profile_namespace.clone()),
+                                            native_scope: None,
                                         },
                                     ),
                                     expected_lifecycle_generation: generation,

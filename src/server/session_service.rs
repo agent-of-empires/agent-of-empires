@@ -225,6 +225,14 @@ pub struct SessionService {
     install_barrier: std::sync::Mutex<
         Option<tokio::sync::mpsc::UnboundedSender<(String, tokio::sync::oneshot::Sender<()>)>>,
     >,
+    /// Single-use gate for loss between final admission/publication and native delivery.
+    #[cfg(test)]
+    native_prompt_send_gate: std::sync::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     // `created_instance_gate` was deleted with the rewrite of `session_spawn.rs`:
     // it existed only to let a test hold a creation between the store read and
     // the commit, and nothing arms or reads it any more. Upstream kept the
@@ -301,6 +309,8 @@ pub(crate) enum SendTurnError {
     /// coming; retryable, and nothing was published, so the transcript is
     /// not left with a prompt no agent ever received. See #1748 and #3172.
     WorkerNotReady,
+    /// Pre-publish: current qualified loss/refusal preserves the pending intent.
+    Unavailable(crate::acp::state::AcpConnectionUnavailability),
     /// Pre-publish: `no_revive` was set and delivering this turn would have
     /// required resuming a worker that is not currently running.
     RevivalRefused,
@@ -321,6 +331,8 @@ pub(crate) enum PromptTouch {
     RevivalRefused,
     /// The session is archived or trashed; refused before any mutation.
     Blocked(crate::session::StartBlocked),
+    /// Known native/control unavailability is not permission to wake or queue.
+    Unavailable(crate::acp::state::AcpConnectionUnavailability),
     WorkerNotReady,
 }
 
@@ -356,6 +368,11 @@ impl std::fmt::Display for SendTurnError {
             Self::ModeApplication(e) => write!(f, "mode application failed: {e}"),
             Self::ResumeFailed(e) => write!(f, "worker resume failed: {e}"),
             Self::WorkerNotReady => write!(f, "worker not ready"),
+            Self::Unavailable(unavailable) => write!(
+                f,
+                "native input unavailable ({:?}, {:?}, {:?})",
+                unavailable.source, unavailable.cause, unavailable.phase
+            ),
             Self::RevivalRefused => write!(f, "no_revive: reviving a stopped worker is required"),
             Self::Send(e) => write!(f, "prompt forward failed: {e}"),
         }
@@ -402,6 +419,8 @@ impl SessionService {
             submission_claims: std::sync::OnceLock::new(),
             #[cfg(test)]
             install_barrier: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            native_prompt_send_gate: std::sync::Mutex::new(None),
         }
     }
 
@@ -751,10 +770,29 @@ impl SessionService {
         .unwrap_or(PromptTouch::WorkerNotReady)
     }
 
+    /// Reuse the common qualified projection before any prompt-side mutation.
+    pub(crate) async fn prompt_native_unavailability(
+        &self,
+        id: &str,
+    ) -> Option<crate::acp::state::AcpConnectionUnavailability> {
+        match self.acp_control_cache.native_metadata(id) {
+            Some((historical, control_seq)) => {
+                self.native_control_projection(id, historical, control_seq)
+                    .await
+                    .unavailable
+            }
+            None => self.fold_control_state(id).await.connection_unavailable,
+        }
+    }
+
     async fn touch_and_wake_on_prompt_inner(&self, id: &str, no_revive: bool) -> PromptTouch {
         let Ok(state) = self.native_state() else {
             return PromptTouch::WorkerNotReady;
         };
+        if let Some(unavailable) = self.prompt_native_unavailability(id).await {
+            return PromptTouch::Unavailable(unavailable);
+        }
+        let mut current_native = self.acp_supervisor.current_native_availability(id).await;
         let namespace = state.profile_namespace.clone().read_owned().await;
         let guard = self.instance_lock(id).await.lock_owned().await;
         let (worker_id, profile, title, generation, provider, view, needs_resume, was_idle_dormant) = {
@@ -862,6 +900,22 @@ impl SessionService {
             let committed = store.update(|rows, _| {
                 let row = rows.iter_mut().find(|row| row.id == worker_id)
                     .ok_or(crate::session::SessionGone)?;
+                let unavailable = if let Some(current) = current_native.as_mut() {
+                    if current.context != crate::acp::state::NativeEventContext::capture(row, native.storage())?
+                        || !current.refresh(&worker_id)
+                    {
+                        refused = Some(PromptTouch::WorkerNotReady);
+                        anyhow::bail!(crate::session::LifecycleReservationError::Superseded);
+                    }
+                    current.unavailable
+                } else {
+                    crate::process::worker_registry::control_admission(&worker_id)
+                        .err().map(|refusal| refusal.observation())
+                };
+                if let Some(unavailable) = unavailable {
+                    refused = Some(PromptTouch::Unavailable(unavailable));
+                    anyhow::bail!(crate::session::LifecycleReservationError::Superseded);
+                }
                 if let Some(outcome) = prompt_touch_rejection(
                     row, generation, &title, provider.as_deref(), view, no_revive,
                 ) {
@@ -941,6 +995,9 @@ impl SessionService {
             }
             (inst.acp_mode_id.clone(), inst.yolo_mode)
         };
+        if let Some(unavailable) = self.prompt_native_unavailability(id).await {
+            return Err(SendTurnError::Unavailable(unavailable));
+        }
         if resume_authority == crate::process::worker_registry::ResumeAuthority::Automatic
             && crate::process::worker_registry::stop_requested(id)
         {
@@ -961,15 +1018,24 @@ impl SessionService {
             {
                 Ok(ResumeTrigger::NotFound) => return Err(SendTurnError::SessionNotFound),
                 Ok(_) => {}
+                Err(crate::acp::supervisor::SupervisorError::Acp(
+                    crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailable),
+                )) => return Err(SendTurnError::Unavailable(unavailable)),
                 Err(e) => return Err(SendTurnError::ResumeFailed(e)),
             }
         }
         // Gate the publish below on the worker actually being there.
         if let Err(e) = self.acp_supervisor.wait_until_ready(id).await {
+            if let Some(unavailable) = self.prompt_native_unavailability(id).await {
+                return Err(SendTurnError::Unavailable(unavailable));
+            }
             return match e {
                 crate::acp::supervisor::SupervisorError::UnknownSession(_) => {
                     Err(SendTurnError::WorkerNotReady)
                 }
+                crate::acp::supervisor::SupervisorError::Acp(
+                    crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailable),
+                ) => Err(SendTurnError::Unavailable(unavailable)),
                 other => Err(SendTurnError::ResumeFailed(other)),
             };
         }
@@ -980,7 +1046,12 @@ impl SessionService {
         ) {
             if let Some(mode_id) = &acp_mode_id {
                 if let Err(e) = self.acp_supervisor.set_mode(id, mode_id).await {
-                    return Err(SendTurnError::ModeApplication(e));
+                    return Err(match e {
+                        crate::acp::supervisor::SupervisorError::Acp(
+                            crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailable),
+                        ) => SendTurnError::Unavailable(unavailable),
+                        other => SendTurnError::ModeApplication(other),
+                    });
                 }
             }
         }
@@ -988,6 +1059,9 @@ impl SessionService {
             && crate::process::worker_registry::stop_requested(id)
         {
             return Err(SendTurnError::RevivalRefused);
+        }
+        if let Some(unavailable) = self.prompt_native_unavailability(id).await {
+            return Err(SendTurnError::Unavailable(unavailable));
         }
         // Persist the admitted turn before forwarding it to the agent.
         let disposition = self
@@ -1001,6 +1075,18 @@ impl SessionService {
                 caller.message_origin().map(str::to_string),
             )
             .await;
+        #[cfg(test)]
+        {
+            let gate = self
+                .native_prompt_send_gate
+                .lock()
+                .expect("prompt send gate poisoned")
+                .take();
+            if let Some((arrived, released)) = gate {
+                let _ = arrived.send(());
+                let _ = released.await;
+            }
+        }
         let outcome = match disposition {
             crate::acp::supervisor::PromptDisposition::Forward => {
                 self.acp_supervisor.send_prompt(id, text, attachments).await
@@ -1013,6 +1099,9 @@ impl SessionService {
         };
         match outcome {
             Ok(()) => Ok(()),
+            Err(crate::acp::supervisor::SupervisorError::Acp(
+                crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailable),
+            )) => Err(SendTurnError::Unavailable(unavailable)),
             // Intentional override of the canonical UnknownSession 404.
             Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) if needs_resume => {
                 Err(SendTurnError::WorkerNotReady)
@@ -1579,7 +1668,7 @@ impl SessionService {
     /// for the whole scan, which stalls event recording daemon-wide.
     pub(crate) async fn fold_control_state(&self, id: &str) -> crate::acp::state::AcpState {
         use crate::acp::state::{AcpSessionId, AcpState, AgentName};
-        let (agent, model) = {
+        let (agent, model, identity) = {
             let instances = self.instances.read().await;
             instances
                 .iter()
@@ -1588,17 +1677,25 @@ impl SessionService {
                     (
                         AgentName(i.agent_name.clone().unwrap_or_else(|| i.tool.clone())),
                         i.agent_model.clone(),
+                        i.is_structured().then(|| {
+                            (
+                                i.source_profile.clone(),
+                                i.created_at,
+                                i.lifecycle_generation,
+                            )
+                        }),
                     )
                 })
-                .unwrap_or_else(|| (AgentName(String::new()), None))
+                .unwrap_or_else(|| (AgentName(String::new()), None, None))
         };
+        let current = self.acp_supervisor.current_native_availability(id).await;
         let store = Arc::clone(&self.acp_event_store);
         let cache = Arc::clone(&self.acp_control_cache);
         let sid = id.to_string();
         // The hydrate closure runs under the cache's per-session lock and does a locking
         // SQLite scan, so the whole thing goes off the runtime rather than just the scan.
         tokio::task::spawn_blocking(move || {
-            cache.get_or_hydrate(&sid.clone(), || {
+            let reduced = cache.get_or_hydrate(&sid, || {
                 let mut reduced = AcpState::new(AcpSessionId(sid.clone()), agent, model);
                 let mut last_seq = 0;
                 for (seq, event) in store.replay_from(&sid, 0) {
@@ -1606,7 +1703,8 @@ impl SessionService {
                     last_seq = seq;
                 }
                 (reduced, last_seq)
-            })
+            });
+            cache.project_native(&sid, reduced, identity, current)
         })
         .await
         .unwrap_or_else(|_| {
@@ -1618,6 +1716,67 @@ impl SessionService {
         })
     }
 
+    pub(crate) async fn native_control_projection(
+        &self,
+        id: &str,
+        historical: Option<(u64, crate::acp::state::NativeEventSubject)>,
+        control_seq: u64,
+    ) -> crate::acp::state::NativeAvailabilityProjection {
+        let identity = self
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == id && row.is_structured())
+            .map(|row| {
+                (
+                    row.source_profile.clone(),
+                    row.created_at,
+                    row.lifecycle_generation,
+                )
+            });
+        let current = self.acp_supervisor.current_native_availability(id).await;
+        let prompt_wake_eligible = current.is_none()
+            && self
+                .known_prompt_wake_eligibility(id, identity.as_ref())
+                .await;
+        let cache = Arc::clone(&self.acp_control_cache);
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            cache
+                .native_projection(&id, historical, control_seq, identity, current)
+                .with_prompt_wake_eligibility(prompt_wake_eligible)
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    /// Existing WorkerDown/startup prompt-intent admission, not native health.
+    /// The qualified projection separately rejects unreadable/refused owners.
+    async fn known_prompt_wake_eligibility(
+        &self,
+        id: &str,
+        identity: Option<&(String, chrono::DateTime<chrono::Utc>, u64)>,
+    ) -> bool {
+        let Some((profile, created_at, generation)) = identity else {
+            return false;
+        };
+        let known = self.instances.read().await.iter().any(|row| {
+            row.id == id
+                && row.is_structured()
+                && row.archived_at.is_none()
+                && row.trashed_at.is_none()
+                && row.source_profile == *profile
+                && row.created_at == *created_at
+                && row.lifecycle_generation == *generation
+        });
+        known
+            && matches!(
+                self.acp_supervisor.worker_state(id).await,
+                crate::daemon::AcpWorkerState::Absent | crate::daemon::AcpWorkerState::Resuming
+            )
+    }
+
     /// The sidebar status right after `seq`, rebuilt from the durable log. For
     /// a frame published while the control cache was cold, so no status rode
     /// with it; exact for whatever the journal's retention still holds.
@@ -1627,6 +1786,21 @@ impl SessionService {
         seq: u64,
     ) -> Option<crate::session::Status> {
         use crate::acp::state::{AcpSessionId, AcpState, AgentName};
+        let identity = self
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == id && row.is_structured())
+            .map(|row| {
+                (
+                    row.source_profile.clone(),
+                    row.created_at,
+                    row.lifecycle_generation,
+                )
+            });
+        let current = self.acp_supervisor.current_native_availability(id).await;
+        let cache = Arc::clone(&self.acp_control_cache);
         let store = Arc::clone(&self.acp_event_store);
         let sid = id.to_string();
         tokio::task::spawn_blocking(move || {
@@ -1637,7 +1811,11 @@ impl SessionService {
                 let _ = state.apply_event(at, event);
                 folded = true;
             }
-            folded.then(|| state.sidebar_status())
+            folded.then(|| {
+                cache
+                    .project_native(&sid, state, identity, current)
+                    .sidebar_status()
+            })
         })
         .await
         .ok()
@@ -1723,7 +1901,12 @@ impl SessionService {
         // behind every session's events, so it still reads Idle for as long as that task is
         // behind.
         let control = self.fold_control_state(id).await;
-        if control.turn_active || control.sidebar_phase == crate::acp::state::SidebarPhase::Error {
+        if control.turn_active
+            || control.connection_unavailable.is_some()
+            || control.sidebar_phase == crate::acp::state::SidebarPhase::Error
+            || (control.sidebar_phase == crate::acp::state::SidebarPhase::PromptFailed
+                && !control.connection_ready)
+        {
             return;
         }
 
@@ -1820,6 +2003,16 @@ impl SessionService {
     /// `is_idle_dormant` so a session woken by another path between the
     /// reconciler snapshot and this call is left untouched.
     pub(crate) async fn wake_dormant_for_queue_drain(self: &Arc<Self>, id: &str) {
+        let control = self.fold_control_state(id).await;
+        if control.connection_unavailable.is_some()
+            || matches!(
+                control.sidebar_phase,
+                crate::acp::state::SidebarPhase::Error
+                    | crate::acp::state::SidebarPhase::PromptFailed
+            )
+        {
+            return;
+        }
         self.mutate_instance_persisted(id, |inst| {
             if inst.is_idle_dormant() {
                 inst.idle_dormant_since = None;
@@ -2010,6 +2203,10 @@ impl SessionService {
         idle_dormant: bool,
         no_revive: bool,
     ) -> crate::acp::dispatch::PromptDispatch {
+        let control = self.fold_control_state(id).await;
+        if let Some(unavailability) = control.connection_unavailable {
+            return crate::acp::dispatch::PromptDispatch::Unavailable { unavailability };
+        }
         let running = self.acp_supervisor.is_running(id).await;
         if no_revive && !running {
             return crate::acp::dispatch::PromptDispatch::Queued {
@@ -2024,7 +2221,7 @@ impl SessionService {
             idle_dormant,
             rate_limit_parked,
         };
-        let dispatch = crate::acp::dispatch::decide(&self.fold_control_state(id).await, liveness);
+        let dispatch = crate::acp::dispatch::decide(&control, liveness);
         crate::acp::dispatch::hold_solo_command(dispatch, self.is_solo_command(id, text).await)
     }
 
@@ -2104,6 +2301,22 @@ impl SessionService {
         if tx.send((id.to_string(), ack)).is_ok() {
             let _ = released.await;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_native_prompt_send_gate(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (arrived, arrival) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        *self
+            .native_prompt_send_gate
+            .lock()
+            .expect("prompt send gate poisoned") = Some((arrived, released));
+        (arrival, release)
     }
 
     /// Report every [`Self::prompt_submission`] claim at the one moment a
@@ -3992,6 +4205,7 @@ mod tests {
                     store: Arc::new(Storage::open_unwatched("default").unwrap()),
                     generation: stored.lifecycle_generation,
                     namespace: None,
+                    native_scope: None,
                 };
                 let mut child = crate::acp::supervisor::with_durable_launch(
                     Some(admission),

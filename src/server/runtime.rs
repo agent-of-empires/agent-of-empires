@@ -212,12 +212,16 @@ impl NativeRuntime {
         state: &Arc<AppState>,
     ) -> anyhow::Result<Arc<PublishedSnapshot>> {
         let _lane = self.publish_lane.lock().await;
+        // Producers retain lifecycle while taking the native flock; native
+        // observers retain that flock while publishing. Never acquire lifecycle
+        // under publication or instances exclusion and complete that lock cycle.
+        let worker_states = state.acp_supervisor.worker_states_snapshot().await;
         let _publication = state.publication.read().await;
         let mutation_epoch = state
             .mutation_epoch
             .load(std::sync::atomic::Ordering::SeqCst);
         let health = state.canonical_health.read().await.clone();
-        let sessions = super::api::sessions::project_sessions(state).await;
+        let sessions = super::api::sessions::project_sessions(state, &worker_states).await;
         let metadata = state.canonical_metadata.read().await;
         let workspace_ordering =
             super::api::sessions::compute_merged_ordering(&sessions, &metadata.workspace_ordering);
@@ -353,6 +357,10 @@ impl NativeRuntime {
 
     pub(crate) fn has_subscribers(&self) -> bool {
         self.snapshots.receiver_count() != 0
+    }
+
+    pub(crate) fn subscribe_snapshots(&self) -> watch::Receiver<Option<Arc<PublishedSnapshot>>> {
+        self.snapshots.subscribe()
     }
 
     /// Replace the advisory creation progress. Never fails and never blocks:
@@ -688,6 +696,31 @@ pub(crate) async fn publish_loop(state: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn worker_snapshot_precedes_publication_and_instance_exclusion() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let state = crate::server::test_support::build_test_app_state(vec![]);
+        let captured = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        crate::acp::supervisor::before_worker_states_snapshot_for_test({
+            let state = state.clone();
+            let captured = captured.clone();
+            move || {
+                assert!(
+                    state.publication.try_write().is_ok(),
+                    "publication→lifecycle would close the producer/native-flock cycle"
+                );
+                assert!(
+                    state.instances.try_write().is_ok(),
+                    "row projection must not hold instances while acquiring lifecycle"
+                );
+                captured.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        state.runtime.publish(&state).await.unwrap();
+        assert!(captured.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     #[cfg(unix)]
     #[tokio::test]

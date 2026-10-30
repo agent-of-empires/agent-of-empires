@@ -2,7 +2,13 @@
 
 import { useCallback, useSyncExternalStore } from "react";
 import { lastUserBoundaryIndex } from "../../lib/acpHistoryWindow";
-import { emptyAcpState, normaliseTurnState, type AcpState, type BackgroundAgent } from "../../lib/acpTypes";
+import {
+  emptyAcpState,
+  normaliseTurnState,
+  revokeNativeAuthority,
+  type AcpState,
+  type BackgroundAgent,
+} from "../../lib/acpTypes";
 import {
   STORAGE_KEY_PREFIX,
   STATE_TTL_MS,
@@ -70,6 +76,7 @@ export function evictOldestPersistedAcpState(currentKey: string): boolean {
 // Optimistic rows and in-flight ids are ephemeral, and attachment bytes would blow the quota
 // (text alone would drain a degraded prompt on reload), so none of them are persisted.
 function toPersistedState(state: AcpState): AcpState {
+  state = revokeNativeAuthority(state);
   const base: AcpState =
     state.optimisticRows.length > 0 || state.inflightPromptIds.length > 0 || state.interactionError
       ? { ...state, optimisticRows: [], inflightPromptIds: [], interactionError: null }
@@ -90,6 +97,7 @@ export function persistState(sessionId: string, state: AcpState): void {
 // Rows with no user prompt and older history pending would open mid-turn. Drop the rows and cursor so replay
 // reloads the transcript from the tail; folded control state keeps its own cursor and is untouched.
 function reopenState(state: AcpState): AcpState {
+  state = revokeNativeAuthority(state);
   if (state.oldestSeq > 1 && lastUserBoundaryIndex(state.activity) < 0) return { ...state, activity: [], oldestSeq: 0 };
   return state;
 }

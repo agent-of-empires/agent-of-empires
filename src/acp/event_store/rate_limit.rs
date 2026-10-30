@@ -162,13 +162,18 @@ impl EventStore {
         };
         let terminator: Option<String> = logged(
             conn.query_row(
-                "SELECT event_json FROM acp_events
+                concat!(
+                    "SELECT event_json FROM acp_events
                  WHERE session_id = ?1
                    AND seq > ?2
                    AND (json_extract(event_json, '$.Stopped') IS NOT NULL
-                     OR json_extract(event_json, '$.AgentStartupError') IS NOT NULL)
+                     OR json_extract(event_json, '$.AgentStartupError') IS NOT NULL
+                     OR ",
+                    native_channel_loss_sql!("event_json"),
+                    ")
                  ORDER BY seq ASC
-                 LIMIT 1",
+                 LIMIT 1"
+                ),
                 params![session_id, prompt_seq],
                 |row| row.get(0),
             )
@@ -208,7 +213,7 @@ impl EventStore {
         };
         logged(
             conn.query_row(
-                "SELECT IFNULL(SUM(discriminant IN ('UserPromptSent', 'UserDiffCommentsPrompt')), 0),
+                concat!("SELECT IFNULL(SUM(discriminant IN ('UserPromptSent', 'UserDiffCommentsPrompt')), 0),
                         IFNULL(SUM(discriminant IN ('AgentMessageChunk', 'ToolCallStarted')), 0)
                  FROM acp_events
                  WHERE session_id = ?1
@@ -217,7 +222,8 @@ impl EventStore {
                        SELECT IFNULL(MAX(seq), 0) FROM acp_events
                        WHERE session_id = ?1
                          AND seq < ?2
-                         AND discriminant IN ('Stopped', 'AgentStartupError'))",
+                         AND (discriminant IN ('Stopped', 'AgentStartupError')
+                              OR ", native_channel_loss_sql!("event_json"), "))"),
                 params![session_id, stop_seq],
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
             )
@@ -265,11 +271,12 @@ impl EventStore {
 }
 
 /// The log derivation of the streak: automatic resume breadcrumbs after the
-/// last organic boundary whose next prompt, startup error, or resume is the
+/// last organic boundary whose next prompt, loss, startup error, or resume is the
 /// redelivered `UserPromptSent`. `bounded` restricts it to rows below `?2`.
 fn streak_sql(events_table: &str, bounded: bool) -> String {
     let below = if bounded { "AND r.seq < ?2" } else { "" };
     let next_below = if bounded { "AND n.seq < ?2" } else { "" };
+    let native_loss = native_channel_loss_sql!("n.event_json");
     format!(
         "SELECT COUNT(*) FROM {events_table} r
          WHERE r.session_id = ?1
@@ -290,8 +297,8 @@ fn streak_sql(events_table: &str, bounded: bool) -> String {
                WHERE n.session_id = ?1
                  AND n.seq > r.seq
                  {next_below}
-                 AND n.discriminant IN (
-                       'UserPromptSent', 'AgentStartupError', 'RateLimitAutoResumed')
+                 AND (n.discriminant IN ('UserPromptSent', 'AgentStartupError', 'RateLimitAutoResumed')
+                      OR {native_loss})
                ORDER BY n.seq ASC
                LIMIT 1
            ), '') = 'UserPromptSent'"
@@ -322,6 +329,7 @@ pub(super) fn update_rate_limit_budget(
         Event::RateLimitAutoResumed { manual: true, .. } | Event::AgentStartupError { .. } => {
             Step::Disarm
         }
+        event if event.is_channel_loss() => Step::Disarm,
         Event::UserPromptSent { .. } => Step::Spend,
         Event::AgentSwitched { .. } => Step::Reset,
         Event::Stopped { reason } if reason != "rate_limited" => Step::Reset,
@@ -381,6 +389,7 @@ fn seed_budget_from_log(
         )
         .unwrap_or(0);
     // Armed iff the newest relevant event before `seq` is an automatic resume.
+    let native_loss = native_channel_loss_sql!("d.event_json");
     let armed: i64 = conn
         .query_row(
             &format!(
@@ -391,8 +400,8 @@ fn seed_budget_from_log(
                             THEN 1 ELSE 0 END
                     FROM {events_table} d
                     WHERE d.session_id = ?1 AND d.seq < ?2
-                      AND d.discriminant IN ('UserPromptSent', 'AgentStartupError',
-                                             'RateLimitAutoResumed')
+                      AND (d.discriminant IN ('UserPromptSent', 'AgentStartupError', 'RateLimitAutoResumed')
+                           OR {native_loss})
                     ORDER BY d.seq DESC LIMIT 1
                 ), 0)"
             ),
@@ -442,6 +451,7 @@ mod tests {
                     auto_resume(),
                     Event::AgentStartupError {
                         message: "spawn failed".into(),
+                        native_subject: None,
                     },
                 ],
                 true,
@@ -478,6 +488,8 @@ mod tests {
                     },
                     Event::AcpSessionAssigned {
                         acp_session_id: "acp-2".into(),
+                        connection_ready: false,
+                        native_subject: None,
                     },
                 ],
                 false,
@@ -664,6 +676,7 @@ mod tests {
                 auto_resume(),
                 Event::AgentStartupError {
                     message: "boom".into(),
+                    native_subject: None,
                 },
             ],
         );
@@ -798,6 +811,55 @@ mod tests {
             .record("s-seed", 23, &user_prompt("run the nightly task"))
             .unwrap();
         assert_eq!(store.rate_limit_redelivery_streak("s-seed"), 2);
+    }
+
+    #[test]
+    fn admission_refusal_does_not_consume_native_retry_budget_boundaries() {
+        for (source, expected) in [
+            (crate::acp::state::AcpConnectionSource::RunnerRecord, 1),
+            (crate::acp::state::AcpConnectionSource::Native, 0),
+        ] {
+            let (_tmp, store) = open_store(1000);
+            record_from(
+                &store,
+                "retained",
+                1,
+                [
+                    auto_resume(),
+                    Event::AcpConnectionUnavailable {
+                        source,
+                        cause: if source == crate::acp::state::AcpConnectionSource::RunnerRecord {
+                            crate::acp::state::AcpConnectionCause::ControlProtocolUnknown
+                        } else {
+                            crate::acp::state::AcpConnectionCause::StdoutEof
+                        },
+                        phase: if source == crate::acp::state::AcpConnectionSource::RunnerRecord {
+                            crate::acp::state::AcpConnectionPhase::Establishing
+                        } else {
+                            crate::acp::state::AcpConnectionPhase::Established
+                        },
+                        native_subject: None,
+                    },
+                    user_prompt("already governed redelivery"),
+                ],
+            );
+            assert_eq!(store.rate_limit_redelivery_streak("retained"), expected);
+            store
+                .conn()
+                .execute(
+                    &format!(
+                        "DELETE FROM {} WHERE session_id = ?1",
+                        store.schema.rate_limit_budgets_table()
+                    ),
+                    params!["retained"],
+                )
+                .unwrap();
+            assert_eq!(
+                store.rate_limit_redelivery_streak("retained"),
+                expected,
+                "the log fallback must agree with the durable budget"
+            );
+        }
     }
 
     #[test]

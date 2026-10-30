@@ -23,10 +23,19 @@ pub async fn get_recent_projects() -> Json<RecentProjectsResponse> {
     Json(RecentProjectsResponse { projects })
 }
 
-pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionResponse> {
+/// Worker presence is sampled before publication/instance exclusion, never under it.
+pub(crate) async fn project_sessions(
+    state: &Arc<AppState>,
+    worker_states: &HashMap<
+        String,
+        (
+            crate::daemon::AcpWorkerState,
+            Option<crate::daemon::AcpWorkerStart>,
+        ),
+    >,
+) -> Vec<SessionResponse> {
     let instances = state.instances.read().await;
     let claude_fullscreen = crate::claude_settings::read_tui_fullscreen();
-    let worker_states = state.acp_supervisor.worker_states_snapshot().await;
     // Every positional overlay shares this filtered view.
     let scoped_instances: Vec<&Instance> = instances
         .iter()

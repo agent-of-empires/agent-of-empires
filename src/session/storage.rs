@@ -1264,6 +1264,20 @@ impl NativeInputStore {
         acquire_open_storage_flock(file, &path)
     }
 
+    pub(crate) fn try_acquire_lifecycle_lock(&self) -> Result<Option<StorageFlock>> {
+        let files = self
+            .storage
+            .files
+            .as_deref()
+            .context("unbound input store")?;
+        let (file, _) = files.directory.open_lock(&self.lifecycle_leaf)?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Some(StorageFlock { file })),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Inspect the current directory entry, never a retained data-file descriptor.
     pub(crate) fn revision(&self) -> Result<NativeInputRevision> {
         self.storage.verify_bound_profile()?;
@@ -1295,6 +1309,30 @@ impl NativeInputStore {
             .directory
             .open_lock(std::ffi::OsStr::new(STORAGE_LOCK_FILENAME))?;
         let _flock = acquire_open_storage_shared_flock(file, &path)?;
+        self.read_complete_locked()
+    }
+
+    /// The producer must never wait on the profile-wide writer while holding
+    /// global worker/lifecycle exclusion, even after obtaining its native flock.
+    pub(crate) fn try_load_complete(&self) -> Result<Option<(NativeInputRevision, Vec<Instance>)>> {
+        let files = self
+            .storage
+            .files
+            .as_deref()
+            .context("unbound input store")?;
+        let (file, _) = files
+            .directory
+            .open_lock(std::ffi::OsStr::new(STORAGE_LOCK_FILENAME))?;
+        match FileExt::try_lock_shared(&file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+        let _flock = StorageFlock { file };
+        self.read_complete_locked().map(Some)
+    }
+
+    fn read_complete_locked(&self) -> Result<(NativeInputRevision, Vec<Instance>)> {
         let revision = self.revision()?;
         let rows = self.storage.load_instances_complete()?;
         anyhow::ensure!(

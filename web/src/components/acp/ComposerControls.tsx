@@ -359,7 +359,7 @@ function sendButtonClass(disabled: boolean, extra = "") {
   ].join(" ");
 }
 
-/** Remains clickable while disconnected so `sendPrompt` can queue the message. */
+/** The caller permits either current native input or an explicitly governed wake intent. */
 export function SendButton({
   connected = true,
   disabled = false,

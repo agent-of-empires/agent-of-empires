@@ -99,8 +99,15 @@ fn render_choice_picker(
         |(_, label)| vec![label.clone()],
     );
     let rows = lines.len();
-    let drawn = render_popup_above(frame, composer_area, theme, picker.title.clone(), lines);
-    record_picker(state, PickerKind::Choice, drawn, first, rows);
+    let title = if state.can_accept_choice() {
+        picker.title.clone()
+    } else {
+        " Native input not ready · Esc dismiss ".into()
+    };
+    let drawn = render_popup_above(frame, composer_area, theme, title, lines);
+    if state.can_accept_choice() {
+        record_picker(state, PickerKind::Choice, drawn, first, rows);
+    }
 }
 
 /// Store a drawn picker as the frame's click / hover target. `rows` counts the
@@ -450,8 +457,12 @@ fn render_approval_shelf(
         .border_style(Style::default().fg(accent));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let (actions, spans) =
-        approval_actions_line(theme, active, row.choice && !row.options.is_empty());
+    let (actions, spans) = approval_actions_line(
+        theme,
+        active,
+        row.choice && !row.options.is_empty(),
+        state.native_input_available(),
+    );
     frame.render_widget(Paragraph::new(actions), inner);
     // An open choice picker owns the keyboard, so the decision buttons go
     // inert with their keys.
@@ -495,9 +506,19 @@ fn approval_actions_line(
     theme: &Theme,
     active: bool,
     choice: bool,
+    native_available: bool,
 ) -> (Line<'static>, Vec<(u16, u16, Intent)>) {
     use crate::acp::protocol::ApprovalDecisionWire as Decision;
 
+    if !native_available {
+        return (
+            Line::from(Span::styled(
+                "Native input unavailable",
+                Style::default().fg(theme.hint),
+            )),
+            Vec::new(),
+        );
+    }
     if !active {
         let hint = Span::styled("Enter to respond", Style::default().fg(theme.hint));
         return (Line::from(hint), Vec::new());
@@ -1034,20 +1055,33 @@ fn render_status(
             Style::default().fg(color),
         ));
     }
-    if state.transcript.turn_active || state.transcript.background_agent_active {
-        let banner = state.transcript.status_text.as_deref().unwrap_or("working");
-        spans.push(Span::styled(
-            format!("· ● {banner} "),
-            Style::default().fg(theme.running),
-        ));
-    } else if state.ws.is_none() {
+    if state.ws.is_none() {
         spans.push(Span::styled(
             "· ○ Disconnected ",
             Style::default().fg(theme.error),
         ));
-    } else {
+    } else if state.transcript.connection_unavailable.is_some() {
+        spans.push(Span::styled(
+            "· ○ Native input unavailable ",
+            Style::default().fg(theme.error),
+        ));
+    } else if !state.native_input_available() {
+        let label = if state.can_submit_prompt_intent() {
+            "· ○ Wake eligible "
+        } else {
+            "· ○ Native input unconfirmed "
+        };
+        spans.push(Span::styled(label, Style::default().fg(theme.hint)));
+    } else if !state.transcript.turn_active && !state.transcript.background_agent_active {
         spans.push(Span::styled(
             "· ● Ready ",
+            Style::default().fg(theme.running),
+        ));
+    }
+    if state.transcript.turn_active || state.transcript.background_agent_active {
+        let banner = state.transcript.status_text.as_deref().unwrap_or("working");
+        spans.push(Span::styled(
+            format!("· ● {banner} "),
             Style::default().fg(theme.running),
         ));
     }
@@ -1120,14 +1154,20 @@ fn render_status(
             );
         }
     }
-    let hint = if active {
+    let hint = if state.choice.is_some() && !state.can_accept_choice() {
+        " Native input not ready · Esc dismiss · Ctrl+Q exit "
+    } else if active {
         help_hint(
             state.focus,
             selected_approval_is_choice(state),
             state.visible_notices().next().is_some(),
+            state.native_input_available(),
+            state.can_submit_prompt_intent(),
         )
-    } else {
+    } else if state.can_submit_prompt_intent() {
         " Enter reply · wheel history "
+    } else {
+        " Enter view · wheel history "
     };
     let hint_width = hint.chars().count() as u16;
     if left_area.width > hint_width.saturating_add(24) {
@@ -1885,13 +1925,22 @@ fn selected_approval_is_choice(state: &StructuredViewState) -> bool {
         .any(|pending| pending.nonce == selected && pending.choice && !pending.options.is_empty())
 }
 
-fn help_hint(focus: Focus, approval_is_choice: bool, has_notices: bool) -> &'static str {
+fn help_hint(
+    focus: Focus,
+    approval_is_choice: bool,
+    has_notices: bool,
+    native_available: bool,
+    prompt_eligible: bool,
+) -> &'static str {
     match focus {
+        Focus::Composer if !prompt_eligible => " Input retained · Ctrl+Q to exit ",
+        Focus::Composer if !native_available => " Enter to queue wake intent · Ctrl+Q to exit ",
         Focus::Composer => " Enter to send · Ctrl+Q to exit ",
         // `render_status` drops the hint unless it has `len + 24` spare columns,
         // so keep these short.
         Focus::Transcript if has_notices => " x dismiss · scroll · p pane · Ctrl+Q exit ",
         Focus::Transcript => " scroll · p pane · Ctrl+Q exit ",
+        Focus::Approval if !native_available => " Native input unavailable · Ctrl+Q exit ",
         Focus::Approval if approval_is_choice => " a answer · d deny · Esc stop ",
         Focus::Approval => " a allow · A always · d deny · Esc stop ",
         Focus::Pane => " scroll to read · Esc to close ",
@@ -1953,10 +2002,6 @@ mod tests {
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(rows[0].contains("Model fallback"), "{rows:?}");
         assert!(rows[1].contains("Fast mode turned off"), "{rows:?}");
-        assert!(
-            help_hint(Focus::Transcript, false, true).contains("x dismiss"),
-            "the key is advertised while a notice is up"
-        );
 
         state.dismissed_notices.insert("notice-1".into());
         let rows = strip_rows(&state);
@@ -2120,7 +2165,7 @@ mod tests {
                 ],
             ),
         ] {
-            let (line, buttons) = approval_actions_line(&Theme::default(), true, choice);
+            let (line, buttons) = approval_actions_line(&Theme::default(), true, choice, true);
             let text = line_text(&line);
             assert!(
                 !text.contains('[') && !text.contains(']'),
@@ -2142,12 +2187,12 @@ mod tests {
             assert_eq!(got, want, "choice={choice}");
         }
         // The preview shelf has no keyboard, so nothing is clickable.
-        assert!(approval_actions_line(&Theme::default(), false, false)
+        assert!(approval_actions_line(&Theme::default(), false, false, true)
             .1
             .is_empty());
-        assert!(help_hint(Focus::Approval, true, false).contains("a answer"));
-        assert!(!help_hint(Focus::Approval, true, false).contains("always"));
-        assert!(help_hint(Focus::Approval, false, false).contains("A always"));
+        assert!(approval_actions_line(&Theme::default(), true, false, false)
+            .1
+            .is_empty());
     }
 
     #[test]

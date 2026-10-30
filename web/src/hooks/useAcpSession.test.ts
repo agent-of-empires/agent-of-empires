@@ -9,6 +9,7 @@ import { reportAcpInteraction, type ServerQueuedPrompt } from "../lib/api";
 import { ACP_DIAL_TIMEOUT_MS, ACP_MAX_RETRIES, ACP_WS_STALE_MS, acpRetryDelayMs } from "./acpSession/useAcpConnection";
 import {
   FakeWebSocket,
+  currentControlSnapshot,
   flushAsync,
   installAcpFakes,
   json,
@@ -45,12 +46,17 @@ function render(...args: HookArgs) {
   return renderHook(() => useAcpSession(...args), { wrapper: profileWrapper });
 }
 
-async function openSession(...args: HookArgs) {
+async function openSessionWithReceipt(receipt: Parameters<typeof currentControlSnapshot>[1], ...args: HookArgs) {
   const hook = render(...args);
   await flushAsync();
   lastSocket().open();
   await flushAsync();
+  lastSocket().message(currentControlSnapshot(hook.result.current.state, receipt));
   return hook;
+}
+
+async function openSession(...args: HookArgs) {
+  return openSessionWithReceipt({ ready: true }, ...args);
 }
 
 const posts = (fragment: string) => calls.filter((c) => c.method === "POST" && c.url.includes(fragment));
@@ -443,7 +449,13 @@ describe("sendPrompt outcomes", () => {
 
     it("wakes a snoozed session before sending", async () => {
       calls = installAcpFakes(queuedPrompt);
-      const { result } = render("sess-wake", "absent", null, "2099-01-01T00:00:00Z");
+      const { result } = await openSessionWithReceipt(
+        { ready: false, wakeEligible: true },
+        "sess-wake",
+        "absent",
+        null,
+        "2099-01-01T00:00:00Z",
+      );
       await flushAsync();
       await act(() => result.current.sendPrompt("wake me up"));
       await flushAsync();
@@ -468,7 +480,7 @@ describe("sendPrompt outcomes", () => {
 
     it("does not call wake endpoints for a live session", async () => {
       calls = installAcpFakes(queuedPrompt);
-      const { result } = render("sess-live", "absent", null, null);
+      const { result } = await openSession("sess-live", "absent", null, null);
       await flushAsync();
       await act(() => result.current.sendPrompt("just a prompt"));
       await flushAsync();
@@ -478,7 +490,13 @@ describe("sendPrompt outcomes", () => {
 
     it("sends nothing when the snooze wake fails", async () => {
       calls = installAcpFakes(failingWake("/snooze"));
-      const { result } = render("sess-wake-fail", "absent", null, "2099-01-01T00:00:00Z");
+      const { result } = await openSessionWithReceipt(
+        { ready: false, wakeEligible: true },
+        "sess-wake-fail",
+        "absent",
+        null,
+        "2099-01-01T00:00:00Z",
+      );
       await flushAsync();
       await act(() => result.current.sendPrompt("wake me up"));
       await flushAsync();
@@ -497,7 +515,7 @@ describe("sendPrompt outcomes", () => {
       if (url.includes("/queue") && method === "GET") return json([]);
       return undefined;
     });
-    const { result } = render("sess-capacity", "running", null, null);
+    const { result } = await openSession("sess-capacity", "running", null, null);
     await flushAsync();
     await act(() => result.current.sendPrompt("no room at the inn"));
     await flushAsync();
@@ -524,12 +542,17 @@ describe("sendPrompt outcomes", () => {
         return undefined;
       };
 
-    // The re-queue keys on the daemon's `worker_not_ready`, not on this flag: a park the client
-    // has not learned about yet must not cost the prompt, so BOTH rows re-enqueue. The flag is
-    // still asserted because `canSendQueuedNow` reads it.
+    // Replay flags are not admission. The explicit current server governor can
+    // report a park the client has not learned about yet.
     it.each([[true], [false]])("parked=%s re-enqueues a 503'd prompt", async (isParked) => {
       calls = installAcpFakes(parked(isParked));
-      const { result } = render(`sess-${tag}`, "running", null, null);
+      const { result } = await openSessionWithReceipt(
+        { ready: false, wakeEligible: true },
+        `sess-${tag}`,
+        "running",
+        null,
+        null,
+      );
       await flushAsync();
       expect(result.current.state[flag]).toBe(isParked);
       await act(() => result.current.sendPrompt("try again after the park"));
@@ -540,7 +563,13 @@ describe("sendPrompt outcomes", () => {
 
     it("offers Send now on a row stranded behind the park", async () => {
       installAcpFakes(parked(true));
-      const { result } = await openSession(`sess-${tag}-send`, "absent", null, null);
+      const { result } = await openSessionWithReceipt(
+        { ready: false, wakeEligible: true },
+        `sess-${tag}-send`,
+        "absent",
+        null,
+        null,
+      );
       expect(result.current.status).toBe("open");
       expect(result.current.canSendQueuedNow).toBe(true);
     });
@@ -660,6 +689,68 @@ describe("server queue", () => {
     expect(result.current.state.queuedPrompts.map((q) => q.id)).toEqual(["unsent"]);
   });
 
+  it.each([
+    ["legacy", false],
+    ["legacy", true],
+    ["lost", false],
+    ["lost", true],
+  ] as const)(
+    "holds cached intent across %s refusal, then migrates on governed=%s eligibility",
+    async (refusal, governed) => {
+      const id = `sess-cache-${refusal}-${governed}`;
+      const queuedAt = "2026-01-01T00:00:00.000Z";
+      localStorage.setItem(
+        `${STORAGE_KEY_PREFIX}${id}`,
+        JSON.stringify({
+          savedAt: Date.now(),
+          state: {
+            ...emptyAcpState(),
+            connectionReady: true,
+            nativeSnapshotSeq: 42,
+            queuedPrompts: [
+              { id: "unsent", text: "cached intent", queuedAt, pending: true },
+              { id: "drained", text: "already delivered", queuedAt, pending: false },
+            ],
+          },
+        }),
+      );
+      const { result } = render(id);
+      await flushAsync();
+      lastSocket().open();
+      await flushAsync();
+      expect(calls.some((call) => call.method === "GET" && call.url.includes("/queue"))).toBe(true);
+      expect(posts("/queue")).toHaveLength(0);
+      expect(result.current.state.queuedPrompts).toMatchObject([{ id: "unsent", pending: true }]);
+
+      lastSocket().message(
+        currentControlSnapshot(result.current.state, {
+          ready: false,
+          unavailable: refusal === "lost" ? { source: "native", cause: "stdout_eof", phase: "established" } : null,
+        }),
+      );
+      await flushAsync();
+      expect(posts("/queue")).toHaveLength(0);
+      expect(result.current.state.queuedPrompts).toMatchObject([{ id: "unsent", pending: true }]);
+
+      lastSocket().message(
+        currentControlSnapshot(result.current.state, {
+          ready: !governed,
+          wakeEligible: governed,
+        }),
+      );
+      await flushAsync();
+      expect(posts("/queue").map((call) => JSON.parse(call.body!).id)).toEqual(["unsent"]);
+      expect(result.current.state.queuedPrompts).toMatchObject([{ id: "unsent" }]);
+      expect(result.current.state.queuedPrompts[0]?.pending).not.toBe(true);
+      expect(serverQueue.has("drained")).toBe(false);
+      expect(posts("/acp/prompt")).toHaveLength(0);
+
+      lastSocket().message(currentControlSnapshot(result.current.state, { ready: !governed, wakeEligible: governed }));
+      await flushAsync();
+      expect(posts("/queue")).toHaveLength(1);
+    },
+  );
+
   describe("sendQueuedNow", () => {
     async function sendNow(id: string, prepare: () => void = () => {}) {
       const { result } = await openSession(`sess-${id}`);
@@ -711,7 +802,7 @@ describe("server queue", () => {
 
 describe("setConfigOption", () => {
   it("posts the config id and value", async () => {
-    const { result } = render("sess-cfg");
+    const { result } = await openSession("sess-cfg");
     await flushAsync();
     await act(() => result.current.setConfigOption("model", "claude-sonnet-4-6"));
     const [post] = posts("/api/sessions/sess-cfg/acp/config-option");
@@ -729,7 +820,7 @@ describe("setConfigOption", () => {
     ],
   ])("clears pending and reports %s", async (_label, respond, error) => {
     installAcpFakes(({ url }) => (url.includes("/acp/config-option") ? respond() : undefined));
-    const { result } = render("sess-cfg-fail");
+    const { result } = await openSession("sess-cfg-fail");
     await flushAsync();
     await act(() => result.current.setConfigOption("model", "claude-sonnet-4-6"));
     expect(result.current.state.pendingConfigOption).toBeNull();
@@ -754,5 +845,115 @@ describe("setConfigOption", () => {
     expect(result.current.state.configOptionSwitchFailed?.reason).toBe("rate limited");
     act(() => result.current.dismissConfigOptionSwitchFailed());
     expect(result.current.state.configOptionSwitchFailed).toBeNull();
+  });
+});
+
+describe("current native admission", () => {
+  it("does not treat socket-open as a native receipt or wake permission", async () => {
+    const { result, unmount } = render("sess-open-unknown", "absent", null, "2099-01-01T00:00:00Z");
+    await flushAsync();
+    lastSocket().open();
+    await flushAsync();
+    await act(async () => {
+      await result.current.sendPrompt("retain this unsent intent");
+      await result.current.setConfigOption("model", "other");
+      await result.current.cancelPrompt();
+    });
+    expect(posts("/acp/prompt")).toEqual([]);
+    expect(posts("/queue")).toEqual([]);
+    expect(posts("/config-option")).toEqual([]);
+    expect(posts("/cancel")).toEqual([]);
+    expect(calls.filter((c) => c.method === "PATCH" && c.url.endsWith("/snooze"))).toEqual([]);
+    expect(result.current.state.optimisticRows.map((row) => row.text)).toContain("retain this unsent intent");
+    unmount();
+  });
+
+  it("does not wake or queue from generic Unknown, native loss, or a legacy-owner refusal", async () => {
+    for (const unavailable of [
+      null,
+      { source: "native", cause: "stdout_eof", phase: "established" },
+      { source: "runner_record", cause: "control_protocol_unknown", phase: "establishing" },
+    ] as const) {
+      calls = installAcpFakes();
+      const { result, unmount } = await openSessionWithReceipt(
+        {
+          ready: false,
+          unavailable,
+          wakeEligible: unavailable !== null,
+        },
+        `sess-refused-${unavailable?.source ?? "unknown"}`,
+        "absent",
+        null,
+        "2099-01-01T00:00:00Z",
+      );
+      await act(async () => {
+        await result.current.sendPrompt("must not wake");
+        await result.current.setConfigOption("model", "other");
+      });
+      expect(posts("/acp/prompt")).toEqual([]);
+      expect(posts("/queue")).toEqual([]);
+      expect(posts("/config-option")).toEqual([]);
+      expect(calls.filter((c) => c.method === "PATCH" && c.url.endsWith("/snooze"))).toEqual([]);
+      expect(result.current.canSendQueuedNow).toBe(false);
+      unmount();
+    }
+  });
+
+  it("finishes only its already-authorized snooze intent if its own wake consumes the current eligibility", async () => {
+    let queued: ServerQueuedPrompt[] = [];
+    calls = installAcpFakes(({ url, method, body }) => {
+      if (method === "PATCH" && url.endsWith("/snooze")) {
+        lastSocket().message(currentControlSnapshot(emptyAcpState(), { ready: false }));
+        return json({});
+      }
+      if (url.includes("/queue") && method === "GET") return json(queued);
+      if (url.includes("/acp/prompt")) {
+        queued = [{ id: "governed", seq: 0, text: JSON.parse(body!).text, created_at: "2026-01-01T00:00:00Z" }];
+        return json({ disposition: "queued", queued_id: "governed" }, 202);
+      }
+      return undefined;
+    });
+    const { result } = await openSessionWithReceipt(
+      { ready: false, wakeEligible: true },
+      "sess-governed-wake",
+      "absent",
+      null,
+      "2099-01-01T00:00:00Z",
+    );
+    await act(() => result.current.sendPrompt("one governed intent"));
+    expect(posts("/acp/prompt")).toHaveLength(1);
+    expect(result.current.state.queuedPrompts.map((row) => row.text)).toEqual(["one governed intent"]);
+    await act(() => result.current.setConfigOption("model", "other"));
+    expect(posts("/config-option")).toEqual([]);
+  });
+
+  it("withdraws the receipt on disconnect without erasing the operation diagnostic", async () => {
+    const { result } = await openSession("sess-lost-receipt");
+    lastSocket().message({
+      session_id: "sess-lost-receipt",
+      seq: 1,
+      event: { PromptRuntimeError: { message: "canonical request failure" } },
+    });
+    lastSocket().drop();
+    expect(result.current.state.connectionReady).toBe(false);
+    expect(result.current.state.nativeSnapshotSeq).toBeNull();
+    expect(result.current.state.lastError).toBe("canonical request failure");
+  });
+
+  it("retains the existing explicit initial-start queue intent without enabling native controls", async () => {
+    calls = installAcpFakes(({ url }) =>
+      url.includes("/acp/prompt") ? json({ disposition: "queued", queued_id: "starting-intent" }, 202) : undefined,
+    );
+    const { result } = await openSessionWithReceipt(
+      { ready: false, wakeEligible: true },
+      "sess-initial-intent",
+      "resuming",
+    );
+    await act(() => result.current.sendPrompt("initial explicit intent"));
+    await act(() => result.current.setConfigOption("model", "other"));
+    expect(posts("/acp/prompt")).toHaveLength(1);
+    expect(posts("/config-option")).toEqual([]);
+    expect(result.current.state.queuedPrompts.map((row) => row.text)).toEqual(["initial explicit intent"]);
+    expect(result.current.state.connectionReady).toBe(false);
   });
 });

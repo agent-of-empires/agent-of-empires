@@ -241,6 +241,15 @@ pub(super) async fn reap_rate_limit_resumes(
             skip("not enabled for this profile");
             continue;
         }
+        if state
+            .session_service
+            .prompt_native_unavailability(&id)
+            .await
+            .is_some()
+        {
+            skip("current native control admission is unavailable");
+            continue;
+        }
         let Some(park) = query_store(
             &state.acp_event_store,
             &id,
@@ -345,6 +354,15 @@ pub(super) async fn reap_rate_limit_resumes(
             skip("a prompt submission owns the session");
             continue;
         };
+        if state
+            .session_service
+            .prompt_native_unavailability(&id)
+            .await
+            .is_some()
+        {
+            skip("native control admission changed before continuation installation");
+            continue;
+        }
         let outcome = install_rate_limit_continuation(state, &id, submission).await;
         match outcome {
             ContinuationOutcome::Stands => {
@@ -866,6 +884,8 @@ mod tests {
                 next_seq,
                 &Event::AcpSessionAssigned {
                     acp_session_id: "sid-1".into(),
+                    connection_ready: false,
+                    native_subject: None,
                 },
                 Utc::now().timestamp_millis(),
             )

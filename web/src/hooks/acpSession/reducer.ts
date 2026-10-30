@@ -6,6 +6,8 @@ import {
   applyReducedState,
   deriveTurnActive,
   emptyAcpState,
+  nativeInputAvailable,
+  revokeNativeAuthority,
   mergePrependedActivity,
   mergeServerRows,
   patchServerRow,
@@ -28,7 +30,8 @@ import type { ServerQueuedPrompt } from "../../lib/api";
 
 export type Action =
   | { kind: "frame"; frame: AcpFrame }
-  | { kind: "reduced_state"; state: ReducedState; unchanged: string[] }
+  | { kind: "reduced_state"; state: ReducedState; unchanged: string[]; seq?: number }
+  | { kind: "native_authority_pending" }
   | { kind: "frames"; frames: AcpFrame[]; rows?: ActivityRow[]; oldestSeq?: number }
   | { kind: "prepend"; rows: ActivityRow[]; oldestSeq: number }
   | { kind: "handshake"; frames: AcpFrame[] }
@@ -52,7 +55,7 @@ export type Action =
   | { kind: "dequeue_prompt"; id: string }
   | { kind: "edit_queued_prompt"; id: string; text: string }
   | { kind: "clear_queue" }
-  | { kind: "hydrate_server_queue"; rows: ServerQueuedPrompt[] }
+  | { kind: "hydrate_server_queue"; rows: ServerQueuedPrompt[]; queueAtRead: QueuedPrompt[] }
   | { kind: "confirm_queued_prompt"; id: string }
   | { kind: "dismiss_primer" }
   | { kind: "dismiss_compaction_reminder" }
@@ -143,7 +146,9 @@ export function reducer(state: AcpState, action: Action): AcpState {
     case "frame":
       return applyEvent(state, action.frame);
     case "reduced_state":
-      return applyReducedState(state, action.state, action.unchanged);
+      return applyReducedState(state, action.state, action.unchanged, action.seq);
+    case "native_authority_pending":
+      return revokeNativeAuthority(state);
     case "frames": {
       // Frames feed control state; the transcript comes from the server-folded rows.
       let next = action.frames.reduce(applyEvent, state);
@@ -194,7 +199,7 @@ export function reducer(state: AcpState, action: Action): AcpState {
     case "clear_error":
       return state.interactionError
         ? { ...state, interactionError: null }
-        : { ...state, lastError: null, lastErrorEvidence: null };
+        : { ...state, lastError: null, lastErrorEvidence: null, startupError: null };
     case "approval_resolved_locally": {
       // Don't wait for the broadcast, which the seq dedupe can swallow (#1821).
       const pendingApprovals = state.pendingApprovals.filter((a) => a.nonce !== action.nonce);
@@ -239,12 +244,11 @@ export function reducer(state: AcpState, action: Action): AcpState {
       return {
         ...state,
         optimisticRows: state.optimisticRows.concat(row),
-        startupError: null,
         inflightPromptIds: state.inflightPromptIds.includes(id)
           ? state.inflightPromptIds
           : state.inflightPromptIds.concat(id),
         promptSeq: state.promptSeq + 1,
-        turnActive: true,
+        turnActive: nativeInputAvailable(state) || state.serverTurnActive,
       };
     }
     case "prompt_send_rejected":
@@ -260,23 +264,34 @@ export function reducer(state: AcpState, action: Action): AcpState {
       return settleInflightPrompt({ ...state, optimisticRows }, action.id);
     }
     case "enqueue_prompt": {
+      const existing = state.queuedPrompts.find((q) => q.id === action.id);
       const entry: QueuedPrompt = {
         id: action.id,
         text: action.text,
-        queuedAt: new Date().toISOString(),
+        queuedAt: existing?.queuedAt ?? new Date().toISOString(),
         pending: true,
+        ...(existing?.attachments ? { attachments: existing.attachments } : {}),
         ...(action.attachments && action.attachments.length > 0 ? { attachments: action.attachments } : {}),
       };
-      return { ...state, queuedPrompts: state.queuedPrompts.concat(entry) };
+      return {
+        ...state,
+        queuedPrompts: existing
+          ? state.queuedPrompts.map((q) => (q.id === action.id ? entry : q))
+          : state.queuedPrompts.concat(entry),
+      };
     }
     case "dequeue_prompt":
+      // Even an already-removed row gets a new queue snapshot: the final
+      // acknowledgement must fence reads begun during optimistic delivery.
       return { ...state, queuedPrompts: state.queuedPrompts.filter((q) => q.id !== action.id) };
     case "edit_queued_prompt":
       return mapQueued(state, action.id, (q) => ({ ...q, text: action.text }));
     case "clear_queue":
       return { ...state, queuedPrompts: [] };
     case "hydrate_server_queue":
-      return hydrateServerQueue(state, action.rows);
+      // A GET begun before a local queue change cannot overwrite its outcome,
+      // even when React batches the mutation and hydration actions together.
+      return state.queuedPrompts === action.queueAtRead ? hydrateServerQueue(state, action.rows) : state;
     case "confirm_queued_prompt":
       return mapQueued(state, action.id, (q) => ({ ...q, pending: false }));
     case "dismiss_primer":

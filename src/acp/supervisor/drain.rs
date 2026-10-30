@@ -83,6 +83,17 @@ struct StreamEnd {
     superseded: bool,
 }
 
+enum OwnedPublication {
+    Published,
+    Discarded,
+    Superseded,
+}
+
+struct PublicationWait {
+    fence: Arc<crate::session::NativeInputFence>,
+    custody: Option<Arc<super::teardown::RetiringIdentityScope>>,
+}
+
 #[derive(Debug)]
 enum RestartDecision {
     Respawn(Box<SpawnConfig>),
@@ -167,27 +178,100 @@ impl<S: BroadcastSink> Drain<S> {
     }
 
     /// Fence publication with the installed worker or exact retained retirement custody.
-    async fn publish_owned(&self, lease: &Lease, event: &mut Event) -> bool {
+    async fn publish_owned(&self, lease: &Lease, event: &mut Event) -> OwnedPublication {
+        loop {
+            match self.try_publish_owned(lease, event).await {
+                Ok(result) => return result,
+                Err(wait) => {
+                    // No worker/lifecycle/cache guard survives this wait. The
+                    // unchanged event is retried under every current fence.
+                    let settled = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                        drop(wait.fence.lock_observation_matching(|row| {
+                            wait.custody
+                                .as_ref()
+                                .is_none_or(|custody| custody.matches(row))
+                        })?);
+                        Ok(())
+                    })
+                    .await;
+                    if settled.is_err() {
+                        return OwnedPublication::Superseded;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn try_publish_owned(
+        &self,
+        lease: &Lease,
+        event: &mut Event,
+    ) -> Result<OwnedPublication, PublicationWait> {
         let mut workers = self.workers.lock().await;
         let lifecycle = lock_recover(&self.lifecycle);
         if lifecycle.current_lease(&self.session_id).as_ref() != Some(lease) {
-            return false;
+            return Ok(OwnedPublication::Superseded);
         }
         let handle = match workers.get_mut(&self.session_id) {
             Some(handle) if handle.lease == *lease => Some(handle),
-            Some(_) => return false,
+            Some(_) => return Ok(OwnedPublication::Superseded),
             None => {
                 if lifecycle.phase(&self.session_id) != WorkerPhase::Stopping
                     || !lease.retirement().has_retained_drain()
                 {
-                    return false;
+                    return Ok(OwnedPublication::Superseded);
                 }
                 None
             }
         };
-        if let Some(handle) = handle {
+        let native_owner = handle
+            .as_ref()
+            .and_then(|handle| handle.client.connected_runner())
+            .or_else(|| lease.spawned_runner());
+        let retiring_identity = lease.retirement().identity_scope();
+        let native_scope = if let Some(custody) = &retiring_identity {
+            if native_owner != Some(custody.owner) {
+                return Ok(OwnedPublication::Superseded);
+            }
+            Some(custody.scope.clone())
+        } else {
+            match lease.native_scope() {
+                Ok(scope) => scope,
+                Err(()) => return Ok(OwnedPublication::Superseded),
+            }
+        };
+        let _native_lifecycle = match native_scope.as_ref() {
+            Some(scope) => {
+                match scope.fence.try_lock_observation_matching(|row| {
+                    retiring_identity
+                        .as_ref()
+                        .is_none_or(|custody| custody.matches(row))
+                }) {
+                    Ok(Some(guard)) => Some(guard),
+                    Ok(None) => {
+                        return Err(PublicationWait {
+                            fence: Arc::clone(&scope.fence),
+                            custody: retiring_identity,
+                        })
+                    }
+                    Err(_) => return Ok(OwnedPublication::Superseded),
+                }
+            }
+            None => None,
+        };
+        if retiring_identity.is_some() {
             match event {
-                Event::AcpSessionAssigned { acp_session_id } => {
+                // Custody preserves only the correlated binding, never channel
+                // readiness, turn/status edges or actionable native controls.
+                Event::AcpSessionAssigned {
+                    connection_ready, ..
+                } => *connection_ready = false,
+                _ => return Ok(OwnedPublication::Discarded),
+            }
+        }
+        if let Some(handle) = handle.filter(|_| retiring_identity.is_none()) {
+            match event {
+                Event::AcpSessionAssigned { acp_session_id, .. } => {
                     handle.native_session_id = Some(acp_session_id.clone());
                     if let WorkerKind::Runner { spawn_config } = &mut handle.kind {
                         spawn_config.stored_acp_session_id = Some(acp_session_id.clone());
@@ -216,27 +300,38 @@ impl<S: BroadcastSink> Drain<S> {
                 lease.epoch(),
             ));
         }
+        let native_subject = native_scope.as_ref().map(|scope| {
+            crate::acp::state::NativeEventSubject::channel(scope.context, native_owner, event)
+        });
+        if let Some(subject) = native_subject {
+            event.set_native_subject(subject);
+        }
         self.sink.publish_from_worker(
             &self.session_id,
             next_seq(&self.next_seqs, &self.session_id),
             event,
             lease.epoch(),
+            native_subject,
         );
-        true
+        Ok(OwnedPublication::Published)
     }
 
     async fn pump(&mut self, inbound: &mut mpsc::Receiver<Event>, lease: &Lease) -> StreamEnd {
         let mut end = StreamEnd::default();
         let mut established = false;
         while let Some(mut event) = inbound.recv().await {
-            if let Event::AcpSessionAssigned { acp_session_id } = &event {
+            if let Event::AcpSessionAssigned { acp_session_id, .. } = &event {
                 if let Some(pending) = self.context_reset.take() {
                     let mut reset = Event::SessionContextReset {
                         reason: pending.reason,
                     };
-                    if !self.publish_owned(lease, &mut reset).await {
-                        end.superseded = true;
-                        return end;
+                    match self.publish_owned(lease, &mut reset).await {
+                        OwnedPublication::Published => {}
+                        OwnedPublication::Discarded => continue,
+                        OwnedPublication::Superseded => {
+                            end.superseded = true;
+                            return end;
+                        }
                     }
                     let id = self.session_id.clone();
                     let assigned = acp_session_id.clone();
@@ -261,10 +356,15 @@ impl<S: BroadcastSink> Drain<S> {
                             message: format!(
                                 "Could not commit the isolated native context: {error}"
                             ),
+                            native_subject: None,
                         };
-                        if !self.publish_owned(lease, &mut failure).await {
-                            end.superseded = true;
-                            return end;
+                        match self.publish_owned(lease, &mut failure).await {
+                            OwnedPublication::Published => {}
+                            OwnedPublication::Discarded => continue,
+                            OwnedPublication::Superseded => {
+                                end.superseded = true;
+                                return end;
+                            }
                         }
                         end.startup_failed = true;
                         let client = self
@@ -281,9 +381,16 @@ impl<S: BroadcastSink> Drain<S> {
                     }
                 }
             }
-            if !self.publish_owned(lease, &mut event).await {
-                end.superseded = true;
-                return end;
+            match self.publish_owned(lease, &mut event).await {
+                OwnedPublication::Published => {}
+                OwnedPublication::Discarded => continue,
+                OwnedPublication::Superseded => {
+                    end.superseded = true;
+                    return end;
+                }
+            }
+            if lease.retirement().identity_scope().is_some() {
+                continue;
             }
             match &event {
                 Event::Stopped { reason } => match reason.as_str() {
@@ -291,7 +398,6 @@ impl<S: BroadcastSink> Drain<S> {
                         end.agent_unresponsive = true;
                     }
                     "rate_limited" => end.rate_limited = true,
-                    "stored_session_rejected" => end.startup_failed = true,
                     _ => {}
                 },
                 Event::AgentStartupError { .. } if !established => end.startup_failed = true,
@@ -457,12 +563,16 @@ impl<S: BroadcastSink> Drain<S> {
                 let mut error = Event::AgentStartupError {
                     message: format!(
                         "ACP agent crashed more than {} times in {}s; \
-                             not respawning. Use the web dashboard to retry.",
+                         not respawning. Use the web dashboard to retry.",
                         MAX_RESPAWNS_IN_WINDOW,
                         RESTART_WINDOW.as_secs()
                     ),
+                    native_subject: None,
                 };
-                if !self.publish_owned(lease, &mut error).await {
+                if !matches!(
+                    self.publish_owned(lease, &mut error).await,
+                    OwnedPublication::Published
+                ) {
                     return None;
                 }
             }
@@ -538,6 +648,7 @@ impl<S: BroadcastSink> Drain<S> {
             lease: respawn_lease.clone(),
             expected_lifecycle_generation: None,
             attach_record: None,
+            preserve_owner: false,
             lifecycle: Arc::clone(&self.lifecycle),
             notify: Arc::clone(&self.notify),
         };
@@ -584,9 +695,7 @@ impl<S: BroadcastSink> Drain<S> {
                         let _workers = self.workers.lock().await;
                         let lifecycle = lock_recover(&self.lifecycle);
                         if lifecycle.current_lease(session_id).as_ref() == Some(&respawn_lease) {
-                            self.publish(Event::AgentStartupError {
-                                message: "Prime native termination is unproven; replacement remains blocked".into(),
-                            });
+                            self.publish(Event::AgentStartupError { message: "Prime native termination is unproven; replacement remains blocked".into(), native_subject: None });
                         }
                     }
                     self.settle_retirement(&respawn_lease, settlement).await;
@@ -904,6 +1013,7 @@ impl<S: BroadcastSink> Drain<S> {
                 if !publish_rejection(&e, |event| self.publish(event)) {
                     self.publish(Event::AgentStartupError {
                         message: format!("ACP agent respawn failed: {e}"),
+                        native_subject: None,
                     });
                 }
             }
@@ -1039,6 +1149,114 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn native_flock_contention_releases_global_guards_and_rechecks_before_publication() {
+        let (_home, _temp) = isolate_home();
+        for (supersede, profile_writer) in [(false, false), (true, false), (false, true)] {
+            let storage = crate::session::Storage::new_unwatched("default").unwrap();
+            let mut row = crate::session::Instance::new("native contention", "/tmp");
+            row.source_profile = "default".into();
+            row.view = crate::session::View::Structured;
+            storage
+                .update(|rows, _| {
+                    rows.push(row.clone());
+                    Ok(())
+                })
+                .unwrap();
+            // Seed first, then capture an actual physically bound profile.
+            let storage = Arc::new(crate::session::Storage::open_reference("default").unwrap());
+            let (sink, store, mut frames, _db) = channel_sink();
+            let supervisor = Supervisor::new(sink.clone());
+            let lease = supervisor.test_install_stdio(&row.id).await;
+            lease.set_admission(Some(super::super::LaunchAdmission {
+                store: storage.clone(),
+                generation: row.lifecycle_generation,
+                namespace: None,
+                native_scope: Some(
+                    crate::acp::state::NativeObservationScope::capture(&row, &storage).unwrap(),
+                ),
+            }));
+            let drain = Drain {
+                session_id: row.id.clone(),
+                sink: Arc::clone(&supervisor.sink),
+                workers: Arc::clone(&supervisor.workers),
+                next_seqs: Arc::clone(&supervisor.next_seqs),
+                incompatible_binaries: Arc::clone(&supervisor.incompatible_binaries),
+                lifecycle: Arc::clone(&supervisor.lifecycle),
+                process_control: Arc::clone(&supervisor.process_control),
+                launcher: Arc::clone(&supervisor.launcher),
+                notify: Arc::clone(&supervisor.worker_notify),
+                startup_failures: Arc::clone(&supervisor.startup_failures),
+                pending_context_resets: Arc::clone(&supervisor.pending_context_resets),
+                context_reset: None,
+                respawned_in_place: Arc::clone(&supervisor.respawned_in_place),
+            };
+            let native = if profile_writer {
+                crate::session::acquire_storage_flock(
+                    storage.sessions_path().parent().unwrap(),
+                    crate::session::STORAGE_LOCK_FILENAME,
+                )
+                .unwrap()
+            } else {
+                storage.acquire_instance_lifecycle_lock(&row.id).unwrap()
+            };
+            let mut event = Event::PromptRuntimeError {
+                message: "retain this completed outcome exactly once".into(),
+                evidence: None,
+                native_subject: None,
+            };
+            let publishing = drain.publish_owned(&lease, &mut event);
+            tokio::pin!(publishing);
+            assert!(futures_util::poll!(&mut publishing).is_pending());
+            assert!(supervisor.workers.try_lock().is_ok());
+            assert!(supervisor.lifecycle.try_lock().is_ok());
+            assert!(
+                supervisor.capture_retirement(&row.id).is_ok(),
+                "native-flock owners must still be able to capture lifecycle custody"
+            );
+            assert!(!supervisor.next_seqs.lock().unwrap().contains_key(&row.id));
+            assert!(store.replay_from(&row.id, 0).is_empty());
+            if supersede {
+                storage
+                    .update(|rows, _| {
+                        rows.iter_mut()
+                            .find(|current| current.id == row.id)
+                            .unwrap()
+                            .lifecycle_generation += 1;
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            drop(native);
+            let result = tokio::time::timeout(Duration::from_secs(5), publishing)
+                .await
+                .unwrap();
+            if supersede {
+                assert!(matches!(result, OwnedPublication::Superseded));
+                assert!(!supervisor.next_seqs.lock().unwrap().contains_key(&row.id));
+                assert!(store.replay_from(&row.id, 0).is_empty());
+                assert!(matches!(
+                    frames.try_recv(),
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                ));
+            } else {
+                assert!(matches!(result, OwnedPublication::Published));
+                let frame = frames.try_recv().unwrap();
+                assert_eq!(frame.seq, 1);
+                assert!(
+                    matches!(frame.event.as_ref(), Event::PromptRuntimeError { message, .. }
+                    if message == "retain this completed outcome exactly once")
+                );
+                assert_eq!(store.replay_from(&row.id, 0).len(), 1);
+                assert!(matches!(
+                    frames.try_recv(),
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn an_absent_worker_without_retained_custody_cannot_publish() {
         use crate::acp::state::{AcpState, AgentName};
         let (_home, _temp) = isolate_home();
@@ -1081,6 +1299,8 @@ mod tests {
             events
                 .send(Event::AcpSessionAssigned {
                     acp_session_id: "uncaptured-native-sid".into(),
+                    connection_ready: false,
+                    native_subject: None,
                 })
                 .await
                 .unwrap();
@@ -1128,6 +1348,7 @@ mod tests {
                 ErrorEvidenceSource::LocalPromptResult,
                 ErrorOperation::Prompt,
             )),
+            native_subject: None,
         };
         let (queued, inbound) = mpsc::channel(4);
         queued.send(error()).await.unwrap();
@@ -1301,6 +1522,8 @@ mod tests {
             let drain = sup.start_drain_task(id.into(), lease, rx, None);
             tx.send(Event::AcpSessionAssigned {
                 acp_session_id: "native-context".into(),
+                connection_ready: false,
+                native_subject: None,
             })
             .await
             .unwrap();
@@ -1484,12 +1707,15 @@ mod tests {
             inbound_tx
                 .send(Event::AcpSessionAssigned {
                     acp_session_id: "acp-1".into(),
+                    connection_ready: false,
+                    native_subject: None,
                 })
                 .await
                 .unwrap();
             inbound_tx
                 .send(Event::AgentStartupError {
                     message: "ACP connection failed: native binary failed to launch".into(),
+                    native_subject: None,
                 })
                 .await
                 .unwrap();
@@ -1513,7 +1739,7 @@ mod tests {
                 "{id}: only a registry-backed attached crash re-arms"
             );
             let banner_published = sink.frames.lock().unwrap().iter().any(|(_, _, ev)| {
-                matches!(ev, Event::AgentStartupError { message } if message.contains("crashed more than"))
+                matches!(ev, Event::AgentStartupError { message, .. } if message.contains("crashed more than"))
             });
             assert!(
                 !banner_published,
@@ -1600,9 +1826,12 @@ mod tests {
         }];
         let startup_error = Event::AgentStartupError {
             message: "ACP connection failed: native binary failed to launch".into(),
+            native_subject: None,
         };
         let established = Event::AcpSessionAssigned {
             acp_session_id: "acp-1".into(),
+            connection_ready: false,
+            native_subject: None,
         };
         let cases = [
             ("s-rl", rate_limited, false, false),
@@ -1655,7 +1884,7 @@ mod tests {
             let crash_messages = published
                 .iter()
                 .filter(|ev| {
-                    matches!(ev, Event::AgentStartupError { message } if message.contains("crashed more than"))
+                    matches!(ev, Event::AgentStartupError { message, .. } if message.contains("crashed more than"))
                 })
                 .count();
             assert_eq!(crash_messages, usize::from(expect_crash_message), "{id}");
@@ -1685,6 +1914,8 @@ mod tests {
             sender
                 .send(Event::AcpSessionAssigned {
                     acp_session_id: sid.into(),
+                    connection_ready: false,
+                    native_subject: None,
                 })
                 .await
                 .unwrap();
@@ -1699,7 +1930,7 @@ mod tests {
             assert!(events
                 .iter()
                 .any(|(_, _, event)| matches!(event, Event::SessionContextReset { .. })));
-            assert!(events.iter().any(|(_, _, event)| matches!(event, Event::AgentStartupError { message } if message.contains("Could not commit the isolated native context"))));
+            assert!(events.iter().any(|(_, _, event)| matches!(event, Event::AgentStartupError { message, .. } if message.contains("Could not commit the isolated native context"))));
             assert!(!events
                 .iter()
                 .any(|(_, _, event)| matches!(event, Event::AcpSessionAssigned { .. })));
