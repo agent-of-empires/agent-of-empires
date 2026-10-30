@@ -20,6 +20,8 @@ import type {
   CreationTrustFingerprint,
   ImportableSession,
   SettingsFieldDescriptor,
+  SuggestionPrepared,
+  SuggestionsSnapshot,
 } from "./types";
 import type { ConfigOptionDescriptor } from "./acpTypes";
 import { clearDeviceBindingSecret, getOrCreateDeviceBindingSecret } from "./deviceBinding";
@@ -3211,3 +3213,38 @@ export async function syncSkills(options?: {
     };
   }
 }
+
+// --- Suggested sessions ---
+
+export type SuggestionResult<T = undefined> = { ok: true; data: T } | { ok: false; error: string; stale: boolean };
+
+export function fetchSuggestions(): Promise<SuggestionsSnapshot | null> {
+  return fetchJson<SuggestionsSnapshot>("/api/suggestions");
+}
+
+async function suggestionRequest<T>(url: string, method: string, body?: unknown): Promise<SuggestionResult<T>> {
+  try {
+    const res = await fetch(url, jsonInit(method, body));
+    const text = await res.text();
+    if (!res.ok) return { ok: false, error: parseApiErrorText(text, res.status), stale: res.status === 409 };
+    return { ok: true, data: (text ? JSON.parse(text) : undefined) as T };
+  } catch (error) {
+    return {
+      ok: false,
+      error: `Network error: ${error instanceof Error ? error.message : "connection failed"}`,
+      stale: false,
+    };
+  }
+}
+
+export const refreshSuggestions = () => suggestionRequest("/api/suggestions/refresh", "POST");
+
+export const dismissSuggestion = (providerId: string, id: string, dismissed: boolean) =>
+  suggestionRequest(`/api/suggestions/${dismissed ? "dismiss" : "undismiss"}`, "POST", { provider_id: providerId, id });
+
+export const updateSuggestionSource = (providerId: string, criterion: string, enabled: boolean) =>
+  suggestionRequest("/api/suggestions/sources", "PATCH", { provider_id: providerId, criterion, enabled });
+
+/** Resolves the wizard prefill. Creates nothing. */
+export const prepareSuggestion = (providerId: string, id: string) =>
+  suggestionRequest<SuggestionPrepared>("/api/suggestions/prepare", "POST", { provider_id: providerId, id });
