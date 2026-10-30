@@ -90,6 +90,13 @@ it("LoggingTargetsWidget clears one area without losing unrelated overrides", ()
   expect(save).toHaveBeenLastCalledWith({ ...initial, "server.lifecycle": "debug" });
 });
 
+it("LoggingTargetsWidget exposes the session lifecycle area and saves only that override", () => {
+  const initial = { "plugin.host": "warn" };
+  const { save } = mount(LoggingTargetsWidget, "Targets", initial);
+  fireEvent.change(control("session.status_change", "select"), { target: { value: "info" } });
+  expect(save).toHaveBeenLastCalledWith({ ...initial, "session.status_change": "info" });
+});
+
 describe("ThemeNameWidget", () => {
   it.each([
     [true, 1],
