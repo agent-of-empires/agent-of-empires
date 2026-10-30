@@ -640,10 +640,6 @@ mod tests {
             "only meaningful while a search is active",
         ),
         (
-            ActionId::Suggestions,
-            "palette entry arrives with the Suggested group (#5107)",
-        ),
-        (
             ActionId::ToggleProjectPin,
             "only valid on a project header, reached via its context menu and `p`",
         ),
