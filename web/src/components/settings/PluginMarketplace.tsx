@@ -1,3 +1,5 @@
+import { Sparkles } from "lucide-react";
+
 import { sourceFromCommand, type PluginMarketplaceState } from "./pluginFlows";
 
 interface Props {
@@ -8,7 +10,26 @@ interface Props {
 
 /** The marketplace tab: GitHub search results, each installable in-app. */
 export function PluginMarketplace({ market, installedSources, onOpenDetail }: Props) {
-  const { query, setQuery, results, error, discovering, previewingSource, discover, install } = market;
+  const {
+    query,
+    setQuery,
+    suggestionsOnly,
+    setSuggestionsOnly,
+    results,
+    error,
+    discovering,
+    previewingSource,
+    discover,
+    install,
+  } = market;
+  const suggestingCount = results?.filter((r) => r.suggestions).length ?? 0;
+  const shown = suggestionsOnly ? results?.filter((r) => r.suggestions) : results;
+  const chipClass = (active: boolean) =>
+    `inline-flex h-8 items-center gap-1.5 rounded-md border px-3 text-xs ${
+      active
+        ? "border-brand-600 bg-brand-500/12 text-text-primary"
+        : "border-surface-700 text-text-secondary hover:bg-surface-800"
+    }`;
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap items-center gap-2">
@@ -40,12 +61,41 @@ export function PluginMarketplace({ market, installedSources, onOpenDetail }: Pr
         </p>
       )}
 
-      {results && (
+      {results && results.length > 0 && (
+        <div className="flex flex-wrap gap-2" data-testid="plugins-filter">
+          <button
+            type="button"
+            className={chipClass(!suggestionsOnly)}
+            aria-pressed={!suggestionsOnly}
+            onClick={() => setSuggestionsOnly(false)}
+            data-testid="plugins-filter-all"
+          >
+            All
+          </button>
+          <button
+            type="button"
+            className={chipClass(suggestionsOnly)}
+            aria-pressed={suggestionsOnly}
+            onClick={() => setSuggestionsOnly(true)}
+            data-testid="plugins-filter-suggestions"
+          >
+            <Sparkles className="size-3.5" aria-hidden="true" />
+            Works with Suggestions
+            <span className="font-mono text-text-dim">{suggestingCount}</span>
+          </button>
+        </div>
+      )}
+
+      {shown && (
         <div className="space-y-2" data-testid="plugins-discover-results">
-          {results.length === 0 ? (
-            <p className="text-xs text-text-dim">No plugins found on the aoe-plugin topic.</p>
+          {shown.length === 0 ? (
+            <p className="text-xs text-text-dim">
+              {results?.length === 0
+                ? "No plugins found on the aoe-plugin topic."
+                : "No plugins here work with Suggestions yet."}
+            </p>
           ) : (
-            results.map((r) => {
+            shown.map((r) => {
               const source = sourceFromCommand(r.install_command);
               return (
                 <div
@@ -75,6 +125,16 @@ export function PluginMarketplace({ market, installedSources, onOpenDetail }: Pr
                     <span className="rounded bg-accent-500/20 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-accent-500">
                       {r.badge}
                     </span>
+                    {r.suggestions && (
+                      <span
+                        className="inline-flex h-5 items-center gap-1 rounded border border-brand-600 px-1.5 font-mono text-[11px] text-brand-400"
+                        title={`This plugin can suggest Sessions. Turn it on in Settings › Suggestions${r.badge === "installed" ? "" : " after installing"}.`}
+                        data-testid={`plugins-suggestions-chip-${r.slug}`}
+                      >
+                        <Sparkles className="size-3" aria-hidden="true" />
+                        Suggestions
+                      </span>
+                    )}
                     <span className="text-text-dim">★ {r.stars}</span>
                     <a href={r.html_url} target="_blank" rel="noreferrer" className="text-text-dim hover:underline">
                       GitHub ↗

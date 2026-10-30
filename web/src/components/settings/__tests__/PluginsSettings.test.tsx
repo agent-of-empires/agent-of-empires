@@ -117,7 +117,15 @@ const WIDGET = {
   description: "A widget plugin.",
   stars: 42,
   badge: "unvetted",
+  suggestions: false,
   install_command: "aoe plugin install gh:acme/widget",
+};
+const TRACKER = {
+  ...WIDGET,
+  slug: "gh:acme/tracker",
+  description: "A tracker plugin.",
+  suggestions: true,
+  install_command: "aoe plugin install gh:acme/tracker",
 };
 
 beforeEach(() => {
@@ -519,6 +527,71 @@ describe("marketplace", () => {
     await click("plugins-install-gh:acme/widget");
     await click("plugin-install-approve");
     expect((await screen.findByTestId("plugin-install-consent-error")).textContent).toContain("already running");
+  });
+});
+
+describe("marketplace suggestions badge and filter", () => {
+  const chip = (slug: string) => screen.queryByTestId(`plugins-suggestions-chip-${slug}`);
+
+  it("chips only flagged plugins, counts them, and filters on demand", async () => {
+    api.discoverPlugins.mockResolvedValue({ kind: "ok", results: [WIDGET, TRACKER] });
+    renderWith();
+    await click("plugins-tab-marketplace");
+    await click("plugins-discover");
+    await screen.findByTestId("plugins-discover-result-gh:acme/widget");
+    expect(chip("gh:acme/tracker")?.getAttribute("title")).toContain("Turn it on in Settings");
+    expect(chip("gh:acme/widget")).toBeNull();
+    expect(screen.getByTestId("plugins-filter-suggestions").textContent).toContain("1");
+
+    await click("plugins-filter-suggestions");
+    expect(screen.queryByTestId("plugins-discover-result-gh:acme/widget")).toBeNull();
+    expect(screen.getByTestId("plugins-discover-result-gh:acme/tracker")).toBeTruthy();
+
+    await click("plugins-filter-all");
+    expect(screen.getByTestId("plugins-discover-result-gh:acme/widget")).toBeTruthy();
+  });
+
+  it("the deep link opens the Marketplace already searched with the filter on", async () => {
+    api.discoverPlugins.mockResolvedValue({ kind: "ok", results: [WIDGET, TRACKER] });
+    render(<PluginsSettings initialMarketplaceFilter="suggestions" />);
+    await screen.findByTestId("plugins-discover-result-gh:acme/tracker");
+    expect(screen.queryByTestId("plugins-discover-result-gh:acme/widget")).toBeNull();
+    expect(screen.getByTestId("plugins-filter-suggestions").getAttribute("aria-pressed")).toBe("true");
+    expect(api.discoverPlugins).toHaveBeenCalledTimes(1);
+  });
+
+  it("drops the install clause from the tooltip of an installed plugin", async () => {
+    api.discoverPlugins.mockResolvedValue({ kind: "ok", results: [{ ...TRACKER, badge: "installed" }] });
+    renderWith();
+    await click("plugins-tab-marketplace");
+    await click("plugins-discover");
+    await screen.findByTestId("plugins-discover-result-gh:acme/tracker");
+    expect(chip("gh:acme/tracker")?.getAttribute("title")).toBe(
+      "This plugin can suggest Sessions. Turn it on in Settings › Suggestions.",
+    );
+  });
+
+  it("a later search wins over a slower deep-link search", async () => {
+    let resolveFirst!: (v: unknown) => void;
+    api.discoverPlugins
+      .mockImplementationOnce(() => new Promise((r) => (resolveFirst = r)))
+      .mockResolvedValueOnce({ kind: "ok", results: [TRACKER] });
+    render(<PluginsSettings initialMarketplaceFilter="suggestions" />);
+    await waitFor(() => expect(api.discoverPlugins).toHaveBeenCalledTimes(1));
+    fireEvent.keyDown(await screen.findByTestId("plugins-discover-query"), { key: "Enter" });
+    await screen.findByTestId("plugins-discover-result-gh:acme/tracker");
+    resolveFirst({ kind: "ok", results: [WIDGET] });
+    await waitFor(() => expect(screen.queryByTestId("plugins-discover-result-gh:acme/widget")).toBeNull());
+    expect(screen.getByTestId("plugins-discover-result-gh:acme/tracker")).toBeTruthy();
+  });
+
+  it("explains an empty filtered list", async () => {
+    api.discoverPlugins.mockResolvedValue({ kind: "ok", results: [WIDGET] });
+    renderWith();
+    await click("plugins-tab-marketplace");
+    await click("plugins-discover");
+    await click("plugins-filter-suggestions");
+    expect(await screen.findByText(/work with Suggestions yet/)).toBeTruthy();
   });
 });
 

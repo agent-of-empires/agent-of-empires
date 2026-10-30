@@ -24,6 +24,10 @@
 #   [plugins."agent-of-empires.example"]
 #   source = "gh:agent-of-empires/example"
 #   versions = { "1.0" = "sha256:<hex>", "1.1" = "sha256:<hex>" }
+#   suggestions = true  # optional; see below
+#
+# `suggestions = true` marks the plugin in the dashboard Marketplace. Set it when
+# the pinned release's manifest declares `[suggestions]`.
 
 [plugins."agent-of-empires.github"]
 source = "gh:agent-of-empires/plugin-github"

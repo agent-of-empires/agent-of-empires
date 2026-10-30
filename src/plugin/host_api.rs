@@ -14,6 +14,9 @@ use crate::plugin::suggestions;
 use crate::plugin::ui_state::{Tone, UiError, UiSnapshot, UiStore};
 use crate::session::Storage;
 
+/// File name of the plugin database under the app directory.
+pub(crate) const EVENTS_DB: &str = "plugin_events.db";
+
 const CAP_WORKER: &str = "runtime.worker";
 pub(crate) const CAP_SESSION_READ: &str = "session.read";
 const CAP_SESSION_WRITE: &str = "session.write";

@@ -347,7 +347,7 @@ An item is `{ id, title, reason, source_url, source_ref, preview, project?, mapp
 `suggestions.set` fails with invalid-params, and publishes nothing, when:
 
 - an item names an undeclared `criterion`, or its `variables` differ from the source's declaration;
-- `source_url` is not an http(s) URL;
+- `source_url` is not an http(s) URL, or has an empty host, userinfo, percent-encoding in the host, or non-ASCII characters;
 - `id`, `title` or `source_ref` is empty, `mapping_key` is present but empty, or an `id` repeats;
 - there are more than 500 items, or a string exceeds its bound (`id` and `mapping_key` 256 bytes, `title` and `draft.title` 512, `reason`, `source_url`, `source_ref` and each variable value 2 KiB, `preview` 16 KiB, `draft.prompt` 64 KiB, `project` 4 KiB).
 
@@ -384,7 +384,7 @@ Suggestions are stored per profile. The routes below list and act on them; none 
 
 Providers are listed in the user's `provider_order`; a provider never ordered follows, sorted by id. `prefs` defaults to `{ homepage: true, sidebar: false, refresh_minutes: 15, provider_order: [] }` and is per profile. `PATCH /api/suggestions/prefs` is partial: `refresh_minutes` is one of 5, 15, 30, 60 or 120, `provider_order` must list every provider exactly once, and `provider_enabled` maps provider ids to booleans. Other values fail with 400 `validation_failed`, and nothing is stored. `refresh_minutes` is a hint for plugins; core does not schedule refreshes yet. The route is denied in read-only (403 `read_only`) and CityHall mode.
 
-A provider's `status` is `pending` before its first publish, `ok`, or `error`. Each item is the published item plus `provider_id` and `dismissed`; dismissed items are still returned. Items of a disabled source or provider are hidden, and `refresh` skips a disabled provider. `updated_at` is Unix seconds of the provider's last report. `refresh` and a `sources` change send `suggestions.refresh` to the affected workers.
+A provider's `status` is `pending` before its first publish, `ok`, or `error`. Uninstalling a plugin, or updating it to a build whose `[suggestions]` block differs, clears its items, checks and status so it is `pending` again until its next publish; source switches, dismissals, templates and mappings are kept. Each item is the published item plus `provider_id` and `dismissed`; dismissed items are still returned. Items of a disabled source or provider are hidden, and `refresh` skips a disabled provider. `updated_at` is Unix seconds of the provider's last report. `refresh` and a `sources` change send `suggestions.refresh` to the affected workers.
 
 `prepare` resolves settings through the normal repo and profile config. `project` is `{ name, path }` or `null`, resolved in this order: the user's mapping for the item's `mapping_key`, then the item's `project` hint (exactly one registered project by name or exact path), else `null`; an item is never given a scratch project.
 
@@ -394,7 +394,7 @@ A template is stored per profile and criterion and replaces the provider's `draf
 
 Errors: 404 `unknown_provider` (no active plugin provides suggestions under that id), 409 `stale_suggestion` (the item is no longer published, or its source is disabled), 400 `validation_failed` (`criterion` not declared by the provider, or a template or its expansion over 64 KiB), 403 `read_only`.
 
-The TUI lists suggestions from Home with `S` (`Ctrl+S` in strict mode). The view shows each item's `preview` and prompt as plain text; The first Enter resolves `prepare` and shows its final `initial_prompt` (after any template); a second Enter opens the new-session dialog prefilled with it, and an item whose `project` is `null` cannot be started. The dialog adds an editable Prompt row, labelled with the provider, holding that prompt; Ctrl+P on that row shows the item's `preview` as source text. `r` only asks providers to refresh; `l` reloads the list. Items keep the order of the snapshot. Every TUI key is provisional pending #4597: `S` / `Ctrl+S` to open, and `x` (dismiss), `d` (dismissed), `r` and `l` inside the view may move.
+The TUI lists suggestions from Home with `S` (`Ctrl+S` in strict mode). The view shows each item's `preview` and prompt as plain text; The first Enter resolves `prepare` and shows its final `initial_prompt` (after any template); a second Enter opens the new-session dialog prefilled with it, and an item whose `project` is `null` cannot be started. The dialog adds an editable Prompt row, labelled with the provider, holding that prompt; Ctrl+P on that row shows the item's `preview` as source text. `r` only asks providers to refresh; `l` reloads the list. Items keep the order of the snapshot. Home also lists a collapsed **Suggested (N)** group above Trash, absent when no provider is active. Enter expands it to the first 3 items and a "View all" row that opens the view above; Enter on an item prepares it and opens the prefilled dialog directly, `z` (`Z` in strict mode) dismisses it, and `N` (`Ctrl+N`) starts a blank session. `Ctrl+K` lists "Suggested sessions". Every TUI key is provisional pending #4597: `S` / `Ctrl+S` to open, `z` / `N` on a Home row, and `x` (dismiss), `d` (dismissed), `r` and `l` inside the view may move.
 
 ### Project mappings
 
