@@ -10,8 +10,8 @@ pub use runtime::{
     CreationPhase, CreationProgress, MutationReceipt, OwnerLoadDiagnostic, ProfileMutation,
     ProfileSnapshot, ProjectMutation, ProjectResponse, ProjectTarget, ReloadFailureCode,
     RuntimeCapabilities, RuntimeContents, RuntimeCursor, RuntimeFrame, RuntimeHealth, RuntimeInfo,
-    RuntimeSnapshot, SessionMutation, RUNTIME_EPOCH_HEADER, RUNTIME_PROTOCOL_VERSION,
-    RUNTIME_REVISION_HEADER,
+    RuntimeSnapshot, SandboxProgress, SessionMutation, RUNTIME_EPOCH_HEADER,
+    RUNTIME_PROTOCOL_VERSION, RUNTIME_REVISION_HEADER,
 };
 pub(crate) use runtime::{NamespaceMutation, NamespaceOutcome};
 pub use runtime_connection::{RuntimeConnection, RuntimeConnectionError, RuntimeEvent};

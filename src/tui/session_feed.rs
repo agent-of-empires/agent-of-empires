@@ -600,6 +600,8 @@ pub struct SessionFeed {
     progress_receiver: tokio::sync::watch::Receiver<Option<Vec<CreationProgress>>>,
     diagnostics: tokio::sync::watch::Sender<Vec<crate::daemon::OwnerLoadDiagnostic>>,
     diagnostics_receiver: tokio::sync::watch::Receiver<Vec<crate::daemon::OwnerLoadDiagnostic>>,
+    sandbox_progress: tokio::sync::watch::Sender<Vec<crate::daemon::SandboxProgress>>,
+    sandbox_progress_receiver: tokio::sync::watch::Receiver<Vec<crate::daemon::SandboxProgress>>,
     quit_control: tokio::sync::watch::Sender<Option<QuitCancellationHandle>>,
     task: Option<tokio::task::JoinHandle<()>>,
     grant: Arc<AtomicU64>,
@@ -629,6 +631,7 @@ impl SessionFeed {
         let (progress, progress_receiver) = tokio::sync::watch::channel(None);
         let (quit_control, _) = tokio::sync::watch::channel(None);
         let (diagnostics, diagnostics_receiver) = tokio::sync::watch::channel(Vec::new());
+        let (sandbox_progress, sandbox_progress_receiver) = tokio::sync::watch::channel(Vec::new());
         Self {
             sender,
             receiver,
@@ -638,6 +641,8 @@ impl SessionFeed {
             task: None,
             diagnostics,
             diagnostics_receiver,
+            sandbox_progress,
+            sandbox_progress_receiver,
             grant: Arc::new(AtomicU64::new(0)),
             native_grant: Arc::new(AtomicU64::new(0)),
             cityhall: Arc::new(AtomicBool::new(false)),
@@ -697,6 +702,8 @@ impl SessionFeed {
         let sender = self.sender.clone();
         let quit_control = self.quit_control.clone();
         let diagnostics = self.diagnostics.clone();
+        let sandbox_progress = self.sandbox_progress.clone();
+        sandbox_progress.send_replace(Vec::new());
         self.task = Some(tokio::spawn(async move {
             let result: anyhow::Result<()> = async {
                 let (mut connection, client) = match prepared {
@@ -744,10 +751,14 @@ impl SessionFeed {
                             Ok(RuntimeEvent::Progress(progresses)) => {
                                 progress.send_replace(Some(progresses));
                             }
+                            Ok(RuntimeEvent::Sandbox(current)) => {
+                                sandbox_progress.send_replace(current);
+                            }
                             Err(error) => {
                                 set_grant(&grant, false);
                                 set_grant(&native_grant, false);
                                 progress.send_replace(Some(Vec::new()));
+                                sandbox_progress.send_replace(Vec::new());
                                 sender.send_replace(Some(SessionFeedResult::Unavailable(
                                     error.to_string(),
                                 )));
@@ -771,11 +782,39 @@ impl SessionFeed {
             set_grant(&grant, false);
             set_grant(&native_grant, false);
             quit_control.send_replace(None);
+            sandbox_progress.send_replace(Vec::new());
             if let Err(error) = result {
                 sender.send_replace(Some(SessionFeedResult::Unavailable(error.to_string())));
             }
         }));
     }
+    pub(crate) fn poll_sandbox_progress(&mut self) -> bool {
+        let changed = self
+            .sandbox_progress_receiver
+            .has_changed()
+            .unwrap_or(false);
+        self.sandbox_progress_receiver.borrow_and_update();
+        changed
+    }
+
+    pub(crate) fn sandbox_status_line(&self) -> Option<String> {
+        if !self.native_interaction_available() {
+            return None;
+        }
+        let progress = self.sandbox_progress_receiver.borrow();
+        let current = progress.iter().find(|item| {
+            self.pending.contains_key(&item.session_id)
+                && self
+                    .applied_session(&item.session_id)
+                    .is_some_and(|row| row.profile == item.profile)
+        })?;
+        let title = &self.applied_session(&current.session_id)?.title;
+        Some(format!(
+            "moving the agent store of '{title}': {}",
+            current.activity
+        ))
+    }
+
     pub(crate) fn take_diagnostics(&mut self) -> Option<Vec<crate::daemon::OwnerLoadDiagnostic>> {
         self.diagnostics_receiver
             .has_changed()

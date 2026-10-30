@@ -326,20 +326,7 @@ pub(crate) fn migrate_sandbox_store_for_with(
     }
     let _installed = progress::install(reporter);
     v027_isolate_sandbox_stores::migrate_instance(id, store, runtime)?;
-    v033_isolate_sandbox_content::migrate_instance(id)
-}
-
-/// [`migrate_sandbox_store_for_with`] with the container probes injected, for
-/// a test that drives the launch-time move with no container runtime.
-#[cfg(test)]
-pub(crate) fn migrate_sandbox_store_for_test(
-    id: &str,
-    reporter: Option<progress::Reporter>,
-    is_running: &dyn Fn(&str) -> Result<bool>,
-    reap: &dyn Fn(&str) -> Result<bool>,
-) -> Result<()> {
-    let _installed = progress::install(reporter);
-    v027_isolate_sandbox_stores::migrate_instance_with(id, is_running, reap, None)
+    v033_isolate_sandbox_content::migrate_instance(id, runtime)
 }
 
 pub fn run_migrations() -> Result<()> {

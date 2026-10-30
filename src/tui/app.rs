@@ -1366,12 +1366,7 @@ impl App {
 
             needs_full_refresh |= self.home.apply_restart_results();
 
-            let store_move = self.home.poll_store_move();
-            needs_full_refresh |= store_move.changed;
-            if let Some(action) = store_move.resume {
-                self.execute_action(action, terminal)?;
-                needs_full_refresh = true;
-            }
+            needs_full_refresh |= self.home.poll_store_move();
 
             let created_attach = self
                 .home
@@ -2945,13 +2940,6 @@ impl App {
                 }
             }
 
-            if instance.is_sandboxed()
-                && self
-                    .defer_to_store_move(session_id, Action::AttachSession(session_id.to_string()))
-            {
-                return Ok(());
-            }
-
             let size = crate::terminal::get_size();
             if instance.status == crate::session::Status::Stopped {
                 self.home.start_then_attach(session_id, size);
@@ -2998,18 +2986,6 @@ impl App {
         }
 
         Ok(())
-    }
-
-    /// Start a pending sandbox store copy and resume `resume` afterwards,
-    /// returning `true` when the launch was deferred.
-    fn defer_to_store_move(&mut self, session_id: &str, resume: Action) -> bool {
-        if !self.home.needs_store_move_before_launch(session_id) {
-            return false;
-        }
-        if !self.home.begin_store_move(session_id, Some(resume)) {
-            self.set_status("another agent store move is still in progress");
-        }
-        true
     }
 
     fn attach_terminal(&mut self, session_id: &str, mode: TerminalMode) {

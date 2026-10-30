@@ -73,22 +73,11 @@ impl Instance {
         environment
     }
 
-    /// Whether this session still reads the shared sandbox store, so its next
-    /// container launch first copies that store; see [`Self::move_sandbox_store`].
+    /// Whether the next container launch must isolate the sandbox's shared store.
     pub fn sandbox_store_move_pending(&self) -> bool {
         self.is_sandboxed()
             && !crate::migrations::v033_isolate_sandbox_content::instance_ready(self)
                 .unwrap_or(false)
-    }
-
-    /// Move a stopped container's shared store and report progress.
-    pub fn move_sandbox_store(
-        &self,
-        reporter: Option<crate::migrations::progress::Reporter>,
-    ) -> Result<bool> {
-        let storage = Storage::new(&self.effective_profile(), self.resolve_file_watch())?;
-        let container = DockerContainer::from_session_id(&self.id);
-        self.move_sandbox_store_in(&storage, reporter, &container)
     }
 
     fn move_sandbox_store_in(
@@ -201,24 +190,14 @@ impl Instance {
             global_config.sandbox.container_runtime.into(),
         );
         // Migration takes the transition lock exclusively, before the shared guard below.
-        if self.sandbox_store_move_pending() {
-            match self.move_sandbox_store_in(
+        if self.sandbox_store_move_pending()
+            && self.move_sandbox_store_in(
                 store,
                 Some(crate::migrations::progress::tracing_reporter()),
                 &container,
-            ) {
-                Ok(true) => self.reconcile_from_store(store)?,
-                Ok(false) => {}
-                Err(error) if error.is::<crate::session::NativeStoreUnavailable>() => {
-                    return Err(error)
-                }
-                Err(error) => tracing::warn!(
-                    target: "session.store",
-                    session_id = %self.id,
-                    %error,
-                    "sandbox store move deferred; session continues on its shared store"
-                ),
-            }
+            )?
+        {
+            self.reconcile_from_store(store)?;
         }
         self.warn_legacy_agent_config_mounts(profile_config);
         let mut transition_lock = self.container_transition_lock()?;
