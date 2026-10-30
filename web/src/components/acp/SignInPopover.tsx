@@ -1,7 +1,9 @@
 import { ShieldAlert } from "lucide-react";
 import { useEffect, useId, useRef, useState } from "react";
 
+import { useIsCoarsePointer } from "../../hooks/useIsCoarsePointer";
 import { restartSession } from "../../lib/api";
+import { dispatchFocusTerminal } from "../../lib/terminalFocus";
 import type { ShellMode } from "../PairedTerminal";
 import { useOutsideDismiss } from "../useOutsideDismiss";
 import { signInSteps } from "./signInSteps";
@@ -89,6 +91,7 @@ function SignInPanel({ id, signIn, onLeave }: { id: string; signIn?: SignInConte
   const [restart, setRestart] = useState<{ state: "idle" | "restarting" | "failed"; message?: string }>({
     state: "idle",
   });
+  const isCoarse = useIsCoarsePointer();
   const panelRef = useRef<HTMLDivElement>(null);
   const mounted = useRef(false);
   useEffect(() => {
@@ -104,8 +107,11 @@ function SignInPanel({ id, signIn, onLeave }: { id: string; signIn?: SignInConte
     const result = await restartSession(sessionId);
     // A panel closed meanwhile must not close the one opened after it.
     if (!mounted.current) return;
-    if (result.ok) onLeave();
-    else setRestart({ state: "failed", message: result.message });
+    if (result.ok) {
+      onLeave();
+      // The Restart button is gone, so focus would fall to the body; not on touch, where it opens the keyboard.
+      if (!isCoarse) dispatchFocusTerminal("composer");
+    } else setRestart({ state: "failed", message: result.message });
   };
   return (
     <div

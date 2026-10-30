@@ -10,10 +10,12 @@ import type { SignInContext } from "../SignInPopover";
 import type { AuthStatus } from "../../../lib/acpTypes";
 import { restartSession } from "../../../lib/api";
 import { writeClipboard } from "../../../lib/clipboard";
+import { FOCUS_TERMINAL_EVENT, type FocusTerminalDetail } from "../../../lib/terminalFocus";
 
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  vi.unstubAllGlobals();
 });
 
 const chip = () => screen.queryByTestId("composer-auth-status");
@@ -183,11 +185,21 @@ describe("AuthStatusHint signed out", () => {
     expect(dialog()).not.toBeNull();
   });
 
-  it("closes once the restart is accepted", async () => {
+  it.each([
+    ["a mouse", false, ["composer"]],
+    // Focusing the composer would open the on-screen keyboard.
+    ["touch", true, []],
+  ])("closes once the restart is accepted, and with %s focuses the composer", async (_, coarse, focused) => {
+    vi.stubGlobal("matchMedia", (query: string) => ({ matches: coarse && query === "(pointer: coarse)" }));
+    const targets: string[] = [];
+    const onFocus = (e: Event) => targets.push((e as CustomEvent<FocusTerminalDetail>).detail.target);
+    window.addEventListener(FOCUS_TERMINAL_EVENT, onFocus);
     vi.mocked(restartSession).mockResolvedValueOnce({ ok: true });
     renderSignedOut(signIn());
     fireEvent.click(trigger());
     fireEvent.click(screen.getByRole("button", { name: "Restart Agent" }));
     await waitFor(() => expect(dialog()).toBeNull());
+    window.removeEventListener(FOCUS_TERMINAL_EVENT, onFocus);
+    expect(targets).toEqual(focused);
   });
 });
