@@ -254,10 +254,19 @@ fn load_checks(
             |row| row.get(0),
         )
         .optional()?;
-    Ok(match stored {
-        Some(json) => serde_json::from_str(&json)?,
-        None => Vec::new(),
-    })
+    Ok(stored
+        .and_then(|json| match serde_json::from_str(&json) {
+            Ok(checks) => Some(checks),
+            Err(e) => {
+                tracing::warn!(
+                    target: "plugin.suggestions",
+                    provider = %provider_id,
+                    "ignoring undecodable stored checks: {e}"
+                );
+                None
+            }
+        })
+        .unwrap_or_default())
 }
 
 fn record_status(
@@ -840,6 +849,17 @@ mod tests {
             json!([check("auth", "warn")])
         );
         set_checks(&conn, "p", "acme.github", &json!({ "checks": [] })).unwrap();
+        assert_eq!(snap(&conn, "p")["providers"][0]["checks"], json!([]));
+    }
+
+    #[test]
+    fn undecodable_stored_checks_read_as_empty_instead_of_failing_the_snapshot() {
+        let conn = store();
+        conn.execute(
+            "INSERT INTO suggestion_checks (profile, provider_id, checks_json) VALUES ('p', 'acme.github', 'not json')",
+            [],
+        )
+        .unwrap();
         assert_eq!(snap(&conn, "p")["providers"][0]["checks"], json!([]));
     }
 

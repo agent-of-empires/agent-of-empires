@@ -992,14 +992,13 @@ mod tests {
             assert_eq!(err.code, codes::FORBIDDEN, "{method}");
         }
         // A worker whose manifest declares no [suggestions] is refused too.
-        let err = dispatch(
-            &state,
-            &ctx(&[CAP_WORKER]),
-            "suggestions.sources",
-            &json!({}),
-        )
-        .unwrap_err();
-        assert!(err.message.contains("did not declare suggestions"));
+        for method in ["suggestions.sources", "suggestions.checks.set"] {
+            let err = dispatch(&state, &ctx(&[CAP_WORKER]), method, &json!({})).unwrap_err();
+            assert!(
+                err.message.contains("did not declare suggestions"),
+                "{method}"
+            );
+        }
     }
 
     #[test]
