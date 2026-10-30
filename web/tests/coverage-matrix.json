@@ -843,6 +843,7 @@
       "risk": "medium",
       "specs": [
         "tests/suggestions-review.spec.ts",
+        "tests/dashboard-suggestions.spec.ts",
         "src/components/__tests__/SuggestionsView.test.tsx",
         "src/components/__tests__/DashboardSuggestions.test.tsx"
       ],
