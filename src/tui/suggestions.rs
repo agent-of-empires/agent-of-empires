@@ -195,6 +195,36 @@ fn plain(s: &str) -> String {
         .collect()
 }
 
+const NO_PROJECT: &str = "No registered project matches this suggestion";
+
+/// Resolves a prepared suggestion into a dialog `Start`; `None` when the
+/// prepare response names no registered project.
+fn start_for(snapshot: Option<&Snapshot>, key: &ItemKey, prepared: Prepared) -> Option<Start> {
+    let project = prepared.project?;
+    let item = snapshot
+        .iter()
+        .flat_map(|s| &s.items)
+        .find(|i| i.provider_id == key.0 && i.id == key.1);
+    let provider = snapshot
+        .iter()
+        .flat_map(|s| &s.providers)
+        .find(|p| p.id == key.0)
+        .map_or(key.0.as_str(), |p| p.name.as_str())
+        .to_owned();
+    Some(Start {
+        provider,
+        source_ref: item.map(|i| i.source_ref.clone()).unwrap_or_default(),
+        reason: item.map(|i| i.reason.clone()).unwrap_or_default(),
+        source_text: item
+            .map(|i| i.preview.clone())
+            .filter(|p| !p.trim().is_empty()),
+        path: project.path,
+        title: prepared.title,
+        initial_prompt: prepared.initial_prompt,
+        tool: prepared.tool,
+    })
+}
+
 pub(super) enum SuggestionsAction {
     Continue,
     Close,
@@ -260,13 +290,6 @@ impl SuggestionsView {
     fn item_at(&self, index: usize) -> Option<&Item> {
         let snapshot = self.snapshot.as_ref()?;
         snapshot.items.get(*self.order.get(index)?)
-    }
-
-    fn item_by_key(&self, key: &ItemKey) -> Option<&Item> {
-        self.snapshot
-            .iter()
-            .flat_map(|s| &s.items)
-            .find(|i| i.provider_id == key.0 && i.id == key.1)
     }
 
     fn selected_key(&self) -> Option<ItemKey> {
@@ -387,42 +410,21 @@ impl SuggestionsView {
             Res::Snapshot(Err(e)) | Res::Refreshed(Err(e)) | Res::Prepared(Err(e)) => {
                 self.error = Some(e);
             }
-            Res::Prepared(Ok(prepared)) => match (prepared.project, self.prepare_key.take()) {
-                (None, _) => {
-                    self.error = Some("No registered project matches this suggestion".into());
+            Res::Prepared(Ok(prepared)) => {
+                let key = self.prepare_key.take();
+                match (prepared.project.is_some(), key) {
+                    (false, _) => {
+                        self.error = Some(NO_PROJECT.into());
+                    }
+                    (true, Some(key)) => {
+                        let start = start_for(self.snapshot.as_ref(), &key, prepared);
+                        self.notice =
+                            Some("Review the prompt below, then press Enter to start.".into());
+                        self.prepared = start.map(|start| (key, start));
+                    }
+                    (true, None) => {}
                 }
-                (Some(project), Some(key)) => {
-                    let item = self.item_by_key(&key);
-                    let (provider, source_ref, reason) = item
-                        .map(|i| {
-                            (
-                                self.provider_name(&i.provider_id).to_owned(),
-                                i.source_ref.clone(),
-                                i.reason.clone(),
-                            )
-                        })
-                        .unwrap_or_else(|| (key.0.clone(), String::new(), String::new()));
-                    let source_text = item
-                        .map(|i| i.preview.clone())
-                        .filter(|p| !p.trim().is_empty());
-                    self.notice =
-                        Some("Review the prompt below, then press Enter to start.".into());
-                    self.prepared = Some((
-                        key,
-                        Start {
-                            provider,
-                            source_ref,
-                            reason,
-                            source_text,
-                            path: project.path,
-                            title: prepared.title,
-                            initial_prompt: prepared.initial_prompt,
-                            tool: prepared.tool,
-                        },
-                    ));
-                }
-                (Some(_), None) => {}
-            },
+            }
         }
         true
     }
@@ -590,6 +592,278 @@ impl SuggestionsView {
     }
 }
 
+/// How often the Home list reloads the suggestions snapshot.
+const FEED_RELOAD: std::time::Duration = std::time::Duration::from_secs(60);
+const SOURCE_LABEL_WIDTH: usize = 6;
+
+/// What the Home list shows for one suggestion; provider text is untrusted and
+/// already stripped of control characters.
+pub(super) struct Entry {
+    pub label: String,
+    pub source_ref: String,
+    pub title: String,
+    pub reason: String,
+    pub provider: String,
+    pub project: Option<String>,
+    pub prompt: String,
+    pub provider_error: Option<String>,
+}
+
+pub(super) struct FeedPoll {
+    pub changed: bool,
+    /// A prepared suggestion, with the key it was requested for.
+    pub start: Option<(ItemKey, Start)>,
+    /// Failure of a user-initiated request; background reloads only log.
+    pub error: Option<String>,
+}
+
+/// Background snapshot behind the Home list's Suggested group. The full view
+/// keeps its own state; both read the same daemon endpoints.
+pub(super) struct SuggestionsFeed {
+    snapshot: Option<Snapshot>,
+    prepare_key: Option<ItemKey>,
+    /// The in-flight request came from the user (prepare or dismiss), so its
+    /// failure is worth showing.
+    in_flight_user: bool,
+    busy: bool,
+    /// User requests that arrived while another request was in flight.
+    queued: std::collections::VecDeque<Req>,
+    loaded_at: Option<std::time::Instant>,
+    load_attempt_at: Option<std::time::Instant>,
+    worker: Worker<Req, Res>,
+}
+
+impl SuggestionsFeed {
+    pub(super) fn new() -> Self {
+        // Tests must not reach a developer's real daemon.
+        #[cfg(test)]
+        let worker = Worker::spawn("test-suggestions-feed", |req| {
+            failed(&req, "no daemon in tests".into())
+        });
+        #[cfg(not(test))]
+        let worker = spawn_worker();
+        Self::with_worker(worker)
+    }
+
+    fn with_worker(worker: Worker<Req, Res>) -> Self {
+        Self {
+            snapshot: None,
+            prepare_key: None,
+            in_flight_user: false,
+            busy: false,
+            queued: std::collections::VecDeque::new(),
+            loaded_at: None,
+            load_attempt_at: None,
+            worker,
+        }
+    }
+
+    fn send(&mut self, req: Req) {
+        self.busy = true;
+        self.in_flight_user = !matches!(req, Req::Load);
+        match &req {
+            Req::Load => self.load_attempt_at = Some(std::time::Instant::now()),
+            Req::Prepare { provider_id, id } => {
+                self.prepare_key = Some((provider_id.clone(), id.clone()));
+            }
+            _ => {}
+        }
+        self.worker.request(req);
+    }
+
+    /// Sends now, or behind the request in flight.
+    fn submit(&mut self, req: Req) {
+        if self.busy {
+            self.queued.push_back(req);
+        } else {
+            self.send(req);
+        }
+    }
+
+    /// Whether the provider is listed: items of an unlisted provider are not
+    /// shown anywhere.
+    fn provider(&self, id: &str) -> Option<&Provider> {
+        self.snapshot
+            .as_ref()?
+            .providers
+            .iter()
+            .find(|p| p.id == id)
+    }
+
+    /// `(provider_id, id)` of every undismissed suggestion of a listed
+    /// provider, in snapshot order.
+    pub(super) fn keys(&self) -> Vec<ItemKey> {
+        self.snapshot
+            .iter()
+            .flat_map(|s| &s.items)
+            .filter(|i| !i.dismissed && self.provider(&i.provider_id).is_some())
+            .map(|i| (i.provider_id.clone(), i.id.clone()))
+            .collect()
+    }
+
+    /// Provider names in snapshot order, for the group preview.
+    pub(super) fn provider_names(&self) -> Vec<String> {
+        self.snapshot
+            .iter()
+            .flat_map(|s| &s.providers)
+            .map(|p| plain(&p.name))
+            .collect()
+    }
+
+    pub(super) fn entry(&self, key: &ItemKey) -> Option<Entry> {
+        let item = self
+            .snapshot
+            .iter()
+            .flat_map(|s| &s.items)
+            .find(|i| i.provider_id == key.0 && i.id == key.1)?;
+        let provider = self.provider(&key.0)?;
+        let label: String = plain(&provider.name)
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .take(SOURCE_LABEL_WIDTH)
+            .collect();
+        Some(Entry {
+            label,
+            source_ref: plain(&item.source_ref),
+            title: plain(&item.title),
+            reason: plain(&item.reason),
+            provider: plain(&provider.name),
+            project: item.project.as_deref().map(plain),
+            prompt: plain(&item.draft.prompt),
+            provider_error: provider.error.as_deref().map(plain),
+        })
+    }
+
+    /// Reloads when the snapshot is stale and nothing is in flight. Never
+    /// while `connected` is false, and a failed load waits a full interval.
+    pub(super) fn tick(&mut self, connected: bool) {
+        let due = |at: Option<std::time::Instant>| at.is_none_or(|at| at.elapsed() >= FEED_RELOAD);
+        if connected && !self.busy && due(self.loaded_at) && due(self.load_attempt_at) {
+            self.send(Req::Load);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_snapshot_for_test(&mut self, snapshot: serde_json::Value) {
+        self.snapshot = Some(serde_json::from_value(snapshot).unwrap());
+    }
+
+    /// Test feed whose worker records each request as text on `sink` and
+    /// answers it from `snapshot`; a prepare resolves to `/tmp`.
+    #[cfg(test)]
+    pub(super) fn recording_for_test(
+        snapshot: serde_json::Value,
+        sink: std::sync::mpsc::Sender<String>,
+    ) -> Self {
+        let worker = Worker::spawn("test-suggestions-feed", move |req| {
+            let parse = || serde_json::from_value(snapshot.clone()).map_err(text);
+            match req {
+                Req::Load => {
+                    let _ = sink.send("load".into());
+                    Res::Snapshot(parse())
+                }
+                Req::Dismiss {
+                    provider_id,
+                    id,
+                    dismissed,
+                } => {
+                    let _ = sink.send(format!("dismiss {provider_id}/{id} {dismissed}"));
+                    Res::Snapshot(parse())
+                }
+                Req::Prepare { provider_id, id } => {
+                    let _ = sink.send(format!("prepare {provider_id}/{id}"));
+                    Res::Prepared(Ok(Prepared {
+                        title: "Prepared title".into(),
+                        initial_prompt: "Prepared prompt".into(),
+                        tool: "claude".into(),
+                        project: Some(PreparedProject {
+                            path: "/tmp".into(),
+                        }),
+                    }))
+                }
+                Req::Refresh => Res::Refreshed(Ok(())),
+            }
+        });
+        Self::with_worker(worker)
+    }
+
+    #[cfg(test)]
+    pub(super) fn failed_load_for_test(message: &str) -> Self {
+        let seeded = Res::Snapshot(Err(message.into()));
+        Self::with_worker(Worker::seeded_for_test("test-suggestions-feed", seeded))
+    }
+
+    pub(super) fn reload(&mut self) {
+        self.submit(Req::Load);
+    }
+
+    pub(super) fn dismiss(&mut self, key: &ItemKey) {
+        self.submit(Req::Dismiss {
+            provider_id: key.0.clone(),
+            id: key.1.clone(),
+            dismissed: true,
+        });
+    }
+
+    pub(super) fn prepare(&mut self, key: ItemKey) {
+        self.submit(Req::Prepare {
+            provider_id: key.0,
+            id: key.1,
+        });
+    }
+
+    pub(super) fn poll(&mut self) -> FeedPoll {
+        let mut out = FeedPoll {
+            changed: false,
+            start: None,
+            error: None,
+        };
+        let res = match self.worker.try_recv() {
+            Ok(res) => res,
+            Err(TryRecvError::Disconnected) if self.busy => {
+                self.busy = false;
+                self.queued.clear();
+                out.error = Some("The suggestions worker stopped".into());
+                return out;
+            }
+            Err(_) => return out,
+        };
+        self.busy = false;
+        let user = std::mem::take(&mut self.in_flight_user);
+        match res {
+            Res::Snapshot(Ok(snapshot)) => {
+                self.snapshot = Some(snapshot);
+                self.loaded_at = Some(std::time::Instant::now());
+                out.changed = true;
+            }
+            Res::Prepared(Ok(prepared)) => {
+                let key = self.prepare_key.take();
+                match key.and_then(|key| {
+                    start_for(self.snapshot.as_ref(), &key, prepared).map(|start| (key, start))
+                }) {
+                    Some(start) => out.start = Some(start),
+                    None => out.error = Some(NO_PROJECT.into()),
+                }
+            }
+            Res::Snapshot(Err(e)) | Res::Refreshed(Err(e)) | Res::Prepared(Err(e)) => {
+                self.prepare_key = None;
+                if user {
+                    out.error = Some(e);
+                } else {
+                    tracing::debug!(target: "tui.suggestions", error = %e, "suggestions reload failed");
+                }
+            }
+            Res::Refreshed(Ok(())) => {}
+        }
+        if let Some(next) = self.queued.pop_front() {
+            self.send(next);
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -752,6 +1026,37 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("No registered project"));
+    }
+
+    #[test]
+    fn feed_loads_only_when_connected_and_backs_off_after_a_failure() {
+        let (sink, requests) = std::sync::mpsc::channel();
+        let mut feed = SuggestionsFeed::recording_for_test(
+            serde_json::json!({ "providers": [], "items": [] }),
+            sink,
+        );
+        feed.tick(false);
+        feed.tick(true);
+        assert_eq!(
+            requests
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            "load"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !feed.poll().changed {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Fresh snapshot: no second load is due; the prepare is the next request.
+        feed.tick(true);
+        feed.prepare(("p".into(), "a".into()));
+        assert_eq!(
+            requests
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            "prepare p/a"
+        );
     }
 
     #[test]

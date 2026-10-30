@@ -1822,6 +1822,23 @@ impl HomeView {
                 }
                 (icon, text, style)
             }
+            Item::Suggestion {
+                provider_id, id, ..
+            } => {
+                let (prefix, title) = self
+                    .suggestion_row_text(provider_id, id)
+                    .unwrap_or_else(|| (String::new(), "(no longer available)".to_string()));
+                (
+                    " ",
+                    Cow::Owned(format!("{prefix}{title}")),
+                    Style::default().fg(theme.text),
+                )
+            }
+            Item::SuggestionsViewAll { total, .. } => (
+                " ",
+                Cow::Owned(format!("… View all ({total})")),
+                Style::default().fg(theme.dimmed),
+            ),
             Item::Session { id, .. } => {
                 if let Some(inst) = self.get_instance(id) {
                     // Each view mode contributes only the live-state glyph and color for
@@ -1978,6 +1995,29 @@ impl HomeView {
             _ => None,
         };
         let Some((id, inst)) = inst else {
+            if let Item::Suggestion {
+                provider_id, id, ..
+            } = item
+            {
+                if let Some((prefix, _)) = self.suggestion_row_text(provider_id, id) {
+                    let shown = truncate_to_width(&text, room);
+                    let split = prefix.chars().count().min(shown.chars().count());
+                    let (muted, title) = shown.split_at(
+                        shown
+                            .char_indices()
+                            .nth(split)
+                            .map_or(shown.len(), |(at, _)| at),
+                    );
+                    let muted_style = if is_selected {
+                        text_style
+                    } else {
+                        Style::default().fg(theme.dimmed)
+                    };
+                    line_spans.push(Span::styled(muted.to_string(), muted_style));
+                    line_spans.push(Span::styled(title.to_string(), text_style));
+                    return Line::from(line_spans);
+                }
+            }
             line_spans.push(Span::styled(truncate_to_width(&text, room), text_style));
             return Line::from(line_spans);
         };
@@ -3005,6 +3045,9 @@ impl HomeView {
                 &self.metrics,
                 self.system_health_scroll,
             );
+            return;
+        }
+        if self.render_suggestion_preview(frame, area, theme) {
             return;
         }
         let compact = area.width < responsive::STACKED_BREAKPOINT;
@@ -4287,6 +4330,8 @@ impl HomeView {
                     (Some("Attach"), Some("Live"))
                 }
             }
+            Some(Item::Suggestion { .. }) => (Some("Start"), None),
+            Some(Item::SuggestionsViewAll { .. }) => (Some("View all"), None),
             None => (None, None),
         };
         if let Some(enter_action_text) = enter_action_text {
@@ -4297,17 +4342,27 @@ impl HomeView {
             groups.push((2, ktab, mk("⇥ ", tab_action_text)));
         }
 
-        let (click, key) = bound(ActionId::ToggleView);
-        groups.push((2, click, mk(&key, "View")));
-        if matches!(self.view_mode, ViewMode::Tool(_)) {
-            let (click, key) = bound(ActionId::ToolPicker);
-            groups.push((1, click, mk(&key, "Back")));
-        } else if self.has_tool_targets() {
-            let (click, key) = bound(ActionId::ToolPicker);
-            groups.push((2, click, mk(&key, "Tools")));
+        // A suggestion row is not a session: only start, dismiss and another apply.
+        let on_suggestion = matches!(
+            self.flat_items.get(self.cursor),
+            Some(Item::Suggestion { .. })
+        );
+        if on_suggestion {
+            let (click, key) = bound(ActionId::ToggleArchive);
+            groups.push((1, click, mk(&key, "Dismiss")));
+        } else {
+            let (click, key) = bound(ActionId::ToggleView);
+            groups.push((2, click, mk(&key, "View")));
+            if matches!(self.view_mode, ViewMode::Tool(_)) {
+                let (click, key) = bound(ActionId::ToolPicker);
+                groups.push((1, click, mk(&key, "Back")));
+            } else if self.has_tool_targets() {
+                let (click, key) = bound(ActionId::ToolPicker);
+                groups.push((2, click, mk(&key, "Tools")));
+            }
+            let (click, key) = bound(ActionId::GroupBy);
+            groups.push((3, click, mk(&key, "Group")));
         }
-        let (click, key) = bound(ActionId::GroupBy);
-        groups.push((3, click, mk(&key, "Group")));
 
         // c: container/host toggle hint for sandboxed sessions in Terminal view
         if self.view_mode == ViewMode::Terminal {
@@ -4325,12 +4380,16 @@ impl HomeView {
         // `n` for cycling, advertise Shift+N (which still creates, #3038). Strict mode
         // already uses `N`.
         let new_uses_shift = committed_search && !strict;
-        let (click, key) = if new_uses_shift {
-            (kc('N'), "N".to_string())
+        let (click, key, label) = if on_suggestion {
+            let (click, key) = bound(ActionId::NewFromSelection);
+            (click, key, "Another")
+        } else if new_uses_shift {
+            (kc('N'), "N".to_string(), "New")
         } else {
-            bound(ActionId::NewSession)
+            let (click, key) = bound(ActionId::NewSession);
+            (click, key, "New")
         };
-        groups.push((1, click, mk(&key, "New")));
+        groups.push((1, click, mk(&key, label)));
 
         // Priority 1 is the core daily workflow (new, message, the web dashboard), which
         // survives the greedy pack at ~80 cols; del stays at p3 and can drop first.
@@ -4338,14 +4397,14 @@ impl HomeView {
             let (click, key) = bound(ActionId::SendMessage);
             groups.push((1, click, mk(&key, "Msg")));
         }
-        if !self.flat_items.is_empty() {
+        if !self.flat_items.is_empty() && !on_suggestion {
             let (click, key) = bound(ActionId::Delete);
             groups.push((3, click, mk(&key, "Del")));
         }
         // Archive / Snooze render only in Attention sort: they shape the Attention queue
         // and do nothing visible elsewhere, so they would just take footer space.
         let in_attention = self.sort_order == SortOrder::Attention;
-        if in_attention {
+        if in_attention && !on_suggestion {
             if !self.flat_items.is_empty() {
                 let (click, key) = bound(ActionId::ToggleArchive);
                 groups.push((1, click, mk(&key, "Archive")));
@@ -4377,8 +4436,10 @@ impl HomeView {
 
         let (click, key) = bound(ActionId::SearchStart);
         groups.push((4, click, mk_key(&key)));
-        let (click, key) = bound(ActionId::Diff);
-        groups.push((4, click, mk(&key, "Diff")));
+        if !on_suggestion {
+            let (click, key) = bound(ActionId::Diff);
+            groups.push((4, click, mk(&key, "Diff")));
+        }
         // The R entry carries one state: a Daemon problem or limit, else the Web dashboard.
         let mut serving_status = None;
         let attention = self.daemon_attention();

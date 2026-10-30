@@ -336,6 +336,8 @@ impl HomeView {
                 .and_then(|c| c.app_state.archived_section_collapsed)
                 .unwrap_or(true),
             trashed_section_collapsed: true,
+            suggested_section_collapsed: true,
+            suggestions_feed: crate::tui::suggestions::SuggestionsFeed::new(),
             hide_stopped_in_groups: false,
             group_totals: HashMap::new(),
             opener_exits: Vec::new(),

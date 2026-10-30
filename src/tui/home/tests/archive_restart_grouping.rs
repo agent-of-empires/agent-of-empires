@@ -597,6 +597,7 @@ fn build_flat_items_by_org_groups_by_resolved_owner() {
                     membership.insert(inst.title.clone(), current_group.clone().unwrap());
                 }
             }
+            _ => {}
         }
     }
 
@@ -725,13 +726,12 @@ fn project_grouping_survives_attention_sort() {
         for item in &env.view.flat_items {
             match item {
                 Item::Group { name, .. } => current_group = Some(name.clone()),
-                Item::Session { id, .. } => {
-                    if current_group.as_deref() == Some("alpha") {
-                        if let Some(inst) = env.view.instances.get(id) {
-                            alpha_session_order.push(inst.title.clone());
-                        }
+                Item::Session { id, .. } if current_group.as_deref() == Some("alpha") => {
+                    if let Some(inst) = env.view.instances.get(id) {
+                        alpha_session_order.push(inst.title.clone());
                     }
                 }
+                _ => {}
             }
         }
         assert_eq!(
@@ -1831,7 +1831,7 @@ fn group_by_toggle_preserves_selected_session() {
             .expect("cursor must point into flat_items");
         match cursor_item {
             Item::Session { id, .. } => assert_eq!(id, &target_id),
-            Item::Group { .. } => panic!("cursor landed on a group header, not the session"),
+            _ => panic!("cursor landed on a non-session row"),
         }
     }
     // Newest to Attention under Project grouping.
@@ -2415,7 +2415,7 @@ fn archived_section_nests_by_project_in_project_mode() {
             .iter()
             .filter(|it| match it {
                 Item::Group { path, .. } => is_within_archived_section(path),
-                Item::Session { .. } => false,
+                _ => false,
             })
             .collect();
         assert_eq!(
