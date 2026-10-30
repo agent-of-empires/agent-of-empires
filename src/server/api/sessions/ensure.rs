@@ -199,7 +199,7 @@ pub async fn ensure_session(
     .await
 }
 
-pub(super) fn ready_agent_session(instance: &Instance) -> anyhow::Result<Option<String>> {
+pub(crate) fn ready_agent_session(instance: &Instance) -> anyhow::Result<Option<String>> {
     let panes = crate::tmux::batch_pane_metadata()?;
     let Some((name, pane)) =
         crate::tmux::agent_pane_metadata_in(&panes, &instance.id, &instance.title)?
