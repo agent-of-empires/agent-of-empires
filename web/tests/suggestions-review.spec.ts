@@ -78,15 +78,22 @@ test("source switch patches the provider and the list reloads", async ({ page })
   await page.route("**/api/sessions", (route) =>
     route.fulfill({ headers: CURSOR, json: { sessions: [], workspace_ordering: [] } }),
   );
-  await page.route("**/api/suggestions", (route) => route.fulfill({ json: { providers: [provider], items: [item] } }));
+  let snapshotReads = 0;
+  await page.route("**/api/suggestions", (route) => {
+    snapshotReads++;
+    return route.fulfill({ json: { providers: [provider], items: [item] } });
+  });
   await page.route("**/api/suggestions/sources", (route) =>
     route.fulfill({ json: { provider_id: "github", criterion: "ci", enabled: true } }),
   );
   await page.goto("/suggestions");
+  await expect(page.getByRole("heading", { name: item.title })).toBeVisible();
+  expect(snapshotReads).toBe(1);
 
   const patch = page.waitForRequest((r) => r.url().endsWith("/api/suggestions/sources") && r.method() === "PATCH");
   await page.getByLabel("GitHub: Failing checks").click();
   expect((await patch).postDataJSON()).toEqual({ provider_id: "github", criterion: "ci", enabled: true });
+  await expect.poll(() => snapshotReads).toBe(2);
 });
 
 test("dismissed items move to the dismissed list and can be restored", async ({ page }) => {
@@ -110,7 +117,8 @@ test("dismissed items move to the dismissed list and can be restored", async ({ 
   await expect(page.getByRole("heading", { name: item.title })).toHaveCount(0);
   await page.getByRole("button", { name: "Dismissed (1)" }).click();
   await page.getByRole("button", { name: "Restore" }).click();
-  await expect(page.getByText("No dismissed suggestions")).toBeVisible();
+  await page.getByRole("button", { name: "Show active" }).click();
+  await expect(page.getByRole("heading", { name: item.title })).toBeVisible();
 });
 
 test("a provider error stays visible next to the last items", async ({ page }) => {

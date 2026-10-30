@@ -17,16 +17,19 @@ interface Props {
   onPrepare: (prefill: WizardPrefill) => void;
 }
 
-const STALE_NOTICE = "That suggestion is no longer published. The list was refreshed.";
+const STALE_NOTICE = "That suggestion changed. Refreshing the list.";
 const isHttpUrl = (url: string) => /^https?:\/\//i.test(url);
 
+// `p.worktree` is dropped on purpose: the wizard resolves worktree itself, and
+// `WizardPrefill.worktreeEnabled` means a registered-project override.
 function toWizardPrefill(p: SuggestionPrepared): WizardPrefill {
   return {
     path: p.project?.path,
     tool: p.tool,
     yoloMode: p.yolo,
     sandboxEnabled: p.sandbox,
-    initialPrompt: p.initial_prompt,
+    // A blank initial_prompt is rejected by POST /api/sessions, so send none.
+    initialPrompt: p.initial_prompt || undefined,
   };
 }
 
@@ -179,7 +182,7 @@ export function SuggestionsView({ readOnly = false, onPrepare }: Props) {
           </section>
         ))}
 
-        {dismissedCount > 0 && (
+        {(dismissedCount > 0 || showDismissed) && (
           <div className="mt-4 flex justify-end">
             <button
               type="button"

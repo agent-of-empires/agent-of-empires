@@ -132,7 +132,7 @@ describe("SuggestionsView", () => {
     prepareSuggestion.mockResolvedValue({ ok: false, error: "gone", stale: true });
     const onPrepare = await open(snapshot());
     fireEvent.click(await screen.findByRole("button", { name: "Start" }));
-    expect((await screen.findByRole("alert")).textContent).toContain("no longer published");
+    expect((await screen.findByRole("alert")).textContent).toContain("Refreshing the list");
     expect(onPrepare).not.toHaveBeenCalled();
     expect(fetchSuggestions).toHaveBeenCalledTimes(2);
   });
@@ -169,10 +169,75 @@ describe("SuggestionsView", () => {
     expect((screen.getByLabelText("GitHub: Failing checks") as HTMLInputElement).disabled).toBe(true);
   });
 
-  it("disables mutations while offline", async () => {
+  it("disables every mutation while offline", async () => {
     await open(snapshot());
     await screen.findByText("Fix lifecycle");
     act(() => setServerDown(true));
-    expect((screen.getByRole("button", { name: "Start" }) as HTMLButtonElement).disabled).toBe(true);
+    for (const name of ["Start", "Dismiss", "Refresh"]) {
+      expect((screen.getByRole("button", { name }) as HTMLButtonElement).disabled).toBe(true);
+    }
+    expect((screen.getByLabelText("GitHub: Failing checks") as HTMLInputElement).disabled).toBe(true);
+  });
+
+  it("restoring the last dismissed item keeps the way back to the active list", async () => {
+    dismissSuggestion.mockResolvedValue(ok);
+    await open(snapshot({ items: [{ ...item, dismissed: true }] }));
+    fireEvent.click(await screen.findByRole("button", { name: "Dismissed (1)" }));
+    fetchSuggestions.mockResolvedValue(snapshot());
+    fireEvent.click(await screen.findByRole("button", { name: "Restore" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Show active" }));
+    expect(await screen.findByText("Fix lifecycle")).toBeTruthy();
+  });
+
+  it("omits an empty initial prompt from the wizard prefill", async () => {
+    prepareSuggestion.mockResolvedValue({
+      ok: true,
+      data: {
+        title: "t",
+        initial_prompt: "",
+        source_ref: "example/1",
+        project: null,
+        tool: "claude",
+        yolo: false,
+        sandbox: false,
+        worktree: false,
+      },
+    });
+    const onPrepare = await open(snapshot());
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+    await waitFor(() => expect(onPrepare).toHaveBeenCalled());
+    expect(onPrepare.mock.calls[0][0].initialPrompt).toBeUndefined();
+  });
+
+  describe("non-stale failures show the error and release the controls", () => {
+    const failure = { ok: false, error: "boom", stale: false };
+    const expectReleased = async (...names: string[]) => {
+      expect((await screen.findByRole("alert")).textContent).toContain("boom");
+      for (const name of names) {
+        await waitFor(() => expect((screen.getByRole("button", { name }) as HTMLButtonElement).disabled).toBe(false));
+      }
+    };
+
+    it("dismiss", async () => {
+      dismissSuggestion.mockResolvedValue(failure);
+      await open(snapshot());
+      fireEvent.click(await screen.findByRole("button", { name: "Dismiss" }));
+      await expectReleased("Start", "Dismiss", "Refresh");
+    });
+
+    it("refresh", async () => {
+      refreshSuggestions.mockResolvedValue(failure);
+      await open(snapshot());
+      fireEvent.click(await screen.findByRole("button", { name: "Refresh" }));
+      await expectReleased("Refresh", "Start");
+    });
+
+    it("start", async () => {
+      prepareSuggestion.mockResolvedValue(failure);
+      const onPrepare = await open(snapshot());
+      fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+      await expectReleased("Start", "Dismiss");
+      expect(onPrepare).not.toHaveBeenCalled();
+    });
   });
 });
