@@ -79,9 +79,9 @@ pub use skills::{
 };
 pub use suggestions::{
     delete_suggestion_mapping, delete_suggestion_template, dismiss_suggestion,
-    get_suggestion_templates, get_suggestions, list_suggestion_mappings, prepare_suggestion,
-    put_suggestion_mapping, put_suggestion_template, refresh_suggestions, run_suggestion_checks,
-    undismiss_suggestion, update_suggestion_source,
+    get_suggestion_templates, get_suggestions, list_suggestion_mappings, patch_suggestion_prefs,
+    prepare_suggestion, put_suggestion_mapping, put_suggestion_template, refresh_suggestions,
+    run_suggestion_checks, undismiss_suggestion, update_suggestion_source,
 };
 
 pub use system::{
@@ -598,6 +598,7 @@ mod tests {
                 "delete_suggestion_mapping",
                 "delete_suggestion_template",
                 "dismiss_suggestion",
+                "patch_suggestion_prefs",
                 "put_suggestion_mapping",
                 "put_suggestion_template",
                 "refresh_suggestions",
@@ -1778,6 +1779,7 @@ mod tests {
             (Method::POST, "/api/suggestions/dismiss"),
             (Method::POST, "/api/suggestions/undismiss"),
             (Method::PATCH, "/api/suggestions/sources"),
+            (Method::PATCH, "/api/suggestions/prefs"),
             (Method::PUT, "/api/suggestions/templates"),
             (Method::DELETE, "/api/suggestions/templates"),
             (Method::PUT, "/api/suggestions/mappings"),

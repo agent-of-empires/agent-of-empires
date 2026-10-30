@@ -5,21 +5,18 @@ import { SuggestionsView } from "../SuggestionsView";
 import { setServerDown } from "../../lib/connectionState";
 import type { SuggestionItem, SuggestionsSnapshot } from "../../lib/types";
 
-const { fetchSuggestions, prepareSuggestion, refreshSuggestions, dismissSuggestion, updateSuggestionSource } =
-  vi.hoisted(() => ({
-    fetchSuggestions: vi.fn(),
-    prepareSuggestion: vi.fn(),
-    refreshSuggestions: vi.fn(),
-    dismissSuggestion: vi.fn(),
-    updateSuggestionSource: vi.fn(),
-  }));
+const { fetchSuggestions, prepareSuggestion, refreshSuggestions, dismissSuggestion } = vi.hoisted(() => ({
+  fetchSuggestions: vi.fn(),
+  prepareSuggestion: vi.fn(),
+  refreshSuggestions: vi.fn(),
+  dismissSuggestion: vi.fn(),
+}));
 
 vi.mock("../../lib/api", () => ({
   fetchSuggestions,
   prepareSuggestion,
   refreshSuggestions,
   dismissSuggestion,
-  updateSuggestionSource,
 }));
 
 const item: SuggestionItem = {
@@ -42,12 +39,14 @@ const snapshot = (over: Partial<SuggestionsSnapshot> = {}): SuggestionsSnapshot 
       id: "github",
       name: "GitHub",
       status: "ok",
+      enabled: true,
       sources: [
-        { criterion: "assigned", label: "Assigned issues", description: "", enabled: true },
-        { criterion: "ci", label: "Failing checks", description: "", enabled: false },
+        { criterion: "assigned", label: "Assigned issues", description: "", enabled: true, variables: [] },
+        { criterion: "ci", label: "Failing checks", description: "", enabled: false, variables: [] },
       ],
     },
   ],
+  prefs: { homepage: true, sidebar: false, refresh_minutes: 15, provider_order: ["github"] },
   ...over,
 });
 const ok = { ok: true, data: undefined };
@@ -58,7 +57,7 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-async function open(snap: SuggestionsSnapshot | null, props: { readOnly?: boolean } = {}) {
+async function open(snap: SuggestionsSnapshot | null, props: { readOnly?: boolean; initialDismissed?: boolean } = {}) {
   fetchSuggestions.mockResolvedValue(snap);
   const onPrepare = vi.fn();
   const onOpenSession = vi.fn();
@@ -167,12 +166,10 @@ describe("SuggestionsView", () => {
     expect(meta.firstElementChild?.className).toContain("font-mono");
   });
 
-  it("source switch patches and reloads", async () => {
-    updateSuggestionSource.mockResolvedValue(ok);
-    await open(snapshot());
-    fireEvent.click(await screen.findByLabelText("GitHub: Failing checks"));
-    await waitFor(() => expect(updateSuggestionSource).toHaveBeenCalledWith("github", "ci", true));
-    await waitFor(() => expect(fetchSuggestions).toHaveBeenCalledTimes(2));
+  it("opens on the Dismissed filter when asked", async () => {
+    await open(snapshot({ items: [{ ...item, dismissed: true }] }), { initialDismissed: true });
+    expect(await screen.findByText("Fix lifecycle")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Restore" })).toBeTruthy();
   });
 
   it("dismiss, then restore from the dismissed list", async () => {
@@ -227,7 +224,6 @@ describe("SuggestionsView", () => {
     expect(start.title).toBe("Read-only: can't create Sessions");
     expect((screen.getByRole("button", { name: "Refresh" }) as HTMLButtonElement).disabled).toBe(true);
     expect(screen.queryByRole("button", { name: "Dismiss" })).toBeNull();
-    expect((screen.getByLabelText("GitHub: Failing checks") as HTMLInputElement).disabled).toBe(true);
     expect(screen.getByText("This dashboard is read-only. Start, Dismiss and Refresh are off.")).toBeTruthy();
   });
 
@@ -238,7 +234,6 @@ describe("SuggestionsView", () => {
     for (const name of ["Start", "Dismiss", "Refresh"]) {
       expect((screen.getByRole("button", { name }) as HTMLButtonElement).disabled).toBe(true);
     }
-    expect((screen.getByLabelText("GitHub: Failing checks") as HTMLInputElement).disabled).toBe(true);
     expect(
       screen.getByText("Disconnected. Suggestions show from the last fetch; reconnect to start one."),
     ).toBeTruthy();

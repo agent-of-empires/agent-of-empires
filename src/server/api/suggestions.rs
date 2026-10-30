@@ -104,7 +104,12 @@ fn find_provider(id: &str) -> Option<Provider> {
 
 pub async fn get_suggestions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let Some(host) = state.plugin_host.clone() else {
-        return Json(json!({ "providers": [], "items": [] })).into_response();
+        return Json(json!({
+            "providers": [],
+            "items": [],
+            "prefs": suggestions::prefs_json(suggestions::DEFAULT_PREFS, &[]),
+        }))
+        .into_response();
     };
     let profile = host.suggestions_profile();
     let started = suggestions::started_sessions(&state.instances.read().await, &profile);
@@ -252,6 +257,35 @@ pub async fn update_suggestion_source(
         "enabled": body.enabled,
     }))
     .into_response()
+}
+
+pub async fn patch_suggestion_prefs(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<suggestions::PrefsPatch>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(patch) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let Some(host) = state.plugin_host.clone() else {
+        return unavailable();
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let known: Vec<String> = suggestions::providers().into_iter().map(|p| p.id).collect();
+        host.with_suggestions_db(|conn, profile| {
+            suggestions::apply_prefs(conn, profile, &known, &patch)
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(Ok(()))) => Json(json!({ "ok": true })).into_response(),
+        Ok(Ok(Err(message))) => api_error(StatusCode::BAD_REQUEST, "validation_failed", message),
+        Ok(Err(error)) => internal(error),
+        Err(error) => internal(error),
+    }
 }
 
 pub async fn prepare_suggestion(
