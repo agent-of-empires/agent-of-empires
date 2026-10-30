@@ -440,6 +440,32 @@ mod tests {
     }
 
     #[test]
+    fn row_badges_are_budgeted_and_keep_path_aligned() {
+        // A long itemized badge is truncated to the budget, not overflowing it.
+        let long_badge = state_with(
+            &["s1"],
+            json!([row_badge("s1", json!({"items": [
+                {"text": "x".repeat(ROW_COLUMN_MAX_WIDTH + 20), "tone": "danger"}
+            ]}))]),
+        );
+        let (cells, width) = row_column_cells(&long_badge, "s1");
+        assert_eq!(width, ROW_COLUMN_MAX_WIDTH);
+        assert!(cells[0].0.ends_with('…'), "{:?}", cells[0].0);
+
+        // A badge on one row must not shift the path column vs a row without one.
+        let both = state_with(
+            &["s1", "s2"],
+            json!([row_badge("s1", json!({"items": [{"text": "CI failed"}]}))]),
+        );
+        let painted = rows(&both);
+        assert!(painted.iter().any(|l| l.contains("CI failed")), "{painted:?}");
+        assert_eq!(
+            column_of(&painted, "/tmp/s1"),
+            column_of(&painted, "/tmp/s2")
+        );
+    }
+
+    #[test]
     fn wide_glyphs_are_budgeted_by_terminal_cells() {
         // 13 CJK chars paint 26 cells, over the 24-cell budget, though a char
         // count would have called it a comfortable fit.
