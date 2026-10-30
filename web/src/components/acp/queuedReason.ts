@@ -18,7 +18,7 @@ export type QueuedAction =
 
 export interface QueuedReason {
   /** The uppercase header label, before the count. */
-  label: "Queued" | "Not sent";
+  label: "Queued" | "Queuing" | "Not sent";
   /** Sentence-case reason after the label, or null when nothing holds the queue. */
   reason: string | null;
   /** What a message row's action does. */
@@ -63,6 +63,12 @@ function resetTime(resetsAt: string): string | null {
 
 /** Why the queue is waiting, in the order the states outrank each other. */
 export function queuedReason(input: QueuedReasonInput): QueuedReason {
+  const reason = heldBy(input);
+  // Online, a row the Daemon hasn't confirmed yet is still on its way to the queue.
+  return reason.label === "Queued" && input.online && input.anyPending ? { ...reason, label: "Queuing" } : reason;
+}
+
+function heldBy(input: QueuedReasonInput): QueuedReason {
   const { agent } = input;
   const same = (label: QueuedReason["label"], reason: string | null, action: QueuedAction): QueuedReason => ({
     label,

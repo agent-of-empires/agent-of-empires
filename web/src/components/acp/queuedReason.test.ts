@@ -38,6 +38,8 @@ describe("queuedReason", () => {
         "dropOnly",
       ],
       ["offline, all confirmed", { online: false }, "Queued", null, "send", "send"],
+      // Online, an unconfirmed row is still on its way to the Daemon.
+      ["online, a row unconfirmed", { anyPending: true }, "Queuing", null, "send", "send"],
       [
         "new Session",
         { waitingFor: "Claude Code", workerDown: true },
