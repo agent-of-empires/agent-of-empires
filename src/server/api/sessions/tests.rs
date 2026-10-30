@@ -8529,6 +8529,74 @@ async fn create_rejects_hook_env_without_sandbox() {
 }
 
 #[tokio::test]
+async fn create_rejects_blank_initial_prompt() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let state = crate::server::test_support::build_test_app_state_impl(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        |_| {},
+        |supervisor| supervisor,
+    );
+    let (status, body) = post_create(
+        &state,
+        serde_json::json!({
+            "title": "blank-prompt", "path": "", "tool": "claude",
+            "scratch": true, "view": "structured", "initial_prompt": "  \n",
+        }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "validation_failed");
+    assert!(state.instances.read().await.is_empty());
+}
+
+#[tokio::test]
+async fn create_persists_initial_prompt_as_pending_turn() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .expect("acknowledge the agent hook paths");
+    crate::session::config::update_config(|config| {
+        config.default_profile = "chosen-default".to_string();
+    })
+    .unwrap();
+    crate::session::Storage::new_unwatched("chosen-default").unwrap();
+    let (launcher, _launches) = crate::server::test_support::counting_failing_launcher();
+    let state = crate::server::test_support::build_test_app_state_impl(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        |state| {
+            state.profile = std::sync::RwLock::new(crate::session::config::effective_profile(""));
+        },
+        |supervisor| supervisor.with_launcher(launcher),
+    );
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+    let (status, body) = post_create(
+        &state,
+        serde_json::json!({
+            "title": "with-prompt", "path": "", "tool": "claude",
+            "scratch": true, "view": "structured", "initial_prompt": "fix the bug",
+        }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
+    let instances = state.instances.read().await;
+    let turn = instances[0].pending_initial_turn.as_ref().expect("queued");
+    assert_eq!(turn.text, "fix the bug");
+    assert!(!turn.synthesized);
+}
+
+#[tokio::test]
 async fn scratch_create_resolves_profile_before_publication_and_purge() {
     use axum::response::IntoResponse;
 

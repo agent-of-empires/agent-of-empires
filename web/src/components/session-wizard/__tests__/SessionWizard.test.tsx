@@ -1046,3 +1046,23 @@ describe("SessionWizard Group field", () => {
     expect(payload()).toMatchObject({ group: "client/new" });
   });
 });
+
+describe("SessionWizard initial prompt", () => {
+  it("seeds the field from the prefill and sends edits as initial_prompt", async () => {
+    renderWizard({ path: "/tmp/proj", tool: "claude", initialPrompt: "draft" });
+    const field = screen.getByLabelText("Prompt") as HTMLTextAreaElement;
+    expect(field.value).toBe("draft");
+    fireEvent.change(field, { target: { value: "edited" } });
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload()).toMatchObject({ initial_prompt: "edited" });
+  });
+
+  it("omits initial_prompt when the field is blank", async () => {
+    renderWizard();
+    fireEvent.change(screen.getByLabelText("Prompt"), { target: { value: "  " } });
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload().initial_prompt).toBeUndefined();
+  });
+});

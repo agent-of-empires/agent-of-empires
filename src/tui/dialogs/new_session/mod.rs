@@ -131,6 +131,8 @@ pub struct NewSessionData {
     /// Create in the structured (ACP) view instead of a tmux terminal. Only
     /// true for ACP-capable tools; `validate_structured_choice` enforces it.
     pub structured: bool,
+    /// First turn typed into the agent once it is ready.
+    pub initial_prompt: Option<String>,
 }
 
 /// The one conversion from wizard output to builder input, so a new field
@@ -2278,6 +2280,7 @@ impl NewSessionDialog {
             scratch: self.scratch,
             fork_seed: self.fork_seed.clone(),
             structured: self.structured_enabled && self.structured_capable,
+            initial_prompt: None,
         })
     }
 
