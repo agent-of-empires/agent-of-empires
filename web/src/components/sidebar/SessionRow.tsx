@@ -14,7 +14,7 @@ import { statusMeaning } from "../../lib/statusLegend";
 import { StatusGlyph } from "../StatusGlyph";
 import { Tooltip } from "../Tooltip";
 import { useContextMenu } from "../useContextMenu";
-import { RowSubRows, RowTrailingBadges } from "./RowBadges";
+import { GroupExpandToggle, RowSubRows, RowTrailingBadges } from "./RowBadges";
 import { NAV_ITEM, onSidebarArrowKey } from "./keyboardNav";
 import { SessionActionsMenu, type SessionActionHandlers, type SessionMenuState } from "./SessionActions";
 import { useSessionRowModel } from "./useSessionRowModel";
@@ -33,6 +33,8 @@ export interface SessionRowProps extends SessionActionHandlers {
   indented?: boolean;
   optimistic: OptimisticTriage;
   bulkApi: RowBulkApi;
+  /** The session the URL currently points at, so an expanded sibling can tell whether it, not the group, is open. */
+  activeSessionId?: string | null;
 }
 
 export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
@@ -42,6 +44,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
   const compact = useSidebarCompact();
   const { model, setNotify, setColor } = useSessionRowModel(workspace, props.optimistic, isActive, props);
   const { label, sessionId, isDeleting, navigationSession } = model;
+  const [expanded, setExpanded] = useState(false);
 
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(label);
@@ -237,6 +240,13 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
                 {label}
               </span>
               {!compact && <RowTrailingBadges workspace={workspace} model={model} />}
+              {!compact && (
+                <GroupExpandToggle
+                  count={workspace.sessions.length}
+                  expanded={expanded}
+                  onToggle={() => setExpanded((e) => !e)}
+                />
+              )}
             </span>
             {!compact && <RowSubRows first={model.firstSession} />}
           </div>
@@ -256,6 +266,22 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
         onRename={startRename}
         bulkApi={bulkApi}
       />
+      {expanded && workspace.sessions.length > 1 && (
+        // The guide line is what reads as "these rows belong to the header above"; indentation
+        // alone is too subtle a shift to carry that on its own.
+        <div className="ml-4 border-l border-surface-700/50" data-testid="sidebar-expanded-sessions">
+          {workspace.sessions.map((session) => (
+            <SessionRow
+              key={session.id}
+              {...props}
+              workspace={{ ...workspace, sessions: [session] }}
+              indented
+              isActive={session.id === (props.activeSessionId ?? null)}
+              isSelected={false}
+            />
+          ))}
+        </div>
+      )}
     </>
   );
 });

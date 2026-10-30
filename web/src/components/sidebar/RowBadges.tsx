@@ -10,6 +10,7 @@ import { useHasDraftForSessions } from "../../lib/acpDrafts";
 import { useQueuedCountForSessions } from "../../hooks/useAcpQueueCount";
 import { summarizeRateLimits } from "../../lib/rateLimitSummary";
 import { computeSessionRowTag, useSessionRowTagMode } from "../../lib/sessionRowTag";
+import { FoldChevron } from "../icons";
 import { PluginRowLine } from "../plugin/PluginSlots";
 import { formatDurationSecondsShort, formatSnoozeRemainingShort } from "./format";
 import type { RowModel } from "./rowModel";
@@ -209,6 +210,37 @@ export function RowTrailingBadges({ workspace, model }: { workspace: Workspace; 
         </Chip>
       )}
     </>
+  );
+}
+
+/** Toggles a worktree row's siblings open below it as their own full rows, instead of leaving them collapsed. */
+export function GroupExpandToggle({
+  count,
+  expanded,
+  onToggle,
+}: {
+  count: number;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  if (count < 2) return null;
+  return (
+    <button
+      type="button"
+      onClick={(e) => {
+        // Without preventDefault, the anchor's native href navigation still fires on this click.
+        e.preventDefault();
+        e.stopPropagation();
+        onToggle();
+      }}
+      data-testid="sidebar-group-expand-toggle"
+      aria-expanded={expanded}
+      title={expanded ? "Collapse sessions" : `Show ${count} sessions`}
+      className={`${CHIP} gap-0.5 ${MUTED} shrink-0 cursor-pointer hover:text-text-primary hover:bg-surface-700/50`}
+    >
+      <FoldChevron className={`h-3 w-3 transition-transform duration-75 ${expanded ? "" : "-rotate-90"}`} />
+      {count}
+    </button>
   );
 }
 

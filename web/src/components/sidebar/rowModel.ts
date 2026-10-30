@@ -69,10 +69,11 @@ export function deriveRowModel(
   const { sessions } = workspace;
   const firstSession = sessions[0];
   const runningSession = sessions.find((s) => isSessionActive(s, idleDecayWindowMs));
-  const sessionTitle = firstSession?.title.trim() ?? "";
+  // The row stands in for whichever session it would navigate to, not arbitrarily the first one.
+  const preferredSession = runningSession ?? firstSession;
+  const sessionTitle = preferredSession?.title.trim() ?? "";
   const branchLabel = workspace.branch ?? null;
-  const label =
-    sessions.length === 1 ? sessionTitle || branchLabel || "default" : branchLabel || sessionTitle || "default";
+  const label = sessionTitle || branchLabel || "default";
   const sessionColor = sessions.map((s) => s.color).find((c) => c != null) ?? null;
   const isPinned = sessions.some((s) => s.pinned_at != null);
   const isArchived = sessions.some((s) => s.archived_at != null);
@@ -92,9 +93,9 @@ export function deriveRowModel(
     ...best,
     firstSession,
     runningSession,
-    navigationSession: runningSession ?? firstSession,
+    navigationSession: preferredSession,
     actionTargets: resolveActionTargets(sessions, optimistic),
-    sessionId: firstSession?.id,
+    sessionId: preferredSession?.id,
     sessionTitle,
     branchLabel,
     label,
