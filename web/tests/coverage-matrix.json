@@ -841,8 +841,16 @@
       "id": "suggestions.review-and-start",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/suggestions-review.spec.ts", "src/components/__tests__/SuggestionsView.test.tsx"],
-      "components": ["web/src/components/SuggestionsView.tsx"]
+      "specs": [
+        "tests/suggestions-review.spec.ts",
+        "src/components/__tests__/SuggestionsView.test.tsx",
+        "src/components/__tests__/DashboardSuggestions.test.tsx"
+      ],
+      "components": [
+        "web/src/components/SuggestionsView.tsx",
+        "web/src/components/SuggestionRow.tsx",
+        "web/src/components/DashboardSuggestions.tsx"
+      ]
     },
     {
       "id": "settings.advanced-fold",
