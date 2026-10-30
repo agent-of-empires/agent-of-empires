@@ -31,9 +31,85 @@ function baseArgs(overrides: Partial<Args> = {}): Args {
     onGoDashboard: vi.fn(),
     onToggleSidebar: vi.fn(),
     onLogout: vi.fn(),
+    focusMode: false,
+    onEnterFocusMode: vi.fn(),
+    onOpenFocusWindow: vi.fn(),
+    onExitFocusMode: vi.fn(),
     ...overrides,
   };
 }
+
+describe("useCommandActions focus mode", () => {
+  const sessions = ["a", "b"].map((id) => ({ id, title: id, project_path: `/tmp/${id}` })) as SessionResponse[];
+  const SWITCHING = [
+    "action:new-session",
+    "action:new-scratch-session",
+    "action:go-dashboard",
+    "action:jump-attention",
+    "action:toggle-sidebar",
+    "session:b",
+  ];
+
+  it("offers the session alone in this window and in its own window as separate commands, beside switching", () => {
+    const onEnterFocusMode = vi.fn();
+    const onOpenFocusWindow = vi.fn();
+    const actions = actionsFor({
+      sessions,
+      activeSessionId: "a",
+      hasAttentionSession: true,
+      onEnterFocusMode,
+      onOpenFocusWindow,
+    });
+    expect(actions.map((a) => a.id)).toEqual(expect.arrayContaining(SWITCHING));
+    expect(find(actions, "action:exit-focus-mode")).toBeUndefined();
+
+    const enter = find(actions, "action:enter-focus-mode")!;
+    expect(enter.title).toBe("Show only this Session");
+    enter.perform();
+    expect(onEnterFocusMode).toHaveBeenCalledWith("a");
+    expect(onOpenFocusWindow).not.toHaveBeenCalled();
+
+    const open = find(actions, "action:open-focus-window")!;
+    expect(open.title).toBe("Open in its own window");
+    // The former names still find them.
+    expect(open.keywords).toEqual(expect.arrayContaining(["focus", "pop out"]));
+    open.perform();
+    expect(onOpenFocusWindow).toHaveBeenCalledWith("a");
+    expect(onEnterFocusMode).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers neither command for a trashed session", () => {
+    const trashed = { ...sessions[0]!, trashed_at: "2026-01-01T00:00:00Z" } as SessionResponse;
+    const ids = actionsFor({ sessions, activeSessionId: "a", activeSession: trashed }).map((a) => a.id);
+    expect(ids).not.toContain("action:enter-focus-mode");
+    expect(ids).not.toContain("action:open-focus-window");
+  });
+
+  it("leaves out the own-window command where a second window cannot open", () => {
+    const ids = actionsFor({ sessions, activeSessionId: "a", onOpenFocusWindow: undefined }).map((a) => a.id);
+    expect(ids).toContain("action:enter-focus-mode");
+    expect(ids).not.toContain("action:open-focus-window");
+  });
+
+  it("drops every switching command in a focus window and offers to exit", () => {
+    const onExitFocusMode = vi.fn();
+    const actions = actionsFor({
+      sessions,
+      activeSessionId: "a",
+      hasAttentionSession: true,
+      focusMode: true,
+      onExitFocusMode,
+    });
+    const ids = actions.map((a) => a.id);
+    for (const id of SWITCHING) expect(ids).not.toContain(id);
+    expect(ids).not.toContain("action:enter-focus-mode");
+    expect(ids).not.toContain("action:open-focus-window");
+    const exit = find(actions, "action:exit-focus-mode")!;
+    expect(exit.title).toBe("Show all Sessions");
+    exit.perform();
+    expect(onExitFocusMode).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe("useCommandActions creation and attention commands", () => {
   it("offers New scratch session right after New session, dispatching onNewScratch", () => {

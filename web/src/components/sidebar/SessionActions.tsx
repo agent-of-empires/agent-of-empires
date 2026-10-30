@@ -11,7 +11,8 @@ import {
 } from "../../lib/api";
 import { useUnreadIndicatorEnabled } from "../../lib/unreadIndicator";
 import { useSessionColorsEnabled } from "../../lib/sessionColors";
-import { requestOpenSession } from "../../lib/sessionRoute";
+import { enterFocusWindow, openFocusWindow, requestOpenSession } from "../../lib/sessionRoute";
+import { useIsCoarsePointer } from "../../hooks/useIsCoarsePointer";
 import { requestSwitchAgent } from "../../lib/switchAgentTrigger";
 import { reportError, reportInfo } from "../../lib/toastBus";
 import { ContextMenu } from "../ContextMenu";
@@ -83,11 +84,15 @@ export function SessionActionsMenu({
   const owner = useSessionActions();
   const colorsEnabled = useSessionColorsEnabled();
   const unreadEnabled = useUnreadIndicatorEnabled();
+  // An installed dashboard on a phone cannot open a second window.
+  const canOpenWindows = !useIsCoarsePointer();
   const { label } = model;
+  const rowActions = buildRowActions(workspace, handlers, model, closeMenu, setModal, setRecreating, () => {
+    if (model.firstSession) owner.openAttach(model.firstSession);
+  });
   const actions = {
-    ...buildRowActions(workspace, handlers, model, closeMenu, setModal, setRecreating, () => {
-      if (model.firstSession) owner.openAttach(model.firstSession);
-    }),
+    ...rowActions,
+    openOwnWindow: canOpenWindows ? rowActions.openOwnWindow : undefined,
     rename: onRename,
     notify: setNotify,
     color: setColor,
@@ -225,6 +230,8 @@ function buildRowActions(
       if (result.ok) reportInfo("Summarizing the conversation so far…");
       else reportError(result.message ?? "Could not start the summary. Please try again.");
     }),
+    showOnly: afterTarget("showOnly", (s) => enterFocusWindow(s.id)),
+    openOwnWindow: afterTarget("openOwnWindow", (s) => openFocusWindow(s.id)),
     stop: afterTarget("stop", (s) => props.onStop?.(s.id)),
     start: afterTarget("start", (s) => props.onStart?.(s.id)),
     restartUpdate: afterTarget("restartUpdate", (s) => props.onRestartForUpdate?.(s.id)),

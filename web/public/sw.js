@@ -54,6 +54,27 @@ function recordSeq(tag, seq) {
   if (hw == null || seq > hw) seqHighWater.set(tag, seq);
 }
 
+// The session a focus-mode window is limited to (`/session/<id>?focus=1`), or null for a regular window. `client.url`
+// is the URL the document loaded with, so entering and leaving focus mode must load a new document.
+function focusSessionOf(client) {
+  try {
+    const url = new URL(client.url);
+    const match = /^\/session\/([^/]+)\/?$/.exec(url.pathname);
+    return match && url.searchParams.get("focus") === "1" ? decodeURIComponent(match[1]) : null;
+  } catch {
+    return null;
+  }
+}
+
+function sessionOfUrl(target) {
+  try {
+    const match = /^\/session\/([^/]+)/.exec(new URL(target, self.location.origin).pathname);
+    return match ? decodeURIComponent(match[1]) : null;
+  } catch {
+    return null;
+  }
+}
+
 // Unknown counts as Apple: a needless OS notification beats a revoked subscription.
 async function mustShowNotification() {
   try {
@@ -146,7 +167,10 @@ self.addEventListener("push", (event) => {
         includeUncontrolled: true,
       });
       const focused = clientList.find((c) => c.visibilityState === "visible" && c.focused);
-      if (focused && !(await mustShowNotification())) {
+      // A focus-mode window only takes pushes about its own session; others still reach the OS.
+      const focusSession = focused ? focusSessionOf(focused) : null;
+      const inScope = !focusSession || focusSession === payload.session_id;
+      if (focused && inScope && !(await mustShowNotification())) {
         try {
           focused.postMessage({ type: "aoe-push", payload });
         } catch {
@@ -160,14 +184,20 @@ self.addEventListener("push", (event) => {
 });
 
 // Tap-to-open. Look for an existing PWA window first so we focus it
-// (and navigate if needed) rather than opening a second instance.
+// (and navigate if needed) rather than opening a second instance. A focus-mode
+// window already showing the session is focused as is; other focus windows
+// are never navigated away from their session.
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   const target = (event.notification.data && event.notification.data.url) || "/";
+  const targetSession = sessionOfUrl(target);
   event.waitUntil(
     self.clients.matchAll({ type: "window", includeUncontrolled: true }).then(async (clientList) => {
-      for (const client of clientList) {
-        if ("focus" in client) {
+      const windows = clientList.filter((c) => "focus" in c);
+      const focusWindow = targetSession && windows.find((c) => focusSessionOf(c) === targetSession);
+      if (focusWindow) return focusWindow.focus();
+      for (const client of windows) {
+        if (!focusSessionOf(client)) {
           if (client.url !== target && "navigate" in client) {
             try {
               await client.navigate(target);
