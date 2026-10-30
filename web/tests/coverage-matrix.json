@@ -3487,6 +3487,13 @@
       "components": ["web/src/components/acp/ApprovalCard.tsx", "web/src/components/acp/PlanModal.tsx"]
     },
     {
+      "id": "acp.plan-modal",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/acp-plan-modal.spec.ts"],
+      "components": ["web/src/components/acp/PlanModal.tsx"]
+    },
+    {
       "id": "acp.markdown",
       "kind": "vitest",
       "risk": "high",
