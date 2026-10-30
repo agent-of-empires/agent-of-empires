@@ -206,6 +206,10 @@ async fn send_terminal_message_inner(
     drop(guard);
     drop(_submission);
     drop(namespace);
+    if result.is_ok() {
+        // A newer prompt supersedes an undelivered initial one, as in ACP.
+        service.clear_pending_initial_turn(id).await;
+    }
     result.map_err(|error| {
         if let Some(blocked) = error.downcast_ref::<crate::session::StartBlocked>() {
             SendKeysError::Blocked(*blocked)

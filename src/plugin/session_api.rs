@@ -1755,6 +1755,7 @@ mod tests {
         parked.view = crate::session::View::Structured;
         parked.agent_name = Some("aoe-no-such-agent-msg".to_string());
         let seeded = crate::session::PendingInitialTurn {
+            error: None,
             text: "queued before the park".to_string(),
             attachments: Vec::new(),
             synthesized: true,

@@ -8145,6 +8145,7 @@ mod tests {
             scratch: false,
             fork_seed: None,
             structured: false,
+            initial_prompt: None,
         }
     }
 
