@@ -128,7 +128,7 @@ export function PluginMarketplace({ market, installedSources, onOpenDetail }: Pr
                     {r.suggestions && (
                       <span
                         className="inline-flex h-5 items-center gap-1 rounded border border-brand-600 px-1.5 font-mono text-[11px] text-brand-400"
-                        title="This plugin can suggest Sessions. Turn it on in Settings › Suggestions after installing."
+                        title={`This plugin can suggest Sessions. Turn it on in Settings › Suggestions${r.badge === "installed" ? "" : " after installing"}.`}
                         data-testid={`plugins-suggestions-chip-${r.slug}`}
                       >
                         <Sparkles className="size-3" aria-hidden="true" />

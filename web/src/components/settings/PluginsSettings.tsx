@@ -49,7 +49,7 @@ export function PluginsSettings({
       void discover();
     }, 0);
     return () => clearTimeout(timer);
-    // Runs once on mount: the deep link lands on a populated, filtered list.
+    // Once on mount; the cleared timer makes a StrictMode remount fire it once.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

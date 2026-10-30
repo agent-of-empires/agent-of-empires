@@ -5038,6 +5038,7 @@
         "web/src/components/settings/PluginIdentityIcon.tsx",
         "web/src/components/settings/PluginCard.tsx",
         "web/src/components/settings/PluginMarketplace.tsx",
+        "web/src/components/settings/pluginFlows.ts",
         "web/src/components/settings/PluginModal.tsx"
       ]
     },

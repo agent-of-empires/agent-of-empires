@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 import {
   applyPluginUpdate,
@@ -162,10 +162,13 @@ export function usePluginMarketplace(startJob: (job: PluginJobRef) => void, init
   const [installBusy, setInstallBusy] = useState(false);
   const [installError, setInstallError] = useState<string | null>(null);
 
+  const latestDiscover = useRef(0);
   const discover = async () => {
+    const id = ++latestDiscover.current;
     setDiscovering(true);
     setError(null);
     const res = await discoverPlugins(query);
+    if (id !== latestDiscover.current) return;
     if (res.kind === "ok") {
       setResults(res.results);
     } else {
