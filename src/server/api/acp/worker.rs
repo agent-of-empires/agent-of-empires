@@ -322,12 +322,26 @@ pub async fn restart_acp(
 }
 
 async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpRequest) -> Response {
-    let Some(restart) = state.acp_supervisor.try_begin_restart(&id).await else {
-        return (
-            StatusCode::CONFLICT,
-            "restart_in_progress: a restart is already in progress for this session",
-        )
-            .into_response();
+    let restart = match state
+        .acp_supervisor
+        .try_begin_restart_with_reason(&id)
+        .await
+    {
+        Ok(restart) => restart,
+        Err(crate::acp::supervisor::RestartClaimConflict::Switch) => {
+            return (
+                StatusCode::CONFLICT,
+                "switch_in_progress: an agent switch is already in progress for this session",
+            )
+                .into_response();
+        }
+        Err(crate::acp::supervisor::RestartClaimConflict::Restart) => {
+            return (
+                StatusCode::CONFLICT,
+                "restart_in_progress: a restart is already in progress for this session",
+            )
+                .into_response();
+        }
     };
     let Some(preflight_instance) = find_instance(&state, &id).await else {
         return session_not_found();

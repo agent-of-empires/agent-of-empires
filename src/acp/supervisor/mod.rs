@@ -239,6 +239,12 @@ pub(crate) struct RestartRequestGuard {
     requests: RestartRequests,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RestartClaimConflict {
+    Switch,
+    Restart,
+}
+
 /// Cancellation for a request that is still acquiring launch guards or
 /// waiting to be admitted into the Lease table.
 pub(crate) struct PendingSpawnGuard {
@@ -807,25 +813,32 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     /// Claim the session's restart lane while holding the same gate used by
     /// `begin_resume`, so an explicit launch cannot slip past the claim.
-    pub(crate) async fn try_begin_restart(&self, session_id: &str) -> Option<RestartRequestGuard> {
+    pub(crate) async fn try_begin_restart_with_reason(
+        &self,
+        session_id: &str,
+    ) -> Result<RestartRequestGuard, RestartClaimConflict> {
         let _workers = self.workers.lock().await;
         let spawn_requests = lock_recover(&self.spawn_requests);
         if spawn_requests.switches.contains_key(session_id) {
-            return None;
+            return Err(RestartClaimConflict::Switch);
         }
         let mut requests = lock_recover(&self.restart_requests);
         if requests.contains_key(session_id) {
-            return None;
+            return Err(RestartClaimConflict::Restart);
         }
         let request_id = self.next_restart_request_id.fetch_add(1, Ordering::Relaxed);
         let cancellation = CancellationToken::new();
         requests.insert(session_id.to_string(), (request_id, cancellation.clone()));
-        Some(RestartRequestGuard {
+        Ok(RestartRequestGuard {
             session_id: session_id.to_string(),
             request_id,
             cancellation,
             requests: Arc::clone(&self.restart_requests),
         })
+    }
+
+    pub(crate) async fn try_begin_restart(&self, session_id: &str) -> Option<RestartRequestGuard> {
+        self.try_begin_restart_with_reason(session_id).await.ok()
     }
 
     /// Serialize with resume admission, then cancel any restart that has not settled yet.
