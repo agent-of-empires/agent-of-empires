@@ -4,9 +4,9 @@
 import { useEffect, useState } from "react";
 import { Bot, ChevronDown, Maximize2, Square, Workflow, X } from "lucide-react";
 
-import { useBackgroundAgents } from "../../hooks/useAcpSession";
+import { useBackgroundAgents, useBackgroundTasks, useWorkflowRuns } from "../../hooks/useAcpSession";
 import type { BackgroundAgent, BackgroundAgentStatus, BackgroundAgentTool } from "../../lib/acpTypes";
-import { isActiveAgent, workflowPhases } from "./backgroundAgentsContext";
+import { isActiveAgent, workflowPhases, workflowRunning } from "./backgroundAgentsContext";
 import { CopyMarkdownButton } from "./CopyMarkdownButton";
 
 type Entry =
@@ -32,6 +32,8 @@ function entries(sorted: BackgroundAgent[], all: BackgroundAgent[]): Entry[] {
 
 export function BackgroundAgentsPanel({ sessionId }: { sessionId: string | null }) {
   const agents = useBackgroundAgents(sessionId);
+  const backgroundTasks = useBackgroundTasks(sessionId);
+  const workflowRuns = useWorkflowRuns(sessionId);
 
   if (agents.length === 0) {
     return (
@@ -71,7 +73,12 @@ export function BackgroundAgentsPanel({ sessionId }: { sessionId: string | null 
           entry.kind === "agent" ? (
             <AgentRow key={entry.agent.agentId} agent={entry.agent} />
           ) : (
-            <WorkflowGroup key={entry.runId} name={entry.name} agents={entry.agents} />
+            <WorkflowGroup
+              key={entry.runId}
+              name={entry.name}
+              agents={entry.agents}
+              live={workflowRunning(workflowRuns[entry.agents[0]!.toolCallId], backgroundTasks, entry.agents)}
+            />
           ),
         )}
       </div>
@@ -79,7 +86,7 @@ export function BackgroundAgentsPanel({ sessionId }: { sessionId: string | null 
   );
 }
 
-function WorkflowGroup({ name, agents }: { name: string; agents: BackgroundAgent[] }) {
+function WorkflowGroup({ name, agents, live }: { name: string; agents: BackgroundAgent[]; live: boolean }) {
   const [open, setOpen] = useState(true);
   const done = agents.filter((a) => !isActiveAgent(a)).length;
   return (
@@ -89,7 +96,7 @@ function WorkflowGroup({ name, agents }: { name: string; agents: BackgroundAgent
         onClick={() => setOpen((v) => !v)}
         className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-surface-800"
       >
-        <StatusDot status={done < agents.length ? "running" : "completed"} />
+        <StatusDot status={live ? "running" : "completed"} />
         <Workflow className="h-3.5 w-3.5 shrink-0 text-text-dim" />
         <span className="min-w-0 flex-1 truncate text-xs text-text-secondary">{name}</span>
         <span className="shrink-0 text-[11px] tabular-nums text-text-dim">

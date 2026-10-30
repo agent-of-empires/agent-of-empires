@@ -337,7 +337,7 @@ describe("applyEvent / workflow runs", () => {
       { BackgroundTaskStarted: { task_id: "bash1", tool_call_id: "toolu_bash", description: "" } },
     ];
     const state = events.reduce((s, e, i) => ev(s, i + 1, e), emptyAcpState());
-    expect(state.workflowRuns).toEqual({ toolu_wf: { name: "drafts", summary: "Draft five issues" } });
+    expect(state.workflowRuns).toEqual({ toolu_wf: { taskId: "wfx", name: "drafts", summary: "Draft five issues" } });
     expect(state.backgroundTasks).toEqual(["wfx", "bash1"]);
     expect(state.backgroundAgents[0]).toMatchObject({
       toolCallId: "toolu_wf",

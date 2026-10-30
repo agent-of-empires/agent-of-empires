@@ -7,6 +7,7 @@ import type { BackgroundAgent, WorkflowRun } from "../../lib/acpTypes";
 export interface BackgroundAgentsContextValue {
   agents: BackgroundAgent[];
   workflowRuns?: Record<string, WorkflowRun>;
+  backgroundTasks?: string[];
   openPane?: () => void;
 }
 
@@ -26,6 +27,23 @@ export function useBackgroundAgentsFor(toolCallId: string): BackgroundAgent[] {
 
 export function useWorkflowRun(toolCallId: string): WorkflowRun | undefined {
   return useContext(BackgroundAgentsContext).workflowRuns?.[toolCallId];
+}
+
+export function useBackgroundTaskIds(): string[] {
+  return useContext(BackgroundAgentsContext).backgroundTasks ?? NO_TASKS;
+}
+
+const NO_TASKS: string[] = [];
+
+/** A run is live while its background task is; its agents only fill the phase
+ *  counts. A run launched before the replay window has no record, so its
+ *  agents decide. */
+export function workflowRunning(
+  run: WorkflowRun | undefined,
+  backgroundTasks: string[],
+  agents: BackgroundAgent[],
+): boolean {
+  return run ? backgroundTasks.includes(run.taskId) : agents.some(isActiveAgent);
 }
 
 export function useOpenBackgroundAgentsPane(): (() => void) | undefined {

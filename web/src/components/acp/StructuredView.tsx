@@ -103,6 +103,7 @@ export function StructuredView(props: Props) {
                   value={{
                     agents: ctx.state.backgroundAgents,
                     workflowRuns: ctx.state.workflowRuns,
+                    backgroundTasks: ctx.state.backgroundTasks,
                     openPane: props.onOpenAgentsPane,
                   }}
                 >

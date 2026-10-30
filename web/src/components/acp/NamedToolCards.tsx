@@ -32,9 +32,11 @@ import { ProvenanceBadge } from "../ProvenanceBadge";
 import {
   isActiveAgent,
   useBackgroundAgentsFor,
+  useBackgroundTaskIds,
   useOpenBackgroundAgentsPane,
   useWorkflowRun,
   workflowPhases,
+  workflowRunning,
 } from "./backgroundAgentsContext";
 import { GenericToolCard } from "./CoreToolCards";
 import {
@@ -171,8 +173,8 @@ function lastEnd(agents: { endedAt: string | null }[]): string | undefined {
   );
 }
 
-/** Claude's `Workflow` returns at once while its agents keep running, so the
- *  card follows the agents (from the Sub agents pane's store), not the call. */
+/** Claude's `Workflow` returns at once while the run goes on, so the card
+ *  follows the run's background task and agents, not the call. */
 export function WorkflowToolCard({ tool, result }: ToolCardProps) {
   const callStatus = statusFor(result);
   const run = useWorkflowRun(tool.id);
@@ -180,14 +182,15 @@ export function WorkflowToolCard({ tool, result }: ToolCardProps) {
   const openPane = useOpenBackgroundAgentsPane();
   const args = useToolArgs(tool);
   const script = pickStr(args, "script");
+  const live = workflowRunning(run, useBackgroundTaskIds(), agents);
   const running = agents.filter(isActiveAgent).length;
-  const status = callStatus === "ok" && running > 0 ? "running" : callStatus;
+  const status = callStatus === "ok" && live ? "running" : callStatus;
   const [open, setOpen] = useToolCardExpansion(status);
   return (
     <CardChrome
       status={status}
       startedAt={tool.started_at}
-      endedAt={running > 0 ? undefined : (lastEnd(agents) ?? result?.at)}
+      endedAt={live ? undefined : (lastEnd(agents) ?? result?.at)}
       icon={<Workflow className={ICON} />}
       label="workflow"
       primary={run?.name ?? agents[0]?.workflow?.name ?? "Workflow"}

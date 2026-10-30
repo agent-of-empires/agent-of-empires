@@ -658,6 +658,8 @@ export interface WorkflowRef {
 }
 
 export interface WorkflowRun {
+  /** The run's background task, live until the run ends. */
+  taskId: string;
   name: string;
   summary: string | null;
 }
@@ -1328,7 +1330,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     if (workflow && toolCallId) {
       next.workflowRuns = {
         ...next.workflowRuns,
-        [toolCallId]: { name: workflow.name, summary: workflow.summary ?? null },
+        [toolCallId]: { taskId: id, name: workflow.name, summary: workflow.summary ?? null },
       };
     }
     return next;

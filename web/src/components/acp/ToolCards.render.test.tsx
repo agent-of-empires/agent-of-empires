@@ -848,7 +848,8 @@ describe("WorkflowToolCard", () => {
     const openPane = vi.fn();
     const value = {
       agents: [member("d1", "Draft", "completed"), member("v1", "Verify", "running")],
-      workflowRuns: { toolu_wf: { name: "issue-drafts", summary: "Draft five issues" } },
+      workflowRuns: { toolu_wf: { taskId: "wfx", name: "issue-drafts", summary: "Draft five issues" } },
+      backgroundTasks: ["wfx"],
       openPane,
     };
     const { container, getByText } = render(
@@ -862,7 +863,7 @@ describe("WorkflowToolCard", () => {
     const text = () => container.textContent ?? "";
     expect(text()).toContain("issue-drafts");
     expect(text()).toContain("1 of 2 agents done");
-    // The call returned at launch, but an agent still runs.
+    // The call returned at launch, but the run goes on.
     expect(text()).toContain("running");
     expect(text()).not.toContain("Draft five issues");
     fireEvent.click(container.querySelector("button")!);
@@ -872,6 +873,28 @@ describe("WorkflowToolCard", () => {
     expect(text()).toContain("await agent");
     fireEvent.click(getByText("Open Sub agents"));
     expect(openPane).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["before its first agent", [], ["wfx"], true],
+    ["between phases", [member("d1", "Draft", "completed")], ["wfx"], true],
+    ["once its task ends", [member("d1", "Draft", "completed")], [], false],
+  ] as const)("follows the run's task %s", (_label, agents, backgroundTasks, running) => {
+    const value = {
+      agents: [...agents],
+      workflowRuns: { toolu_wf: { taskId: "wfx", name: "issue-drafts", summary: null } },
+      backgroundTasks: [...backgroundTasks],
+    };
+    const { container } = render(
+      wrap(
+        <BackgroundAgentsContext.Provider value={value}>
+          <ToolCard tool={tool} result={launched} />
+        </BackgroundAgentsContext.Provider>,
+        { toolKey: "claude" },
+      ),
+    );
+    expect(container.textContent).toContain("issue-drafts");
+    expect(container.textContent?.includes("running")).toBe(running);
   });
 
   it("names a run with no agents yet, and is the generic card for other agents", () => {
