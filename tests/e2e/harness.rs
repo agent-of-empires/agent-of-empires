@@ -808,21 +808,7 @@ last_seen_version = "{}"
                 shell_words::quote(path.to_str().expect("input barrier path"))
             );
         }
-        // A running tmux server keeps the environment of the client that
-        // started it, so the autostart policy goes on the command line.
-        let autostart = match self
-            .extra_env
-            .iter()
-            .rev()
-            .find(|(key, _)| key == "AOE_NO_AUTOSTART")
-        {
-            Some((_, value)) => format!(
-                "AOE_NO_AUTOSTART={}",
-                shell_words::quote(value.to_str().expect("AOE_NO_AUTOSTART value"))
-            ),
-            None => "-u AOE_NO_AUTOSTART".to_string(),
-        };
-        aoe_cmd = format!("env {autostart} {aoe_cmd}");
+        aoe_cmd = format!("env {} {aoe_cmd}", self.pane_env_policy());
         for arg in args {
             aoe_cmd.push(' ');
             aoe_cmd.push_str(arg);
@@ -848,8 +834,37 @@ last_seen_version = "{}"
         self.spawn(&[]);
     }
 
+    /// `env` arguments pinning autostart and daemon discovery in the pane. A
+    /// running tmux server keeps the environment of the client that started
+    /// it, so the policy goes on the command line: `set_env` values win and
+    /// everything else is unset. `env` needs every `-u` before the first
+    /// assignment.
+    fn pane_env_policy(&self) -> String {
+        let (set, unset): (Vec<_>, Vec<_>) =
+            ["AOE_NO_AUTOSTART", "AOE_DAEMON_URL", "AOE_DAEMON_TOKEN"]
+                .into_iter()
+                .map(|name| {
+                    (
+                        name,
+                        self.extra_env.iter().rev().find(|(key, _)| key == name),
+                    )
+                })
+                .partition(|(_, value)| value.is_some());
+        let unset = unset.into_iter().map(|(name, _)| format!("-u {name}"));
+        let set = set.into_iter().map(|(name, value)| {
+            let value = value
+                .expect("partitioned on Some")
+                .1
+                .to_str()
+                .expect("env value");
+            format!("{name}={}", shell_words::quote(value))
+        });
+        unset.chain(set).collect::<Vec<_>>().join(" ")
+    }
+
     pub fn spawn_peer_tui(&self, name: &str) {
-        self.tmux_new_detached(name, self.binary_path.to_str().expect("binary path"));
+        let binary = self.binary_path.to_str().expect("binary path");
+        self.tmux_new_detached(name, &format!("env {} {binary}", self.pane_env_policy()));
     }
 
     /// Spawn `aoe <args>` inside a detached tmux session.
@@ -1714,6 +1729,89 @@ fn tui_launch_sets_autostart_policy_on_a_running_tmux_server() {
             std::fs::read_to_string(&report).expect("probe report"),
             expected,
             "server started with {inherited:?}, set_env {explicit:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::parallel]
+fn tui_launch_isolates_daemon_endpoint_from_the_tmux_server() {
+    require_tmux!();
+    const HOSTILE: [(&str, &str); 2] = [
+        ("AOE_DAEMON_URL", "http://127.0.0.1:1"),
+        ("AOE_DAEMON_TOKEN", "hostile-token"),
+    ];
+    const EXPLICIT: [(&str, &str); 2] = [
+        ("AOE_DAEMON_URL", "http://127.0.0.1:2"),
+        ("AOE_DAEMON_TOKEN", "explicit-token"),
+    ];
+    // (server started with hostile values, set_env, what every pane sees)
+    let cases = [
+        (true, None, "unset unset"),
+        (true, Some(EXPLICIT), "http://127.0.0.1:2 explicit-token"),
+        (false, Some(EXPLICIT), "http://127.0.0.1:2 explicit-token"),
+    ];
+    for (hostile, explicit, expected) in cases {
+        let mut harness = TuiTestHarness::new("daemon_env_policy");
+        for (key, value) in explicit.into_iter().flatten() {
+            harness.set_env(key, value);
+        }
+
+        // Stands in for the TUI: reports what it inherited, then acknowledges
+        // startup. Drop runs the binary with arguments to stop the daemon;
+        // those calls exit at once.
+        let report = harness.home_path().join("daemon-env");
+        let probe = harness.home_path().join("probe");
+        write_executable(
+            &probe,
+            &format!(
+                "#!/bin/sh\n[ \"$#\" -eq 0 ] || exit 0\nprintf '%s %s\\n' \"${{AOE_DAEMON_URL-unset}}\" \"${{AOE_DAEMON_TOKEN-unset}}\" >> {}\nprintf '\\033]0;aoe-e2e-0\\007'\nexec sleep 600\n",
+                shell_words::quote(report.to_str().expect("report path"))
+            ),
+        );
+        harness.binary_path = probe;
+        // The first client fixes the server's environment, and its own pane
+        // is the fresh-server launch.
+        let mut panes = 2;
+        if hostile {
+            panes += 1;
+            let mut tmux = harness.tmux();
+            tmux.env("HOME", harness.home_path())
+                .env("XDG_CONFIG_HOME", harness.home_path().join(".config"))
+                .env("PATH", harness.env_path());
+            for (key, value) in &harness.extra_env {
+                tmux.env(key, value);
+            }
+            // Stale server globals must survive the `set_env` overrides.
+            tmux.envs(HOSTILE);
+            let output = tmux
+                .args(["new-session", "-d", "-s", "server"])
+                .arg(format!(
+                    "env {} {}",
+                    harness.pane_env_policy(),
+                    harness.binary_path.display()
+                ))
+                .output()
+                .expect("start harness tmux server");
+            assert!(output.status.success(), "{output:?}");
+        }
+        harness.spawn_tui();
+        harness.spawn_peer_tui("peer");
+
+        let lines = wait_until(Duration::from_secs(10), Duration::from_millis(50), || {
+            let text = std::fs::read_to_string(&report).map_err(|e| e.to_string())?;
+            let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+            if lines.len() == panes {
+                Ok(lines)
+            } else {
+                Err(format!("reports so far: {lines:?}"))
+            }
+        });
+        assert_eq!(
+            lines,
+            vec![expected; panes],
+            "server hostile {hostile}, set_env {explicit:?}"
         );
     }
 }
