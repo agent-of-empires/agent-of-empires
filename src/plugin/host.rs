@@ -192,9 +192,20 @@ impl PluginHost {
     }
 
     async fn notify_suggestion_workers(&self, method: &str, provider_id: Option<&str>) -> usize {
+        // An unreadable switch store notifies nobody rather than a provider the user turned off.
+        let disabled =
+            match self.with_suggestions_db(crate::plugin::suggestions::disabled_providers) {
+                Ok(disabled) => disabled,
+                Err(error) => {
+                    tracing::warn!(
+                        "suggestions: provider switches unreadable, skipping {method}: {error}"
+                    );
+                    return 0;
+                }
+            };
         let mut sent = 0;
         for provider in crate::plugin::suggestions::providers() {
-            if provider_id.is_some_and(|id| id != provider.id) {
+            if provider_id.is_some_and(|id| id != provider.id) || disabled.contains(&provider.id) {
                 continue;
             }
             let notified = self
