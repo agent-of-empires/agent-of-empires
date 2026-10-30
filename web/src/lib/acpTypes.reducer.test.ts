@@ -344,6 +344,23 @@ describe("applyEvent / workflow runs", () => {
       workflow: { run_id: "wf_1", name: "drafts", phase: "Draft" },
     });
   });
+
+  it("keeps the run's end time from its task", () => {
+    const events: AcpEvent[] = [
+      {
+        BackgroundTaskStarted: {
+          task_id: "wfx",
+          tool_call_id: "toolu_wf",
+          description: "drafts",
+          workflow: { run_id: "wf_1", name: "drafts" },
+        },
+      },
+      { BackgroundTaskFinished: { task_id: "wfx", ended_at: "2026-10-30T10:01:00Z" } },
+    ];
+    const state = events.reduce((s, e, i) => ev(s, i + 1, e), emptyAcpState());
+    expect(state.backgroundTasks).toEqual([]);
+    expect(state.workflowRuns.toolu_wf).toMatchObject({ taskId: "wfx", endedAt: "2026-10-30T10:01:00Z" });
+  });
 });
 
 describe("transcriptRowToActivity (Tier 4 wire mapping)", () => {

@@ -953,12 +953,14 @@ mod tests {
         record(task("done"));
         record(Event::BackgroundTaskFinished {
             task_id: "done".into(),
+            ended_at: None,
         });
         // An id reused after its finish: the second start is open and must
         // outlive the sweep that drops the completed first pair.
         record(task("reused"));
         record(Event::BackgroundTaskFinished {
             task_id: "reused".into(),
+            ended_at: None,
         });
         record(task("reused"));
         record(bg_launched("agent-open", ""));
@@ -1021,6 +1023,7 @@ mod tests {
         };
         let finished = || Event::BackgroundTaskFinished {
             task_id: "t".into(),
+            ended_at: None,
         };
         store.record("s-1", 1, &started("toolu_old")).unwrap();
         assert!(store.has_in_flight_turn("s-1"));
@@ -1063,6 +1066,7 @@ mod tests {
                 3,
                 &Event::BackgroundTaskFinished {
                     task_id: "t-1".into(),
+                    ended_at: None,
                 },
             )
             .unwrap();

@@ -444,7 +444,7 @@ export type AcpEvent =
         workflow?: { run_id: string; name: string; summary?: string | null } | null;
       };
     }
-  | { BackgroundTaskFinished: { task_id: string } }
+  | { BackgroundTaskFinished: { task_id: string; ended_at?: string | null } }
   | { PromptRejected: { reason: string; text: string } }
   | { AgentSwitched: { from: string; to: string; reason: string } }
   | { ConversationSummary: { text: string; summarized_until_seq: number } };
@@ -662,6 +662,7 @@ export interface WorkflowRun {
   taskId: string;
   name: string;
   summary: string | null;
+  endedAt?: string | null;
 }
 
 export interface BackgroundAgent {
@@ -1336,8 +1337,12 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     return next;
   }
   if ("BackgroundTaskFinished" in event) {
-    const id = event.BackgroundTaskFinished.task_id;
+    const { task_id: id, ended_at: endedAt } = event.BackgroundTaskFinished;
     next.backgroundTasks = next.backgroundTasks.filter((t) => t !== id);
+    const runKey = Object.keys(next.workflowRuns).find((k) => next.workflowRuns[k]!.taskId === id);
+    if (runKey && endedAt) {
+      next.workflowRuns = { ...next.workflowRuns, [runKey]: { ...next.workflowRuns[runKey]!, endedAt } };
+    }
     return next;
   }
   // Remaining events carry no client control state.

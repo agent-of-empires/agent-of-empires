@@ -747,6 +747,8 @@ pub enum Event {
     /// A background task reached a terminal state.
     BackgroundTaskFinished {
         task_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ended_at: Option<DateTime<Utc>>,
     },
     /// The adapter runtime failed a prompt before emitting any transcript.
     PromptRuntimeError {
@@ -1171,7 +1173,7 @@ impl AcpState {
                     self.background_tasks.push(task_id);
                 }
             }
-            Event::BackgroundTaskFinished { task_id } => {
+            Event::BackgroundTaskFinished { task_id, .. } => {
                 self.background_tasks.retain(|id| *id != task_id);
             }
             // Titles live on `Instance`; wakeups and monitors are read from the log.
@@ -2183,7 +2185,10 @@ mod tests {
             description: "sleep".into(),
             workflow: None,
         };
-        let finished = |id: &str| Event::BackgroundTaskFinished { task_id: id.into() };
+        let finished = |id: &str| Event::BackgroundTaskFinished {
+            task_id: id.into(),
+            ended_at: None,
+        };
         let mut s = applied([prompt("go"), started("t-1"), started("t-2"), stopped("end")]);
         assert!(!s.turn_active);
         assert!(s.has_active_background_agent());

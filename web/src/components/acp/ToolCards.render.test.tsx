@@ -897,6 +897,29 @@ describe("WorkflowToolCard", () => {
     expect(container.textContent?.includes("running")).toBe(running);
   });
 
+  it.each([
+    ["its last agent ended", [{ ...member("d1", "Draft", "completed"), endedAt: "2026-10-30T10:00:10Z" }]],
+    ["it had no agents", []],
+  ] as const)("times a finished run by its task even when %s", (_label, agents) => {
+    const value = {
+      agents: [...agents],
+      workflowRuns: { toolu_wf: { taskId: "wfx", name: "drafts", summary: null, endedAt: "2026-10-30T10:01:00Z" } },
+      backgroundTasks: [],
+    };
+    const { container } = render(
+      wrap(
+        <BackgroundAgentsContext.Provider value={value}>
+          <ToolCard
+            tool={{ ...tool, started_at: "2026-10-30T10:00:00Z" }}
+            result={{ ...launched, at: "2026-10-30T10:00:01Z" }}
+          />
+        </BackgroundAgentsContext.Provider>,
+        { toolKey: "claude" },
+      ),
+    );
+    expect(container.textContent).toContain("1m 0s");
+  });
+
   it("names a run with no agents yet, and is the generic card for other agents", () => {
     // The "workflow" label, then the fallback run name.
     expect(renderCard(tool, launched, { toolKey: "claude" }).text()).toContain("workflowWorkflow");

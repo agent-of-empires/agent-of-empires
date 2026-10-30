@@ -171,7 +171,10 @@ fn finish_stop_completion<S: BroadcastSink>(sink: &S, seqs: &super::SeqMap, leas
             if !sink.publish_persisted(
                 id,
                 super::next_seq(seqs, id),
-                &Event::BackgroundTaskFinished { task_id },
+                &Event::BackgroundTaskFinished {
+                    task_id,
+                    ended_at: Some(chrono::Utc::now()),
+                },
             ) {
                 return false;
             }
@@ -328,7 +331,10 @@ impl<S: BroadcastSink> Supervisor<S> {
             if !self.sink.publish_persisted(
                 session_id,
                 super::next_seq(&self.next_seqs, session_id),
-                &Event::BackgroundTaskFinished { task_id },
+                &Event::BackgroundTaskFinished {
+                    task_id,
+                    ended_at: Some(chrono::Utc::now()),
+                },
             ) {
                 return Err(SupervisorError::TeardownPending(session_id.to_owned()));
             }
@@ -1432,7 +1438,7 @@ mod tests {
             assert!(sink.failed.load(std::sync::atomic::Ordering::SeqCst));
             let prefix = store.replay_from(id, 0);
             assert_eq!(prefix.iter().filter(|(_, event)|
-                matches!(event, Event::BackgroundTaskFinished { task_id } if task_id == "original-task")).count(), 1);
+                matches!(event, Event::BackgroundTaskFinished { task_id, .. } if task_id == "original-task")).count(), 1);
             assert_eq!(prefix.iter().filter(|(_, event)|
                 matches!(event, Event::BackgroundAgentCompleted { agent_id, .. } if agent_id == "original-agent")).count(),
                 usize::from(fail_stopped));
@@ -1506,7 +1512,7 @@ mod tests {
         let mut terminals = [None; 3];
         for (seq, event) in store.replay_from(id, 0) {
             let index = match event {
-                Event::BackgroundTaskFinished { task_id } if task_id == task => Some(0),
+                Event::BackgroundTaskFinished { task_id, .. } if task_id == task => Some(0),
                 Event::BackgroundAgentCompleted {
                     agent_id,
                     status: BackgroundAgentStatus::Detached,
@@ -2747,7 +2753,7 @@ mod tests {
         let completed = p.store.replay_from(id, 0);
         assert_eq!(completed.len(), 3);
         assert!(matches!(&completed[1].1,
-            Event::BackgroundTaskFinished { task_id } if task_id == "open"));
+            Event::BackgroundTaskFinished { task_id, .. } if task_id == "open"));
         assert!(matches!(&completed[2].1,
             Event::Stopped { reason } if reason == "user_stopped"));
         assert_eq!(p.sup.worker_state(id).await, AcpWorkerState::Absent);

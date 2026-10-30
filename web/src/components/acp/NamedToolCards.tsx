@@ -190,7 +190,7 @@ export function WorkflowToolCard({ tool, result }: ToolCardProps) {
     <CardChrome
       status={status}
       startedAt={tool.started_at}
-      endedAt={live ? undefined : (lastEnd(agents) ?? result?.at)}
+      endedAt={live ? undefined : (run?.endedAt ?? lastEnd(agents) ?? result?.at)}
       icon={<Workflow className={ICON} />}
       label="workflow"
       primary={run?.name ?? agents[0]?.workflow?.name ?? "Workflow"}

@@ -249,6 +249,7 @@ impl TaskTailer {
                 let _ = tx
                     .send(Event::BackgroundTaskFinished {
                         task_id: self.task_id.clone(),
+                        ended_at: Some(chrono::Utc::now()),
                     })
                     .await;
             }
@@ -758,7 +759,10 @@ mod tests {
 
     fn finished_id(event: Event) -> String {
         match event {
-            Event::BackgroundTaskFinished { task_id } => task_id,
+            Event::BackgroundTaskFinished {
+                task_id,
+                ended_at: Some(_),
+            } => task_id,
             other => panic!("expected BackgroundTaskFinished, got {other:?}"),
         }
     }

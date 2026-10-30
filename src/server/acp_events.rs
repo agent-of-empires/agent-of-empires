@@ -2472,6 +2472,7 @@ mod tests {
             (
                 Event::BackgroundTaskFinished {
                     task_id: "t".into(),
+                    ended_at: None,
                 },
                 Some(Background),
             ),
@@ -2725,6 +2726,7 @@ mod tests {
                     events.len() as u64 + 1,
                     &crate::acp::Event::BackgroundTaskFinished {
                         task_id: "task-1".into(),
+                        ended_at: None,
                     },
                 )
                 .unwrap();
