@@ -13,7 +13,15 @@ const { fetchSuggestions, prepareSuggestion, refreshSuggestions, dismissSuggesti
   wide: { value: true },
 }));
 
-vi.mock("../../lib/api", () => ({ fetchSuggestions, prepareSuggestion, refreshSuggestions, dismissSuggestion }));
+const { updateSuggestionSource } = vi.hoisted(() => ({ updateSuggestionSource: vi.fn() }));
+
+vi.mock("../../lib/api", () => ({
+  fetchSuggestions,
+  prepareSuggestion,
+  refreshSuggestions,
+  dismissSuggestion,
+  updateSuggestionSource,
+}));
 vi.mock("../../hooks/useIsWideViewport", () => ({ useIsWideViewport: () => wide.value }));
 
 const mk = (n: number, over: Partial<SuggestionItem> = {}): SuggestionItem => ({
@@ -104,6 +112,29 @@ describe("DashboardSuggestions", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Undo" }));
     await waitFor(() => expect(dismissSuggestion).toHaveBeenCalledWith("github", "i1", false));
+    await waitFor(() => expect(screen.queryByText(/Dismissed/)).toBeNull());
+  });
+
+  it("Stop suggesting turns the item's kind off and closes the bar", async () => {
+    const withKind = (items: SuggestionItem[]): SuggestionsSnapshot => ({
+      items,
+      providers: [
+        {
+          id: "github",
+          name: "GitHub",
+          status: "ok",
+          enabled: true,
+          sources: [{ criterion: "assigned", label: "Assigned issues", description: "", enabled: true, variables: [] }],
+        },
+      ],
+    });
+    fetchSuggestions.mockResolvedValueOnce(withKind([mk(1)])).mockResolvedValue(withKind([mk(1, { dismissed: true })]));
+    dismissSuggestion.mockResolvedValue(ok);
+    updateSuggestionSource.mockResolvedValue(ok);
+    renderIt();
+    fireEvent.click(await screen.findByRole("button", { name: "Dismiss" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Stop suggesting assigned issues" }));
+    await waitFor(() => expect(updateSuggestionSource).toHaveBeenCalledWith("github", "assigned", false));
     await waitFor(() => expect(screen.queryByText(/Dismissed/)).toBeNull());
   });
 

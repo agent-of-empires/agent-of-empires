@@ -572,6 +572,8 @@ export interface SuggestionProvider {
   enabled: boolean;
   /** Unix seconds of the last report; absent before the first one. */
   updated_at?: number;
+  /** A refresh the host requested is unanswered. */
+  refreshing?: boolean;
   sources: SuggestionSource[];
 }
 
@@ -621,6 +623,8 @@ export interface SuggestionItem {
   draft: { title: string; prompt: string };
   dismissed: boolean;
   started_session?: StartedSession;
+  /** The registered Project the item resolves to; the provider's `project` is only a hint. */
+  resolved_project?: { name: string; path: string } | null;
 }
 
 export interface SuggestionsSnapshot {

@@ -99,9 +99,9 @@ test("dismissed items move to the dismissed list and can be restored", async ({ 
 
   await page.getByRole("button", { name: "Dismiss", exact: true }).click();
   await expect(page.getByText(item.title, { exact: true })).toHaveCount(0);
-  await page.getByRole("button", { name: "Dismissed (1)" }).click();
+  await page.getByRole("button", { name: "Dismissed 1" }).click();
   await page.getByRole("button", { name: "Restore" }).click();
-  await page.getByRole("button", { name: "Show active" }).click();
+  await page.getByRole("button", { name: /^All/ }).click();
   await expect(page.getByText(item.title, { exact: true })).toBeVisible();
 });
 

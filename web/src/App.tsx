@@ -2188,6 +2188,7 @@ function AppContent({
               setShowSessionWizard(true);
             }}
             onOpenSession={(id) => requestNavigate(`/session/${encodeURIComponent(id)}`)}
+            onOpenSettings={() => requestNavigate("/settings/suggestions")}
           />
         </div>
       );

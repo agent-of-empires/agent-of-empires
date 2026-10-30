@@ -1,9 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { fetchSuggestions, prepareSuggestion, refreshSuggestions, type SuggestionResult } from "../lib/api";
+import {
+  dismissSuggestion,
+  fetchSuggestions,
+  prepareSuggestion,
+  refreshSuggestions,
+  type SuggestionResult,
+} from "../lib/api";
 import { useServerDown } from "../lib/connectionState";
 import { STALE_NOTICE, toWizardPrefill } from "../lib/suggestionPrefill";
 import type { SuggestionItem, SuggestionsSnapshot } from "../lib/types";
 import type { WizardPrefill } from "../components/session-wizard/SessionWizard";
+
+const REFRESH_POLL_MS = 2000;
+const UNDO_MS = 10_000;
 
 export const suggestionKey = (item: SuggestionItem) => `${item.provider_id}:${item.id}`;
 
@@ -32,6 +41,14 @@ export function useSuggestions(onPrepare: (prefill: WizardPrefill) => void) {
     const seq = ++loadSeq.current;
     apply(await fetchSuggestions(), seq);
   }, [apply]);
+
+  // While a provider refreshes, follow it until it answers.
+  const refreshingProvider = snapshot?.providers.some((p) => p.refreshing) ?? false;
+  useEffect(() => {
+    if (!refreshingProvider) return;
+    const timer = setTimeout(() => void load(), REFRESH_POLL_MS);
+    return () => clearTimeout(timer);
+  }, [refreshingProvider, snapshot, load]);
 
   useEffect(() => {
     mounted.current = true;
@@ -92,4 +109,24 @@ export function useSuggestions(onPrepare: (prefill: WizardPrefill) => void) {
   };
 
   return { snapshot, loading, loadFailed, refreshing, busy, notice, offline, load, act, refresh, start };
+}
+
+/** Dismiss that can be undone for 10 s; `act` is the one from {@link useSuggestions}. */
+export function useDismissUndo(act: (key: string, run: () => Promise<SuggestionResult<unknown>>) => Promise<boolean>) {
+  const [undo, setUndo] = useState<SuggestionItem | null>(null);
+  const timer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  useEffect(() => () => clearTimeout(timer.current), []);
+
+  const dismiss = async (item: SuggestionItem, dismissed: boolean) => {
+    const ok = await act(suggestionKey(item), () => dismissSuggestion(item.provider_id, item.id, dismissed));
+    if (!ok) return;
+    clearTimeout(timer.current);
+    if (dismissed) {
+      setUndo(item);
+      timer.current = setTimeout(() => setUndo(null), UNDO_MS);
+    } else {
+      setUndo(null);
+    }
+  };
+  return { undo, dismiss, clearUndo: () => setUndo(null) };
 }

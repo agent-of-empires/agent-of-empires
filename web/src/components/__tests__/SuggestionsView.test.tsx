@@ -40,6 +40,7 @@ const snapshot = (over: Partial<SuggestionsSnapshot> = {}): SuggestionsSnapshot 
       name: "GitHub",
       status: "ok",
       enabled: true,
+      enabled: true,
       sources: [
         { criterion: "assigned", label: "Assigned issues", description: "", enabled: true, variables: [] },
         { criterion: "ci", label: "Failing checks", description: "", enabled: false, variables: [] },
@@ -179,9 +180,93 @@ describe("SuggestionsView", () => {
     fetchSuggestions.mockResolvedValue(snapshot({ items: [{ ...item, dismissed: true }] }));
     fireEvent.click(button);
     await waitFor(() => expect(dismissSuggestion).toHaveBeenCalledWith("github", "issue-1", true));
-    fireEvent.click(await screen.findByRole("button", { name: "Dismissed (1)" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Dismissed 1" }));
     fireEvent.click(await screen.findByRole("button", { name: "Restore" }));
     await waitFor(() => expect(dismissSuggestion).toHaveBeenCalledWith("github", "issue-1", false));
+  });
+
+  describe("grouping, filters and provider status", () => {
+    const linear = {
+      id: "linear",
+      name: "Linear",
+      status: "ok" as const,
+      enabled: true,
+      updated_at: Math.floor(Date.now() / 1000) - 120,
+      sources: [],
+    };
+    const resolved = (name: string) => ({ name, path: `/work/${name}` });
+    const two = (): SuggestionsSnapshot => {
+      const base = snapshot();
+      return {
+        ...base,
+        providers: [{ ...base.providers[0]!, updated_at: Math.floor(Date.now() / 1000) - 120 }, linear],
+        items: [
+          { ...item, id: "a", title: "Loose", resolved_project: null },
+          { ...item, id: "b", title: "In api", resolved_project: resolved("api") },
+          { ...item, id: "c", provider_id: "linear", title: "Linear api", resolved_project: resolved("api") },
+        ],
+      };
+    };
+
+    it("groups by resolved project with counts, unresolved last", async () => {
+      await open(two());
+      const headings = await screen.findAllByRole("heading", { level: 2 });
+      expect(headings.map((h) => h.textContent)).toEqual(["api 2", "No project 1"]);
+      const api = screen.getByRole("region", { name: "Project api" });
+      expect(api.textContent).toContain("In api");
+      expect(api.textContent).toContain("Linear api");
+    });
+
+    it("chips filter by provider and show the active counts", async () => {
+      await open(two());
+      expect((await screen.findByRole("button", { name: "All 3" })).getAttribute("aria-pressed")).toBe("true");
+      fireEvent.click(screen.getByRole("button", { name: "Linear 1" }));
+      expect(screen.queryByText("In api")).toBeNull();
+      expect(screen.getByText("Linear api")).toBeTruthy();
+    });
+
+    it("shows each provider's update age, error, emptiness and refresh state", async () => {
+      const base = two();
+      await open({
+        ...base,
+        providers: [
+          { ...base.providers[0]!, refreshing: true },
+          { ...linear, status: "error", error: "API key rejected" },
+        ],
+      });
+      const status = await screen.findByRole("list", { name: "Provider status" });
+      expect(status.textContent).toContain("⠙ GitHub: refreshing…");
+      expect(status.textContent).toContain("Linear: couldn't refresh, API key rejected");
+      cleanup();
+      await open({ ...base, items: [{ ...base.items[0]!, provider_id: "linear" }] });
+      expect((await screen.findByRole("list", { name: "Provider status" })).textContent).toContain(
+        "GitHub: nothing new",
+      );
+      expect(screen.getByRole("list", { name: "Provider status" }).textContent).toContain("Linear: updated 2 min ago");
+    });
+
+    it("follows a refreshing provider until it answers", async () => {
+      const base = two();
+      fetchSuggestions
+        .mockResolvedValueOnce({ ...base, providers: [{ ...base.providers[0]!, refreshing: true }, linear] })
+        .mockResolvedValue(base);
+      render(<SuggestionsView onPrepare={vi.fn()} onOpenSession={vi.fn()} />);
+      expect((await screen.findByRole("list", { name: "Provider status" })).textContent).toContain("refreshing…");
+      await waitFor(() => expect(fetchSuggestions).toHaveBeenCalledTimes(2), { timeout: 5000 });
+      await waitFor(() =>
+        expect(screen.getByRole("list", { name: "Provider status" }).textContent).not.toContain("refreshing…"),
+      );
+    });
+
+    it("a dismiss offers Undo here too", async () => {
+      dismissSuggestion.mockResolvedValue(ok);
+      await open(snapshot());
+      fireEvent.click(await screen.findByRole("button", { name: "Dismiss" }));
+      expect(await screen.findByText(/Dismissed/)).toBeTruthy();
+      expect(screen.queryByRole("button", { name: /Stop suggesting/ })).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+      await waitFor(() => expect(dismissSuggestion).toHaveBeenCalledWith("github", "issue-1", false));
+    });
   });
 
   it("a stale item shows a notice and reloads instead of opening the wizard", async () => {
@@ -205,7 +290,9 @@ describe("SuggestionsView", () => {
     await open(
       snapshot({
         items: [],
-        providers: [{ id: "github", name: "GitHub", status: "error", error: "token expired", sources: [] }],
+        providers: [
+          { id: "github", name: "GitHub", status: "error", error: "token expired", enabled: true, sources: [] },
+        ],
       }),
     );
     expect(await screen.findByText(/token expired/)).toBeTruthy();
@@ -242,10 +329,10 @@ describe("SuggestionsView", () => {
   it("restoring the last dismissed item keeps the way back to the active list", async () => {
     dismissSuggestion.mockResolvedValue(ok);
     await open(snapshot({ items: [{ ...item, dismissed: true }] }));
-    fireEvent.click(await screen.findByRole("button", { name: "Dismissed (1)" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Dismissed 1" }));
     fetchSuggestions.mockResolvedValue(snapshot());
     fireEvent.click(await screen.findByRole("button", { name: "Restore" }));
-    fireEvent.click(await screen.findByRole("button", { name: "Show active" }));
+    fireEvent.click(await screen.findByRole("button", { name: /^All/ }));
     expect(await screen.findByText("Fix lifecycle")).toBeTruthy();
   });
 

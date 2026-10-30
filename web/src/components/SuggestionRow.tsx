@@ -2,18 +2,10 @@ import { useRef, useState, type ReactNode } from "react";
 import { MoreHorizontal, Undo2, X } from "lucide-react";
 import { OFFLINE_TITLE } from "../lib/connectionState";
 import type { StartedSession } from "../lib/types";
+import { agoLabel } from "../lib/suggestionTime";
 import { useOutsideDismiss } from "./useOutsideDismiss";
 
 export const SUGGESTION_NOTE_CLASS = "border-t border-surface-700/40 px-3 py-2 text-xs text-text-dim first:border-t-0";
-
-/** "just now", "5 min ago", "3h ago", "2d ago". */
-function startedAgo(iso: string, now = Date.now()): string {
-  const mins = Math.floor((now - new Date(iso).getTime()) / 60_000);
-  if (mins < 1) return "just now";
-  if (mins < 60) return `${mins} min ago`;
-  if (mins < 60 * 24) return `${Math.floor(mins / 60)}h ago`;
-  return `${Math.floor(mins / 60 / 24)}d ago`;
-}
 
 /** The reason line of a started item: Session state, its title, how long ago it began. */
 function StartedReason({ session }: { session: StartedSession }) {
@@ -39,7 +31,7 @@ function StartedReason({ session }: { session: StartedSession }) {
       )}
       {" · "}
       {session.title}
-      {" · "}started {startedAgo(session.created_at)}
+      {" · "}started {agoLabel(Date.parse(session.created_at))}
     </>
   );
 }
@@ -244,5 +236,47 @@ export function SuggestionStatusNotes({ readOnly, offline }: { readOnly: boolean
         </li>
       )}
     </>
+  );
+}
+
+/** Shown for 10 s after a dismiss; `onStop` turns the item's kind off (homepage only). */
+export function UndoBar({
+  title,
+  disabled,
+  onUndo,
+  onStop,
+  stopLabel,
+}: {
+  title: string;
+  disabled: boolean;
+  onUndo: () => void;
+  onStop?: () => void;
+  stopLabel?: string;
+}) {
+  return (
+    <div className="mt-2 flex w-max max-w-full items-baseline gap-1 rounded-md bg-surface-800 px-3 py-1.5 text-[13px] text-text-secondary">
+      <span className="min-w-0 truncate">Dismissed &ldquo;{title}&rdquo;.</span>
+      <button
+        type="button"
+        onClick={onUndo}
+        disabled={disabled}
+        className="flex-none cursor-pointer text-brand-500 hover:underline disabled:opacity-50"
+      >
+        Undo
+      </button>
+      {onStop && stopLabel && (
+        <>
+          <span aria-hidden="true">·</span>
+          <button
+            type="button"
+            onClick={onStop}
+            disabled={disabled}
+            className="flex-none cursor-pointer text-brand-500 hover:underline disabled:opacity-50"
+          >
+            Stop suggesting {stopLabel}
+          </button>
+        </>
+      )}
+    </div>
   );
 }
