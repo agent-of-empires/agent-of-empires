@@ -53,8 +53,8 @@ aoe logs
 Use explicit dotted tracing area targets so per-target logging overrides affect
 native and dashboard failures consistently. Every `target:` root used in `src/`
 must be listed in `DEFAULT_TARGET_ROOTS` in `src/logging.rs`; a unit test
-enforces it, and an unlisted root is dropped at every level. Dependency crates
-log at `warn` regardless of `default_level`. Clearing one override in
+enforces it, and an unlisted root only reaches the file at `warn` and above.
+Dependency crates log at `warn` regardless of `default_level`. Clearing one override in
 Settings > Logging restores inheritance without clearing other targets.
 
 Filter changes saved in Settings > Logging apply to the TUI, running daemon and structured runners in the same app namespace. Sink and rotation changes require restart. No-op and unrelated saves preserve temporary runtime filters.
