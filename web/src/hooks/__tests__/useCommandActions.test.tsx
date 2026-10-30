@@ -32,7 +32,6 @@ function baseArgs(overrides: Partial<Args> = {}): Args {
     onToggleSidebar: vi.fn(),
     onLogout: vi.fn(),
     focusMode: false,
-    focusModeEnabled: true,
     onEnterFocusMode: vi.fn(),
     onOpenFocusWindow: vi.fn(),
     onExitFocusMode: vi.fn(),
@@ -51,7 +50,7 @@ describe("useCommandActions focus mode", () => {
     "session:b",
   ];
 
-  it("offers focus mode in this window and in a new one as separate commands, beside the switching commands", () => {
+  it("offers the session alone in this window and in its own window as separate commands, beside switching", () => {
     const onEnterFocusMode = vi.fn();
     const onOpenFocusWindow = vi.fn();
     const actions = actionsFor({
@@ -64,13 +63,25 @@ describe("useCommandActions focus mode", () => {
     expect(actions.map((a) => a.id)).toEqual(expect.arrayContaining(SWITCHING));
     expect(find(actions, "action:exit-focus-mode")).toBeUndefined();
 
-    find(actions, "action:enter-focus-mode")!.perform();
+    const enter = find(actions, "action:enter-focus-mode")!;
+    expect(enter.title).toBe("Show only this Session");
+    enter.perform();
     expect(onEnterFocusMode).toHaveBeenCalledWith("a");
     expect(onOpenFocusWindow).not.toHaveBeenCalled();
 
-    find(actions, "action:open-focus-window")!.perform();
+    const open = find(actions, "action:open-focus-window")!;
+    expect(open.title).toBe("Open in its own window");
+    // The former names still find them.
+    expect(open.keywords).toEqual(expect.arrayContaining(["focus", "pop out"]));
+    open.perform();
     expect(onOpenFocusWindow).toHaveBeenCalledWith("a");
     expect(onEnterFocusMode).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves out the own-window command where a second window cannot open", () => {
+    const ids = actionsFor({ sessions, activeSessionId: "a", onOpenFocusWindow: undefined }).map((a) => a.id);
+    expect(ids).toContain("action:enter-focus-mode");
+    expect(ids).not.toContain("action:open-focus-window");
   });
 
   it("drops every switching command in a focus window and offers to exit", () => {
@@ -86,17 +97,10 @@ describe("useCommandActions focus mode", () => {
     for (const id of SWITCHING) expect(ids).not.toContain(id);
     expect(ids).not.toContain("action:enter-focus-mode");
     expect(ids).not.toContain("action:open-focus-window");
-    find(actions, "action:exit-focus-mode")!.perform();
+    const exit = find(actions, "action:exit-focus-mode")!;
+    expect(exit.title).toBe("Show all Sessions");
+    exit.perform();
     expect(onExitFocusMode).toHaveBeenCalledTimes(1);
-  });
-
-  it("drops the enter commands when focus mode is disabled, but still lets a focus window exit", () => {
-    const off = actionsFor({ sessions, activeSessionId: "a", focusModeEnabled: false }).map((a) => a.id);
-    expect(off).not.toContain("action:enter-focus-mode");
-    expect(off).not.toContain("action:open-focus-window");
-
-    const inFocus = actionsFor({ sessions, activeSessionId: "a", focusMode: true, focusModeEnabled: false });
-    expect(find(inFocus, "action:exit-focus-mode")).toBeDefined();
   });
 });
 

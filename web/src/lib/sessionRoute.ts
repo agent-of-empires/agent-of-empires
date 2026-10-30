@@ -22,6 +22,11 @@ export function openFocusWindow(sessionId: string): void {
   window.open(focusSessionPath(sessionId), "_blank");
 }
 
+/** Turns this window into a focus window on `sessionId`. */
+export function enterFocusWindow(sessionId: string): void {
+  replaceDocument(focusSessionPath(sessionId));
+}
+
 /** Loads `path` as a new document in place of the current history entry. Unlike a router navigation, this updates
  *  the URL the service worker sees for this window (`Client.url`). */
 export function replaceDocument(path: string): void {

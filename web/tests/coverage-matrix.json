@@ -903,21 +903,27 @@
       "risk": "medium",
       "specs": [
         "tests/focus-mode.spec.ts",
+        "src/components/__tests__/SessionRowTriage.test.tsx",
         "src/components/__tests__/TopBar.test.tsx",
+        "src/components/__tests__/FocusModeNote.test.tsx",
         "src/components/__tests__/FocusSessionGone.test.tsx",
         "src/hooks/__tests__/useCommandActions.test.tsx",
         "src/hooks/useDashboardPresence.test.ts",
         "src/hooks/useFocusMode.test.tsx",
         "src/lib/__tests__/focusMode.test.ts",
+        "src/lib/__tests__/sessionRoute.test.ts",
         "src/__tests__/sw.test.ts"
       ],
       "components": [
         "web/src/App.tsx",
+        "web/src/components/sidebar/SessionRowMenu.tsx",
+        "web/src/components/sidebar/SessionActions.tsx",
         "web/src/components/TopBar.tsx",
+        "web/src/components/FocusModeNote.tsx",
         "web/src/components/FocusSessionGone.tsx",
         "web/public/sw.js"
       ],
-      "notes": "The top bar's enter button and its palette command switch the current window to `/session/<id>?focus=1` in place, and the palette can also open it in a new window; a focus window hides the sidebar, the dashboard link and the switching shortcuts, reports its focus session with its presence, and its labelled top-left exit button, which replaces the logo, restores the sidebar. The service worker sends pushes about other sessions to the OS rather than a focus window's toasts, and never navigates a focus window to another session on a notification click. The `session.focus_mode` setting (on by default) hides the enter button and both enter commands, while a window already in focus mode can still exit. A focus window counts badges and sounds for its own session only, opens other sessions, plugin links and settings in a new window, and shows an exit screen when its session is gone. Server-side push scoping is covered by `web_watch_follows_foreground_windows_and_their_focus`, `due_events_hold_sessions_a_window_shows_until_it_stops_showing_them` and `presence_is_recorded_per_window_with_its_focus`."
+      "notes": "The Session menu's More lists Show only this Session, which reloads the current window as `/session/<id>?focus=1`, and, on desktop, Open in its own window; the palette offers both under the same names. A focus window hides the sidebar, the dashboard link and the switching shortcuts, titles the tab after its session, shows a dismissible first-use note, and reports its focus session with its presence; its All Sessions button, which replaces the sidebar toggle and the logo, reloads the window back to the regular view. Because both transitions load a new document, the service worker reads the current mode from the window's URL: it sends pushes about other sessions to the OS rather than a focus window's toasts, and never navigates a focus window to another session on a notification click. A focus window counts badges and sounds for its own session only, opens other sessions, plugin links and settings in a new window, and names its session on the screen shown once it is trashed or deleted. Server-side push scoping and presence expiry are covered by `web_watch_follows_foreground_windows_and_their_focus`, `web_presence_writes_prune_abandoned_windows`, `due_events_hold_sessions_a_window_shows_until_it_stops_showing_them` and `presence_is_recorded_per_window_with_its_focus`."
     },
     {
       "id": "notifications.service-worker-clear",
