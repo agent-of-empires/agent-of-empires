@@ -1639,7 +1639,7 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
                 &observation,
             )
             .status
-            .unwrap_or_default()
+            .unwrap_or(inst.status)
         } else {
             let hook = hook.filter(|_| !crate::tmux::status_rules::has_rules(profile, &rules_tool));
             match hook {
