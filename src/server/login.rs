@@ -1328,7 +1328,7 @@ async fn trigger_new_login_push(state: &AppState, user_agent: &str) {
             }
             Ok(_) => {}
             Err(error) => {
-                tracing::warn!(target: "auth.passphrase", %host, %error, "login push failed");
+                tracing::warn!(target: "auth.passphrase", %host, error = %error.without_url(), "login push failed");
             }
         }
     }
