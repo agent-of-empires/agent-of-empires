@@ -1006,7 +1006,11 @@ impl DaemonClient {
                     truncated: false,
                 });
             }
-            if creating {
+            if creating
+                && !(self.unix_path.is_some()
+                    && code == Some(ApiErrorCode::CreateHookFailed)
+                    && self.should_read_error_body(code))
+            {
                 let (body, truncated) = self.read_error_body(&mut response).await?;
                 let body = public_creation_failure(
                     &body,
@@ -1336,6 +1340,56 @@ fn default_of(rows: Vec<ProfileRow>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cli_creation_hook_details_stay_available_only_to_the_unix_owner() {
+        for (unix, authenticated) in [(true, false), (false, false), (false, true)] {
+            let root = tempfile::tempdir().unwrap();
+            let app = axum::Router::new().route(
+                "/api/sessions",
+                axum::routing::post(|| async {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        ApiErrorCode::CreateHookFailed.header(),
+                        "on_create hook failed: LOCAL_HOOK_SENTINEL",
+                    )
+                }),
+            );
+            let (client, server) = if unix {
+                let socket = root.path().join("api.sock");
+                let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+                let client = DaemonClient::new_unix(socket).unwrap();
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                (client, server)
+            } else {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let client = DaemonClient::new(
+                    &format!("http://{}", listener.local_addr().unwrap()),
+                    authenticated.then_some("credential"),
+                )
+                .unwrap();
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                (client, server)
+            };
+            let body = serde_json::from_value(serde_json::json!({
+                "path": "/tmp", "tool": "claude", "cli": {},
+            }))
+            .unwrap();
+            let error = client.create_session(&body, "epoch").await.unwrap_err();
+            assert!(matches!(
+                &error,
+                DaemonClientError::Status {
+                    status: StatusCode::BAD_REQUEST,
+                    code: Some(ApiErrorCode::CreateHookFailed),
+                    ..
+                }
+            ));
+            assert_eq!(error.to_string().contains("LOCAL_HOOK_SENTINEL"), unix);
+            server.abort();
+            let _ = server.await;
+        }
+    }
 
     #[test]
     fn default_profile_is_the_row_the_daemon_marks() {

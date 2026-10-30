@@ -173,8 +173,10 @@ pub(super) async fn resolve_cli_creation(
                     .cloned()
             })
             .unwrap_or_else(|| "claude".to_owned());
-        if let Some(name) = crate::agents::resolve_tool_name(&body.tool) {
-            body.tool = name.to_owned();
+        if !config.session.custom_agents.contains_key(&body.tool) {
+            if let Some(name) = crate::agents::resolve_tool_name(&body.tool) {
+                body.tool = name.to_owned();
+            }
         }
     }
     if explicit_tool {

@@ -382,6 +382,8 @@ sleep 60
             .env("SHELL", "/bin/bash")
             .env("TMPDIR", temp.path())
             .env("AOE_TMUX_SOCKET", tmux_socket())
+            .env_remove("AOE_DAEMON_URL")
+            .env_remove("AOE_NO_AUTOSTART")
             .output()
             .unwrap();
         assert!(
@@ -399,6 +401,8 @@ sleep 60
         "-t",
         "parent",
     ]);
+    // Local identity fixtures must finish before the Daemon loads their rows.
+    cli(&["serve", "--stop"]);
     std::fs::create_dir_all(temp.path().join(".claude")).unwrap();
     cli(&["session", "set-session-id", "parent", VALID_CLAUDE_UUID]);
     cli(&["add", "--fork-from", "parent", "-t", "child"]);
@@ -412,6 +416,7 @@ sleep 60
     let session_name = tmux::Session::generate_name(&child.id, &child.title);
     let _cleanup = TmuxCleanup(&session_name);
     let child_sid = child.agent_session_id.clone();
+    cli(&["serve", "--stop"]);
     cli(&["session", "start", "child"]);
     std::fs::write(&publish, "").unwrap();
     assert!(

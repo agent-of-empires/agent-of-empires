@@ -225,10 +225,10 @@ pub struct SessionService {
     install_barrier: std::sync::Mutex<
         Option<tokio::sync::mpsc::UnboundedSender<(String, tokio::sync::oneshot::Sender<()>)>>,
     >,
-    // `created_instance_gate` was deleted with the rewrite of `session_spawn.rs`:
-    // it existed only to let a test hold a creation between the store read and
-    // the commit, and nothing arms or reads it any more. Upstream kept the
-    // field; bringing it back would leave it declared, initialised and dead.
+    #[cfg(test)]
+    creation_commit_barrier: std::sync::Mutex<
+        Option<tokio::sync::mpsc::UnboundedSender<(String, tokio::sync::oneshot::Sender<()>)>>,
+    >,
 }
 
 /// Who is asking the session service to act. Constructed only by the
@@ -402,6 +402,8 @@ impl SessionService {
             submission_claims: std::sync::OnceLock::new(),
             #[cfg(test)]
             install_barrier: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            creation_commit_barrier: std::sync::Mutex::new(None),
         }
     }
 
@@ -2118,6 +2120,18 @@ impl SessionService {
             .expect("one submission watcher per service");
         rx
     }
+
+    #[cfg(test)]
+    pub(crate) fn arm_creation_commit(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<(String, tokio::sync::oneshot::Sender<()>)> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *self
+            .creation_commit_barrier
+            .lock()
+            .expect("creation commit barrier poisoned") = Some(tx);
+        rx
+    }
 }
 
 /// Releases a session's `pending_drains` claim on every exit path of
@@ -2227,6 +2241,21 @@ impl CreationGuard {
     }
 
     pub(super) fn commit(&self) -> Result<(), CreationCancelled> {
+        #[cfg(test)]
+        if let Some(tx) = self
+            .service
+            .creation_commit_barrier
+            .lock()
+            .expect("creation commit barrier poisoned")
+            .take()
+        {
+            let (ack, released) = tokio::sync::oneshot::channel();
+            if tx.send((self.id.clone(), ack)).is_ok() {
+                released
+                    .blocking_recv()
+                    .expect("creation commit barrier released");
+            }
+        }
         let mut entry = self.entry.lock().expect("creation entry poisoned");
         match entry.lifecycle {
             CreationLifecycle::Cancelled => Err(CreationCancelled),

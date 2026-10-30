@@ -900,9 +900,22 @@ pub async fn create_session(
         );
     }
 
-    // Validate user inputs for shell injection. `path` is server-provisioned
-    // for scratch sessions, so skip it there.
-    let mut shell_checks: Vec<(&str, &str)> = vec![(body.extra_args.as_str(), "extra_args")];
+    // CLI arguments are parsed and shell-quoted on the Daemon; other callers retain their gate.
+    let mut shell_checks: Vec<(&str, &str)> = Vec::new();
+    if body.cli.is_some() {
+        body.extra_args = match shell_words::split(&body.extra_args) {
+            Ok(args) => shell_words::join(args),
+            Err(error) => {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "validation_failed",
+                    error.to_string(),
+                )
+            }
+        };
+    } else {
+        shell_checks.push((body.extra_args.as_str(), "extra_args"));
+    }
     if !body.scratch {
         shell_checks.push((body.path.as_str(), "path"));
     }

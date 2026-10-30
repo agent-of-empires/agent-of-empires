@@ -583,7 +583,10 @@ pub(crate) async fn spawn_structured_session(
         }
 
         if cli.is_some() && !instance.is_structured() {
-            creation_guard.commit()?;
+            if let Err(error) = creation_guard.commit() {
+                rollback(native, instance, false);
+                return Err(error.into());
+            }
             let _namespace = runtime.block_on(worker_state.profile_namespace.read());
             let _submission = runtime.block_on(worker_state.session_service.prompt_submission(&instance.id));
             let _guard = lock.blocking_lock();

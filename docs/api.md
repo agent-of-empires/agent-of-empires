@@ -407,6 +407,10 @@ launching the agent. Launch is a separate epoch-checked request. Requests withou
 clients must require it before sending CLI intent to avoid an older Daemon ignoring it.
 Concurrent CLI requests with the same title and working directory cannot create duplicates.
 
+With CLI intent, `extra_args` uses shell-style word grouping, then each argument
+is quoted for literal delivery. Quotes group text; shell operators and substitutions
+are arguments, not scripts. Other API callers retain their existing input validation.
+
 Host launches that need agent-hook approval return `409` with
 `aoe-error-code: agent_hooks_not_approved`. Run `aoe hooks approve` on the Daemon
 host before retrying launch; repository creation trust does not grant this approval.

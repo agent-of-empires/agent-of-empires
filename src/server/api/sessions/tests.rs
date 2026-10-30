@@ -10548,3 +10548,154 @@ async fn cli_canonical_fork_uses_the_pinned_binding_across_agent_accounts() {
         assert_eq!(*parent, binding);
     }
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cli_cancellation_at_final_commit_removes_provisioned_scratch() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let app = crate::session::get_app_dir().unwrap();
+    crate::session::purge_owners::initialize(&app).unwrap();
+    crate::tmux::tool_retirement::initialize(&app).unwrap();
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let state = support::build_test_app_state(Vec::new());
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let mut commits = state.session_service.arm_creation_commit();
+    let create =
+        tokio::spawn({
+            let state = state.clone();
+            async move {
+                post_create_raw(&state, serde_json::json!({
+            "path": "", "tool": "", "profile": "test", "scratch": true,
+            "title": "cancel-at-commit", "cli": {}, "idempotency_key": "cancel-at-commit",
+        })).await
+            }
+        });
+    let (id, release) = tokio::time::timeout(std::time::Duration::from_secs(10), commits.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let path = {
+        let rows = state.instances.read().await;
+        let row = rows.iter().find(|row| row.id == id).unwrap();
+        assert_eq!(row.status, Status::Creating);
+        std::path::PathBuf::from(&row.project_path)
+    };
+    assert!(path.is_dir());
+    assert!(state.session_service.cancel_creation(&id));
+    release.send(()).unwrap();
+    let (status, code, body) = create.await.unwrap();
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(code.as_deref(), Some("creation_cancelled"));
+    assert!(!path.exists());
+    assert!(!state.instances.read().await.iter().any(|row| row.id == id));
+    assert!(!Storage::open_unwatched("test")
+        .unwrap()
+        .load()
+        .unwrap()
+        .iter()
+        .any(|row| row.id == id));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial]
+async fn cli_custom_default_and_quoted_arguments_reach_the_shell_as_literals() {
+    use crate::server::test_support as support;
+    use std::os::unix::fs::PermissionsExt;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let root = tempfile::tempdir().unwrap();
+    let script = root.path().join("agent");
+    let observed = root.path().join("arguments");
+    let injected = root.path().join("must-not-run");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
+            shell_words::quote(observed.to_str().unwrap())
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::session::config::update_config(|config| {
+        config.session.default_tool = Some("lenovo-claude".into());
+        config.session.custom_agents.insert(
+            "lenovo-claude".into(),
+            script.to_string_lossy().into_owned(),
+        );
+    })
+    .unwrap();
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let state = support::build_test_app_state(Vec::new());
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let literal = format!("$(touch {})", injected.display());
+    let args = format!(
+        "--append-system-prompt \"hello world\" --model opus[1m] '{}'",
+        literal
+    );
+    let (status, result) = post_create(
+        &state,
+        serde_json::json!({
+            "path": root.path(), "tool": "", "profile": "test", "title": "literal arguments",
+            "extra_args": args, "cli": {},
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{result}");
+    let row = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|row| row.id == result["id"].as_str().unwrap())
+        .unwrap()
+        .clone();
+    assert_eq!(row.tool, "lenovo-claude");
+    let launched = std::process::Command::new("/bin/sh")
+        .args(["-c", &format!("{} {}", row.command, row.extra_args)])
+        .status()
+        .unwrap();
+    assert!(launched.success());
+    assert_eq!(
+        std::fs::read_to_string(observed).unwrap(),
+        format!("--append-system-prompt\nhello world\n--model\nopus[1m]\n{literal}\n")
+    );
+    assert!(!injected.exists());
+    for cli in [serde_json::Value::Null, serde_json::json!({})] {
+        let (status, _) = post_create(
+            &state,
+            serde_json::json!({
+                "path": root.path(), "tool": "", "profile": "test", "extra_args": "'unterminated",
+                "cli": cli,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cli_fork_inherits_a_custom_identity_instead_of_its_builtin_token() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let project = tempfile::tempdir().unwrap();
+    crate::session::config::update_config(|config| {
+        config.session.default_tool = Some("claude".into());
+        config
+            .session
+            .custom_agents
+            .insert("claude-personal".into(), "claude".into());
+    })
+    .unwrap();
+    let mut source = Instance::new("source", project.path().to_str().unwrap());
+    source.source_profile = "test".into();
+    source.tool = "claude-personal".into();
+    let state = crate::server::test_support::build_test_app_state(vec![source.clone()]);
+    let mut body = create_body_from_json(serde_json::json!({
+        "path": project.path(), "tool": "", "profile": "test", "cli": {"fork_source": source.id},
+    }));
+    super::cli_create::resolve_cli_creation(&state, &mut body, "test")
+        .await
+        .unwrap();
+    assert_eq!(body.tool, "claude-personal");
+}
