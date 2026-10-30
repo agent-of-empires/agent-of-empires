@@ -44,6 +44,11 @@ pub struct WebPresence {
     pub focus_session: Option<String>,
 }
 
+/// How long a window entry outlives its last heartbeat before a write prunes it,
+/// whatever threshold readers use. Each page load reports under a new window id,
+/// so this bounds the map even when nothing reads it (push disabled).
+const WEB_PRESENCE_MAX_AGE_MS: i64 = 5 * 60 * 1000;
+
 /// What foregrounded dashboard windows are currently watching.
 #[derive(Debug, PartialEq, Eq)]
 pub enum WebWatch {
@@ -481,19 +486,22 @@ impl AppState {
 
     /// Record whether one dashboard window is currently foregrounded, and the
     /// session it is focused on, if any. Browser identity is derived from its
-    /// device-binding secret, never retained in plaintext.
+    /// device-binding secret, never retained in plaintext. Entries silent for
+    /// `WEB_PRESENCE_MAX_AGE_MS` are pruned on every write.
     pub fn set_web_presence(
         &self,
         key: WebPresenceKey,
         active: bool,
         focus_session: Option<String>,
     ) {
+        let now = crate::util::now_ms() as i64;
         let mut presence = self.web_presence.lock().expect("web_presence poisoned");
+        presence.retain(|_, p| now.saturating_sub(p.last_seen_ms) < WEB_PRESENCE_MAX_AGE_MS);
         if active {
             presence.insert(
                 key,
                 WebPresence {
-                    last_seen_ms: crate::util::now_ms() as i64,
+                    last_seen_ms: now,
                     focus_session,
                 },
             );
@@ -645,5 +653,40 @@ mod tests {
             .unwrap()
             .last_seen_ms -= 30_000;
         assert_eq!(watch(), WebWatch::Nothing, "stale windows must expire");
+    }
+
+    /// Without any reader (push disabled), a write still drops windows that
+    /// stopped reporting long ago, so per-page-load ids cannot pile up.
+    #[test]
+    fn web_presence_writes_prune_abandoned_windows() {
+        let state = test_support::build_test_app_state(vec![]);
+        let key = |window: &str| WebPresenceKey {
+            client: [1; 32],
+            window: window.to_string(),
+        };
+        let age = |window: &str, ms: i64| {
+            state
+                .web_presence
+                .lock()
+                .unwrap()
+                .get_mut(&key(window))
+                .unwrap()
+                .last_seen_ms -= ms;
+        };
+        state.set_web_presence(key("abandoned"), true, None);
+        state.set_web_presence(key("recent"), true, None);
+        age("abandoned", WEB_PRESENCE_MAX_AGE_MS);
+        age("recent", WEB_PRESENCE_MAX_AGE_MS - 60_000);
+
+        state.set_web_presence(key("new"), false, None);
+        let mut windows: Vec<String> = state
+            .web_presence
+            .lock()
+            .unwrap()
+            .keys()
+            .map(|k| k.window.clone())
+            .collect();
+        windows.sort();
+        assert_eq!(windows, ["recent"]);
     }
 }

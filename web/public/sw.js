@@ -54,11 +54,12 @@ function recordSeq(tag, seq) {
   if (hw == null || seq > hw) seqHighWater.set(tag, seq);
 }
 
-// The session a focus-mode window is limited to (`/session/<id>?focus=1`), or null for a regular window.
+// The session a focus-mode window is limited to (`/session/<id>?focus=1`), or null for a regular window. `client.url`
+// is the URL the document loaded with, so entering and leaving focus mode must load a new document.
 function focusSessionOf(client) {
   try {
     const url = new URL(client.url);
-    const match = /^\/session\/([^/]+)$/.exec(url.pathname);
+    const match = /^\/session\/([^/]+)\/?$/.exec(url.pathname);
     return match && url.searchParams.get("focus") === "1" ? decodeURIComponent(match[1]) : null;
   } catch {
     return null;

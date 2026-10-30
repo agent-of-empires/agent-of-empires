@@ -22,6 +22,13 @@ export function openFocusWindow(sessionId: string): void {
   window.open(focusSessionPath(sessionId), "_blank");
 }
 
+/** Loads `path` as a new document in place of the current history entry. Unlike a router navigation, this updates
+ *  the URL the service worker sees for this window (`Client.url`). */
+export function replaceDocument(path: string): void {
+  if (typeof window === "undefined") return;
+  window.location.replace(path);
+}
+
 export const NAVIGATE_EVENT = "aoe-navigate";
 
 /** `path` must already be same-origin relative (see `isInternalHref`/`toInternalPath`). */

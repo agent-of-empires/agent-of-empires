@@ -85,14 +85,17 @@ describe("service worker push handler (#2491)", () => {
     expect(postMessage.mock.calls).toEqual(shows ? [] : [[{ type: "aoe-push", payload }]]);
   });
 
-  it.each<[string, string, boolean]>([
-    ["its own session", "s1", false],
-    ["another session", "s2", true],
-  ])("a focused focus-mode window toasts only pushes about its session: %s", async (_label, sessionId, shows) => {
+  it.each<[string, string, string, boolean]>([
+    ["its own session", "/session/s1?focus=1", "s1", false],
+    ["another session", "/session/s1?focus=1", "s2", true],
+    // The app routes a trailing slash to the same session, so the worker must scope it the same way.
+    ["another session, trailing slash", "/session/s1/?focus=1", "s2", true],
+    ["its own session, trailing slash", "/session/s1/?focus=1", "s1", false],
+  ])("a focused focus-mode window toasts only pushes about its session: %s", async (_label, path, sessionId, shows) => {
     const { handlers, showNotification, matchAll } = loadSw();
     const postMessage = vi.fn();
     matchAll.mockResolvedValue([
-      { url: "https://aoe.test/session/s1?focus=1", visibilityState: "visible", focused: true, postMessage },
+      { url: `https://aoe.test${path}`, visibilityState: "visible", focused: true, postMessage },
     ]);
     const payload = { kind: "notify", title: "t", tag: `session-${sessionId}`, session_id: sessionId };
     await dispatchPush(handlers, payload);
@@ -166,6 +169,7 @@ describe("service worker notification click with focus-mode windows", () => {
 
   it.each<[string, string[], number | "open"]>([
     ["focuses the focus window already showing the session", ["/session/s2?focus=1", "/session/s1?focus=1"], 1],
+    ["focuses it through a trailing slash too", ["/session/s2/?focus=1", "/session/s1/?focus=1"], 1],
     ["navigates a regular window, never another session's focus window", ["/session/s2?focus=1", "/"], 1],
     ["opens a window when only other focus windows exist", ["/session/s2?focus=1"], "open"],
   ])("%s", async (_label, paths, expected) => {
