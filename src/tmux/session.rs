@@ -5517,6 +5517,7 @@ mod tests {
             "aoe-session-example-1.scope",
             "aoe session example",
             "example",
+            "example-id",
         ));
         let env_bin = which::which("env").unwrap().to_string_lossy().into_owned();
         crate::process::systemd::ScopePrefix { argv, env_bin }

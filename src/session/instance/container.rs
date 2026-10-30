@@ -364,7 +364,8 @@ impl Instance {
         let mut config = self.build_container_config(&launch_config)?;
         // The profile `spawn_prepared_launch` gives `scope_prefix_for`, so the
         // container lands in its session's slice.
-        config.cgroup_parent = crate::process::systemd::slice_for(store.storage().profile());
+        config.cgroup_parent =
+            crate::process::systemd::slice_for(store.storage().profile(), &self.id);
         // Still the workdir the *previous* container was created with; the pin below
         // is what moves it forward.
         let stranded = container_config::stranded_named_ignore_volumes(
