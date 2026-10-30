@@ -108,7 +108,8 @@ pub(super) fn init(conn: &Connection) -> rusqlite::Result<()> {
              profile         TEXT PRIMARY KEY,
              homepage        INTEGER NOT NULL DEFAULT 1,
              sidebar         INTEGER NOT NULL DEFAULT 0,
-             refresh_minutes INTEGER NOT NULL DEFAULT 15
+             refresh_minutes INTEGER NOT NULL DEFAULT 15,
+             start_without_review INTEGER NOT NULL DEFAULT 0
          );
          CREATE TABLE IF NOT EXISTS suggestion_provider_prefs (
              profile     TEXT NOT NULL,
@@ -117,7 +118,19 @@ pub(super) fn init(conn: &Connection) -> rusqlite::Result<()> {
              sort_order  INTEGER NOT NULL DEFAULT 2147483647,
              PRIMARY KEY (profile, provider_id)
          );",
-    )
+    )?;
+    let has_start_pref: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('suggestion_preferences') WHERE name = 'start_without_review'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_start_pref {
+        conn.execute(
+            "ALTER TABLE suggestion_preferences ADD COLUMN start_without_review INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 fn db_error(e: rusqlite::Error) -> DispatchError {
@@ -538,6 +551,7 @@ pub struct PrefsPatch {
     pub homepage: Option<bool>,
     pub sidebar: Option<bool>,
     pub refresh_minutes: Option<u32>,
+    pub start_without_review: Option<bool>,
     /// Every provider id exactly once.
     pub provider_order: Option<Vec<String>>,
     pub provider_enabled: Option<BTreeMap<String, bool>>,
@@ -581,24 +595,25 @@ fn ordered_indexes(providers: &[Provider], stored: &HashMap<String, (bool, i64)>
     order
 }
 
-/// `(homepage, sidebar, refresh_minutes)` of a profile that never saved any.
-pub(crate) const DEFAULT_PREFS: (bool, bool, u32) = (true, false, 15);
+/// `(homepage, sidebar, refresh_minutes, start_without_review)` of a profile that never saved any.
+pub(crate) const DEFAULT_PREFS: (bool, bool, u32, bool) = (true, false, 15, false);
 
-pub(crate) fn prefs_json(prefs: (bool, bool, u32), provider_order: &[&str]) -> Value {
+pub(crate) fn prefs_json(prefs: (bool, bool, u32, bool), provider_order: &[&str]) -> Value {
     json!({
         "homepage": prefs.0,
         "sidebar": prefs.1,
         "refresh_minutes": prefs.2,
+        "start_without_review": prefs.3,
         "provider_order": provider_order,
     })
 }
 
-fn load_prefs(conn: &Connection, profile: &str) -> rusqlite::Result<(bool, bool, u32)> {
+fn load_prefs(conn: &Connection, profile: &str) -> rusqlite::Result<(bool, bool, u32, bool)> {
     Ok(conn
         .query_row(
-            "SELECT homepage, sidebar, refresh_minutes FROM suggestion_preferences WHERE profile = ?1",
+            "SELECT homepage, sidebar, refresh_minutes, start_without_review FROM suggestion_preferences WHERE profile = ?1",
             [profile],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?
         .unwrap_or(DEFAULT_PREFS))
@@ -655,6 +670,12 @@ pub(crate) fn apply_prefs(
     if let Some(v) = patch.refresh_minutes {
         tx.execute(
             "UPDATE suggestion_preferences SET refresh_minutes = ?2 WHERE profile = ?1",
+            params![profile, v],
+        )?;
+    }
+    if let Some(v) = patch.start_without_review {
+        tx.execute(
+            "UPDATE suggestion_preferences SET start_without_review = ?2 WHERE profile = ?1",
             params![profile, v],
         )?;
     }
@@ -1780,7 +1801,7 @@ mod tests {
         assert_eq!(
             snap("p")["prefs"],
             json!({ "homepage": true, "sidebar": false, "refresh_minutes": 15,
-                    "provider_order": ["acme.github", "acme.linear"] })
+                    "start_without_review": false, "provider_order": ["acme.github", "acme.linear"] })
         );
         assert_eq!(
             snapshot(&conn, "p", &[]).unwrap()["prefs"],
@@ -1794,6 +1815,9 @@ mod tests {
         );
 
         apply(json!({ "sidebar": true })).unwrap();
+        apply(json!({ "start_without_review": true })).unwrap();
+        assert_eq!(snap("p")["prefs"]["start_without_review"], true);
+        assert_eq!(snap("q")["prefs"]["start_without_review"], false);
         apply(json!({ "refresh_minutes": 60, "provider_order": ["acme.linear", "acme.github"] }))
             .unwrap();
         let prefs = snap("p")["prefs"].clone();
@@ -1818,6 +1842,24 @@ mod tests {
         }
         assert_eq!(snap("p")["prefs"]["refresh_minutes"], 60);
         assert!(serde_json::from_value::<PrefsPatch>(json!({ "extra": 1 })).is_err());
+    }
+
+    #[test]
+    fn init_adds_start_without_review_to_an_existing_preferences_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE suggestion_preferences (
+                 profile TEXT PRIMARY KEY,
+                 homepage INTEGER NOT NULL DEFAULT 1,
+                 sidebar INTEGER NOT NULL DEFAULT 0,
+                 refresh_minutes INTEGER NOT NULL DEFAULT 15
+             );
+             INSERT INTO suggestion_preferences (profile, sidebar) VALUES ('p', 1);",
+        )
+        .unwrap();
+        init(&conn).unwrap();
+        init(&conn).unwrap();
+        assert_eq!(load_prefs(&conn, "p").unwrap(), (true, true, 15, false));
     }
 
     #[test]
