@@ -52,6 +52,7 @@ impl HostApiState {
              );",
         )
         .context("create plugin_storage table")?;
+        suggestions::init(&conn).context("create suggestion tables")?;
         Ok(Self {
             events: Mutex::new(conn),
             schema,
@@ -68,6 +69,15 @@ impl HostApiState {
 
     pub(crate) fn profile(&self) -> &str {
         &self.profile
+    }
+
+    /// Run `f` on the plugin database with the profile key suggestions are
+    /// stored and read under. The key is resolved before the shared lock is
+    /// taken, and `f` must stay a short query: every worker RPC waits behind it.
+    pub(crate) fn with_suggestions_db<T>(&self, f: impl FnOnce(&Connection, &str) -> T) -> T {
+        let profile = crate::session::config::effective_profile(&self.profile);
+        let conn = self.events.lock().unwrap_or_else(|p| p.into_inner());
+        f(&conn, &profile)
     }
 
     pub fn bump_settings_revision(&self) -> u64 {
@@ -183,16 +193,24 @@ pub fn dispatch(
     match method {
         "suggestions.set" => {
             ctx.require(CAP_WORKER)?;
-            suggestions::set(&suggestions_spec(ctx)?, params)
+            let spec = suggestions_spec(ctx)?;
+            state.with_suggestions_db(|conn, profile| {
+                suggestions::set(conn, profile, &ctx.plugin_id, &spec, params)
+            })
         }
         "suggestions.error" => {
             ctx.require(CAP_WORKER)?;
             suggestions_spec(ctx)?;
-            suggestions::error(params)
+            state.with_suggestions_db(|conn, profile| {
+                suggestions::error(conn, profile, &ctx.plugin_id, params)
+            })
         }
         "suggestions.sources" => {
             ctx.require(CAP_WORKER)?;
-            Ok(suggestions::sources(&suggestions_spec(ctx)?))
+            let spec = suggestions_spec(ctx)?;
+            state.with_suggestions_db(|conn, profile| {
+                suggestions::sources(conn, profile, &ctx.plugin_id, &spec)
+            })
         }
         "projects.list" => {
             ctx.require(CAP_SESSION_READ)?;

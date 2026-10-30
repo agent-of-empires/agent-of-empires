@@ -151,6 +151,27 @@ async fn sensitive_routes_are_blocked() {
             "/api/plugins/x/enabled",
             r#"{"enabled":true}"#,
         ),
+        (Method::POST, "/api/suggestions/refresh", "{}"),
+        (
+            Method::POST,
+            "/api/suggestions/dismiss",
+            r#"{"provider_id":"x","id":"y"}"#,
+        ),
+        (
+            Method::POST,
+            "/api/suggestions/undismiss",
+            r#"{"provider_id":"x","id":"y"}"#,
+        ),
+        (
+            Method::PATCH,
+            "/api/suggestions/sources",
+            r#"{"provider_id":"x","criterion":"c","enabled":true}"#,
+        ),
+        (
+            Method::POST,
+            "/api/suggestions/prepare",
+            r#"{"provider_id":"x","id":"y"}"#,
+        ),
         // Session lifecycle on a foreign or unknown target. With no structured
         // session seeded, an enumerated / crafted id resolves to a
         // non-structured-or-unknown target, so a pre-existing plain/terminal
