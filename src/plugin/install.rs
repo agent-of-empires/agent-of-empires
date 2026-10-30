@@ -322,7 +322,13 @@ fn apply_prepared_install(p: &PreparedInstall, log: &OperationLog) -> Result<Ins
             Ok(true) => remove_external(&p.id),
             Ok(false) => std::fs::remove_dir_all(&final_dir)
                 .with_context(|| format!("removing {}", final_dir.display())),
-            Err(error) => Err(error),
+            // An unreadable config must not strand the staged tree, or the next
+            // install of the same plugin is refused as already installed.
+            Err(error) => {
+                tracing::warn!(target: "plugin.install", plugin = %p.id, %error, "install rollback: config check failed; removing staged tree");
+                std::fs::remove_dir_all(&final_dir)
+                    .with_context(|| format!("removing {}", final_dir.display()))
+            }
         };
         if let Err(error) = rollback {
             tracing::warn!(target: "plugin.install", plugin = %p.id, %error, "install rollback failed");
