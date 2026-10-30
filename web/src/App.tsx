@@ -1719,7 +1719,18 @@ function AppContent({
     setRightPanelView,
   });
 
-  const handleOpenPairedTerminal = useOpenPairedTerminal(activeSessionId, showPairedTerminal, setShellMode);
+  // PairedTerminal shows Host whatever the stored mode while the Session isn't sandboxed.
+  const shownShellMode = useCallback(
+    (sessionId: string, terminalIndex: number) =>
+      activeSession?.is_sandboxed ? shellModeFor(sessionId, terminalIndex) : "host",
+    [activeSession?.is_sandboxed, shellModeFor],
+  );
+  const handleOpenPairedTerminal = useOpenPairedTerminal(
+    activeSessionId,
+    showPairedTerminal,
+    shownShellMode,
+    setShellMode,
+  );
 
   const handleToggleTerminalFocus = useCallback(() => {
     if (!activeSessionId) return;
