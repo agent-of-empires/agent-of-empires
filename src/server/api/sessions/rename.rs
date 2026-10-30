@@ -26,10 +26,8 @@ pub async fn rename_session(
         Ok(body) => body,
         Err(error) => return error.into_response(),
     };
-    let before = row_labels(&state, &id).await;
     match edit_session(&state, &id, SessionEdit::Rename(body)).await {
         Ok(warnings) => {
-            log_committed_edit(&id, before, row_labels(&state, &id).await);
             crate::server::runtime::session_mutation_response(
                 &state,
                 &id,
@@ -86,31 +84,8 @@ fn edit_identity_matches(row: &Instance, expected: &Instance) -> bool {
         && row.worktree_info == expected.worktree_info
 }
 
-/// Committed (title, group, profile) of a row, for logging what an edit changed.
-async fn row_labels(state: &Arc<AppState>, id: &str) -> Option<(String, String, String)> {
-    state
-        .instances
-        .read()
-        .await
-        .iter()
-        .find(|row| row.id == id)
-        .map(|row| {
-            (
-                row.title.clone(),
-                row.group_path.clone(),
-                row.source_profile.clone(),
-            )
-        })
-}
-
-fn log_committed_edit(
-    id: &str,
-    before: Option<(String, String, String)>,
-    after: Option<(String, String, String)>,
-) {
-    let (Some(before), Some(after)) = (before, after) else {
-        return;
-    };
+/// Committed (title, group, profile) before and after an edit; caller holds the session lock.
+fn log_committed_edit(id: &str, before: (&str, &str, &str), after: (&str, &str, &str)) {
     if before.0 != after.0 {
         tracing::info!(target: "session.rename", session = %id, from = %before.0, to = %after.0, "session renamed");
     }
@@ -366,6 +341,7 @@ async fn edit_session(
     let move_warning_slot = move_warning.clone();
     let old_title = before.title.clone();
     let new_title = after.title.clone();
+    let (old_group, new_group) = (before.group_path.clone(), after.group_path.clone());
     let structured = before.is_structured();
     let profiles = vec![before.source_profile.clone(), after.source_profile.clone()];
     let committed = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
@@ -518,6 +494,11 @@ async fn edit_session(
             ));
         }
     };
+    log_committed_edit(
+        id,
+        (&old_title, &old_group, &profiles[0]),
+        (&new_title, &new_group, &profiles[1]),
+    );
     let mut warnings = Vec::new();
     warnings.extend(move_warning.lock().expect("move warning slot").take());
     if old_title != new_title && !structured {
