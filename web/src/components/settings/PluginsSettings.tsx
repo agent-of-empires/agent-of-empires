@@ -24,18 +24,34 @@ type DetailTarget = Pick<Parameters<typeof PluginDetailModal>[0], "source" | "ti
 /** Plugin management: installed list with toggles and lifecycle jobs, plus the
  *  marketplace. Mutations need an elevated session; the fetch interceptor
  *  handles `403 elevation_required`. */
-export function PluginsSettings({ readOnly = false }: { readOnly?: boolean } = {}) {
+export function PluginsSettings({
+  readOnly = false,
+  initialMarketplaceFilter,
+}: { readOnly?: boolean; initialMarketplaceFilter?: "suggestions" } = {}) {
   const [data, setData] = useState<PluginListResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [tab, setTab] = useState<"installed" | "marketplace">("installed");
+  const [tab, setTab] = useState<"installed" | "marketplace">(
+    initialMarketplaceFilter && !readOnly ? "marketplace" : "installed",
+  );
   const [detail, setDetail] = useState<DetailTarget | null>(null);
   const [confirmUninstall, setConfirmUninstall] = useState<PluginView | null>(null);
   const uninstallDialogRef = useRef<HTMLDivElement | null>(null);
   const [confirmWebOff, setConfirmWebOff] = useState<PluginView | null>(null);
   const [job, setJob] = useState<PluginJobRef | null>(null);
   const updates = usePluginUpdates(setError, setJob);
-  const market = usePluginMarketplace(setJob);
+  const market = usePluginMarketplace(setJob, initialMarketplaceFilter === "suggestions");
+  const { discover } = market;
+
+  useEffect(() => {
+    if (!initialMarketplaceFilter || readOnly) return;
+    const timer = setTimeout(() => {
+      void discover();
+    }, 0);
+    return () => clearTimeout(timer);
+    // Runs once on mount: the deep link lands on a populated, filtered list.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const reload = useCallback(async () => {
     const next = await fetchPlugins();

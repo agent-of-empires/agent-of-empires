@@ -669,6 +669,8 @@ export interface PluginDiscoveryResult {
   description: string | null;
   stars: number;
   badge: "installed" | "featured" | "unvetted";
+  /** The featured index marks the manifest as declaring `[suggestions]`. */
+  suggestions: boolean;
   install_command: string;
   /** The repo owner's GitHub avatar; a source-identity affordance, NOT the
    *  plugin's own icon (unknown until a manifest fetch, which discovery

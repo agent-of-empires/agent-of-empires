@@ -151,8 +151,9 @@ export function usePluginUpdates(setError: (e: string | null) => void, startJob:
 export const sourceFromCommand = (command: string) => command.replace(/^.*\binstall\s+/, "").trim();
 
 /** GitHub discovery and the preview, consent and install flow. */
-export function usePluginMarketplace(startJob: (job: PluginJobRef) => void) {
+export function usePluginMarketplace(startJob: (job: PluginJobRef) => void, initialSuggestionsOnly = false) {
   const [query, setQuery] = useState("");
+  const [suggestionsOnly, setSuggestionsOnly] = useState(initialSuggestionsOnly);
   const [results, setResults] = useState<PluginDiscoveryResult[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [discovering, setDiscovering] = useState(false);
@@ -207,6 +208,8 @@ export function usePluginMarketplace(startJob: (job: PluginJobRef) => void) {
   return {
     query,
     setQuery,
+    suggestionsOnly,
+    setSuggestionsOnly,
     results,
     error,
     discovering,
