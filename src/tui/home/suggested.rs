@@ -91,7 +91,7 @@ impl HomeView {
             self.flat_items.get(self.cursor),
             Some(Item::SuggestionsViewAll { .. })
         ) {
-            self.suggestions_view = Some(super::super::suggestions::SuggestionsView::new());
+            self.open_suggestions_view();
             return true;
         }
         false
@@ -103,7 +103,7 @@ impl HomeView {
             return false;
         };
         if self.session_feed.mutations_available() {
-            self.suggestions_feed.dismiss(&key);
+            self.suggestions_feed.dismiss(&key, true);
         } else {
             self.flash_status("The daemon is read-only or unavailable");
         }

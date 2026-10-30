@@ -1905,12 +1905,9 @@ impl HomeView {
 
         if let Some(view) = &mut self.suggestions_view {
             let mutations_allowed = self.session_feed.mutations_available();
-            match view.handle_key(key, mutations_allowed) {
+            match view.handle_key(key, mutations_allowed, &mut self.suggestions_feed) {
                 SuggestionsAction::Continue => {}
-                SuggestionsAction::Close => {
-                    self.suggestions_view = None;
-                    self.suggestions_feed.reload();
-                }
+                SuggestionsAction::Close => self.suggestions_view = None,
                 SuggestionsAction::Start(start) => self.start_suggestion(start),
             }
             return None;
@@ -3056,9 +3053,7 @@ impl HomeView {
             ActionId::Diff => self.open_diff_for_selected(),
             ActionId::Serve => self.open_connections(),
             ActionId::Settings => self.open_settings(),
-            ActionId::Suggestions => {
-                self.suggestions_view = Some(crate::tui::suggestions::SuggestionsView::new())
-            }
+            ActionId::Suggestions => self.open_suggestions_view(),
             ActionId::Profiles => self.show_profile_picker(),
             ActionId::Projects => {
                 let profile = self.config_profile();
