@@ -21,6 +21,13 @@ use crate::session::projects::{self, Project};
 use std::path::Path;
 
 const MAX_ITEMS: usize = 500;
+
+/// Driven from the capped items table so the read tracks live items, not
+/// historical dismissals, which are never pruned.
+const LIVE_DISMISSALS_SQL: &str = "SELECT i.provider_id, i.item_id FROM suggestion_items i
+     WHERE i.profile = ?1 AND EXISTS (
+         SELECT 1 FROM suggestion_dismissals d
+         WHERE d.profile = i.profile AND d.provider_id = i.provider_id AND d.item_id = i.item_id)";
 const MAX_TITLE_BYTES: usize = 512;
 const MAX_REASON_BYTES: usize = 2048;
 const MAX_URL_BYTES: usize = 2048;
@@ -496,7 +503,7 @@ pub(crate) fn snapshot(
     providers: &[Provider],
 ) -> anyhow::Result<Value> {
     let dismissed: HashSet<(String, String)> = conn
-        .prepare("SELECT provider_id, item_id FROM suggestion_dismissals WHERE profile = ?1")?
+        .prepare(LIVE_DISMISSALS_SQL)?
         .query_map([profile], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<Result<_, _>>()?;
     let mut out_providers = Vec::with_capacity(providers.len());
@@ -1081,11 +1088,35 @@ mod tests {
         assert!(!set_dismissed(&conn, "p", &p, "a", true).unwrap());
         publish(&conn, "p", &[item("a", "assigned")]);
         assert!(set_dismissed(&conn, "p", &p, "a", true).unwrap());
+        publish(&conn, "p", &[]);
         publish(&conn, "p", &[item("a", "assigned")]);
         assert_eq!(snap(&conn, "p")["items"][0]["dismissed"], true);
         assert_eq!(snap(&conn, "other")["items"], json!([]));
         assert!(set_dismissed(&conn, "p", &p, "a", false).unwrap());
         assert_eq!(snap(&conn, "p")["items"][0]["dismissed"], false);
+    }
+
+    #[test]
+    fn dismissal_read_searches_dismissals_by_full_key() {
+        let conn = store();
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {LIVE_DISMISSALS_SQL}"))
+            .unwrap()
+            .query_map(["p"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let dismissals: Vec<&String> = plan
+            .iter()
+            .filter(|step| step.contains("suggestion_dismissals"))
+            .collect();
+        assert!(
+            !dismissals.is_empty()
+                && dismissals
+                    .iter()
+                    .all(|s| s.starts_with("SEARCH") && s.contains("item_id=?")),
+            "{plan:?}"
+        );
     }
 
     #[test]
