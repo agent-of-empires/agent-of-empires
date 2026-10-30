@@ -25,6 +25,7 @@ struct Snapshot {
 
 #[derive(Debug, Clone, Deserialize)]
 struct Provider {
+    id: String,
     name: String,
     #[serde(default)]
     error: Option<String>,
@@ -66,6 +67,9 @@ struct Prepared {
 
 /// A suggestion resolved to a registered project, ready for the dialog.
 pub(super) struct Start {
+    pub provider: String,
+    pub source_ref: String,
+    pub reason: String,
     pub path: String,
     pub title: String,
     pub initial_prompt: String,
@@ -189,16 +193,14 @@ fn plain(s: &str) -> String {
         .collect()
 }
 
-pub(super) enum Poll {
-    Idle,
-    Changed,
-    Start(Start),
-}
-
 pub(super) enum SuggestionsAction {
     Continue,
     Close,
+    /// The user confirmed a prepared suggestion.
+    Start(Start),
 }
+
+type ItemKey = (String, String);
 
 pub(super) struct SuggestionsView {
     snapshot: Option<Snapshot>,
@@ -207,6 +209,10 @@ pub(super) struct SuggestionsView {
     order: Vec<usize>,
     pub(super) error: Option<String>,
     notice: Option<String>,
+    /// The item whose `prepare` is in flight.
+    prepare_key: Option<ItemKey>,
+    /// The resolved prefill, shown before the second Enter confirms it.
+    prepared: Option<(ItemKey, Start)>,
     selected: usize,
     detail_scroll: u16,
     show_dismissed: bool,
@@ -227,6 +233,8 @@ impl SuggestionsView {
             order: Vec::new(),
             error: None,
             notice: None,
+            prepare_key: None,
+            prepared: None,
             selected: 0,
             detail_scroll: 0,
             show_dismissed: false,
@@ -243,6 +251,7 @@ impl SuggestionsView {
         self.busy = true;
         self.error = None;
         self.notice = None;
+        self.prepared = None;
         self.worker.request(req);
     }
 
@@ -251,28 +260,37 @@ impl SuggestionsView {
         snapshot.items.get(*self.order.get(index)?)
     }
 
-    fn selected_key(&self) -> Option<(String, String)> {
+    fn item_by_key(&self, key: &ItemKey) -> Option<&Item> {
+        self.snapshot
+            .iter()
+            .flat_map(|s| &s.items)
+            .find(|i| i.provider_id == key.0 && i.id == key.1)
+    }
+
+    fn selected_key(&self) -> Option<ItemKey> {
         self.item_at(self.selected)
             .map(|i| (i.provider_id.clone(), i.id.clone()))
     }
 
-    /// Rebuilds `order`, keeping the selection on `key` when it is still listed.
-    fn reorder(&mut self, key: Option<(String, String)>) {
-        let items = self.snapshot.iter().flat_map(|s| &s.items);
-        let mut order: Vec<usize> = items
-            .clone()
+    fn provider_name<'a>(&'a self, id: &'a str) -> &'a str {
+        self.snapshot
+            .iter()
+            .flat_map(|s| &s.providers)
+            .find(|p| p.id == id)
+            .map_or(id, |p| p.name.as_str())
+    }
+
+    /// Rebuilds `order` in snapshot order (core interleaves providers),
+    /// keeping the selection on `key` when it is still listed.
+    fn reorder(&mut self, key: Option<ItemKey>) {
+        self.order = self
+            .snapshot
+            .iter()
+            .flat_map(|s| &s.items)
             .enumerate()
             .filter(|(_, i)| self.show_dismissed || !i.dismissed)
             .map(|(index, _)| index)
             .collect();
-        let items: Vec<&Item> = items.collect();
-        order.sort_by(|&a, &b| {
-            items[a]
-                .project
-                .cmp(&items[b].project)
-                .then_with(|| items[a].source_ref.cmp(&items[b].source_ref))
-        });
-        self.order = order;
         let kept = key.and_then(|(provider_id, id)| {
             (0..self.order.len()).find(|&index| {
                 self.item_at(index)
@@ -328,29 +346,35 @@ impl SuggestionsView {
                 self.error = Some("The daemon is read-only or unavailable".into());
             }
             KeyCode::Enter => {
-                if let Some(item) = self.item_at(self.selected) {
-                    let req = Req::Prepare {
-                        provider_id: item.provider_id.clone(),
-                        id: item.id.clone(),
-                    };
-                    self.send(req);
+                let Some(key) = self.selected_key() else {
+                    return SuggestionsAction::Continue;
+                };
+                if self.prepared.as_ref().is_some_and(|(k, _)| *k == key) {
+                    if let Some((_, start)) = self.prepared.take() {
+                        return SuggestionsAction::Start(start);
+                    }
                 }
+                self.prepare_key = Some(key.clone());
+                self.send(Req::Prepare {
+                    provider_id: key.0,
+                    id: key.1,
+                });
             }
             _ => {}
         }
         SuggestionsAction::Continue
     }
 
-    /// Applies a finished request, if any.
-    pub(super) fn poll(&mut self) -> Poll {
+    /// Applies a finished request, if any. True when state changed.
+    pub(super) fn poll(&mut self) -> bool {
         let res = match self.worker.try_recv() {
             Ok(res) => res,
             Err(TryRecvError::Disconnected) if self.busy => {
                 self.busy = false;
                 self.error = Some("The suggestions worker stopped".into());
-                return Poll::Changed;
+                return true;
             }
-            Err(_) => return Poll::Idle,
+            Err(_) => return false,
         };
         self.busy = false;
         match res {
@@ -361,21 +385,40 @@ impl SuggestionsView {
             Res::Snapshot(Err(e)) | Res::Refreshed(Err(e)) | Res::Prepared(Err(e)) => {
                 self.error = Some(e);
             }
-            Res::Prepared(Ok(prepared)) => match prepared.project {
-                None => {
+            Res::Prepared(Ok(prepared)) => match (prepared.project, self.prepare_key.take()) {
+                (None, _) => {
                     self.error = Some("No registered project matches this suggestion".into());
                 }
-                Some(project) => {
-                    return Poll::Start(Start {
-                        path: project.path,
-                        title: prepared.title,
-                        initial_prompt: prepared.initial_prompt,
-                        tool: prepared.tool,
-                    });
+                (Some(project), Some(key)) => {
+                    let (provider, source_ref, reason) = self
+                        .item_by_key(&key)
+                        .map(|i| {
+                            (
+                                self.provider_name(&i.provider_id).to_owned(),
+                                i.source_ref.clone(),
+                                i.reason.clone(),
+                            )
+                        })
+                        .unwrap_or_else(|| (key.0.clone(), String::new(), String::new()));
+                    self.notice =
+                        Some("Review the prompt below, then press Enter to start.".into());
+                    self.prepared = Some((
+                        key,
+                        Start {
+                            provider,
+                            source_ref,
+                            reason,
+                            path: project.path,
+                            title: prepared.title,
+                            initial_prompt: prepared.initial_prompt,
+                            tool: prepared.tool,
+                        },
+                    ));
                 }
+                (Some(_), None) => {}
             },
         }
-        Poll::Changed
+        true
     }
 
     pub(super) fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -411,10 +454,15 @@ impl SuggestionsView {
             }
         }
         footer.push(Line::from(Span::styled(
-            "j/k select · Enter start · x dismiss/restore · d dismissed · r refresh · l reload · PgUp/PgDn prompt · Esc back",
+            "j/k select · Enter review/start · x dismiss/restore · d dismissed · r refresh · l reload · PgUp/PgDn prompt · Esc back",
             Style::default().fg(theme.dimmed),
         )));
-        let footer_height = (footer.len() as u16).min(inner.height.saturating_sub(1));
+        let width = (inner.width as usize).max(1);
+        let wrapped_rows: usize = footer
+            .iter()
+            .map(|line| line.width().div_ceil(width).max(1))
+            .sum();
+        let footer_height = (wrapped_rows as u16).min(inner.height.saturating_sub(1));
         let [body, footer_area] = *Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(1), Constraint::Length(footer_height)])
@@ -447,15 +495,20 @@ impl SuggestionsView {
             } else {
                 Style::default().fg(theme.text)
             };
-            lines.push(Line::from(Span::styled(
-                plain(&format!("{marker}{}{state}", item.title)),
-                title_style,
-            )));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    plain(&format!(
+                        "{marker}{} ",
+                        self.provider_name(&item.provider_id)
+                    )),
+                    Style::default().fg(theme.dimmed),
+                ),
+                Span::styled(plain(&format!("{}{state}", item.title)), title_style),
+            ]));
             lines.push(Line::from(Span::styled(
                 plain(&format!(
-                    "    {} · {} · {}",
+                    "    {} · {}",
                     item.reason,
-                    item.source_ref,
                     item.project.as_deref().unwrap_or("no project")
                 )),
                 Style::default().fg(theme.dimmed),
@@ -463,9 +516,9 @@ impl SuggestionsView {
         }
         if lines.is_empty() {
             let message = match (&self.snapshot, self.busy) {
-                (None, true) => "Loading suggestions...",
+                (None, true) => "Loading suggestions…",
                 (None, false) => "No suggestions loaded. Press l to reload.",
-                (Some(_), _) => "No suggestions. Press r to ask providers to refresh.",
+                (Some(_), _) => "Nothing to suggest right now.",
             };
             lines.push(Line::from(Span::styled(
                 message,
@@ -481,8 +534,10 @@ impl SuggestionsView {
                 Style::default().add_modifier(Modifier::BOLD),
             )));
             detail.push(Line::from(plain(&format!(
-                "Provider: {} · Source: {}",
-                item.provider_id, item.source_url
+                "{} · {} · {}",
+                self.provider_name(&item.provider_id),
+                item.source_ref,
+                item.source_url
             ))));
             detail.extend(
                 plain(&item.preview)
@@ -490,15 +545,23 @@ impl SuggestionsView {
                     .map(|l| Line::from(l.to_owned())),
             );
             detail.push(Line::from(""));
+            let final_prompt = self
+                .prepared
+                .as_ref()
+                .filter(|(key, _)| *key == (item.provider_id.clone(), item.id.clone()))
+                .map(|(_, start)| start.initial_prompt.as_str());
+            let (header, prompt) = match final_prompt {
+                Some(prompt) => ("Prompt sent to the agent (untrusted source text):", prompt),
+                None => (
+                    "Provider draft prompt (Enter resolves the final prompt first):",
+                    item.draft.prompt.as_str(),
+                ),
+            };
             detail.push(Line::from(Span::styled(
-                "Prompt sent to the agent (untrusted source text):",
+                header,
                 Style::default().fg(theme.accent),
             )));
-            detail.extend(
-                plain(&item.draft.prompt)
-                    .lines()
-                    .map(|l| Line::from(l.to_owned())),
-            );
+            detail.extend(plain(prompt).lines().map(|l| Line::from(l.to_owned())));
         }
         frame.render_widget(
             Paragraph::new(detail)
@@ -514,17 +577,10 @@ impl SuggestionsView {
     }
 
     #[cfg(test)]
-    pub(super) fn with_start_for_test(start: Start) -> Self {
-        let prepared = Prepared {
-            title: start.title,
-            initial_prompt: start.initial_prompt,
-            tool: start.tool,
-            project: Some(PreparedProject { path: start.path }),
-        };
-        Self::with_worker(Worker::seeded_for_test(
-            "test-suggestions",
-            Res::Prepared(Ok(prepared)),
-        ))
+    pub(super) fn idle_for_test() -> Self {
+        Self::with_worker(Worker::spawn("test-suggestions", |_| {
+            unreachable!("no request expected")
+        }))
     }
 }
 
@@ -553,7 +609,11 @@ mod tests {
     fn view_with(items: Vec<Item>, worker: Worker<Req, Res>) -> SuggestionsView {
         let mut view = SuggestionsView::with_worker(worker);
         view.replace(Snapshot {
-            providers: vec![],
+            providers: vec![Provider {
+                id: "p".into(),
+                name: "GitHub".into(),
+                error: None,
+            }],
             items,
         });
         view
@@ -563,8 +623,24 @@ mod tests {
         Worker::spawn("test-suggestions", |_| unreachable!("no request expected"))
     }
 
-    fn press(view: &mut SuggestionsView, code: KeyCode, mutations: bool) {
-        view.handle_key(KeyEvent::new(code, KeyModifiers::NONE), mutations);
+    fn press(view: &mut SuggestionsView, code: KeyCode, mutations: bool) -> SuggestionsAction {
+        view.handle_key(KeyEvent::new(code, KeyModifiers::NONE), mutations)
+    }
+
+    fn render_text(view: &SuggestionsView) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal
+            .draw(|frame| view.render(frame, frame.area(), &Theme::default()))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(100)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn ids(view: &SuggestionsView) -> Vec<String> {
@@ -577,27 +653,27 @@ mod tests {
     /// Seeded results are queued before the worker thread starts and a dead
     /// worker disconnects shortly after a request, so a bounded retry loop
     /// only covers scheduling.
-    fn poll_until_settled(view: &mut SuggestionsView) -> Poll {
+    fn poll_until_settled(view: &mut SuggestionsView) -> bool {
         for _ in 0..200 {
-            match view.poll() {
-                Poll::Idle => std::thread::sleep(std::time::Duration::from_millis(10)),
-                other => return other,
+            if view.poll() {
+                return true;
             }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        Poll::Idle
+        false
     }
 
     fn prepared(project: Option<&str>) -> Prepared {
         Prepared {
             title: "t".into(),
-            initial_prompt: "p".into(),
+            initial_prompt: "final prompt".into(),
             tool: "claude".into(),
             project: project.map(|path| PreparedProject { path: path.into() }),
         }
     }
 
     #[test]
-    fn dismissed_items_are_hidden_until_toggled_and_sorted_by_project() {
+    fn dismissed_items_are_hidden_until_toggled_and_keep_snapshot_order() {
         let mut view = view_with(
             vec![
                 item("b", Some("zeta"), false),
@@ -606,9 +682,9 @@ mod tests {
             ],
             idle_worker(),
         );
-        assert_eq!(ids(&view), ["a", "b"]);
+        assert_eq!(ids(&view), ["b", "a"]);
         press(&mut view, KeyCode::Char('d'), true);
-        assert_eq!(ids(&view), ["a", "gone", "b"]);
+        assert_eq!(ids(&view), ["b", "a", "gone"]);
     }
 
     #[test]
@@ -640,17 +716,31 @@ mod tests {
     }
 
     #[test]
-    fn prepare_result_starts_only_with_a_registered_project() {
+    fn enter_resolves_the_final_prompt_and_a_second_enter_starts() {
         let worker = Worker::seeded_for_test("t", Res::Prepared(Ok(prepared(Some("/repo")))));
-        let mut view = view_with(vec![], worker);
-        let Poll::Start(start) = poll_until_settled(&mut view) else {
+        let mut view = view_with(vec![item("a", Some("repo"), false)], worker);
+        assert!(matches!(
+            press(&mut view, KeyCode::Enter, true),
+            SuggestionsAction::Continue
+        ));
+        assert!(poll_until_settled(&mut view));
+        assert!(view.prepared.is_some());
+        assert!(render_text(&view).contains("final prompt"));
+        let SuggestionsAction::Start(start) = press(&mut view, KeyCode::Enter, true) else {
             panic!("expected a start");
         };
         assert_eq!(start.path, "/repo");
+        assert_eq!(start.initial_prompt, "final prompt");
+        assert!(view.prepared.is_none());
+    }
 
+    #[test]
+    fn prepare_without_a_registered_project_cannot_start() {
         let worker = Worker::seeded_for_test("t", Res::Prepared(Ok(prepared(None))));
-        let mut view = view_with(vec![], worker);
-        assert!(matches!(poll_until_settled(&mut view), Poll::Changed));
+        let mut view = view_with(vec![item("a", None, false)], worker);
+        press(&mut view, KeyCode::Enter, true);
+        assert!(poll_until_settled(&mut view));
+        assert!(view.prepared.is_none());
         assert!(view
             .error
             .as_deref()
@@ -662,7 +752,7 @@ mod tests {
     fn failed_request_keeps_the_last_snapshot() {
         let worker = Worker::seeded_for_test("t", Res::Snapshot(Err("daemon down".into())));
         let mut view = view_with(vec![item("a", None, false)], worker);
-        assert!(matches!(poll_until_settled(&mut view), Poll::Changed));
+        assert!(poll_until_settled(&mut view));
         assert_eq!(view.error.as_deref(), Some("daemon down"));
         assert_eq!(ids(&view), ["a"]);
     }
@@ -671,7 +761,7 @@ mod tests {
     fn refresh_notifies_and_asks_for_a_reload() {
         let worker = Worker::seeded_for_test("t", Res::Refreshed(Ok(())));
         let mut view = view_with(vec![], worker);
-        assert!(matches!(poll_until_settled(&mut view), Poll::Changed));
+        assert!(poll_until_settled(&mut view));
         assert!(view.notice.as_deref().unwrap().contains("Press l"));
     }
 
@@ -683,10 +773,10 @@ mod tests {
         let mut view = view_with(vec![item("a", None, false)], worker);
         press(&mut view, KeyCode::Char('l'), true);
         assert!(view.busy);
-        assert!(matches!(poll_until_settled(&mut view), Poll::Changed));
+        assert!(poll_until_settled(&mut view));
         assert!(!view.busy);
         assert!(view.error.is_some());
-        assert!(matches!(view.poll(), Poll::Idle));
+        assert!(!view.poll());
     }
 
     #[test]
@@ -694,24 +784,14 @@ mod tests {
         let mut hostile = item("a", Some("repo"), false);
         hostile.draft.prompt = "run \u{1b}[31mrm -rf\u{1b}[0m now".into();
         let view = view_with(vec![hostile], idle_worker());
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
-        terminal
-            .draw(|frame| view.render(frame, frame.area(), &Theme::default()))
-            .unwrap();
-        let rows: Vec<String> = terminal
-            .backend()
-            .buffer()
-            .content
-            .chunks(100)
-            .map(|row| row.iter().map(|c| c.symbol()).collect())
-            .collect();
-        let text = rows.join("\n");
+        let text = render_text(&view);
         println!("{text}");
         for expected in [
-            "reason · ref-a · repo",
+            "GitHub a",
+            "reason · repo",
+            "GitHub · ref-a · https://example.test/x",
             "preview text",
-            "Prompt sent to the agent",
+            "Provider draft prompt",
             "run \u{fffd}[31mrm -rf\u{fffd}[0m now",
         ] {
             assert!(text.contains(expected), "missing {expected:?}");

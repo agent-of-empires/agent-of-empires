@@ -49,6 +49,23 @@ fn overlay_hover_rects(entries: &[(usize, Rect)], fields: &[(usize, Rect)]) -> V
         .collect()
 }
 
+const PROMPT_TEXT_WIDTH: usize = 68;
+const PROMPT_MAX_ROWS: usize = 4;
+
+/// Provider text is untrusted: one cell per char, with newlines shown as `⏎`
+/// and other control or bidi characters replaced, so nothing can move the
+/// terminal or reorder the line.
+fn prompt_display(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\n' => '⏎',
+            c if c.is_control() => '\u{fffd}',
+            '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => '\u{fffd}',
+            c => c,
+        })
+        .collect()
+}
+
 impl NewSessionDialog {
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         // Rebuilt every frame: a layout change moves every later field, so a
@@ -94,6 +111,9 @@ impl NewSessionDialog {
             };
 
         let mut constraints = Vec::new();
+        if self.prompt_origin.is_some() {
+            constraints.push(Constraint::Length(2)); // From line
+        }
         if has_profile_selection {
             constraints.push(Constraint::Length(profile_field_height)); // Profile
         }
@@ -114,7 +134,10 @@ impl NewSessionDialog {
         if has_sandbox {
             constraints.push(Constraint::Length(2)); // Sandbox checkbox (summary only)
         }
-        constraints.push(Constraint::Length(2)); // Group (always, at the bottom)
+        constraints.push(Constraint::Length(2)); // Group
+        if self.prompt_origin.is_some() {
+            constraints.push(Constraint::Length(self.prompt_height())); // Prompt
+        }
 
         // Inner width is 76: dialog width less borders and margin. The hint
         // line reserves 2 rows so per-field hints wrap instead of truncating.
@@ -156,6 +179,16 @@ impl NewSessionDialog {
         let mut ci = 0; // chunk index
 
         let fields = self.field_indices();
+
+        if let Some(origin) = &self.prompt_origin {
+            let from = format!(
+                "From {} · {} · {}",
+                origin.provider, origin.source_ref, origin.reason
+            );
+            let line = Line::styled(prompt_display(&from), Style::default().fg(theme.dimmed));
+            frame.render_widget(Paragraph::new(line), chunks[ci]);
+            ci += 1;
+        }
 
         if has_profile_selection {
             let area = chunks[ci];
@@ -413,6 +446,13 @@ impl NewSessionDialog {
         self.focusable_rects.push((fields.group, area));
         ci += 1;
 
+        if self.prompt_origin.is_some() {
+            let area = chunks[ci];
+            self.render_prompt_field(frame, area, self.focused_field == fields.prompt, theme);
+            self.focusable_rects.push((fields.prompt, area));
+            ci += 1;
+        }
+
         // Hints/errors (last chunk)
         let hint_chunk = ci;
         if self.confirm_create_dir.is_some() {
@@ -549,6 +589,68 @@ impl NewSessionDialog {
 
         if self.dir_picker.is_active() {
             self.dir_picker.render(frame, full_area, theme);
+        }
+    }
+
+    /// Rows the wrapped prompt needs (cursor cell included) plus the sub-line.
+    fn prompt_height(&self) -> u16 {
+        let chars = self.prompt.value().chars().count() + 1;
+        chars.div_ceil(PROMPT_TEXT_WIDTH).clamp(1, PROMPT_MAX_ROWS) as u16 + 1
+    }
+
+    /// The prompt hard-wrapped at `PROMPT_TEXT_WIDTH`, scrolled to keep the
+    /// cursor in view, with a sub-line naming where the text came from.
+    fn render_prompt_field(&self, frame: &mut Frame, area: Rect, focused: bool, theme: &Theme) {
+        let label_style = if focused {
+            Style::default().fg(theme.accent).underlined()
+        } else {
+            Style::default().fg(theme.text)
+        };
+        let value_style = Style::default().fg(if focused { theme.accent } else { theme.text });
+        let chars: Vec<char> = prompt_display(self.prompt.value()).chars().collect();
+        let rows = (area.height as usize).saturating_sub(1);
+        let cursor = self.prompt.cursor();
+        let cursor_row = cursor / PROMPT_TEXT_WIDTH;
+        let start = if focused {
+            (cursor_row + 1).saturating_sub(rows)
+        } else {
+            0
+        };
+        let mut lines: Vec<Line> = Vec::new();
+        for row in start..start + rows {
+            let text: String = chars
+                .iter()
+                .skip(row * PROMPT_TEXT_WIDTH)
+                .take(PROMPT_TEXT_WIDTH)
+                .collect();
+            let prefix = if row == start {
+                Span::styled("Prompt:", label_style)
+            } else {
+                Span::raw("       ")
+            };
+            lines.push(Line::from(vec![
+                prefix,
+                Span::raw(" "),
+                Span::styled(text, value_style),
+            ]));
+        }
+        if let Some(origin) = &self.prompt_origin {
+            lines.push(Line::styled(
+                prompt_display(&format!(
+                    "        from {}, not checked by AoE",
+                    origin.provider
+                )),
+                Style::default().fg(theme.dimmed),
+            ));
+        }
+        frame.render_widget(Paragraph::new(lines), area);
+        if focused {
+            let col = (cursor % PROMPT_TEXT_WIDTH) as u16;
+            let row = cursor_row.saturating_sub(start) as u16;
+            frame.set_cursor_position(Position::new(
+                area.x + 8 + col.min(area.width.saturating_sub(9)),
+                area.y + row.min(area.height.saturating_sub(2)),
+            ));
         }
     }
 

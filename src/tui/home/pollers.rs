@@ -1,7 +1,8 @@
 //! Typed runtime completion polling; durable lifecycle work belongs to the daemon.
 
 use super::*;
-use crate::tui::suggestions::{Poll, Start};
+use crate::tui::dialogs::PromptOrigin;
+use crate::tui::suggestions::{Start, SuggestionsView};
 
 impl HomeView {
     pub(super) const CANONICAL_RELOAD_RETRY_INTERVAL: std::time::Duration =
@@ -48,29 +49,25 @@ impl HomeView {
         }
     }
 
-    /// Drains the suggestions worker. A started suggestion replaces the view
-    /// with the regular new-session dialog, prefilled; when the dialog cannot
-    /// open the view stays and shows why. True when state changed.
+    /// Drains the suggestions worker. True when state changed.
     pub fn apply_suggestions_results(&mut self) -> bool {
-        let Some(view) = &mut self.suggestions_view else {
-            return false;
-        };
-        match view.poll() {
-            Poll::Idle => false,
-            Poll::Changed => true,
-            Poll::Start(start) => {
-                match self.suggestion_dialog(start) {
-                    Ok(dialog) => {
-                        self.suggestions_view = None;
-                        self.new_dialog = Some(dialog);
-                    }
-                    Err(message) => {
-                        if let Some(view) = &mut self.suggestions_view {
-                            view.set_error(message);
-                        }
-                    }
+        self.suggestions_view
+            .as_mut()
+            .is_some_and(SuggestionsView::poll)
+    }
+
+    /// Replaces the view with the regular new-session dialog, prefilled; when
+    /// the dialog cannot open the view stays and shows why.
+    pub(super) fn start_suggestion(&mut self, start: Start) {
+        match self.suggestion_dialog(start) {
+            Ok(dialog) => {
+                self.suggestions_view = None;
+                self.new_dialog = Some(dialog);
+            }
+            Err(message) => {
+                if let Some(view) = &mut self.suggestions_view {
+                    view.set_error(message);
                 }
-                true
             }
         }
     }
@@ -97,7 +94,14 @@ impl HomeView {
         dialog.set_path(start.path);
         dialog.set_tool(&start.tool);
         dialog.set_title(start.title);
-        dialog.set_initial_prompt(start.initial_prompt);
+        dialog.set_suggestion(
+            start.initial_prompt,
+            PromptOrigin {
+                provider: start.provider,
+                source_ref: start.source_ref,
+                reason: start.reason,
+            },
+        );
         dialog.focus_title();
         Ok(dialog)
     }

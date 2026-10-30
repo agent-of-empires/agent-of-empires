@@ -99,6 +99,14 @@ pub(super) const FIELD_HELP: &[FieldHelp] = &[
     },
 ];
 
+/// Where a prefilled prompt came from, shown with the Prompt row.
+#[derive(Clone)]
+pub struct PromptOrigin {
+    pub provider: String,
+    pub source_ref: String,
+    pub reason: String,
+}
+
 #[derive(Clone)]
 pub struct NewSessionData {
     pub profile: String,
@@ -267,8 +275,9 @@ pub struct NewSessionDialog {
     pub(super) fork_seed: Option<crate::session::ForkSeed>,
     /// The title the dialog was opened with, which the user did not type.
     pub(super) suggested_title: String,
-    /// First turn for the agent, set by callers that prefill the dialog.
-    initial_prompt: Option<String>,
+    /// First turn for the agent; the row exists only when `prompt_origin` is set.
+    prompt: Input,
+    prompt_origin: Option<PromptOrigin>,
     /// `(focused_field_index, rect)` per main-form field, repopulated every
     /// frame and empty while an overlay is up, so a click during one cannot
     /// snap focus to the field that used to sit there.
@@ -458,6 +467,7 @@ pub(super) struct FieldIndices {
     pub worktree: usize,
     pub sandbox: usize,
     pub group: usize,
+    pub prompt: usize,
     /// One past the last focusable row, where Tab wraps.
     pub count: usize,
 }
@@ -623,7 +633,8 @@ impl NewSessionDialog {
             scratch: false,
             fork_seed: None,
             suggested_title: String::new(),
-            initial_prompt: None,
+            prompt: Input::default(),
+            prompt_origin: None,
             focusable_rects: Vec::new(),
             sandbox_config_rects: Vec::new(),
             tool_config_rects: Vec::new(),
@@ -651,8 +662,10 @@ impl NewSessionDialog {
         self.suggested_title = title;
     }
 
-    pub fn set_initial_prompt(&mut self, prompt: String) {
-        self.initial_prompt = Some(prompt);
+    /// Show an editable Prompt row for text a plugin proposed.
+    pub fn set_suggestion(&mut self, prompt: String, origin: PromptOrigin) {
+        self.prompt = Input::new(prompt);
+        self.prompt_origin = Some(origin);
     }
 
     pub fn set_fork_from(&mut self, seed: crate::session::ForkSeed) {
@@ -976,6 +989,7 @@ impl NewSessionDialog {
             worktree: take(!is_host_only),
             sandbox: take(self.docker_available && !is_host_only),
             group: take(true),
+            prompt: take(self.prompt_origin.is_some()),
             count: next,
         }
     }
@@ -1143,7 +1157,8 @@ impl NewSessionDialog {
             scratch: false,
             fork_seed: None,
             suggested_title: String::new(),
-            initial_prompt: None,
+            prompt: Input::default(),
+            prompt_origin: None,
             focusable_rects: Vec::new(),
             sandbox_config_rects: Vec::new(),
             tool_config_rects: Vec::new(),
@@ -1225,7 +1240,8 @@ impl NewSessionDialog {
             scratch: false,
             fork_seed: None,
             suggested_title: String::new(),
-            initial_prompt: None,
+            prompt: Input::default(),
+            prompt_origin: None,
             focusable_rects: Vec::new(),
             sandbox_config_rects: Vec::new(),
             tool_config_rects: Vec::new(),
@@ -2169,6 +2185,7 @@ impl NewSessionDialog {
             n if n == fields.title => &mut self.title,
             n if n == fields.path => &mut self.path,
             n if n == fields.group => &mut self.group,
+            n if n == fields.prompt => &mut self.prompt,
             _ => &mut self.title,
         }
     }
@@ -2289,7 +2306,9 @@ impl NewSessionDialog {
             scratch: self.scratch,
             fork_seed: self.fork_seed.clone(),
             structured: self.structured_enabled && self.structured_capable,
-            initial_prompt: self.initial_prompt.clone(),
+            initial_prompt: (self.prompt_origin.is_some()
+                && !self.prompt.value().trim().is_empty())
+            .then(|| self.prompt.value().to_string()),
         })
     }
 

@@ -1476,6 +1476,9 @@ fn s_opens_the_suggestions_view_which_owns_keys_until_esc() {
 
 fn start_for_test(path: &str) -> crate::tui::suggestions::Start {
     crate::tui::suggestions::Start {
+        provider: "GitHub".to_string(),
+        source_ref: "#7".to_string(),
+        reason: "review requested".to_string(),
         path: path.to_string(),
         title: "Review PR 7".to_string(),
         initial_prompt: "Inspect the diff".to_string(),
@@ -1487,9 +1490,8 @@ fn start_for_test(path: &str) -> crate::tui::suggestions::Start {
 #[serial]
 fn a_started_suggestion_opens_the_prefilled_dialog_and_closes_the_view() {
     let mut env = create_test_env_empty();
-    env.view.suggestions_view =
-        Some(crate::tui::suggestions::SuggestionsView::with_start_for_test(start_for_test("/tmp")));
-    assert!(env.view.apply_suggestions_results());
+    env.view.suggestions_view = Some(crate::tui::suggestions::SuggestionsView::idle_for_test());
+    env.view.start_suggestion(start_for_test("/tmp"));
     assert!(env.view.suggestions_view.is_none());
     let data = match env
         .view
@@ -1512,9 +1514,8 @@ fn a_started_suggestion_opens_the_prefilled_dialog_and_closes_the_view() {
 fn a_blocked_suggestion_start_keeps_the_view_open_with_the_reason() {
     let mut env = create_test_env_empty();
     env.view.creating_stub_id = Some("pending".to_string());
-    env.view.suggestions_view =
-        Some(crate::tui::suggestions::SuggestionsView::with_start_for_test(start_for_test("/tmp")));
-    assert!(env.view.apply_suggestions_results());
+    env.view.suggestions_view = Some(crate::tui::suggestions::SuggestionsView::idle_for_test());
+    env.view.start_suggestion(start_for_test("/tmp"));
     assert!(env.view.new_dialog.is_none());
     let view = env.view.suggestions_view.as_ref().expect("view stays open");
     assert!(view

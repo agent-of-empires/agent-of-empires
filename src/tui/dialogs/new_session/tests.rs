@@ -98,18 +98,62 @@ fn a_profile_default_tool_beats_the_global_one() {
     assert_eq!(dialog.available_tools[dialog.tool_index], "opencode");
 }
 
+fn github_origin() -> super::PromptOrigin {
+    super::PromptOrigin {
+        provider: "GitHub".to_string(),
+        source_ref: "#4562".to_string(),
+        reason: "review requested from you".to_string(),
+    }
+}
+
 #[test]
-fn a_prefilled_initial_prompt_is_submitted() {
+fn a_suggested_prompt_is_shown_wrapped_attributed_and_editable() {
     let mut dialog = single_tool_dialog();
+    let prompt = "Review PR 4562. ".repeat(8);
+    dialog.set_suggestion(prompt.clone(), github_origin());
+    let screen = screen_of(&mut dialog, 100, 40);
+    for expected in [
+        "From GitHub · #4562 · review requested from you",
+        "Prompt:",
+        &prompt[..40],
+        "from GitHub, not checked by AoE",
+    ] {
+        assert!(screen.contains(expected), "missing {expected:?}");
+    }
+    assert!(
+        !screen.contains(prompt.trim_end()),
+        "a prompt longer than the row wraps instead of running on"
+    );
+
+    dialog.focused_field = dialog.field_indices().prompt;
+    type_str(&mut dialog, "!");
+    assert_eq!(
+        submitted(dialog.handle_key(key(KeyCode::Enter))).initial_prompt,
+        Some(format!("{prompt}!"))
+    );
+}
+
+#[test]
+fn the_prompt_row_exists_only_for_a_suggestion_and_hostile_text_is_neutralised() {
+    let mut dialog = single_tool_dialog();
+    assert_eq!(dialog.field_indices().prompt, super::FieldIndices::ABSENT);
     assert_eq!(
         submitted(dialog.handle_key(key(KeyCode::Enter))).initial_prompt,
         None
     );
+
     let mut dialog = single_tool_dialog();
-    dialog.set_initial_prompt("Review PR 7".to_string());
+    dialog.set_suggestion("run \u{1b}[31mnow\nthen stop".to_string(), github_origin());
+    let screen = screen_of(&mut dialog, 100, 40);
+    assert!(!screen.contains('\u{1b}'));
+    assert!(screen.contains("run \u{fffd}[31mnow\u{23ce}then stop"));
+
+    let mut dialog = single_tool_dialog();
+    dialog.set_suggestion("   ".to_string(), github_origin());
     assert_eq!(
         submitted(dialog.handle_key(key(KeyCode::Enter))).initial_prompt,
-        Some("Review PR 7".to_string())
+        None,
+        "a blank prompt is omitted, which creation would reject"
     );
 }
 
