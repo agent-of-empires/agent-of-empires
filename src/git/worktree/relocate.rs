@@ -221,12 +221,12 @@ impl GitWorktree {
         if to.exists() {
             return Err(GitError::WorktreeAlreadyExists(to.to_path_buf()));
         }
+        let (from_str, to_str) = (path_str(from)?, path_str(to)?);
         if worktree_has_submodule_admin_state(from) {
             return self.relocate_worktree_with_submodules(from, to);
         }
         let observation_from = canonicalize_move_endpoint(from);
         let observation_to = canonicalize_move_endpoint(to);
-        let (from_str, to_str) = (path_str(from)?, path_str(to)?);
 
         tracing::info!(target: "git.worktree",
             from = %from.display(),
@@ -342,8 +342,8 @@ impl GitWorktree {
                 );
                 problems.push(format!(
                     "`git worktree repair` failed ({e}) and moving back failed ({rollback}); \
-                     run `git worktree repair {}` from the main repository",
-                    to.display()
+                     run `{}` from the main repository",
+                    repair_command(to)
                 ));
             } else {
                 let _ = self.repair_worktree(from);
@@ -355,8 +355,8 @@ impl GitWorktree {
         if let Err(e) = Self::convert_git_file_to_relative(to) {
             problems.push(format!(
                 "could not restore the relative .git pointer ({e}); \
-                 run `git worktree repair {}` from the main repository",
-                to.display()
+                 run `{}` from the main repository",
+                repair_command(to)
             ));
         }
         let mut submodule_failed = false;
@@ -475,11 +475,36 @@ impl GitWorktree {
     }
 }
 
+/// A copyable repair command whose destination stays one shell word.
+fn repair_command(to: &Path) -> String {
+    format!(
+        "git worktree repair {}",
+        shell_words::quote(&to.to_string_lossy())
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::git::test_support::{init_repo, repo_with_nested_submodules, run_git};
     use tempfile::TempDir;
+
+    #[test]
+    fn repair_command_keeps_the_destination_one_argument() {
+        for path in [
+            "/repo/new",
+            "/home/alice/My Projects/new",
+            "/home/o'connor/projects/new",
+            "/home/o'connor/My Projects/new",
+        ] {
+            let words = shell_words::split(&repair_command(Path::new(path))).unwrap();
+            assert_eq!(words, ["git", "worktree", "repair", path]);
+        }
+        assert_eq!(
+            repair_command(Path::new("/repo/new")),
+            "git worktree repair /repo/new"
+        );
+    }
 
     #[test]
     fn timed_mutation_classification_fails_closed() {

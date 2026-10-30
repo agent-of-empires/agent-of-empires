@@ -31,6 +31,10 @@ export interface AcpSessionMockOptions {
   acpSessionId?: string;
   /** An import whose history hasn't loaded yet; its `acp_session_id` is set from creation. */
   importPending?: boolean;
+  /** The profile's rate-limit auto-resume setting; omitted means unknown. */
+  rateLimitAutoResume?: boolean;
+  /** Daemon control state sent on connect, over idle defaults; the only way a rate limit reaches the client. */
+  reducedState?: Record<string, unknown>;
 }
 
 export interface AcpSessionMock {
@@ -228,6 +232,7 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
             ...(opts.workerStarting ? { acp_agent: opts.startingAgent ?? "claude" } : {}),
             ...(opts.acpSessionId ? { acp_session_id: opts.acpSessionId } : {}),
             ...(opts.importPending ? { import_pending: true } : {}),
+            ...(opts.rateLimitAutoResume === undefined ? {} : { rate_limit_auto_resume: opts.rateLimitAutoResume }),
             claude_fullscreen: false,
           },
         ],
@@ -330,6 +335,27 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
         rows: rowLog.filter((entry) => entry.seq > since).map((entry) => entry.row),
       }),
     );
+    if (opts.reducedState) {
+      const state = {
+        agent: "claude",
+        model: null,
+        mode: "Default",
+        current_plan: null,
+        in_flight_tool: null,
+        pending_approvals: [],
+        pending_elicitations: [],
+        thinking: null,
+        rate_limit: null,
+        available_commands: [],
+        available_modes: [],
+        current_mode_id: null,
+        turn_active: false,
+        cancelling: false,
+        compacting: false,
+        ...opts.reducedState,
+      };
+      route.send(JSON.stringify({ kind: "reduced_state", state }));
+    }
   });
 
   pushEvents(opts.initialEvents ?? []);

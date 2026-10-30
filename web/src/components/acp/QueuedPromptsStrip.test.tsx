@@ -30,6 +30,7 @@ function renderWithProfile(
     sendNowInterrupts?: boolean;
     pendingResume?: boolean;
     waitingFor?: string | null;
+    connecting?: boolean;
     agent?: string;
   } = {},
 ) {
@@ -45,6 +46,7 @@ function renderWithProfile(
         sendNowInterrupts={opts.sendNowInterrupts ?? false}
         pendingResume={opts.pendingResume ?? false}
         waitingFor={opts.waitingFor}
+        connecting={opts.connecting}
         agent={opts.agent ?? "Claude Code"}
       />
     </AgentProfileProvider>,
@@ -73,12 +75,23 @@ describe("QueuedPromptsStrip", () => {
     expect(tooltip.textContent).not.toMatch(/tab stays open|other devices|Three closed chats/);
   });
 
-  it.each<[string, boolean, string | null, string]>([
+  it.each<[string, boolean, string | null, string, boolean?, boolean?]>([
     ["a new Session names the Agent it waits for", true, "Claude Code", "Pending until Claude Code is ready (1)"],
     ["a resumed Session waits to resume", true, null, "Pending until session resumes (1)"],
     ["a running Session just queues", false, "Claude Code", "Queued (1)"],
-  ])("%s", (_label, pendingResume, waitingFor, header) => {
-    const { container } = renderWithProfile("claude", [mk("a", "hello")], { pendingResume, waitingFor });
+    ["an open connection holds an unconfirmed row", false, null, "Queuing (1)", false, true],
+    ["a running Worker with the connection down keeps a confirmed row queued", true, null, "Queued (1)", true],
+    [
+      "a running Worker with the connection down holds an unconfirmed row",
+      true,
+      null,
+      "Pending until connected (1)",
+      true,
+      true,
+    ],
+  ])("%s", (_label, pendingResume, waitingFor, header, connecting = false, pending = false) => {
+    const row = { ...mk("a", "hello"), ...(pending ? { pending } : {}) };
+    const { container } = renderWithProfile("claude", [row], { pendingResume, waitingFor, connecting });
     expect(container.textContent).toContain(header);
     expect(container.textContent).not.toContain("Held in this tab");
   });

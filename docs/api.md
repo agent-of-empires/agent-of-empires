@@ -660,7 +660,7 @@ attachment is delivered. Genuine authority loss or an unknown outcome remains
 blocked until reconciled.
 
 A failed launch can still commit a lifecycle generation. The finite
-`aoe-error-code` values `start_failed`, `resume_failed`, and
+`aoe-error-code` values `start_failed`, `resume_failed`, `launch_indeterminate`, and
 `managed_resume_refused`, with valid same-epoch runtime receipt headers,
 acknowledge that preparation commit, not a successful
 launch. Clients must apply its snapshot before retrying. A later send or target

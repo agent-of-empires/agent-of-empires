@@ -1,9 +1,15 @@
+import { useState } from "react";
+
+import { writeClipboard } from "../../lib/clipboard";
+
 export interface RecoveryAction {
   label: string;
   onClick: () => void;
   testId: string;
   disabled?: boolean;
   title?: string;
+  /** Id of the text that says why the action is disabled. */
+  describedBy?: string;
 }
 
 const BUTTON =
@@ -35,6 +41,7 @@ export function RecoveryActionRow({
             onClick={action.onClick}
             disabled={action.disabled}
             title={action.title}
+            aria-describedby={action.describedBy}
             className={
               action === primary
                 ? `${PRIMARY} w-full sm:w-auto`
@@ -55,6 +62,44 @@ export function RecoveryActionRow({
           {install.output}
         </pre>
       )}
+    </>
+  );
+}
+
+/** A command to run by hand, with a copy button. `scroll` keeps it on one line
+ *  and scrolls it sideways instead of wrapping. */
+export function CommandBlock({
+  command,
+  note = null,
+  testId,
+  scroll = false,
+}: {
+  command: string;
+  note?: string | null;
+  testId: string;
+  scroll?: boolean;
+}) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <>
+      <div className="mt-1 flex items-start gap-2 rounded-md border border-surface-700 bg-surface-950 p-2">
+        <code
+          data-testid={testId}
+          className={`min-w-0 flex-1 font-mono text-[12px] text-text-primary ${
+            scroll ? "overflow-x-auto whitespace-pre" : "whitespace-pre-wrap break-all"
+          }`}
+        >
+          {command}
+        </code>
+        <button
+          type="button"
+          onClick={() => void writeClipboard(command).then(setCopied)}
+          className="shrink-0 rounded-md px-2 text-[11px] text-text-subtle hover:text-text-primary"
+        >
+          {copied ? "Copied" : "Copy"}
+        </button>
+      </div>
+      {note && <p className="mt-1 text-text-subtle">{note}</p>}
     </>
   );
 }

@@ -99,6 +99,7 @@ import {
   fetchPlugins,
 } from "./lib/api";
 import type { DeleteSessionOptions, RuntimeCursor, ServerAbout, SettingsResponse } from "./lib/api";
+import { autoResumeSettingsHref } from "./lib/autoResumeSettingsHref";
 import { getClientCapabilities } from "./lib/clientCapabilities";
 import { normalizeProjectPathKey } from "./lib/registeredProjects";
 import { IdleDecayWindowContext, parseIdleDecayWindowMs } from "./lib/idleDecay";
@@ -2001,6 +2002,7 @@ function AppContent({
                             sessionId={session.id}
                             acpWorkerState={session.acp_worker_state ?? "absent"}
                             rateLimitAutoResume={session.rate_limit_auto_resume}
+                            settingsHref={autoResumeSettingsHref(session.profile, serverAbout)}
                             tool={session.tool}
                             acpAgent={session.acp_agent ?? null}
                             startedBefore={hasStartedBefore(session)}
@@ -2262,6 +2264,7 @@ function AppContent({
           onOpenSendDialog={() => setSendDialogOpen(true)}
           onCloseSendDialog={() => setSendDialogOpen(false)}
           onClearSelectedFile={() => setSelectedFile(null)}
+          serverAbout={serverAbout}
         />
       );
     }
