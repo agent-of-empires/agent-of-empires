@@ -197,6 +197,12 @@ impl PluginHost {
             if provider_id.is_some_and(|id| id != provider.id) {
                 continue;
             }
+            let enabled = self.with_suggestions_db(|conn, profile| {
+                crate::plugin::suggestions::provider_enabled(conn, profile, &provider.id)
+            });
+            if !enabled.unwrap_or(true) {
+                continue;
+            }
             let notified = self
                 .notify_worker(&provider.id, method, serde_json::json!({}))
                 .await;
