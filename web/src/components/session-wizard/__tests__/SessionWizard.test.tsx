@@ -1066,3 +1066,28 @@ describe("SessionWizard initial prompt", () => {
     expect(payload().initial_prompt).toBeUndefined();
   });
 });
+
+describe("SessionWizard suggestion source", () => {
+  const source = { label: "GitHub", title: "Fix lifecycle", url: "https://example.test/issues/1" };
+
+  it("shows the From strip and seeds the title", async () => {
+    renderWizard({ path: "/tmp/proj", tool: "claude", title: "Review RFC 4562", source });
+    const strip = screen.getByTestId("wizard-source");
+    expect(strip.textContent).toContain("GitHub");
+    expect(strip.textContent).toContain("Fix lifecycle");
+    expect(strip.textContent).toContain("issue text not included");
+    expect(strip.querySelector("a")?.getAttribute("href")).toBe(source.url);
+    expect((screen.getByLabelText("Title") as HTMLInputElement).value).toBe("Review RFC 4562");
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload()).toMatchObject({ title: "Review RFC 4562" });
+  });
+
+  it("does not link a non-http source url, and shows no strip without a source", () => {
+    renderWizard({ path: "/tmp/proj", tool: "claude", source: { ...source, url: "javascript:alert(1)" } });
+    expect(screen.getByTestId("wizard-source").querySelector("a")).toBeNull();
+    cleanup();
+    renderWizard();
+    expect(screen.queryByTestId("wizard-source")).toBeNull();
+  });
+});

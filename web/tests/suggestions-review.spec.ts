@@ -59,13 +59,19 @@ test("Start opens the wizard with the draft prompt and creates nothing until Lau
   await page.goto("/suggestions");
 
   await expect(page.getByRole("heading", { name: "Suggested sessions" })).toBeVisible();
-  const preview = page.getByLabel("Provider preview, untrusted");
-  await expect(preview).toContainText("UNTRUSTED PROVIDER BODY");
+  await expect(page.getByText("GitHub · Assigned to you · aoe")).toBeVisible();
+  await expect(page.getByText("UNTRUSTED PROVIDER BODY")).toHaveCount(0);
 
   await page.getByRole("button", { name: "Start" }).click();
   const prompt = page.getByLabel("Prompt", { exact: true });
   await expect(prompt).toHaveValue(item.draft.prompt);
   await expect(prompt).not.toHaveValue(/UNTRUSTED/);
+  await expect(page.getByLabel("Title")).toHaveValue(item.draft.title);
+  const from = page.getByTestId("wizard-source");
+  await expect(from).toContainText("GitHub");
+  await expect(from).toContainText(item.title);
+  await expect(from).toContainText("issue text not included");
+  await expect(from.getByRole("link", { name: /Open/ })).toHaveAttribute("href", item.source_url);
   expect(sessionPosts).toEqual([]);
 
   const create = page.waitForRequest((r) => r.url().endsWith("/api/sessions") && r.method() === "POST");
@@ -87,7 +93,7 @@ test("source switch patches the provider and the list reloads", async ({ page })
     route.fulfill({ json: { provider_id: "github", criterion: "ci", enabled: true } }),
   );
   await page.goto("/suggestions");
-  await expect(page.getByRole("heading", { name: item.title })).toBeVisible();
+  await expect(page.getByText(item.title, { exact: true })).toBeVisible();
   expect(snapshotReads).toBe(1);
 
   const patch = page.waitForRequest((r) => r.url().endsWith("/api/suggestions/sources") && r.method() === "PATCH");
@@ -114,11 +120,11 @@ test("dismissed items move to the dismissed list and can be restored", async ({ 
   await page.goto("/suggestions");
 
   await page.getByRole("button", { name: "Dismiss", exact: true }).click();
-  await expect(page.getByRole("heading", { name: item.title })).toHaveCount(0);
+  await expect(page.getByText(item.title, { exact: true })).toHaveCount(0);
   await page.getByRole("button", { name: "Dismissed (1)" }).click();
   await page.getByRole("button", { name: "Restore" }).click();
   await page.getByRole("button", { name: "Show active" }).click();
-  await expect(page.getByRole("heading", { name: item.title })).toBeVisible();
+  await expect(page.getByText(item.title, { exact: true })).toBeVisible();
 });
 
 test("a provider error stays visible next to the last items", async ({ page }) => {
@@ -134,5 +140,34 @@ test("a provider error stays visible next to the last items", async ({ page }) =
   await page.goto("/suggestions");
 
   await expect(page.getByRole("region", { name: "Provider GitHub" })).toContainText("Rate limit exceeded");
-  await expect(page.getByRole("heading", { name: item.title })).toBeVisible();
+  await expect(page.getByText(item.title, { exact: true })).toBeVisible();
+});
+
+test("read-only dashboard disables Start, hides Dismiss and says why", async ({ page }) => {
+  await mockTerminalApis(page);
+  await page.route("**/api/about", (route) =>
+    route.fulfill({ json: { read_only: true, auth_mode: "none", behind_tunnel: false, profile: "main" } }),
+  );
+  await page.route("**/api/sessions", (route) =>
+    route.fulfill({ headers: CURSOR, json: { sessions: [], workspace_ordering: [] } }),
+  );
+  await page.route("**/api/suggestions", (route) => route.fulfill({ json: { providers: [provider], items: [item] } }));
+  await page.goto("/suggestions");
+
+  const start = page.getByRole("button", { name: "Start" });
+  await expect(start).toBeDisabled();
+  await expect(start).toHaveAttribute("title", "Read-only: can't create Sessions");
+  await expect(page.getByRole("button", { name: "Dismiss" })).toHaveCount(0);
+  await expect(page.getByText("This dashboard is read-only. Start, Dismiss and Refresh are off.")).toBeVisible();
+});
+
+test("an empty list says there is nothing to suggest", async ({ page }) => {
+  await mockTerminalApis(page);
+  await page.route("**/api/sessions", (route) =>
+    route.fulfill({ headers: CURSOR, json: { sessions: [], workspace_ordering: [] } }),
+  );
+  await page.route("**/api/suggestions", (route) => route.fulfill({ json: { providers: [provider], items: [] } }));
+  await page.goto("/suggestions");
+
+  await expect(page.getByText("Nothing to suggest right now.")).toBeVisible();
 });

@@ -85,6 +85,8 @@ describe("SuggestionsView", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Start" }));
     await waitFor(() =>
       expect(onPrepare).toHaveBeenCalledWith({
+        source: { label: "GitHub", title: "Fix lifecycle", url: "https://example.test/issues/1" },
+        title: "Fix lifecycle",
         path: "/work/aoe",
         tool: "opencode",
         yoloMode: true,
@@ -95,17 +97,14 @@ describe("SuggestionsView", () => {
     expect(prepareSuggestion).toHaveBeenCalledWith("github", "issue-1");
   });
 
-  it("keeps the untrusted preview in its own labelled block", async () => {
+  it("renders one compact row: title, then Source, reason and Project, with no preview or chip", async () => {
     await open(snapshot());
-    const block = await screen.findByLabelText("Provider preview, untrusted");
-    expect(block.textContent).toContain("UNTRUSTED BODY");
-    expect(block.textContent).toContain("Provider text, untrusted");
-  });
-
-  it("only links http(s) source urls", async () => {
-    await open(snapshot({ items: [{ ...item, source_url: "javascript:alert(1)" }] }));
-    await screen.findByText("Fix lifecycle");
-    expect(screen.queryByRole("link")).toBeNull();
+    const row = (await screen.findByText("Fix lifecycle")).closest("li") as HTMLElement;
+    expect(row.textContent).not.toContain("UNTRUSTED BODY");
+    expect(row.querySelector("a")).toBeNull();
+    const meta = row.querySelector("p:nth-of-type(2)") as HTMLElement;
+    expect(meta.textContent).toBe("GitHub · Assigned to you · aoe");
+    expect(meta.firstElementChild?.className).toContain("font-mono");
   });
 
   it("source switch patches and reloads", async () => {
@@ -153,20 +152,23 @@ describe("SuggestionsView", () => {
       }),
     );
     expect(await screen.findByText(/token expired/)).toBeTruthy();
-    expect(screen.getByText("No suggestions yet")).toBeTruthy();
+    expect(screen.getByText("Nothing to suggest right now.")).toBeTruthy();
     cleanup();
 
     await open(null);
     expect((await screen.findByRole("alert")).textContent).toContain("Could not load");
   });
 
-  it("disables every mutation when read-only", async () => {
+  it("read-only disables Start and Refresh, drops Dismiss and explains why", async () => {
     await open(snapshot(), { readOnly: true });
     await screen.findByText("Fix lifecycle");
-    for (const name of ["Start", "Dismiss", "Refresh"]) {
-      expect((screen.getByRole("button", { name }) as HTMLButtonElement).disabled).toBe(true);
-    }
+    const start = screen.getByRole("button", { name: "Start" }) as HTMLButtonElement;
+    expect(start.disabled).toBe(true);
+    expect(start.title).toBe("Read-only: can't create Sessions");
+    expect((screen.getByRole("button", { name: "Refresh" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.queryByRole("button", { name: "Dismiss" })).toBeNull();
     expect((screen.getByLabelText("GitHub: Failing checks") as HTMLInputElement).disabled).toBe(true);
+    expect(screen.getByText("This dashboard is read-only. Start, Dismiss and Refresh are off.")).toBeTruthy();
   });
 
   it("disables every mutation while offline", async () => {
@@ -177,6 +179,9 @@ describe("SuggestionsView", () => {
       expect((screen.getByRole("button", { name }) as HTMLButtonElement).disabled).toBe(true);
     }
     expect((screen.getByLabelText("GitHub: Failing checks") as HTMLInputElement).disabled).toBe(true);
+    expect(
+      screen.getByText("Disconnected. Suggestions show from the last fetch; reconnect to start one."),
+    ).toBeTruthy();
   });
 
   it("restoring the last dismissed item keeps the way back to the active list", async () => {

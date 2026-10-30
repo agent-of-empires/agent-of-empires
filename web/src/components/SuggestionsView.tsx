@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ArrowUpRight, RefreshCw, Sparkles } from "lucide-react";
+import { RefreshCw, Undo2, X } from "lucide-react";
 import {
   dismissSuggestion,
   fetchSuggestions,
@@ -18,12 +18,13 @@ interface Props {
 }
 
 const STALE_NOTICE = "That suggestion changed. Refreshing the list.";
-const isHttpUrl = (url: string) => /^https?:\/\//i.test(url);
 
 // `p.worktree` is dropped on purpose: the wizard resolves worktree itself, and
 // `WizardPrefill.worktreeEnabled` means a registered-project override.
-function toWizardPrefill(p: SuggestionPrepared): WizardPrefill {
+function toWizardPrefill(p: SuggestionPrepared, source: NonNullable<WizardPrefill["source"]>): WizardPrefill {
   return {
+    source,
+    title: p.title || undefined,
     path: p.project?.path,
     tool: p.tool,
     yoloMode: p.yolo,
@@ -59,15 +60,15 @@ export function SuggestionsView({ readOnly = false, onPrepare }: Props) {
 
   useEffect(() => {
     mounted.current = true;
-    const seq = ++loadSeq.current;
-    void fetchSuggestions().then((data) => apply(data, seq));
+    void load();
     return () => {
       mounted.current = false;
     };
-  }, [apply]);
+  }, [load]);
 
   const disabled = readOnly || offline;
-  const unavailableTitle = readOnly ? "Read-only server" : offline ? OFFLINE_TITLE : undefined;
+  const startTitle = readOnly ? "Read-only: can't create Sessions" : offline ? OFFLINE_TITLE : undefined;
+  const unavailableTitle = readOnly ? "Read-only dashboard" : offline ? OFFLINE_TITLE : undefined;
 
   // Runs a mutation, then reloads; a stale item gets a notice instead of a raw error.
   const act = async (key: string, run: () => Promise<SuggestionResult<unknown>>) => {
@@ -90,7 +91,7 @@ export function SuggestionsView({ readOnly = false, onPrepare }: Props) {
     if (mounted.current) setRefreshing(false);
   };
 
-  const start = async (item: SuggestionItem) => {
+  const start = async (item: SuggestionItem, providerName: string) => {
     const key = `${item.provider_id}:${item.id}`;
     setBusy(key);
     setNotice(null);
@@ -98,7 +99,7 @@ export function SuggestionsView({ readOnly = false, onPrepare }: Props) {
     if (!mounted.current) return;
     if (result.ok) {
       setBusy(null);
-      onPrepare(toWizardPrefill(result.data));
+      onPrepare(toWizardPrefill(result.data, { label: providerName, title: item.title, url: item.source_url }));
       return;
     }
     setNotice(result.stale ? STALE_NOTICE : result.error);
@@ -200,87 +201,81 @@ export function SuggestionsView({ readOnly = false, onPrepare }: Props) {
             Loading suggestions…
           </p>
         )}
-        {!loading && snapshot && visible.length === 0 && (
-          <div className="mt-6 rounded-lg border border-dashed border-surface-700 p-8 text-center">
-            <Sparkles className="mx-auto h-5 w-5 text-text-dim" />
-            <h2 className="mt-3 text-sm font-medium">
-              {showDismissed ? "No dismissed suggestions" : "No suggestions yet"}
-            </h2>
-            <p className="mt-1 text-sm text-text-dim">
-              {snapshot.providers.length === 0
-                ? "No plugin provides suggestions."
-                : "Refresh to check the enabled sources."}
-            </p>
-          </div>
-        )}
-
-        <ul className="mt-4 space-y-3">
-          {visible.map((item) => {
-            const key = `${item.provider_id}:${item.id}`;
-            const providerName = snapshot?.providers.find((p) => p.id === item.provider_id)?.name ?? item.provider_id;
-            return (
-              <li key={key} className="rounded-lg border border-surface-700/60 bg-surface-800/40 p-4">
-                <div className="flex flex-wrap items-start justify-between gap-3">
+        {snapshot && (
+          <ul className="mt-4 overflow-hidden rounded-lg border border-surface-700/40 bg-surface-900">
+            {visible.map((item) => {
+              const key = `${item.provider_id}:${item.id}`;
+              const providerName = snapshot.providers.find((p) => p.id === item.provider_id)?.name ?? item.provider_id;
+              return (
+                <li
+                  key={key}
+                  className="flex items-center gap-3 border-t border-surface-700/40 px-3 py-2.5 first:border-t-0"
+                >
                   <div className="min-w-0 flex-1">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <h3 className="text-sm font-semibold">{item.title}</h3>
-                      <span className="rounded bg-surface-700/60 px-2 py-0.5 text-[11px] text-text-dim">
-                        {providerName}
-                      </span>
-                    </div>
-                    <p className="mt-1 text-sm text-text-secondary">{item.reason}</p>
-                    {isHttpUrl(item.source_url) && (
-                      <a
-                        href={item.source_url}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="mt-2 inline-flex items-center gap-1 text-xs text-brand-500 hover:underline"
-                      >
-                        {item.source_ref} <ArrowUpRight className="h-3 w-3" />
-                        <span className="sr-only"> (opens in new tab)</span>
-                      </a>
-                    )}
-                    {item.preview && (
-                      <figure
-                        aria-label="Provider preview, untrusted"
-                        className="mt-3 rounded-md border border-dashed border-status-warning/50 bg-surface-900/60 p-3"
-                      >
-                        <figcaption className="text-[11px] uppercase tracking-wide text-status-warning">
-                          Provider text, untrusted
-                        </figcaption>
-                        <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap text-xs text-text-dim">
-                          {item.preview}
-                        </pre>
-                      </figure>
-                    )}
+                    <p className="truncate text-sm text-text-primary">{item.title}</p>
+                    <p className="mt-0.5 truncate text-xs text-text-muted">
+                      <span className="font-mono font-medium text-text-secondary">{providerName}</span>
+                      {" · "}
+                      {item.reason}
+                      {item.project && (
+                        <>
+                          {" · "}
+                          <span className="font-mono font-medium text-text-secondary">{item.project}</span>
+                        </>
+                      )}
+                    </p>
                   </div>
-                  <div className="flex w-full flex-wrap gap-2 sm:w-auto sm:justify-end">
+                  <div className="flex flex-none gap-1">
                     {!item.dismissed && (
                       <button
                         type="button"
-                        onClick={() => void start(item)}
+                        onClick={() => void start(item, providerName)}
                         disabled={busy !== null || disabled}
-                        title={unavailableTitle}
-                        className="min-h-10 rounded-md bg-brand-600 px-3 text-sm font-medium text-white hover:bg-brand-500 disabled:opacity-50"
+                        title={startTitle}
+                        className="inline-flex h-8 items-center rounded-md border border-surface-700 bg-surface-800 px-3 text-xs font-medium text-text-primary hover:bg-surface-700/50 disabled:opacity-50"
                       >
                         Start
                       </button>
                     )}
-                    <button
-                      type="button"
-                      onClick={() => void act(key, () => dismissSuggestion(item.provider_id, item.id, !item.dismissed))}
-                      disabled={busy !== null || disabled}
-                      title={unavailableTitle}
-                      className="min-h-10 rounded-md border border-surface-700 px-3 text-sm text-text-secondary hover:bg-surface-700/50 disabled:opacity-50"
-                    >
-                      {item.dismissed ? "Restore" : "Dismiss"}
-                    </button>
+                    {!readOnly && (
+                      <button
+                        type="button"
+                        aria-label={item.dismissed ? "Restore" : "Dismiss"}
+                        title={item.dismissed ? "Restore" : "Dismiss"}
+                        onClick={() =>
+                          void act(key, () => dismissSuggestion(item.provider_id, item.id, !item.dismissed))
+                        }
+                        disabled={busy !== null || disabled}
+                        className="inline-flex h-8 w-8 items-center justify-center rounded-md text-text-secondary hover:bg-surface-700/50 disabled:opacity-50"
+                      >
+                        {item.dismissed ? <Undo2 className="h-4 w-4" /> : <X className="h-4 w-4" />}
+                      </button>
+                    )}
                   </div>
-                </div>
+                </li>
+              );
+            })}
+            {visible.length === 0 && (
+              <li className="border-t border-surface-700/40 px-3 py-2 text-xs text-text-dim first:border-t-0">
+                {showDismissed
+                  ? "No dismissed suggestions."
+                  : snapshot.providers.length === 0
+                    ? "No plugin provides suggestions."
+                    : "Nothing to suggest right now."}
               </li>
-            );
-          })}
-        </ul>
+            )}
+            {readOnly && (
+              <li className="border-t border-surface-700/40 px-3 py-2 text-xs text-text-dim">
+                This dashboard is read-only. Start, Dismiss and Refresh are off.
+              </li>
+            )}
+            {offline && (
+              <li className="border-t border-surface-700/40 px-3 py-2 text-xs text-text-dim">
+                Disconnected. Suggestions show from the last fetch; reconnect to start one.
+              </li>
+            )}
+          </ul>
+        )}
       </div>
     </main>
   );
