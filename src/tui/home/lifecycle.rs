@@ -139,6 +139,7 @@ impl HomeView {
             unified_delete_dialog: None,
             group_delete_options_dialog: None,
             rename_dialog: None,
+            session_dialog_target: None,
             worktree_name_dialog: None,
             restart_dialog: None,
             context_menu: None,

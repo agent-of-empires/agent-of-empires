@@ -160,6 +160,10 @@ Scroll with the mouse wheel, or press **Enter** to focus the reader and use
 **Esc** returns to the session list. Restore and permanent deletion remain
 separate management actions shown in the footer.
 
+Rename and workdir dialogs, plus quick permission replies, close if their session
+changes lifecycle or disappears. A pending dialog cannot retarget another session
+when the list updates.
+
 The reader uses the daemon's persisted ACP events, including events retained
 before a switch to terminal view. Retention gaps are marked explicitly. It does
 not import native agent history files: those files may remain in the agent's

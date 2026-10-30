@@ -449,20 +449,84 @@ impl HomeView {
             })
     }
 
+    fn selected_dialog_target(&self) -> Option<super::SessionDialogTarget> {
+        let instance = self.get_instance(self.selected_session.as_deref()?)?;
+        Some(super::SessionDialogTarget {
+            session_id: instance.id.clone(),
+            source_profile: instance.source_profile.clone(),
+            lifecycle_generation: instance.lifecycle_generation,
+        })
+    }
+
+    fn reconcile_session_dialog(&mut self) {
+        let Some(target) = self.session_dialog_target.as_ref() else {
+            return;
+        };
+        let session_rename = self
+            .rename_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.mode() == RenameMode::Session);
+        if !session_rename
+            && self.worktree_name_dialog.is_none()
+            && self.restart_dialog.is_none()
+            && self.tool_picker_dialog.is_none()
+            && self.permission_response_dialog.is_none()
+        {
+            self.session_dialog_target = None;
+            return;
+        }
+        let valid = self.selected_session.as_deref() == Some(target.session_id.as_str())
+            && self
+                .get_instance(&target.session_id)
+                .is_some_and(|instance| {
+                    instance.source_profile == target.source_profile
+                        && instance.lifecycle_generation == target.lifecycle_generation
+                        && !instance.is_trashed()
+                        && (self.permission_response_dialog.is_none() || !instance.is_archived())
+                });
+        if valid {
+            return;
+        }
+        if session_rename {
+            self.rename_dialog = None;
+        }
+        self.worktree_name_dialog = None;
+        self.restart_dialog = None;
+        self.tool_picker_dialog = None;
+        self.permission_response_dialog = None;
+        self.pending_permission_response = None;
+        self.session_dialog_target = None;
+        self.info_dialog = Some(InfoDialog::new(
+            "Session Changed",
+            "The session changed or is no longer selected. The pending edit or response was cancelled.",
+        ));
+    }
+
     pub(in crate::tui) fn enforce_trash_read_only(&mut self) {
+        self.reconcile_session_dialog();
         if !self.selected_is_trashed() {
             return;
         }
         self.exit_live_send_if_active();
         self.cancel_native_attachment();
+        if self.preview_capture_target.is_some() {
+            self.sync_preview_capture_worker(None);
+        }
+        self.mouse_forward_btn = None;
+        self.hover_forward_cell = None;
         self.send_message_dialog = None;
         self.pending_send_session = None;
         self.permission_response_dialog = None;
         self.pending_permission_response = None;
         self.restart_dialog = None;
         self.tool_picker_dialog = None;
-        self.rename_dialog = None;
-        self.group_rename_context = None;
+        if self
+            .rename_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.mode() == RenameMode::Session)
+        {
+            self.rename_dialog = None;
+        }
         self.worktree_name_dialog = None;
         self.attach_project_dialog = None;
         self.snooze_duration_dialog = None;
@@ -543,6 +607,7 @@ impl HomeView {
     }
 
     fn open_tool_picker(&mut self) {
+        self.session_dialog_target = self.selected_dialog_target();
         let observed = self
             .selected_session
             .as_ref()
@@ -4769,12 +4834,25 @@ impl HomeView {
         self.send_to_preview_pane(key)
     }
 
-    /// Send a forwarded key or mouse-byte payload to the pane the preview shows
-    /// (`preview_capture_target`), which is what the cursor and mapped coordinates
-    /// describe. Routed through the ordered live-send worker only when that pane is also
-    /// the live-send target, so it stays in sequence with typed keystrokes; otherwise a
-    /// one-shot send is forked. True when something was dispatched.
+    fn preview_accepts_input(&self) -> bool {
+        self.session_feed.native_interaction_available()
+            && self
+                .selected_session
+                .as_deref()
+                .and_then(|id| self.get_instance(id))
+                .is_some_and(|instance| {
+                    !instance.is_trashed()
+                        && self.active_preview_cache().session_id.as_deref()
+                            == Some(instance.id.as_str())
+                        && self.active_preview_cursor().is_some()
+                })
+    }
+
+    /// Keep forwarded input on the current preview owner's pane.
     fn send_to_preview_pane(&self, key: live_send::TmuxKey) -> bool {
+        if !self.preview_accepts_input() {
+            return false;
+        }
         let Some(target) = self.preview_capture_target.as_deref() else {
             return false;
         };
@@ -4784,8 +4862,10 @@ impl HomeView {
                 return true;
             }
         }
-        live_send::send_key_oneshot(target, key);
-        true
+        let Some(lease) = self.session_feed.native_input_lease() else {
+            return false;
+        };
+        live_send::send_key_oneshot(target, key, lease)
     }
 
     /// The previewed agent's cursor when a mouse button event over the preview should go
@@ -4818,6 +4898,10 @@ impl HomeView {
         row: u16,
     ) -> bool {
         use crossterm::event::{MouseButton, MouseEventKind};
+        if !self.preview_accepts_input() {
+            self.mouse_forward_btn = None;
+            return false;
+        }
         let base = |b: MouseButton| match b {
             MouseButton::Left => 0u16,
             MouseButton::Middle => 1,
@@ -4860,7 +4944,6 @@ impl HomeView {
             self.mouse_forward_btn = None;
             return false;
         }
-        self.mouse_forward_btn = if release { None } else { Some(base_button) };
         let bytes = mouse_event_bytes(
             base_button,
             release,
@@ -4868,7 +4951,12 @@ impl HomeView {
             cursor.mouse_sgr,
             mouse_pane(&cursor, self.preview_text_view).cell(col, row),
         );
-        self.send_to_preview_pane(live_send::TmuxKey::HexBytes(bytes))
+        if !self.send_to_preview_pane(live_send::TmuxKey::HexBytes(bytes)) {
+            self.mouse_forward_btn = None;
+            return false;
+        }
+        self.mouse_forward_btn = if release { None } else { Some(base_button) };
+        true
     }
 
     /// Forward a bare mouse-motion event to a previewed agent in any-event tracking (DEC
@@ -4878,9 +4966,10 @@ impl HomeView {
     /// terminal delivers. Unlike `forward_mouse_to_preview` it never consumes the event,
     /// so aoe's own hover handling still runs. True when a report was sent.
     pub fn forward_hover_to_preview(&mut self, col: u16, row: u16) -> bool {
-        if self.has_non_live_send_overlay() || !self.hit_preview(col, row) {
-            // Off-preview (or covered by a modal): drop the dedup cell so
-            // re-entering the preview on the same cell reports again.
+        if !self.preview_accepts_input()
+            || self.has_non_live_send_overlay()
+            || !self.hit_preview(col, row)
+        {
             self.hover_forward_cell = None;
             return false;
         }
@@ -4895,8 +4984,12 @@ impl HomeView {
         if self.hover_forward_cell == Some(cell) {
             return false;
         }
+        if !self.send_to_preview_pane(live_send::TmuxKey::HexBytes(bytes)) {
+            self.hover_forward_cell = None;
+            return false;
+        }
         self.hover_forward_cell = Some(cell);
-        self.send_to_preview_pane(live_send::TmuxKey::HexBytes(bytes))
+        true
     }
 
     pub fn handle_scroll_up(&mut self, col: u16, row: u16) -> bool {
@@ -5639,6 +5732,8 @@ impl HomeView {
                     dialog = dialog.with_worktree_branch(&branch, upstream);
                 }
             }
+            self.session_dialog_target = self.selected_dialog_target();
+            self.group_rename_context = None;
             self.rename_dialog = Some(dialog);
         } else if let Some(group_path) = &self.selected_group {
             if let Some((title, hint)) = self.automatic_group_hint() {
@@ -5722,6 +5817,7 @@ impl HomeView {
             .and_then(|s| s.to_str())
             .unwrap_or(&project_path)
             .to_string();
+        self.session_dialog_target = self.selected_dialog_target();
         self.worktree_name_dialog = Some(WorktreeNameDialog::new(&current_dir, &wt.branch));
     }
 
@@ -6413,6 +6509,7 @@ impl HomeView {
         let profiles =
             list_profiles_for_display().unwrap_or_else(|_| vec![current_profile.clone()]);
         let tools: Vec<String> = self.available_tools.available_list().to_vec();
+        self.session_dialog_target = self.selected_dialog_target();
         self.restart_dialog = Some(RestartDialog::new(
             &current_title,
             &current_profile,
@@ -6898,6 +6995,7 @@ impl HomeView {
                 ));
                 return;
             }
+            self.session_dialog_target = self.selected_dialog_target();
             self.permission_response_dialog =
                 Some(crate::tui::dialogs::PermissionResponseDialog::structured(
                     &title,
@@ -6919,6 +7017,7 @@ impl HomeView {
             ));
             return;
         };
+        self.session_dialog_target = self.selected_dialog_target();
         self.pending_permission_response = Some(PermissionResponseTarget::Terminal(id));
         self.permission_response_dialog = Some(crate::tui::dialogs::PermissionResponseDialog::new(
             &title,

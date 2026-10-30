@@ -2495,6 +2495,7 @@ impl HomeView {
             // New pane under the pointer: drop the hover dedup cell so a
             // stationary pointer still reports its cell to the new agent.
             self.hover_forward_cell = None;
+            self.mouse_forward_btn = None;
         }
         // Fast cadence only when the displayed pane is the live-send target; a preview
         // of some other pane stays on the idle interval instead of forking every 25ms.

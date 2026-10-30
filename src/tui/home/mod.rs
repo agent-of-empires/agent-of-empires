@@ -85,6 +85,12 @@ pub(super) struct GroupRenameContext {
     pub(super) old_profile: String,
 }
 
+pub(super) struct SessionDialogTarget {
+    session_id: String,
+    source_profile: String,
+    lifecycle_generation: u64,
+}
+
 pub(super) enum PermissionResponseTarget {
     Terminal(String),
     Structured { session_id: String, nonce: String },
@@ -255,6 +261,7 @@ pub struct HomeView {
     pub(super) restart_dialog: Option<RestartDialog>,
     pub(super) context_menu: Option<ContextMenuDialog>,
     pub(super) group_rename_context: Option<GroupRenameContext>,
+    pub(super) session_dialog_target: Option<SessionDialogTarget>,
     pub(super) repo_trust_dialog: Option<RepoTrustDialog>,
     pub(super) pending_repo_trust_data: Option<NewSessionData>,
     /// Canonical daemon-reviewed configuration fingerprint for the pending

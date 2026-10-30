@@ -821,6 +821,18 @@ impl SessionFeed {
                 .is_some_and(|commands| !commands.is_closed())
     }
 
+    pub(crate) fn native_input_lease(&self) -> Option<NativeLease> {
+        let generation = self.native_grant.load(Ordering::SeqCst);
+        if generation & 1 == 0 || !self.native_interaction_available() {
+            return None;
+        }
+        Some(NativeLease {
+            grant: self.native_grant.clone(),
+            generation,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
     pub(crate) fn can_submit(&self, id: &str) -> bool {
         self.mutations_available()
             && !self.namespace_blocked()

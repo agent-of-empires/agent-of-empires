@@ -153,6 +153,90 @@ fn snapshot_of(sessions: Vec<crate::daemon::SessionResponse>) -> SessionFeedResu
 
 #[test]
 #[serial]
+fn session_dialogs_follow_their_original_identity_across_snapshots() {
+    use crate::tui::home::bindings::{self, ActionId};
+    for action in [
+        ActionId::Rename,
+        ActionId::SetWorktreeName,
+        ActionId::RespondToPermission,
+    ] {
+        let permission = action == ActionId::RespondToPermission;
+        for change in ["trash", "purge", "generation", "status"] {
+            let mut env = create_test_env_with_sessions(2);
+            for instance in env.view.cloned_instances() {
+                env.view.mutate_instance(&instance.id, |row| {
+                    row.view = crate::session::View::Terminal;
+                    row.tool = "claude".into();
+                    row.worktree_info = Some(crate::session::WorktreeInfo {
+                        branch: "fixture".into(),
+                        main_repo_path: "/tmp".into(),
+                        managed_by_aoe: true,
+                        created_at: chrono::Utc::now(),
+                        base_branch: None,
+                    });
+                });
+            }
+            env.view.cursor = 1;
+            env.view.update_selected();
+            let id = env.view.selected_session.clone().unwrap();
+            env.view
+                .session_feed
+                .publish_for_test(daemon_snapshot(&env.view, &id, "Stopped"));
+            env.view.apply_session_feed();
+            env.view
+                .handle_key(bindings::key_event(action, false).unwrap(), None);
+            assert_eq!(env.view.permission_response_dialog.is_some(), permission);
+            assert_eq!(
+                env.view.rename_dialog.is_some() || env.view.worktree_name_dialog.is_some(),
+                !permission,
+            );
+
+            let SessionFeedResult::Snapshot(mut snapshot) = daemon_snapshot(&env.view, &id, "Idle")
+            else {
+                unreachable!()
+            };
+            let next = Arc::make_mut(&mut snapshot);
+            match change {
+                "trash" => {
+                    next.contents.sessions[0].trashed_at = Some(chrono::Utc::now().to_rfc3339());
+                    next.contents.sessions[0].lifecycle_generation += 1;
+                }
+                "purge" => next.contents.sessions.retain(|row| row.id != id),
+                "generation" => next.contents.sessions[0].lifecycle_generation += 1,
+                "status" => {}
+                _ => unreachable!(),
+            }
+            env.view
+                .session_feed
+                .publish_for_test(SessionFeedResult::Snapshot(snapshot));
+            env.view.apply_session_feed();
+            env.view.enforce_trash_read_only();
+            let retained = change == "status";
+            assert_eq!(
+                env.view.permission_response_dialog.is_some(),
+                permission && retained,
+                "action={action:?}, change={change}",
+            );
+            assert_eq!(
+                env.view.rename_dialog.is_some() || env.view.worktree_name_dialog.is_some(),
+                !permission && retained,
+                "action={action:?}, change={change}",
+            );
+            if !retained {
+                assert!(env.view.pending_permission_response.is_none());
+                assert!(
+                    env.view
+                        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), None)
+                        .is_none(),
+                    "a stale dialog submit must not activate the replacement selection",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[serial]
 fn native_attachment_never_survives_a_cancelled_context() {
     use crate::daemon::{MutationReceipt, RuntimeCursor, TerminalTarget, TerminalTargetStatus};
     use crate::session::{AuxiliaryObservation, AuxiliaryTarget, PanePresence};
