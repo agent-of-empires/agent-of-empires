@@ -114,7 +114,7 @@ impl RetainedView {
                     "Retained ACP transcript · scroll to read · drag to copy".into()
                 };
                 if let Some(state) = self.state.as_mut() {
-                    state.transcript.merge_server_rows(rows);
+                    state.transcript.server_rows = rows;
                 }
             }
             Err(error) => self.message = format!("Transcript read failed: {error}"),
