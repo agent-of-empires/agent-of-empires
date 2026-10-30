@@ -1649,6 +1649,20 @@ describe("header-complete operations", () => {
   });
 });
 
+describe("restartSession", () => {
+  it("POSTs and reports success, the server message on a refusal, and nothing when offline", async () => {
+    fetchSpy.mockResolvedValueOnce(empty());
+    expect(await api.restartSession("s 1")).toEqual({ ok: true });
+    expect(lastCall()).toMatchObject({ url: "/api/sessions/s%201/restart", init: { method: "POST" } });
+
+    fetchSpy.mockResolvedValueOnce(json({ error: "start_failed", message: "Structured restart failed" }, 500));
+    expect(await api.restartSession("s1")).toEqual({ ok: false, message: "Structured restart failed" });
+
+    offline();
+    expect(await api.restartSession("s1")).toEqual({ ok: false });
+  });
+});
+
 describe("restartSessionForUpdate", () => {
   it("POSTs and reports success, the server message on a 409, and nothing when offline", async () => {
     fetchSpy.mockResolvedValueOnce(empty());

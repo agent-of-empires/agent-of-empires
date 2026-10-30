@@ -56,7 +56,7 @@ import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
 import { useMobileViewportLock } from "./hooks/useMobileViewportLock";
 import { useIsWideViewport } from "./hooks/useIsWideViewport";
 import type { RightPanelView } from "./lib/rightPanelView";
-import { usePaneLayout, dockTabs, dockGroups, dockOf, isActiveTab, isDockCollapsed } from "./lib/paneLayout";
+import { usePaneLayout, dockTabs, dockGroups, dockOf, isDockCollapsed } from "./lib/paneLayout";
 import { isPluginPaneId, resolvePaneIcon, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
 import { PluginPaneBody } from "./components/plugin/PluginPane";
 import { PluginPageView } from "./components/plugin/PluginPageView";
@@ -152,6 +152,8 @@ import { DiffPane } from "./components/DiffPane";
 import { FilesPane } from "./components/FilesPane";
 import { FileContentViewer } from "./components/diff/FileContentViewer";
 import { PairedShellPane } from "./components/PairedTerminal";
+import { usePairedShellModes } from "./hooks/usePairedShellModes";
+import { useOpenPairedTerminal, usePairedTerminalReveal } from "./hooks/usePairedTerminalReveal";
 import { BUILTIN_PANES, isTerminalTabId, terminalIndexOf, terminalTabId, type DockLocation } from "./lib/panes";
 import { MobileRightPanelPicker } from "./components/MobileRightPanelPicker";
 import { MobileMainPane } from "./components/MobileMainPane";
@@ -806,6 +808,7 @@ function AppContent({
   // switches. Mounting it eagerly would spawn a shell for every mobile
   // session the user never opens the shell on.
   const [pairedMounted, setPairedMounted] = useState(false);
+  const { modeFor: shellModeFor, setMode: setShellMode } = usePairedShellModes();
   const [showSessionWizard, setShowSessionWizard] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const tipsAutoPoppedRef = useRef(false);
@@ -1375,6 +1378,8 @@ function AppContent({
   // The startup error banner's way out, where the server allows the switch. Each
   // mounted Structured view switches its own Session.
   const canSwitchToTerminal = !serverAbout?.read_only && caps.canUseTerminal;
+  // The server refuses a restart on a read-only or CityHall server.
+  const canRestartAgent = !serverAbout?.read_only && !caps.cityhall;
 
   const handleConfirmSwitchView = useCallback(async () => {
     if (!switchViewTarget) return;
@@ -1706,6 +1711,27 @@ function AppContent({
     setShowSessionWizard(true);
   }, []);
 
+  const showPairedTerminal = usePairedTerminalReveal({
+    singlePane,
+    layout: paneLayout,
+    openTab,
+    activateTab,
+    setRightPanelView,
+  });
+
+  // PairedTerminal shows Host whatever the stored mode while the Session isn't sandboxed.
+  const shownShellMode = useCallback(
+    (sessionId: string, terminalIndex: number) =>
+      activeSession?.is_sandboxed ? shellModeFor(sessionId, terminalIndex) : "host",
+    [activeSession?.is_sandboxed, shellModeFor],
+  );
+  const handleOpenPairedTerminal = useOpenPairedTerminal(
+    activeSessionId,
+    showPairedTerminal,
+    shownShellMode,
+    setShellMode,
+  );
+
   const handleToggleTerminalFocus = useCallback(() => {
     if (!activeSessionId) return;
     // Probe by data-term attribute rather than a component ref: it is
@@ -1728,40 +1754,13 @@ function AppContent({
     }
     const target = inPaired ? "agent" : "paired";
 
-    if (singlePane) {
-      // Below md there is one full-viewport pane. Promote the target view,
-      // then dispatch focus on the next frame: the inactive layer is inert
-      // until React commits the switch, and focus() on an inert subtree is
-      // a no-op. The paired shell mounts lazily on first activation, so its
-      // PTY may not be ready when the dispatch fires; latch the intent too,
-      // and PairedTerminal grabs focus once ready.
-      setRightPanelView(target);
-      if (target === "paired") setPendingTerminalFocus("paired");
-      requestAnimationFrame(() => dispatchFocusTerminal(target));
+    if (target === "paired") {
+      showPairedTerminal();
       return;
     }
-
-    if (target === "paired") {
-      // The paired shell only mounts when a terminal tab is the active tab of
-      // its group. Prefer a terminal that is already active (and thus mounted)
-      // over the first one, so multi-group layouts focus the live terminal
-      // instead of switching another group's tab.
-      const terminalTabs = (["right", "bottom"] as DockLocation[])
-        .flatMap((d) => dockTabs(paneLayout, d))
-        .filter(isTerminalTabId);
-      const termTab = terminalTabs.find((id) => isActiveTab(paneLayout, id)) ?? terminalTabs[0] ?? terminalTabId(0);
-      const termDock = dockOf(paneLayout, termTab);
-      if (termDock && isActiveTab(paneLayout, termTab)) {
-        // Already the active tab (mounted): move focus synchronously so rapid
-        // agent<->paired toggles stay deterministic.
-        dispatchFocusTerminal("paired");
-        return;
-      }
-      // Not mounted yet: latch the intent and activate/open its tab; the paired
-      // panel grabs focus once its PTY is ready.
-      setPendingTerminalFocus("paired");
-      if (termDock) activateTab(termDock, termTab);
-      else openTab(termTab, "right");
+    if (singlePane) {
+      setRightPanelView("agent");
+      requestAnimationFrame(() => dispatchFocusTerminal("agent"));
       return;
     }
     if (target === "agent" && selectedFilePath) {
@@ -1773,7 +1772,7 @@ function AppContent({
       return;
     }
     dispatchFocusTerminal(target);
-  }, [activeSessionId, singlePane, paneLayout, openTab, activateTab, selectedFilePath]);
+  }, [activeSessionId, singlePane, selectedFilePath, showPairedTerminal]);
 
   // Flattened, display-ordered session ids plus the subset needing attention,
   // sourced from the same sidebar model the user sees so jump-to-next follows
@@ -1969,12 +1968,15 @@ function AppContent({
           />
         );
       }
+      const terminalIndex = isTerminalTabId(id) ? terminalIndexOf(id) : 0;
       return (
         <PairedShellPane
           readOnly={!!serverAbout?.read_only}
           session={activeSession ?? null}
           sessionId={activeSessionId}
-          terminalIndex={isTerminalTabId(id) ? terminalIndexOf(id) : 0}
+          terminalIndex={terminalIndex}
+          mode={shellModeFor(activeSessionId, terminalIndex)}
+          onModeChange={(mode) => activeSessionId && setShellMode(activeSessionId, terminalIndex, mode)}
         />
       );
     };
@@ -2023,6 +2025,10 @@ function AppContent({
                             onSwitchToTerminal={
                               canSwitchToTerminal ? () => handleSwitchView(session.id, false) : undefined
                             }
+                            onOpenTerminal={
+                              canSwitchToTerminal ? (mode) => handleOpenPairedTerminal(session.id, mode) : undefined
+                            }
+                            canRestartAgent={canRestartAgent}
                           />
                         </Suspense>
                       )}
@@ -2238,6 +2244,10 @@ function AppContent({
           onBackToAgent={() => handlePickView("agent")}
           onOpenAgentsPane={() => handlePickView("agents")}
           onSwitchToTerminal={canSwitchToTerminal ? (id) => handleSwitchView(id, false) : undefined}
+          onOpenTerminal={canSwitchToTerminal ? handleOpenPairedTerminal : undefined}
+          canRestartAgent={canRestartAgent}
+          shellMode={shellModeFor(activeSessionId, 0)}
+          onShellModeChange={(mode) => activeSessionId && setShellMode(activeSessionId, 0, mode)}
           pairedMounted={pairedMounted}
           activeSession={activeSession ?? null}
           activeSessionId={activeSessionId}

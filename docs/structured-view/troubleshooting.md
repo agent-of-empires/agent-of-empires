@@ -10,7 +10,7 @@ Install Node.js 22 or newer (`brew install node`, `apt install nodejs`, `nvm ins
 
 ### An adapter is missing or too old
 
-aoe refuses to start a session whose adapter is below the version floor and reports the exact requirement. Install the official adapter (`npm install -g @agentclientprotocol/claude-agent-acp@latest`), then `claude login` if you have not.
+aoe refuses to start a session whose adapter is below the version floor and reports the exact requirement. Install the official adapter (`npm install -g @agentclientprotocol/claude-agent-acp@latest`), then `claude auth login` if you have not.
 
 `aoe-agent` ships inside the `aoe` binary and installs into the data dir on demand: `aoe acp doctor --fix --adapter aoe-agent`. It needs Node 22.6+. An `aoe` upgrade that changes its bundled sources makes an installed copy stale, and sessions refuse it until `doctor --fix` reinstalls it.
 

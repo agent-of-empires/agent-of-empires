@@ -11,7 +11,7 @@ use crate::agents::registry_lifecycle;
 #[derive(Subcommand)]
 pub enum AcpCommands {
     /// Verify the structured view can start: Node runtime, configured agents,
-    /// provider auth (claude login).
+    /// provider auth (claude auth login).
     Doctor {
         /// Emit machine-readable JSON instead of a human report.
         #[arg(long)]

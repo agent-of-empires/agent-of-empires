@@ -2591,6 +2591,15 @@ export async function recreateSessionContainer(id: string): Promise<{ ok: boolea
   return okWithMessage(`/api/sessions/${encodeURIComponent(id)}/recreate-container`, { method: "POST" });
 }
 
+/** Restarts a session's Agent, replacing a running structured worker; the conversation resumes. */
+export async function restartSession(id: string): Promise<{ ok: boolean; message?: string }> {
+  try {
+    return await okWithMessage(`/api/sessions/${encodeURIComponent(id)}/restart`, { method: "POST" });
+  } catch {
+    return { ok: false };
+  }
+}
+
 /** The server re-checks eligibility; a 409 means the session got busy or is no longer out of date. */
 export async function restartSessionForUpdate(id: string): Promise<{ ok: boolean; message?: string }> {
   try {

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 
 import type { AgentInstallInfo } from "../../../lib/api";
 import { StartupErrorBanner } from "../StartupErrorBanner";
@@ -243,20 +243,34 @@ describe("StartupErrorBanner auth remediation", () => {
     {
       agent: "claude",
       info: claude(),
-      present: ["claude /login", "ANTHROPIC_API_KEY"],
-      absent: ["codex login"],
+      present: [
+        "claude auth login",
+        "host terminal",
+        "Or set ANTHROPIC_API_KEY in the environment that runs aoe serve, restart aoe serve, then click Retry.",
+      ],
+      absent: ["codex login", "claude /login", "[sandbox] environment"],
     },
     {
       agent: "codex",
       info: claude({ agent: "codex", display_name: "Codex" }),
       present: ["codex login", "OPENAI_API_KEY"],
-      absent: ["claude /login", "ANTHROPIC_API_KEY"],
+      absent: ["claude auth login", "ANTHROPIC_API_KEY", "--device-auth"],
+    },
+    {
+      agent: "codex",
+      info: claude({ agent: "codex", display_name: "Codex", sandboxed: true }),
+      present: [
+        "codex login --device-auth",
+        "Container terminal",
+        "Or set OPENAI_API_KEY in the environment that runs aoe serve, restart aoe serve, then click Retry.",
+      ],
+      absent: ["host terminal", "[sandbox] environment"],
     },
     {
       agent: "opencode",
       info: opencode,
-      present: ["OpenCode isn't signed in"],
-      absent: ["claude /login", "codex login"],
+      present: ["OpenCode isn't signed in", "Sign in to OpenCode"],
+      absent: ["claude auth login", "codex login"],
     },
   ])("names the $agent login step, not another agent's", async ({ agent, info, present, absent }) => {
     stubApi({ info: json(info) });
@@ -268,6 +282,17 @@ describe("StartupErrorBanner auth remediation", () => {
     });
     expect(banner.textContent).not.toContain("usually missing");
     for (const text of absent) expect(banner.textContent).not.toContain(text);
+  });
+
+  it("names no command while it can't tell host from Container", async () => {
+    const spy = stubApi({});
+    const message = 'Failed to start structured view agent "codex": authentication required';
+    const { findByTestId } = renderBanner({ message });
+    const banner = await findByTestId("startup-error-banner");
+    await waitFor(() => expect(calls(spy, "/acp/install-info")).toBe(1));
+    await act(async () => {});
+    expect(banner.textContent).toContain("Sign in to codex, then click Retry");
+    expect(banner.textContent).not.toContain("codex login");
   });
 });
 
