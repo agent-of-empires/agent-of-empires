@@ -1490,6 +1490,11 @@ fn start_for_test(path: &str) -> crate::tui::suggestions::Start {
 #[serial]
 fn a_started_suggestion_opens_the_prefilled_dialog_and_closes_the_view() {
     let mut env = create_test_env_empty();
+    // A structured default would make Enter check for the ACP adapter on the host.
+    crate::session::config::update_config(|config| {
+        config.acp.structured_view = crate::session::config::StructuredView::Terminal;
+    })
+    .unwrap();
     env.view.suggestions_view = Some(crate::tui::suggestions::SuggestionsView::idle_for_test());
     env.view.start_suggestion(start_for_test("/tmp"));
     assert!(env.view.suggestions_view.is_none());
