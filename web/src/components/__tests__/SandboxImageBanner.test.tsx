@@ -429,14 +429,24 @@ describe("SandboxImageBanner", () => {
     expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
   });
 
-  it("offers the image again rather than claim success for a done this click never saw", async () => {
-    await mount(status());
-    pullSandboxImage.mockImplementationOnce(() => new Promise(() => {}));
-    fireEvent.click(screen.getByRole("button", { name: "Update now" }));
-    // An older pull's `done` while the image this click asked for is still on offer.
-    fetchSandboxImageStatus.mockResolvedValue(status({ pull: { state: "done" } }));
-    await pollAfter(32_000);
-    expect(banner()?.getAttribute("aria-label")).toBe("Sandbox image update available");
+  it("ties an outcome to this click only once a status or the accepted reply does", async () => {
+    // (reply, outcome status after the cap, banner)
+    const cases: [string, { ok: boolean } | null, Partial<SandboxImageStatus>, string][] = [
+      // No status saw it running and no reply came: an older pull's outcome isn't this click's.
+      ["older done", null, { pull: { state: "done" } }, "Sandbox image update available"],
+      ["older failed", null, { pull: { state: "failed", error: "old" } }, "Sandbox image update available"],
+      // The Daemon claims the pull before it answers, so after an accepted reply it is this click's.
+      ["accepted, then done", { ok: true }, { pull: { state: "done" } }, "Sandbox image updated"],
+    ];
+    for (const [name, reply, after, want] of cases) {
+      const { unmount } = await mount(status());
+      pullSandboxImage.mockImplementationOnce(() => (reply ? Promise.resolve(reply) : new Promise(() => {})));
+      fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+      fetchSandboxImageStatus.mockResolvedValue(status(after));
+      await pollAfter(32_000);
+      expect(banner()?.getAttribute("aria-label"), name).toBe(want);
+      unmount();
+    }
   });
 
   it("hides an earlier available update once a check fails", async () => {

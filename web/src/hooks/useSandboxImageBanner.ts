@@ -41,7 +41,8 @@ export function useSandboxImageBanner(): SandboxImageBannerView | null {
   // pull can tell a newer image published since from the one it just pulled.
   const offeredDigest = useRef<string | null>(null);
   const [pulledDigest, setPulledDigest] = useState<string | null>(null);
-  // A status showed the current attempt's pull running, so its outcome is this attempt's.
+  // A status showed the current attempt's pull running, or the Daemon accepted it (it claims the
+  // pull before it answers), so the outcome a status shows from then on is this attempt's.
   const [sawRunning, setSawRunning] = useState(false);
   // The Daemon refuses checks and pulls while it can't read its configuration.
   const [configUnreadable, setConfigUnreadable] = useState(false);
@@ -128,6 +129,7 @@ export function useSandboxImageBanner(): SandboxImageBannerView | null {
     void pullSandboxImage().then((reply) => {
       if (mine !== attempt.current) return;
       replyPendingSince.current = null;
+      if (reply.ok) setSawRunning(true);
       if (!reply.ok && !pullConfirmed.current) {
         // Nothing was pulled, and the Daemon may still hold an older pull's outcome. No status has
         // shown a pull since the click, so the "running" in `status` is this page's own guess.
@@ -165,7 +167,9 @@ export function useSandboxImageBanner(): SandboxImageBannerView | null {
     // pull's: show the offer rather than success.
     const unconfirmed = !sawRunning && status.state === "available";
     if (pull.state === "done" && !newer && !unconfirmed) return { kind: "done", onDismiss };
-    if (pull.state === "failed") return { kind: "failed", error: pull.error, onRetry: update, onDismiss };
+    if (pull.state === "failed" && !unconfirmed) {
+      return { kind: "failed", error: pull.error, onRetry: update, onDismiss };
+    }
   }
 
   if (status.state !== "available" || status.dismissed || dismissedDigest === status.remote_digest) return null;
