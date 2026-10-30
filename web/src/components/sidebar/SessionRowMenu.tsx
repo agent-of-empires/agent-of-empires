@@ -357,7 +357,7 @@ export function SingleRowMenuItems({
             </MenuChoiceRow>
           ),
         ],
-        [extraItems],
+        [extraItems && <Fragment key="plugin">{extraItems}</Fragment>],
         [
           write && (
             <MenuItem
