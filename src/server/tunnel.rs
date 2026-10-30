@@ -170,9 +170,10 @@ impl TunnelHandle {
     /// Configure Tailscale Funnel for the local port and return a handle carrying the
     /// stable `https://<host>.<tailnet>.ts.net` URL.
     pub async fn spawn_tailscale(local_port: u16) -> anyhow::Result<Self> {
-        // Beside the app dir, so a release and a debug build (separate app dirs) share it.
-        let app_dir = crate::session::get_app_dir()?;
-        let lock = app_dir.parent().unwrap_or(&app_dir).join(FUNNEL_LOCK_FILE);
+        use anyhow::Context as _;
+        let home =
+            dirs::home_dir().context("couldn't find the home directory for the Funnel lock")?;
+        let lock = funnel_lock_path(&home);
         Self::spawn_tailscale_with(std::ffi::OsStr::new("tailscale"), &lock, local_port).await
     }
 
@@ -545,11 +546,21 @@ pub async fn tailscale_available() -> bool {
 /// removes every path on :443, so it only runs when the pre-flight found :443 unused;
 /// `tailscale funnel reset` would clear every port.
 const FUNNEL_OFF_ARGS: [&str; 3] = ["funnel", "--https=443", "off"];
-/// The lock that serializes Tailscale starts across aoe daemons, beside their app dirs.
-const FUNNEL_LOCK_FILE: &str = "agent-of-empires-tailscale-funnel.lock";
+/// The lock that serializes Tailscale starts across aoe daemons. It sits in the home directory, not
+/// beside an app dir: a release and a debug build may resolve different app-dir layouts (legacy
+/// `~/.agent-of-empires` next to an XDG `agent-of-empires-dev`), and must still share it.
+fn funnel_lock_path(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".agent-of-empires-tailscale-funnel.lock")
+}
 
-/// How long to wait for another aoe daemon's Tailscale start; each of its steps is bounded.
-const FUNNEL_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+/// How long to wait for another aoe daemon's Tailscale start. Below the 90 s deadline on the whole
+/// tunnel start, so this error (with its `--no-tailscale` hint) is the one the user sees.
+const FUNNEL_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Lock paths a start has found held by another, so a test can wait until one is really blocked.
+#[cfg(test)]
+static CONTENDED_FUNNEL_LOCKS: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// Wait, bounded and cancellable, for the cross-daemon Funnel lock.
 async fn lock_funnel_starts(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
@@ -575,7 +586,15 @@ async fn lock_funnel_starts(path: &std::path::Path) -> anyhow::Result<std::fs::F
                     );
                 }
                 if !std::mem::replace(&mut logged, true) {
-                    info!("Waiting for another aoe daemon's Tailscale Funnel start to finish");
+                    info!(
+                        target: "serve.tunnel",
+                        "Waiting for another aoe daemon's Tailscale Funnel start to finish"
+                    );
+                    #[cfg(test)]
+                    CONTENDED_FUNNEL_LOCKS
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(path.to_owned());
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
@@ -738,7 +757,7 @@ impl FunnelStartGuard {
             return match skip_reason(&ownership) {
                 None => Ok(()),
                 Some(why) => {
-                    warn!(?ownership, "Left the Tailscale Funnel on: {why}");
+                    warn!(target: "serve.tunnel", ?ownership, "Left the Tailscale Funnel on: {why}");
                     Err(ResetFailure::Skipped(why))
                 }
             };
@@ -753,7 +772,7 @@ impl FunnelStartGuard {
         self.armed = false;
         let why = match result {
             Ok(Ok(out)) if out.status.success() => {
-                info!("Turned off the Tailscale Funnel this start switched on");
+                info!(target: "serve.tunnel", "Turned off the Tailscale Funnel this start switched on");
                 return Ok(());
             }
             Ok(Ok(out)) => format!(
@@ -764,7 +783,7 @@ impl FunnelStartGuard {
             Ok(Err(e)) => e.to_string(),
             Err(_) => format!("timed out after {}s", FUNNEL_OFF_TIMEOUT.as_secs()),
         };
-        warn!(%why, "Couldn't turn off the Tailscale Funnel this start switched on");
+        warn!(target: "serve.tunnel", %why, "Couldn't turn off the Tailscale Funnel this start switched on");
         Err(ResetFailure::Failed(why))
     }
 }
@@ -789,6 +808,7 @@ impl Drop for FunnelStartGuard {
         if ownership != FunnelOwnership::Ours {
             if let Some(why) = skip_reason(&ownership) {
                 warn!(
+                    target: "serve.tunnel",
                     ?ownership,
                     "Left the Tailscale Funnel on after a cancelled start: {why}"
                 );
@@ -797,9 +817,10 @@ impl Drop for FunnelStartGuard {
         }
         match run(&FUNNEL_OFF_ARGS) {
             Ok(Some(out)) if out.status.success() => {
-                info!("Turned off the Tailscale Funnel a cancelled start switched on")
+                info!(target: "serve.tunnel", "Turned off the Tailscale Funnel a cancelled start switched on")
             }
             other => warn!(
+                target: "serve.tunnel",
                 ?other,
                 "Couldn't turn off the Tailscale Funnel a cancelled start switched on"
             ),
@@ -849,6 +870,7 @@ async fn inspect_existing_funnel(program: &std::ffi::OsStr, local_port: u16) -> 
     };
     if !out.status.success() {
         debug!(
+            target: "serve.tunnel",
             exit = ?out.status.code(),
             stderr = %String::from_utf8_lossy(&out.stderr).trim(),
             "inspect_existing_funnel: `tailscale funnel status --json` non-zero; state unknown"
@@ -858,7 +880,7 @@ async fn inspect_existing_funnel(program: &std::ffi::OsStr, local_port: u16) -> 
     let parsed: serde_json::Value = match serde_json::from_slice(&out.stdout) {
         Ok(v) => v,
         Err(e) => {
-            debug!(error = %e, "inspect_existing_funnel: JSON parse failed; state unknown");
+            debug!(target: "serve.tunnel", error = %e, "inspect_existing_funnel: JSON parse failed; state unknown");
             return unreadable_funnel_status();
         }
     };
@@ -1751,14 +1773,13 @@ esac
         };
         let a = start(8081);
         wait("A's off", &|| dir.path().join("off-entered").exists());
-        // B gets as far as its capability check, the step before the lock.
+        // B is really waiting on the lock A holds, not just on its way to it.
         let b = start(8080);
-        wait("B's capability check", &|| {
-            argv_log(dir.path())
-                .iter()
-                .filter(|c| *c == "status --json")
-                .count()
-                >= 3
+        wait("B blocked on the lock", &|| {
+            CONTENDED_FUNNEL_LOCKS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&lock)
         });
         std::fs::write(&release, "").unwrap();
         assert!(a.await.unwrap().is_err());
@@ -1767,6 +1788,15 @@ esac
 
         let calls = argv_log(dir.path());
         let at = |want: &str| calls.iter().position(|c| c == want).unwrap_or(usize::MAX);
+        // B's pre-flight (the third `funnel status`, after A's pre-flight and reset read) and its
+        // `--bg` both come after A's `off` finished.
+        let b_preflight = calls
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| *c == "funnel status --json")
+            .nth(2)
+            .map_or(usize::MAX, |(i, _)| i);
+        assert!(at("off done") < b_preflight, "{calls:?}");
         assert!(at("off done") < at("funnel --bg --yes 8080"), "{calls:?}");
         let state = std::fs::read_to_string(dir.path().join("funnel-state")).unwrap();
         assert!(
