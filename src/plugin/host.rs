@@ -461,7 +461,39 @@ impl PluginHost {
             drained
         };
 
+        let uninstalled: Vec<String> = to_teardown
+            .iter()
+            .map(|(id, _)| id.clone())
+            .filter(|id| registry.get(id).is_none())
+            .collect();
         self.teardown_workers(to_teardown).await;
+        for id in uninstalled {
+            self.forget_suggestions(id).await;
+        }
+    }
+
+    /// Clear what a plugin gone from the registry published. Runs after its
+    /// worker is stopped, so the worker cannot publish again behind the clear.
+    async fn forget_suggestions(&self, plugin_id: String) {
+        let api = self.api.clone();
+        let id = plugin_id.clone();
+        let cleared = tokio::task::spawn_blocking(move || {
+            api.with_suggestions_db(|conn, _| {
+                crate::plugin::suggestions::forget_publication(conn, &id)
+            })
+        })
+        .await;
+        match cleared {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(
+                target: "plugin.host", plugin = %plugin_id,
+                "could not clear published suggestions: {e}"
+            ),
+            Err(e) => tracing::warn!(
+                target: "plugin.host", plugin = %plugin_id,
+                "clearing published suggestions did not finish: {e}"
+            ),
+        }
     }
 
     /// Replace one plugin's worker so it runs the build now on disk, clearing its
@@ -1706,6 +1738,74 @@ command = ["sleep", "600"]
         })
         .await;
 
+        host.shutdown().await;
+    }
+
+    /// A plugin that is gone from the registry has its published suggestions
+    /// cleared once its worker stops; a merely disabled one keeps them.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reconcile_clears_suggestions_of_an_uninstalled_plugin_only() {
+        use crate::session::update_config;
+
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("XDG_CONFIG_HOME", temp.path().to_path_buf()),
+            ("HOME", temp.path().to_path_buf()),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        let plugin_id = "acme.sleeper";
+        install_sleeper(plugin_id);
+        let registry = crate::plugin::reload_registry();
+        let host = PluginHost::new(
+            &temp.path().join("host"),
+            "default",
+            None,
+            std::sync::Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
+        host.start(&registry).await;
+        wait_until("the worker", || async {
+            worker_pid(&host, plugin_id).await.is_some()
+        })
+        .await;
+        let published = || {
+            host.api.with_suggestions_db(|conn, _| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM suggestion_providers WHERE provider_id = ?1",
+                    [plugin_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+            })
+        };
+        host.api.with_suggestions_db(|conn, _| {
+            conn.execute(
+                "INSERT INTO suggestion_providers (profile, provider_id, updated_at) VALUES ('p', ?1, 0)",
+                [plugin_id],
+            )
+            .unwrap();
+        });
+
+        update_config(|config| config.plugins.get_mut(plugin_id).unwrap().enabled = false).unwrap();
+        host.reconcile(&crate::plugin::reload_registry()).await;
+        assert!(host.state.lock().await.running.is_empty());
+        assert_eq!(published(), 1);
+
+        update_config(|config| config.plugins.get_mut(plugin_id).unwrap().enabled = true).unwrap();
+        host.reconcile(&crate::plugin::reload_registry()).await;
+        wait_until("the worker again", || async {
+            worker_pid(&host, plugin_id).await.is_some()
+        })
+        .await;
+
+        update_config(|config| config.plugins.remove(plugin_id)).unwrap();
+        std::fs::remove_dir_all(crate::plugin::plugins_dir().unwrap().join(plugin_id)).unwrap();
+        host.reconcile(&crate::plugin::reload_registry()).await;
+        assert!(host.state.lock().await.running.is_empty());
+        assert_eq!(published(), 0);
         host.shutdown().await;
     }
 

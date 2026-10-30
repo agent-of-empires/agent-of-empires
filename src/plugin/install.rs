@@ -15,7 +15,7 @@ use super::changelog::UpdateChangelog;
 use super::featured::FeaturedIndex;
 use super::fetch::{self, FetchedPlugin};
 use super::lockfile::{LockedPlugin, Lockfile};
-use super::registry::ValidationState;
+use super::registry::{LoadedPlugin, ValidationState};
 use super::source::PluginSource;
 
 pub enum OperationLog {
@@ -595,9 +595,8 @@ fn apply_prepared(
         "updating {id} to {}",
         prepared.fetched.manifest.version
     ));
-    let suggestions_changed = super::registry()
-        .get(id)
-        .is_none_or(|p| p.manifest.suggestions != prepared.fetched.manifest.suggestions);
+    let suggestions_changed =
+        suggestions_spec_changed(super::registry().get(id), &prepared.fetched.manifest);
     replace_and_build(id, &prepared.fetched, &final_dir, log)?;
 
     let granted = grant.is_some();
@@ -956,18 +955,28 @@ pub fn uninstall(id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Best effort: the daemon holds the same database and republishes on its
-/// next refresh, so a failure only leaves stale rows until then. A worker
-/// still running can republish before the daemon reconciles.
+/// Whether an update replaces the installed `[suggestions]` block; an
+/// unknown installed plugin counts as changed.
+fn suggestions_spec_changed(current: Option<&LoadedPlugin>, next: &PluginManifest) -> bool {
+    current.is_none_or(|p| p.manifest.suggestions != next.suggestions)
+}
+
+/// Best effort, for when no daemon is involved: it waits on the daemon's write
+/// lock, and a failure only leaves stale rows until the next publish. A running
+/// daemon clears them again itself once it stops the worker of a plugin
+/// that is gone from the registry.
 fn forget_suggestion_publication(plugin_id: &str) {
     let result = (|| -> Result<()> {
         let path = crate::session::get_app_dir()?.join(super::host_api::EVENTS_DB);
         if !path.exists() {
             return Ok(());
         }
-        let conn = rusqlite::Connection::open(&path)
-            .with_context(|| format!("opening {}", path.display()))?;
-        super::suggestions::init(&conn)?;
+        let conn = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )
+        .with_context(|| format!("opening {}", path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         super::suggestions::forget_publication(&conn, plugin_id)?;
         Ok(())
     })();
@@ -1442,6 +1451,44 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("gh:"), "{err}");
+    }
+
+    #[test]
+    fn suggestions_spec_changed_compares_the_installed_block() {
+        let manifest = |sources: &str| {
+            PluginManifest::from_toml_str(&format!(
+                "id = \"acme.thing\"\nname = \"Thing\"\nversion = \"1.0.0\"\napi_version = 20\ncapabilities = [\"runtime.worker\"]\n\
+                 [runtime]\nkind = \"command\"\nsystem = true\ncommand = [\"true\"]\n{sources}"
+            ))
+            .unwrap()
+        };
+        let block = |criterion: &str| {
+            format!(
+                "[suggestions]\n[[suggestions.sources]]\ncriterion = \"{criterion}\"\nlabel = \"L\"\n"
+            )
+        };
+        let installed = LoadedPlugin {
+            manifest: manifest(&block("assigned")),
+            enabled: true,
+            trust: aoe_plugin_api::TrustLevel::Community,
+            validation: ValidationState::Local,
+            source: None,
+            dir: None,
+            manifest_hash: String::new(),
+            granted: true,
+        };
+        assert!(suggestions_spec_changed(
+            Some(&installed),
+            &manifest(&block("quiet"))
+        ));
+        assert!(!suggestions_spec_changed(
+            Some(&installed),
+            &manifest(&block("assigned"))
+        ));
+        assert!(suggestions_spec_changed(
+            None,
+            &manifest(&block("assigned"))
+        ));
     }
 
     /// A separate process clears a provider's published rows through the

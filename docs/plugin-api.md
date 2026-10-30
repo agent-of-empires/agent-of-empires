@@ -381,7 +381,7 @@ Suggestions are stored per profile. The routes below list and act on them; none 
 | `PUT /api/suggestions/mappings` | `{ provider_id, mapping_key, projects }` | `{ provider_id, mapping_key, projects }` |
 | `DELETE /api/suggestions/mappings?provider_id=&mapping_key=` | none | `{ ok, deleted }` |
 
-A provider's `status` is `pending` before its first publish, `ok`, or `error`. Each item is the published item plus `provider_id` and `dismissed`; dismissed items are still returned. Items of a disabled source are hidden. `refresh` and a `sources` change send `suggestions.refresh` to the affected workers.
+A provider's `status` is `pending` before its first publish, `ok`, or `error`. Uninstalling a plugin, or updating it to a build whose `[suggestions]` block differs, clears its items, checks and status so it is `pending` again until its next publish; source switches, dismissals, templates and mappings are kept. Each item is the published item plus `provider_id` and `dismissed`; dismissed items are still returned. Items of a disabled source are hidden. `refresh` and a `sources` change send `suggestions.refresh` to the affected workers.
 
 `prepare` resolves settings through the normal repo and profile config. `project` is `{ name, path }` or `null`, resolved in this order: the user's mapping for the item's `mapping_key`, then the item's `project` hint (exactly one registered project by name or exact path), else `null`; an item is never given a scratch project.
 
