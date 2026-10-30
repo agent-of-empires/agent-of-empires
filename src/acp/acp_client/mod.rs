@@ -48,7 +48,7 @@ pub use resolve_command::{
     is_bare_command, on_agent_path, resolve_agent_command, ResolvedAgentCommand, Unresolved,
 };
 pub(crate) use runner::wrap_in_scope;
-pub use session_sandbox::SessionSandbox;
+pub use session_sandbox::{effective_launch_env, SessionSandbox};
 pub(crate) use spawn::host_environment_denyreason;
 pub use spawn::SpawnConfig;
 

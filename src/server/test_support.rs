@@ -399,6 +399,38 @@ pub fn seed_instances_on_disk_for_test(profile: &str, insts: Vec<Instance>) {
         .expect("seed sessions.json");
 }
 
+/// Seeds the rows `state` holds into their profiles' stores and refreshes the canonical
+/// metadata: a launch opens the stored row, so a row that exists only in memory is a session
+/// whose source is unavailable. Rows with no profile run under `default`.
+pub async fn seed_native_rows_for_test(state: &Arc<AppState>) {
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().expect("app dir"))
+        .expect("purge owners");
+    let mut by_profile: std::collections::BTreeMap<String, Vec<Instance>> = Default::default();
+    for row in state.instances.read().await.iter() {
+        by_profile
+            .entry(row.source_profile.clone())
+            .or_default()
+            .push(row.clone());
+    }
+    for (profile, rows) in by_profile {
+        seed_instances_on_disk_for_test(&profile, rows);
+    }
+    refresh_canonical_metadata_for_test(state).await;
+}
+
+/// [`build_test_app_state`] for rows a launch opens from the store (see
+/// [`seed_native_rows_for_test`]); a row with no profile gets `default`.
+pub async fn build_native_test_app_state(mut rows: Vec<Instance>) -> Arc<AppState> {
+    for row in &mut rows {
+        if row.source_profile.is_empty() {
+            row.source_profile = "default".to_string();
+        }
+    }
+    let state = build_test_app_state(rows);
+    seed_native_rows_for_test(&state).await;
+    state
+}
+
 /// Make storage for `profile` fail on every write: a plain file where its directory belongs.
 pub fn block_profile_storage_for_test(profile: &str) {
     let dir = crate::session::get_app_dir()

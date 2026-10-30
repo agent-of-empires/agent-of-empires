@@ -876,6 +876,119 @@ pub async fn fire_wake_fired_push(
     }
 }
 
+/// Pushes each "sandbox login required" notice (at most one per episode).
+pub async fn spawn_login_required_consumer(state: std::sync::Arc<super::AppState>) {
+    if state.push.is_none() {
+        return;
+    }
+    let mut rx = state.session_service.sandbox_login.subscribe();
+    let work = state.runtime.work.clone();
+    work.spawn("server.sandbox_login_push_consumer", async move {
+        loop {
+            let notice = tokio::select! {
+                recv = rx.recv() => match recv {
+                    Ok(notice) => notice,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                },
+                _ = state.shutdown.cancelled() => return,
+            };
+            fire_sandbox_login_push(state.clone(), &notice.session_id, &notice.tool).await;
+        }
+    });
+}
+
+/// What the "sandbox login required" push shows and where it leads.
+#[derive(Debug, PartialEq, Eq)]
+struct SandboxLoginPush {
+    title: &'static str,
+    body: String,
+    path: String,
+    tag: &'static str,
+}
+
+impl SandboxLoginPush {
+    /// Names the agent and the session; the session by its id when it has no title (or is gone).
+    fn new(session_id: &str, tool: &str, session_title: Option<&str>) -> Self {
+        let name = session_title
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .unwrap_or(session_id);
+        Self {
+            title: "Sandbox login required",
+            body: format!("Log in {tool} to continue: {name}"),
+            path: format!("/session/{session_id}"),
+            tag: "sandbox-login",
+        }
+    }
+}
+
+/// Fire the one push of a login-needed episode for the unattended session `session_id`.
+pub async fn fire_sandbox_login_push(
+    state: std::sync::Arc<super::AppState>,
+    session_id: &str,
+    tool: &str,
+) {
+    let Some(push) = state.push.as_ref().cloned() else {
+        return;
+    };
+    if !state.web_config.notifications_enabled {
+        return;
+    }
+    if crate::session::is_tui_active(std::time::Duration::from_secs(30)) {
+        tracing::debug!(target: "push.sandbox_login", session = %session_id, "suppressed: TUI is active");
+        return;
+    }
+    if state.web_active_within(std::time::Duration::from_secs(30)) {
+        tracing::debug!(target: "push.sandbox_login", session = %session_id, "suppressed: web dashboard is active");
+        return;
+    }
+    let subs = push.store.snapshot().await;
+    if subs.is_empty() {
+        return;
+    }
+    let client = match super::push_send::build_client() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(target: "push.sandbox_login", "failed to build reqwest client: {e}");
+            return;
+        }
+    };
+    let title = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|i| i.id == session_id)
+        .map(|i| i.title.clone());
+    let content = SandboxLoginPush::new(session_id, tool, title.as_deref());
+
+    for sub in subs {
+        let Some(url) = build_push_url(&sub, &content.path) else {
+            continue;
+        };
+        let client = client.clone();
+        let push = push.clone();
+        let permit_sem = push.send_semaphore.clone();
+        let payload = super::push_send::PushPayload {
+            title: content.title.to_string(),
+            body: content.body.clone(),
+            url,
+            tag: content.tag.to_string(),
+            session_id: session_id.to_string(),
+        };
+        state
+            .runtime
+            .work
+            .spawn("server.sandbox_login_push", async move {
+                let Ok(_permit) = permit_sem.acquire_owned().await else {
+                    return;
+                };
+                deliver(&push, &client, &sub, &payload, PUSH_TTL_SECS).await;
+            });
+    }
+}
+
 /// Build an absolute URL for a push payload by joining the
 /// subscription's recorded origin with a leading-slash path. Returns
 /// `None` for legacy subscriptions with no origin recorded (predate
@@ -1759,5 +1872,27 @@ mod tests {
             },
         );
         assert!(!dwell.contains_key(&id));
+    }
+
+    #[test]
+
+    fn sandbox_login_push_content_names_the_agent_and_the_session() {
+        let expected = |body: &str| SandboxLoginPush {
+            title: "Sandbox login required",
+            body: body.to_string(),
+            path: "/session/sess-1".to_string(),
+            tag: "sandbox-login",
+        };
+        assert_eq!(
+            SandboxLoginPush::new("sess-1", "codex", Some("nightly")),
+            expected("Log in codex to continue: nightly")
+        );
+        for missing in [None, Some(""), Some("  ")] {
+            assert_eq!(
+                SandboxLoginPush::new("sess-1", "codex", missing),
+                expected("Log in codex to continue: sess-1"),
+                "{missing:?}"
+            );
+        }
     }
 }

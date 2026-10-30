@@ -126,6 +126,16 @@ async fn run_shutdown_sequence<R, F>(
     }
 }
 
+/// The daemon's profile and every session, whose shared credential files may have login
+/// helpers.
+async fn login_helper_scopes(state: &AppState) -> Vec<super::sandbox_login::LoginScope> {
+    use super::sandbox_login::LoginScope;
+    let instances = state.instances.read().await;
+    std::iter::once(LoginScope::profile(state.served_profile().clone()))
+        .chain(instances.iter().flat_map(LoginScope::of_session))
+        .collect()
+}
+
 /// Raise the soft `RLIMIT_NOFILE` so the server can sustain many WS
 /// terminals at once. macOS's default soft cap of 256 is exhausted
 /// quickly: each WS terminal consumes ~3 file descriptors (PTY master +
@@ -1130,6 +1140,18 @@ pub(crate) async fn start_server(
     }
 
     push::spawn_consumer(state.clone()).await;
+    push::spawn_login_required_consumer(state.clone()).await;
+    {
+        let profile = state.served_profile().clone();
+        let scopes = login_helper_scopes(&state).await;
+        state
+            .runtime
+            .work
+            .spawn("server.sandbox_login_sweep", async move {
+                super::sandbox_login::log_login_status(profile).await;
+                super::sandbox_login::sweep_stale_login_helpers(scopes).await;
+            });
+    }
     callback::spawn_consumer(state.clone()).await;
 
     // Report this process's own session commits exactly; the disk consumer covers the rest.

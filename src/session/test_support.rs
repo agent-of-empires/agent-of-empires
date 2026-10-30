@@ -161,6 +161,42 @@ pub(crate) fn stub_claude_adapter_on_agent_path() -> tempfile::TempDir {
     bin
 }
 
+/// Puts `docker`, `podman` and `container` on PATH that log every call to the
+/// returned file and fail.
+#[cfg(unix)]
+pub(crate) fn failing_container_runtime(root: &Path) -> (EnvGuard, PathBuf) {
+    fake_container_runtime(root, "")
+}
+
+/// As [`failing_container_runtime`], except the installed and daemon-running
+/// probes succeed unlogged, so a sandboxed session can be created.
+#[cfg(unix)]
+pub(crate) fn probing_container_runtime(root: &Path) -> (EnvGuard, PathBuf) {
+    fake_container_runtime(
+        root,
+        "case \"$*\" in --version|info|'system status') exit 0;; esac\n",
+    )
+}
+
+#[cfg(unix)]
+fn fake_container_runtime(root: &Path, prelude: &str) -> (EnvGuard, PathBuf) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let bin = root.join("runtime-bin");
+    std::fs::create_dir_all(&bin).expect("create fake runtime directory");
+    let calls = root.join("runtime-calls");
+    let script = format!(
+        "#!/bin/sh\n{prelude}printf '%s\\n' \"$*\" >> '{}'\nexit 1\n",
+        calls.display()
+    );
+    for name in ["docker", "podman", "container"] {
+        let path = bin.join(name);
+        std::fs::write(&path, &script).expect("write fake runtime");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake runtime executable");
+    }
+    (path_prepended(&bin), calls)
+}
+
 pub(crate) fn install_login_shell_path_command(root: &Path, name: &str, script: &str) -> EnvGuard {
     let bin = root.join("bin");
     std::fs::create_dir_all(&bin).expect("create test bin directory");
@@ -418,6 +454,66 @@ pub(crate) fn launch_owed_handoff(
         launch_started: false,
         launch: None,
     }
+}
+
+/// The error a launch of `tool` refused for the sandbox login carries.
+pub(crate) fn login_required(tool: &str) -> crate::session::SandboxLoginRequired {
+    crate::session::SandboxLoginRequired {
+        tool: tool.to_string(),
+        credential: PathBuf::from("/test/sandbox-v2/.credentials.json"),
+        command: None,
+        profile: None,
+    }
+}
+
+/// As [`login_required`], for the shared credential file under `home`.
+pub(crate) fn login_required_under(
+    tool: &str,
+    home: &Path,
+) -> crate::session::SandboxLoginRequired {
+    crate::session::SandboxLoginRequired {
+        tool: tool.to_string(),
+        credential: home.join(".claude/sandbox-v2/.credentials.json"),
+        command: None,
+        profile: None,
+    }
+}
+
+/// Puts the app under `home` in `separate_login` mode with an empty shared Claude credential and
+/// makes `inst` a sandboxed Claude session, so its launch needs the sandbox login.
+/// Returns the shared credential file.
+pub(crate) fn sandbox_needing_login(home: &Path, inst: &mut crate::session::Instance) -> PathBuf {
+    crate::session::config::update_config(|c| {
+        c.sandbox.shared_credential = crate::session::config::SharedCredentialMode::SeparateLogin;
+    })
+    .expect("set separate_login");
+    let shared = home.join(".claude/sandbox-v2/.credentials.json");
+    std::fs::create_dir_all(shared.parent().expect("credential dir")).expect("create dir");
+    std::fs::write(&shared, "{}").expect("write empty credential");
+    inst.tool = "claude".to_string();
+    inst.sandbox_info = Some(crate::session::SandboxInfo {
+        provider: None,
+        enabled: true,
+        container_id: None,
+        image: "test:latest".to_string(),
+        container_name: format!("aoe-login-{}", inst.id),
+        extra_env: None,
+        custom_instruction: None,
+        before_start_env: Vec::new(),
+        before_start_hook_env: Vec::new(),
+        container_workdir: None,
+    });
+    shared
+}
+
+/// Writes a fake Claude credential valid for an hour, as a login would.
+pub(crate) fn write_fake_shared_credential(shared: &Path) {
+    let expires_at = chrono::Utc::now().timestamp_millis() + 3_600_000;
+    std::fs::write(
+        shared,
+        crate::session::sandbox_login::claude::fixtures::usable(expires_at as u64),
+    )
+    .expect("write fake credential");
 }
 
 #[cfg(test)]

@@ -37,6 +37,7 @@ use crate::session::capture::{
 mod accessors;
 mod capture_slot;
 mod container;
+pub(crate) use container::{forget_before_start_resolution, BeforeStartHookError};
 mod execution;
 pub(crate) use capture_slot::{Handoff, Held, Unserved};
 pub(crate) use execution::{ActiveExecution, CaptureContext, ConversationKey, ConversationState};
@@ -76,7 +77,10 @@ mod tmux_session;
 mod types;
 
 pub(crate) use accessors::resolved_agent_for;
-pub use flags::{is_valid_session_color, SessionBucket, StartBlocked, SESSION_COLORS};
+pub use flags::{
+    is_valid_session_color, SandboxLoginRequired, SandboxLoginUnsupported, SessionBucket,
+    StartBlocked, SESSION_COLORS,
+};
 pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservationError};
 
 #[cfg(test)]
@@ -922,6 +926,15 @@ pub struct Instance {
     /// from scratch.
     #[serde(skip)]
     pending_host_env: Vec<(String, String)>,
+    /// What the sandbox login admission of the launch in progress ran with (the target agent
+    /// and the request's environment), so the come-up gates on the same launch. May hold a
+    /// secret; never persisted, never printed.
+    #[serde(skip)]
+    launch_admission: Option<container::LaunchAdmission>,
+    /// The come-up's `before_start` environment was already resolved, ahead of the
+    /// destructive steps of this launch: the come-up itself does not mint again.
+    #[serde(skip)]
+    before_start_minted_for_launch: bool,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) capture_started_at: Option<std::time::SystemTime>,

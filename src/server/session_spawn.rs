@@ -738,14 +738,20 @@ pub(crate) async fn spawn_structured_session(
                 let cwd = std::path::PathBuf::from(project_path);
                 let supervisor = service.acp_supervisor.clone();
                 let service_for_check = service.clone();
-                let has_pending_initial_turn = {
+                let (has_pending_initial_turn, origin) = {
                     let instances = service.instances.read().await;
-                    instances
-                        .iter()
-                        .find(|i| i.id == id)
-                        .is_some_and(|i| i.pending_initial_turn.is_some())
+                    let row = instances.iter().find(|i| i.id == id);
+                    (
+                        row.is_some_and(|i| i.pending_initial_turn.is_some()),
+                        if row.is_some_and(|i| i.created_by_plugin.is_some()) {
+                            crate::server::sandbox_login::LaunchOrigin::Unattended
+                        } else {
+                            crate::server::sandbox_login::LaunchOrigin::Interactive
+                        },
+                    )
                 };
                 let launch_native = native.clone();
+                let admission_row = response_instance.clone();
                 let sandbox_info = response_instance.sandbox_info.clone();
                 let generation = response_instance.lifecycle_generation;
                 let spawn_state = state.clone();
@@ -806,6 +812,12 @@ pub(crate) async fn spawn_structured_session(
                             return;
                         }
                     };
+                    // The sandbox login admission of this launch, with the guards released: a
+                    // `before_start` hook it has to resolve may call `aoe` on this session.
+                    let validation = match validation {
+                        Ok(()) => admit_created_sandbox(native.clone(), admission_row).await,
+                        refused => refused,
+                    };
                     let source_profile_for_spawn = Some(source_profile);
                     let spawned = match validation {
                         Err(error) => Err(error),
@@ -853,9 +865,7 @@ pub(crate) async fn spawn_structured_session(
                             }),
                     };
                     if let Err(error) = &spawned {
-                        tracing::warn!(target: "acp.supervisor", session = %id,
-                            "auto-spawn after create failed: {error}");
-                        supervisor.publish_startup_error(&id, error.to_string());
+                        report_failed_auto_spawn(&service_for_check, &id, origin, error);
                     }
                     let settled =
                         finish_structured_launch(&spawn_state, native, &id, generation, spawned)
@@ -880,6 +890,45 @@ pub(crate) async fn spawn_structured_session(
         Ok(Err(e)) => Err(e),
         Err(e) => Err(anyhow::Error::new(SessionBuildPanicked(e.to_string()))),
     }
+}
+
+/// Reports an auto-spawn after a create that did not start: the startup error every client
+/// shows, and for a launch refused for the sandbox login the hold that releases it when the
+/// login appears (a push notice only for an unattended origin).
+fn report_failed_auto_spawn(
+    service: &SessionService,
+    id: &str,
+    origin: crate::server::sandbox_login::LaunchOrigin,
+    error: &anyhow::Error,
+) {
+    if let Some(blocked) = error.downcast_ref::<crate::session::SandboxLoginRequired>() {
+        tracing::warn!(target: "acp.supervisor", session = %id,
+            "auto-spawn after create held: {blocked}");
+        service.sandbox_login.hold(id, origin, blocked);
+    } else {
+        tracing::warn!(target: "acp.supervisor", session = %id,
+            "auto-spawn after create failed: {error}");
+    }
+    service
+        .acp_supervisor
+        .publish_startup_error(id, error.to_string());
+}
+
+/// The sandbox login admission of the auto-spawn after a create, on the row the create
+/// published. It holds no lock, so a `before_start` hook it resolves may call back.
+async fn admit_created_sandbox(
+    native: Arc<crate::server::session_store::NativeSessionStore>,
+    row: crate::session::Instance,
+) -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(move || {
+        let mut row = row;
+        if !row.is_sandboxed() {
+            return Ok(());
+        }
+        row.ensure_sandbox_launchable(&*native)
+    })
+    .await
+    .map_err(anyhow::Error::from)?
 }
 
 /// Takes the namespace, submission and instance guards, or `None` once a stop
@@ -1245,5 +1294,87 @@ mod tests {
         })
         .await
         .expect("the refused handshake reports a startup error");
+    }
+    /// The auto-spawn after a create holds a session the login gate refuses: a
+    /// plugin-created one unattended (with the push notice), a user's interactive. The
+    /// create itself brings the container up before any launch, so this drives the
+    /// admission and the report the auto-spawn makes of its refusal.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_hold_origin_by_site_create() {
+        use crate::server::sandbox_login::LaunchOrigin;
+        for (created_by_plugin, origin) in [
+            (None, LaunchOrigin::Interactive),
+            (Some("cron".to_string()), LaunchOrigin::Unattended),
+        ] {
+            let home = crate::session::test_support::isolate_app_dir();
+            let (_runtime, calls) =
+                crate::session::test_support::probing_container_runtime(home.path());
+            let mut row = crate::session::Instance::new("login-hold", "/tmp/aoe-login-hold");
+            row.view = crate::session::View::Structured;
+            row.created_by_plugin = created_by_plugin.clone();
+            crate::session::test_support::sandbox_needing_login(home.path(), &mut row);
+            let id = row.id.clone();
+            let state =
+                crate::server::test_support::build_native_test_app_state(vec![row.clone()]).await;
+            let login = &state.session_service.sandbox_login;
+            let mut notices = login.subscribe();
+            let exclusion =
+                crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &id, false)
+                    .await
+                    .unwrap();
+            let (native, _exclusion) =
+                crate::server::session_store::NativeSessionStore::open_for_launch(
+                    state.clone(),
+                    &row,
+                    exclusion,
+                )
+                .await
+                .unwrap();
+
+            let error = admit_created_sandbox(native, row)
+                .await
+                .expect_err("the launch needs the login");
+            assert!(
+                error.is::<crate::session::SandboxLoginRequired>(),
+                "{created_by_plugin:?}: {error:#}"
+            );
+            report_failed_auto_spawn(&state.session_service, &id, origin, &error);
+
+            assert_eq!(
+                login.held_origin(&id),
+                Some(origin),
+                "{created_by_plugin:?}"
+            );
+            assert_eq!(
+                notices.try_recv().is_ok(),
+                origin == LaunchOrigin::Unattended,
+                "{created_by_plugin:?}"
+            );
+            let messages: Vec<String> = state
+                .acp_event_store
+                .replay_from(&id, 0)
+                .into_iter()
+                .filter_map(|(_, e)| match e {
+                    crate::acp::Event::AgentStartupError { message } => Some(message),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                messages,
+                vec![crate::session::test_support::login_required("claude").to_string()]
+            );
+            // No runtime call concerns this session. Other tests may run a container command
+            // meanwhile (the fake runtime is on the process PATH), so the file is not
+            // required to be empty.
+            let own = format!("aoe-sandbox-{}", &id[..8]);
+            assert!(
+                !std::fs::read_to_string(&calls)
+                    .unwrap_or_default()
+                    .contains(&own),
+                "the admission runs before any runtime call for the session"
+            );
+        }
     }
 }

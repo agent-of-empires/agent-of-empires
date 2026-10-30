@@ -6354,6 +6354,95 @@ async fn start_paths_refuse_archived_and_trashed_sessions() {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial]
+async fn sandbox_login_gate_tmux_start_ensure_and_send_are_409() {
+    use axum::body::to_bytes;
+    if !crate::tmux::tmux_command()
+        .arg("-V")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        return;
+    }
+    let home = crate::session::test_support::isolate_app_dir();
+    let (_runtime, calls) = crate::session::test_support::failing_container_runtime(home.path());
+    crate::session::config::update_app_state(|s| s.has_acknowledged_agent_hooks = true).unwrap();
+    crate::session::config::update_config(|c| {
+        c.sandbox.shared_credential = crate::session::config::SharedCredentialMode::SeparateLogin;
+    })
+    .unwrap();
+    let root = home.path().join(".claude").join("sandbox-v2");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join(".credentials.json"), "{}").unwrap();
+    let message = crate::session::test_support::login_required("claude").to_string();
+
+    for which in ["start", "ensure", "send"] {
+        let mut inst = make_test_instance();
+        inst.title = format!("login-gate-{which}");
+        inst.project_path = home.path().to_string_lossy().into_owned();
+        inst.source_profile = "default".to_string();
+        inst.status = Status::Stopped;
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: format!("aoe-login-gate-{which}"),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            container_workdir: None,
+        });
+        let id = inst.id.clone();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![inst.clone()]);
+        let session = inst.tmux_session().unwrap();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let response = match which {
+            "start" => start_session(State(state.clone()), Path(id.clone()), Ok(None))
+                .await
+                .into_response(),
+            "ensure" => ensure_session(State(state.clone()), Path(id.clone()), Ok(None))
+                .await
+                .into_response(),
+            // A terminal session has no queue: the send fails with the error text.
+            _ => send_message(
+                State(state.clone()),
+                Path(id.clone()),
+                Ok(Json(SendMessageRequest {
+                    message: "hello".into(),
+                    revive: true,
+                })),
+            )
+            .await
+            .into_response(),
+        };
+        let spawned = session.exists();
+        let _ = session.kill();
+        assert_eq!(response.status(), StatusCode::CONFLICT, "{which}");
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024).await.unwrap()).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"error": "sandbox_login_required", "message": message, "tool": "claude"}),
+            "{which}"
+        );
+        assert!(!spawned, "{which}");
+        let after = crate::session::Storage::open_unwatched("default")
+            .unwrap()
+            .load()
+            .unwrap()
+            .remove(0);
+        // The refusal is the response above; the stored row only records that the launch
+        // did not start (a failed launch persists no error text).
+        assert_eq!(after.status, Status::Error, "{which}");
+    }
+    assert_eq!(std::fs::read_to_string(&calls).unwrap_or_default(), "");
+}
+
 /// #4116: a peer (e.g. `aoe session archive`) can shelve the stored row after the daemon's
 /// memory check. Structured start and prompt-wake recheck that row inside their write, refuse,
 /// and leave `archived_at` in place.
@@ -10340,5 +10429,277 @@ async fn empty_trash_keeps_a_row_retrashed_after_selection() -> anyhow::Result<(
         .expect("the retrashed row survives");
     assert_eq!(kept.title, "edited while the batch ran");
     assert!(kept.is_trashed());
+    Ok(())
+}
+
+/// The sandbox login admission of a recreate (and of any restart) runs before the old agent is
+/// stopped and before its container is discarded, hook resolution included: a session that
+/// needs a login is refused with 409, a failing `before_start` hook with 502, and the runtime
+/// is never asked to remove anything; a hook or key that supplies the login lets it through.
+#[tokio::test]
+#[serial_test::serial]
+async fn recreate_container_checks_the_sandbox_login_before_discarding_anything(
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let home = crate::session::test_support::isolate_app_dir();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })?;
+    let _unset = crate::session::test_support::EnvGuard::unset(&[
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+    ]);
+    crate::session::config::update_config(|c| {
+        c.sandbox.shared_credential = crate::session::config::SharedCredentialMode::SeparateLogin;
+    })?;
+    let root = home.path().join(".claude").join("sandbox-v2");
+    std::fs::create_dir_all(&root)?;
+    std::fs::write(root.join(".credentials.json"), "{}")?;
+    let bin = tempfile::tempdir()?;
+    let calls = bin.path().join("runtime-calls");
+    for binary in ["docker", "podman", "container"] {
+        let script = bin.path().join(binary);
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n\
+                 if [ \"$1\" = rm ]; then exit 0; fi\n\
+                 case \"$*\" in \"image inspect\"*) exit 0;; *inspect*) echo 'Error: No such container (container not found)' >&2; exit 1;; esac\n\
+                 echo 'permission denied' >&2\nexit 1\n",
+                calls.display()
+            ),
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+    }
+    let _path = crate::session::test_support::path_prepended(bin.path());
+    let project = tempfile::tempdir()?;
+    let message = crate::session::test_support::login_required("claude").to_string();
+
+    // (hook, expected status, expected error code); no code means admitted.
+    let hooks: [(Option<&str>, StatusCode, Option<&str>); 4] = [
+        (None, StatusCode::CONFLICT, Some("sandbox_login_required")),
+        (
+            Some("echo FOO=bar"),
+            StatusCode::CONFLICT,
+            Some("sandbox_login_required"),
+        ),
+        (
+            Some("echo token=sekret >&2; exit 3"),
+            StatusCode::BAD_GATEWAY,
+            Some("before_start_hook_failed"),
+        ),
+        (Some("echo ANTHROPIC_API_KEY=sk-hook"), StatusCode::OK, None),
+    ];
+    for structured in [false, true] {
+        for (hook, expected, code) in hooks {
+            let case = format!("structured={structured} hook={hook:?}");
+            let _ = std::fs::remove_file(&calls);
+            crate::session::config::update_config(|c| {
+                c.host_hooks.before_start = hook.map(str::to_string).into_iter().collect();
+            })?;
+            let mut row = Instance::new("recreate-login", project.path().to_str().unwrap());
+            row.source_profile = "default".into();
+            row.tool = "claude".into();
+            row.status = Status::Stopped;
+            if structured {
+                row.view = crate::session::View::Structured;
+                row.agent_name = Some("claude".into());
+                row.mark_idle_dormant();
+            }
+            row.sandbox_info = Some(crate::session::SandboxInfo {
+                provider: None,
+                enabled: true,
+                container_id: None,
+                image: "ubuntu:latest".to_string(),
+                container_name: "recreate-login-test".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
+                container_workdir: None,
+            });
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![row.clone()],
+            );
+            let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+            let response = recreate_container(State(state.clone()), Path(row.id.clone())).await;
+            let status = response.status();
+            let body: serde_json::Value =
+                serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 8192).await?)
+                    .unwrap_or_default();
+            let log = std::fs::read_to_string(&calls).unwrap_or_default();
+            let removed = log.lines().any(|line| line.starts_with("rm "));
+            match code {
+                Some(code) => {
+                    assert_eq!(status, expected, "{case}: {body}");
+                    assert_eq!(body["error"], code, "{case}");
+                    if code == "sandbox_login_required" {
+                        assert_eq!(body["message"], message, "{case}");
+                    } else {
+                        assert_eq!(body["message"], "the before_start hook failed", "{case}");
+                    }
+                    assert!(!removed, "{case}: the container was discarded:\n{log}");
+                    let stored = crate::session::Storage::open_unwatched("default")?.load()?;
+                    assert_eq!(stored[0].status, Status::Stopped, "{case}");
+                    assert!(
+                        !stored[0].has_fresh_lifecycle_reservation(chrono::Utc::now()),
+                        "{case}: nothing was reserved"
+                    );
+                }
+                None => {
+                    // The fake runtime fails the create, so the relaunch itself fails, but
+                    // only after the old container was removed.
+                    assert!(!status.is_success(), "{case}: {status} {body}");
+                    assert_ne!(body["error"], "sandbox_login_required", "{case}");
+                    assert!(removed, "{case}: no removal:\n{log}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The cheaper refusals of a restart answer first: an archived session gets its own code and
+/// the `before_start` hook is never run for it.
+#[tokio::test]
+#[serial_test::serial]
+async fn restart_of_a_shelved_sandbox_session_runs_no_before_start_hook() -> anyhow::Result<()> {
+    let home = crate::session::test_support::isolate_app_dir();
+    crate::session::config::update_config(|c| {
+        c.sandbox.shared_credential = crate::session::config::SharedCredentialMode::SeparateLogin;
+    })?;
+    let root = home.path().join(".claude").join("sandbox-v2");
+    std::fs::create_dir_all(&root)?;
+    std::fs::write(root.join(".credentials.json"), "{}")?;
+    let counter = home.path().join("hook-runs");
+    let hook = format!(
+        "echo run >> {}",
+        crate::session::environment::shell_escape(&counter.to_string_lossy())
+    );
+    crate::session::config::update_config(|c| c.host_hooks.before_start = vec![hook])?;
+    let project = tempfile::tempdir()?;
+    let mut row = Instance::new("shelved", project.path().to_str().unwrap());
+    row.source_profile = "default".into();
+    row.tool = "claude".into();
+    row.status = Status::Stopped;
+    row.sandbox_info = Some(crate::session::SandboxInfo {
+        provider: None,
+        enabled: true,
+        container_id: None,
+        image: "ubuntu:latest".to_string(),
+        container_name: "shelved-test".to_string(),
+        extra_env: None,
+        custom_instruction: None,
+        before_start_env: Vec::new(),
+        before_start_hook_env: Vec::new(),
+        container_workdir: None,
+    });
+    row.archive();
+    crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+    let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+    let response = recreate_container(State(state.clone()), Path(row.id.clone())).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 8192).await?)?;
+    assert_eq!(body["error"], "session_archived");
+    assert!(!counter.exists(), "the hook ran for a shelved session");
+    Ok(())
+}
+
+/// A restart that changes the tool is admitted on the launch it makes, not on the row it
+/// leaves: the hook runs for the incoming tool, and a restart into a tool without a sandbox
+/// login is not held by the outgoing tool's login.
+#[tokio::test]
+#[serial_test::serial]
+async fn restart_admission_decides_on_the_incoming_tool() -> anyhow::Result<()> {
+    let home = crate::session::test_support::isolate_app_dir();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })?;
+    let _unset = crate::session::test_support::EnvGuard::unset(&[
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+    ]);
+    crate::session::config::update_config(|c| {
+        c.sandbox.shared_credential = crate::session::config::SharedCredentialMode::SeparateLogin;
+    })?;
+    let root = home.path().join(".claude").join("sandbox-v2");
+    std::fs::create_dir_all(&root)?;
+    std::fs::write(root.join(".credentials.json"), "{}")?;
+    let project = tempfile::tempdir()?;
+
+    // (outgoing tool, incoming tool, hook, refused)
+    let cases = [
+        ("codex", "claude", "echo ANTHROPIC_API_KEY=sk-hook", false),
+        ("codex", "claude", "echo FOO=bar", true),
+        ("claude", "codex", "echo FOO=bar", false),
+    ];
+    for structured in [false, true] {
+        for (outgoing, incoming, hook, refused) in cases {
+            let case = format!("structured={structured} {outgoing}->{incoming} {hook}");
+            crate::session::config::update_config(|c| {
+                c.host_hooks.before_start = vec![hook.to_string()];
+            })?;
+            let mut row = Instance::new("restart-tool", project.path().to_str().unwrap());
+            row.source_profile = "default".into();
+            row.tool = outgoing.into();
+            row.status = Status::Stopped;
+            if structured {
+                row.view = crate::session::View::Structured;
+                row.agent_name = Some(outgoing.into());
+                row.mark_idle_dormant();
+            }
+            row.sandbox_info = Some(crate::session::SandboxInfo {
+                provider: None,
+                enabled: true,
+                container_id: None,
+                image: "ubuntu:latest".to_string(),
+                container_name: "restart-tool-test".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
+                container_workdir: None,
+            });
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![row.clone()],
+            );
+            let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+            let response = restart_session(
+                State(state.clone()),
+                Path(row.id.clone()),
+                Ok(Some(Json(crate::daemon::RestartSessionBody {
+                    tool: Some(incoming.into()),
+                    command_override: Some(incoming.into()),
+                    ..Default::default()
+                }))),
+            )
+            .await;
+            let body: serde_json::Value =
+                serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 8192).await?)
+                    .unwrap_or_default();
+            assert_eq!(
+                body["error"] == "sandbox_login_required",
+                refused,
+                "{case}: {body}"
+            );
+            assert_ne!(body["error"], "before_start_hook_failed", "{case}: {body}");
+            crate::session::forget_before_start_resolution(&row.id);
+        }
+    }
     Ok(())
 }

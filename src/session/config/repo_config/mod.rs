@@ -530,6 +530,7 @@ mod tests {
             ("sandbox", "default_image", false),
             ("sandbox", "container_runtime", false),
             ("sandbox", "selinux_relabel", false),
+            ("sandbox", "shared_credential", false),
             ("sandbox", "privileged", false),
             ("sandbox", "cap_add", false),
             ("sandbox", "cap_drop", false),
@@ -598,11 +599,14 @@ mod tests {
             memory_limit = "16g"
             cpu_limit = "8"
             volume_ignores = ["node_modules"]
+            shared_credential = "host_seed"
         "#,
         )
         .unwrap();
         let mut base = Config::default();
         base.sandbox.environment = vec!["USER_KEY=$USER_KEY".to_string()];
+        base.sandbox.shared_credential =
+            crate::session::config::SharedCredentialMode::SeparateLogin;
         let merged = merge_repo_config(base, &repo);
         let sb = &merged.sandbox;
         assert!(!sb.enabled_by_default);
@@ -614,6 +618,10 @@ mod tests {
         assert_eq!(sb.memory_limit.as_deref(), Some("16g"));
         assert_eq!(sb.cpu_limit.as_deref(), Some("8"));
         assert_eq!(sb.volume_ignores, vec!["node_modules"]);
+        assert_eq!(
+            sb.shared_credential,
+            crate::session::config::SharedCredentialMode::SeparateLogin
+        );
         assert_eq!(
             rejected(&repo),
             vec![
@@ -628,6 +636,7 @@ mod tests {
                 "sandbox.privileged",
                 "sandbox.security_opt",
                 "sandbox.selinux_relabel",
+                "sandbox.shared_credential",
             ]
         );
     }

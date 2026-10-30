@@ -94,6 +94,8 @@ impl Instance {
             unknown_since: None,
             detection: DetectionState::default(),
             pending_host_env: Vec::new(),
+            launch_admission: None,
+            before_start_minted_for_launch: false,
             capture_started_at: None,
             started_at: None,
             launch_executable: None,

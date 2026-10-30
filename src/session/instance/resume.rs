@@ -257,6 +257,13 @@ impl Instance {
             return Ok(StartOutcome::Fresh);
         }
         storage.check_available()?;
+        if options.restart && self.is_sandboxed() {
+            // A `before_start` hook the sandbox login admission needs runs here, before the
+            // title lock and lifecycle flock are taken (hooks may call `aoe` on this session)
+            // and before anything is stopped or discarded: the checks below then decide on
+            // its real environment, and a hook failure is its own error with nothing touched.
+            self.resolve_before_start_for_restart(storage, true)?;
+        }
 
         let title_lock = crate::session::storage::acquire_session_title_lock(&self.id)
             .context("failed to acquire instance start title lock")?;
@@ -282,6 +289,22 @@ impl Instance {
             LifecycleOperation::Launch,
             Some(Status::Starting),
         )?;
+        if options.restart && self.is_sandboxed() {
+            // Refused before the poller stops or the old container is discarded, so a launch
+            // that cannot start leaves the running agent and its container alone. The
+            // pre-launch hooks never run for it; the gate in them still covers fresh starts.
+            // No host hook runs here, under the title lock and lifecycle flock. The hook the
+            // admission needs was resolved before the locks were taken (see the top of this
+            // function), and this re-checks on what the session holds right now, strictly: a
+            // resolution a concurrent come-up consumed, or that expired while this restart
+            // waited for the locks, refuses the restart here, with nothing stopped or
+            // discarded, instead of deferring to an admission that runs after the old agent is
+            // gone.
+            if let Err(error) = self.ensure_sandbox_launchable_strict(storage) {
+                self.fail_reserved_launch(storage, generation, &error, false);
+                return Err(error);
+            }
+        }
         if discard_sandbox_container {
             if let Err(error) = self.discard_stale_sandbox_container() {
                 self.fail_reserved_launch(storage, generation, &error, false);
@@ -311,7 +334,7 @@ impl Instance {
     ) -> Result<StartOutcome> {
         let generation =
             self.prepare_reserved_launch_hooks(storage, options.restart, reservation)?;
-        let hook_result = self.run_pre_launch_hooks(skip_on_launch, storage, None);
+        let hook_result = self.run_agent_launch_hooks(skip_on_launch, storage, None);
         self.finish_reserved_launch(storage, size, options, generation, hook_result)
     }
     pub(crate) fn capture_before_restart_in(

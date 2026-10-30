@@ -1,7 +1,37 @@
 //! Container-backed sessions: config, workdir, and the environment minted
 //! before start.
+//!
+//! # Sandbox login admission
+//!
+//! This is the one place for the invariants of admitting a sandbox launch that needs the
+//! agent's sandbox login (`sandbox.shared_credential = "separate_login"`).
+//!
+//! - The gate counts the launch's real auth route. A configured `host_hooks.before_start`
+//!   hook may produce one, so the hook runs lazily: only when the cheap decision would refuse
+//!   and the hook has no usable resolution yet. An empty result is a result.
+//! - A resolution belongs to the session, not to a copy of its row: one slot per session id
+//!   (`BEFORE_START_SLOTS`), whose lock is the resolution guard. Concurrent callers and the
+//!   come-up run the hook once between them. A wait for the lock is bounded by the hook
+//!   deadline plus a margin ([`BeforeStartHookError::Busy`]), so a hook must not call back
+//!   into the daemon about its own session while it is admitted.
+//! - A resolution is fresh for [`BEFORE_START_RESOLUTION_MAX_AGE`] and for the inputs its
+//!   hook ran on (the fingerprint: commands, project, profile, tool and the environment the
+//!   hook is given). Anything else is dropped and overwritten when found.
+//!   The come-up consumes it; an already-running container attaches with it without
+//!   consuming it, and forwards that fresh resolution rather than an older row cache.
+//! - A come-up that has to mint again gates again, with the admission's agent and request
+//!   environment kept on the row ([`LaunchAdmission`]), before any destructive step.
+//! - A restart resolves the hook first, before the title and lifecycle locks and before it
+//!   stops or discards anything, wanting [`RESTART_RESOLUTION_MARGIN`] of life left. Under the
+//!   locks it re-checks strictly and runs no hook.
+//! - The secret lives in memory only. Deleting, trashing or archiving the session, or
+//!   removing the hook, scrubs the slot ([`forget_before_start_resolution`]), and a
+//!   resolver that finds the tombstone drops its result. Copies the launch makes are dropped
+//!   with their owners, not scrubbed.
+//! - Hook errors are [`BeforeStartHookError`]: fixed words, never the command or output.
 
 use super::*;
+use crate::session::sandbox_login::LaunchAuth;
 use crate::session::{SessionStore, Storage};
 
 const IDENTITY_PUBLISHER_DEPENDENCY_TIMEOUT: std::time::Duration =
@@ -45,6 +75,196 @@ fn identity_publisher_mount_matches(
     config: &crate::containers::ContainerConfig,
 ) -> Result<bool> {
     Ok(container.mount_fingerprint_matches(config)? == Some(true))
+}
+
+/// How long a resolved `host_hooks.before_start` environment stays good for the next
+/// container come-up. A session held longer re-runs the hook, so it never starts on a stale
+/// minted token.
+pub(crate) const BEFORE_START_RESOLUTION_MAX_AGE: std::time::Duration =
+    std::time::Duration::from_secs(300);
+
+/// The `host_hooks.before_start` environment resolved for a session's next come-up. Secret:
+/// kept in memory only, never stored, logged or sent anywhere. Copies of it (the row's cache,
+/// the gate's environment, the container's run environment) are short-lived values the
+/// process drops with their owners; only the slot's copy is overwritten on removal.
+struct ResolvedBeforeStart {
+    env: Vec<(String, String)>,
+    at: std::time::Instant,
+    /// Of the hook's inputs ([`Instance::hook_fingerprint`]), so a changed hook, profile or
+    /// project never reuses an older env.
+    fingerprint: u64,
+}
+
+impl ResolvedBeforeStart {
+    /// Fresh for the hook with `fingerprint`, with at least `margin` of its life left.
+    fn fresh_for(&self, fingerprint: u64, margin: std::time::Duration) -> bool {
+        self.fingerprint == fingerprint
+            && self.at.elapsed() + margin < BEFORE_START_RESOLUTION_MAX_AGE
+    }
+}
+
+/// A session's resolution state. `forgotten` is the tombstone of a slot whose session was
+/// deleted while a resolver held it: whoever finds it set drops its result and starts over
+/// on the session's next slot.
+#[derive(Default)]
+struct Slot {
+    forgotten: std::sync::atomic::AtomicBool,
+    state: std::sync::Mutex<Option<ResolvedBeforeStart>>,
+    /// Callers that found the lock held and began to wait, for a test to observe.
+    #[cfg(test)]
+    waiters: std::sync::atomic::AtomicUsize,
+}
+
+type ResolutionSlot = std::sync::Arc<Slot>;
+
+/// One slot per session id, shared by every copy of the row and every caller in the process:
+/// the resolution is the session's, not a copy's, so concurrent pre-checks and the come-up
+/// run the hook once between them. Holding a slot's lock is the resolution guard.
+static BEFORE_START_SLOTS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, ResolutionSlot>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn resolution_slot(session_id: &str) -> ResolutionSlot {
+    let mut slots = BEFORE_START_SLOTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::sync::Arc::clone(slots.entry(session_id.to_string()).or_default())
+}
+
+/// Drops (and overwrites) a resolution found stale: expired, or made for other hook inputs.
+fn drop_if_stale(state: &mut Option<ResolvedBeforeStart>, fingerprint: u64) {
+    if state
+        .as_ref()
+        .is_some_and(|resolved| !resolved.fresh_for(fingerprint, std::time::Duration::ZERO))
+    {
+        if let Some(mut stale) = state.take() {
+            scrub(&mut stale.env);
+        }
+    }
+}
+
+/// What the sandbox login admission of a launch ran with, kept on the row for the come-up
+/// of that launch. The request's environment may hold a key: it is never printed.
+#[derive(Clone)]
+pub(crate) struct LaunchAdmission {
+    agent: Option<String>,
+    request_env: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for LaunchAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaunchAdmission")
+            .field("agent", &self.agent)
+            .field(
+                "request_env",
+                &format_args!("<{} redacted>", self.request_env.len()),
+            )
+            .finish()
+    }
+}
+
+/// How long one resolution of the `host_hooks.before_start` hooks (all of its commands
+/// together) may take when the caller set no hook deadline of its own (a bounded restart or
+/// recovery installs one). The run is cut off and its process tree killed at the deadline,
+/// so a hook that never exits cannot hold the session's resolution slot, a blocking thread
+/// or an HTTP request for ever. A process that daemonizes or reparents itself escapes the
+/// kill.
+const BEFORE_START_HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long a restart wants a resolution to stay fresh: it re-checks strictly under the
+/// locks, and the admission that follows its destructive steps must not find the resolution
+/// expired.
+const RESTART_RESOLUTION_MARGIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long past the hook's own deadline a caller waits for the session's slot, held by
+/// another caller's hook run, before it gives up with [`BeforeStartHookError::Busy`].
+#[cfg(not(test))]
+const SLOT_WAIT_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(test)]
+const SLOT_WAIT_MARGIN: std::time::Duration = std::time::Duration::from_millis(100);
+
+fn before_start_hook_timeout() -> std::time::Duration {
+    crate::session::recovery::current_hook_timeout().unwrap_or(BEFORE_START_HOOK_TIMEOUT)
+}
+
+/// Why the `host_hooks.before_start` hook produced no environment for a launch, in words that
+/// are safe to show a client: never the command, the hook's output or its environment (which
+/// may carry tokens). The server logs only the class and the exit status or timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum BeforeStartHookError {
+    #[error("the before_start hook failed")]
+    Failed,
+    #[error("the before_start hook timed out")]
+    TimedOut,
+    #[error("the before_start hook could not be started")]
+    NotStarted,
+    /// Another caller's run of the hook for this session did not finish in time. A hook
+    /// that calls back into the daemon about its own session during admission ends here.
+    #[error("the before_start hook is still running for this session")]
+    Busy,
+}
+
+/// Takes the slot's lock, waiting at most the hook deadline plus a margin for a run in
+/// progress. A timed-out wait leaves the slot as it is.
+fn lock_slot(
+    slot: &Slot,
+) -> Result<std::sync::MutexGuard<'_, Option<ResolvedBeforeStart>>, BeforeStartHookError> {
+    let deadline = std::time::Instant::now() + before_start_hook_timeout() + SLOT_WAIT_MARGIN;
+    #[cfg(test)]
+    let mut counted = false;
+    loop {
+        match slot.state.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) =>
+            {
+                #[cfg(test)]
+                if !std::mem::replace(&mut counted, true) {
+                    slot.waiters
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                target: "session.profile",
+                "timed out waiting for another before_start hook run of this session"
+            );
+            return Err(BeforeStartHookError::Busy);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Overwrites the values in place before they are dropped (best effort: copies made
+/// elsewhere are not reachable from here).
+fn scrub(env: &mut [(String, String)]) {
+    for (key, value) in env {
+        for text in [key, value] {
+            let len = text.len();
+            text.replace_range(.., &"\0".repeat(len));
+        }
+    }
+}
+
+/// Forgets a session's resolved hook environment (the session was deleted, trashed or
+/// archived, or has no hook configured any more), so a secret nothing will consume does not
+/// stay in memory. A resolver that holds the slot meanwhile finds its tombstone and drops
+/// what it resolved instead of storing it.
+pub(crate) fn forget_before_start_resolution(session_id: &str) {
+    let slot = BEFORE_START_SLOTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(session_id);
+    if let Some(slot) = slot {
+        slot.forgotten
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut state) = slot.state.try_lock() {
+            if let Some(mut resolved) = state.take() {
+                scrub(&mut resolved.env);
+            }
+        }
+    }
 }
 
 impl Instance {
@@ -193,6 +413,18 @@ impl Instance {
             &image,
             global_config.sandbox.container_runtime.into(),
         );
+        // A come-up resolves its `before_start` environment, and gates on it again if it has
+        // to mint, before any destructive step below (store move, container removal, image
+        // pull): a refusal then leaves everything as it was. A running container comes up
+        // nothing and leaves the session's resolution alone.
+        self.before_start_minted_for_launch = false;
+        if self.launch_admission.is_some()
+            && !launch_config.profile.host_hooks.before_start.is_empty()
+            && !container.is_running()?
+        {
+            self.ensure_before_start_env(true, &launch_config, &mut run_hook)?;
+            self.before_start_minted_for_launch = true;
+        }
         // Migration takes the transition lock exclusively, before the shared guard below.
         if self.sandbox_store_move_pending() {
             match self.move_sandbox_store_in(
@@ -439,6 +671,579 @@ impl Instance {
         Ok(container.carries_shared_credential_label()? == Some(false))
     }
 
+    /// Refuses a sandbox launch in `separate_login` mode while the shared credential its
+    /// agent needs holds none, before any container or agent starts. The agent's login
+    /// integration says whether this launch uses that credential at all: another auth
+    /// route, such as a cloud provider pick or an API key, does not. An unreadable file
+    /// counts as holding none. Keyed on `tool`, as the container's agent config mounts are,
+    /// so another agent run in a `tool = "claude"` session is gated too.
+    ///
+    /// This is the hold decision only: a launch the active runtime cannot log in at all
+    /// ([`SandboxLoginUnsupported`]) is never held, see [`Self::ensure_sandbox_launchable_for`].
+    #[cfg(test)]
+    pub(crate) fn ensure_sandbox_login(&self) -> Result<(), SandboxLoginRequired> {
+        self.ensure_sandbox_login_for(None, &[])
+    }
+
+    /// The hold decision of [`Self::ensure_sandbox_login`] on `config`, for the launch of the
+    /// stored agent: reads only what the session already holds (its fresh hook resolution,
+    /// never a hook run), so a poller can ask for every held session.
+    pub(crate) fn ensure_sandbox_login_with(
+        &self,
+        config: &crate::session::LaunchConfig,
+    ) -> Result<(), SandboxLoginRequired> {
+        let hook_env = self.trusted_before_start_env(config, std::time::Duration::ZERO);
+        match self.sandbox_login_gate_with(config, None, &[], hook_env) {
+            Some((container_config::LoginGate::LoginRequired, target)) => {
+                Err(self.login_required(&target))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// The launch configuration the files on disk give this row, for a test that decides on
+    /// what a settings file says.
+    #[cfg(test)]
+    pub(crate) fn test_launch_config(&self) -> crate::session::LaunchConfig {
+        crate::session::storage::local_launch_configuration(
+            &self.effective_profile(),
+            Path::new(&self.project_path),
+        )
+    }
+
+    /// The store of this row's profile on disk, for a test of the admission.
+    #[cfg(test)]
+    pub(crate) fn test_store(&self) -> Storage {
+        Storage::open_unwatched(&self.effective_profile()).expect("open the profile's store")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_launchable(&mut self) -> anyhow::Result<()> {
+        let store = self.test_store();
+        self.ensure_sandbox_launchable(&store)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_launchable_for(
+        &mut self,
+        launch_agent: Option<&str>,
+        request_env: &[(String, String)],
+    ) -> anyhow::Result<()> {
+        let store = self.test_store();
+        self.ensure_sandbox_launchable_for(
+            &store,
+            launch_agent,
+            request_env,
+            &mut Self::mint_before_start_env,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_launchable_strict(&self) -> anyhow::Result<()> {
+        self.ensure_sandbox_launchable_strict(&self.test_store())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_resolve_for_restart(&mut self) -> anyhow::Result<()> {
+        let store = self.test_store();
+        self.resolve_before_start_for_restart(&store, true)
+    }
+
+    #[cfg(test)]
+    fn test_ensure_before_start_env(&mut self, force: bool) -> Result<()> {
+        let config = self.test_launch_config();
+        self.ensure_before_start_env(force, &config, &mut Self::mint_before_start_env)
+    }
+
+    /// [`Self::ensure_sandbox_login`] for a launch that carries a request's `provider_env`,
+    /// which the launch forwards into the sandbox and so counts as its auth route, and the
+    /// agent the request selected. `launch_agent` is the agent the launch will run; its
+    /// adapter's allowlist decides which host variables cross, so it is what admission
+    /// reads, and `None` is the stored agent. Both are read for this decision only, never
+    /// stored; a launch without the request (a respawn, the reconciler) is admitted on what
+    /// is stored.
+    #[cfg(test)]
+    pub(crate) fn ensure_sandbox_login_for(
+        &self,
+        launch_agent: Option<&str>,
+        request_env: &[(String, String)],
+    ) -> Result<(), SandboxLoginRequired> {
+        match self.sandbox_login_gate(launch_agent, request_env) {
+            Some((container_config::LoginGate::LoginRequired, target)) => {
+                Err(self.login_required(&target))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// The whole admission of a sandbox launch (see the module doc): the hold decision of
+    /// [`Self::ensure_sandbox_login_for`] and the refusal of a login the runtime cannot
+    /// perform ([`SandboxLoginUnsupported`]). The error downcasts to one of the two, or is a
+    /// [`BeforeStartHookError`]. The target agent and request environment stay on the row for
+    /// the come-up of the same launch.
+    pub(crate) fn ensure_sandbox_launchable_for(
+        &mut self,
+        store: &dyn SessionStore,
+        launch_agent: Option<&str>,
+        request_env: &[(String, String)],
+        run_hook: &mut impl FnMut(&mut Self, &crate::session::LaunchConfig) -> Result<()>,
+    ) -> anyhow::Result<()> {
+        let config = store.launch_configuration(Path::new(&self.project_path))?;
+        self.launch_admission = Some(LaunchAdmission {
+            agent: launch_agent.map(str::to_string),
+            request_env: request_env.to_vec(),
+        });
+        let gate = self.resolve_before_start_if_refused(
+            Some(store),
+            &config,
+            launch_agent,
+            request_env,
+            std::time::Duration::ZERO,
+            run_hook,
+        )?;
+        self.admission_result(gate)
+    }
+
+    /// The gate decision for this launch, resolving the `before_start` environment first when
+    /// the cheap decision refuses and a configured hook has no resolution with `margin` of
+    /// life left (see the module doc). The row is reconciled from `reconcile_from` first, so
+    /// the hook sees the row the launch will run (`None` when the row already is that row, as
+    /// a restart's with its settings applied), and the decision is taken on the environment
+    /// just resolved.
+    fn resolve_before_start_if_refused(
+        &mut self,
+        reconcile_from: Option<&dyn SessionStore>,
+        config: &crate::session::LaunchConfig,
+        launch_agent: Option<&str>,
+        request_env: &[(String, String)],
+        margin: std::time::Duration,
+        run_hook: &mut impl FnMut(&mut Self, &crate::session::LaunchConfig) -> Result<()>,
+    ) -> anyhow::Result<Option<(container_config::LoginGate, container_config::LoginTarget)>> {
+        let refused = |gate: &Option<(container_config::LoginGate, _)>| {
+            matches!(
+                gate,
+                Some((
+                    container_config::LoginGate::LoginRequired
+                        | container_config::LoginGate::Unsupported,
+                    _
+                ))
+            )
+        };
+        let mut gate = self.sandbox_login_gate_with(
+            config,
+            launch_agent,
+            request_env,
+            self.trusted_before_start_env(config, margin),
+        );
+        if refused(&gate) && self.before_start_hook_pending(config, margin) {
+            // The hook's environment is built from the reconciled row, and the reconciled
+            // row may decide differently before any hook is needed.
+            if let Some(Err(error)) =
+                reconcile_from.map(|store| self.try_reconcile_from_store(store))
+            {
+                tracing::warn!(
+                    target: "session.store",
+                    session = %self.id,
+                    error = %format_args!("{error:#}"),
+                    "failed to reload disk state before resolving the before_start hook; using in-memory value"
+                );
+            }
+            gate = self.sandbox_login_gate_with(
+                config,
+                launch_agent,
+                request_env,
+                self.trusted_before_start_env(config, margin),
+            );
+            if refused(&gate) && self.before_start_hook_pending(config, margin) {
+                let resolved = self.resolve_before_start_in_slot(config, margin, run_hook)?;
+                gate = self.sandbox_login_gate_with(config, launch_agent, request_env, resolved);
+            }
+        }
+        Ok(gate)
+    }
+
+    /// The admission's decision on what the session holds right now, running no hook and
+    /// deferring nothing: a launch the cheap decision refuses is refused, whether its hook
+    /// was never resolved, its resolution expired, would expire within a restart's safety
+    /// margin, or a concurrent come-up consumed it. A restart re-checks with this under the
+    /// lifecycle locks, immediately before it stops or discards anything (hooks may call
+    /// `aoe` on the session, so none runs there).
+    pub(crate) fn ensure_sandbox_launchable_strict(
+        &self,
+        store: &dyn SessionStore,
+    ) -> anyhow::Result<()> {
+        let config = store.launch_configuration(Path::new(&self.project_path))?;
+        let gate = self.sandbox_login_gate_with(
+            &config,
+            None,
+            &[],
+            self.trusted_before_start_env(&config, RESTART_RESOLUTION_MARGIN),
+        );
+        self.admission_result(gate)
+    }
+
+    /// The restart's early resolution, before any lock is taken: like the admission, but a
+    /// resolution that would expire within the restart's safety margin counts as unresolved.
+    /// `reconcile` reloads the row from `store` first; a caller that has applied the restart's
+    /// settings to a row it reconciled itself passes `false`, so the reload cannot undo them.
+    pub(crate) fn resolve_before_start_for_restart(
+        &mut self,
+        store: &dyn SessionStore,
+        reconcile: bool,
+    ) -> anyhow::Result<()> {
+        let config = store.launch_configuration(Path::new(&self.project_path))?;
+        self.resolve_before_start_if_refused(
+            reconcile.then_some(store),
+            &config,
+            None,
+            &[],
+            RESTART_RESOLUTION_MARGIN,
+            &mut Self::mint_before_start_env,
+        )
+        .map(|_| ())
+    }
+
+    /// The refusal a gate decision stands for, as the admission reports it.
+    fn admission_result(
+        &self,
+        gate: Option<(container_config::LoginGate, container_config::LoginTarget)>,
+    ) -> anyhow::Result<()> {
+        match gate {
+            Some((container_config::LoginGate::LoginRequired, target)) => {
+                Err(self.login_required(&target).into())
+            }
+            Some((container_config::LoginGate::Unsupported, _)) => {
+                Err(SandboxLoginUnsupported.into())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// The hook environment the gate may count as an auth route: the session's resolved
+    /// resolution with at least `margin` of life left, or nothing. A cache an earlier come-up
+    /// left on the row is not trusted, and a stale resolution found here is dropped. Never
+    /// blocks: a resolution in flight counts as none yet.
+    fn trusted_before_start_env(
+        &self,
+        config: &crate::session::LaunchConfig,
+        margin: std::time::Duration,
+    ) -> Vec<(String, String)> {
+        let commands = &config.profile.host_hooks.before_start;
+        if commands.is_empty() {
+            return Vec::new();
+        }
+        let fingerprint = self.hook_fingerprint(config);
+        let slot = resolution_slot(&self.id);
+        let mut state = match slot.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Vec::new(),
+        };
+        drop_if_stale(&mut state, fingerprint);
+        state
+            .as_ref()
+            .filter(|resolved| resolved.fresh_for(fingerprint, margin))
+            .map(|resolved| resolved.env.clone())
+            .unwrap_or_default()
+    }
+
+    /// Identity of what the `before_start` hook runs on: its commands, its working directory
+    /// and the environment it is given (the session's `AOE_*` values, among them the profile,
+    /// and the session's host environment). The values are hashed, never kept. A resolution
+    /// made for other inputs (another profile, tool or project) is not this launch's.
+    fn hook_fingerprint(&self, config: &crate::session::LaunchConfig) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        config.profile.host_hooks.before_start.hash(&mut hasher);
+        for part in [
+            &self.id,
+            &self.title,
+            &self.project_path,
+            &self.effective_profile(),
+            &self.tool,
+            &self.group_path,
+        ] {
+            part.hash(&mut hasher);
+        }
+        self.worktree_info
+            .as_ref()
+            .map(|worktree| &worktree.branch)
+            .hash(&mut hasher);
+        if let Some(sandbox) = &self.sandbox_info {
+            crate::session::environment::session_host_env_pairs(
+                &config.profile.sandbox.environment,
+                &config.sandbox().environment,
+                sandbox,
+            )
+            .hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// Whether a configured `host_hooks.before_start` hook has not run for this launch yet
+    /// (or its resolution has less than `margin` left), so its environment could still
+    /// change a refusal.
+    fn before_start_hook_pending(
+        &self,
+        config: &crate::session::LaunchConfig,
+        margin: std::time::Duration,
+    ) -> bool {
+        let commands = &config.profile.host_hooks.before_start;
+        if self.sandbox_info.is_none() || commands.is_empty() {
+            return false;
+        }
+        let fingerprint = self.hook_fingerprint(config);
+        let slot = resolution_slot(&self.id);
+        let mut state = match slot.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            // In flight: resolving waits for it and finds its result.
+            Err(std::sync::TryLockError::WouldBlock) => return true,
+        };
+        drop_if_stale(&mut state, fingerprint);
+        !state
+            .as_ref()
+            .is_some_and(|resolved| resolved.fresh_for(fingerprint, margin))
+    }
+
+    /// Runs `body` on the session's slot with its lock held, which is the resolution guard.
+    /// The wait is bounded; a slot whose session was deleted meanwhile (its tombstone is set)
+    /// is left for the session's next one.
+    fn with_session_slot<R>(
+        &mut self,
+        body: impl FnOnce(&mut Self, &mut Option<ResolvedBeforeStart>, &Slot) -> Result<R>,
+    ) -> Result<R> {
+        let mut body = Some(body);
+        for _ in 0..3 {
+            let slot = resolution_slot(&self.id);
+            let mut state = lock_slot(&slot)?;
+            if slot.forgotten.load(std::sync::atomic::Ordering::SeqCst) {
+                continue;
+            }
+            if let Some(body) = body.take() {
+                return body(self, &mut state, &slot);
+            }
+        }
+        Err(BeforeStartHookError::Busy.into())
+    }
+
+    /// Resolves the session's `before_start` environment into its slot and returns it. The
+    /// slot's lock is held across the check and the hook run, so a caller that finds the slot
+    /// resolved takes that result and runs nothing. One deadline bounds the whole run
+    /// ([`BEFORE_START_HOOK_TIMEOUT`], or the caller's own); a timeout leaves the slot
+    /// unresolved for a retry.
+    fn resolve_before_start_in_slot(
+        &mut self,
+        config: &crate::session::LaunchConfig,
+        margin: std::time::Duration,
+        run_hook: &mut impl FnMut(&mut Self, &crate::session::LaunchConfig) -> Result<()>,
+    ) -> Result<Vec<(String, String)>> {
+        let commands = &config.profile.host_hooks.before_start;
+        if commands.is_empty() {
+            forget_before_start_resolution(&self.id);
+            return Ok(Vec::new());
+        }
+        let fingerprint = self.hook_fingerprint(config);
+        self.with_session_slot(|this, state, slot| {
+            drop_if_stale(state, fingerprint);
+            if let Some(resolved) = state
+                .as_ref()
+                .filter(|resolved| resolved.fresh_for(fingerprint, margin))
+            {
+                let env = resolved.env.clone();
+                if let Some(sandbox) = this.sandbox_info.as_mut() {
+                    sandbox.before_start_env.clone_from(&env);
+                }
+                return Ok(env);
+            }
+            run_hook(this, config)?;
+            let env = this
+                .sandbox_info
+                .as_ref()
+                .map(|sandbox| sandbox.before_start_env.clone())
+                .unwrap_or_default();
+            // The session was deleted while the hook ran: its result is not kept.
+            if !slot.forgotten.load(std::sync::atomic::Ordering::SeqCst) {
+                if let Some(mut replaced) = state.take() {
+                    scrub(&mut replaced.env);
+                }
+                *state = Some(ResolvedBeforeStart {
+                    env: env.clone(),
+                    at: std::time::Instant::now(),
+                    fingerprint,
+                });
+            }
+            Ok(env)
+        })
+    }
+
+    /// Ages the session's resolution past its limit, for a test of the expiry.
+    #[cfg(test)]
+    fn expire_before_start_resolution(&self) {
+        let slot = resolution_slot(&self.id);
+        let mut state = slot
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(resolved) = state.as_mut() {
+            resolved.at = std::time::Instant::now()
+                .checked_sub(BEFORE_START_RESOLUTION_MAX_AGE * 2)
+                .expect("an instant that far back");
+        }
+    }
+
+    /// Leaves the session's resolution only `remaining` of its life, for a test of a
+    /// restart's safety margin.
+    #[cfg(test)]
+    fn age_before_start_resolution(&self, remaining: std::time::Duration) {
+        let slot = resolution_slot(&self.id);
+        let mut state = slot
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(resolved) = state.as_mut() {
+            resolved.at = std::time::Instant::now()
+                .checked_sub(BEFORE_START_RESOLUTION_MAX_AGE - remaining)
+                .expect("an instant that far back");
+        }
+    }
+
+    /// Whether the session's slot still holds a resolution, for a test.
+    #[cfg(test)]
+    fn holds_before_start_resolution(&self) -> bool {
+        resolution_slot(&self.id)
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// The refusal for a launch gated on `target`. The recovery it prints must release this
+    /// launch: it runs under the session's profile (`-p`, unless that is the default one the
+    /// CLI uses anyway), and names the session's own command (`--command`) only when
+    /// `--tool` alone reaches another file than `target` and the command is what leads to
+    /// it.
+    fn login_required(&self, target: &container_config::LoginTarget) -> SandboxLoginRequired {
+        let profile = self.effective_profile();
+        let session_command = Some(self.command.as_str()).filter(|c| !c.is_empty());
+        let reaches = |command: Option<&str>| {
+            container_config::login_target_with_command(&profile, &self.tool, command)
+                .is_some_and(|t| t.credential == target.credential)
+        };
+        let command = session_command.filter(|_| !reaches(None) && reaches(session_command));
+        SandboxLoginRequired {
+            tool: self.tool.clone(),
+            credential: target.credential.clone(),
+            profile: (profile != crate::session::config::effective_profile(""))
+                .then(|| profile.clone()),
+            command: command.map(str::to_string),
+        }
+    }
+
+    /// [`Self::ensure_sandbox_launchable_for`] for a launch without a request.
+    pub(crate) fn ensure_sandbox_launchable(
+        &mut self,
+        store: &dyn SessionStore,
+    ) -> anyhow::Result<()> {
+        self.ensure_sandbox_launchable_for(store, None, &[], &mut Self::mint_before_start_env)
+    }
+
+    /// The gate decision for this launch with the target it is gated on; `None` when the
+    /// session is not sandboxed or its agent has no sandbox login.
+    #[cfg(test)]
+    fn sandbox_login_gate(
+        &self,
+        launch_agent: Option<&str>,
+        request_env: &[(String, String)],
+    ) -> Option<(container_config::LoginGate, container_config::LoginTarget)> {
+        let config = self.test_launch_config();
+        self.sandbox_login_gate_with(
+            &config,
+            launch_agent,
+            request_env,
+            self.trusted_before_start_env(&config, std::time::Duration::ZERO),
+        )
+    }
+
+    /// [`Self::sandbox_login_gate`] on an explicit `before_start` environment: the one a
+    /// come-up has just minted, which is not resolved in any slot.
+    fn sandbox_login_gate_with(
+        &self,
+        config: &crate::session::LaunchConfig,
+        launch_agent: Option<&str>,
+        request_env: &[(String, String)],
+        hook_env: Vec<(String, String)>,
+    ) -> Option<(container_config::LoginGate, container_config::LoginTarget)> {
+        if !self.is_sandboxed() {
+            return None;
+        }
+        let profile = self.effective_profile();
+        let mode = config.profile.sandbox.shared_credential;
+        // The same resolution `aoe sandbox login` runs, with this session's command, so the
+        // file the gate waits for is the one the login writes. The agent identity comes from
+        // the profile's settings alone, as the container mount resolves the agent it mounts
+        // (`build_container_config`): an agent only the repository's settings declare gets no
+        // shared credential mount, so gating on its file would hold the session for a login
+        // the sandbox never reads. Only the env route below follows the repository too,
+        // because the launch reads profile and repository for its adapter's allowlist.
+        let target =
+            container_config::login_target_with_command(&profile, &self.tool, Some(&self.command))?;
+        let gate = container_config::login_gate(
+            mode,
+            containers::get_container_runtime().kind,
+            target.login,
+            &self.launch_auth(config, &profile, launch_agent, request_env, hook_env),
+            || {
+                container_config::read_shared_credential(&target.credential).unwrap_or_else(|e| {
+                tracing::warn!(target: "session.profile", session = %self.id, "Failed to read the shared credential: {e:#}");
+                None
+            })
+            },
+        );
+        Some((gate, target))
+    }
+
+    /// The auth route this launch runs with: the sandbox environment for the session's own
+    /// provider pick, which a container built for an earlier pick does not reflect yet.
+    fn launch_auth(
+        &self,
+        launch_config: &crate::session::LaunchConfig,
+        profile: &str,
+        launch_agent: Option<&str>,
+        request_env: &[(String, String)],
+        hook_env: Vec<(String, String)>,
+    ) -> LaunchAuth {
+        let Some(sandbox) = self.sandbox_info.as_ref() else {
+            return LaunchAuth::default();
+        };
+        // Only a resolved, fresh hook environment counts as an auth route: a cache an earlier
+        // come-up left on the row says nothing about what the hook emits now.
+        let sandbox = SandboxInfo {
+            provider: self.agent_provider.clone(),
+            before_start_env: hook_env,
+            ..sandbox.clone()
+        };
+        let mut env =
+            crate::session::environment::collect_environment(launch_config.sandbox(), &sandbox);
+        // A structured launch also forwards the request's `provider_env` and the adapter's
+        // allowlisted host variables (an API key or token the daemon has set), after the
+        // sandbox environment has claimed its own; the launch's own resolution decides which
+        // of them cross, so this sees what the launch will run with.
+        if self.view == View::Structured {
+            let agent = launch_agent
+                .or(self.agent_name.as_deref())
+                .unwrap_or(&self.tool);
+            // The launch resolves profile and repository settings, so admission does too.
+            let session = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+                profile,
+                std::path::Path::new(&self.project_path),
+            )
+            .session;
+            env = crate::acp::sandbox::effective_launch_env(agent, &session, &env, request_env);
+        }
+        LaunchAuth::from_env(&env)
+    }
+
     fn ensure_container_hook_mount_source(&self) {
         if let Err(error) = crate::hooks::ensure_instance_dir_path(&self.id) {
             tracing::warn!(
@@ -590,7 +1395,18 @@ impl Instance {
         .map(Some)
     }
 
-    /// Mint host-only hooks on come-up, or backfill an existing container once.
+    /// Mint host-only hooks on come-up, or backfill an existing container once, into
+    /// `sandbox_info.before_start_env`, from where
+    /// [`crate::session::environment::collect_environment`] injects them into the
+    /// container environment on every surface (docker run, the tmux `docker
+    /// exec` launch, and the structured-view worker).
+    ///
+    /// `force` is a container come-up (create or restart): it consumes the resolution the
+    /// admission left in the session's slot, or mints and gates again (see the module doc).
+    /// Without it the container is already running and the slot is not consumed (see
+    /// [`Self::backfill_before_start_env`]). A hook failure is propagated, so the container
+    /// does not come up without the values the agent depends on. Hooks are resolved from
+    /// profile/global config only, never from the repo.
     fn ensure_before_start_env(
         &mut self,
         force: bool,
@@ -602,27 +1418,126 @@ impl Instance {
         }
         let commands = &config.profile.host_hooks.before_start;
         if commands.is_empty() {
+            forget_before_start_resolution(&self.id);
+            return self.mint_before_start_env(config);
+        }
+        if !force {
+            return self.backfill_before_start_env(config, run_hook);
+        }
+        // Already resolved for this launch, ahead of its destructive steps.
+        if std::mem::take(&mut self.before_start_minted_for_launch) {
+            return Ok(());
+        }
+        self.come_up_before_start_env(config, run_hook)
+    }
+
+    /// The values of an already-running container's row. A fresh resolution replaces what
+    /// the row holds (the admission admitted the launch on it; the slot is not consumed, no
+    /// container comes up). Without one, a row that has values keeps them, and one that has
+    /// none runs the hooks once.
+    fn backfill_before_start_env(
+        &mut self,
+        config: &crate::session::LaunchConfig,
+        run_hook: &mut impl FnMut(&mut Self, &crate::session::LaunchConfig) -> Result<()>,
+    ) -> Result<()> {
+        let fingerprint = self.hook_fingerprint(config);
+        if self
+            .sandbox_info
+            .as_ref()
+            .is_some_and(|s| !s.before_start_env.is_empty())
+        {
+            // Never waits on a hook run in flight: the row already has values to attach with.
+            let slot = resolution_slot(&self.id);
+            let state = match slot.state.try_lock() {
+                Ok(state) => state,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
+            };
+            if let (Some(resolved), Some(sandbox)) = (
+                state
+                    .as_ref()
+                    .filter(|r| r.fresh_for(fingerprint, std::time::Duration::ZERO)),
+                self.sandbox_info.as_mut(),
+            ) {
+                sandbox.before_start_env.clone_from(&resolved.env);
+            }
+            return Ok(());
+        }
+        self.with_session_slot(|this, state, _| {
+            drop_if_stale(state, fingerprint);
+            if let Some(resolved) = state
+                .as_ref()
+                .filter(|r| r.fresh_for(fingerprint, std::time::Duration::ZERO))
+            {
+                if let Some(sandbox) = this.sandbox_info.as_mut() {
+                    sandbox.before_start_env.clone_from(&resolved.env);
+                }
+                return Ok(());
+            }
+            run_hook(this, config)
+        })
+    }
+
+    /// The come-up's values: the consumed resolution, or a mint gated again.
+    fn come_up_before_start_env(
+        &mut self,
+        config: &crate::session::LaunchConfig,
+        run_hook: &mut impl FnMut(&mut Self, &crate::session::LaunchConfig) -> Result<()>,
+    ) -> Result<()> {
+        let fingerprint = self.hook_fingerprint(config);
+        self.with_session_slot(|this, state, _| {
+            match state.take() {
+                Some(mut resolved)
+                    if resolved.fresh_for(fingerprint, std::time::Duration::ZERO) =>
+                {
+                    if let Some(sandbox) = this.sandbox_info.as_mut() {
+                        sandbox.before_start_env.clone_from(&resolved.env);
+                    }
+                    scrub(&mut resolved.env);
+                    return Ok(());
+                }
+                Some(mut stale) => scrub(&mut stale.env),
+                None => {}
+            }
+            run_hook(this, config)?;
+            if let Some(admission) = this.launch_admission.clone() {
+                let minted = this
+                    .sandbox_info
+                    .as_ref()
+                    .map(|sandbox| sandbox.before_start_env.clone())
+                    .unwrap_or_default();
+                let gate = this.sandbox_login_gate_with(
+                    config,
+                    admission.agent.as_deref(),
+                    &admission.request_env,
+                    minted,
+                );
+                this.admission_result(gate)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Runs the configured `before_start` hooks now, all commands under one deadline
+    /// ([`BEFORE_START_HOOK_TIMEOUT`] or the caller's own, the time left for each command),
+    /// and caches their environment (clearing it when none is configured). The one mint
+    /// behind both the container come-up and the admission's resolution; a failure leaves
+    /// the cache as it was and is a [`BeforeStartHookError`]: its words never carry the
+    /// command or the hook's output.
+    pub(crate) fn mint_before_start_env(
+        &mut self,
+        config: &crate::session::LaunchConfig,
+    ) -> Result<()> {
+        if self.sandbox_info.is_none() {
+            return Ok(());
+        }
+        let commands = &config.profile.host_hooks.before_start;
+        if commands.is_empty() {
             if let Some(sb) = self.sandbox_info.as_mut() {
                 sb.before_start_env.clear();
             }
             return Ok(());
         }
-        let already_minted = self
-            .sandbox_info
-            .as_ref()
-            .is_some_and(|s| !s.before_start_env.is_empty());
-        if !force && already_minted {
-            return Ok(());
-        }
-        run_hook(self, config)
-    }
-
-    pub(crate) fn mint_before_start_env(
-        &mut self,
-        config: &crate::session::LaunchConfig,
-    ) -> Result<()> {
-        let commands = &config.profile.host_hooks.before_start;
-
         let hook_env = crate::session::config::repo_config::lifecycle_env_vars(self);
         let project_path = PathBuf::from(&self.project_path);
         // Repository-contributed values must not enter the host hook environment.
@@ -637,12 +1552,28 @@ impl Instance {
                 )
             })
             .unwrap_or_default();
-        let minted = crate::session::config::repo_config::run_before_start_hooks(
-            commands,
-            &project_path,
-            &hook_env,
-            &session_env,
-        )?;
+        let deadline = std::time::Instant::now() + before_start_hook_timeout();
+        let mut minted: Vec<(String, String)> = Vec::new();
+        for command in commands {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(self
+                    .log_before_start_failure(BeforeStartHookError::TimedOut, None)
+                    .into());
+            }
+            let _bounded = crate::session::HookTimeoutScope::new(remaining);
+            let pairs = crate::session::config::repo_config::run_before_start_hooks(
+                std::slice::from_ref(command),
+                &project_path,
+                &hook_env,
+                &session_env,
+            )
+            .map_err(|error| self.classify_before_start_failure(&error))?;
+            for (key, value) in pairs {
+                minted.retain(|(existing, _)| existing != &key);
+                minted.push((key, value));
+            }
+        }
         if let Some(sb) = self.sandbox_info.as_mut() {
             sb.before_start_env = minted;
         }
@@ -664,7 +1595,38 @@ impl Instance {
         self.resolved_host_environment_from(self.profile_host_environment())
     }
 
-    ////// Mint the `host_hooks.before_session` environment for a host
+    /// The client-safe class of a failed hook run; the server logs it with the exit status or
+    /// the timeout, never the command or the hook's output.
+    fn classify_before_start_failure(&self, error: &anyhow::Error) -> BeforeStartHookError {
+        use crate::session::config::repo_config::{HookExit, HookTimeout};
+        let timeout = error.chain().find_map(|c| c.downcast_ref::<HookTimeout>());
+        let exit = error.chain().find_map(|c| c.downcast_ref::<HookExit>());
+        let class = if timeout.is_some() {
+            BeforeStartHookError::TimedOut
+        } else if exit.is_some() {
+            BeforeStartHookError::Failed
+        } else {
+            BeforeStartHookError::NotStarted
+        };
+        self.log_before_start_failure(class, exit.and_then(|e| e.code))
+    }
+
+    fn log_before_start_failure(
+        &self,
+        class: BeforeStartHookError,
+        exit_status: Option<i32>,
+    ) -> BeforeStartHookError {
+        tracing::warn!(
+            target: "session.profile",
+            session = %self.id,
+            class = ?class,
+            exit_status = ?exit_status,
+            "host before_start hook produced no environment"
+        );
+        class
+    }
+
+    /// Mint the `host_hooks.before_session` environment for a host
     /// (non-sandboxed) session launch.
     ///
     /// Host launches mint fresh values; sandboxed launches use before_start instead.
@@ -694,6 +1656,322 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::config::SharedCredentialMode;
+
+    fn sandboxed_instance(tool: &str) -> Instance {
+        let mut inst = Instance::new("login gate", "/tmp/aoe-login-gate");
+        inst.tool = tool.to_string();
+        inst.sandbox_info = Some(SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "aoe-login-gate".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            container_workdir: None,
+        });
+        inst
+    }
+
+    fn set_shared_credential_mode(mode: SharedCredentialMode) {
+        crate::session::config::update_config(|c| c.sandbox.shared_credential = mode).unwrap();
+    }
+
+    /// Writes `content` to the shared Claude credential under `home`.
+    fn write_shared_credential(home: &std::path::Path, content: &str) {
+        let root = home.join(".claude").join("sandbox-v2");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".credentials.json"), content).unwrap();
+    }
+
+    /// Waits for `done` to hold, for a condition another thread brings about. Failing the
+    /// wait fails the test, so a precondition is never assumed.
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(done(), "timed out waiting for {what}");
+    }
+
+    fn usable_credential() -> String {
+        let expires_at = chrono::Utc::now().timestamp_millis() + 3_600_000;
+        crate::session::sandbox_login::claude::fixtures::usable(expires_at as u64)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_gate_instance_requires_login_in_separate_login() {
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        set_shared_credential_mode(SharedCredentialMode::SeparateLogin);
+        let claude = sandboxed_instance("claude");
+
+        assert_eq!(
+            claude.ensure_sandbox_login(),
+            Err(crate::session::test_support::login_required_under(
+                "claude",
+                home.path()
+            )),
+            "no file"
+        );
+        write_shared_credential(home.path(), "{}");
+        assert_eq!(
+            claude.ensure_sandbox_login(),
+            Err(crate::session::test_support::login_required_under(
+                "claude",
+                home.path()
+            ))
+        );
+        write_shared_credential(home.path(), &usable_credential());
+        assert_eq!(claude.ensure_sandbox_login(), Ok(()));
+
+        #[cfg(unix)]
+        if !nix::unistd::geteuid().is_root() {
+            use std::os::unix::fs::PermissionsExt;
+            let shared = home.path().join(".claude/sandbox-v2/.credentials.json");
+            std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let unreadable = claude.ensure_sandbox_login();
+            std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(
+                unreadable,
+                Err(crate::session::test_support::login_required_under(
+                    "claude",
+                    home.path()
+                )),
+                "unreadable file"
+            );
+        }
+
+        write_shared_credential(home.path(), "{}");
+        let mut host = sandboxed_instance("claude");
+        host.sandbox_info = None;
+        assert_eq!(host.ensure_sandbox_login(), Ok(()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_gate_host_seed_and_codex_launch_unchanged() {
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        write_shared_credential(home.path(), "{}");
+
+        set_shared_credential_mode(SharedCredentialMode::HostSeed);
+        assert_eq!(sandboxed_instance("claude").ensure_sandbox_login(), Ok(()));
+        set_shared_credential_mode(SharedCredentialMode::SeparateLogin);
+        assert_eq!(sandboxed_instance("codex").ensure_sandbox_login(), Ok(()));
+    }
+
+    /// A launch on another auth route (a cloud provider pick, an API key or token in the
+    /// sandbox environment) never reads the shared OAuth login, so an empty file does not
+    /// hold it; an OAuth-dependent launch with the same file stays held.
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_gate_holds_only_launches_that_use_the_shared_login() {
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let _env = crate::session::test_support::EnvGuard::unset(&[
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+        ]);
+        set_shared_credential_mode(SharedCredentialMode::SeparateLogin);
+        write_shared_credential(home.path(), "{}");
+
+        // (provider pick, sandbox environment, held)
+        let cases: [(Option<&str>, &[&str], bool); 8] = [
+            (None, &[], true),
+            (Some("api"), &[], true),
+            (Some("bedrock"), &[], false),
+            (Some("vertex"), &[], false),
+            (None, &["ANTHROPIC_API_KEY=sk-test"], false),
+            (Some("api"), &["CLAUDE_CODE_OAUTH_TOKEN=token"], false),
+            (None, &["ANTHROPIC_AUTH_TOKEN=token"], false),
+            (None, &["UNRELATED=1"], true),
+        ];
+        for (provider, env, held) in cases {
+            let mut inst = sandboxed_instance("claude");
+            inst.agent_provider = provider.map(str::to_string);
+            if let Some(sandbox) = inst.sandbox_info.as_mut() {
+                sandbox.extra_env = Some(env.iter().map(|e| e.to_string()).collect());
+            }
+            assert_eq!(
+                inst.ensure_sandbox_login().is_err(),
+                held,
+                "{provider:?} {env:?}"
+            );
+        }
+
+        // The pick on the session decides, not the provider its container was built for.
+        let mut stale = sandboxed_instance("claude");
+        stale.agent_provider = Some("bedrock".to_string());
+        if let Some(sandbox) = stale.sandbox_info.as_mut() {
+            sandbox.provider = Some("api".to_string());
+        }
+        assert_eq!(stale.ensure_sandbox_login(), Ok(()));
+    }
+
+    /// A structured launch also gets the adapter's allowlisted host variables, so a daemon
+    /// host exporting an API key or setup token is not held; a terminal session gets none of
+    /// them, so the same host still holds it. An empty value is no route.
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_gate_counts_the_host_variables_a_structured_launch_forwards() {
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let _unset = crate::session::test_support::EnvGuard::unset(&[
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+        ]);
+        set_shared_credential_mode(SharedCredentialMode::SeparateLogin);
+        write_shared_credential(home.path(), "{}");
+        let structured = {
+            let mut inst = sandboxed_instance("claude");
+            inst.view = View::Structured;
+            inst
+        };
+        let terminal = sandboxed_instance("claude");
+
+        let unset = crate::session::test_support::EnvGuard::unset(&["ANTHROPIC_API_KEY"]);
+        assert!(
+            structured.ensure_sandbox_login().is_err(),
+            "no host key: held"
+        );
+        drop(unset);
+
+        let _empty = crate::session::test_support::EnvGuard::set(&[("ANTHROPIC_API_KEY", "")]);
+        assert!(
+            structured.ensure_sandbox_login().is_err(),
+            "an empty key is no route"
+        );
+        drop(_empty);
+
+        let _key = crate::session::test_support::EnvGuard::set(&[("ANTHROPIC_API_KEY", "sk-host")]);
+        assert_eq!(
+            structured.ensure_sandbox_login(),
+            Ok(()),
+            "forwarded host key"
+        );
+        assert!(
+            terminal.ensure_sandbox_login().is_err(),
+            "a terminal session forwards no host variables"
+        );
+        // The sandbox environment still claims a key first: an explicit provider pick that
+        // blanks nothing relevant leaves the host key in effect, and the pick of API stays held
+        // only without any key.
+        let mut picked = structured.clone();
+        picked.agent_provider = Some("api".to_string());
+        assert_eq!(picked.ensure_sandbox_login(), Ok(()));
+    }
+
+    /// A structured launch forwards the request's `provider_env` between the sandbox
+    /// environment and the daemon's host variables, first claim winning even when empty;
+    /// admission resolves the same order, so a request-only key lifts the hold and an empty
+    /// claim by a higher source beats a key from a lower one.
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_gate_counts_the_request_key_in_the_launch_precedence() {
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let _unset = crate::session::test_support::EnvGuard::unset(&[
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+        ]);
+        set_shared_credential_mode(SharedCredentialMode::SeparateLogin);
+        write_shared_credential(home.path(), "{}");
+        let structured = |sandbox_env: &[&str]| {
+            let mut inst = sandboxed_instance("claude");
+            inst.view = View::Structured;
+            if let Some(sandbox) = inst.sandbox_info.as_mut() {
+                sandbox.extra_env = Some(sandbox_env.iter().map(|e| e.to_string()).collect());
+            }
+            inst
+        };
+        let request = |value: &str| vec![("ANTHROPIC_API_KEY".to_string(), value.to_string())];
+        let held = |inst: &Instance, request_env: &[(String, String)]| {
+            inst.ensure_sandbox_login_for(None, request_env).is_err()
+        };
+
+        let plain = structured(&[]);
+        assert!(!held(&plain, &request("sk-request")), "request-only key");
+        assert!(held(&plain, &[]), "no key: the OAuth-only refusal");
+        assert!(
+            held(&plain, &request("")),
+            "an empty request key is no route"
+        );
+        assert!(
+            held(&plain, &[("UNRELATED".to_string(), "1".to_string())]),
+            "an unrelated request variable is no route"
+        );
+        assert!(
+            held(
+                &plain,
+                &[("CLAUDE_CONFIG_DIR".to_string(), "/x".to_string())]
+            ),
+            "a denied request key claims nothing"
+        );
+        assert!(
+            sandboxed_instance("claude")
+                .ensure_sandbox_login_for(None, &request("sk-request"))
+                .is_err(),
+            "a terminal launch forwards no request"
+        );
+        assert!(held(&plain, &[]), "nothing was remembered from the request");
+
+        // The sandbox environment claims first, even with an empty value.
+        assert!(
+            !held(&structured(&["ANTHROPIC_API_KEY=sk-sandbox"]), &request("")),
+            "sandbox key beats an empty request key"
+        );
+        assert!(
+            held(&structured(&["ANTHROPIC_API_KEY="]), &request("sk-request")),
+            "an empty sandbox key beats the request key"
+        );
+
+        // The request claims ahead of the daemon's host variables.
+        let _host =
+            crate::session::test_support::EnvGuard::set(&[("ANTHROPIC_API_KEY", "sk-host")]);
+        assert!(!held(&plain, &[]), "host key alone");
+        assert!(
+            held(&plain, &request("")),
+            "an empty request key beats the host key"
+        );
+        assert!(
+            !held(&plain, &request("sk-request")),
+            "request key beats the host key"
+        );
+        assert!(
+            held(&structured(&["ANTHROPIC_API_KEY="]), &[]),
+            "an empty sandbox key beats the host key"
+        );
+    }
+
+    #[test]
+    fn sandbox_login_gate_survives_anyhow_context() {
+        let error = anyhow::Error::new(crate::session::test_support::login_required("claude"))
+            .context("ensuring sandbox container");
+        assert_eq!(
+            error.downcast_ref::<SandboxLoginRequired>(),
+            Some(&crate::session::test_support::login_required("claude"))
+        );
+    }
 
     #[test]
     fn hook_mount_source_is_restored_for_agent_without_hooks() {
@@ -709,6 +1987,1670 @@ mod tests {
         assert!(hook_dir.is_dir());
 
         crate::hooks::cleanup_hook_status_dir(&inst.id);
+    }
+
+    /// The agent an explicit spawn selects decides which adapter allowlist admission reads,
+    /// as the launch it admits forwards host variables by that adapter: the stored agent
+    /// stands only when the request names none, and nothing of the request is stored.
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_gate_reads_the_selected_launch_agents_allowlist() {
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let _unset = crate::session::test_support::EnvGuard::unset(&[
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+        ]);
+        let _host =
+            crate::session::test_support::EnvGuard::set(&[("ANTHROPIC_API_KEY", "sk-host")]);
+        set_shared_credential_mode(SharedCredentialMode::SeparateLogin);
+        write_shared_credential(home.path(), "{}");
+        let stored = |agent: &str| {
+            let mut inst = sandboxed_instance("claude");
+            inst.view = View::Structured;
+            inst.agent_name = Some(agent.to_string());
+            inst
+        };
+        let held = |inst: &Instance, selected: Option<&str>| {
+            inst.ensure_sandbox_login_for(selected, &[]).is_err()
+        };
+
+        // The stored agent's allowlist does not forward the key; the selected one does.
+        let codex = stored("codex");
+        assert!(held(&codex, None), "stored codex forwards no host key");
+        assert!(
+            !held(&codex, Some("claude")),
+            "the selected claude adapter forwards the key"
+        );
+        // The reverse: the stored agent would forward it, the selected one does not.
+        let claude = stored("claude");
+        assert!(!held(&claude, None), "stored claude forwards the host key");
+        assert!(
+            held(&claude, Some("codex")),
+            "the selected codex adapter forwards no host key"
+        );
+        assert!(!held(&claude, Some("claude")), "same agent, same decision");
+        // The request's own key still counts with either agent.
+        let request = [("ANTHROPIC_API_KEY".to_string(), "sk-request".to_string())];
+        assert!(codex.ensure_sandbox_login_for(None, &request).is_ok());
+
+        // Nothing of the request reached the session or the shared credential.
+        assert_eq!(codex.agent_name.as_deref(), Some("codex"));
+        assert_eq!(claude.agent_name.as_deref(), Some("claude"));
+        assert_eq!(
+            std::fs::read_to_string(home.path().join(".claude/sandbox-v2/.credentials.json"))
+                .unwrap(),
+            "{}"
+        );
+        assert!(held(&codex, None), "the selection was not remembered");
+    }
+
+    /// The adapter an agent name resolves to may come from the repository's own settings:
+    /// execution resolves profile and repository, so admission must too. A key the daemon
+    /// holds crosses for a repository-only `agent_detect_as`, and a launch without one is
+    /// still held.
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_gate_reads_the_adapter_a_repository_setting_declares() {
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let _unset = crate::session::test_support::EnvGuard::unset(&[
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+        ]);
+        set_shared_credential_mode(SharedCredentialMode::SeparateLogin);
+        write_shared_credential(home.path(), "{}");
+        let project = tempfile::TempDir::new().unwrap();
+        let repo_config = project.path().join(".agent-of-empires");
+        std::fs::create_dir_all(&repo_config).unwrap();
+        std::fs::write(
+            repo_config.join("config.toml"),
+            "[session.agent_detect_as]\npersonal = \"claude\"\n",
+        )
+        .unwrap();
+        let mut inst = sandboxed_instance("claude");
+        inst.project_path = project.path().to_string_lossy().into_owned();
+        inst.view = View::Structured;
+        inst.agent_name = Some("personal".to_string());
+
+        assert!(
+            inst.ensure_sandbox_login().is_err(),
+            "no allowlisted key: held"
+        );
+        let _key = crate::session::test_support::EnvGuard::set(&[("ANTHROPIC_API_KEY", "sk-host")]);
+        assert_eq!(
+            inst.ensure_sandbox_login(),
+            Ok(()),
+            "the repository's adapter forwards the host key, as the launch does"
+        );
+        assert!(inst.test_launchable().is_ok(), "the whole admission agrees");
+    }
+
+    /// Writes a repository config declaring `personal` as a Claude adapter and returns the
+    /// repository directory.
+    fn repository_declaring_personal_as_claude() -> tempfile::TempDir {
+        let project = tempfile::TempDir::new().unwrap();
+        let repo_config = project.path().join(".agent-of-empires");
+        std::fs::create_dir_all(&repo_config).unwrap();
+        std::fs::write(
+            repo_config.join("config.toml"),
+            "[session.agent_detect_as]\npersonal = \"claude\"\n",
+        )
+        .unwrap();
+        project
+    }
+
+    /// Writes `body` as the config of profile `name`.
+    fn write_profile_config(name: &str, body: &str) {
+        let path = crate::session::config::profile_config::get_profile_config_path(name).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    /// The gate resolves under the session's profile, the CLI under the default one unless
+    /// `-p` says otherwise: a session in another profile gets the recovery with `-p`, whose
+    /// file is the gate's, while the plain form would log in the default profile's file.
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_required_names_the_profile_the_session_runs_under() {
+        use crate::session::config::container_config::login_target_with_command;
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        set_shared_credential_mode(SharedCredentialMode::SeparateLogin);
+        crate::session::config::update_config(|c| {
+            c.session
+                .custom_agents
+                .insert("personal".to_string(), "claude".to_string());
+        })
+        .unwrap();
+        let default = crate::session::config::effective_profile("");
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("work");
+        write_profile_config(
+            "work",
+            "[session.agent_config_dir]\npersonal = \"~/.claude-work\"\n",
+        );
+        let work_file = home
+            .path()
+            .join(".claude-work/sandbox-v2/.credentials.json");
+        let mut inst = sandboxed_instance("personal");
+        inst.source_profile = "work".to_string();
+
+        let held = inst.ensure_sandbox_login().unwrap_err();
+        assert_eq!(
+            held.to_string(),
+            "sandbox login required for personal: run `aoe sandbox login -p work --tool personal`"
+        );
+        assert_eq!(
+            login_target_with_command("work", "personal", None).map(|t| t.credential),
+            Some(work_file.clone()),
+            "-p work resolves the gate's file"
+        );
+        assert_ne!(
+            login_target_with_command(&default, "personal", None).map(|t| t.credential),
+            Some(work_file),
+            "the plain form would log in another file"
+        );
+
+        // The default profile needs no `-p`.
+        let held = sandboxed_instance("personal")
+            .ensure_sandbox_login()
+            .unwrap_err();
+        assert_eq!(
+            held.to_string(),
+            "sandbox login required for personal: run `aoe sandbox login --tool personal`"
+        );
+    }
+
+    /// Both flags needed: the session's profile is the only one declaring the tool's
+    /// directory and the session's command override is what makes the tool a login agent.
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_required_combines_profile_and_command() {
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        set_shared_credential_mode(SharedCredentialMode::SeparateLogin);
+        crate::session::config::update_config(|c| {
+            c.session
+                .custom_agents
+                .insert("personal".to_string(), "codex".to_string());
+        })
+        .unwrap();
+        // Resolve the default profile before `work` exists, or `work` would become it.
+        let _default = crate::session::config::effective_profile("");
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("work");
+        write_profile_config(
+            "work",
+            "[session.agent_config_dir]\npersonal = \"~/.claude-work\"\n",
+        );
+        let mut inst = sandboxed_instance("personal");
+        inst.source_profile = "work".to_string();
+        inst.command = "claude".to_string();
+
+        assert_eq!(
+            inst.ensure_sandbox_login().unwrap_err().to_string(),
+            "sandbox login required for personal: run `aoe sandbox login -p work --tool personal --command claude`"
+        );
+    }
+
+    /// Identity follows the container mount, which resolves the agent from the profile
+    /// alone: a tool only the repository maps to a login agent gets no shared credential
+    /// mount, so nothing is gated on one.
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_gate_ignores_an_agent_only_the_repository_declares() {
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        set_shared_credential_mode(SharedCredentialMode::SeparateLogin);
+        write_shared_credential(home.path(), "{}");
+        let project = repository_declaring_personal_as_claude();
+        let mut inst = sandboxed_instance("personal");
+        inst.project_path = project.path().to_string_lossy().into_owned();
+
+        assert_eq!(inst.ensure_sandbox_login(), Ok(()));
+        assert!(inst.test_launchable().is_ok());
+    }
+
+    #[test]
+    fn sandbox_login_required_prints_profile_and_command_quoted_in_one_command() {
+        let both = SandboxLoginRequired {
+            tool: "personal".to_string(),
+            credential: "/x/.credentials.json".into(),
+            profile: Some("my work".to_string()),
+            command: Some("claude --model fast".to_string()),
+        };
+        assert_eq!(
+            shell_words::split(&both.login_command()).unwrap(),
+            [
+                "aoe",
+                "sandbox",
+                "login",
+                "-p",
+                "my work",
+                "--tool",
+                "personal",
+                "--command",
+                "claude --model fast",
+            ]
+        );
+    }
+
+    /// A session without a command of its own runs what the profile gives its tool, which is
+    /// what `aoe sandbox login --tool` resolves: the gate must hold it and wait for the same
+    /// file, not stop at the built-in binary or `bash`.
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_gate_resolves_the_profile_command_of_a_session_without_one() {
+        use crate::session::config::container_config::login_target;
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        set_shared_credential_mode(SharedCredentialMode::SeparateLogin);
+        crate::session::config::update_config(|c| {
+            c.session
+                .custom_agents
+                .insert("personal".to_string(), "claude".to_string());
+            c.session
+                .agent_config_dir
+                .insert("personal".to_string(), "~/.claude-personal".to_string());
+        })
+        .unwrap();
+        let profile = crate::session::config::effective_profile("");
+        let mut inst = sandboxed_instance("personal");
+        assert!(inst.command.is_empty());
+
+        let held = inst.ensure_sandbox_login().unwrap_err();
+        let login = login_target(&profile, "personal").unwrap().credential;
+        assert_eq!(
+            login,
+            home.path()
+                .join(".claude-personal/sandbox-v2/.credentials.json")
+        );
+        assert_eq!(
+            held.credential, login,
+            "the gate waits for the login's file"
+        );
+        assert_eq!(held.command, None, "plain --tool reaches it");
+
+        // A command of its own still wins over the profile's.
+        inst.command = "codex".to_string();
+        assert_eq!(inst.ensure_sandbox_login(), Ok(()), "codex has no login");
+    }
+
+    /// The recovery the refusal prints must release the launch: the plain `--tool` form when
+    /// that reaches the gate's file, the `--command` form (quoted) only when the session's own
+    /// command is what leads there.
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_required_names_the_command_only_where_tool_alone_misses_the_file() {
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        set_shared_credential_mode(SharedCredentialMode::SeparateLogin);
+        crate::session::config::update_config(|c| {
+            c.session
+                .custom_agents
+                .insert("personal".to_string(), "codex".to_string());
+            c.session
+                .agent_config_dir
+                .insert("personal".to_string(), "~/.codex-personal".to_string());
+        })
+        .unwrap();
+        let refused = |tool: &str, command: &str| {
+            let mut inst = sandboxed_instance(tool);
+            inst.command = command.to_string();
+            inst.ensure_sandbox_login().unwrap_err()
+        };
+
+        let overridden = refused("personal", "claude");
+        assert_eq!(overridden.command.as_deref(), Some("claude"));
+        assert_eq!(
+            overridden.to_string(),
+            "sandbox login required for personal: run `aoe sandbox login --tool personal --command claude`"
+        );
+
+        let spaced = refused("personal", "claude --model fast");
+        assert_eq!(spaced.command.as_deref(), Some("claude --model fast"));
+        assert!(
+            spaced
+                .to_string()
+                .contains("--tool personal --command 'claude --model fast'`"),
+            "{spaced}"
+        );
+        let quoted = spaced.login_command();
+        let words = shell_words::split(&quoted).unwrap();
+        assert_eq!(
+            words.last().map(String::as_str),
+            Some("claude --model fast"),
+            "the command is one shell word"
+        );
+
+        for (tool, command) in [("claude", "claude"), ("claude", "")] {
+            let plain = refused(tool, command);
+            assert_eq!(plain.command, None, "{tool} {command:?}");
+            assert_eq!(
+                plain.to_string(),
+                "sandbox login required for claude: run `aoe sandbox login --tool claude`"
+            );
+        }
+        let body = crate::server::api::sandbox_login_required_body(&overridden);
+        assert_eq!(body["command"], "claude");
+        assert_eq!(
+            crate::server::api::sandbox_login_required_body(&refused("claude", "claude"))
+                .get("command"),
+            None
+        );
+    }
+
+    /// Points `host_hooks.before_start` at a hook that appends a line to the returned counter
+    /// file on every run, then runs `tail`. Returns the counter's path.
+    fn counting_before_start_hook(dir: &std::path::Path, tail: &str) -> std::path::PathBuf {
+        let counter = dir.join("hook-runs");
+        let hook = format!(
+            "echo run >> {}; {tail}",
+            crate::session::environment::shell_escape(&counter.to_string_lossy()),
+        );
+        crate::session::config::update_config(|global| {
+            global.host_hooks.before_start = vec![hook];
+        })
+        .unwrap();
+        counter
+    }
+
+    fn hook_runs(counter: &std::path::Path) -> usize {
+        std::fs::read_to_string(counter)
+            .map(|runs| runs.lines().count())
+            .unwrap_or(0)
+    }
+
+    /// Admission looks at what the launch really carries, and a trusted `before_start` host
+    /// hook is part of that: its environment is not cached yet when the gate runs (always
+    /// after a daemon restart). The gate resolves it lazily, only when it would refuse,
+    /// through the mint the container come-up uses, so the hook runs once per come-up, a
+    /// refused attempt does not run it again (an empty result is a result), and merely
+    /// configuring one never admits a launch whose environment carries no auth route.
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_gate_resolves_a_before_start_hook_lazily_once_per_come_up() {
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let _unset = crate::session::test_support::EnvGuard::unset(&[
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+        ]);
+        set_shared_credential_mode(SharedCredentialMode::SeparateLogin);
+        write_shared_credential(home.path(), "{}");
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let session = |view: View| {
+            let mut inst = sandboxed_instance("claude");
+            inst.project_path = project.to_string_lossy().into_owned();
+            inst.view = view;
+            inst
+        };
+        let required = |result: &anyhow::Result<()>| {
+            result
+                .as_ref()
+                .err()
+                .and_then(|e| e.downcast_ref::<SandboxLoginRequired>())
+                .is_some()
+        };
+
+        for view in [View::Structured, View::Terminal] {
+            let label = format!("{view:?}");
+            let launch = |inst: &mut Instance| match view {
+                View::Structured => inst.test_launchable_for(None, &[]),
+                View::Terminal => inst.test_launchable(),
+            };
+
+            // A hook emitting the key: admitted; a second pre-check and the come-up reuse
+            // its values; only the next come-up mints again.
+            let counter = counting_before_start_hook(home.path(), "echo ANTHROPIC_API_KEY=sk-hook");
+            let _ = std::fs::remove_file(&counter);
+            let mut inst = session(view);
+            assert!(
+                inst.sandbox_info
+                    .as_ref()
+                    .unwrap()
+                    .before_start_env
+                    .is_empty(),
+                "{label}: nothing cached at admission"
+            );
+            let result = launch(&mut inst);
+            assert!(result.is_ok(), "{label}: {result:?}");
+            assert_eq!(hook_runs(&counter), 1, "{label}: one run at admission");
+            assert_eq!(
+                inst.sandbox_info.as_ref().unwrap().before_start_env,
+                vec![("ANTHROPIC_API_KEY".to_string(), "sk-hook".to_string())],
+                "{label}: the values stay in the cache"
+            );
+            assert!(launch(&mut inst).is_ok(), "{label}: second pre-check");
+            assert_eq!(hook_runs(&counter), 1, "{label}: it reuses the resolution");
+            inst.test_ensure_before_start_env(true).unwrap();
+            assert_eq!(hook_runs(&counter), 1, "{label}: the come-up consumes it");
+            inst.test_ensure_before_start_env(true).unwrap();
+            assert_eq!(hook_runs(&counter), 2, "{label}: the next come-up mints");
+
+            // A restart empties the cache: it resolves again, once.
+            inst.sandbox_info.as_mut().unwrap().before_start_env.clear();
+            assert!(launch(&mut inst).is_ok(), "{label}");
+            assert_eq!(hook_runs(&counter), 3, "{label}: resolved after a restart");
+
+            // A hook without an auth route does not admit the launch, and a repeated refused
+            // attempt does not run it again, whether it printed nothing useful or nothing.
+            for (tail, what) in [("echo FOO=bar", "no auth"), ("true", "empty")] {
+                let counter = counting_before_start_hook(home.path(), tail);
+                let _ = std::fs::remove_file(&counter);
+                let mut inst = session(view);
+                assert!(required(&launch(&mut inst)), "{label} {what}: refused");
+                assert_eq!(hook_runs(&counter), 1, "{label} {what}");
+                assert!(
+                    required(&launch(&mut inst)),
+                    "{label} {what}: refused again"
+                );
+                assert_eq!(hook_runs(&counter), 1, "{label} {what}: not run again");
+            }
+
+            // A failing hook surfaces its own error, not the login refusal.
+            let counter = counting_before_start_hook(home.path(), "exit 3");
+            let _ = std::fs::remove_file(&counter);
+            let mut inst = session(view);
+            let result = launch(&mut inst);
+            assert!(!required(&result), "{label}: {result:?}");
+            let message = format!("{:#}", result.unwrap_err());
+            assert!(
+                message.contains("before_start hook failed"),
+                "{label}: {message}"
+            );
+
+            // Without a hook nothing runs and the refusal stands.
+            crate::session::config::update_config(|global| global.host_hooks.before_start.clear())
+                .unwrap();
+            let mut inst = session(view);
+            assert!(required(&launch(&mut inst)), "{label}: no hook");
+            assert!(inst
+                .sandbox_info
+                .as_ref()
+                .unwrap()
+                .before_start_env
+                .is_empty());
+
+            // A usable login admits at once: the hook is not run for nothing.
+            let counter = counting_before_start_hook(home.path(), "echo ANTHROPIC_API_KEY=sk-hook");
+            let _ = std::fs::remove_file(&counter);
+            write_shared_credential(home.path(), &usable_credential());
+            let mut inst = session(view);
+            assert!(launch(&mut inst).is_ok(), "{label}");
+            assert_eq!(hook_runs(&counter), 0, "{label}: no hook at admission");
+            write_shared_credential(home.path(), "{}");
+        }
+    }
+
+    /// The hook sees the row the launch will run: admission reconciles the row from disk
+    /// before it builds the hook's environment.
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_admission_builds_the_hook_environment_from_the_reconciled_row() {
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let _unset = crate::session::test_support::EnvGuard::unset(&[
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+        ]);
+        set_shared_credential_mode(SharedCredentialMode::SeparateLogin);
+        write_shared_credential(home.path(), "{}");
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let seen = home.path().join("seen");
+        let hook = format!(
+            "echo \"marker=$TEST_MARKER\" >> {}; echo ANTHROPIC_API_KEY=sk-hook",
+            crate::session::environment::shell_escape(&seen.to_string_lossy())
+        );
+        crate::session::config::update_config(|global| global.host_hooks.before_start = vec![hook])
+            .unwrap();
+        let profile = "w11-reconcile";
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(profile);
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        let mut stored = sandboxed_instance("claude");
+        stored.project_path = project.to_string_lossy().into_owned();
+        stored.source_profile = profile.to_string();
+        stored.sandbox_info.as_mut().unwrap().extra_env = Some(vec!["TEST_MARKER=disk".into()]);
+        storage
+            .update(|instances, _groups| {
+                instances.push(stored.clone());
+                Ok(())
+            })
+            .unwrap();
+        // A copy that is stale against what a peer wrote.
+        let mut live = stored.clone();
+        live.sandbox_info.as_mut().unwrap().extra_env = Some(vec!["TEST_MARKER=stale".into()]);
+
+        assert!(live.test_launchable_for(None, &[]).is_ok());
+        assert_eq!(
+            std::fs::read_to_string(&seen).unwrap().trim(),
+            "marker=disk",
+            "the hook ran on the reconciled row"
+        );
+    }
+
+    /// A resolution ages out and a restart's pre-check under the lifecycle locks never runs
+    /// the hook; the resolution is the session's, so every copy of the row shares it and the
+    /// come-up consumes it.
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_before_start_resolution_expires_is_shared_and_runs_no_hook_under_locks() {
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let _unset = crate::session::test_support::EnvGuard::unset(&[
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+        ]);
+        set_shared_credential_mode(SharedCredentialMode::SeparateLogin);
+        write_shared_credential(home.path(), "{}");
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let counter = counting_before_start_hook(home.path(), "echo FOO=bar");
+        let session = || {
+            let mut inst = sandboxed_instance("claude");
+            inst.project_path = project.to_string_lossy().into_owned();
+            inst
+        };
+        let required = |result: anyhow::Result<()>| {
+            result
+                .err()
+                .and_then(|e| e.downcast::<SandboxLoginRequired>().ok())
+                .is_some()
+        };
+
+        // Under the locks no hook runs: an unresolved one is refused by the strict re-check
+        // (a restart resolves its hook before the locks), never deferred.
+        let mut inst = session();
+        assert!(required(inst.test_launchable_strict()));
+        assert_eq!(hook_runs(&counter), 0, "no hook under the locks");
+        assert!(required(inst.test_launchable()));
+        assert_eq!(hook_runs(&counter), 1);
+        assert!(inst.test_launchable_strict().is_err());
+        assert_eq!(hook_runs(&counter), 1);
+
+        // A resolution older than the limit is unresolved: the hook runs again.
+        inst.expire_before_start_resolution();
+        assert!(required(inst.test_launchable()));
+        assert_eq!(
+            hook_runs(&counter),
+            2,
+            "an expired resolution is resolved again"
+        );
+
+        // Every copy of the row shares the session's resolution, and the come-up consumes it.
+        let mut live = session();
+        let mut copy = live.clone();
+        assert!(required(copy.test_launchable()));
+        assert_eq!(hook_runs(&counter), 3);
+        assert!(required(live.test_launchable()));
+        assert_eq!(hook_runs(&counter), 3, "another copy reuses the resolution");
+        live.test_ensure_before_start_env(true).unwrap();
+        assert_eq!(hook_runs(&counter), 3, "the come-up consumes it");
+        assert!(required(live.test_launchable()));
+        assert_eq!(
+            hook_runs(&counter),
+            4,
+            "consumed: the next admission resolves again"
+        );
+    }
+
+    /// Pre-checks racing on one dormant session (sends, a switch, a launch: each on its own
+    /// copy of the row) run the hook once between them, and so does the come-up that follows.
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_concurrent_pre_checks_run_the_before_start_hook_once() {
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let _unset = crate::session::test_support::EnvGuard::unset(&[
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+        ]);
+        set_shared_credential_mode(SharedCredentialMode::SeparateLogin);
+        write_shared_credential(home.path(), "{}");
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        // The hook takes a moment, so every thread is inside the check while it runs.
+        let counter =
+            counting_before_start_hook(home.path(), "sleep 0.5; echo ANTHROPIC_API_KEY=sk-hook");
+        let mut row = sandboxed_instance("claude");
+        row.project_path = project.to_string_lossy().into_owned();
+        row.view = View::Structured;
+
+        let threads: Vec<_> = (0..4)
+            .map(|n| {
+                let mut copy = row.clone();
+                std::thread::spawn(move || match n {
+                    0 => copy.test_launchable_for(Some("codex"), &[]),
+                    1 => copy.test_launchable_for(None, &[]),
+                    _ => copy.test_launchable(),
+                })
+            })
+            .collect();
+        for thread in threads {
+            assert!(thread.join().unwrap().is_ok(), "every copy is admitted");
+        }
+        assert_eq!(hook_runs(&counter), 1, "the hook ran once for all of them");
+
+        let mut comes_up = row.clone();
+        comes_up.test_ensure_before_start_env(true).unwrap();
+        assert_eq!(hook_runs(&counter), 1, "the come-up used the resolution");
+        assert_eq!(
+            comes_up.sandbox_info.as_ref().unwrap().before_start_env,
+            vec![("ANTHROPIC_API_KEY".to_string(), "sk-hook".to_string())]
+        );
+    }
+
+    /// A cache an earlier come-up left on the row is no auth route: the hook may emit
+    /// something else now. The gate re-resolves instead of trusting it, and a changed hook
+    /// never reuses an older resolution.
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_gate_does_not_trust_a_stale_hook_cache_or_a_changed_hook() {
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let _unset = crate::session::test_support::EnvGuard::unset(&[
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+        ]);
+        set_shared_credential_mode(SharedCredentialMode::SeparateLogin);
+        write_shared_credential(home.path(), "{}");
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let session = || {
+            let mut inst = sandboxed_instance("claude");
+            inst.project_path = project.to_string_lossy().into_owned();
+            // What an earlier come-up minted.
+            inst.sandbox_info.as_mut().unwrap().before_start_env =
+                vec![("ANTHROPIC_API_KEY".to_string(), "sk-old".to_string())];
+            inst
+        };
+        let required = |result: anyhow::Result<()>| {
+            result
+                .err()
+                .and_then(|e| e.downcast::<SandboxLoginRequired>().ok())
+                .is_some()
+        };
+
+        // The hook now emits nothing useful: the stale key does not admit the launch.
+        let counter = counting_before_start_hook(home.path(), "echo FOO=bar");
+        let _ = std::fs::remove_file(&counter);
+        let mut inst = session();
+        assert!(required(inst.test_launchable()), "stale cache");
+        assert_eq!(hook_runs(&counter), 1, "re-resolved, not trusted");
+
+        // The hook now emits a different key: that one is the launch's.
+        let counter = counting_before_start_hook(home.path(), "echo ANTHROPIC_API_KEY=sk-new");
+        let _ = std::fs::remove_file(&counter);
+        let mut inst = session();
+        assert!(inst.test_launchable().is_ok());
+        assert_eq!(hook_runs(&counter), 1);
+        assert_eq!(
+            inst.sandbox_info.as_ref().unwrap().before_start_env,
+            vec![("ANTHROPIC_API_KEY".to_string(), "sk-new".to_string())]
+        );
+
+        // A resolution of one hook is not reused once the hook changed.
+        let counter = counting_before_start_hook(home.path(), "echo FOO=bar");
+        let _ = std::fs::remove_file(&counter);
+        let mut inst = session();
+        assert!(required(inst.test_launchable()));
+        assert_eq!(hook_runs(&counter), 1);
+        let counter = counting_before_start_hook(home.path(), "echo ANTHROPIC_API_KEY=sk-changed");
+        let _ = std::fs::remove_file(&counter);
+        assert!(inst.test_launchable().is_ok(), "the changed hook ran");
+        assert_eq!(hook_runs(&counter), 1);
+    }
+
+    fn hook_prelude(home: &std::path::Path) {
+        set_shared_credential_mode(SharedCredentialMode::SeparateLogin);
+        write_shared_credential(home, "{}");
+    }
+
+    /// A hook that never exits is cut off at its deadline (its process tree killed), and a
+    /// failed run says only that it failed: the error and the logs carry neither the command
+    /// nor the hook's output, which may hold tokens. The slot stays unresolved, so a later
+    /// attempt resolves.
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_before_start_hook_is_bounded_and_its_failure_is_opaque() {
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let _unset = crate::session::test_support::EnvGuard::unset(&[
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+        ]);
+        hook_prelude(home.path());
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let logs = crate::session::test_support::LogCapture::start();
+        let session = || {
+            let mut inst = sandboxed_instance("claude");
+            inst.project_path = project.to_string_lossy().into_owned();
+            inst
+        };
+
+        // Never exits: cut off at the deadline.
+        let counter = counting_before_start_hook(
+            home.path(),
+            "echo token=sekret-token >&2; echo \"K=$HOOK_ONLY_VALUE\"; sleep 30",
+        );
+        let _ = std::fs::remove_file(&counter);
+        let started = std::time::Instant::now();
+        let error = {
+            let _deadline =
+                crate::session::HookTimeoutScope::new(std::time::Duration::from_millis(400));
+            session().test_launchable().unwrap_err()
+        };
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "cut off"
+        );
+        assert_eq!(format!("{error:#}"), "the before_start hook timed out");
+
+        // Exits unsuccessfully: only the class.
+        let counter =
+            counting_before_start_hook(home.path(), "echo token=sekret-token >&2; set -x; exit 3");
+        let _ = std::fs::remove_file(&counter);
+        let error = session().test_launchable().unwrap_err();
+        assert_eq!(format!("{error:#}"), "the before_start hook failed");
+        let logged = logs.contents();
+        for text in [format!("{error:?}"), logged] {
+            assert!(!text.contains("sekret-token"), "{text}");
+            assert!(!text.contains("exit 3"), "{text}");
+            assert!(!text.contains("echo token"), "{text}");
+        }
+
+        // The slot was left unresolved: a working hook resolves on the next attempt.
+        let counter = counting_before_start_hook(home.path(), "echo ANTHROPIC_API_KEY=sk-hook");
+        let _ = std::fs::remove_file(&counter);
+        assert!(session().test_launchable().is_ok());
+    }
+
+    /// A caller waits for another's hook run only as long as its own deadline plus a margin:
+    /// one blocked behind a run that waits for it (a hook calling back into the daemon about
+    /// its own session) times out instead of deadlocking, and the holder is cut off by its
+    /// own deadline. The slot stays consistent for a later retry.
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_slot_waiters_are_bounded_and_a_timeout_leaves_the_slot_retryable() {
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let _unset = crate::session::test_support::EnvGuard::unset(&[
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+        ]);
+        hook_prelude(home.path());
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let counter = counting_before_start_hook(home.path(), "sleep 30");
+        let _ = std::fs::remove_file(&counter);
+        let mut row = sandboxed_instance("claude");
+        row.project_path = project.to_string_lossy().into_owned();
+
+        let holder = {
+            let mut copy = row.clone();
+            std::thread::spawn(move || {
+                let _deadline =
+                    crate::session::HookTimeoutScope::new(std::time::Duration::from_secs(3));
+                copy.test_launchable()
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while hook_runs(&counter) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(hook_runs(&counter), 1, "the holder's hook is running");
+
+        let started = std::time::Instant::now();
+        let waiter = {
+            let _deadline =
+                crate::session::HookTimeoutScope::new(std::time::Duration::from_millis(200));
+            row.clone().test_launchable().unwrap_err()
+        };
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(2000),
+            "the waiter is bounded by its own deadline: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            format!("{waiter:#}"),
+            "the before_start hook is still running for this session"
+        );
+        assert_eq!(hook_runs(&counter), 1, "the waiter ran nothing");
+
+        let held = holder.join().unwrap().unwrap_err();
+        assert_eq!(format!("{held:#}"), "the before_start hook timed out");
+
+        let counter = counting_before_start_hook(home.path(), "echo ANTHROPIC_API_KEY=sk-hook");
+        let _ = std::fs::remove_file(&counter);
+        assert!(row.clone().test_launchable().is_ok(), "retry resolves");
+    }
+
+    /// When the come-up has to mint itself because the resolution its admission relied on has
+    /// expired, the new environment is gated before anything is created: a hook that now
+    /// emits no key refuses the launch cleanly. The mint leaves the slot empty.
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_come_up_regates_when_it_has_to_mint_again() {
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let _unset = crate::session::test_support::EnvGuard::unset(&[
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+        ]);
+        hook_prelude(home.path());
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut inst = sandboxed_instance("claude");
+        inst.project_path = project.to_string_lossy().into_owned();
+
+        let counter = counting_before_start_hook(home.path(), "echo ANTHROPIC_API_KEY=sk-hook");
+        let _ = std::fs::remove_file(&counter);
+        assert!(inst.test_launchable().is_ok());
+        // The image pull took longer than the resolution lives, and the hook now emits no key.
+        inst.expire_before_start_resolution();
+        let counter = counting_before_start_hook(home.path(), "echo FOO=bar");
+        let _ = std::fs::remove_file(&counter);
+        let error = inst.test_ensure_before_start_env(true).unwrap_err();
+        assert!(
+            error.downcast_ref::<SandboxLoginRequired>().is_some(),
+            "{error:#}"
+        );
+        assert_eq!(hook_runs(&counter), 1);
+        // The slot is empty: the next admission resolves again.
+        assert!(inst.test_launchable().is_err());
+        assert_eq!(hook_runs(&counter), 2, "nothing was left filled");
+
+        // A come-up whose admission needed no hook mints without re-gating (an admission can
+        // rest on a request-only key the come-up cannot see).
+        let mut other = sandboxed_instance("claude");
+        other.project_path = project.to_string_lossy().into_owned();
+        assert!(other.test_ensure_before_start_env(true).is_ok());
+    }
+
+    /// The come-up's own mint and a resolver never run the hook in parallel: the mint holds
+    /// the slot lock, so the resolver runs after it, not beside it.
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_come_up_mint_and_resolver_never_run_the_hook_in_parallel() {
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let _unset = crate::session::test_support::EnvGuard::unset(&[
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+        ]);
+        hook_prelude(home.path());
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let counter = home.path().join("hook-runs");
+        let hook = format!(
+            "echo run >> {c}; sleep 0.5; echo end >> {c}; echo ANTHROPIC_API_KEY=sk-hook",
+            c = crate::session::environment::shell_escape(&counter.to_string_lossy())
+        );
+        crate::session::config::update_config(|global| global.host_hooks.before_start = vec![hook])
+            .unwrap();
+        let mut row = sandboxed_instance("claude");
+        row.project_path = project.to_string_lossy().into_owned();
+
+        let come_up = {
+            let mut copy = row.clone();
+            std::thread::spawn(move || copy.test_ensure_before_start_env(true))
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while hook_runs(&counter) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let resolver = {
+            let mut copy = row.clone();
+            std::thread::spawn(move || copy.test_launchable())
+        };
+        come_up.join().unwrap().unwrap();
+        resolver.join().unwrap().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&counter)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["run", "end", "run", "end"],
+            "the runs did not overlap"
+        );
+    }
+
+    /// A resolved environment nothing will consume is forgotten with its session (trashed,
+    /// archived, deleted) and with its hook (removed from the configuration).
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_resolution_is_dropped_with_the_session_or_the_hook() {
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let _unset = crate::session::test_support::EnvGuard::unset(&[
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+        ]);
+        hook_prelude(home.path());
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let counter = counting_before_start_hook(home.path(), "echo ANTHROPIC_API_KEY=sk-hook");
+        let session = || {
+            let mut inst = sandboxed_instance("claude");
+            inst.project_path = project.to_string_lossy().into_owned();
+            inst
+        };
+        type Forget = (&'static str, fn(&mut Instance));
+        let forgets: [Forget; 3] = [
+            ("trash", |i| i.trash()),
+            ("archive", |i| i.archive()),
+            ("delete", |i| {
+                crate::session::forget_before_start_resolution(&i.id.clone())
+            }),
+        ];
+        for (what, forget) in forgets {
+            let _ = std::fs::remove_file(&counter);
+            let mut inst = session();
+            assert!(inst.test_launchable().is_ok(), "{what}");
+            assert!(inst.test_launchable().is_ok(), "{what}");
+            assert_eq!(hook_runs(&counter), 1, "{what}: resolved once");
+            forget(&mut inst);
+            assert!(inst.test_launchable().is_ok(), "{what}");
+            assert_eq!(hook_runs(&counter), 2, "{what}: nothing was kept");
+        }
+
+        // The hook is removed, then configured again: nothing of the old run survives.
+        let _ = std::fs::remove_file(&counter);
+        let mut inst = session();
+        assert!(inst.test_launchable().is_ok());
+        crate::session::config::update_config(|global| global.host_hooks.before_start.clear())
+            .unwrap();
+        inst.test_ensure_before_start_env(true).unwrap();
+        let counter = counting_before_start_hook(home.path(), "echo ANTHROPIC_API_KEY=sk-hook");
+        assert_eq!(hook_runs(&counter), 1, "the earlier run's count");
+        assert!(inst.test_launchable().is_ok());
+        assert_eq!(hook_runs(&counter), 2, "resolved again, not reused");
+    }
+
+    /// A restart re-checks strictly under the locks: a resolution that expired or was consumed
+    /// since the early one refuses, and no hook runs there.
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_restart_recheck_refuses_what_expired_or_was_consumed() {
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let _unset = crate::session::test_support::EnvGuard::unset(&[
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+        ]);
+        hook_prelude(home.path());
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let counter = counting_before_start_hook(home.path(), "echo ANTHROPIC_API_KEY=sk-hook");
+        let _ = std::fs::remove_file(&counter);
+        let mut inst = sandboxed_instance("claude");
+        inst.project_path = project.to_string_lossy().into_owned();
+        let refused = |inst: &Instance| {
+            inst.test_launchable_strict()
+                .err()
+                .and_then(|e| e.downcast::<SandboxLoginRequired>().ok())
+                .is_some()
+        };
+
+        assert!(refused(&inst), "unresolved: refused, not deferred");
+        assert!(inst.test_launchable().is_ok());
+        assert!(!refused(&inst), "resolved: admitted");
+        inst.expire_before_start_resolution();
+        assert!(refused(&inst), "expired while waiting for the locks");
+        assert!(inst.test_launchable().is_ok());
+        inst.test_ensure_before_start_env(true).unwrap();
+        assert!(refused(&inst), "consumed by a concurrent come-up");
+        assert_eq!(hook_runs(&counter), 2, "the re-check ran no hook");
+    }
+
+    fn hook_env_unset() -> crate::session::test_support::EnvGuard {
+        crate::session::test_support::EnvGuard::unset(&[
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+        ])
+    }
+
+    fn required_error(result: anyhow::Result<()>) -> bool {
+        result
+            .err()
+            .and_then(|e| e.downcast::<SandboxLoginRequired>().ok())
+            .is_some()
+    }
+
+    /// The come-up gates again with what its admission ran with: a request-only key and the
+    /// target agent of a switch are part of the launch, so a come-up that has to mint
+    /// (expired resolution, hook that now emits nothing) does not refuse a launch they admit.
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_come_up_regate_carries_the_request_key_and_the_target_agent() {
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let _unset = hook_env_unset();
+        hook_prelude(home.path());
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let _counter = counting_before_start_hook(home.path(), "echo FOO=bar");
+        let session = || {
+            let mut inst = sandboxed_instance("claude");
+            inst.project_path = project.to_string_lossy().into_owned();
+            inst.view = View::Structured;
+            inst.agent_name = Some("codex".to_string());
+            inst
+        };
+
+        // (a) A request-only key admits the launch with no hook run; the come-up that mints
+        // after the old empty resolution expired still sees the key.
+        let mut inst = session();
+        assert!(required_error(inst.test_launchable_for(None, &[])));
+        inst.expire_before_start_resolution();
+        let request = [("ANTHROPIC_API_KEY".to_string(), "sk-request".to_string())];
+        assert!(inst.test_launchable_for(None, &request).is_ok());
+        assert!(
+            inst.test_ensure_before_start_env(true).is_ok(),
+            "the request's key is part of the launch the come-up gates"
+        );
+
+        // (b) A switch's target agent, not the row's stored one, decides which host variables
+        // cross: the daemon's key reaches claude, not codex.
+        let _host =
+            crate::session::test_support::EnvGuard::set(&[("ANTHROPIC_API_KEY", "sk-host")]);
+        let mut switching = session();
+        assert!(required_error(switching.test_launchable_for(None, &[])));
+        switching.expire_before_start_resolution();
+        assert!(switching.test_launchable_for(Some("claude"), &[]).is_ok());
+        assert!(
+            switching.test_ensure_before_start_env(true).is_ok(),
+            "the come-up gates on the target agent"
+        );
+    }
+
+    /// A come-up that mints because a concurrent come-up consumed the resolution gates again:
+    /// a hook that emitted a key once and nothing now does not launch with no auth route.
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_come_up_regates_when_the_resolution_was_consumed() {
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let _unset = hook_env_unset();
+        hook_prelude(home.path());
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let once = home.path().join("emitted-once");
+        let _counter = counting_before_start_hook(
+            home.path(),
+            &format!(
+                "if [ ! -e {f} ]; then touch {f}; echo ANTHROPIC_API_KEY=sk-once; fi",
+                f = crate::session::environment::shell_escape(&once.to_string_lossy())
+            ),
+        );
+        let mut row = sandboxed_instance("claude");
+        row.project_path = project.to_string_lossy().into_owned();
+        let mut other = row.clone();
+
+        assert!(row.test_launchable().is_ok(), "the key admits it");
+        other.test_ensure_before_start_env(true).unwrap();
+        let error = row.test_ensure_before_start_env(true).unwrap_err();
+        assert!(
+            error.downcast_ref::<SandboxLoginRequired>().is_some(),
+            "second mint without a key: {error:#}"
+        );
+    }
+
+    /// An already-running container comes up nothing: the session's resolution is not
+    /// consumed, so the next refused admission does not run the hook again.
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_running_container_leaves_the_resolution_alone() {
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let _unset = hook_env_unset();
+        hook_prelude(home.path());
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let counter = counting_before_start_hook(home.path(), "echo FOO=bar");
+        let _ = std::fs::remove_file(&counter);
+        let mut inst = sandboxed_instance("claude");
+        inst.project_path = project.to_string_lossy().into_owned();
+
+        assert!(required_error(inst.test_launchable()));
+        assert_eq!(hook_runs(&counter), 1);
+        inst.test_ensure_before_start_env(false).unwrap();
+        assert!(required_error(inst.test_launchable()));
+        assert_eq!(hook_runs(&counter), 1, "attaching consumed nothing");
+    }
+
+    /// A running container's row may hold the environment of an earlier come-up. The launch
+    /// forwards what the admission admitted on: the session's fresh resolution replaces the
+    /// older cache, without consuming the resolution or running the hook again.
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_running_container_forwards_the_environment_it_was_admitted_on() {
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let _unset = hook_env_unset();
+        hook_prelude(home.path());
+        set_shared_credential_mode(SharedCredentialMode::SeparateLogin);
+        write_shared_credential(home.path(), "{}");
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let counter = counting_before_start_hook(home.path(), "echo ANTHROPIC_API_KEY=K2");
+        let _ = std::fs::remove_file(&counter);
+        let key = |value: &str| vec![("ANTHROPIC_API_KEY".to_string(), value.to_string())];
+
+        let mut admission = sandboxed_instance("claude");
+        admission.project_path = project.to_string_lossy().into_owned();
+        let mut launch = admission.clone();
+        launch.sandbox_info.as_mut().unwrap().before_start_env = key("K1");
+
+        admission.test_launchable().unwrap();
+        assert_eq!(hook_runs(&counter), 1);
+        launch.test_ensure_before_start_env(false).unwrap();
+        assert_eq!(
+            launch.sandbox_info.as_ref().unwrap().before_start_env,
+            key("K2"),
+            "the launch carries the environment the admission admitted on"
+        );
+        assert_eq!(hook_runs(&counter), 1, "no second mint");
+        assert!(launch.holds_before_start_resolution(), "not consumed");
+
+        // With nothing resolved, the row's own cache stays as it is.
+        launch.expire_before_start_resolution();
+        launch.sandbox_info.as_mut().unwrap().before_start_env = key("K1");
+        launch.test_ensure_before_start_env(false).unwrap();
+        assert_eq!(
+            launch.sandbox_info.as_ref().unwrap().before_start_env,
+            key("K1")
+        );
+        assert_eq!(hook_runs(&counter), 1, "attaching mints nothing");
+    }
+
+    /// A resolution is the hook's output for the inputs it ran on. One that profile A's
+    /// launch left in the slot is not profile B's, whatever the hook command: a restart into
+    /// B neither admits on it nor consumes it, and B's come-up runs the hook for itself.
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_resolution_is_not_reused_across_profiles() {
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let _unset = hook_env_unset();
+        hook_prelude(home.path());
+        set_shared_credential_mode(SharedCredentialMode::SeparateLogin);
+        write_shared_credential(home.path(), "{}");
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::session::create_profile("profile-a").unwrap();
+        crate::session::create_profile("profile-b").unwrap();
+        // The hook picks its key by the profile it is run for.
+        let counter =
+            counting_before_start_hook(home.path(), "echo ANTHROPIC_API_KEY=key-$AOE_PROFILE");
+        let _ = std::fs::remove_file(&counter);
+        let key = |value: &str| vec![("ANTHROPIC_API_KEY".to_string(), value.to_string())];
+        let mut in_a = sandboxed_instance("claude");
+        in_a.project_path = project.to_string_lossy().into_owned();
+        in_a.source_profile = "profile-a".to_string();
+        let mut in_b = in_a.clone();
+        in_b.source_profile = "profile-b".to_string();
+
+        // A is admitted and attaches to its running container: the resolution stays.
+        in_a.test_launchable().unwrap();
+        in_a.test_ensure_before_start_env(false).unwrap();
+        assert_eq!(hook_runs(&counter), 1);
+        assert!(in_a.holds_before_start_resolution());
+
+        // The restart into B finds nothing resolved for B.
+        assert!(
+            required_error(in_b.test_launchable_strict()),
+            "B is not admitted on A's key"
+        );
+        in_b.test_launchable().unwrap();
+        assert_eq!(hook_runs(&counter), 2, "B's admission ran the hook for B");
+        in_b.test_ensure_before_start_env(true).unwrap();
+        assert_eq!(
+            in_b.sandbox_info.as_ref().unwrap().before_start_env,
+            key("key-profile-b"),
+            "B's come-up carries B's key"
+        );
+        assert_eq!(
+            hook_runs(&counter),
+            2,
+            "the come-up reused B's own resolution"
+        );
+    }
+
+    /// All commands of a resolution share one deadline, and a waiter does not fail while
+    /// the holder finishes within it.
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_before_start_commands_share_one_deadline() {
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let _unset = hook_env_unset();
+        hook_prelude(home.path());
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::session::config::update_config(|global| {
+            global.host_hooks.before_start = vec![
+                "sleep 0.4; echo A=1".to_string(),
+                "sleep 0.4; echo ANTHROPIC_API_KEY=sk-hook".to_string(),
+            ];
+        })
+        .unwrap();
+        let mut row = sandboxed_instance("claude");
+        row.project_path = project.to_string_lossy().into_owned();
+
+        // Two commands of 0.4 s do not fit one 0.6 s deadline, though each fits alone.
+        let error = {
+            let _deadline =
+                crate::session::HookTimeoutScope::new(std::time::Duration::from_millis(600));
+            row.clone().test_launchable().unwrap_err()
+        };
+        assert_eq!(format!("{error:#}"), "the before_start hook timed out");
+
+        // A healthy holder inside the deadline: the waiter, blocked on the slot while the
+        // hook runs, takes its result and runs nothing itself.
+        let ready = home.path().join("hook-ready");
+        let release = home.path().join("hook-release");
+        let counter = counting_before_start_hook(
+            home.path(),
+            &format!(
+                ": > {}; while [ ! -e {} ]; do sleep 0.01; done; echo ANTHROPIC_API_KEY=sk-hook",
+                crate::session::environment::shell_escape(&ready.to_string_lossy()),
+                crate::session::environment::shell_escape(&release.to_string_lossy()),
+            ),
+        );
+        let _ = std::fs::remove_file(&counter);
+        let id = row.id.clone();
+        let launch = |mut copy: Instance| {
+            std::thread::spawn(move || {
+                let _deadline =
+                    crate::session::HookTimeoutScope::new(std::time::Duration::from_secs(5));
+                copy.test_launchable()
+            })
+        };
+        let holder = launch(row.clone());
+        wait_until("the holder's hook to run", || ready.exists());
+        assert_eq!(hook_runs(&counter), 1, "only the holder has run the hook");
+        let slot = resolution_slot(&id);
+        let waiter = launch(row.clone());
+        wait_until("the waiter to wait on the holder's slot", || {
+            slot.waiters.load(std::sync::atomic::Ordering::SeqCst) == 1
+        });
+        assert!(slot.state.try_lock().is_err(), "the holder holds the slot");
+        std::fs::write(&release, "").unwrap();
+        let (holder, waiter) = (holder.join().unwrap(), waiter.join().unwrap());
+        assert!(holder.is_ok(), "{holder:?}");
+        assert!(waiter.is_ok(), "{waiter:?}");
+        assert_eq!(
+            hook_runs(&counter),
+            1,
+            "the waiter took the holder's result"
+        );
+    }
+
+    /// `Debug` of a row never prints the hook's environment or the request's.
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_debug_output_redacts_the_hook_and_request_environment() {
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let _unset = hook_env_unset();
+        hook_prelude(home.path());
+        let mut inst = sandboxed_instance("claude");
+        inst.view = View::Structured;
+        inst.sandbox_info.as_mut().unwrap().before_start_env = vec![(
+            "ANTHROPIC_API_KEY".to_string(),
+            "sekret-hook-key".to_string(),
+        )];
+        let request = [(
+            "ANTHROPIC_API_KEY".to_string(),
+            "sekret-request-key".to_string(),
+        )];
+        let _ = inst.test_launchable_for(None, &request);
+        let printed = format!("{inst:?} {:?}", inst.sandbox_info);
+        assert!(!printed.contains("sekret-hook-key"), "{printed}");
+        assert!(!printed.contains("sekret-request-key"), "{printed}");
+    }
+
+    /// A session deleted while a caller waits on its slot behind a running resolution: the
+    /// waiter does not take the deleted session's result, and the resolver does not store it.
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_delete_during_a_resolution_wins() {
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let _unset = hook_env_unset();
+        hook_prelude(home.path());
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        // The hook announces itself, then holds until released.
+        let ready = home.path().join("hook-ready");
+        let release = home.path().join("hook-release");
+        let counter = counting_before_start_hook(
+            home.path(),
+            &format!(
+                ": > {}; while [ ! -e {} ]; do sleep 0.01; done; echo ANTHROPIC_API_KEY=sk-hook",
+                crate::session::environment::shell_escape(&ready.to_string_lossy()),
+                crate::session::environment::shell_escape(&release.to_string_lossy()),
+            ),
+        );
+        let _ = std::fs::remove_file(&counter);
+        let mut row = sandboxed_instance("claude");
+        row.project_path = project.to_string_lossy().into_owned();
+        let id = row.id.clone();
+        let holder = {
+            let mut copy = row.clone();
+            std::thread::spawn(move || copy.test_launchable())
+        };
+        wait_until("the holder's hook to run", || ready.exists());
+        assert_eq!(hook_runs(&counter), 1, "only the holder has run the hook");
+        let old_slot = resolution_slot(&id);
+        let waiter = {
+            let mut copy = row.clone();
+            std::thread::spawn(move || copy.test_launchable())
+        };
+        wait_until("the waiter to wait on the holder's slot", || {
+            old_slot.waiters.load(std::sync::atomic::Ordering::SeqCst) == 1
+        });
+        assert!(
+            old_slot.state.try_lock().is_err(),
+            "the holder still holds the slot"
+        );
+
+        crate::session::forget_before_start_resolution(&id);
+        assert!(old_slot.forgotten.load(std::sync::atomic::Ordering::SeqCst));
+        std::fs::write(&release, "").unwrap();
+        assert!(holder.join().unwrap().is_ok());
+        assert!(waiter.join().unwrap().is_ok());
+        assert!(
+            old_slot.state.lock().unwrap().is_none(),
+            "the resolver did not store its result in the deleted session's slot"
+        );
+        assert_eq!(
+            hook_runs(&counter),
+            2,
+            "the waiter resolved afresh instead of taking the deleted session's result"
+        );
+    }
+
+    /// A restart re-checks with a safety margin: a resolution about to expire is refused
+    /// before anything is stopped, and the early resolution renews it.
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_restart_requires_a_resolution_with_margin_and_expiry_drops_it() {
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let _unset = hook_env_unset();
+        hook_prelude(home.path());
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let counter = counting_before_start_hook(home.path(), "echo ANTHROPIC_API_KEY=sk-hook");
+        let _ = std::fs::remove_file(&counter);
+        let mut inst = sandboxed_instance("claude");
+        inst.project_path = project.to_string_lossy().into_owned();
+
+        assert!(inst.test_launchable().is_ok());
+        assert!(inst.test_launchable_strict().is_ok());
+        inst.age_before_start_resolution(std::time::Duration::from_secs(30));
+        assert!(
+            required_error(inst.test_launchable_strict()),
+            "30 s left is under the restart's margin"
+        );
+        inst.test_resolve_for_restart().unwrap();
+        assert_eq!(hook_runs(&counter), 2, "the early resolution renewed it");
+        assert!(inst.test_launchable_strict().is_ok());
+
+        inst.expire_before_start_resolution();
+        assert!(
+            inst.holds_before_start_resolution(),
+            "expired but not yet found"
+        );
+        let _ = inst.test_launchable_strict();
+        assert!(
+            !inst.holds_before_start_resolution(),
+            "an expired resolution is dropped when found"
+        );
+    }
+
+    /// The come-up resolves its hook, and gates on it again if it has to mint, before the
+    /// destructive steps (image pull, container creation or removal): a refusal leaves the
+    /// runtime untouched.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_come_up_refuses_before_any_destructive_step() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let _unset = hook_env_unset();
+        hook_prelude(home.path());
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let bin = home.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let calls = home.path().join("runtime-calls");
+        // No such container; every other call fails, as a missing image would.
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{calls}'\n\
+             if [ \"$1\" = container ] && [ \"$2\" = inspect ]; then echo 'Error: No such container: c' >&2; exit 1; fi\n\
+             case \"$*\" in --version|info|'system status') exit 0;; esac\n\
+             echo 'permission denied' >&2\nexit 1\n",
+            calls = calls.display()
+        );
+        for binary in ["docker", "podman", "container"] {
+            let path = bin.join(binary);
+            std::fs::write(&path, &script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _path = crate::session::test_support::path_prepended(&bin);
+        let _counter = counting_before_start_hook(home.path(), "echo ANTHROPIC_API_KEY=sk-hook");
+        let mut inst = sandboxed_instance("claude");
+        inst.project_path = project.to_string_lossy().into_owned();
+        assert!(inst.test_launchable().is_ok());
+        inst.expire_before_start_resolution();
+        let _no_key = counting_before_start_hook(home.path(), "echo FOO=bar");
+
+        let error = match inst.get_container_for_instance() {
+            Ok(_) => panic!("the come-up must be refused"),
+            Err(error) => error,
+        };
+        assert!(
+            error.downcast_ref::<SandboxLoginRequired>().is_some(),
+            "{error:#}"
+        );
+        let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
+        for step in ["pull", "image", "create", "run", "rm", "start"] {
+            assert!(
+                !recorded
+                    .lines()
+                    .any(|l| l.split_whitespace().next() == Some(step)),
+                "{step} ran before the refusal: {recorded}"
+            );
+        }
+    }
+
+    fn set_container_runtime(runtime: crate::session::config::ContainerRuntimeName) {
+        crate::session::config::update_config(|c| c.sandbox.container_runtime = runtime).unwrap();
+    }
+
+    /// `separate_login` on Apple Container refuses the launches that would wait for the
+    /// login, since the helper that performs it does not run there. The refusal is typed,
+    /// never a hold, and only touches launches that need the shared credential.
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn sandbox_login_gate_refuses_the_mode_on_apple_container() {
+        use crate::session::config::ContainerRuntimeName::{AppleContainer, Docker, Podman};
+        let (_hg, _, _base) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let _unset = crate::session::test_support::EnvGuard::unset(&[
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+        ]);
+        set_shared_credential_mode(SharedCredentialMode::SeparateLogin);
+        write_shared_credential(home.path(), "{}");
+        let mut claude = sandboxed_instance("claude");
+        let refused = |inst: &mut Instance| {
+            inst.test_launchable()
+                .unwrap_err()
+                .downcast_ref::<SandboxLoginUnsupported>()
+                .is_some()
+        };
+
+        set_container_runtime(AppleContainer);
+        assert!(refused(&mut claude), "the OAuth launch is refused");
+        assert_eq!(
+            claude.ensure_sandbox_login(),
+            Ok(()),
+            "a refusal is not a hold"
+        );
+        assert_eq!(
+            SandboxLoginUnsupported.to_string(),
+            "sandbox.shared_credential is separate_login, which is not supported with Apple Container; use host_seed or Docker/Podman"
+        );
+
+        // A launch that does not use the shared credential proceeds.
+        let mut keyed = sandboxed_instance("claude");
+        keyed.view = View::Structured;
+        let request = [("ANTHROPIC_API_KEY".to_string(), "sk-request".to_string())];
+        assert!(keyed.test_launchable_for(None, &request).is_ok());
+        let mut bedrock = {
+            let mut inst = sandboxed_instance("claude");
+            if let Some(sandbox) = inst.sandbox_info.as_mut() {
+                sandbox.extra_env = Some(vec!["CLAUDE_CODE_USE_BEDROCK=1".to_string()]);
+            }
+            inst
+        };
+        assert!(bedrock.test_launchable().is_ok());
+        // An agent without a sandbox login is not gated.
+        assert!(sandboxed_instance("codex").test_launchable().is_ok());
+
+        // A login the shared file already holds needs no helper.
+        write_shared_credential(home.path(), &usable_credential());
+        assert!(claude.test_launchable().is_ok());
+        write_shared_credential(home.path(), "{}");
+
+        // `host_seed` is unaffected.
+        set_shared_credential_mode(SharedCredentialMode::HostSeed);
+        assert!(claude.test_launchable().is_ok());
+        set_shared_credential_mode(SharedCredentialMode::SeparateLogin);
+
+        // Docker and Podman hold the launch as before.
+        for runtime in [Docker, Podman] {
+            set_container_runtime(runtime);
+            let error = claude.test_launchable().unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<SandboxLoginRequired>(),
+                Some(&crate::session::test_support::login_required_under(
+                    "claude",
+                    home.path()
+                )),
+                "{runtime:?}"
+            );
+            assert!(claude.ensure_sandbox_login().is_err(), "{runtime:?}");
+        }
     }
 
     /// Regression for issue #2414: a sandboxed worktree session's

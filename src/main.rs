@@ -247,6 +247,9 @@ async fn run_cli(mut cli: Cli, read_source: cli::runtime_read::ReadRequestSource
     {
         Ok(exit) => exit,
         Err(e) => {
+            if let Some(cli::Exit(code)) = e.downcast_ref::<cli::Exit>() {
+                std::process::exit(*code);
+            }
             tracing::error!(target: "log.runtime", "fatal: {e:#}");
             if !is_daemon_child {
                 eprintln!("Error: {e:#}");
@@ -429,7 +432,7 @@ async fn run(
         Some(Commands::Telemetry { command }) => return exit_zero(cli::telemetry::run(command)),
         Some(Commands::Serve(args)) => cli::serve::run(&profile, args, serve_lock).await,
         Some(Commands::Url(args)) => cli::url::run(args),
-        Some(Commands::Sandbox { command }) => cli::sandbox::run(command),
+        Some(Commands::Sandbox { command }) => cli::sandbox::run(&profile, command).await,
         // Runs after migrations, which run for every command: `approve` writes
         // state.toml, and on a pre-v021 install v021 strips [app_state] from
         // config.toml without copying it, dropping every other key.

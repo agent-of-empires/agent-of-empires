@@ -682,7 +682,17 @@ pub fn run_before_session_hooks(
     )
 }
 
-/// Stdout carries secrets: it is never logged or included in errors.
+/// A host hook that ran and exited unsuccessfully; carried in the error chain so a caller
+/// can classify the failure without reading the message, which names the command and the
+/// hook's stderr.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("hook exited unsuccessfully (status {code:?})")]
+pub struct HookExit {
+    pub code: Option<i32>,
+}
+
+/// Stdout carries secrets: it is never logged or included in errors. The command string is
+/// not logged either, and a timeout names only the hook's label.
 fn run_env_minting_hooks(
     commands: &[String],
     project_path: &Path,
@@ -694,9 +704,8 @@ fn run_env_minting_hooks(
     for cmd in commands {
         tracing::info!(
             target: "session.store",
-            "Running {} host hook (stdout not logged): {}",
+            "Running {} host hook (stdout and command not logged)",
             label,
-            cmd
         );
         let opts = HookSpawnOpts {
             merge_stderr: false,
@@ -705,7 +714,7 @@ fn run_env_minting_hooks(
         let mut command =
             build_hook_command(cmd, &HookTarget::Local { project_path }, opts, extra_env);
         command.envs(session_env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-        let output = run_hook_output(&mut command, cmd, || {
+        let output = run_hook_output(&mut command, label, || {
             format!("Failed to execute {} hook: {}", label, cmd)
         })?;
 
@@ -716,13 +725,16 @@ fn run_env_minting_hooks(
             } else {
                 format!("\nstderr:\n{}", stderr.trim_end())
             };
-            anyhow::bail!(
+            return Err(anyhow::Error::new(HookExit {
+                code: output.status.code(),
+            })
+            .context(format!(
                 "{} hook failed with exit code {}: {}{}",
                 label,
                 output.status.code().unwrap_or(-1),
                 cmd,
                 stderr_detail
-            );
+            )));
         }
         for (key, value) in parse_env_kv_lines(&String::from_utf8_lossy(&output.stdout)) {
             collected.retain(|(k, _)| k != &key);

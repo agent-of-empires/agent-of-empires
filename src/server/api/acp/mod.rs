@@ -222,6 +222,16 @@ fn launch_error_response(context: &str, error: &anyhow::Error) -> Response {
     if let Some(blocked) = error.downcast_ref::<crate::session::StartBlocked>() {
         return crate::server::api::start_blocked_response(*blocked);
     }
+    if let Some(login) = error.downcast_ref::<crate::session::SandboxLoginRequired>() {
+        return crate::server::api::sandbox_login_required_response(login);
+    }
+    if let Some(unsupported) = error.downcast_ref::<crate::session::SandboxLoginUnsupported>() {
+        return crate::server::api::sandbox_login_unsupported_response(unsupported);
+    }
+    if let Some(hook) = error.downcast_ref::<crate::session::BeforeStartHookError>() {
+        // The hook's own failure, in fixed words; a switch queues nothing.
+        return crate::server::api::before_start_hook_failed_response(hook);
+    }
     if error.is::<crate::session::SessionGone>() {
         return session_not_found();
     }

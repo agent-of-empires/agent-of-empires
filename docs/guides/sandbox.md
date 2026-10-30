@@ -60,6 +60,7 @@ environment = ["ANTHROPIC_API_KEY"]
 | `cap_add` / `cap_drop` | `[]` | Capabilities added or dropped |
 | `security_opt` | `[]` | Security options, e.g. `seccomp=unconfined` |
 | `extra_run_args` | `[]` | Extra arguments passed to container run, before the image |
+| `shared_credential` | `"host_seed"` | `"host_seed"` or `"separate_login"`: where the credential an agent shares across its sandboxes comes from (see [Shared credentials](#shared-credentials)); applies to every agent with a sandbox login, today Claude. `"separate_login"` is not supported with Apple Container. Global only |
 
 Docker and Podman honor every run-policy option. Apple Container honors `cap_add` / `cap_drop` and ignores `privileged` and `security_opt` with a warning; `extra_run_args` is passed through everywhere.
 
@@ -217,11 +218,27 @@ moved, so drop the variable or run `aoe migrate` before launching it.
 
 Claude Code rotates refresh tokens and invalidates the old token, so per-session credential copies would log each other out. All Claude sandboxes mount `sandbox-v2/.credentials.json`; login or refresh in one reaches all. Conversation stores remain private.
 
-When the shared file holds no credential, the next start or refresh seeds it from the freshest macOS Keychain entry, host `.credentials.json`, or earlier session-store copy. Once populated, the host never replaces it automatically; the sandboxes have their own refresh chain. Fresher sandbox credentials from an earlier layout are folded in at that session's next start.
+When the shared file holds no credential, the next start or refresh seeds it from the freshest macOS Keychain entry, host `.credentials.json`, or earlier session-store copy (in `host_seed` mode). Once populated, the host never replaces it automatically; the sandboxes have their own refresh chain. Fresher sandbox credentials from an earlier layout are folded in at that session's next start.
 
-Claude Code empties both tokens after failed authentication, making the shared file eligible for seeding again. Simultaneous refreshes can still conflict: the losing container may empty the shared file and lose the winner's new token.
+Claude Code empties both tokens after failed authentication, making the shared file eligible for seeding again (in `host_seed` mode). Simultaneous refreshes can still conflict: the losing container may empty the shared file and lose the winner's new token.
 
 To seed from a new host login, stop every Claude sandbox, delete only `sandbox-v2/.credentials.json`, and start one. Older containers are recreated when stopped; a running one must be stopped before relaunch. `/logout` in any sandbox revokes all sandboxes' tokens but cannot remove the mounted file; log in again to replace the revoked credential.
+
+
+#### Separate sandbox login
+
+By default the shared file starts from the host's own token, so the first side to refresh logs the other out once. With `shared_credential = "separate_login"` under `[sandbox]` the sandboxes hold a login of their own. A host refresh or logout never touches it, and a sandbox refresh or logout never touches the host. AoE never reads the host file or the Keychain for it, and only creates the shared file empty when it is absent. The setting applies to every agent that declares a sandbox login; today that is Claude.
+
+Log in once with [`aoe sandbox login`](../cli/reference.md#aoe-sandbox-login). It prints a sign-in link and reads the code shown after you sign in. The login lands in the shared file every sandbox of that agent mounts.
+
+- The file belongs to a profile and tool. A session of profile `work` running tool `T` waits for `aoe sandbox login -p work --tool T`; a session with its own command for the tool waits for `aoe sandbox login --tool T --command <command>`. The "sandbox login required" message prints the exact command.
+- Without `--tool`, the login is for the profile's default tool when it has a sandbox login, else the only agent that has one. `--check` reports whether a login is needed, and `--force` logs in again.
+- A launch that needs the login stops with "sandbox login required". The session then starts by itself after the login, and messages sent to it meanwhile are kept.
+- A launch that does not use the shared credential is not held: an API key in the sandbox environment or in the request that spawns the session, a Bedrock or Vertex provider, or a key a `host_hooks.before_start` hook produces. Such a hook runs only when the launch would otherwise be refused, is cut off after 120 seconds, and must not call back into the daemon about its own session (the call would wait for the hook it came from). If it fails, the launch reports that error instead.
+- A credential that fails to authenticate is emptied for all sandboxes and is not seeded again; log in again. `/logout` in a sandbox ends the sandbox login for all of them.
+- Apple Container cannot run the login helper, so `separate_login` is refused there at once, and `aoe sandbox login` says so.
+
+AoE leaves an existing file as it is, so an install that was seeded from the host keeps the host's token after the switch. To switch, stop the sandboxes, delete `sandbox-v2/.credentials.json`, set the option and run `aoe sandbox login`. The option is global only: a profile cannot override it, because every profile that uses the same agent config directory shares the one file. Profiles with their own directory via `session.agent_config_dir` have separate shared files, but still follow the one global value.
 
 ### Reclaiming stores
 
