@@ -143,6 +143,7 @@ pub(super) fn set(
     let overrides = overrides(conn, profile, provider_id).map_err(db_error)?;
     let accepted =
         validate_items(spec, &overrides, request.items).map_err(DispatchError::invalid_params)?;
+    // `unchecked_`: the connection is only reachable as `&Connection` behind the host mutex.
     let tx = conn.unchecked_transaction().map_err(db_error)?;
     tx.execute(
         "DELETE FROM suggestion_items WHERE profile = ?1 AND provider_id = ?2",
@@ -242,9 +243,20 @@ pub(crate) fn find_item(
     provider: &Provider,
     id: &str,
 ) -> anyhow::Result<Option<Suggestion>> {
-    Ok(load_items(conn, profile, provider)?
-        .into_iter()
-        .find(|item| item.id == id))
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT item_json FROM suggestion_items
+             WHERE profile = ?1 AND provider_id = ?2 AND item_id = ?3",
+            params![profile, provider.id, id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    let item: Suggestion = serde_json::from_str(&stored)?;
+    let overrides = overrides(conn, profile, &provider.id)?;
+    Ok(effective_enabled(&provider.spec, &overrides, &item.criterion).then_some(item))
 }
 
 /// `false` when the provider has no such live item, so a stale client cannot

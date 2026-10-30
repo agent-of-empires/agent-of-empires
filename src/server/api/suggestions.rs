@@ -209,12 +209,12 @@ pub async fn prepare_suggestion(
         return unknown_provider();
     };
     let result = tokio::task::spawn_blocking(move || {
-        host.with_suggestions_db(|conn, profile| {
-            Ok::<_, anyhow::Error>(
-                suggestions::find_item(conn, profile, &provider, &item.id)?
-                    .map(|found| suggestions::prepare(profile, &found)),
-            )
-        })
+        let (profile, found) = host.with_suggestions_db(|conn, profile| {
+            suggestions::find_item(conn, profile, &provider, &item.id)
+                .map(|found| (profile.to_string(), found))
+        })?;
+        // Config and project resolution touch disk, so they run off the lock.
+        Ok::<_, anyhow::Error>(found.map(|found| suggestions::prepare(&profile, &found)))
     })
     .await;
     match result {

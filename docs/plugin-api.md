@@ -339,7 +339,7 @@ At least one source is required. Criteria are unique, non-empty and at most 256 
 | `suggestions.set` | `{ items }` | `{ ok, accepted, dropped }` |
 | `suggestions.error` | `{ message }` | `{ ok }` |
 
-Call `suggestions.sources` before discovering and skip every criterion that is not enabled. A source is enabled when its `default_enabled` (default `true`) says so. The host sends the `suggestions.refresh` notification (`{}`); on it, discover again and call `suggestions.set` or `suggestions.error`.
+Call `suggestions.sources` before discovering and skip every criterion that is not enabled. A source is enabled when the user's stored switch says so, else when its `default_enabled` (default `true`) does. The host sends the `suggestions.refresh` notification (`{}`); on it, discover again and call `suggestions.set` or `suggestions.error`.
 
 An item is `{ id, title, reason, source_url, source_ref, preview, project?, criterion, variables, draft: { title, prompt } }`. `variables` holds exactly the names the item's source declares. Treat `preview`, `variables` and `draft` as untrusted source content. `projects.list` returns the registered projects so a provider can map its own keys to a `project` name or path.
 
@@ -351,6 +351,27 @@ An item is `{ id, title, reason, source_url, source_ref, preview, project?, crit
 - there are more than 500 items, or a string exceeds its bound (`id` 256 bytes, `title` and `draft.title` 512, `reason`, `source_url`, `source_ref` and each variable value 2 KiB, `preview` 16 KiB, `draft.prompt` 64 KiB, `project` 4 KiB).
 
 After validation, items of a source that is not enabled are dropped and counted in `dropped`. `suggestions.error` messages are limited to 4096 bytes.
+
+Each `suggestions.set` replaces the provider's whole set, so an empty `items` clears it and an item left out disappears. `suggestions.error` records the failure on the provider and keeps the last published items; the next successful `suggestions.set` clears it. A user's dismissal is stored by provider and item `id`, survives republishing and never changes the source, so reuse an `id` only for the same suggestion.
+
+### Suggestions API
+
+Suggestions are stored per profile. The routes below list and act on them; none starts a session. Mutations return 403 `read_only` in read-only mode and are refused in CityHall mode. Item bodies name an item by `{ "provider_id", "id" }`, since an `id` is only unique within a provider.
+
+| Route | Body | Result |
+|---|---|---|
+| `GET /api/suggestions` | none | `{ providers: [{ id, name, status, error?, sources: [{ criterion, label, description, enabled }] }], items }` |
+| `POST /api/suggestions/refresh` | none | `{ ok, notified }` |
+| `POST /api/suggestions/dismiss` | `{ provider_id, id }` | `{ ok }` |
+| `POST /api/suggestions/undismiss` | `{ provider_id, id }` | `{ ok }` |
+| `PATCH /api/suggestions/sources` | `{ provider_id, criterion, enabled }` | `{ provider_id, criterion, enabled }` |
+| `POST /api/suggestions/prepare` | `{ provider_id, id }` | `{ title, initial_prompt, source_ref, project, tool, yolo, sandbox, worktree }` |
+
+A provider's `status` is `pending` before its first publish, `ok`, or `error`. Each item is the published item plus `provider_id` and `dismissed`; dismissed items are still returned. Items of a disabled source are hidden. `refresh` and a `sources` change send `suggestions.refresh` to the affected workers.
+
+`prepare` resolves settings through the normal repo and profile config. `project` is `{ name, path }` only when the item's `project` matches exactly one registered project by name or exact path, otherwise `null`.
+
+Errors: 404 `unknown_provider` (no active plugin provides suggestions under that id), 409 `stale_suggestion` (the item is no longer published, or its source is disabled), 400 `validation_failed` (`criterion` not declared by the provider), 403 `read_only`.
 
 ## UI slots
 
