@@ -57,12 +57,12 @@ replies = true
 | Key | Type | Required | Notes |
 |---|---|---|---|
 | `tool` | string | yes | Lowercase agent id; each tool may appear only once per plugin. |
-| `provider_versions` | array of strings | conditional | Required when declaring `session.integration`; nonempty alternative semver requirements for the agent runtime. A report's `provider_version` must match at least one. Omit for launch-only agent declarations. |
+| `provider_versions` | array of strings | conditional | Required for every entry when the manifest declares `session.integration`, including launch-only entries in a mixed manifest; nonempty valid alternative semver requirements for the agent runtime. A report's `provider_version` must match at least one. Omit only when the manifest declares no `session.integration` (launch-only agents). |
 | `command` | string | no | Default launch command for this agent. Active plugins with a command contribute the agent to AoE's agent picker and CLI only when the tool name is unique across plugins and does not collide with a built-in or configured custom agent. |
 | `replies` | boolean | no | Explicitly enable provider-native prompt replies; defaults to false. Requires `session.integration`. Status-only integrations do not take over quick-response actions. |
 
 The host matches status integrations to terminal sessions and rejects missing, malformed, or unsupported runtime versions before consuming reports or sending replies. The runtime extension must also enforce supported versions before activation. These requirements are independent of the plugin's `version`, AoE host `api_version` / `aoe_version`, and report/reply `schema_version`. Launch-only agent declarations do not enable provider-native status or replies.
-For reply-enabled integrations, the provider report's `reply_keys` must contain only function-key names from `F1` through `F12`. AoE sends those keys only after the user submits a response. A status-only report may omit `reply_keys` or send an empty array. Prompts are ignored unless the integration enables replies and the report supplies wake keys. Missing or invalid reports for reply-enabled integrations never fall back to terminal approval keystrokes.
+For reply-enabled integrations, the provider report's `reply_keys` must contain at most eight distinct function-key names from `F1` through `F12`; the host rejects a report with more than eight keys or any duplicate. AoE sends those keys only after the user submits a response. A status-only report may omit `reply_keys` or send an empty array. Prompts are ignored unless the integration enables replies and the report supplies wake keys. Missing or invalid reports for reply-enabled integrations never fall back to terminal approval keystrokes.
 
 ### Report and reply files
 
