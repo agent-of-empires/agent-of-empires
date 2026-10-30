@@ -3,6 +3,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 use tui_input::Input;
+use unicode_width::UnicodeWidthChar;
 
 use super::{NewSessionDialog, FIELD_HELP, HELP_DIALOG_WIDTH};
 use crate::tui::components::{
@@ -47,6 +48,40 @@ fn overlay_hover_rects(entries: &[(usize, Rect)], fields: &[(usize, Rect)]) -> V
         .map(|(_, r)| *r)
         .chain(fields.iter().map(|(_, r)| label_row(*r)))
         .collect()
+}
+
+const PROMPT_TEXT_WIDTH: usize = 68;
+const PROMPT_MAX_ROWS: usize = 4;
+
+/// Provider text is untrusted: one cell per char, with newlines shown as `⏎`
+/// and other control or bidi characters replaced, so nothing can move the
+/// terminal or reorder the line.
+fn prompt_display(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\n' => '⏎',
+            c if c.is_control() => '\u{fffd}',
+            '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => '\u{fffd}',
+            c => c,
+        })
+        .collect()
+}
+
+/// Hard-wraps `line` into rows of at most `cols` display cells. Zero-width
+/// chars stay on the current row so they never start one by themselves.
+pub(super) fn wrap_cells(line: &str, cols: usize) -> Vec<String> {
+    let mut rows = vec![String::new()];
+    let mut used = 0;
+    for c in line.chars() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used > 0 && used + w > cols {
+            rows.push(String::new());
+            used = 0;
+        }
+        rows.last_mut().expect("one row").push(c);
+        used += w;
+    }
+    rows
 }
 
 impl NewSessionDialog {
@@ -94,6 +129,9 @@ impl NewSessionDialog {
             };
 
         let mut constraints = Vec::new();
+        if self.prompt_origin.is_some() {
+            constraints.push(Constraint::Length(2)); // From line
+        }
         if has_profile_selection {
             constraints.push(Constraint::Length(profile_field_height)); // Profile
         }
@@ -114,7 +152,10 @@ impl NewSessionDialog {
         if has_sandbox {
             constraints.push(Constraint::Length(2)); // Sandbox checkbox (summary only)
         }
-        constraints.push(Constraint::Length(2)); // Group (always, at the bottom)
+        constraints.push(Constraint::Length(2)); // Group
+        if self.prompt_origin.is_some() {
+            constraints.push(Constraint::Length(self.prompt_height())); // Prompt
+        }
 
         // Inner width is 76: dialog width less borders and margin. The hint
         // line reserves 2 rows so per-field hints wrap instead of truncating.
@@ -156,6 +197,16 @@ impl NewSessionDialog {
         let mut ci = 0; // chunk index
 
         let fields = self.field_indices();
+
+        if let Some(origin) = &self.prompt_origin {
+            let from = format!(
+                "From {} · {} · {}",
+                origin.provider, origin.source_ref, origin.reason
+            );
+            let line = Line::styled(prompt_display(&from), Style::default().fg(theme.dimmed));
+            frame.render_widget(Paragraph::new(line), chunks[ci]);
+            ci += 1;
+        }
 
         if has_profile_selection {
             let area = chunks[ci];
@@ -413,6 +464,13 @@ impl NewSessionDialog {
         self.focusable_rects.push((fields.group, area));
         ci += 1;
 
+        if self.prompt_origin.is_some() {
+            let area = chunks[ci];
+            self.render_prompt_field(frame, area, self.focused_field == fields.prompt, theme);
+            self.focusable_rects.push((fields.prompt, area));
+            ci += 1;
+        }
+
         // Hints/errors (last chunk)
         let hint_chunk = ci;
         if self.confirm_create_dir.is_some() {
@@ -491,6 +549,10 @@ impl NewSessionDialog {
                 hint_spans.push(Span::styled("Ctrl+P", Style::default().fg(theme.hint)));
                 hint_spans.push(Span::raw(" configure  "));
             }
+            if self.focused_field == fields.prompt {
+                hint_spans.push(Span::styled("Ctrl+P", Style::default().fg(theme.hint)));
+                hint_spans.push(Span::raw(" view source  "));
+            }
             // Ctrl+T scratch chip. Always present so the binding is
             // discoverable without opening the `?` overlay. When focus is on
             // the Path row the chip is emphasized (bold accent) so users
@@ -535,6 +597,10 @@ impl NewSessionDialog {
             self.render_help_overlay(frame, full_area, theme);
         }
 
+        if self.show_prompt_source {
+            self.render_prompt_source_overlay(frame, full_area, theme);
+        }
+
         if self.group_picker.is_active() {
             self.group_picker.render(frame, full_area, theme);
         }
@@ -549,6 +615,68 @@ impl NewSessionDialog {
 
         if self.dir_picker.is_active() {
             self.dir_picker.render(frame, full_area, theme);
+        }
+    }
+
+    /// Rows the wrapped prompt needs (cursor cell included) plus the sub-line.
+    fn prompt_height(&self) -> u16 {
+        let chars = self.prompt.value().chars().count() + 1;
+        chars.div_ceil(PROMPT_TEXT_WIDTH).clamp(1, PROMPT_MAX_ROWS) as u16 + 1
+    }
+
+    /// The prompt hard-wrapped at `PROMPT_TEXT_WIDTH`, scrolled to keep the
+    /// cursor in view, with a sub-line naming where the text came from.
+    fn render_prompt_field(&self, frame: &mut Frame, area: Rect, focused: bool, theme: &Theme) {
+        let label_style = if focused {
+            Style::default().fg(theme.accent).underlined()
+        } else {
+            Style::default().fg(theme.text)
+        };
+        let value_style = Style::default().fg(if focused { theme.accent } else { theme.text });
+        let chars: Vec<char> = prompt_display(self.prompt.value()).chars().collect();
+        let rows = (area.height as usize).saturating_sub(1);
+        let cursor = self.prompt.cursor();
+        let cursor_row = cursor / PROMPT_TEXT_WIDTH;
+        let start = if focused {
+            (cursor_row + 1).saturating_sub(rows)
+        } else {
+            0
+        };
+        let mut lines: Vec<Line> = Vec::new();
+        for row in start..start + rows {
+            let text: String = chars
+                .iter()
+                .skip(row * PROMPT_TEXT_WIDTH)
+                .take(PROMPT_TEXT_WIDTH)
+                .collect();
+            let prefix = if row == start {
+                Span::styled("Prompt:", label_style)
+            } else {
+                Span::raw("       ")
+            };
+            lines.push(Line::from(vec![
+                prefix,
+                Span::raw(" "),
+                Span::styled(text, value_style),
+            ]));
+        }
+        if let Some(origin) = &self.prompt_origin {
+            lines.push(Line::styled(
+                prompt_display(&format!(
+                    "        from {}, not checked by AoE",
+                    origin.provider
+                )),
+                Style::default().fg(theme.dimmed),
+            ));
+        }
+        frame.render_widget(Paragraph::new(lines), area);
+        if focused {
+            let col = (cursor % PROMPT_TEXT_WIDTH) as u16;
+            let row = cursor_row.saturating_sub(start) as u16;
+            frame.set_cursor_position(Position::new(
+                area.x + 8 + col.min(area.width.saturating_sub(9)),
+                area.y + row.min(area.height.saturating_sub(2)),
+            ));
         }
     }
 
@@ -1214,13 +1342,15 @@ impl NewSessionDialog {
 
         let dialog_width: u16 = HELP_DIALOG_WIDTH;
         let has_profile_selection = self.has_profile_selection();
+        let has_prompt = self.prompt_origin.is_some();
         // Base fields: Scratch, Title, Path, YOLO, Worktree, Group + close hint
         let base_height: u16 = 20;
         let dialog_height: u16 = base_height
             + if has_profile_selection { 3 } else { 0 }
             + if has_tool_selection { 3 } else { 0 }
             + if has_sandbox { 3 } else { 0 }
-            + if show_sandbox_options_help { 12 } else { 0 };
+            + if show_sandbox_options_help { 12 } else { 0 }
+            + if has_prompt { 3 } else { 0 };
 
         let block = crate::tui::dialogs::toned_dialog_block(
             " New Session Help ",
@@ -1246,6 +1376,7 @@ impl NewSessionDialog {
                 "YOLO Mode" => !self.selected_tool_always_yolo(),
                 "Sandbox" => has_sandbox,
                 "Image" | "Environment" | "Host hook env" => show_sandbox_options_help,
+                "Prompt" => has_prompt,
                 _ => true,
             };
             if !show {
@@ -1270,6 +1401,72 @@ impl NewSessionDialog {
             Span::styled(" to close", Style::default().fg(theme.dimmed)),
         ]));
 
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    /// The provider text behind the prompt, in the help overlay's frame.
+    /// Hard-wrapped by cell width so the row count is exact and the close
+    /// hint always fits; rows past the area are folded into a count.
+    fn render_prompt_source_overlay(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let Some(origin) = &self.prompt_origin else {
+            return;
+        };
+        let width = HELP_DIALOG_WIDTH.min(area.width);
+        let cols = usize::from(width.saturating_sub(2)).max(1);
+        let body: Vec<String> = match origin.source_text.as_deref() {
+            Some(text) => text
+                .lines()
+                .flat_map(|line| wrap_cells(&prompt_display(line), cols))
+                .collect(),
+            None => vec!["No source text.".to_string()],
+        };
+        // Header, blank, body, close hint, plus the two border rows.
+        let max_body_rows = usize::from(area.height.saturating_sub(5)).max(1);
+        let body_rows = body.len().min(max_body_rows);
+        let height = body_rows as u16 + 5;
+        // On overflow the last visible row becomes the hidden-row count.
+        let shown = if body.len() > body_rows {
+            body_rows - 1
+        } else {
+            body_rows
+        };
+        let hidden = body.len() - shown;
+
+        let block = crate::tui::dialogs::toned_dialog_block(
+            " Suggestion source ",
+            theme.border,
+            theme.title,
+        );
+        let (_, inner) =
+            crate::tui::dialogs::render_dialog_frame(frame, area, width, height, block);
+
+        let mut lines = vec![
+            Line::styled(
+                prompt_display(&format!("From {}, not checked by AoE", origin.provider)),
+                Style::default().fg(theme.dimmed),
+            ),
+            Line::from(""),
+        ];
+        lines.extend(
+            body.into_iter()
+                .take(shown)
+                .map(|row| Line::styled(row, Style::default().fg(theme.text))),
+        );
+        if hidden > 0 {
+            lines.push(Line::styled(
+                format!("\u{2026} {hidden} more lines"),
+                Style::default().fg(theme.dimmed),
+            ));
+        }
+        lines.push(Line::from(vec![
+            Span::styled("Press ", Style::default().fg(theme.dimmed)),
+            Span::styled("Esc", Style::default().fg(theme.hint)),
+            Span::styled(", ", Style::default().fg(theme.dimmed)),
+            Span::styled("Enter", Style::default().fg(theme.hint)),
+            Span::styled(" or ", Style::default().fg(theme.dimmed)),
+            Span::styled("Ctrl+P", Style::default().fg(theme.hint)),
+            Span::styled(" to close", Style::default().fg(theme.dimmed)),
+        ]));
         frame.render_widget(Paragraph::new(lines), inner);
     }
 }

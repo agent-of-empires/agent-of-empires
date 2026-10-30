@@ -28,6 +28,7 @@ use crate::tui::dialogs::{
 use crate::tui::diff::{DiffAction, DiffView};
 use crate::tui::responsive;
 use crate::tui::settings::{SettingsAction, SettingsView};
+use crate::tui::suggestions::SuggestionsAction;
 
 /// Empty Trash checkbox keys.
 const EMPTY_TRASH_FORCE_FAILED: &str = "force_failed";
@@ -1902,6 +1903,16 @@ impl HomeView {
             }
         }
 
+        if let Some(view) = &mut self.suggestions_view {
+            let mutations_allowed = self.session_feed.mutations_available();
+            match view.handle_key(key, mutations_allowed) {
+                SuggestionsAction::Continue => {}
+                SuggestionsAction::Close => self.suggestions_view = None,
+                SuggestionsAction::Start(start) => self.start_suggestion(start),
+            }
+            return None;
+        }
+
         // Live-send capture normally wins over every other key handler: the home view is
         // a thin relay to the target pane, so dialog hotkeys, search and navigation
         // suspend until Ctrl+q. That holds while dialogs are keyboard-only, since
@@ -3033,6 +3044,9 @@ impl HomeView {
             ActionId::Diff => self.open_diff_for_selected(),
             ActionId::Serve => self.open_connections(),
             ActionId::Settings => self.open_settings(),
+            ActionId::Suggestions => {
+                self.suggestions_view = Some(crate::tui::suggestions::SuggestionsView::new())
+            }
             ActionId::Profiles => self.show_profile_picker(),
             ActionId::Projects => {
                 let profile = self.config_profile();

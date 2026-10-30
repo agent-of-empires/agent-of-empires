@@ -391,6 +391,8 @@ A template is stored per profile and criterion and replaces the provider's `draf
 
 Errors: 404 `unknown_provider` (no active plugin provides suggestions under that id), 409 `stale_suggestion` (the item is no longer published, or its source is disabled), 400 `validation_failed` (`criterion` not declared by the provider, or a template or its expansion over 64 KiB), 403 `read_only`.
 
+The TUI lists suggestions from Home with `S` (`Ctrl+S` in strict mode). The view shows each item's `preview` and prompt as plain text; The first Enter resolves `prepare` and shows its final `initial_prompt` (after any template); a second Enter opens the new-session dialog prefilled with it, and an item whose `project` is `null` cannot be started. The dialog adds an editable Prompt row, labelled with the provider, holding that prompt; Ctrl+P on that row shows the item's `preview` as source text. `r` only asks providers to refresh; `l` reloads the list. Items keep the order of the snapshot. Every TUI key is provisional pending #4597: `S` / `Ctrl+S` to open, and `x` (dismiss), `d` (dismissed), `r` and `l` inside the view may move.
+
 ### Project mappings
 
 An item may carry an opaque `mapping_key` (a repository, a team). Core stores, per profile, an ordered list of registered project paths for each `(provider_id, mapping_key)`; the first is the primary project and the rest come back as `extra_projects`. A mapping whose primary path no longer names exactly one registered project is ignored and the hint applies instead; stale extras are dropped, and an extra is never promoted. `GET` returns the stored paths as they are, including mappings of providers that are no longer active, and `DELETE` removes them; both stay allowed so stale rows can be repaired.

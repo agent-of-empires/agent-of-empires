@@ -301,6 +301,7 @@ impl HomeView {
             settings_view: None,
             settings_close_confirm: false,
             diff_view: None,
+            suggestions_view: None,
             list_width: user_config
                 .as_ref()
                 .and_then(|c| c.app_state.home_list_width)

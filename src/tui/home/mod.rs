@@ -452,6 +452,7 @@ pub struct HomeView {
     pub(super) settings_close_confirm: bool,
 
     pub(super) diff_view: Option<DiffView>,
+    pub(super) suggestions_view: Option<super::suggestions::SuggestionsView>,
 
     pub(super) list_width: u16,
     pub(super) list_height: Option<u16>,

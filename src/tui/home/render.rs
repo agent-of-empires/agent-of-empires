@@ -940,6 +940,12 @@ impl HomeView {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
 
+        if let Some(view) = &self.suggestions_view {
+            self.divider_col = None;
+            self.main_area_width = 0;
+            view.render(frame, area, theme);
+            return;
+        }
         if let Some(ref serve) = self.serve_view {
             self.divider_col = None;
             self.main_area_width = 0;
