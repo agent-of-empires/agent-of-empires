@@ -1903,7 +1903,20 @@ impl HomeView {
             }
         }
 
-        if let Some(view) = &mut self.suggestions_view {
+        if let (Some(view), None) = (&self.suggestions_view, &self.command_palette) {
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('k' | 'K'))
+            {
+                let command = view
+                    .selected_key()
+                    .and_then(|key| self.open_source_command(&key));
+                if let Some(command) = command {
+                    self.command_palette = Some(CommandPaletteDialog::new(vec![command]));
+                }
+                return None;
+            }
+        }
+        if let (Some(view), None) = (&mut self.suggestions_view, &self.command_palette) {
             let mutations_allowed = self.session_feed.mutations_available();
             match view.handle_key(key, mutations_allowed, &mut self.suggestions_feed) {
                 SuggestionsAction::Continue => {}
@@ -3911,6 +3924,13 @@ impl HomeView {
             payload: PaletteAction::Invoke(ActionId::Quit),
         });
 
+        if let Some(command) = self
+            .cursor_suggestion()
+            .and_then(|key| self.open_source_command(&key))
+        {
+            entries.push(command);
+        }
+
         // Dynamic session/group entries, one per flat_items row, so the user can
         // fuzzy-search and jump to it. In-flight sessions are tagged in the title so it is
         // clear that Stop/Delete will be a no-op for them.
@@ -4047,6 +4067,10 @@ impl HomeView {
                 None
             }
             PaletteAction::ToolSession(tool_name) => self.activate_tool(tool_name, false),
+            PaletteAction::OpenLink(url) => {
+                self.open_link(&url);
+                None
+            }
             PaletteAction::Cheat(message) => Some(Action::SetTransientStatus(message)),
         }
     }

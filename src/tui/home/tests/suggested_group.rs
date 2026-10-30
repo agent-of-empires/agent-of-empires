@@ -264,3 +264,113 @@ fn the_cursor_stays_on_its_suggestion_when_the_list_reorders() {
         Some(("gh".to_string(), "i1".to_string()))
     );
 }
+
+fn ctrl_k() -> KeyEvent {
+    KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)
+}
+
+fn type_text(env: &mut TestEnv, text: &str) {
+    for c in text.chars() {
+        env.view.handle_key(key(KeyCode::Char(c)), None);
+    }
+}
+
+/// Runs `body` with `AOE_OPEN_URL_TO` pointing at a fresh file and returns the
+/// URLs recorded there.
+fn recorded_opens(body: impl FnOnce()) -> Vec<String> {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::env::set_var("AOE_OPEN_URL_TO", file.path());
+    body();
+    std::env::remove_var("AOE_OPEN_URL_TO");
+    std::fs::read_to_string(file.path())
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+#[serial]
+fn open_in_source_is_offered_for_an_http_source_only() {
+    let (mut env, _requests) = expanded_env(1);
+    let key = ("gh".to_string(), "i0".to_string());
+    let command = env.view.open_source_command(&key).expect("an entry");
+    assert_eq!(command.title, "Open in GitHub");
+    assert!(matches!(
+        command.payload,
+        crate::tui::dialogs::PaletteAction::OpenLink(ref url) if url == "https://example.test"
+    ));
+
+    let mut hostile = snapshot(1, &[]);
+    hostile["items"][0]["source_url"] = "javascript:alert(1)".into();
+    env.view.suggestions_feed.set_snapshot_for_test(hostile);
+    assert!(env.view.open_source_command(&key).is_none());
+}
+
+#[test]
+#[serial]
+fn the_palette_opens_the_source_of_the_suggestion_under_the_cursor() {
+    let (mut env, _requests) = expanded_env(2);
+    env.view.cursor += 1;
+    env.view.update_selected();
+    let opened = recorded_opens(|| {
+        env.view.handle_key(ctrl_k(), None);
+        type_text(&mut env, "Open in GitHub");
+        env.view.handle_key(key(KeyCode::Enter), None);
+    });
+    assert_eq!(opened, ["https://example.test"]);
+    assert!(env.view.command_palette.is_none());
+}
+
+#[test]
+#[serial]
+fn the_full_view_palette_opens_the_selected_source_and_esc_returns_to_the_view() {
+    let (mut env, _requests) = expanded_env(2);
+    env.view.open_suggestions_view();
+
+    env.view.handle_key(ctrl_k(), None);
+    assert!(env.view.command_palette.is_some());
+    env.view.handle_key(key(KeyCode::Esc), None);
+    assert!(env.view.command_palette.is_none());
+    assert!(env.view.suggestions_view.is_some());
+
+    let opened = recorded_opens(|| {
+        env.view.handle_key(ctrl_k(), None);
+        env.view.handle_key(key(KeyCode::Enter), None);
+    });
+    assert_eq!(opened, ["https://example.test"]);
+    assert!(env.view.suggestions_view.is_some());
+}
+
+#[test]
+#[serial]
+fn the_preview_key_line_names_the_source_from_120_columns() {
+    let (mut env, _requests) = expanded_env(1);
+    env.view.cursor += 1;
+    env.view.update_selected();
+    for (width, expected) in [
+        (119, "z dismiss  ^K more"),
+        (120, "z dismiss  ^K open in GitHub"),
+    ] {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                assert!(env.view.render_suggestion_preview(
+                    frame,
+                    area,
+                    &crate::tui::styles::Theme::default()
+                ));
+            })
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains(expected), "{width} cols: {expected:?}");
+    }
+}

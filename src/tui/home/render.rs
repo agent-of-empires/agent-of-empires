@@ -944,6 +944,9 @@ impl HomeView {
             self.divider_col = None;
             self.main_area_width = 0;
             view.render(frame, area, theme, &self.suggestions_feed);
+            if let Some(palette) = &mut self.command_palette {
+                palette.render(frame, area, theme);
+            }
             return;
         }
         if let Some(ref serve) = self.serve_view {

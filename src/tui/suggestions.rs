@@ -297,7 +297,7 @@ impl SuggestionsView {
         store.item(key)
     }
 
-    fn selected_key(&self) -> Option<ItemKey> {
+    pub(super) fn selected_key(&self) -> Option<ItemKey> {
         self.order.get(self.selected).cloned()
     }
 
@@ -587,6 +587,9 @@ pub(super) struct Entry {
     pub project: Option<String>,
     pub prompt: String,
     pub provider_error: Option<String>,
+    /// The item's `source_url` when it is an http(s) address; core validates
+    /// it, this is a second check before anything is opened.
+    pub source_url: Option<String>,
 }
 
 pub(super) struct FeedPoll {
@@ -734,6 +737,7 @@ impl SuggestionsFeed {
             project: item.project.as_deref().map(plain),
             prompt: plain(&item.draft.prompt),
             provider_error: provider.error.as_deref().map(plain),
+            source_url: crate::util::is_http_url(&item.source_url).then(|| item.source_url.clone()),
         })
     }
 
