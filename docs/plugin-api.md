@@ -377,7 +377,7 @@ Suggestions are stored per profile. The routes below list and act on them; none 
 | `GET /api/suggestions/templates` | query `provider_id` and `criterion`, or neither | one: `{ provider_id, criterion, template, default }`; none: `{ templates: [{ provider_id, criterion, template }] }` |
 | `PUT /api/suggestions/templates` | `{ provider_id, criterion, template }` | `{ provider_id, criterion, template, default }` |
 | `DELETE /api/suggestions/templates` | `{ provider_id, criterion }` | `{ ok }` |
-| `POST /api/suggestions/prepare` | `{ provider_id, id }` | `{ title, initial_prompt, source_ref, project, extra_projects, tool, yolo, sandbox, worktree }` |
+| `POST /api/suggestions/prepare` | `{ provider_id, id }` | `{ title, initial_prompt, template_criterion, source_ref, project, extra_projects, tool, yolo, sandbox, worktree }` |
 | `GET /api/suggestions/mappings` | none | `{ mappings: [{ provider_id, mapping_key, projects }] }` |
 | `PUT /api/suggestions/mappings` | `{ provider_id, mapping_key, projects }` | `{ provider_id, mapping_key, projects }` |
 | `DELETE /api/suggestions/mappings?provider_id=&mapping_key=` | none | `{ ok, deleted }` |
@@ -388,7 +388,7 @@ A provider's `status` is `pending` before its first publish, `ok`, or `error`. U
 
 `prepare` resolves settings through the normal repo and profile config. `project` is `{ name, path }` or `null`, resolved in this order: the user's mapping for the item's `mapping_key`, then the item's `project` hint (exactly one registered project by name or exact path), else `null`; an item is never given a scratch project.
 
-A template is stored per profile and criterion and replaces the provider's `draft.prompt` in `prepare`'s `initial_prompt`, nowhere else. `{name}` expands to the item's variable of that name, scanning left to right (`{a{pr_number}}` becomes `{a42}`); unknown names and stray braces stay as typed, and expanded values are never scanned again. No stored template (`default: true`) uses `draft.prompt`; an empty template gives an empty prompt, so a client must then omit `initial_prompt` when creating the session, which rejects a blank one. A template and its expansion are each limited to 64 KiB; `prepare` fails with 400 `validation_failed` when the expansion is longer.
+A template is stored per profile and criterion and replaces the provider's `draft.prompt` in `prepare`'s `initial_prompt`, nowhere else. `{name}` expands to the item's variable of that name, scanning left to right (`{a{pr_number}}` becomes `{a42}`); unknown names and stray braces stay as typed, and expanded values are never scanned again. `template_criterion` is the item's criterion when a stored template produced `initial_prompt`, else `null`. No stored template (`default: true`) uses `draft.prompt`; an empty template gives an empty prompt, so a client must then omit `initial_prompt` when creating the session, which rejects a blank one. A template and its expansion are each limited to 64 KiB; `prepare` fails with 400 `validation_failed` when the expansion is longer.
 
 `GET` without parameters lists every stored template of the profile, including those of a disabled plugin or a criterion it no longer declares. `DELETE` checks neither, so any listed template can be removed and deleting an absent one succeeds.
 

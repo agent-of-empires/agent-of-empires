@@ -2217,6 +2217,15 @@ function AppContent({
           }}
           profile={searchParams.get("profile")}
           onOpenSuggestions={(dismissed) => navigate(dismissed ? "/suggestions?dismissed=1" : "/suggestions")}
+          templateFocus={
+            searchParams.get("template_provider") && searchParams.get("template_criterion")
+              ? {
+                  providerId: searchParams.get("template_provider")!,
+                  criterion: searchParams.get("template_criterion")!,
+                  returnToSuggestions: searchParams.get("from") === "suggestions",
+                }
+              : undefined
+          }
           field={searchParams.get("field")}
           onSelectProfile={(p) => {
             const next = new URLSearchParams(searchParams);
@@ -2633,6 +2642,16 @@ function AppContent({
               }}
               prefill={wizardPrefill}
               nameOnly={caps.nameOnlyWizard}
+              onEditTemplate={({ providerId, criterion }) => {
+                setShowSessionWizard(false);
+                setWizardPrefill(undefined);
+                const q = new URLSearchParams({
+                  template_provider: providerId,
+                  template_criterion: criterion,
+                  from: "suggestions",
+                });
+                navigate(`/settings/suggestions?${q}`);
+              }}
             />
           )}
 

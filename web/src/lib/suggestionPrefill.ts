@@ -5,9 +5,14 @@ export const STALE_NOTICE = "That suggestion changed. Refreshing the list.";
 
 // `p.worktree` is dropped on purpose: the wizard resolves worktree itself, and
 // `WizardPrefill.worktreeEnabled` means a registered-project override.
-export function toWizardPrefill(p: SuggestionPrepared, source: NonNullable<WizardPrefill["source"]>): WizardPrefill {
+export function toWizardPrefill(
+  p: SuggestionPrepared,
+  source: NonNullable<WizardPrefill["source"]>,
+  providerId?: string,
+): WizardPrefill {
   return {
     source,
+    template: p.template_criterion && providerId ? { providerId, criterion: p.template_criterion } : undefined,
     title: p.title || undefined,
     path: p.project?.path,
     tool: p.tool,

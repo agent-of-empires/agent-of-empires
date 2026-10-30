@@ -42,6 +42,7 @@ import {
 import { PluginSettingsSections } from "./settings/PluginSettingsSections";
 import { LogsSettings } from "./settings/LogsSettings";
 import { SuggestionsSettings } from "./settings/SuggestionsSettings";
+import type { TemplateFocus } from "./settings/SuggestionTemplates";
 import { useSuggestionsSnapshot } from "./settings/useSuggestionsSnapshot";
 import { SettingsHeader } from "./settings/SettingsHeader";
 import { StructuredViewDisplaySettings } from "./settings/StructuredViewDisplaySettings";
@@ -196,6 +197,8 @@ interface Props {
   cityhall?: boolean;
   /** Opens the full Suggested sessions view, optionally on its Dismissed filter. */
   onOpenSuggestions?: (dismissed: boolean) => void;
+  /** Opens Settings > Suggestions on one template block. */
+  templateFocus?: TemplateFocus;
 }
 
 const LAST_TAB_KEY = "aoe-settings-last-tab";
@@ -276,6 +279,7 @@ export function SettingsView({
   readOnly,
   cityhall = false,
   onOpenSuggestions,
+  templateFocus,
 }: Props) {
   const offline = useServerDown();
   const suggestions = useSuggestionsSnapshot();
@@ -784,6 +788,7 @@ export function SettingsView({
             reload={suggestions.reload}
             readOnly={readOnly ?? false}
             onOpenSuggestions={onOpenSuggestions}
+            templateFocus={templateFocus}
           />
         );
       case "structured-view": {

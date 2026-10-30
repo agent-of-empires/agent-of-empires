@@ -2,6 +2,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { SuggestionsSettings } from "../SuggestionsSettings";
+import type { TemplateFocus } from "../SuggestionTemplates";
 import { useSuggestionsSnapshot } from "../useSuggestionsSnapshot";
 import { expandTemplate } from "../../../lib/suggestionTemplate";
 import type { SuggestionsSnapshot } from "../../../lib/types";
@@ -61,7 +62,15 @@ const snapshot = (): SuggestionsSnapshot => ({
   ],
 });
 
-function Harness({ readOnly, onOpenSuggestions }: { readOnly: boolean; onOpenSuggestions: () => void }) {
+function Harness({
+  readOnly,
+  onOpenSuggestions,
+  templateFocus,
+}: {
+  readOnly: boolean;
+  onOpenSuggestions: () => void;
+  templateFocus?: TemplateFocus;
+}) {
   const { snapshot, failed, reload } = useSuggestionsSnapshot();
   return (
     <SuggestionsSettings
@@ -70,11 +79,12 @@ function Harness({ readOnly, onOpenSuggestions }: { readOnly: boolean; onOpenSug
       reload={reload}
       readOnly={readOnly}
       onOpenSuggestions={onOpenSuggestions}
+      templateFocus={templateFocus}
     />
   );
 }
 
-function open(props: { readOnly?: boolean } = {}) {
+function open(props: { readOnly?: boolean; templateFocus?: TemplateFocus } = {}) {
   api.fetchSuggestions.mockResolvedValue(snapshot());
   api.fetchSuggestionTemplates.mockResolvedValue([]);
   api.fetchSuggestionMappings.mockResolvedValue([]);
@@ -90,7 +100,13 @@ function open(props: { readOnly?: boolean } = {}) {
     f.mockResolvedValue(ok);
   }
   const onOpenSuggestions = vi.fn();
-  render(<Harness readOnly={props.readOnly ?? false} onOpenSuggestions={onOpenSuggestions} />);
+  render(
+    <Harness
+      readOnly={props.readOnly ?? false}
+      onOpenSuggestions={onOpenSuggestions}
+      templateFocus={props.templateFocus}
+    />,
+  );
   return onOpenSuggestions;
 }
 
@@ -181,6 +197,15 @@ describe("SuggestionsSettings", () => {
     fireEvent.blur(field);
     expect((await screen.findByRole("alert")).textContent).toContain("too long");
     expect(field.value).toBe("typed");
+  });
+
+  it("opens straight on a focused template and returns to the suggestions view", async () => {
+    const openFull = open({
+      templateFocus: { providerId: "gh", criterion: "review-requested", returnToSuggestions: true },
+    });
+    await screen.findByLabelText("GitHub review-requested template");
+    fireEvent.click(screen.getByRole("button", { name: /Suggested sessions/ }));
+    expect(openFull).toHaveBeenCalledWith(false);
   });
 
   it("maps a source to a Project and clears it", async () => {

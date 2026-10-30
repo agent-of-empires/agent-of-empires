@@ -76,7 +76,7 @@ export function useSuggestions(onPrepare: (prefill: WizardPrefill) => void) {
     if (result.ok) {
       setBusy(null);
       const label = snapshot?.providers.find((p) => p.id === item.provider_id)?.name ?? item.provider_id;
-      onPrepare(toWizardPrefill(result.data, { label, title: item.title, url: item.source_url }));
+      onPrepare(toWizardPrefill(result.data, { label, title: item.title, url: item.source_url }, item.provider_id));
       return;
     }
     setNotice(result.stale ? STALE_NOTICE : result.error);

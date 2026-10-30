@@ -620,6 +620,8 @@ export interface SuggestionsSnapshot {
 export interface SuggestionPrepared {
   title: string;
   initial_prompt: string;
+  /** The item's criterion when a stored template produced `initial_prompt`, else null. */
+  template_criterion: string | null;
   source_ref: string;
   project: { name: string; path: string } | null;
   tool: string;

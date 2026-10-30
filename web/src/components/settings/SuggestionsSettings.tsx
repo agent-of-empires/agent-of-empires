@@ -12,7 +12,7 @@ import {
 import type { SuggestionProvider, SuggestionsSnapshot } from "../../lib/types";
 import { OFFLINE_TITLE, useServerDown } from "../../lib/connectionState";
 import { SectionHeader, SuggestionSwitch } from "./suggestionsShared";
-import { SuggestionTemplates } from "./SuggestionTemplates";
+import { SuggestionTemplates, type TemplateFocus } from "./SuggestionTemplates";
 
 const REFRESH_OPTIONS = [5, 15, 30, 60, 120];
 
@@ -146,13 +146,14 @@ interface Props {
   reload: () => Promise<void>;
   readOnly: boolean;
   onOpenSuggestions?: (dismissed: boolean) => void;
+  templateFocus?: TemplateFocus;
 }
 
-export function SuggestionsSettings({ snapshot, failed, reload, readOnly, onOpenSuggestions }: Props) {
+export function SuggestionsSettings({ snapshot, failed, reload, readOnly, onOpenSuggestions, templateFocus }: Props) {
   const offline = useServerDown();
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [templates, setTemplates] = useState(false);
+  const [templates, setTemplates] = useState(Boolean(templateFocus));
   const mounted = useRef(true);
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 4 } }));
 
@@ -186,7 +187,9 @@ export function SuggestionsSettings({ snapshot, failed, reload, readOnly, onOpen
       <SuggestionTemplates
         snapshot={snapshot}
         disabled={disabled}
+        focus={templateFocus}
         onBack={() => setTemplates(false)}
+        onReturn={templateFocus?.returnToSuggestions ? () => onOpenSuggestions?.(false) : undefined}
         onSource={(providerId, criterion, enabled) => act(() => updateSuggestionSource(providerId, criterion, enabled))}
       />
     );

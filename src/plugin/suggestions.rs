@@ -1052,6 +1052,7 @@ pub(crate) fn prepare(
     Ok(json!({
         "title": item.draft.title,
         "initial_prompt": prompt,
+        "template_criterion": template.map(|_| &item.criterion),
         "source_ref": item.source_ref,
         "project": project.as_ref().map(describe),
         "extra_projects": extras.unwrap_or_default().iter().map(describe).collect::<Vec<_>>(),
@@ -1450,6 +1451,9 @@ mod tests {
         }
         let out = prepared(None);
         assert_eq!(out["initial_prompt"], "Do work");
+        assert!(out["template_criterion"].is_null());
+        let templated = prepare("default", &item("a", "assigned"), Some(""), None).unwrap();
+        assert_eq!(templated["template_criterion"], "assigned");
         assert_eq!(out["source_ref"], "example/1");
         assert_eq!(out["extra_projects"], json!([]));
     }
