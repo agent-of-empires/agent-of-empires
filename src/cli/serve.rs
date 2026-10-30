@@ -1570,6 +1570,12 @@ pub(crate) async fn ensure_local_daemon(
             allow_start,
             "Local daemon autostart is disabled; start one with `aoe serve --core-only --daemon`"
         );
+        let transaction = tokio::task::spawn_blocking(move || {
+            let lock = try_lock_serve()?.context("Another daemon or migration owns serve.lock")?;
+            crate::migrations::run_migrations_under_exclusion(None, false, &transaction, &lock)?;
+            Ok::<_, anyhow::Error>(transaction)
+        })
+        .await??;
         let resolved_profile = if let Some(profile) = native_profile {
             crate::session::config::effective_profile(profile)
         } else {
