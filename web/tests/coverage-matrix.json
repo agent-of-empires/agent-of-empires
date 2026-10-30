@@ -838,6 +838,13 @@
       ]
     },
     {
+      "id": "suggestions.review-and-start",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/suggestions-review.spec.ts", "src/components/__tests__/SuggestionsView.test.tsx"],
+      "components": ["web/src/components/SuggestionsView.tsx"]
+    },
+    {
       "id": "settings.advanced-fold",
       "kind": "vitest",
       "risk": "medium",
