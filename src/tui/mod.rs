@@ -285,8 +285,10 @@ pub(crate) async fn migrate_for_startup(
             }
         }
     };
-    crate::cli::migrate::resolve_blocked_migration(outcome, interactive, daemon, || migrate(None))
-        .await
+    crate::cli::migrate::resolve_blocked_migration(outcome, interactive, daemon, || {
+        migrate(Some(crate::cli::migrate::stderr_reporter()))
+    })
+    .await
 }
 
 pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
