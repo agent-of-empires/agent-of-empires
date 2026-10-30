@@ -37,13 +37,14 @@ function useModalFocus(onClose: () => void) {
     const root = () => document.querySelector<HTMLElement>('[data-testid="plan-modal"]');
     root()?.querySelector<HTMLElement>(FOCUSABLE)?.focus();
     const onKey = (e: KeyboardEvent) => {
-      // A covered session (inert) or another overlay holding focus, such as
-      // the command palette, owns the keyboard; this trap only acts for the
-      // topmost surface.
+      // A covered session (inert) or a higher overlay such as the command
+      // palette owns the keyboard. Focus on a non-modal element, like a
+      // terminal behind the plan, does not: the trap pulls it back.
       const el = root();
       const holder = document.activeElement;
       if (!el || el.closest("[inert]")) return;
-      if (holder && holder !== document.body && !el.contains(holder)) return;
+      const overlay = holder?.closest('[aria-modal="true"]');
+      if (overlay && overlay !== el) return;
       if (e.key === "Escape") {
         e.preventDefault();
         onCloseRef.current();

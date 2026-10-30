@@ -5,6 +5,7 @@
 import type { Page } from "@playwright/test";
 import { test, expect, pressShortcut } from "./helpers/mockedTest";
 import { mockAcpSession, openStructuredSession } from "./helpers/acpMock";
+import { mockTerminalApis } from "./helpers/terminal-mocks";
 
 const TITLE = "plan-modal";
 const PLAN = `# Plan\n\nRead [PLAN.md](/tmp/${TITLE}/PLAN.md) first.\n\n- step one\n- step two`;
@@ -26,9 +27,10 @@ const approval = {
   resolved: null,
 };
 
-async function openPlanModal(page: Page) {
+async function openPlanModal(page: Page, beforeOpen?: () => Promise<void>) {
   const mock = await mockAcpSession(page, { title: TITLE, reducedState: { pending_approvals: [approval] } });
   await openStructuredSession(page, mock);
+  await beforeOpen?.();
   const opener = page.getByRole("button", { name: "View plan" });
   await expect(opener).toBeVisible({ timeout: 10_000 });
   await opener.click();
@@ -70,6 +72,26 @@ test("the command palette keeps Tab and Escape while it covers the plan modal", 
   await page.keyboard.press("Escape");
   await expect(palette).toBeHidden();
   await expect(dialog).toBeVisible();
+});
+
+test("the terminal-focus shortcut cannot strand focus behind the plan modal", async ({ page }) => {
+  await mockTerminalApis(page);
+  const pairedInput = page.locator('[data-term="paired"]:visible textarea').first();
+  const { dialog } = await openPlanModal(page, async () => {
+    await page.locator('[data-testid^="pane-tab-terminal:"]').first().click();
+    await expect(pairedInput).toBeAttached();
+  });
+
+  await pressShortcut(page, "ControlOrMeta+`");
+  await expect(pairedInput).toBeFocused();
+
+  await page.keyboard.press("Tab");
+  await expect.poll(() => dialog.evaluate((el) => el.contains(document.activeElement))).toBe(true);
+
+  await pressShortcut(page, "ControlOrMeta+`");
+  await expect(pairedInput).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("plan-modal")).toHaveCount(0);
 });
 
 test("a plan file link closes the modal and leaves Tab alone while the approval stays pending", async ({ page }) => {

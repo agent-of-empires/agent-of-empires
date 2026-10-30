@@ -340,11 +340,14 @@ describe("ApprovalCard plan viewer", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(document.activeElement).toBe(opener);
   });
-  it("leaves Tab and Escape alone while another overlay holds focus or the modal is inert", () => {
+  it("leaves Tab and Escape to a higher overlay or an inert modal but reclaims plain focus", () => {
     mount(withPlan());
     fireEvent.click(screen.getByText("View plan"));
+    const overlay = document.createElement("div");
+    overlay.setAttribute("aria-modal", "true");
     const other = document.createElement("input");
-    document.body.append(other);
+    overlay.append(other);
+    document.body.append(overlay);
     other.focus();
     for (const init of [{ key: "Tab" }, { key: "Escape" }]) {
       const ev = new KeyboardEvent("keydown", { ...init, bubbles: true, cancelable: true });
@@ -353,7 +356,20 @@ describe("ApprovalCard plan viewer", () => {
       expect(screen.queryByRole("dialog")).not.toBeNull();
     }
     expect(document.activeElement).toBe(other);
-    other.remove();
+    overlay.remove();
+
+    const plain = document.createElement("textarea");
+    document.body.append(plain);
+    plain.focus();
+    const tab = new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true });
+    document.dispatchEvent(tab);
+    expect(tab.defaultPrevented).toBe(true);
+    expect(screen.getByRole("dialog").contains(document.activeElement)).toBe(true);
+    plain.focus();
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    plain.remove();
+    fireEvent.click(screen.getByText("View plan"));
 
     const dialog = screen.getByRole("dialog");
     const wrapper = document.createElement("div");
