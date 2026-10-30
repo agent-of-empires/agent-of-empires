@@ -259,6 +259,7 @@ pub(crate) async fn spawn_structured_session(
                 text,
                 attachments: Vec::new(),
                 synthesized: false,
+                error: None,
             });
         instance.acp_mode_id = acp_mode_id;
         instance.callback_url = callback_url;

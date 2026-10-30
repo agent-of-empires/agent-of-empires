@@ -684,6 +684,18 @@ pub async fn create_session(
         }
     }
 
+    if body
+        .initial_prompt
+        .as_deref()
+        .is_some_and(|prompt| prompt.trim().is_empty())
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "initial_prompt must not be blank",
+        );
+    }
+
     // Idempotency first: a known key is answered from its result, replayed failure or
     // restart fence before any validation that reads mutable state (profiles, agents,
     // projects), which could otherwise turn a retry of an unknown outcome into a verdict.
@@ -1128,6 +1140,7 @@ pub async fn create_session(
         );
     }
 
+    let initial_prompt = body.initial_prompt.take();
     let profile = body.profile.unwrap_or(default_profile);
     // `body.profile` is the caller's authority when it names one; otherwise
     // the served profile resolved above, which is also what the validation
@@ -1204,7 +1217,7 @@ pub async fn create_session(
         let _creation_profile = _creation_profile;
         let result = task_state
             .session_service
-            .create_structured_session(spec, None, None, None)
+            .create_structured_session(spec, None, None, initial_prompt.as_deref())
             .await;
         if let (Err(e), Some(key)) = (&result, &key) {
             if let Some(failure) = create_failure(e) {

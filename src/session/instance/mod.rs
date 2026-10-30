@@ -198,6 +198,10 @@ pub struct PendingInitialTurn {
     /// once, before the park.
     #[serde(default)]
     pub synthesized: bool,
+    /// Why a terminal session's initial prompt was not typed. Set once, never
+    /// retried automatically; the text is kept so a user can resend it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

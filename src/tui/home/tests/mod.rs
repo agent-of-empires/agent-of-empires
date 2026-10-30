@@ -910,6 +910,7 @@ fn creation_data(project_dir: &std::path::Path, title: &str, group: &str) -> New
         scratch: false,
         fork_seed: None,
         structured: false,
+        initial_prompt: None,
     }
 }
 

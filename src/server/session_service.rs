@@ -1183,6 +1183,7 @@ impl SessionService {
             text,
             attachments,
             synthesized: true,
+            error: None,
         };
         let profile = {
             let mut instances = self.instances.write().await;
@@ -3332,6 +3333,7 @@ mod tests {
                 text: "hello".to_string(),
                 attachments: Vec::new(),
                 synthesized: false,
+                error: None,
             });
             inst
         }
@@ -3797,6 +3799,7 @@ mod tests {
             text: "resume".into(),
             attachments: vec![],
             synthesized: true,
+            error: None,
         };
         type Mutate = fn(Arc<SessionService>) -> futures_util::future::BoxFuture<'static, ()>;
         type Check = fn(&Instance) -> bool;
