@@ -871,6 +871,14 @@ pub(crate) async fn spawn_structured_session(
                             "created session completion failed: {error}"),
                     }
                 });
+            } else if !response_instance.is_structured()
+                && response_instance.pending_initial_turn.is_some()
+            {
+                let id = response_instance.id.clone();
+                let service_for_drain = service.clone();
+                service.work.spawn("tmux.initial_turn", async move {
+                    service_for_drain.drain_terminal_initial_turn(&id).await;
+                });
             }
 
             Ok(SpawnOutcome {
