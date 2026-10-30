@@ -5,6 +5,8 @@ import { useIdleDecayWindowMs } from "../lib/idleDecay";
 import { useIsWideViewport } from "../hooks/useIsWideViewport";
 import { AOE_BRAND_MARK_COLORS, AOE_BRAND_MARK_TEXT_SHADOW } from "../lib/brandMark";
 import { TOUR_ANCHORS, type TourAnchorId } from "../lib/tourSteps";
+import { DashboardSuggestions } from "./DashboardSuggestions";
+import type { WizardPrefill } from "./session-wizard/SessionWizard";
 import { PluginCards, PluginHomePanes } from "./plugin/PluginSlots";
 import { StatusGlyph } from "./StatusGlyph";
 import { StrokeIcon } from "./icons";
@@ -19,6 +21,9 @@ interface Props {
   canManageProjects?: boolean;
   onToggleSidebar: () => void;
   readOnly?: boolean;
+  /** Both required to show the Suggested sessions section. */
+  onPrepareSuggestion?: (prefill: WizardPrefill) => void;
+  onViewAllSuggestions?: () => void;
 }
 
 export function Dashboard({
@@ -29,6 +34,8 @@ export function Dashboard({
   onToggleSidebar,
   readOnly,
   canManageProjects = true,
+  onPrepareSuggestion,
+  onViewAllSuggestions,
 }: Props) {
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const isWideViewport = useIsWideViewport();
@@ -138,6 +145,10 @@ export function Dashboard({
             {stats.projects !== 1 ? "s" : ""}
           </span>
         </div>
+      )}
+
+      {onPrepareSuggestion && onViewAllSuggestions && (
+        <DashboardSuggestions readOnly={readOnly} onPrepare={onPrepareSuggestion} onViewAll={onViewAllSuggestions} />
       )}
 
       {/* The desktop sidebar is always available, but mobile starts at this dashboard. */}
