@@ -92,7 +92,8 @@ describe("AuthStatusHint signed out", () => {
 
     fireEvent.click(button);
     expect(button.getAttribute("aria-expanded")).toBe("true");
-    expect(screen.getByRole("dialog", { name: "Claude Code isn't signed in" })).toBeTruthy();
+    // Focus enters the dialog, so a screen reader announces it.
+    expect(document.activeElement).toBe(screen.getByRole("dialog", { name: "Claude Code isn't signed in" }));
     expect(screen.getByTestId("sign-in-command").textContent).toBe("claude auth login");
     expect(dialog()!.textContent).toContain("host terminal");
     expect(dialog()!.textContent).toContain("ANTHROPIC_API_KEY");
@@ -168,6 +169,18 @@ describe("AuthStatusHint signed out", () => {
     await act(async () => answer({ ok: false, message: "session is busy" }));
     expect(screen.getByRole("status").textContent).toBe("Couldn't restart the Agent: session is busy");
     expect(screen.getByRole("button", { name: "Restart Agent" })).toBeTruthy();
+  });
+
+  it("a restart that lands after the panel closed leaves the reopened one open", async () => {
+    let answer!: (r: { ok: boolean }) => void;
+    vi.mocked(restartSession).mockReturnValueOnce(new Promise((r) => (answer = r)));
+    renderSignedOut(signIn());
+    fireEvent.click(trigger());
+    fireEvent.click(screen.getByRole("button", { name: "Restart Agent" }));
+    fireEvent.mouseDown(document.body);
+    fireEvent.click(trigger());
+    await act(async () => answer({ ok: true }));
+    expect(dialog()).not.toBeNull();
   });
 
   it("closes once the restart is accepted", async () => {

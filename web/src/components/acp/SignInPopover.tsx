@@ -1,5 +1,5 @@
 import { ShieldAlert } from "lucide-react";
-import { useId, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 
 import { restartSession } from "../../lib/api";
 import type { ShellMode } from "../PairedTerminal";
@@ -89,19 +89,33 @@ function SignInPanel({ id, signIn, onLeave }: { id: string; signIn?: SignInConte
   const [restart, setRestart] = useState<{ state: "idle" | "restarting" | "failed"; message?: string }>({
     state: "idle",
   });
+  const panelRef = useRef<HTMLDivElement>(null);
+  const mounted = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    // Into the dialog, so a screen reader announces it.
+    panelRef.current?.focus();
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
   const restartAgent = async (sessionId: string) => {
     setRestart({ state: "restarting" });
     const result = await restartSession(sessionId);
+    // A panel closed meanwhile must not close the one opened after it.
+    if (!mounted.current) return;
     if (result.ok) onLeave();
     else setRestart({ state: "failed", message: result.message });
   };
   return (
     <div
+      ref={panelRef}
       id={id}
       role="dialog"
+      tabIndex={-1}
       aria-labelledby={headingId}
       data-testid="sign-in-popover"
-      className="absolute bottom-full left-0 z-30 mb-2 w-80 max-w-[calc(100vw-2rem)] rounded-lg border border-surface-700 bg-surface-850 p-3 text-xs text-text-secondary shadow-xl"
+      className="absolute bottom-full left-0 z-30 mb-2 w-80 focus:outline-none max-w-[calc(100vw-2rem)] rounded-lg border border-surface-700 bg-surface-850 p-3 text-xs text-text-secondary shadow-xl"
     >
       <h2 id={headingId} className="text-sm font-medium text-text-primary">
         {name} isn't signed in
