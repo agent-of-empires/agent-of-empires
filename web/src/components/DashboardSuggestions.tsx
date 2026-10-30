@@ -10,11 +10,12 @@ interface Props {
   readOnly?: boolean;
   onPrepare: (prefill: WizardPrefill) => void;
   onViewAll: () => void;
+  onOpenSession: (sessionId: string) => void;
 }
 
 const UNDO_MS = 10_000;
 
-export function DashboardSuggestions({ readOnly = false, onPrepare, onViewAll }: Props) {
+export function DashboardSuggestions({ readOnly = false, onPrepare, onViewAll, onOpenSession }: Props) {
   const wide = useIsWideViewport();
   const { snapshot, loadFailed, busy, refreshing, notice, offline, act, refresh, start } = useSuggestions(onPrepare);
   const [undo, setUndo] = useState<SuggestionItem | null>(null);
@@ -71,6 +72,7 @@ export function DashboardSuggestions({ readOnly = false, onPrepare, onViewAll }:
             source={nameOf(item.provider_id)}
             reason={item.reason}
             project={item.project}
+            session={item.started_session}
             actions={
               <SuggestionActions
                 readOnly={readOnly}
@@ -78,6 +80,14 @@ export function DashboardSuggestions({ readOnly = false, onPrepare, onViewAll }:
                 busy={busy !== null}
                 onStart={() => void start(item)}
                 onToggleDismiss={() => void dismiss(item, true)}
+                started={
+                  item.started_session && {
+                    onOpen: () => onOpenSession(item.started_session!.id),
+                    onStartAnother: () => void start(item, true),
+                    providerName: nameOf(item.provider_id),
+                    sourceUrl: item.source_url,
+                  }
+                }
               />
             }
           />

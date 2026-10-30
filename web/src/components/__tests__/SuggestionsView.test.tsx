@@ -61,9 +61,10 @@ afterEach(() => {
 async function open(snap: SuggestionsSnapshot | null, props: { readOnly?: boolean } = {}) {
   fetchSuggestions.mockResolvedValue(snap);
   const onPrepare = vi.fn();
-  render(<SuggestionsView onPrepare={onPrepare} {...props} />);
+  const onOpenSession = vi.fn();
+  render(<SuggestionsView onPrepare={onPrepare} onOpenSession={onOpenSession} {...props} />);
   await waitFor(() => expect(fetchSuggestions).toHaveBeenCalled());
-  return onPrepare;
+  return Object.assign(onPrepare, { onOpenSession });
 }
 
 describe("SuggestionsView", () => {
@@ -92,9 +93,68 @@ describe("SuggestionsView", () => {
         yoloMode: true,
         sandboxEnabled: false,
         initialPrompt: "Review the issue.",
+        suggestion: { provider_id: "github", id: "issue-1" },
       }),
     );
     expect(prepareSuggestion).toHaveBeenCalledWith("github", "issue-1");
+  });
+
+  describe("a started suggestion", () => {
+    const started = {
+      id: "sess-1",
+      title: "Review RFC 4562",
+      status: "Running" as const,
+      archived: false,
+      created_at: new Date(Date.now() - 3 * 60_000).toISOString(),
+    };
+    const prepared = {
+      ok: true,
+      data: {
+        title: "Fix lifecycle",
+        initial_prompt: "Review the issue.",
+        source_ref: "example/1",
+        project: { name: "aoe", path: "/work/aoe" },
+        tool: "opencode",
+        yolo: false,
+        sandbox: false,
+        worktree: true,
+      },
+    };
+    const openStarted = (session = started) => open(snapshot({ items: [{ ...item, started_session: session }] }));
+
+    it("shows Open and the Session state instead of Start", async () => {
+      const onPrepare = await openStarted();
+      expect(screen.queryByRole("button", { name: "Start" })).toBeNull();
+      const row = (await screen.findByText("Fix lifecycle")).closest("li") as HTMLElement;
+      expect(row.querySelector("p:nth-of-type(2)")?.textContent).toBe(
+        "GitHub · ⠋ Session running · Review RFC 4562 · started 3 min ago · aoe",
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Open" }));
+      expect(onPrepare.onOpenSession).toHaveBeenCalledWith("sess-1");
+    });
+
+    it("Start another opens the wizard without linking the new Session", async () => {
+      prepareSuggestion.mockResolvedValue(prepared);
+      const onPrepare = await openStarted();
+      fireEvent.click(await screen.findByRole("button", { name: "More" }));
+      expect(screen.getByRole("menuitem", { name: "Open in GitHub ↗" }).getAttribute("href")).toBe(
+        "https://example.test/issues/1",
+      );
+      fireEvent.click(screen.getByRole("menuitem", { name: "Start another Session…" }));
+      await waitFor(() => expect(onPrepare).toHaveBeenCalled());
+      expect(onPrepare.mock.calls[0]![0].suggestion).toBeUndefined();
+    });
+
+    it("an archived Session says so and read-only keeps Open but offers no Dismiss", async () => {
+      await openStarted({ ...started, archived: true });
+      const row = (await screen.findByText("Fix lifecycle")).closest("li") as HTMLElement;
+      expect(row.textContent).toContain("Archived · Review RFC 4562");
+      cleanup();
+      await open(snapshot({ items: [{ ...item, started_session: started }] }), { readOnly: true });
+      fireEvent.click(await screen.findByRole("button", { name: "More" }));
+      expect(screen.queryByRole("menuitem", { name: "Dismiss" })).toBeNull();
+      expect(screen.getByRole("button", { name: "Open" })).toBeTruthy();
+    });
   });
 
   it("renders one compact row: title, then Source, reason and Project, with no preview or chip", async () => {

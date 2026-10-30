@@ -1,18 +1,60 @@
-import type { ReactNode } from "react";
-import { Undo2, X } from "lucide-react";
+import { useRef, useState, type ReactNode } from "react";
+import { MoreHorizontal, Undo2, X } from "lucide-react";
 import { OFFLINE_TITLE } from "../lib/connectionState";
+import type { StartedSession } from "../lib/types";
+import { useOutsideDismiss } from "./useOutsideDismiss";
 
 export const SUGGESTION_NOTE_CLASS = "border-t border-surface-700/40 px-3 py-2 text-xs text-text-dim first:border-t-0";
+
+/** "just now", "5 min ago", "3h ago", "2d ago". */
+function startedAgo(iso: string, now = Date.now()): string {
+  const mins = Math.floor((now - new Date(iso).getTime()) / 60_000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins} min ago`;
+  if (mins < 60 * 24) return `${Math.floor(mins / 60)}h ago`;
+  return `${Math.floor(mins / 60 / 24)}d ago`;
+}
+
+/** The reason line of a started item: Session state, its title, how long ago it began. */
+function StartedReason({ session }: { session: StartedSession }) {
+  const status = session.archived ? null : session.status;
+  return (
+    <>
+      {status === "Running" ? (
+        <span className="text-status-running">
+          <span aria-hidden="true" className="font-mono">
+            ⠋
+          </span>{" "}
+          Session running
+        </span>
+      ) : status === "Idle" ? (
+        <span>
+          <span aria-hidden="true" className="font-mono">
+            ⠒
+          </span>{" "}
+          Session idle
+        </span>
+      ) : (
+        <span>{status ? `Session ${status.toLowerCase()}` : "Archived"}</span>
+      )}
+      {" · "}
+      {session.title}
+      {" · "}started {startedAgo(session.created_at)}
+    </>
+  );
+}
 
 interface RowProps {
   title: string;
   source: string;
   reason: string;
   project?: string | null;
+  /** Replaces the reason with the started Session's state. */
+  session?: StartedSession;
   actions: ReactNode;
 }
 
-export function SuggestionRow({ title, source, reason, project, actions }: RowProps) {
+export function SuggestionRow({ title, source, reason, project, session, actions }: RowProps) {
   return (
     <li className="flex items-center gap-3 border-t border-surface-700/40 px-3 py-2.5 first:border-t-0">
       <div className="min-w-0 flex-1">
@@ -20,7 +62,7 @@ export function SuggestionRow({ title, source, reason, project, actions }: RowPr
         <p className="mt-0.5 truncate text-xs text-text-muted">
           <span className="font-mono font-medium text-text-secondary">{source}</span>
           {" · "}
-          {reason}
+          {session ? <StartedReason session={session} /> : reason}
           {project && (
             <>
               {" · "}
@@ -41,6 +83,92 @@ interface ActionsProps {
   busy: boolean;
   onStart: () => void;
   onToggleDismiss: () => void;
+  /** A started item: Open replaces Start, and the others move into a menu. */
+  started?: { onOpen: () => void; onStartAnother: () => void; providerName: string; sourceUrl: string };
+}
+
+const MENU_ITEM_CLASS =
+  "block w-full px-3 py-1.5 text-left text-xs text-text-secondary hover:bg-surface-700 disabled:opacity-50";
+
+function MoreMenu({
+  started,
+  disabled,
+  readOnly,
+  offline,
+  onDismiss,
+}: {
+  started: NonNullable<ActionsProps["started"]>;
+  disabled: boolean;
+  readOnly: boolean;
+  offline: boolean;
+  onDismiss: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useOutsideDismiss(open, [ref], () => setOpen(false));
+  const unavailable = readOnly ? "Read-only: can't create Sessions" : offline ? OFFLINE_TITLE : undefined;
+  return (
+    <div ref={ref} className="relative">
+      <button
+        type="button"
+        aria-label="More"
+        title="More"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+        className="inline-flex h-8 w-8 items-center justify-center rounded-md text-text-secondary hover:bg-surface-700/50"
+      >
+        <MoreHorizontal className="h-4 w-4" />
+      </button>
+      {open && (
+        <div
+          role="menu"
+          className="absolute right-0 z-20 mt-1 w-[220px] rounded-md border border-surface-700 bg-surface-800 py-1 shadow-lg"
+        >
+          <button
+            type="button"
+            role="menuitem"
+            disabled={disabled}
+            title={unavailable}
+            className={MENU_ITEM_CLASS}
+            onClick={() => {
+              setOpen(false);
+              started.onStartAnother();
+            }}
+          >
+            Start another Session…
+          </button>
+          <a
+            role="menuitem"
+            href={started.sourceUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className={MENU_ITEM_CLASS}
+            onClick={() => setOpen(false)}
+          >
+            Open in {started.providerName} ↗
+          </a>
+          {!readOnly && (
+            <>
+              <hr className="my-1 border-surface-700/60" />
+              <button
+                type="button"
+                role="menuitem"
+                disabled={disabled}
+                className={MENU_ITEM_CLASS}
+                onClick={() => {
+                  setOpen(false);
+                  onDismiss();
+                }}
+              >
+                Dismiss
+              </button>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
 
 /** Start plus the dismiss (or, for a dismissed item, restore) button. */
@@ -51,9 +179,30 @@ export function SuggestionActions({
   busy,
   onStart,
   onToggleDismiss,
+  started,
 }: ActionsProps) {
   const disabled = busy || readOnly || offline;
   const label = dismissed ? "Restore" : "Dismiss";
+  if (started && !dismissed) {
+    return (
+      <>
+        <button
+          type="button"
+          onClick={started.onOpen}
+          className="inline-flex h-8 items-center rounded-md bg-brand-600 px-3 text-xs font-medium text-text-on-brand hover:bg-brand-500"
+        >
+          Open
+        </button>
+        <MoreMenu
+          started={started}
+          disabled={disabled}
+          readOnly={readOnly}
+          offline={offline}
+          onDismiss={onToggleDismiss}
+        />
+      </>
+    );
+  }
   return (
     <>
       {!dismissed && (

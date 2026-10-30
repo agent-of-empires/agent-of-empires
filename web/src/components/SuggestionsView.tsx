@@ -9,9 +9,10 @@ import type { WizardPrefill } from "./session-wizard/SessionWizard";
 interface Props {
   readOnly?: boolean;
   onPrepare: (prefill: WizardPrefill) => void;
+  onOpenSession: (sessionId: string) => void;
 }
 
-export function SuggestionsView({ readOnly = false, onPrepare }: Props) {
+export function SuggestionsView({ readOnly = false, onPrepare, onOpenSession }: Props) {
   const { snapshot, loading, loadFailed, refreshing, busy, notice, offline, act, refresh, start } =
     useSuggestions(onPrepare);
   const [showDismissed, setShowDismissed] = useState(false);
@@ -125,6 +126,7 @@ export function SuggestionsView({ readOnly = false, onPrepare }: Props) {
                   source={providerName}
                   reason={item.reason}
                   project={item.project}
+                  session={item.started_session}
                   actions={
                     <SuggestionActions
                       dismissed={item.dismissed}
@@ -132,6 +134,14 @@ export function SuggestionsView({ readOnly = false, onPrepare }: Props) {
                       offline={offline}
                       busy={busy !== null}
                       onStart={() => void start(item)}
+                      started={
+                        item.started_session && {
+                          onOpen: () => onOpenSession(item.started_session!.id),
+                          onStartAnother: () => void start(item, true),
+                          providerName,
+                          sourceUrl: item.source_url,
+                        }
+                      }
                       onToggleDismiss={() =>
                         void act(key, () => dismissSuggestion(item.provider_id, item.id, !item.dismissed))
                       }

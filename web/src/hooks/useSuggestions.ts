@@ -68,7 +68,8 @@ export function useSuggestions(onPrepare: (prefill: WizardPrefill) => void) {
     if (mounted.current) setRefreshing(false);
   };
 
-  const start = async (item: SuggestionItem) => {
+  // `another` starts a further Session without claiming the suggestion's link.
+  const start = async (item: SuggestionItem, another = false) => {
     setBusy(suggestionKey(item));
     setNotice(null);
     const result = await prepareSuggestion(item.provider_id, item.id);
@@ -76,7 +77,13 @@ export function useSuggestions(onPrepare: (prefill: WizardPrefill) => void) {
     if (result.ok) {
       setBusy(null);
       const label = snapshot?.providers.find((p) => p.id === item.provider_id)?.name ?? item.provider_id;
-      onPrepare(toWizardPrefill(result.data, { label, title: item.title, url: item.source_url }));
+      onPrepare(
+        toWizardPrefill(
+          result.data,
+          { label, title: item.title, url: item.source_url },
+          another ? undefined : { provider_id: item.provider_id, id: item.id },
+        ),
+      );
       return;
     }
     setNotice(result.stale ? STALE_NOTICE : result.error);

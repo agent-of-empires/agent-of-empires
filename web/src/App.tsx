@@ -2186,6 +2186,7 @@ function AppContent({
               setWizardPrefill(prefill);
               setShowSessionWizard(true);
             }}
+            onOpenSession={(id) => requestNavigate(`/session/${encodeURIComponent(id)}`)}
           />
         </div>
       );

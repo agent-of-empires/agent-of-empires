@@ -45,7 +45,7 @@ afterEach(() => {
 });
 
 const renderIt = (props: Partial<Parameters<typeof DashboardSuggestions>[0]> = {}) =>
-  render(<DashboardSuggestions onPrepare={vi.fn()} onViewAll={vi.fn()} {...props} />);
+  render(<DashboardSuggestions onPrepare={vi.fn()} onViewAll={vi.fn()} onOpenSession={vi.fn()} {...props} />);
 
 describe("DashboardSuggestions", () => {
   it("caps rows (3 wide, 2 narrow) and counts all non-dismissed items in View all", async () => {

@@ -148,7 +148,12 @@ export function Dashboard({
       )}
 
       {onPrepareSuggestion && onViewAllSuggestions && (
-        <DashboardSuggestions readOnly={readOnly} onPrepare={onPrepareSuggestion} onViewAll={onViewAllSuggestions} />
+        <DashboardSuggestions
+          readOnly={readOnly}
+          onPrepare={onPrepareSuggestion}
+          onViewAll={onViewAllSuggestions}
+          onOpenSession={onSelectSession}
+        />
       )}
 
       {/* The desktop sidebar is always available, but mobile starts at this dashboard. */}
