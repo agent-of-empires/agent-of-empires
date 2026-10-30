@@ -278,7 +278,7 @@ pub async fn put_suggestion_mapping(
         return unknown_provider();
     }
     let result = tokio::task::spawn_blocking(move || {
-        let profile = host.with_suggestions_db(|_, profile| profile.to_string());
+        let profile = host.suggestions_profile();
         let registered = crate::session::projects::load_merged(&profile)?;
         let projects =
             match suggestions::normalize_mapping(&body.mapping_key, &body.projects, &registered) {

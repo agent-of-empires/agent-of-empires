@@ -172,6 +172,16 @@ async fn sensitive_routes_are_blocked() {
             "/api/suggestions/prepare",
             r#"{"provider_id":"x","id":"y"}"#,
         ),
+        (
+            Method::PUT,
+            "/api/suggestions/mappings",
+            r#"{"provider_id":"x","mapping_key":"k","projects":["/tmp/p"]}"#,
+        ),
+        (
+            Method::DELETE,
+            "/api/suggestions/mappings?provider_id=x&mapping_key=k",
+            "",
+        ),
         // Session lifecycle on a foreign or unknown target. With no structured
         // session seeded, an enumerated / crafted id resolves to a
         // non-structured-or-unknown target, so a pre-existing plain/terminal

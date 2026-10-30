@@ -374,13 +374,13 @@ A provider's `status` is `pending` before its first publish, `ok`, or `error`. E
 
 `prepare` resolves settings through the normal repo and profile config. `project` is `{ name, path }` or `null`, resolved in this order: the user's mapping for the item's `mapping_key`, then the item's `project` hint (exactly one registered project by name or exact path), else `null`; an item is never given a scratch project.
 
+Errors: 404 `unknown_provider` (no active plugin provides suggestions under that id), 409 `stale_suggestion` (the item is no longer published, or its source is disabled), 400 `validation_failed` (`criterion` not declared by the provider), 403 `read_only`.
+
 ### Project mappings
 
-An item may carry an opaque `mapping_key` (a repository, a team). Core stores, per profile, an ordered list of registered project paths for each `(provider_id, mapping_key)`; the first is the primary project and the rest come back as `extra_projects`. A mapping whose primary path no longer resolves is ignored and the hint applies instead; stale extras are dropped, and an extra is never promoted. `GET` returns the stored paths as they are, including mappings of providers that are no longer active, and `DELETE` removes them; both stay allowed so stale rows can be repaired.
+An item may carry an opaque `mapping_key` (a repository, a team). Core stores, per profile, an ordered list of registered project paths for each `(provider_id, mapping_key)`; the first is the primary project and the rest come back as `extra_projects`. A mapping whose primary path no longer names exactly one registered project is ignored and the hint applies instead; stale extras are dropped, and an extra is never promoted. `GET` returns the stored paths as they are, including mappings of providers that are no longer active, and `DELETE` removes them; both stay allowed so stale rows can be repaired.
 
 `PUT` replaces the list. `projects` holds 1 to 16 distinct registered projects, each named by its path, and is stored as the registered paths. Errors: 404 `unknown_provider`, 400 `validation_failed` (empty or oversized key, bad list, a path that is not exactly one registered project), 403 `read_only`. Mutations are refused in CityHall mode.
-
-Errors: 404 `unknown_provider` (no active plugin provides suggestions under that id), 409 `stale_suggestion` (the item is no longer published, or its source is disabled), 400 `validation_failed` (`criterion` not declared by the provider), 403 `read_only`.
 
 ## UI slots
 
