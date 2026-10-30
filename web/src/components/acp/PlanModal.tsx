@@ -37,28 +37,36 @@ function useModalFocus(onClose: () => void) {
     const root = () => document.querySelector<HTMLElement>('[data-testid="plan-modal"]');
     root()?.querySelector<HTMLElement>(FOCUSABLE)?.focus();
     const onKey = (e: KeyboardEvent) => {
+      // A covered session (inert) or another overlay holding focus, such as
+      // the command palette, owns the keyboard; this trap only acts for the
+      // topmost surface.
+      const el = root();
+      const holder = document.activeElement;
+      if (!el || el.closest("[inert]")) return;
+      if (holder && holder !== document.body && !el.contains(holder)) return;
       if (e.key === "Escape") {
         e.preventDefault();
         onCloseRef.current();
         return;
       }
       if (e.key !== "Tab") return;
-      const items = Array.from(root()?.querySelectorAll<HTMLElement>(FOCUSABLE) ?? []);
+      const items = Array.from(el.querySelectorAll<HTMLElement>(FOCUSABLE));
       const first = items.at(0);
       const last = items.at(-1);
       if (!first || !last) return;
-      const active = document.activeElement;
-      if (!root()?.contains(active) || (e.shiftKey && active === first)) {
+      if (!el.contains(holder) || (e.shiftKey && holder === first)) {
         e.preventDefault();
-        (e.shiftKey && active === first ? last : first).focus();
-      } else if (!e.shiftKey && active === last) {
+        (e.shiftKey && holder === first ? last : first).focus();
+      } else if (!e.shiftKey && holder === last) {
         e.preventDefault();
         first.focus();
       }
     };
-    document.addEventListener("keydown", onKey);
+    // Capture phase: the palette can unmount on this same Escape before a
+    // bubbling listener runs, which would make the plan look like the owner.
+    document.addEventListener("keydown", onKey, true);
     return () => {
-      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("keydown", onKey, true);
       opener?.focus();
     };
   }, []);

@@ -3,7 +3,7 @@
 // a file.
 
 import type { Page } from "@playwright/test";
-import { test, expect } from "./helpers/mockedTest";
+import { test, expect, pressShortcut } from "./helpers/mockedTest";
 import { mockAcpSession, openStructuredSession } from "./helpers/acpMock";
 
 const TITLE = "plan-modal";
@@ -54,6 +54,22 @@ test("plan modal takes focus, contains Tab, and returns focus on Escape", async 
   await page.keyboard.press("Escape");
   await expect(dialog).toBeHidden();
   await expect(opener).toBeFocused();
+});
+
+test("the command palette keeps Tab and Escape while it covers the plan modal", async ({ page }) => {
+  const { dialog } = await openPlanModal(page);
+  await pressShortcut(page, "ControlOrMeta+k");
+  const palette = page.getByRole("dialog", { name: /command palette/i });
+  await expect(palette).toBeVisible();
+  const insidePalette = () => palette.evaluate((el) => el.contains(document.activeElement));
+  await expect.poll(insidePalette).toBe(true);
+
+  await page.keyboard.press("Tab");
+  expect(await insidePalette()).toBe(true);
+
+  await page.keyboard.press("Escape");
+  await expect(palette).toBeHidden();
+  await expect(dialog).toBeVisible();
 });
 
 test("a plan file link closes the modal and leaves Tab alone while the approval stays pending", async ({ page }) => {

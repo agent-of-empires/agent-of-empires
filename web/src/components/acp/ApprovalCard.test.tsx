@@ -340,6 +340,34 @@ describe("ApprovalCard plan viewer", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(document.activeElement).toBe(opener);
   });
+  it("leaves Tab and Escape alone while another overlay holds focus or the modal is inert", () => {
+    mount(withPlan());
+    fireEvent.click(screen.getByText("View plan"));
+    const other = document.createElement("input");
+    document.body.append(other);
+    other.focus();
+    for (const init of [{ key: "Tab" }, { key: "Escape" }]) {
+      const ev = new KeyboardEvent("keydown", { ...init, bubbles: true, cancelable: true });
+      document.dispatchEvent(ev);
+      expect(ev.defaultPrevented).toBe(false);
+      expect(screen.queryByRole("dialog")).not.toBeNull();
+    }
+    expect(document.activeElement).toBe(other);
+    other.remove();
+
+    const dialog = screen.getByRole("dialog");
+    const wrapper = document.createElement("div");
+    wrapper.setAttribute("inert", "");
+    dialog.parentElement?.insertBefore(wrapper, dialog);
+    wrapper.append(dialog);
+    (document.activeElement as HTMLElement | null)?.blur();
+    for (const init of [{ key: "Tab" }, { key: "Escape" }]) {
+      const ev = new KeyboardEvent("keydown", { ...init, bubbles: true, cancelable: true });
+      document.dispatchEvent(ev);
+      expect(ev.defaultPrevented).toBe(false);
+    }
+    expect(screen.queryByRole("dialog", { hidden: true })).not.toBeNull();
+  });
   it("moves between the view tabs with the arrow keys and labels the panel", () => {
     mount(withPlan());
     fireEvent.click(screen.getByText("View plan"));
