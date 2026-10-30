@@ -21,6 +21,13 @@ fn join_names(names: &[String]) -> String {
     }
 }
 
+/// A row of the Suggested group, identified independently of its index.
+pub(super) enum SuggestedRow {
+    Header,
+    Item((String, String)),
+    ViewAll,
+}
+
 impl HomeView {
     pub fn toggle_suggested_section(&mut self) {
         self.suggested_section_collapsed = !self.suggested_section_collapsed;
@@ -39,6 +46,37 @@ impl HomeView {
             }) => Some((provider_id.clone(), id.clone())),
             _ => None,
         }
+    }
+
+    /// What the cursor is on within the Suggested group, to find it again after a rebuild.
+    pub(super) fn suggested_row_at_cursor(&self) -> Option<SuggestedRow> {
+        match self.flat_items.get(self.cursor)? {
+            Item::Group { path, .. } if crate::session::is_suggested_section_path(path) => {
+                Some(SuggestedRow::Header)
+            }
+            Item::Suggestion {
+                provider_id, id, ..
+            } => Some(SuggestedRow::Item((provider_id.clone(), id.clone()))),
+            Item::SuggestionsViewAll { .. } => Some(SuggestedRow::ViewAll),
+            _ => None,
+        }
+    }
+
+    pub(super) fn suggested_row_position(&self, row: Option<&SuggestedRow>) -> Option<usize> {
+        let row = row?;
+        self.flat_items.iter().position(|item| match (row, item) {
+            (SuggestedRow::Header, Item::Group { path, .. }) => {
+                crate::session::is_suggested_section_path(path)
+            }
+            (
+                SuggestedRow::Item((p, i)),
+                Item::Suggestion {
+                    provider_id, id, ..
+                },
+            ) => p == provider_id && i == id,
+            (SuggestedRow::ViewAll, Item::SuggestionsViewAll { .. }) => true,
+            _ => false,
+        })
     }
 
     /// Enter on a suggestion row prepares it and opens the prefilled dialog;

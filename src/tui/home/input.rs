@@ -3006,7 +3006,13 @@ impl HomeView {
                 self.update_selected();
             }
             ActionId::NewSession => self.open_new_session_dialog(),
-            ActionId::NewFromSelection => self.open_new_from_selection(),
+            ActionId::NewFromSelection => {
+                if self.cursor_suggestion().is_some() {
+                    self.open_new_session_dialog();
+                } else {
+                    self.open_new_from_selection();
+                }
+            }
             ActionId::NewFromProject => self.open_project_session_picker(),
             ActionId::AttachTerminal => return self.attach_terminal_for_selected(),
             ActionId::ToggleView => {

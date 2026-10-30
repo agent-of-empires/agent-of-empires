@@ -1827,7 +1827,7 @@ impl HomeView {
             } => {
                 let (prefix, title) = self
                     .suggestion_row_text(provider_id, id)
-                    .unwrap_or_default();
+                    .unwrap_or_else(|| (String::new(), "(no longer available)".to_string()));
                 (
                     " ",
                     Cow::Owned(format!("{prefix}{title}")),

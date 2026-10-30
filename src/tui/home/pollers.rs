@@ -55,15 +55,21 @@ impl HomeView {
             .suggestions_view
             .as_mut()
             .is_some_and(SuggestionsView::poll);
-        self.suggestions_feed.tick();
+        self.suggestions_feed
+            .tick(self.session_feed.latest_snapshot().is_some());
         let polled = self.suggestions_feed.poll();
         if polled.changed {
             self.rebuild_flat_items_keeping_cursor();
             self.update_selected();
             changed = true;
         }
-        if let Some(start) = polled.start {
-            self.start_suggestion(start);
+        if let Some((key, start)) = polled.start {
+            // The prepare answered after the user moved on or opened another dialog.
+            if self.cursor_suggestion().as_ref() == Some(&key) && self.new_dialog.is_none() {
+                self.start_suggestion(start);
+            } else {
+                self.flash_status("Selection changed, suggestion not started");
+            }
             changed = true;
         }
         if let Some(error) = polled.error {
@@ -84,6 +90,8 @@ impl HomeView {
             Err(message) => {
                 if let Some(view) = &mut self.suggestions_view {
                     view.set_error(message);
+                } else {
+                    self.flash_status(message);
                 }
             }
         }
@@ -96,9 +104,7 @@ impl HomeView {
         if !self.available_tools.any_available() {
             return Err("No agent is available. Set one up before starting a suggestion");
         }
-        let profile = self
-            .profile_for_cursor(self.cursor)
-            .unwrap_or_else(|| self.config_profile());
+        let profile = self.config_profile();
         let profiles =
             crate::session::list_profiles_for_display().unwrap_or_else(|_| vec![profile.clone()]);
         let mut dialog = NewSessionDialog::new(
