@@ -99,6 +99,21 @@ fn a_profile_default_tool_beats_the_global_one() {
 }
 
 #[test]
+fn a_prefilled_initial_prompt_is_submitted() {
+    let mut dialog = single_tool_dialog();
+    assert_eq!(
+        submitted(dialog.handle_key(key(KeyCode::Enter))).initial_prompt,
+        None
+    );
+    let mut dialog = single_tool_dialog();
+    dialog.set_initial_prompt("Review PR 7".to_string());
+    assert_eq!(
+        submitted(dialog.handle_key(key(KeyCode::Enter))).initial_prompt,
+        Some("Review PR 7".to_string())
+    );
+}
+
+#[test]
 fn enter_submits_the_form_and_esc_cancels() {
     let data = submitted(single_tool_dialog().handle_key(key(KeyCode::Enter)));
     assert_eq!(

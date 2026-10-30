@@ -267,6 +267,8 @@ pub struct NewSessionDialog {
     pub(super) fork_seed: Option<crate::session::ForkSeed>,
     /// The title the dialog was opened with, which the user did not type.
     pub(super) suggested_title: String,
+    /// First turn for the agent, set by callers that prefill the dialog.
+    initial_prompt: Option<String>,
     /// `(focused_field_index, rect)` per main-form field, repopulated every
     /// frame and empty while an overlay is up, so a click during one cannot
     /// snap focus to the field that used to sit there.
@@ -621,6 +623,7 @@ impl NewSessionDialog {
             scratch: false,
             fork_seed: None,
             suggested_title: String::new(),
+            initial_prompt: None,
             focusable_rects: Vec::new(),
             sandbox_config_rects: Vec::new(),
             tool_config_rects: Vec::new(),
@@ -646,6 +649,10 @@ impl NewSessionDialog {
     pub fn set_title(&mut self, title: String) {
         self.title = Input::new(title.clone());
         self.suggested_title = title;
+    }
+
+    pub fn set_initial_prompt(&mut self, prompt: String) {
+        self.initial_prompt = Some(prompt);
     }
 
     pub fn set_fork_from(&mut self, seed: crate::session::ForkSeed) {
@@ -1136,6 +1143,7 @@ impl NewSessionDialog {
             scratch: false,
             fork_seed: None,
             suggested_title: String::new(),
+            initial_prompt: None,
             focusable_rects: Vec::new(),
             sandbox_config_rects: Vec::new(),
             tool_config_rects: Vec::new(),
@@ -1217,6 +1225,7 @@ impl NewSessionDialog {
             scratch: false,
             fork_seed: None,
             suggested_title: String::new(),
+            initial_prompt: None,
             focusable_rects: Vec::new(),
             sandbox_config_rects: Vec::new(),
             tool_config_rects: Vec::new(),
@@ -2280,7 +2289,7 @@ impl NewSessionDialog {
             scratch: self.scratch,
             fork_seed: self.fork_seed.clone(),
             structured: self.structured_enabled && self.structured_capable,
-            initial_prompt: None,
+            initial_prompt: self.initial_prompt.clone(),
         })
     }
 

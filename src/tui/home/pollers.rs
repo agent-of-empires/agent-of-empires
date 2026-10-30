@@ -1,6 +1,7 @@
 //! Typed runtime completion polling; durable lifecycle work belongs to the daemon.
 
 use super::*;
+use crate::tui::suggestions::Poll;
 
 impl HomeView {
     pub(super) const CANONICAL_RELOAD_RETRY_INTERVAL: std::time::Duration =
@@ -45,5 +46,54 @@ impl HomeView {
                 false
             }
         }
+    }
+
+    /// Drains the suggestions worker. A prepared suggestion replaces the view
+    /// with the regular new-session dialog, prefilled. True when state changed.
+    pub fn apply_suggestions_results(&mut self) -> bool {
+        let Some(view) = &mut self.suggestions_view else {
+            return false;
+        };
+        match view.poll() {
+            Poll::Idle => false,
+            Poll::Changed => true,
+            Poll::Prepared(prepared) => {
+                self.suggestions_view = None;
+                self.open_suggestion_dialog(prepared);
+                true
+            }
+        }
+    }
+
+    fn open_suggestion_dialog(&mut self, prepared: crate::tui::suggestions::Prepared) {
+        if self.creating_stub_id.is_some() {
+            self.flash_status("A session is already being created");
+            return;
+        }
+        if !self.available_tools.any_available() {
+            self.show_no_agents();
+            return;
+        }
+        let Some(project) = prepared.project else {
+            return;
+        };
+        let profile = self
+            .profile_for_cursor(self.cursor)
+            .unwrap_or_else(|| self.config_profile());
+        let profiles =
+            crate::session::list_profiles_for_display().unwrap_or_else(|_| vec![profile.clone()]);
+        let mut dialog = NewSessionDialog::new(
+            self.available_tools.clone(),
+            self.all_group_paths(),
+            &profile,
+            profiles,
+        );
+        // Path first: setting it re-resolves the defaults the rest builds on.
+        dialog.set_path(project.path);
+        dialog.set_tool(&prepared.tool);
+        dialog.set_title(prepared.title);
+        dialog.set_initial_prompt(prepared.initial_prompt);
+        dialog.focus_title();
+        self.new_dialog = Some(dialog);
     }
 }

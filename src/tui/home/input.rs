@@ -1902,6 +1902,16 @@ impl HomeView {
             }
         }
 
+        if let Some(view) = &mut self.suggestions_view {
+            let mutations_allowed = self.session_feed.mutations_available();
+            if let super::super::suggestions::SuggestionsAction::Close =
+                view.handle_key(key, mutations_allowed)
+            {
+                self.suggestions_view = None;
+            }
+            return None;
+        }
+
         // Live-send capture normally wins over every other key handler: the home view is
         // a thin relay to the target pane, so dialog hotkeys, search and navigation
         // suspend until Ctrl+q. That holds while dialogs are keyboard-only, since
@@ -3033,6 +3043,9 @@ impl HomeView {
             ActionId::Diff => self.open_diff_for_selected(),
             ActionId::Serve => self.open_connections(),
             ActionId::Settings => self.open_settings(),
+            ActionId::Suggestions => {
+                self.suggestions_view = Some(super::super::suggestions::SuggestionsView::new())
+            }
             ActionId::Profiles => self.show_profile_picker(),
             ActionId::Projects => {
                 let profile = self.config_profile();

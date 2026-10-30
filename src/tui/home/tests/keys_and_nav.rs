@@ -1455,3 +1455,21 @@ fn ctrl_l_toggles_footer_when_not_in_live_send() {
         "Ctrl+L turns the footer back off"
     );
 }
+
+#[test]
+#[serial]
+fn s_opens_the_suggestions_view_which_owns_keys_until_esc() {
+    let mut env = create_test_env_empty();
+    env.view.handle_key(key(KeyCode::Char('S')), None);
+    assert!(env.view.suggestions_view.is_some());
+    assert!(env.view.has_non_live_send_overlay());
+
+    env.view.handle_key(key(KeyCode::Char('n')), None);
+    assert!(
+        env.view.new_dialog.is_none(),
+        "keys go to the view, not the list behind it"
+    );
+
+    env.view.handle_key(key(KeyCode::Esc), None);
+    assert!(env.view.suggestions_view.is_none());
+}
