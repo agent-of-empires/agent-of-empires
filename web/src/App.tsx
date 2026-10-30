@@ -19,7 +19,7 @@ import { useStatusSounds } from "./hooks/useStatusSounds";
 import { useSessionStatusStream } from "./hooks/useSessionStatusStream";
 import { useDashboardPresence } from "./hooks/useDashboardPresence";
 import { useFocusMode, useFocusSession } from "./hooks/useFocusMode";
-import { focusNavigation, noticedSessions } from "./lib/focusMode";
+import { createToasts, focusNavigation, noticedSessions } from "./lib/focusMode";
 import { FocusModeNote } from "./components/FocusModeNote";
 import { FocusSessionGone } from "./components/FocusSessionGone";
 import { clearAcpCache } from "./hooks/useAcpSession";
@@ -417,22 +417,23 @@ function AppContent({
     applyPushedStatus,
   } = useSessions();
   const workspaces = useWorkspaces(sessions);
-  // Creates whose outcome the wizard never learned keep reconciling here, past its unmount.
+  // Creates whose outcome the wizard never learned keep reconciling here, past its unmount. A focus window cannot
+  // create sessions, so any it reconciles were started elsewhere and stay quiet there.
   useEffect(() => {
     startPendingCreates({
       onCreated: (session) => {
         if (!session) return;
         injectSession(session);
-        toastBus.handler?.info(`"${session.title}" is ready`);
+        createToasts(focusMode)?.info(`"${session.title}" is ready`);
       },
-      onFailed: (message) => toastBus.handler?.error(`Session was not created: ${message}`),
-      onUnknown: (message) => toastBus.handler?.error(message),
+      onFailed: (message) => createToasts(focusMode)?.error(`Session was not created: ${message}`),
+      onUnknown: (message) => createToasts(focusMode)?.error(message),
       onUnsaved: () =>
-        toastBus.handler?.error(
+        createToasts(focusMode)?.error(
           "This browser could not save a session that is still being created; keep this tab open until it finishes.",
         ),
     });
-  }, [injectSession]);
+  }, [injectSession, focusMode]);
   // Trash is a whole-workspace concern, so it is derived here from the
   // authoritative unsliced workspace list rather than reconstructed from the
   // sidebar's per-`group_path` slice views. A workspace is in Trash only when

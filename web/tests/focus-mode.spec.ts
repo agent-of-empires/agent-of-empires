@@ -110,6 +110,20 @@ test("a focus window opens other sessions, plugin pages and settings beside it a
   await page.route("**/api/plugins/ui-state", (r) =>
     r.fulfill({ json: { entries: [link], notifications: [], pages: [board] } }),
   );
+  // A setting the palette opens in its tab rather than toggling inline.
+  const setting = {
+    section: "sandbox",
+    field: "default_image",
+    category: "Sandbox",
+    label: "Default image",
+    description: "",
+    widget: { kind: "text" },
+    web_write: { policy: "allow" },
+    profile_overridable: true,
+    validation: {},
+    advanced: false,
+  };
+  await page.route("**/api/settings/schema", (r) => r.fulfill({ json: [setting] }));
   await page.goto("/session/s-1?focus=1");
   await expect(page.getByRole("button", { name: /^All Sessions/ })).toBeVisible();
 
@@ -120,39 +134,80 @@ test("a focus window opens other sessions, plugin pages and settings beside it a
     "/plugins/acme.kit/board",
   );
   expect(await popupPath(page, () => page.keyboard.press("s"))).toBe("/settings");
+  expect(
+    await popupPath(page, async () => {
+      await page.keyboard.press("ControlOrMeta+k");
+      await page.getByPlaceholder("Search actions, sessions, settings…").fill("Default image");
+      await page.getByText("Opens settings · Sandbox").click();
+    }),
+  ).toBe("/settings/sandbox");
   await expect(page).toHaveURL("/session/s-1?focus=1");
   await expect(page.getByRole("button", { name: /^All Sessions/ })).toBeVisible();
 });
 
-test("a focus window names its session once it is gone and leads back to all Sessions", async ({ page }) => {
+test("a link into focus mode from a regular window reloads it, so the service worker sees the change", async ({
+  page,
+}) => {
   await page.setViewportSize({ width: 1280, height: 720 });
-  let sessions = SESSIONS;
   await installSidebarMocks(page, { sessions: SESSIONS });
-  await page.route("**/api/sessions", (r) =>
-    r.fulfill({
-      headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
-      json: {
-        sessions: sessions.map((s, i) => ({
-          ...sessionResponse({ id: s.id, title: s.title, project_path: s.project_path, branch: s.branch }),
-          created_at: new Date(Date.UTC(2025, 0, 1 + i)).toISOString(),
-        })),
-        workspace_ordering: [],
-      },
-    }),
-  );
-  await page.goto("/session/s-1?focus=1");
-  await expect(page).toHaveTitle("Mongols");
+  const link = {
+    plugin_id: "acme.kit",
+    slot: "header-start",
+    id: "focus",
+    payload: { text: "acme: focus", href: "/session/s-1?focus=1" },
+  };
+  await page.route("**/api/plugins/ui-state", (r) => r.fulfill({ json: { entries: [link], notifications: [] } }));
+  await page.goto("/session/s-1");
+  await expect.poll(() => workerFocusSessions(page)).toEqual([null]);
 
-  sessions = SESSIONS.filter((s) => s.id !== "s-1");
-  const gone = page.getByTestId("focus-session-gone");
-  await expect(gone).toContainText("Mongols no longer exists.");
+  await page.getByRole("link", { name: "acme: focus", exact: true }).click();
   await expect(page).toHaveURL("/session/s-1?focus=1");
-
-  await gone.getByRole("button", { name: "Show all Sessions" }).click();
-  await expect(page).toHaveURL("/");
-  await expect(page.locator(SIDEBAR)).toBeVisible();
-  await expect(gone).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /^All Sessions/ })).toBeVisible();
+  await expect.poll(() => workerFocusSessions(page)).toEqual(["s-1"]);
 });
+
+for (const [how, expected] of [
+  ["trashed", "Mongols was moved to Trash."],
+  ["deleted", "Mongols no longer exists."],
+] as const) {
+  test(`a focus window names its session once it is ${how} and leads back to all Sessions`, async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 720 });
+    let focused: Record<string, unknown> | null = {};
+    await installSidebarMocks(page, { sessions: SESSIONS });
+    await page.route("**/api/sessions", (r) =>
+      r.fulfill({
+        headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
+        json: {
+          sessions: SESSIONS.flatMap((s, i) => {
+            const fields = s.id === "s-1" ? focused : {};
+            if (fields === null) return [];
+            const { id, title, project_path, branch } = s;
+            return [
+              {
+                ...sessionResponse({ id, title, project_path, branch }),
+                created_at: new Date(Date.UTC(2025, 0, 1 + i)).toISOString(),
+                ...fields,
+              },
+            ];
+          }),
+          workspace_ordering: [],
+        },
+      }),
+    );
+    await page.goto("/session/s-1?focus=1");
+    await expect(page).toHaveTitle("Mongols");
+
+    focused = how === "trashed" ? { trashed_at: "2026-01-01T00:00:00Z" } : null;
+    const gone = page.getByTestId("focus-session-gone");
+    await expect(gone).toContainText(expected);
+    await expect(page).toHaveURL("/session/s-1?focus=1");
+
+    await gone.getByRole("button", { name: "Show all Sessions" }).click();
+    await expect(page).toHaveURL("/");
+    await expect(page.locator(SIDEBAR)).toBeVisible();
+    await expect(gone).toHaveCount(0);
+  });
+}
 
 test("Open in its own window pops the session out and leaves this tab as it was", async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 720 });

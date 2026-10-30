@@ -34,7 +34,7 @@ A plain New session opens on the project you launched last; pick another from Re
 
 ## Command palette
 
-The palette (top-bar button or keyboard shortcut) is a fuzzy launcher for global actions: jump to a session, open settings, start a session, toggle the right panel.
+The palette (top-bar button or keyboard shortcut) is a fuzzy launcher for global actions: jump to a session, open settings, start a session, toggle the right panel. With a session open, **Show only this Session** and **Open in its own window** do the same as the session menu entries in [Showing one session](#showing-one-session); "focus" and "pop out" find them too. In such a window, **Show all Sessions** returns to the regular view, and the commands that switch or create sessions are left out.
 
 When an embedded agent or paired terminal, or the structured-session composer, has keyboard focus, press `Ctrl+Q` to return focus to the active session in the sidebar. Then press `a` to move to the next session needing attention; `a` works when a terminal or text field is not focused.
 
@@ -92,7 +92,7 @@ The right-click (long-press on touch) context menu on any session row exposes th
 
 ### Showing one session
 
-Under **More** in the same menu, **Show only this Session** reloads the window to show that session alone: no sidebar and no way to switch sessions. Badges, sounds and in-app toasts cover only that session; other sessions still notify through your system. Links to other sessions, plugin pages and settings open in a new window. **All Sessions** at the top left reloads the window back to the regular view, and a reload keeps the mode. On desktop, **Open in its own window** opens the session the same way in a new window and leaves the current one as it is. The command palette has both commands under the same names. The mode lives in the URL (`/session/<id>?focus=1`), so it never spreads to other windows.
+Under **More** in the same menu, **Show only this Session** reloads the window to show that session alone: no sidebar and no way to switch sessions. The tab is titled after the session, and a note, shown until you dismiss it once, reminds you that other sessions still notify through your system. Badges, sounds and in-app toasts cover only that session. Links to other sessions, plugin pages and settings open in a new window. **All Sessions** at the top left reloads the window back to the regular view, and a reload keeps the mode. If the session is trashed or deleted, the window names it and offers **Show all Sessions** to return to the dashboard. On desktop, **Open in its own window** opens the session the same way in a new window and leaves the current one as it is. The mode lives in the URL (`/session/<id>?focus=1`), so it never spreads to other windows.
 
 Trashed sessions live behind the **Trash** control in the sidebar footer. Right-click a trashed row for **Open**, **Restore**, or **Delete permanently**. Like an archived session, a trashed one cannot start until it is restored.
 
