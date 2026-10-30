@@ -44,7 +44,10 @@ function TemplateBlock({ provider, source, override, item, disabled, onSource, o
 
   const run = async (request: Promise<SuggestionResult<unknown>>) => {
     const result = await request;
-    if (!result.ok) onError(result.error);
+    if (!result.ok) {
+      onError(result.error);
+      return;
+    }
     setEdited(null);
     await onSaved();
   };
@@ -83,6 +86,7 @@ function TemplateBlock({ provider, source, override, item, disabled, onSource, o
           type="button"
           className={GHOST}
           disabled={disabled || override === null}
+          onMouseDown={(e) => e.preventDefault()}
           onClick={() => void run(resetSuggestionTemplate(provider.id, source.criterion))}
         >
           Reset to the plugin&apos;s default
@@ -220,7 +224,8 @@ export function SuggestionTemplates({ snapshot, disabled, onBack, onSource }: Pr
     if (t) setTemplates(t);
     if (m) setMappings(m);
     if (p) setProjects(p);
-    if (!t || !m) setError("Could not load templates and mappings.");
+    const failed = [!t && "templates", !m && "mappings", !p && "Projects"].filter(Boolean);
+    if (failed.length > 0) setError(`Could not load ${failed.join(", ")}.`);
   }, []);
 
   useEffect(() => {

@@ -104,7 +104,12 @@ fn find_provider(id: &str) -> Option<Provider> {
 
 pub async fn get_suggestions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let Some(host) = state.plugin_host.clone() else {
-        return Json(json!({ "providers": [], "items": [] })).into_response();
+        return Json(json!({
+            "providers": [],
+            "items": [],
+            "prefs": suggestions::prefs_json(suggestions::DEFAULT_PREFS, &[]),
+        }))
+        .into_response();
     };
     let result = tokio::task::spawn_blocking(move || {
         let providers = suggestions::providers();

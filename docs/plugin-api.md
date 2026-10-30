@@ -367,12 +367,13 @@ Suggestions are stored per profile. The routes below list and act on them; none 
 
 | Route | Body | Result |
 |---|---|---|
-| `GET /api/suggestions` | none | `{ providers: [{ id, name, status, error?, sources: [{ criterion, label, description, enabled }], checks: [{ id, label, status, detail, fix }] }], items }` |
+| `GET /api/suggestions` | none | `{ providers: [{ id, name, enabled, status, error?, updated_at?, sources: [{ criterion, label, description, variables, enabled }], checks: [{ id, label, status, detail, fix }] }], items, prefs: { homepage, sidebar, refresh_minutes, provider_order } }` |
 | `POST /api/suggestions/refresh` | none | `{ ok, notified }` |
 | `POST /api/suggestions/checks/run` | none | `{ ok, notified }` |
 | `POST /api/suggestions/dismiss` | `{ provider_id, id }` | `{ ok }` |
 | `POST /api/suggestions/undismiss` | `{ provider_id, id }` | `{ ok }` |
 | `PATCH /api/suggestions/sources` | `{ provider_id, criterion, enabled }` | `{ provider_id, criterion, enabled }` |
+| `PATCH /api/suggestions/prefs` | any of `{ homepage, sidebar, refresh_minutes, provider_order, provider_enabled }` | `{ ok }` |
 | `GET /api/suggestions/templates` | query `provider_id` and `criterion`, or neither | one: `{ provider_id, criterion, template, default }`; none: `{ templates: [{ provider_id, criterion, template }] }` |
 | `PUT /api/suggestions/templates` | `{ provider_id, criterion, template }` | `{ provider_id, criterion, template, default }` |
 | `DELETE /api/suggestions/templates` | `{ provider_id, criterion }` | `{ ok }` |
@@ -381,7 +382,9 @@ Suggestions are stored per profile. The routes below list and act on them; none 
 | `PUT /api/suggestions/mappings` | `{ provider_id, mapping_key, projects }` | `{ provider_id, mapping_key, projects }` |
 | `DELETE /api/suggestions/mappings?provider_id=&mapping_key=` | none | `{ ok, deleted }` |
 
-A provider's `status` is `pending` before its first publish, `ok`, or `error`. Each item is the published item plus `provider_id` and `dismissed`; dismissed items are still returned. Items of a disabled source are hidden. `refresh` and a `sources` change send `suggestions.refresh` to the affected workers.
+Providers are listed in the user's `provider_order`; a provider never ordered follows, sorted by id. `prefs` defaults to `{ homepage: true, sidebar: false, refresh_minutes: 15, provider_order: [] }` and is per profile. `PATCH /api/suggestions/prefs` is partial: `refresh_minutes` is one of 5, 15, 30, 60 or 120, `provider_order` must list every provider exactly once, and `provider_enabled` maps provider ids to booleans. Other values fail with 400 `validation_failed`, and nothing is stored. `refresh_minutes` is a hint for plugins; core does not schedule refreshes yet. The route is denied in read-only (403 `read_only`) and CityHall mode.
+
+A provider's `status` is `pending` before its first publish, `ok`, or `error`. Each item is the published item plus `provider_id` and `dismissed`; dismissed items are still returned. Items of a disabled source or provider are hidden, and `refresh` skips a disabled provider. `updated_at` is Unix seconds of the provider's last report. `refresh` and a `sources` change send `suggestions.refresh` to the affected workers.
 
 `prepare` resolves settings through the normal repo and profile config. `project` is `{ name, path }` or `null`, resolved in this order: the user's mapping for the item's `mapping_key`, then the item's `project` hint (exactly one registered project by name or exact path), else `null`; an item is never given a scratch project.
 

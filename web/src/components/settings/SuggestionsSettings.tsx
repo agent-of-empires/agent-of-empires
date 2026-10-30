@@ -1,10 +1,9 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { DndContext, PointerSensor, closestCenter, useSensor, useSensors, type DragEndEvent } from "@dnd-kit/core";
 import { SortableContext, arrayMove, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { ArrowUp, GripVertical } from "lucide-react";
 import {
-  fetchSuggestions,
   updateSuggestionPrefs,
   updateSuggestionSource,
   type SuggestionPrefsPatch,
@@ -53,14 +52,19 @@ const BUTTON =
 interface ProviderRowProps {
   provider: SuggestionProvider;
   disabled: boolean;
+  /** Reordering waits for the previous patch, so a move never starts from a stale order. */
+  reorderLocked: boolean;
   first: boolean;
   onMove: (id: string, delta: -1 | 1) => void;
   onEnabled: (id: string, enabled: boolean) => void;
   onSource: (providerId: string, criterion: string, enabled: boolean) => void;
 }
 
-function ProviderRow({ provider, disabled, first, onMove, onEnabled, onSource }: ProviderRowProps) {
-  const { setNodeRef, attributes, listeners, transform, transition } = useSortable({ id: provider.id, disabled });
+function ProviderRow({ provider, disabled, reorderLocked, first, onMove, onEnabled, onSource }: ProviderRowProps) {
+  const { setNodeRef, attributes, listeners, transform, transition } = useSortable({
+    id: provider.id,
+    disabled: reorderLocked,
+  });
   const status =
     provider.status === "error" ? (
       <span className="text-status-error-text">Couldn&apos;t refresh: {provider.error ?? "provider error"}</span>
@@ -74,7 +78,7 @@ function ProviderRow({ provider, disabled, first, onMove, onEnabled, onSource }:
       tabIndex={0}
       aria-label={`Provider ${provider.name}`}
       onKeyDown={(e) => {
-        if (!e.altKey || disabled || (e.key !== "ArrowUp" && e.key !== "ArrowDown")) return;
+        if (!e.altKey || reorderLocked || (e.key !== "ArrowUp" && e.key !== "ArrowDown")) return;
         e.preventDefault();
         onMove(provider.id, e.key === "ArrowUp" ? -1 : 1);
       }}
@@ -84,7 +88,7 @@ function ProviderRow({ provider, disabled, first, onMove, onEnabled, onSource }:
         <button
           type="button"
           aria-label={`Drag ${provider.name} to reorder`}
-          disabled={disabled}
+          disabled={reorderLocked}
           {...attributes}
           {...listeners}
           className="hidden h-8 w-6 shrink-0 cursor-grab items-center justify-center text-text-dim md:inline-flex"
@@ -94,7 +98,7 @@ function ProviderRow({ provider, disabled, first, onMove, onEnabled, onSource }:
         <button
           type="button"
           aria-label={`Move ${provider.name} up`}
-          disabled={disabled || first}
+          disabled={reorderLocked || first}
           onClick={() => onMove(provider.id, -1)}
           className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-text-secondary hover:bg-surface-700/50 disabled:opacity-30 md:hidden"
         >
@@ -137,45 +141,43 @@ function ProviderRow({ provider, disabled, first, onMove, onEnabled, onSource }:
 }
 
 interface Props {
+  snapshot: SuggestionsSnapshot | null;
+  failed: boolean;
+  reload: () => Promise<void>;
   readOnly: boolean;
   onOpenSuggestions?: (dismissed: boolean) => void;
 }
 
-export function SuggestionsSettings({ readOnly, onOpenSuggestions }: Props) {
+export function SuggestionsSettings({ snapshot, failed, reload, readOnly, onOpenSuggestions }: Props) {
   const offline = useServerDown();
-  const [snapshot, setSnapshot] = useState<SuggestionsSnapshot | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
   const [templates, setTemplates] = useState(false);
   const mounted = useRef(true);
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 4 } }));
 
-  const load = useCallback(async () => {
-    const data = await fetchSuggestions();
-    if (mounted.current && data) setSnapshot(data);
-    else if (mounted.current) setNotice("Could not load suggestions.");
-  }, []);
-
   useEffect(() => {
     mounted.current = true;
-    void load();
     return () => {
       mounted.current = false;
     };
-  }, [load]);
+  }, []);
 
   const disabled = readOnly || offline;
   const act = async (run: () => Promise<SuggestionResult<unknown>>) => {
     setNotice(null);
+    setBusy(true);
     const result = await run();
     if (mounted.current && !result.ok) setNotice(result.error);
-    await load();
+    await reload();
+    if (mounted.current) setBusy(false);
   };
   const patch = (p: SuggestionPrefsPatch) => act(() => updateSuggestionPrefs(p));
 
   if (!snapshot) {
     return (
       <p role="status" className="py-10 text-center text-sm text-text-dim">
-        {notice ?? "Loading suggestions…"}
+        {failed ? "Could not load suggestions." : "Loading suggestions…"}
       </p>
     );
   }
@@ -254,6 +256,7 @@ export function SuggestionsSettings({ readOnly, onOpenSuggestions }: Props) {
                   key={provider.id}
                   provider={provider}
                   disabled={disabled}
+                  reorderLocked={disabled || busy}
                   first={i === 0}
                   onMove={move}
                   onEnabled={(id, enabled) => void patch({ provider_enabled: { [id]: enabled } })}

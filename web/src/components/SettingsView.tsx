@@ -42,7 +42,7 @@ import {
 import { PluginSettingsSections } from "./settings/PluginSettingsSections";
 import { LogsSettings } from "./settings/LogsSettings";
 import { SuggestionsSettings } from "./settings/SuggestionsSettings";
-import { useHasSuggestionProviders } from "./settings/useHasSuggestionProviders";
+import { useSuggestionsSnapshot } from "./settings/useSuggestionsSnapshot";
 import { SettingsHeader } from "./settings/SettingsHeader";
 import { StructuredViewDisplaySettings } from "./settings/StructuredViewDisplaySettings";
 import { ProfilesSection } from "./profiles/ProfilesSection";
@@ -221,7 +221,6 @@ const ALL_TAB_IDS = new Set<TabId>([
   "mcp",
   "skills",
   "suggestions",
-  "suggestions",
   "logging",
   "logs",
   "plugins",
@@ -279,7 +278,8 @@ export function SettingsView({
   onOpenSuggestions,
 }: Props) {
   const offline = useServerDown();
-  const hasSuggestionProviders = useHasSuggestionProviders();
+  const suggestions = useSuggestionsSnapshot();
+  const hasSuggestionProviders = (suggestions.snapshot?.providers.length ?? 0) > 0;
   // Seed empty rather than "default" so the initial
   // useEffect-gated loadSettings doesn't fire a wasted
   // fetchSettings("default") against a profile that may not exist.
@@ -777,7 +777,15 @@ export function SettingsView({
       case "skills":
         return <SkillsManager readOnly={readOnly || cityhall} />;
       case "suggestions":
-        return <SuggestionsSettings readOnly={readOnly ?? false} onOpenSuggestions={onOpenSuggestions} />;
+        return (
+          <SuggestionsSettings
+            snapshot={suggestions.snapshot}
+            failed={suggestions.failed}
+            reload={suggestions.reload}
+            readOnly={readOnly ?? false}
+            onOpenSuggestions={onOpenSuggestions}
+          />
+        );
       case "structured-view": {
         if (!settings) {
           return <div className="text-sm text-text-dim">Loading settings...</div>;

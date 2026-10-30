@@ -2,6 +2,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { SuggestionsSettings } from "../SuggestionsSettings";
+import { useSuggestionsSnapshot } from "../useSuggestionsSnapshot";
 import { expandTemplate } from "../../../lib/suggestionTemplate";
 import type { SuggestionsSnapshot } from "../../../lib/types";
 
@@ -60,6 +61,19 @@ const snapshot = (): SuggestionsSnapshot => ({
   ],
 });
 
+function Harness({ readOnly, onOpenSuggestions }: { readOnly: boolean; onOpenSuggestions: () => void }) {
+  const { snapshot, failed, reload } = useSuggestionsSnapshot();
+  return (
+    <SuggestionsSettings
+      snapshot={snapshot}
+      failed={failed}
+      reload={reload}
+      readOnly={readOnly}
+      onOpenSuggestions={onOpenSuggestions}
+    />
+  );
+}
+
 function open(props: { readOnly?: boolean } = {}) {
   api.fetchSuggestions.mockResolvedValue(snapshot());
   api.fetchSuggestionTemplates.mockResolvedValue([]);
@@ -76,7 +90,7 @@ function open(props: { readOnly?: boolean } = {}) {
     f.mockResolvedValue(ok);
   }
   const onOpenSuggestions = vi.fn();
-  render(<SuggestionsSettings readOnly={props.readOnly ?? false} onOpenSuggestions={onOpenSuggestions} />);
+  render(<Harness readOnly={props.readOnly ?? false} onOpenSuggestions={onOpenSuggestions} />);
   return onOpenSuggestions;
 }
 
@@ -146,12 +160,37 @@ describe("SuggestionsSettings", () => {
     expect(screen.getByText("CI failures from GitHub won't be suggested.")).toBeTruthy();
   });
 
+  it("keeps typed text when saving fails and locks reorder while a patch is in flight", async () => {
+    open();
+    let finish: (v: typeof ok) => void = () => {};
+    api.updateSuggestionPrefs.mockReturnValue(new Promise((resolve) => (finish = resolve)));
+    const github = await screen.findByLabelText("Provider GitHub");
+    fireEvent.keyDown(github, { key: "ArrowDown", altKey: true });
+    await waitFor(() => expect(api.updateSuggestionPrefs).toHaveBeenCalledTimes(1));
+    fireEvent.keyDown(github, { key: "ArrowDown", altKey: true });
+    expect(api.updateSuggestionPrefs).toHaveBeenCalledTimes(1);
+    finish(ok);
+    await waitFor(() => expect(screen.getByLabelText("Drag GitHub to reorder")).toHaveProperty("disabled", false));
+    cleanup();
+
+    open();
+    api.putSuggestionTemplate.mockResolvedValue({ ok: false, error: "too long", stale: false });
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+    const field = (await screen.findByLabelText("GitHub review-requested template")) as HTMLTextAreaElement;
+    fireEvent.change(field, { target: { value: "typed" } });
+    fireEvent.blur(field);
+    expect((await screen.findByRole("alert")).textContent).toContain("too long");
+    expect(field.value).toBe("typed");
+  });
+
   it("maps a source to a Project and clears it", async () => {
     open();
     fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
     const row = (await screen.findByText("github.com/o/r")).closest("li") as HTMLElement;
     expect(within(row).getByText("no mapping: the wizard asks")).toBeTruthy();
-    fireEvent.change(within(row).getByLabelText("Map github.com/o/r"), { target: { value: "/p/aoe" } });
+    const select = within(row).getByLabelText("Map github.com/o/r") as HTMLSelectElement;
+    await waitFor(() => expect(select.disabled).toBe(false));
+    fireEvent.change(select, { target: { value: "/p/aoe" } });
     await waitFor(() => expect(api.putSuggestionMapping).toHaveBeenCalledWith("gh", "github.com/o/r", ["/p/aoe"]));
   });
 });

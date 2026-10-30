@@ -854,7 +854,7 @@
         "web/src/components/settings/SuggestionTemplates.tsx",
         "web/src/components/settings/TemplateEditor.tsx",
         "web/src/components/settings/suggestionsShared.tsx",
-        "web/src/components/settings/useHasSuggestionProviders.ts",
+        "web/src/components/settings/useSuggestionsSnapshot.ts",
         "web/src/lib/suggestionTemplate.ts"
       ]
     },

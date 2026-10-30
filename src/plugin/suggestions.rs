@@ -532,31 +532,40 @@ fn provider_prefs(
     .collect()
 }
 
-/// `true` unless the user switched the provider off.
-pub(crate) fn provider_enabled(
+/// Ids of the providers the user switched off.
+pub(crate) fn disabled_providers(
     conn: &Connection,
     profile: &str,
-    provider_id: &str,
-) -> rusqlite::Result<bool> {
-    Ok(conn
-        .query_row(
-            "SELECT enabled FROM suggestion_provider_prefs WHERE profile = ?1 AND provider_id = ?2",
-            params![profile, provider_id],
-            |row| row.get(0),
-        )
-        .optional()?
-        .unwrap_or(true))
+) -> rusqlite::Result<HashSet<String>> {
+    conn.prepare(
+        "SELECT provider_id FROM suggestion_provider_prefs WHERE profile = ?1 AND enabled = 0",
+    )?
+    .query_map([profile], |row| row.get(0))?
+    .collect()
 }
 
-/// Provider indexes in the saved order; unsaved providers follow in registry order.
+/// Provider indexes in the saved order; unsaved providers follow, ties broken by id.
 fn ordered_indexes(providers: &[Provider], stored: &HashMap<String, (bool, i64)>) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..providers.len()).collect();
-    order.sort_by_key(|&i| {
+    let rank = |i: usize| {
         stored
             .get(&providers[i].id)
             .map_or(i64::from(i32::MAX), |p| p.1)
-    });
+    };
+    let mut order: Vec<usize> = (0..providers.len()).collect();
+    order.sort_by(|&a, &b| (rank(a), &providers[a].id).cmp(&(rank(b), &providers[b].id)));
     order
+}
+
+/// `(homepage, sidebar, refresh_minutes)` of a profile that never saved any.
+pub(crate) const DEFAULT_PREFS: (bool, bool, u32) = (true, false, 15);
+
+pub(crate) fn prefs_json(prefs: (bool, bool, u32), provider_order: &[&str]) -> Value {
+    json!({
+        "homepage": prefs.0,
+        "sidebar": prefs.1,
+        "refresh_minutes": prefs.2,
+        "provider_order": provider_order,
+    })
 }
 
 fn load_prefs(conn: &Connection, profile: &str) -> rusqlite::Result<(bool, bool, u32)> {
@@ -567,7 +576,7 @@ fn load_prefs(conn: &Connection, profile: &str) -> rusqlite::Result<(bool, bool,
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?
-        .unwrap_or((true, false, 15)))
+        .unwrap_or(DEFAULT_PREFS))
 }
 
 /// Applies `patch` atomically; the inner `Err` is a validation message and
@@ -702,13 +711,8 @@ pub(crate) fn snapshot(
             out_items.push(value);
         }
     }
-    let (homepage, sidebar, refresh_minutes) = load_prefs(conn, profile)?;
-    let prefs = json!({
-        "homepage": homepage,
-        "sidebar": sidebar,
-        "refresh_minutes": refresh_minutes,
-        "provider_order": order.iter().map(|&i| providers[i].id.as_str()).collect::<Vec<_>>(),
-    });
+    let order_ids: Vec<&str> = order.iter().map(|&i| providers[i].id.as_str()).collect();
+    let prefs = prefs_json(load_prefs(conn, profile)?, &order_ids);
     Ok(json!({ "providers": out_providers, "items": out_items, "prefs": prefs }))
 }
 
@@ -1616,6 +1620,16 @@ mod tests {
             json!({ "homepage": true, "sidebar": false, "refresh_minutes": 15,
                     "provider_order": ["acme.github", "acme.linear"] })
         );
+        assert_eq!(
+            snapshot(&conn, "p", &[]).unwrap()["prefs"],
+            prefs_json(DEFAULT_PREFS, &[])
+        );
+        // Unsaved providers sort by id whatever the registry order.
+        let reversed = [other(), provider()];
+        assert_eq!(
+            snapshot(&conn, "p", &reversed).unwrap()["prefs"]["provider_order"],
+            json!(["acme.github", "acme.linear"])
+        );
 
         apply(json!({ "sidebar": true })).unwrap();
         apply(json!({ "refresh_minutes": 60, "provider_order": ["acme.linear", "acme.github"] }))
@@ -1649,7 +1663,7 @@ mod tests {
         let conn = store();
         publish(&conn, "p", &[item("a", "assigned")]);
         assert_eq!(ids(&snap(&conn, "p")), ["a"]);
-        assert!(provider_enabled(&conn, "p", "acme.github").unwrap());
+        assert!(disabled_providers(&conn, "p").unwrap().is_empty());
 
         let patch = serde_json::from_value(json!({ "provider_enabled": { "acme.github": false } }))
             .unwrap();
@@ -1660,8 +1674,11 @@ mod tests {
         assert!(ids(&snapshot).is_empty());
         assert_eq!(snapshot["providers"][0]["enabled"], false);
         assert!(snapshot["providers"][0]["updated_at"].is_i64());
-        assert!(!provider_enabled(&conn, "p", "acme.github").unwrap());
-        assert!(provider_enabled(&conn, "other", "acme.github").unwrap());
+        assert_eq!(
+            disabled_providers(&conn, "p").unwrap(),
+            HashSet::from(["acme.github".to_string()])
+        );
+        assert!(disabled_providers(&conn, "other").unwrap().is_empty());
     }
 
     #[test]
