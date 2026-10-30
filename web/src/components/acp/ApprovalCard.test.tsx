@@ -361,12 +361,16 @@ describe("ApprovalCard plan viewer", () => {
     const plain = document.createElement("textarea");
     document.body.append(plain);
     plain.focus();
+    const reached = vi.fn();
+    plain.addEventListener("keydown", reached);
     const tab = new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true });
-    document.dispatchEvent(tab);
+    plain.dispatchEvent(tab);
     expect(tab.defaultPrevented).toBe(true);
+    expect(reached).not.toHaveBeenCalled();
     expect(screen.getByRole("dialog").contains(document.activeElement)).toBe(true);
     plain.focus();
-    fireEvent.keyDown(document, { key: "Escape" });
+    fireEvent.keyDown(plain, { key: "Escape" });
+    expect(reached).not.toHaveBeenCalled();
     expect(screen.queryByRole("dialog")).toBeNull();
     plain.remove();
     fireEvent.click(screen.getByText("View plan"));

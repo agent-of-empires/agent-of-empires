@@ -3,7 +3,7 @@
 // a file.
 
 import type { Page } from "@playwright/test";
-import { test, expect, pressShortcut } from "./helpers/mockedTest";
+import { test, expect, pressShortcut, observeFor } from "./helpers/mockedTest";
 import { mockAcpSession, openStructuredSession } from "./helpers/acpMock";
 import { mockTerminalApis } from "./helpers/terminal-mocks";
 
@@ -75,7 +75,8 @@ test("the command palette keeps Tab and Escape while it covers the plan modal", 
 });
 
 test("the terminal-focus shortcut cannot strand focus behind the plan modal", async ({ page }) => {
-  await mockTerminalApis(page);
+  const terminal = await mockTerminalApis(page);
+  const sentToTerminal = () => terminal.liveInput.length;
   const pairedInput = page.locator('[data-term="paired"]:visible textarea').first();
   const { dialog } = await openPlanModal(page, async () => {
     await page.locator('[data-testid^="pane-tab-terminal:"]').first().click();
@@ -84,14 +85,19 @@ test("the terminal-focus shortcut cannot strand focus behind the plan modal", as
 
   await pressShortcut(page, "ControlOrMeta+`");
   await expect(pairedInput).toBeFocused();
+  // Keys the modal claims must not also reach the terminal behind it.
+  const sentBefore = sentToTerminal();
 
   await page.keyboard.press("Tab");
   await expect.poll(() => dialog.evaluate((el) => el.contains(document.activeElement))).toBe(true);
+  await observeFor(page, 300, async () => expect(sentToTerminal()).toBe(sentBefore));
 
   await pressShortcut(page, "ControlOrMeta+`");
   await expect(pairedInput).toBeFocused();
+  const sentAfterRefocus = sentToTerminal();
   await page.keyboard.press("Escape");
   await expect(page.getByTestId("plan-modal")).toHaveCount(0);
+  await observeFor(page, 300, async () => expect(sentToTerminal()).toBe(sentAfterRefocus));
 });
 
 test("a plan file link closes the modal and leaves Tab alone while the approval stays pending", async ({ page }) => {

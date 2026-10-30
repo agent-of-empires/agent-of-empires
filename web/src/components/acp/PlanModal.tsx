@@ -39,7 +39,8 @@ function useModalFocus(onClose: () => void) {
     const onKey = (e: KeyboardEvent) => {
       // A covered session (inert) or a higher overlay such as the command
       // palette owns the keyboard. Focus on a non-modal element, like a
-      // terminal behind the plan, does not: the trap pulls it back.
+      // terminal behind the plan, does not: the trap pulls it back and
+      // consumes the key so that target never receives it.
       const el = root();
       const holder = document.activeElement;
       if (!el || el.closest("[inert]")) return;
@@ -47,6 +48,7 @@ function useModalFocus(onClose: () => void) {
       if (overlay && overlay !== el) return;
       if (e.key === "Escape") {
         e.preventDefault();
+        e.stopPropagation();
         onCloseRef.current();
         return;
       }
@@ -57,9 +59,11 @@ function useModalFocus(onClose: () => void) {
       if (!first || !last) return;
       if (!el.contains(holder) || (e.shiftKey && holder === first)) {
         e.preventDefault();
+        e.stopPropagation();
         (e.shiftKey && holder === first ? last : first).focus();
       } else if (!e.shiftKey && holder === last) {
         e.preventDefault();
+        e.stopPropagation();
         first.focus();
       }
     };
