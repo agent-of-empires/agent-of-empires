@@ -1,4 +1,4 @@
-// Focus mode (`/session/<id>?focus=1`): a window limited to one session, entered in place from the top bar.
+// Focus mode (`/session/<id>?focus=1`): a window showing only one Session, entered in place from the Session menu.
 
 import type { Page } from "@playwright/test";
 import { test, expect } from "./helpers/mockedTest";
@@ -36,7 +36,7 @@ async function workerFocusSessions(page: Page): Promise<(string | null)[]> {
   });
 }
 
-test("the top bar turns this tab into a focus window that hides the sidebar until it exits", async ({ page }) => {
+test("Show only this Session turns this tab into a focus window until All Sessions", async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 720 });
   await installSidebarMocks(page, { sessions: SESSIONS });
   const reports = await recordPresence(page);
@@ -45,28 +45,59 @@ test("the top bar turns this tab into a focus window that hides the sidebar unti
   await page.goto("/session/s-1");
   await expect(page.locator(SIDEBAR)).toBeVisible();
   await expect.poll(() => workerFocusSessions(page)).toEqual([null]);
+  const appTitle = await page.title();
 
-  await page.getByTestId("topbar-enter-focus").click();
+  await page.locator(SIDEBAR).getByTestId("sidebar-session-row").filter({ hasText: "Mongols" }).click({
+    button: "right",
+  });
+  await page.getByTestId("sidebar-context-menu-more").click();
+  await page.getByTestId("sidebar-context-menu-show-only").click();
   await expect(page).toHaveURL("/session/s-1?focus=1");
-  const exit = page.getByTestId("topbar-exit-focus");
+  const exit = page.getByRole("button", { name: /^All Sessions/ });
   await expect(exit).toBeVisible();
   await expect(page.locator(SIDEBAR)).toHaveCount(0);
-  await expect(page.getByTestId("topbar-enter-focus")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Go to dashboard" })).toHaveCount(0);
+  await expect(page).toHaveTitle("Mongols");
   await expect.poll(() => reports.at(-1)).toBe("s-1");
   // The service worker scopes pushes and notification clicks by the window's URL, so it must see the change.
   await expect.poll(() => workerFocusSessions(page)).toEqual(["s-1"]);
 
-  // A reload keeps focus mode, and the sidebar shortcut does nothing.
+  // The first-use note names the session and stays dismissed.
+  const note = page.getByTestId("focus-mode-note");
+  await expect(note).toContainText("Only Mongols shows here.");
+  await note.getByRole("button", { name: "Dismiss" }).click();
+  await expect(note).toHaveCount(0);
+
+  // A reload keeps focus mode and the dismissed note, and the sidebar shortcut does nothing.
   await page.reload();
   await expect(exit).toBeVisible();
+  await expect(note).toHaveCount(0);
   await page.keyboard.press("ControlOrMeta+b");
   await expect(page.locator(SIDEBAR)).toHaveCount(0);
 
   await exit.click();
   await expect(page).toHaveURL("/session/s-1");
   await expect(page.locator(SIDEBAR)).toBeVisible();
+  await expect(page).toHaveTitle(appTitle);
   await expect.poll(() => reports.at(-1)).toBeNull();
   await expect.poll(() => workerFocusSessions(page)).toEqual([null]);
   expect(popups).toHaveLength(0);
+});
+
+test("Open in its own window pops the session out and leaves this tab as it was", async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 720 });
+  await installSidebarMocks(page, { sessions: SESSIONS });
+  await page.goto("/session/s-1");
+
+  await page.locator(SIDEBAR).getByTestId("sidebar-session-row").filter({ hasText: "Goths" }).click({
+    button: "right",
+  });
+  await page.getByTestId("sidebar-context-menu-more").click();
+  const [popup] = await Promise.all([
+    page.waitForEvent("popup"),
+    page.getByTestId("sidebar-context-menu-own-window").click(),
+  ]);
+  await expect(popup).toHaveURL(/\/session\/s-2\?focus=1$/);
+  await expect(page).toHaveURL("/session/s-1");
+  await expect(page.locator(SIDEBAR)).toBeVisible();
 });

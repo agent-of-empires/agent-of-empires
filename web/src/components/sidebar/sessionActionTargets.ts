@@ -11,7 +11,9 @@ export type SessionAction =
   | "switchAgent"
   | "switchView"
   | "autoName"
-  | "summarize";
+  | "summarize"
+  | "showOnly"
+  | "openOwnWindow";
 
 const isStructured = (s: SessionResponse) => s.view === "structured";
 
@@ -27,6 +29,8 @@ const ELIGIBLE: Record<SessionAction, (s: SessionResponse, archived: boolean) =>
   switchView: (s) => isStructured(s) || (!!s.acp_capable && !s.structured_view_off),
   autoName: isStructured,
   summarize: isStructured,
+  showOnly: (s) => !s.trashed_at,
+  openOwnWindow: (s) => !s.trashed_at,
 };
 
 export type SessionActionTargets = Record<SessionAction, SessionResponse[]>;
@@ -47,5 +51,7 @@ export function resolveActionTargets(sessions: SessionResponse[], optimistic: Op
     switchView: targets("switchView"),
     autoName: targets("autoName"),
     summarize: targets("summarize"),
+    showOnly: targets("showOnly"),
+    openOwnWindow: targets("openOwnWindow"),
   };
 }

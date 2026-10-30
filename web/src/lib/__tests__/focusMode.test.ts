@@ -1,6 +1,16 @@
 import { describe, expect, it } from "vitest";
 
-import { focusNavigation, noticedSessions } from "../focusMode";
+import { focusNavigation, focusSessionTitle, noticedSessions } from "../focusMode";
+
+describe("focusSessionTitle", () => {
+  it.each([
+    [{ title: "Mongols", branch: "feat/x" }, "Mongols"],
+    [{ title: "  ", branch: "feat/x" }, "feat/x"],
+    [{ title: "", branch: null }, "Untitled session"],
+  ])("names %j as %s", (session, expected) => {
+    expect(focusSessionTitle(session)).toBe(expected);
+  });
+});
 
 describe("noticedSessions", () => {
   const sessions = [{ id: "a" }, { id: "b" }];

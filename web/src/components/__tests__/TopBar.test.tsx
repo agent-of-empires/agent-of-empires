@@ -119,7 +119,7 @@ describe("TopBar", () => {
     expect(queryByText("breadcrumb-feature")).toBeNull();
   });
 
-  it("replaces the sidebar toggle and dashboard link with an exit button in focus mode", () => {
+  it("replaces the sidebar toggle and dashboard link with an All Sessions button in focus mode", () => {
     const onToggleSidebar = vi.fn();
     const onExitFocusMode = vi.fn();
     const { getByRole, queryByRole } = render(
@@ -128,30 +128,13 @@ describe("TopBar", () => {
     );
     expect(queryByRole("button", { name: /Toggle sidebar/ })).toBeNull();
     expect(queryByRole("button", { name: "Go to dashboard" })).toBeNull();
-    // The exit button is the only left control: no inert logo beside it.
-    const exit = getByRole("button", { name: "Exit focus mode, 0 unread, 1 waiting for your input" });
-    expect(exit.textContent).toContain("exit focus");
+    // The button is the only left control, and its visible label names what it brings back.
+    const exit = getByRole("button", { name: "All Sessions, 0 unread, 1 waiting for your input" });
+    expect(exit.textContent).toContain("All Sessions");
     expect(exit.closest("header")!.querySelector('img[src="/icon-192.png"]')).toBeNull();
     fireEvent.click(exit);
     expect(onExitFocusMode).toHaveBeenCalledTimes(1);
     expect(onToggleSidebar).not.toHaveBeenCalled();
-    expect(queryByRole("button", { name: "Enter focus mode" })).toBeNull();
-  });
-
-  it("shows an enter focus mode button only when the window can enter it", () => {
-    const without = renderTopBar();
-    expect(without.queryByRole("button", { name: "Enter focus mode" })).toBeNull();
-    without.unmount();
-
-    const onEnterFocusMode = vi.fn();
-    const { getByRole, getAllByRole } = render(<TopBar {...topBarProps()} onEnterFocusMode={onEnterFocusMode} />, {
-      wrapper: MemoryRouter,
-    });
-    // It sits between the sidebar toggle and the logo.
-    const order = getAllByRole("button").map((b) => b.getAttribute("aria-label"));
-    expect(order.slice(0, 3)).toEqual(["Toggle sidebar", "Enter focus mode", "Go to dashboard"]);
-    fireEvent.click(getByRole("button", { name: "Enter focus mode" }));
-    expect(onEnterFocusMode).toHaveBeenCalledTimes(1);
   });
 
   it("exposes a Tips entry in the overflow menu that fires onOpenTips", () => {

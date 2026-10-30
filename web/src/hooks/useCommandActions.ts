@@ -70,12 +70,10 @@ interface Args {
   onLogout: () => void;
   /** This window is limited to the active session: switching, creation and sidebar commands are left out. */
   focusMode: boolean;
-  /** `session.focus_mode`: when off, the commands that enter focus mode are left out. Exit is always offered. */
-  focusModeEnabled: boolean;
   /** Turns this window into a focus window on the given session. */
   onEnterFocusMode: (sessionId: string) => void;
-  /** Opens the given session in a new focus-mode window. */
-  onOpenFocusWindow: (sessionId: string) => void;
+  /** Opens the given session in a new focus-mode window; absent where a second window cannot open (phones). */
+  onOpenFocusWindow?: (sessionId: string) => void;
   onExitFocusMode: () => void;
 }
 
@@ -100,7 +98,6 @@ export function useCommandActions({
   onToggleSidebar,
   onLogout,
   focusMode,
-  focusModeEnabled,
   onEnterFocusMode,
   onOpenFocusWindow,
   onExitFocusMode,
@@ -111,28 +108,30 @@ export function useCommandActions({
     if (focusMode) {
       actions.push({
         id: "action:exit-focus-mode",
-        title: "Exit focus mode",
+        title: "Show all Sessions",
         group: "Actions",
-        keywords: ["focus", "sidebar", "sessions", "leave"],
+        keywords: ["focus", "exit", "sidebar", "sessions", "leave"],
         perform: onExitFocusMode,
       });
-    } else if (activeSessionId && focusModeEnabled) {
+    } else if (activeSessionId) {
       actions.push({
         id: "action:enter-focus-mode",
-        title: "Enter focus mode",
+        title: "Show only this Session",
         subtitle: "current session, in this window",
         group: "Actions",
-        keywords: ["focus", "distraction", "single", "hide", "sidebar"],
+        keywords: ["focus", "single", "hide", "sidebar", "distraction"],
         perform: () => onEnterFocusMode(activeSessionId),
       });
-      actions.push({
-        id: "action:open-focus-window",
-        title: "Open in focus mode",
-        subtitle: "current session, in a new window",
-        group: "Actions",
-        keywords: ["focus", "window", "distraction", "single"],
-        perform: () => onOpenFocusWindow(activeSessionId),
-      });
+      if (onOpenFocusWindow) {
+        actions.push({
+          id: "action:open-focus-window",
+          title: "Open in its own window",
+          subtitle: "current session",
+          group: "Actions",
+          keywords: ["focus", "pop out", "popout", "window", "single"],
+          perform: () => onOpenFocusWindow(activeSessionId),
+        });
+      }
     }
 
     if (!readOnly && !focusMode) {
@@ -301,7 +300,6 @@ export function useCommandActions({
     onToggleSidebar,
     onLogout,
     focusMode,
-    focusModeEnabled,
     onEnterFocusMode,
     onOpenFocusWindow,
     onExitFocusMode,

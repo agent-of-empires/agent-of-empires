@@ -18,8 +18,9 @@ import { useAttentionCounts } from "./hooks/useAttentionCounts";
 import { useStatusSounds } from "./hooks/useStatusSounds";
 import { useSessionStatusStream } from "./hooks/useSessionStatusStream";
 import { useDashboardPresence } from "./hooks/useDashboardPresence";
-import { useFocusMode } from "./hooks/useFocusMode";
+import { useFocusMode, useFocusSession } from "./hooks/useFocusMode";
 import { focusNavigation, noticedSessions } from "./lib/focusMode";
+import { FocusModeNote } from "./components/FocusModeNote";
 import { FocusSessionGone } from "./components/FocusSessionGone";
 import { clearAcpCache } from "./hooks/useAcpSession";
 import { clearDraft, sweepOrphanDrafts } from "./lib/acpDrafts";
@@ -108,7 +109,6 @@ import { IdleDecayWindowContext, parseIdleDecayWindowMs } from "./lib/idleDecay"
 import { parseUnreadIndicatorEnabled, UnreadIndicatorContext, useUnreadIndicatorEnabled } from "./lib/unreadIndicator";
 import { parseSessionRowTagMode, SessionRowTagContext, type SessionRowTagMode } from "./lib/sessionRowTag";
 import { parseSessionColorsEnabled, SessionColorsContext } from "./lib/sessionColors";
-import { FocusModeEnabledContext, parseFocusModeEnabled, useFocusModeEnabled } from "./lib/focusModeSetting";
 import { settleSettingsIntrosReadOnly } from "./lib/settingsIntros";
 import { onSettingsChanged } from "./lib/settingsEvents";
 import { parseSystemHealthEnabled, SystemHealthEnabledContext } from "./lib/systemHealth";
@@ -203,7 +203,6 @@ export default function App() {
   const [unreadIndicatorEnabled, setUnreadIndicatorEnabled] = useState(true);
   const [sessionRowTagMode, setSessionRowTagMode] = useState<SessionRowTagMode>("branch");
   const [sessionColorsEnabled, setSessionColorsEnabled] = useState(true);
-  const [focusModeEnabled, setFocusModeEnabled] = useState(true);
   const [systemHealthEnabled, setSystemHealthEnabled] = useState(false);
 
   const applyAppSettings = useCallback((settings: SettingsResponse | null | undefined) => {
@@ -211,7 +210,6 @@ export default function App() {
     setUnreadIndicatorEnabled(parseUnreadIndicatorEnabled(settings));
     setSessionRowTagMode(parseSessionRowTagMode(settings));
     setSessionColorsEnabled(parseSessionColorsEnabled(settings));
-    setFocusModeEnabled(parseFocusModeEnabled(settings));
     setSystemHealthEnabled(parseSystemHealthEnabled(settings));
   }, []);
 
@@ -305,15 +303,13 @@ export default function App() {
         <SessionRowTagContext.Provider value={sessionRowTagMode}>
           <SessionColorsContext.Provider value={sessionColorsEnabled}>
             <SystemHealthEnabledContext.Provider value={systemHealthEnabled}>
-              <FocusModeEnabledContext.Provider value={focusModeEnabled}>
-                {/* PluginUiProvider must sit above AppContent: AppContent itself reads
-                  the plugin UI snapshot (usePluginPanes), so the provider can't live
-                  inside its own return. */}
-                <PluginUiProvider>
-                  <AppContent loginRequired={loginRequired} onLogout={handleLogout} resolvedTheme={resolvedTheme} />
-                </PluginUiProvider>
-                <ElevationPrompt />
-              </FocusModeEnabledContext.Provider>
+              {/* PluginUiProvider must sit above AppContent: AppContent itself reads
+                the plugin UI snapshot (usePluginPanes), so the provider can't live
+                inside its own return. */}
+              <PluginUiProvider>
+                <AppContent loginRequired={loginRequired} onLogout={handleLogout} resolvedTheme={resolvedTheme} />
+              </PluginUiProvider>
+              <ElevationPrompt />
             </SystemHealthEnabledContext.Provider>
           </SessionColorsContext.Provider>
         </SessionRowTagContext.Provider>
@@ -373,8 +369,6 @@ function AppContent({
   const pluginPageMatch = useMatch("/plugins/:pluginId/:pageId");
   // A focus-mode window shows one session only: no sidebar, no switching, and notifications for that session alone.
   const { focusSessionId, enterFocusMode, exitFocusMode } = useFocusMode(sessionMatch?.params.sessionId ?? null);
-  // `session.focus_mode` gates the ways in; a window already in focus mode can always leave.
-  const focusModeEnabled = useFocusModeEnabled();
   const focusMode = focusSessionId !== null;
   useDashboardPresence(focusSessionId);
   // A plugin page's split pane shows `?session=` as the routed session, docks and all.
@@ -872,6 +866,7 @@ function AppContent({
     return workspaces.find((w) => w.sessions.some((s) => s.id === activeSessionId));
   }, [workspaces, activeSessionId]);
   const activeSession = activeWorkspace?.sessions.find((s) => s.id === activeSessionId);
+  const focusSession = useFocusSession(focusSessionId, activeSession, sessionsLoaded);
   const allPaneIds: string[] = [
     // CityHall client mode hides the code-inspection panes (diff, files) and
     // the terminal (plus plugin panes below) so only the composer + structured
@@ -1943,9 +1938,9 @@ function AppContent({
     onToggleSidebar: handleToggleSidebar,
     onLogout,
     focusMode,
-    focusModeEnabled,
     onEnterFocusMode: enterFocusMode,
-    onOpenFocusWindow: openFocusWindow,
+    // An installed dashboard on a phone cannot open a second window.
+    onOpenFocusWindow: isCoarse ? undefined : openFocusWindow,
     onExitFocusMode: exitFocusMode,
   });
 
@@ -2257,8 +2252,10 @@ function AppContent({
       return <MainPaneSkeleton />;
     }
 
-    if (focusMode && (!activeWorkspace || !activeSession)) {
-      return <FocusSessionGone onExit={exitFocusMode} />;
+    if (focusSession.gone) {
+      return (
+        <FocusSessionGone title={focusSession.title} trashed={focusSession.gone === "trashed"} onExit={exitFocusMode} />
+      );
     }
 
     if (!activeWorkspace || !activeSession) {
@@ -2544,11 +2541,6 @@ function AppContent({
               onOpenTips={tips.open}
               onGoDashboard={handleGoDashboard}
               onExitFocusMode={focusMode ? exitFocusMode : undefined}
-              onEnterFocusMode={
-                focusModeEnabled && !focusMode && sessionMatch && activeSession
-                  ? () => enterFocusMode(activeSession.id)
-                  : undefined
-              }
               sidebarColumnVisible={!focusMode && !fullPageView && sidebarOpen}
               rightColumnVisible={
                 isMdUp && !fullPageView && !!activeWorkspace && !!activeSession && !rightDockCollapsed
@@ -2557,6 +2549,9 @@ function AppContent({
           </CollapsibleRegion>
 
           <BannerStack />
+          {focusMode && focusSession.title !== null && !focusSession.gone && (
+            <FocusModeNote title={focusSession.title} />
+          )}
 
           {/* Below the banners, not directly under the bar: the handle is
             absolutely positioned at the top-right, and hanging it off the bar

@@ -8,6 +8,7 @@ import {
   Container,
   FolderPen,
   FolderPlus,
+  Focus,
   Folders,
   GitFork,
   Moon,
@@ -19,6 +20,7 @@ import {
   ScrollText,
   SquareTerminal,
   Sparkles,
+  SquareArrowOutUpRight,
   Trash2,
 } from "lucide-react";
 import type { SessionResponse } from "../../lib/types";
@@ -95,6 +97,10 @@ export interface SingleRowActions {
   fork: (sessionId: string) => void;
   autoName: (sessionId: string) => void;
   summarize: (sessionId: string) => void;
+  /** Shows only this session in the current window (focus mode). */
+  showOnly: (sessionId: string) => void;
+  /** Opens the session alone in a new window; absent where a second window cannot open (phones). */
+  openOwnWindow?: (sessionId: string) => void;
   stop: (sessionId: string) => void;
   start: (sessionId: string) => void;
   restartUpdate: (sessionId: string) => void;
@@ -164,18 +170,24 @@ export function SingleRowMenuItems({
   const [pickerOpen, setPickerOpen] = useState<SessionAction | null>(null);
   const { actionTargets: t } = model;
   const write = !readOnly;
-  const item = (action: SessionAction, props: Omit<TargetedItemProps, "targets" | "open" | "onToggle" | "onRun">) => (
-    <TargetedItem
-      {...props}
-      targets={t[action]}
-      open={pickerOpen === action}
-      onToggle={() => setPickerOpen((o) => (o === action ? null : action))}
-      onRun={a[action]}
-    />
-  );
-  const more = write && {
-    editWorkdir: model.canEditWorkdir,
-    addProject: !!model.sessionId && model.canAddProject,
+  const item = (
+    action: SessionAction,
+    props: Omit<TargetedItemProps, "targets" | "open" | "onToggle" | "onRun">,
+    run: ((sessionId: string) => void) | undefined = a[action],
+  ) =>
+    run && (
+      <TargetedItem
+        {...props}
+        targets={t[action]}
+        open={pickerOpen === action}
+        onToggle={() => setPickerOpen((o) => (o === action ? null : action))}
+        onRun={run}
+      />
+    );
+  // More always opens: its window entries change no state, so a read-only dashboard still offers them.
+  const more = {
+    editWorkdir: write && model.canEditWorkdir,
+    addProject: write && !!model.sessionId && model.canAddProject,
   };
   return (
     <>
@@ -208,67 +220,72 @@ export function SingleRowMenuItems({
           New session in this project
         </MenuItem>
       )}
-      {more && (
-        <>
-          <MenuItem
-            onClick={() => setMoreOpen((o) => !o)}
-            testId="sidebar-context-menu-more"
-            ariaExpanded={moreOpen}
-            ariaControls={moreId}
-            icon={icon(ChevronRight, `transition-transform ${moreOpen ? "rotate-90" : ""}`)}
-          >
-            More
+      <MenuItem
+        onClick={() => setMoreOpen((o) => !o)}
+        testId="sidebar-context-menu-more"
+        ariaExpanded={moreOpen}
+        ariaControls={moreId}
+        icon={icon(ChevronRight, `transition-transform ${moreOpen ? "rotate-90" : ""}`)}
+      >
+        More
+      </MenuItem>
+      <div id={moreId} hidden={!moreOpen}>
+        {item("showOnly", {
+          label: "Show only this Session",
+          testId: "sidebar-context-menu-show-only",
+          glyph: icon(Focus),
+          indent: true,
+        })}
+        {item("openOwnWindow", {
+          label: "Open in its own window",
+          testId: "sidebar-context-menu-own-window",
+          glyph: icon(SquareArrowOutUpRight),
+          indent: true,
+        })}
+        {write &&
+          item("switchAgent", {
+            label: "Switch agent",
+            testId: "sidebar-context-menu-switch-agent",
+            glyph: icon(ArrowLeftRight),
+            indent: true,
+          })}
+        {write &&
+          item("recreateContainer", {
+            label: "Recreate container",
+            testId: "sidebar-context-menu-recreate-container",
+            glyph: icon(Container),
+            indent: true,
+          })}
+        {write &&
+          item("autoName", {
+            label: "Auto-name now",
+            testId: "sidebar-context-menu-auto-name",
+            glyph: icon(Sparkles),
+            indent: true,
+          })}
+        {write &&
+          item("summarize", {
+            label: "Summarize conversation",
+            testId: "sidebar-context-menu-summarize",
+            glyph: icon(ScrollText),
+            indent: true,
+          })}
+        {more.editWorkdir && (
+          <MenuItem onClick={a.editWorkdir} testId="sidebar-context-menu-edit-workdir" icon={icon(FolderPen)} indent>
+            Edit workdir name
           </MenuItem>
-          <div id={moreId} hidden={!moreOpen}>
-            {write &&
-              item("switchAgent", {
-                label: "Switch agent",
-                testId: "sidebar-context-menu-switch-agent",
-                glyph: icon(ArrowLeftRight),
-                indent: true,
-              })}
-            {write &&
-              item("recreateContainer", {
-                label: "Recreate container",
-                testId: "sidebar-context-menu-recreate-container",
-                glyph: icon(Container),
-                indent: true,
-              })}
-            {write &&
-              item("autoName", {
-                label: "Auto-name now",
-                testId: "sidebar-context-menu-auto-name",
-                glyph: icon(Sparkles),
-                indent: true,
-              })}
-            {write &&
-              item("summarize", {
-                label: "Summarize conversation",
-                testId: "sidebar-context-menu-summarize",
-                glyph: icon(ScrollText),
-                indent: true,
-              })}
-            {more.editWorkdir && (
-              <MenuItem
-                onClick={a.editWorkdir}
-                testId="sidebar-context-menu-edit-workdir"
-                icon={icon(FolderPen)}
-                indent
-              >
-                Edit workdir name
-              </MenuItem>
-            )}
-            {more.addProject && (
-              <MenuItem onClick={a.addProject} testId="sidebar-context-menu-add-project" icon={icon(FolderPlus)} indent>
-                Add project
-              </MenuItem>
-            )}
-            <MenuItem onClick={a.editGroup} testId="sidebar-context-menu-edit-group" icon={icon(Folders)} indent>
-              Edit group
-            </MenuItem>
-          </div>
-        </>
-      )}
+        )}
+        {more.addProject && (
+          <MenuItem onClick={a.addProject} testId="sidebar-context-menu-add-project" icon={icon(FolderPlus)} indent>
+            Add project
+          </MenuItem>
+        )}
+        {write && (
+          <MenuItem onClick={a.editGroup} testId="sidebar-context-menu-edit-group" icon={icon(Folders)} indent>
+            Edit group
+          </MenuItem>
+        )}
+      </div>
       <MenuSeparator />
       <MenuChoiceRow label="Notify" hint={NOTIFY_OPTIONS.find((o) => o.preset === model.notifyPreset)?.hint}>
         <div

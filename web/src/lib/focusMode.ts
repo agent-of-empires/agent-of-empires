@@ -16,3 +16,8 @@ export function focusNavigation(focusSessionId: string | null, sessionId?: strin
   if (!focusSessionId) return "here";
   return sessionId === focusSessionId ? "none" : "new-window";
 }
+
+/** The name a focus window shows for its session, in its tab title, note and gone screen. */
+export function focusSessionTitle(session: { title: string; branch?: string | null }): string {
+  return session.title.trim() || session.branch || "Untitled session";
+}

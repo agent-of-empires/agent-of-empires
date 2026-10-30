@@ -1,5 +1,4 @@
 import { useMemo } from "react";
-import { Focus, Scan } from "lucide-react";
 import type { SessionResponse, Workspace } from "../lib/types";
 import { PaletteTriggerPill } from "./PaletteTriggerPill";
 import { OverflowMenu, type OverflowItem } from "./OverflowMenu";
@@ -47,11 +46,8 @@ interface Props {
    *  re-readable any time, like GIMP/DBeaver's Help menu entry. */
   onOpenTips: () => void;
   onGoDashboard: () => void;
-  /** Set in a focus-mode window: an exit button replaces the sidebar toggle, and the logo no longer leaves the
-   *  session. */
+  /** Set in a focus-mode window: an "All Sessions" button replaces the sidebar toggle and the dashboard logo. */
   onExitFocusMode?: () => void;
-  /** Set on a session route outside focus mode: shows a button that turns this window into a focus window. */
-  onEnterFocusMode?: () => void;
   /** When true (desktop, sidebar open, not in a full-width settings/projects view), the header's left zone widens
    *  to match the sidebar column and the divider runs vertically through the header instead of a bottom border, so
    *  the top-left of the header reads as part of the sidebar. */
@@ -85,7 +81,6 @@ export function TopBar({
   onOpenTips,
   onGoDashboard,
   onExitFocusMode,
-  onEnterFocusMode,
   sidebarColumnVisible,
   rightColumnVisible,
 }: Props) {
@@ -104,7 +99,7 @@ export function TopBar({
   // the wordmark in that combination.
   const { settings: webSettings } = useWebSettings();
   const hideWordmark = sidebarColumnVisible && webSettings.sidebarCompact;
-  const toggleLabel = onExitFocusMode ? "Exit focus mode" : "Toggle sidebar";
+  const toggleLabel = onExitFocusMode ? "All Sessions" : "Toggle sidebar";
 
   return (
     <header {...tourAnchor(TOUR_ANCHORS.topbar)} className="h-12 bg-surface-850 flex items-stretch shrink-0">
@@ -130,14 +125,10 @@ export function TopBar({
         >
           {/* The badges are pinned to this icon box, not the button, so a labelled button keeps them on the icon. */}
           <span className="relative w-8 h-8 flex items-center justify-center shrink-0">
-            {onExitFocusMode ? (
-              <Scan className="h-4 w-4" strokeWidth={1.5} aria-hidden="true" />
-            ) : (
-              <StrokeIcon size={16} strokeWidth="1.5">
-                <rect x="3" y="3" width="18" height="18" rx="2" />
-                <line x1="9" y1="3" x2="9" y2="21" />
-              </StrokeIcon>
-            )}
+            <StrokeIcon size={16} strokeWidth="1.5">
+              <rect x="3" y="3" width="18" height="18" rx="2" />
+              <line x1="9" y1="3" x2="9" y2="21" />
+            </StrokeIcon>
             {unreadCount > 0 && (
               // Positioned on this wrapper, not the pill inside Tooltip: Tooltip's own trigger span is an
               // in-flow inline-flex box, and leaving it in flow would inflate the button's own `relative` box.
@@ -172,8 +163,8 @@ export function TopBar({
             )}
           </span>
           {onExitFocusMode && (
-            <span className="font-mono text-xs leading-none whitespace-nowrap" aria-hidden="true">
-              exit focus
+            <span className="text-xs leading-none whitespace-nowrap" aria-hidden="true">
+              All Sessions
             </span>
           )}
         </button>
@@ -184,21 +175,6 @@ export function TopBar({
         <span className="sr-only" aria-live="polite" aria-atomic="true" data-testid="topbar-attention-live-region">
           {`${unreadCount} unread, ${waitingCount} waiting for your input`}
         </span>
-
-        {onEnterFocusMode && (
-          // Hidden with the wordmark: the compact rail has no room for a third control.
-          <button
-            onClick={onEnterFocusMode}
-            data-testid="topbar-enter-focus"
-            className={`w-8 h-8 shrink-0 items-center justify-center cursor-pointer rounded-md transition-colors text-text-dim hover:text-text-secondary hover:bg-surface-700/50 ${
-              hideWordmark ? "flex md:hidden" : "flex"
-            }`}
-            title="Enter focus mode"
-            aria-label="Enter focus mode"
-          >
-            <Focus className="h-4 w-4" strokeWidth={1.5} aria-hidden="true" />
-          </button>
-        )}
 
         {!onExitFocusMode && (
           <button
