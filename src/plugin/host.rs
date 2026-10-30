@@ -161,6 +161,34 @@ impl PluginHost {
         }))
     }
 
+    /// Run `f` on the suggestions store, keyed by the profile workers publish under.
+    pub(crate) fn with_suggestions_db<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Connection, &str) -> T,
+    ) -> T {
+        self.api.with_suggestions_db(f)
+    }
+
+    /// Ask the worker of `provider_id`, or of every suggestions provider, to
+    /// publish again. Returns how many workers were notified.
+    pub async fn refresh_suggestions(&self, provider_id: Option<&str>) -> usize {
+        let mut sent = 0;
+        for provider in crate::plugin::suggestions::providers() {
+            if provider_id.is_some_and(|id| id != provider.id) {
+                continue;
+            }
+            let notified = self
+                .notify_worker(
+                    &provider.id,
+                    aoe_plugin_api::suggestions::SUGGESTIONS_REFRESH,
+                    serde_json::json!({}),
+                )
+                .await;
+            sent += usize::from(notified);
+        }
+        sent
+    }
+
     /// The aggregated UI-state snapshot for the web to render. Read
     /// synchronously off the in-memory store; never awaits a worker.
     pub fn ui_snapshot(&self) -> crate::plugin::ui_state::UiSnapshot {
