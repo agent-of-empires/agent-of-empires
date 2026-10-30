@@ -2357,7 +2357,7 @@ mod tests {
         let mut instance = crate::session::Instance::new("original-title", "/tmp/rename");
         instance.id = "rename".into();
         instance.source_profile = "test".into();
-        let row = crate::daemon::SessionResponse::from_instance(&instance, false);
+        let row = crate::server::api::sessions::session_response_from_instance(&instance, false);
         let mut original = snapshot("test", 1);
         Arc::make_mut(&mut original)
             .contents

@@ -1,232 +1,226 @@
-//! The `SessionResponse` wire model and per-request config resolution.
+//! Backend conversion to wire responses and per-request config resolution.
 
 use super::*;
 use crate::session::config::StructuredView;
 use crate::session::projection::SessionProjection;
 use chrono::{DateTime, Utc};
 
-impl SessionResponse {
-    /// Build a response from a session instance plus the user's current
-    /// Claude Code fullscreen-renderer preference.
-    ///
-    /// `claude_fullscreen` is the *user-level* setting (read once per
-    /// request via `crate::claude_settings::read_tui_fullscreen()`); it
-    /// surfaces on the response only when the session's agent is Claude.
-    pub fn from_instance(inst: &Instance, claude_fullscreen: bool) -> Self {
-        Self::from_instance_with_plan(
-            inst,
-            claude_fullscreen,
-            None,
-            crate::daemon::AcpWorkerState::Absent,
-            None,
-            None,
-            None,
-        )
-    }
+/// Convert backend session facts using the request's Claude fullscreen preference.
+pub(crate) fn session_response_from_instance(
+    inst: &Instance,
+    claude_fullscreen: bool,
+) -> SessionResponse {
+    session_response_from_instance_with_plan(
+        inst,
+        claude_fullscreen,
+        None,
+        crate::daemon::AcpWorkerState::Absent,
+        None,
+        None,
+        None,
+    )
+}
 
-    /// Build a response with the per-session plan snapshot. Called from
-    /// the REST sessions endpoint after a single bulk read of the
-    /// structured view event store; see #1061.
-    pub fn from_instance_with_plan(
-        inst: &Instance,
-        claude_fullscreen: bool,
-        plan_summary: Option<PlanSummary>,
-        acp_worker_state: crate::daemon::AcpWorkerState,
-        next_wakeup_at: Option<String>,
-        next_wakeup_reason: Option<String>,
-        // `Some(description)` when the session has an armed `Monitor`, `None`
-        // otherwise, mirroring `EventStore::latest_active_monitor`.
-        active_monitor: Option<Option<String>>,
-    ) -> Self {
-        let (monitor_active, monitor_description) = match active_monitor {
-            Some(description) => (true, description),
-            None => (false, None),
-        };
-        let row = SessionProjection::new(inst, &inst.source_profile);
-        let timestamp = |value: Option<DateTime<Utc>>| value.map(|t| t.to_rfc3339());
-        let status = if inst
-            .lifecycle_reservation
+/// Convert backend session facts with the request's plan and runtime snapshots.
+pub(super) fn session_response_from_instance_with_plan(
+    inst: &Instance,
+    claude_fullscreen: bool,
+    plan_summary: Option<PlanSummary>,
+    acp_worker_state: crate::daemon::AcpWorkerState,
+    next_wakeup_at: Option<String>,
+    next_wakeup_reason: Option<String>,
+    // `Some(description)` when the session has an armed `Monitor`, `None`
+    // otherwise, mirroring `EventStore::latest_active_monitor`.
+    active_monitor: Option<Option<String>>,
+) -> SessionResponse {
+    let (monitor_active, monitor_description) = match active_monitor {
+        Some(description) => (true, description),
+        None => (false, None),
+    };
+    let row = SessionProjection::new(inst, &inst.source_profile);
+    let timestamp = |value: Option<DateTime<Utc>>| value.map(|t| t.to_rfc3339());
+    let status = if inst
+        .lifecycle_reservation
+        .as_ref()
+        .is_some_and(|reservation| reservation.op == crate::session::LifecycleOperation::Purge)
+    {
+        Status::Deleting
+    } else {
+        row.status
+    };
+    SessionResponse {
+        agent_pane: inst.agent_pane.clone(),
+        auxiliary: inst.auxiliary.clone(),
+        id: row.id.to_string(),
+        idempotency_key: inst.idempotency_key.clone(),
+        title: row.title.to_string(),
+        project_path: row.project_path.to_string(),
+        agent_session_id: inst.agent_session_id.clone(),
+        parent_session_id: row.parent_session_id.map(str::to_string),
+        artifact_dir: crate::session::artifacts::artifact_dir_path(&inst.id)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        group_path: row.group_path.to_string(),
+        sort_index: inst.sort_index,
+        tool: row.tool.to_string(),
+        command: row.command.to_string(),
+        extra_args: inst.extra_args.clone(),
+        status: status.wire_str().to_string(),
+        lifecycle_reservation: inst.lifecycle_reservation.clone(),
+        lifecycle_generation: inst.lifecycle_generation,
+        dormant: inst.is_shown_dormant(),
+        idle_dormant_since: inst.idle_dormant_since.map(|t| t.to_rfc3339()),
+        pane_dead_observed: inst.pane_dead_observed,
+        yolo_mode: inst.yolo_mode,
+        created_at: row.created_at.to_rfc3339(),
+        last_accessed_at: timestamp(row.last_accessed_at),
+        idle_entered_at: timestamp(row.idle_entered_at),
+        last_error: row.last_error.map(str::to_string),
+        branch: row.worktree.map(|w| w.branch.clone()),
+        main_repo_path: row.worktree.map(|w| w.main_repo_path.clone()),
+        base_branch: row.worktree.and_then(|w| w.base_branch.clone()),
+        base_branch_override: inst.base_branch_override.clone(),
+        worktree_created_at: inst
+            .worktree_info
             .as_ref()
-            .is_some_and(|reservation| reservation.op == crate::session::LifecycleOperation::Purge)
-        {
-            Status::Deleting
-        } else {
-            row.status
-        };
-        Self {
-            agent_pane: inst.agent_pane.clone(),
-            auxiliary: inst.auxiliary.clone(),
-            id: row.id.to_string(),
-            idempotency_key: inst.idempotency_key.clone(),
-            title: row.title.to_string(),
-            project_path: row.project_path.to_string(),
-            agent_session_id: inst.agent_session_id.clone(),
-            parent_session_id: row.parent_session_id.map(str::to_string),
-            artifact_dir: crate::session::artifacts::artifact_dir_path(&inst.id)
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default(),
-            group_path: row.group_path.to_string(),
-            sort_index: inst.sort_index,
-            tool: row.tool.to_string(),
-            command: row.command.to_string(),
-            extra_args: inst.extra_args.clone(),
-            status: status.wire_str().to_string(),
-            lifecycle_reservation: inst.lifecycle_reservation.clone(),
-            lifecycle_generation: inst.lifecycle_generation,
-            dormant: inst.is_shown_dormant(),
-            idle_dormant_since: inst.idle_dormant_since.map(|t| t.to_rfc3339()),
-            pane_dead_observed: inst.pane_dead_observed,
-            yolo_mode: inst.yolo_mode,
-            created_at: row.created_at.to_rfc3339(),
-            last_accessed_at: timestamp(row.last_accessed_at),
-            idle_entered_at: timestamp(row.idle_entered_at),
-            last_error: row.last_error.map(str::to_string),
-            branch: row.worktree.map(|w| w.branch.clone()),
-            main_repo_path: row.worktree.map(|w| w.main_repo_path.clone()),
-            base_branch: row.worktree.and_then(|w| w.base_branch.clone()),
-            base_branch_override: inst.base_branch_override.clone(),
-            worktree_created_at: inst
-                .worktree_info
-                .as_ref()
-                .map(|w| w.created_at.to_rfc3339()),
-            is_sandboxed: inst.is_sandboxed(),
-            sandbox_container_name: inst.sandbox_info.as_ref().map(|s| s.container_name.clone()),
-            // Worktree and workspace creation refuse a path that is not a Repository.
-            outside_repository: inst.worktree_info.is_none()
-                && inst.workspace_info.is_none()
-                && outside_repository_cached(&inst.project_path),
-            scratch: inst.scratch,
-            favorited: inst.is_favorited(),
-            favorited_at: inst.favorited_at.map(|t| t.to_rfc3339()),
-            color: inst.color.clone(),
-            urgent: inst.is_urgent(),
-            pinned_at: timestamp(row.pinned_at),
-            archived_at: timestamp(row.archived_at),
-            snoozed_until: timestamp(row.active_snoozed_until),
-            trashed_at: timestamp(row.trashed_at),
-            trash_lifecycle_id: inst.trash_lifecycle_id.clone(),
-            failed_purge_forced: inst.failed_purge_forced(),
-            // Surface the marker; the web gates the visual on the
-            // `session.unread_indicator` setting.
-            unread: inst.unread,
-            has_managed_worktree: row.has_managed_worktree(),
-            has_cleanable_worktree: inst.has_managed_worktree_or_workspace(),
-            // Overlaid per-profile in list_sessions; see the field doc.
-            tie_workdir_to_name: false,
-            // Overlaid in list_sessions; single-session responses stay inactive.
-            smart_rename: crate::session::smart_rename::SmartRenameState::Inactive,
-            // Overlaid in list_sessions; single-session responses stay false.
-            default_name: false,
-            has_terminal: inst.terminal_info.is_some(),
-            profile: row.profile.to_string(),
-            cleanup_defaults: CleanupDefaults {
-                delete_worktree: true,
-                delete_branch: false,
-                delete_sandbox: true,
-                delete_to_trash: true,
-            },
-            remote_owner: None,
-            remote_owner_key: None,
-            notify_on_waiting: inst.notify_on_waiting,
-            notify_on_idle: inst.notify_on_idle,
-            notify_on_error: inst.notify_on_error,
-            view: inst.view,
-            context_resume: Some(context_resume_for(inst)),
-            acp_worker_state,
-            acp_worker_start: None,
-            update_restart: false,
-            pending_approvals: Vec::new(),
-            rate_limit: None,
-            rate_limit_auto_resume: None,
-            // Built-in ACP capability resolves here from a process-wide
-            // registry (no IO). Custom agents depend on profile config, which
-            // the list and create handlers overlay without a per-row read.
-            acp_capable: {
-                let resolved = inst
-                    .agent_name
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(inst.tool.as_str());
-                builtin_acp_registry().get(resolved).is_some()
-            },
-            acp_session_id: inst.acp_session_id.clone(),
-            import_pending: inst.import_pending == Some(true),
-            // Resolved like `acp_capable`: `agent_name` when non-empty, else
-            // `tool`. This is the ACP registry key, so it matches the
-            // `/api/acp/agents` names the switch-agent modal filters on (#2803).
-            acp_agent: {
-                let resolved = inst
-                    .agent_name
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(inst.tool.as_str());
-                (!resolved.is_empty()).then(|| resolved.to_string())
-            },
-            acp_provider: inst.agent_provider.clone(),
-            // The create-time guard calls the same classifier, so the web
-            // "Fork" affordance and server-side acceptance cannot drift.
-            acp_can_fork: crate::session::fork::structured_fork_capable(
-                &inst.tool,
-                inst.agent_name.as_deref(),
-            ),
-            structured_view_off: false,
-            // Same agent resolution as `acp_agent` above; computed once here so
-            // the web dashboard and native TUI stop mirroring the gate.
-            keeps_context: crate::agents::acp_transcript_cli_resumable(
-                &inst.tool,
-                inst.agent_name
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(inst.tool.as_str()),
-            ),
-            // Same agent resolution as `acp_agent`; the composer palette and
-            // queued-prompt clear-boundary hint read these instead of a
-            // client-side per-agent mirror.
-            clear_aliases: crate::acp::agent_profiles::resolve(
-                inst.agent_name
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(inst.tool.as_str()),
-            )
-            .clear_aliases
+            .map(|w| w.created_at.to_rfc3339()),
+        is_sandboxed: inst.is_sandboxed(),
+        sandbox_container_name: inst.sandbox_info.as_ref().map(|s| s.container_name.clone()),
+        // Worktree and workspace creation refuse a path that is not a Repository.
+        outside_repository: inst.worktree_info.is_none()
+            && inst.workspace_info.is_none()
+            && outside_repository_cached(&inst.project_path),
+        scratch: inst.scratch,
+        favorited: inst.is_favorited(),
+        favorited_at: inst.favorited_at.map(|t| t.to_rfc3339()),
+        color: inst.color.clone(),
+        urgent: inst.is_urgent(),
+        pinned_at: timestamp(row.pinned_at),
+        archived_at: timestamp(row.archived_at),
+        snoozed_until: timestamp(row.active_snoozed_until),
+        trashed_at: timestamp(row.trashed_at),
+        trash_lifecycle_id: inst.trash_lifecycle_id.clone(),
+        failed_purge_forced: inst.failed_purge_forced(),
+        // Surface the marker; the web gates the visual on the
+        // `session.unread_indicator` setting.
+        unread: inst.unread,
+        has_managed_worktree: row.has_managed_worktree(),
+        has_cleanable_worktree: inst.has_managed_worktree_or_workspace(),
+        // Overlaid per-profile in list_sessions; see the field doc.
+        tie_workdir_to_name: false,
+        // Overlaid in list_sessions; single-session responses stay inactive.
+        smart_rename: crate::session::smart_rename::SmartRenameState::Inactive,
+        // Overlaid in list_sessions; single-session responses stay false.
+        default_name: false,
+        has_terminal: inst.terminal_info.is_some(),
+        profile: row.profile.to_string(),
+        cleanup_defaults: CleanupDefaults {
+            delete_worktree: true,
+            delete_branch: false,
+            delete_sandbox: true,
+            delete_to_trash: true,
+        },
+        remote_owner: None,
+        remote_owner_key: None,
+        notify_on_waiting: inst.notify_on_waiting,
+        notify_on_idle: inst.notify_on_idle,
+        notify_on_error: inst.notify_on_error,
+        view: inst.view,
+        context_resume: Some(context_resume_for(inst)),
+        acp_worker_state,
+        acp_worker_start: None,
+        update_restart: false,
+        pending_approvals: Vec::new(),
+        rate_limit: None,
+        rate_limit_auto_resume: None,
+        // Built-in ACP capability resolves here from a process-wide
+        // registry (no IO). Custom agents depend on profile config, which
+        // the list and create handlers overlay without a per-row read.
+        acp_capable: {
+            let resolved = inst
+                .agent_name
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(inst.tool.as_str());
+            builtin_acp_registry().get(resolved).is_some()
+        },
+        acp_session_id: inst.acp_session_id.clone(),
+        import_pending: inst.import_pending == Some(true),
+        // Resolved like `acp_capable`: `agent_name` when non-empty, else
+        // `tool`. This is the ACP registry key, so it matches the
+        // `/api/acp/agents` names the switch-agent modal filters on (#2803).
+        acp_agent: {
+            let resolved = inst
+                .agent_name
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(inst.tool.as_str());
+            (!resolved.is_empty()).then(|| resolved.to_string())
+        },
+        acp_provider: inst.agent_provider.clone(),
+        // The create-time guard calls the same classifier, so the web
+        // "Fork" affordance and server-side acceptance cannot drift.
+        acp_can_fork: crate::session::fork::structured_fork_capable(
+            &inst.tool,
+            inst.agent_name.as_deref(),
+        ),
+        structured_view_off: false,
+        // Same agent resolution as `acp_agent` above; computed once here so
+        // the web dashboard and native TUI stop mirroring the gate.
+        keeps_context: crate::agents::acp_transcript_cli_resumable(
+            &inst.tool,
+            inst.agent_name
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(inst.tool.as_str()),
+        ),
+        // Same agent resolution as `acp_agent`; the composer palette and
+        // queued-prompt clear-boundary hint read these instead of a
+        // client-side per-agent mirror.
+        clear_aliases: crate::acp::agent_profiles::resolve(
+            inst.agent_name
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(inst.tool.as_str()),
+        )
+        .clear_aliases
+        .iter()
+        .map(|s| s.to_string())
+        .collect(),
+        claude_fullscreen: claude_fullscreen && inst.tool == "claude",
+        // A session converted by `attach_project` (#3103) has a real
+        // `workspace_info`, so both repos list here with no special case.
+        workspace_repos: row
+            .workspace_repos
             .iter()
-            .map(|s| s.to_string())
+            .map(|r| WorkspaceRepoSummary {
+                name: r.name.clone(),
+                source_path: r.source_path.clone(),
+                branch: r.branch.clone(),
+                worktree_path: r.worktree_path.clone(),
+                main_repo_path: r.main_repo_path.clone(),
+                managed_by_aoe: r.managed_by_aoe,
+                branch_preexisting: r.branch_preexisting,
+                base_branch: r.base_branch.clone(),
+                base_branch_override: r.base_branch_override.clone(),
+            })
             .collect(),
-            claude_fullscreen: claude_fullscreen && inst.tool == "claude",
-            // A session converted by `attach_project` (#3103) has a real
-            // `workspace_info`, so both repos list here with no special case.
-            workspace_repos: row
-                .workspace_repos
-                .iter()
-                .map(|r| WorkspaceRepoSummary {
-                    name: r.name.clone(),
-                    source_path: r.source_path.clone(),
-                    branch: r.branch.clone(),
-                    worktree_path: r.worktree_path.clone(),
-                    main_repo_path: r.main_repo_path.clone(),
-                    managed_by_aoe: r.managed_by_aoe,
-                    branch_preexisting: r.branch_preexisting,
-                    base_branch: r.base_branch.clone(),
-                    base_branch_override: r.base_branch_override.clone(),
-                })
-                .collect(),
-            workspace_dir: inst
-                .workspace_info
-                .as_ref()
-                .map(|w| w.workspace_dir.clone()),
-            workspace_branch: inst.workspace_info.as_ref().map(|w| w.branch.clone()),
-            workspace_created_at: inst
-                .workspace_info
-                .as_ref()
-                .map(|w| w.created_at.to_rfc3339()),
-            workspace_cleanup_on_delete: inst.workspace_info.as_ref().map(|w| w.cleanup_on_delete),
-            warnings: Vec::new(),
-            plan_summary,
-            next_wakeup_at,
-            next_wakeup_reason,
-            monitor_active,
-            monitor_description,
-        }
+        workspace_dir: inst
+            .workspace_info
+            .as_ref()
+            .map(|w| w.workspace_dir.clone()),
+        workspace_branch: inst.workspace_info.as_ref().map(|w| w.branch.clone()),
+        workspace_created_at: inst
+            .workspace_info
+            .as_ref()
+            .map(|w| w.created_at.to_rfc3339()),
+        workspace_cleanup_on_delete: inst.workspace_info.as_ref().map(|w| w.cleanup_on_delete),
+        warnings: Vec::new(),
+        plan_summary,
+        next_wakeup_at,
+        next_wakeup_reason,
+        monitor_active,
+        monitor_description,
     }
 }
 
