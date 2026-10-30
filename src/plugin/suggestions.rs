@@ -60,10 +60,10 @@ fn validate_items(
     }
     let mut ids = HashSet::new();
     for item in &items {
+        validate_item(spec, item)?;
         if !ids.insert(item.id.as_str()) {
             return Err(format!("duplicate suggestion id {:?}", item.id));
         }
-        validate_item(spec, item)?;
     }
     Ok(items
         .into_iter()

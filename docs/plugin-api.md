@@ -49,7 +49,7 @@ Capabilities gate runtime resource access. They are prompted once at install and
 | Capability | Grants |
 |---|---|
 | `runtime.worker` | Launching a plugin worker and using its base host RPCs. Required for either runtime kind. |
-| `session.read` | Reading sessions of the host's profile: the attached session, `sessions.list`, and the `session.status.changed` (`api_version >= 14`) and `session.lifecycle.changed` (`api_version >= 19`) notifications. |
+| `session.read` | Reading sessions of the host's profile: the attached session, `sessions.list`, `projects.list` (the registered projects), and the `session.status.changed` (`api_version >= 14`) and `session.lifecycle.changed` (`api_version >= 19`) notifications. |
 | `session.write` | Mutating any session of the profile: `session.meta.set`/`cas`, and archive/trash from a plugin page. |
 | `config.read` | Reading host or other-plugin configuration (not the plugin's own settings). |
 | `config.write` | Writing host or other-plugin configuration. |
@@ -350,7 +350,7 @@ An item is `{ id, title, reason, source_url, source_ref, preview, project?, crit
 - `id`, `title` or `source_ref` is empty, or an `id` repeats;
 - there are more than 500 items, or a string exceeds its bound (`id` 256 bytes, `title` and `draft.title` 512, `reason`, `source_url`, `source_ref` and each variable value 2 KiB, `preview` 16 KiB, `draft.prompt` 64 KiB, `project` 4 KiB).
 
-Items of a source that is not enabled are dropped and counted in `dropped`. `suggestions.error` messages are limited to 4096 bytes.
+After validation, items of a source that is not enabled are dropped and counted in `dropped`. `suggestions.error` messages are limited to 4096 bytes.
 
 ## UI slots
 

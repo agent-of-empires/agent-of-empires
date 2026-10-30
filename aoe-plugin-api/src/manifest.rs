@@ -1134,6 +1134,15 @@ impl PluginManifest {
                     format!("suggestion source {criterion:?} needs a label"),
                 );
                 check(
+                    source
+                        .variables
+                        .iter()
+                        .collect::<std::collections::HashSet<_>>()
+                        .len()
+                        == source.variables.len(),
+                    format!("suggestion source {criterion:?} has duplicate variables"),
+                );
+                check(
                     source.variables.iter().all(|name| {
                         !name.is_empty()
                             && name

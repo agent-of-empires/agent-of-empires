@@ -976,6 +976,35 @@ mod tests {
         assert!(err.message.contains("did not declare suggestions"));
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn projects_list_returns_registered_name_and_path() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        crate::session::projects::add(
+            "default",
+            crate::session::projects::ProjectScope::Global,
+            crate::session::projects::Project::new(
+                "target",
+                "/tmp/project-target",
+                crate::session::projects::ProjectScope::Global,
+            ),
+            false,
+        )
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let result = dispatch(
+            &state(tmp.path()),
+            &ctx(&[CAP_SESSION_READ]),
+            "projects.list",
+            &json!({}),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            json!({ "projects": [{ "name": "target", "path": "/tmp/project-target" }] })
+        );
+    }
+
     fn ctx_for(plugin_id: &str, caps: &[&str]) -> PluginRpcContext {
         PluginRpcContext {
             plugin_id: plugin_id.to_string(),

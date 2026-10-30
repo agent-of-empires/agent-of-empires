@@ -435,6 +435,11 @@ fn suggestions_require_current_schema_and_worker() {
             format!("{worker}{source}variables = [\"Pr-Number\"]\n"),
             "[a-z0-9_]+",
         ),
+        (
+            20,
+            format!("{worker}{source}variables = [\"repo\", \"repo\"]\n"),
+            "duplicate variables",
+        ),
     ];
     for (version, body, expected) in cases {
         assert!(
