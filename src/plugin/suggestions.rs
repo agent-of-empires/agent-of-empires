@@ -27,6 +27,7 @@ const MAX_PREVIEW_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_PROMPT_BYTES: usize = 64 * 1024;
 const MAX_VARIABLE_VALUE_BYTES: usize = 2048;
 const MAX_ERROR_BYTES: usize = 4096;
+pub(crate) const MAX_MAPPING_PROJECTS: usize = 16;
 
 /// An active plugin that declares `[suggestions]` and has a worker.
 pub(crate) struct Provider {
@@ -85,6 +86,13 @@ pub(super) fn init(conn: &Connection) -> rusqlite::Result<()> {
              criterion   TEXT NOT NULL,
              template    TEXT NOT NULL,
              PRIMARY KEY (profile, provider_id, criterion)
+         );
+         CREATE TABLE IF NOT EXISTS suggestion_mappings (
+             profile       TEXT NOT NULL,
+             provider_id   TEXT NOT NULL,
+             mapping_key   TEXT NOT NULL,
+             projects_json TEXT NOT NULL,
+             PRIMARY KEY (profile, provider_id, mapping_key)
          );",
     )
 }
@@ -503,6 +511,9 @@ fn validate_item(spec: &SuggestionsSpec, item: &Suggestion) -> Result<(), String
             "suggestion {id:?}: {name} is limited to {max} bytes"
         ));
     }
+    if let Some(key) = &item.mapping_key {
+        check_mapping_key(key).map_err(|e| format!("suggestion {id:?}: {e}"))?;
+    }
     if !is_http_url(&item.source_url) {
         return Err(format!(
             "suggestion {id:?}: source_url must be an http(s) URL"
@@ -535,17 +546,22 @@ fn is_http_url(url: &str) -> bool {
     rest.is_some_and(|r| !r.is_empty() && !r.chars().any(|c| c.is_whitespace() || c.is_control()))
 }
 
+fn check_mapping_key(key: &str) -> Result<(), String> {
+    if key.trim().is_empty() {
+        return Err("mapping_key must not be empty".into());
+    }
+    if key.len() > MAX_KEY_BYTES {
+        return Err(format!("mapping_key is limited to {MAX_KEY_BYTES} bytes"));
+    }
+    Ok(())
+}
+
 /// The registered project `wanted` names, by exact name or path. Zero or
 /// several matches resolve to nothing: a project is never guessed.
-fn resolve_project(profile: &str, wanted: &str) -> Option<Project> {
-    let projects = projects::load_merged(profile).ok()?;
+fn resolve_hint(projects: &[Project], wanted: &str) -> Option<Project> {
     let mut hits: Vec<&Project> = projects.iter().filter(|p| p.name == wanted).collect();
     if hits.is_empty() {
-        let key = projects::canonical_key(wanted);
-        hits = projects
-            .iter()
-            .filter(|p| projects::canonical_key(&p.path) == key)
-            .collect();
+        hits = by_path(projects, wanted);
     }
     match hits[..] {
         [only] => Some(only.clone()),
@@ -553,22 +569,171 @@ fn resolve_project(profile: &str, wanted: &str) -> Option<Project> {
     }
 }
 
+fn by_path<'a>(projects: &'a [Project], path: &str) -> Vec<&'a Project> {
+    let key = projects::canonical_key(path);
+    projects
+        .iter()
+        .filter(|p| projects::canonical_key(&p.path) == key)
+        .collect()
+}
+
+/// The registered project at exactly `path`, never matched by name.
+fn resolve_path(projects: &[Project], path: &str) -> Option<Project> {
+    match by_path(projects, path)[..] {
+        [only] => Some(only.clone()),
+        _ => None,
+    }
+}
+
+/// A mapping's paths as the registered paths they name, or the first
+/// violation. Run before storing; stored rows may go stale afterwards.
+pub(crate) fn normalize_mapping(
+    mapping_key: &str,
+    paths: &[String],
+    registered: &[Project],
+) -> Result<Vec<String>, String> {
+    check_mapping_key(mapping_key)?;
+    if paths.is_empty() || paths.len() > MAX_MAPPING_PROJECTS {
+        return Err(format!(
+            "projects must list 1 to {MAX_MAPPING_PROJECTS} registered projects"
+        ));
+    }
+    let mut stored: Vec<String> = Vec::with_capacity(paths.len());
+    for path in paths {
+        let project = resolve_path(registered, path)
+            .ok_or_else(|| format!("{path:?} is not exactly one registered project"))?;
+        if stored.contains(&project.path) {
+            return Err(format!("{path:?} is listed twice"));
+        }
+        stored.push(project.path);
+    }
+    Ok(stored)
+}
+
+pub(crate) fn put_mapping(
+    conn: &Connection,
+    profile: &str,
+    provider_id: &str,
+    mapping_key: &str,
+    projects: &[String],
+) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO suggestion_mappings (profile, provider_id, mapping_key, projects_json)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (profile, provider_id, mapping_key) DO UPDATE SET projects_json = ?4",
+        params![
+            profile,
+            provider_id,
+            mapping_key,
+            serde_json::to_string(projects)?
+        ],
+    )?;
+    Ok(())
+}
+
+/// `true` when a row existed.
+pub(crate) fn delete_mapping(
+    conn: &Connection,
+    profile: &str,
+    provider_id: &str,
+    mapping_key: &str,
+) -> rusqlite::Result<bool> {
+    let rows = conn.execute(
+        "DELETE FROM suggestion_mappings WHERE profile = ?1 AND provider_id = ?2 AND mapping_key = ?3",
+        params![profile, provider_id, mapping_key],
+    )?;
+    Ok(rows > 0)
+}
+
+fn get_mapping(
+    conn: &Connection,
+    profile: &str,
+    provider_id: &str,
+    mapping_key: &str,
+) -> anyhow::Result<Option<Vec<String>>> {
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT projects_json FROM suggestion_mappings
+             WHERE profile = ?1 AND provider_id = ?2 AND mapping_key = ?3",
+            params![profile, provider_id, mapping_key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(stored.map(|s| serde_json::from_str(&s)).transpose()?)
+}
+
+/// Every stored mapping of the profile, including those of inactive
+/// providers, so orphaned rows stay visible and removable. Paths are returned
+/// as stored, stale or not.
+pub(crate) fn list_mappings(conn: &Connection, profile: &str) -> anyhow::Result<Value> {
+    let rows: Vec<(String, String, String)> = conn
+        .prepare(
+            "SELECT provider_id, mapping_key, projects_json FROM suggestion_mappings
+             WHERE profile = ?1 ORDER BY provider_id, mapping_key",
+        )?
+        .query_map([profile], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    let mappings = rows
+        .into_iter()
+        .map(|(provider_id, mapping_key, projects)| {
+            let projects: Vec<String> = serde_json::from_str(&projects)?;
+            Ok(json!({ "provider_id": provider_id, "mapping_key": mapping_key, "projects": projects }))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(json!({ "mappings": mappings }))
+}
+
+/// The live item plus the mapping its `mapping_key` names, if any.
+pub(crate) fn find_item_with_mapping(
+    conn: &Connection,
+    profile: &str,
+    provider: &Provider,
+    id: &str,
+) -> anyhow::Result<Option<(Suggestion, Option<Vec<String>>)>> {
+    let Some(item) = find_item(conn, profile, provider, id)? else {
+        return Ok(None);
+    };
+    let mapped = match &item.mapping_key {
+        Some(key) => get_mapping(conn, profile, &provider.id, key)?,
+        None => None,
+    };
+    Ok(Some((item, mapped)))
+}
+
 /// Wizard prefill for `item`, resolved through the normal config cascade of its
 /// project, or the saved profile settings when it names none. A `template`
 /// replaces the provider's prompt, expanded from the item's variables.
+///
+/// A mapping whose first path resolves supplies the project and the rest of
+/// its list as extras. Otherwise the provider's `project` hint applies; an
+/// extra is never promoted to primary.
 pub(crate) fn prepare(
     profile: &str,
     item: &Suggestion,
     template: Option<&str>,
+    mapped: Option<&[String]>,
 ) -> Result<Value, PromptTooLong> {
     let prompt = match template {
         Some(t) => expand(t, &item.variables)?,
         None => item.draft.prompt.clone(),
     };
-    let project = item
-        .project
-        .as_deref()
-        .and_then(|wanted| resolve_project(profile, wanted));
+    let registered = projects::load_merged(profile).unwrap_or_default();
+    let from_mapping = mapped
+        .and_then(|paths| paths.split_first())
+        .and_then(|(first, rest)| {
+            let primary = resolve_path(&registered, first)?;
+            let extras: Vec<Project> = rest
+                .iter()
+                .filter_map(|path| resolve_path(&registered, path))
+                .collect();
+            Some((primary, extras))
+        });
+    let (project, extras) = from_mapping.unzip();
+    let project = project.or_else(|| {
+        item.project
+            .as_deref()
+            .and_then(|wanted| resolve_hint(&registered, wanted))
+    });
     let mut config = match &project {
         Some(p) => resolve_config_with_repo_or_warn(profile, Path::new(&p.path)),
         None => resolve_config_or_warn(profile),
@@ -581,11 +746,13 @@ pub(crate) fn prepare(
             config.sandbox.enabled_by_default = enabled;
         }
     }
+    let describe = |p: &Project| json!({ "name": p.name, "path": p.path });
     Ok(json!({
         "title": item.draft.title,
         "initial_prompt": prompt,
         "source_ref": item.source_ref,
-        "project": project.map(|p| json!({ "name": p.name, "path": p.path })),
+        "project": project.as_ref().map(describe),
+        "extra_projects": extras.unwrap_or_default().iter().map(describe).collect::<Vec<_>>(),
         "tool": config.session.default_tool.unwrap_or_else(|| "claude".to_string()),
         "yolo": config.session.yolo_mode_default,
         "sandbox": config.sandbox.enabled_by_default,
@@ -623,6 +790,7 @@ mod tests {
             source_ref: "example/1".into(),
             preview: "body".into(),
             project: None,
+            mapping_key: None,
             criterion: criterion.into(),
             variables: if criterion == "assigned" {
                 [("repo".to_string(), "acme/widgets".to_string())].into()
@@ -651,7 +819,7 @@ mod tests {
     #[test]
     fn contract_violations_are_rejected() {
         type Mutate = fn(&mut Suggestion);
-        let cases: [(&str, Mutate); 9] = [
+        let cases: [(&str, Mutate); 11] = [
             ("undeclared", |i| i.criterion = "nope".into()),
             ("must not be empty", |i| i.title = " ".into()),
             ("http(s)", |i| i.source_url = "javascript:alert(1)".into()),
@@ -663,6 +831,12 @@ mod tests {
             ("variables must be exactly", |i| i.variables.clear()),
             ("variables must be exactly", |i| {
                 i.variables.insert("extra".into(), "v".into());
+            }),
+            ("mapping_key must not be empty", |i| {
+                i.mapping_key = Some(" ".into())
+            }),
+            ("mapping_key is limited", |i| {
+                i.mapping_key = Some("k".repeat(257))
             }),
             ("variable values", |i| {
                 i.variables.insert("repo".into(), "x".repeat(2049));
@@ -837,7 +1011,7 @@ mod tests {
         let prepared = |project: Option<&str>| {
             let mut i = item("a", "assigned");
             i.project = project.map(String::from);
-            prepare("default", &i, None).unwrap()
+            prepare("default", &i, None, None).unwrap()
         };
         for hit in ["widgets", "/tmp/aoe-widgets"] {
             assert_eq!(prepared(Some(hit))["project"]["name"], "widgets", "{hit}");
@@ -848,6 +1022,154 @@ mod tests {
         let out = prepared(None);
         assert_eq!(out["initial_prompt"], "Do work");
         assert_eq!(out["source_ref"], "example/1");
+        assert_eq!(out["extra_projects"], json!([]));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn mapping_beats_hint_and_a_stale_primary_never_promotes_an_extra() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for name in ["api", "web", "hinted"] {
+            let path = dir.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            let path = path.to_string_lossy().into_owned();
+            let scope = projects::ProjectScope::Global;
+            projects::add("default", scope, Project::new(name, &path, scope), false).unwrap();
+            paths.push(path);
+        }
+        let gone = dir.path().join("gone").to_string_lossy().into_owned();
+        let mapped = |list: &[&String]| list.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        let run = |hint: Option<&str>, mapping: Option<Vec<String>>| {
+            let mut i = item("a", "assigned");
+            i.project = hint.map(String::from);
+            prepare("default", &i, None, mapping.as_deref()).unwrap()
+        };
+        let names = |v: &Value| -> Vec<String> {
+            v["extra_projects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let mapping = mapped(&[&paths[0], &gone, &paths[1]]);
+        let out = run(Some("hinted"), Some(mapping));
+        assert_eq!(out["project"]["name"], "api", "mapping beats the hint");
+        assert_eq!(names(&out), ["web"], "stale extras drop, order kept");
+
+        let stale_primary = vec![gone.clone(), paths[1].clone()];
+        let out = run(Some("hinted"), Some(stale_primary.clone()));
+        assert_eq!(out["project"]["name"], "hinted", "stale primary falls back");
+        assert!(names(&out).is_empty(), "an extra is never promoted");
+        assert!(run(None, Some(stale_primary))["project"].is_null());
+        assert!(run(None, None)["project"].is_null());
+        assert_eq!(run(Some("hinted"), None)["project"]["name"], "hinted");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn normalize_mapping_accepts_only_distinct_registered_paths() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        let scope = projects::ProjectScope::Global;
+        for (name, path) in [("a", &a), ("b", &b)] {
+            std::fs::create_dir(path).unwrap();
+            let path = path.to_string_lossy().into_owned();
+            projects::add("default", scope, Project::new(name, path, scope), false).unwrap();
+        }
+        let registered = projects::load_merged("default").unwrap();
+        let (a, b) = (
+            a.to_string_lossy().into_owned(),
+            b.to_string_lossy().into_owned(),
+        );
+        let norm = |key: &str, paths: &[&str]| {
+            let paths: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+            normalize_mapping(key, &paths, &registered)
+        };
+        let registered_path = |p: &str| projects::canonical_key(p);
+        assert_eq!(
+            norm("o/r", &[&b, &a]).unwrap(),
+            [registered_path(&b), registered_path(&a)]
+        );
+        let many: Vec<&str> = vec![a.as_str(); MAX_MAPPING_PROJECTS + 1];
+        let cases = [
+            ("not exactly one", norm("o/r", &["a"])),
+            ("not exactly one", norm("o/r", &["/nowhere"])),
+            ("listed twice", norm("o/r", &[&a, &a])),
+            ("1 to 16", norm("o/r", &[])),
+            ("1 to 16", norm("o/r", &many)),
+            ("must not be empty", norm(" ", &[&a])),
+            ("limited to 256", norm(&"k".repeat(257), &[&a])),
+        ];
+        for (expected, result) in cases {
+            let err = result.unwrap_err();
+            assert!(err.contains(expected), "{expected:?} not in {err:?}");
+        }
+    }
+
+    #[test]
+    fn mappings_are_scoped_ordered_replaced_and_deletable() {
+        let conn = store();
+        let paths = |v: &[&str]| v.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        put_mapping(&conn, "p", "acme.github", "o/r", &paths(&["/b", "/a"])).unwrap();
+        put_mapping(&conn, "p", "acme.github", "o/z", &paths(&["/c"])).unwrap();
+        put_mapping(&conn, "p", "gone.provider", "o/r", &paths(&["/d"])).unwrap();
+        put_mapping(&conn, "other", "acme.github", "o/r", &paths(&["/e"])).unwrap();
+        put_mapping(&conn, "p", "acme.github", "o/r", &paths(&["/b", "/c"])).unwrap();
+
+        let listed = list_mappings(&conn, "p").unwrap();
+        let rows = listed["mappings"].as_array().unwrap();
+        let keys: Vec<_> = rows
+            .iter()
+            .map(|m| {
+                (
+                    m["provider_id"].as_str().unwrap(),
+                    m["mapping_key"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                ("acme.github", "o/r"),
+                ("acme.github", "o/z"),
+                ("gone.provider", "o/r")
+            ],
+            "inactive providers stay listed"
+        );
+        assert_eq!(rows[0]["projects"], json!(["/b", "/c"]), "upsert replaces");
+
+        let p = provider();
+        publish(
+            &conn,
+            "p",
+            &[{
+                let mut i = item("a", "assigned");
+                i.mapping_key = Some("o/r".into());
+                i
+            }],
+        );
+        let (_, mapped) = find_item_with_mapping(&conn, "p", &p, "a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(mapped, Some(paths(&["/b", "/c"])));
+        assert!(find_item_with_mapping(&conn, "other", &p, "a")
+            .unwrap()
+            .is_none());
+
+        assert!(delete_mapping(&conn, "p", "gone.provider", "o/r").unwrap());
+        assert!(!delete_mapping(&conn, "p", "gone.provider", "o/r").unwrap());
+        assert_eq!(
+            list_mappings(&conn, "other").unwrap()["mappings"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -918,7 +1240,7 @@ mod tests {
         let _home = crate::session::test_support::isolate_app_dir();
         let i = item("a", "assigned");
         let prompt =
-            |template| prepare("default", &i, template).map(|v| v["initial_prompt"].clone());
+            |template| prepare("default", &i, template, None).map(|v| v["initial_prompt"].clone());
         assert_eq!(prompt(None), Ok(json!("Do work")));
         assert_eq!(
             prompt(Some("Fix {repo} {nope}")),

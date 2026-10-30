@@ -51,6 +51,21 @@ pub struct TemplateQuery {
     criterion: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MappingBody {
+    provider_id: String,
+    mapping_key: String,
+    projects: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MappingRef {
+    provider_id: String,
+    mapping_key: String,
+}
+
 fn unavailable() -> axum::response::Response {
     api_error(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -235,9 +250,9 @@ pub async fn prepare_suggestion(
     };
     let result = tokio::task::spawn_blocking(move || {
         let (profile, found, template) = host.with_suggestions_db(|conn, profile| {
-            let found = suggestions::find_item(conn, profile, &provider, &item.id)?;
+            let found = suggestions::find_item_with_mapping(conn, profile, &provider, &item.id)?;
             let template = match &found {
-                Some(found) => {
+                Some((found, _)) => {
                     suggestions::template(conn, profile, &provider.id, &found.criterion)?
                 }
                 None => None,
@@ -245,9 +260,9 @@ pub async fn prepare_suggestion(
             Ok::<_, anyhow::Error>((profile.to_string(), found, template))
         })?;
         // Config and project resolution touch disk, so they run off the lock.
-        Ok::<_, anyhow::Error>(
-            found.map(|found| suggestions::prepare(&profile, &found, template.as_deref())),
-        )
+        Ok::<_, anyhow::Error>(found.map(|(found, mapped)| {
+            suggestions::prepare(&profile, &found, template.as_deref(), mapped.as_deref())
+        }))
     })
     .await;
     match result {
@@ -449,6 +464,96 @@ pub async fn delete_suggestion_template(
     .await;
     match result {
         Ok(Ok(())) => Json(json!({ "ok": true })).into_response(),
+        Ok(Err(error)) => internal(error),
+        Err(error) => internal(error),
+    }
+}
+
+pub async fn list_suggestion_mappings(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let Some(host) = state.plugin_host.clone() else {
+        return unavailable();
+    };
+    let result =
+        tokio::task::spawn_blocking(move || host.with_suggestions_db(suggestions::list_mappings))
+            .await;
+    match result {
+        Ok(Ok(mappings)) => Json(mappings).into_response(),
+        Ok(Err(error)) => internal(error),
+        Err(error) => internal(error),
+    }
+}
+
+pub async fn put_suggestion_mapping(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<MappingBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let Some(host) = state.plugin_host.clone() else {
+        return unavailable();
+    };
+    if find_provider(&body.provider_id).is_none() {
+        return unknown_provider();
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        let profile = host.suggestions_profile();
+        let registered = crate::session::projects::load_merged(&profile)?;
+        let projects =
+            match suggestions::normalize_mapping(&body.mapping_key, &body.projects, &registered) {
+                Ok(projects) => projects,
+                Err(message) => return Ok(Err(message)),
+            };
+        host.with_suggestions_db(|conn, profile| {
+            suggestions::put_mapping(
+                conn,
+                profile,
+                &body.provider_id,
+                &body.mapping_key,
+                &projects,
+            )
+        })?;
+        Ok::<_, anyhow::Error>(Ok(json!({
+            "provider_id": body.provider_id,
+            "mapping_key": body.mapping_key,
+            "projects": projects,
+        })))
+    })
+    .await;
+    match result {
+        Ok(Ok(Ok(stored))) => Json(stored).into_response(),
+        Ok(Ok(Err(message))) => api_error(StatusCode::BAD_REQUEST, "validation_failed", message),
+        Ok(Err(error)) => internal(error),
+        Err(error) => internal(error),
+    }
+}
+
+pub async fn delete_suggestion_mapping(
+    State(state): State<Arc<AppState>>,
+    query: Result<Query<MappingRef>, axum::extract::rejection::QueryRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Query(target) = match query {
+        Ok(query) => query,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let Some(host) = state.plugin_host.clone() else {
+        return unavailable();
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        host.with_suggestions_db(|conn, profile| {
+            suggestions::delete_mapping(conn, profile, &target.provider_id, &target.mapping_key)
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(deleted)) => Json(json!({ "ok": true, "deleted": deleted })).into_response(),
         Ok(Err(error)) => internal(error),
         Err(error) => internal(error),
     }
