@@ -2364,6 +2364,11 @@ function AppContent({
           onToggleSidebar={handleToggleSidebar}
           readOnly={caps.readOnly}
           canManageProjects={caps.canManageProjects}
+          onPrepareSuggestion={(prefill) => {
+            setWizardPrefill(prefill);
+            setShowSessionWizard(true);
+          }}
+          onViewAllSuggestions={() => requestNavigate("/suggestions")}
         />
       );
     }
