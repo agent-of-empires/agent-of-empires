@@ -71,11 +71,16 @@ impl HostApiState {
         &self.profile
     }
 
+    /// The profile key suggestions are stored and read under.
+    pub(crate) fn suggestions_profile(&self) -> String {
+        crate::session::config::effective_profile(&self.profile)
+    }
+
     /// Run `f` on the plugin database with the profile key suggestions are
     /// stored and read under. The key is resolved before the shared lock is
     /// taken, and `f` must stay a short query: every worker RPC waits behind it.
     pub(crate) fn with_suggestions_db<T>(&self, f: impl FnOnce(&Connection, &str) -> T) -> T {
-        let profile = crate::session::config::effective_profile(&self.profile);
+        let profile = self.suggestions_profile();
         let conn = self.events.lock().unwrap_or_else(|p| p.into_inner());
         f(&conn, &profile)
     }
