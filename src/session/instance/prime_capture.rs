@@ -548,26 +548,17 @@ impl Instance {
         native_alive.then_some(Status::Unknown)
     }
 
-    /// A sandboxed Prime fork child has its own private store, so the parent's
-    /// transcript is copied into it and the fork target is rebound to the
-    /// child's context before the launch identity check runs. Returns the state
-    /// to restore once the command is built; the rebound one is adopted after
-    /// the launch, as for any resolved target.
-    pub(super) fn hand_off_prime_fork_parent(
-        &mut self,
+    fn prime_fork_parent_handoff<'a>(
+        &'a self,
         execution: &super::execution::NativeExecution,
-    ) -> anyhow::Result<Option<ConversationState>> {
+    ) -> anyhow::Result<Option<(&'a ConversationBinding, &'a std::path::Path)>> {
         let ResumeIntent::Fork { from } = &self.resume_intent else {
             return Ok(None);
         };
-        let Some(CaptureContext::Prime { plan, .. }) = &execution.capture else {
-            return Ok(None);
-        };
-        let from = from.clone();
         let parent = self
             .resume_binding
-            .clone()
-            .filter(|binding| binding.session_id == from)
+            .as_ref()
+            .filter(|binding| binding.session_id == *from)
             .context("Prime fork has no parent conversation binding")?;
         let parent_execution = parent
             .execution
@@ -577,22 +568,58 @@ impl Instance {
         if Self::execution_identity_matches(parent_execution, &execution.binding) {
             return Ok(None);
         }
+        self.validate_conversation_target(
+            parent_execution,
+            execution.target_session_id.as_deref(),
+        )?;
         anyhow::ensure!(
             parent_execution.filesystem == execution.binding.filesystem,
             "the parent's Prime store is not on this launch's filesystem"
         );
-        // A Prime binding records its sessions directory as its one store.
         let [parent_sessions] = parent_execution.stores.as_slice() else {
             anyhow::bail!("the parent records no single Prime sessions directory");
+        };
+        Ok(Some((parent, parent_sessions)))
+    }
+
+    pub(super) fn validate_prime_fork_handoff(
+        &self,
+        execution: &super::execution::NativeExecution,
+    ) -> anyhow::Result<bool> {
+        let Some(CaptureContext::Prime { plan, .. }) = &execution.capture else {
+            return Ok(false);
+        };
+        let Some((parent, parent_sessions)) = self.prime_fork_parent_handoff(execution)? else {
+            return Ok(false);
+        };
+        crate::session::capture::validate_prime_root_transcript(
+            parent_sessions,
+            &parent.session_id,
+            &plan.container_cwd,
+        )?;
+        Ok(true)
+    }
+
+    /// Copy only after read-only preflight; publish the rebound target after launch.
+    pub(super) fn hand_off_prime_fork_parent(
+        &mut self,
+        execution: &super::execution::NativeExecution,
+    ) -> anyhow::Result<Option<ConversationState>> {
+        let Some(CaptureContext::Prime { plan, .. }) = &execution.capture else {
+            return Ok(None);
+        };
+        let Some((parent, parent_sessions)) = self.prime_fork_parent_handoff(execution)? else {
+            return Ok(None);
         };
         crate::session::capture::hand_off_prime_root_transcript(
             parent_sessions,
             &plan.store,
             &plan.session_dir,
-            &from,
+            &parent.session_id,
             &plan.container_cwd,
         )
         .context("cannot hand the parent's Prime conversation to the fork")?;
+        let parent = parent.clone();
         let prior = self.conversation_state();
         let rebound = ConversationBinding {
             execution: Some(execution.binding.clone()),
@@ -1065,6 +1092,57 @@ mod tests {
             &config.volumes,
         );
 
+        let target = child_plan
+            .store
+            .join(&child_plan.session_dir)
+            .join(format!("{parent_id}.jsonl"));
+        let before = child.conversation_state();
+        let file_watch = crate::file_watch::FileWatchService::noop();
+        let invalid_store = tmp.path().join("invalid-parent-store");
+        std::fs::create_dir(&invalid_store).unwrap();
+        std::fs::write(
+            invalid_store.join(format!("{parent_id}.jsonl")),
+            format!("{{\"type\":\"session\",\"id\":\"{parent_id}\",\"cwd\":\"/workspace/foreign\",\"rlmDepth\":0}}\n"),
+        ).unwrap();
+        for reason in ["agent", "filesystem", "id", "missing", "cwd"] {
+            let mut invalid = child.clone();
+            let binding = invalid.resume_binding.as_mut().unwrap();
+            match reason {
+                "agent" => binding.execution.as_mut().unwrap().agent = "omp".into(),
+                "filesystem" => binding.execution.as_mut().unwrap().filesystem = "foreign".into(),
+                "id" => binding.session_id = child_id.into(),
+                "missing" => {
+                    binding.execution.as_mut().unwrap().stores = vec![tmp.path().join("missing")]
+                }
+                "cwd" => binding.execution.as_mut().unwrap().stores = vec![invalid_store.clone()],
+                _ => unreachable!(),
+            }
+            let original = invalid.conversation_state();
+            assert!(
+                invalid
+                    .preflight_resume_launch_in(
+                        CaptureStorage::Profiles(&file_watch),
+                        super::resume::ResumeAttemptPolicy::Allow,
+                    )
+                    .is_err(),
+                "{reason}"
+            );
+            assert_eq!(invalid.conversation_state(), original);
+            assert!(
+                !target.exists(),
+                "preflight must not copy a parent transcript"
+            );
+        }
+        child
+            .preflight_resume_launch_in(
+                CaptureStorage::Profiles(&file_watch),
+                super::resume::ResumeAttemptPolicy::Allow,
+            )
+            .unwrap();
+        assert_eq!(child.conversation_state(), before);
+        assert!(!target.exists(), "valid preflight is read-only");
+        assert_eq!(std::fs::read(&parent_transcript).unwrap(), parent_bytes);
+
         let prepared = child
             .prepare_launch_command(child.conversation_state())
             .unwrap();
@@ -1225,18 +1303,59 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn native_prime_resolution_failure_never_downgrades_to_an_unowned_launch() {
+        use crate::session::{ManagedResumeRefused, ResumeIntent};
+
         let _app = crate::session::test_support::isolate_app_dir();
-        for sid in [None, Some("018f47a6-7b80-7cc3-98a2-37b5f486b2a1")] {
+        let sid = "018f47a6-7b80-7cc3-98a2-37b5f486b2a1";
+        for (intent, recorded_sid, extra_args, refused) in [
+            (ResumeIntent::Default, Some(sid), "", true),
+            (ResumeIntent::Default, None, "", false),
+            (ResumeIntent::Cleared, Some(sid), "", false),
+            (ResumeIntent::Use(sid.into()), Some(sid), "", false),
+            (
+                ResumeIntent::Fork { from: sid.into() },
+                Some(sid),
+                "",
+                false,
+            ),
+            (ResumeIntent::Default, Some(sid), "--no-session", true),
+        ] {
             let mut instance = tool_instance("prime-agent", "/tmp");
-            instance.agent_session_id = sid.map(str::to_owned);
-            super::super::execution::FAIL_NEXT_NATIVE_RESOLUTION.with(|fail| fail.set(true));
-            let expected = instance.conversation_state();
-            let result = instance.prepare_launch_command(expected);
-            assert!(
-                result.is_err(),
-                "Prime resolution failure must not produce an unowned native command"
+            instance.command = "prime-agent".into();
+            instance.agent_session_id = recorded_sid.map(str::to_owned);
+            instance.resume_intent = intent;
+            instance.extra_args = extra_args.into();
+            let agent = instance.default_selector_agent().unwrap();
+            assert_eq!(agent.name, "prime-agent");
+            assert!(instance.launch_invokes_resolved_agent_directly(agent));
+            assert_eq!(
+                instance.prime_agent_launch_options().is_some(),
+                extra_args.is_empty()
             );
+            assert_eq!(
+                instance.conversation_target().is_some(),
+                !matches!(instance.resume_intent, ResumeIntent::Cleared) && recorded_sid.is_some()
+            );
+            let expected = instance.conversation_state();
+            let before = serde_json::to_value(&instance).unwrap();
+            super::super::execution::FAIL_NEXT_NATIVE_RESOLUTION.with(|fail| fail.set(true));
+            let result = instance.prepare_launch_command(expected.clone());
             super::super::execution::FAIL_NEXT_NATIVE_RESOLUTION.with(|fail| fail.set(false));
+            let error = result
+                .err()
+                .expect("Prime resolution failure must not produce an unowned native command");
+            assert_eq!(instance.conversation_state(), expected);
+            assert_eq!(serde_json::to_value(&instance).unwrap(), before);
+            assert_eq!(
+                error.root_cause().to_string(),
+                "injected transient native resolution failure"
+            );
+            assert_eq!(
+                error.is::<ManagedResumeRefused>(),
+                refused,
+                "intent={:?}, recorded_sid={recorded_sid:?}, args={extra_args:?}: {error:#}",
+                instance.resume_intent
+            );
         }
     }
 }

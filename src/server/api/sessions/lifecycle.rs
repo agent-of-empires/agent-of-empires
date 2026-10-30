@@ -2908,6 +2908,18 @@ async fn prepare_agent_session_inner(
                 response
             } else if error.is::<crate::session::NativeStoreUnavailable>() {
                 StatusCode::SERVICE_UNAVAILABLE.into_response()
+            } else if let Some(refusal) =
+                error.downcast_ref::<crate::session::ManagedResumeRefused>()
+            {
+                let mut response = crate::server::api::api_error_with_code_header(
+                    crate::daemon::ApiErrorCode::ManagedResumeRefused(refusal.0),
+                    refusal.0.message(),
+                );
+                response.headers_mut().insert(
+                    crate::daemon::MANAGED_RESUME_CAUSE_HEADER,
+                    axum::http::HeaderValue::from_static(refusal.0.as_str()),
+                );
+                response
             } else {
                 tracing::warn!(target: "http.api.sessions", session = %id, %error, "session start failed");
                 api_error(
@@ -2978,11 +2990,7 @@ async fn prepare_agent_session_inner(
         };
         if matches!(
             outcome,
-            Some(
-                crate::session::StartOutcome::Fresh
-                    | crate::session::StartOutcome::Resumed
-                    | crate::session::StartOutcome::FreshAfterFailedResume { .. }
-            )
+            Some(crate::session::StartOutcome::Fresh | crate::session::StartOutcome::Resumed)
         ) {
             let wake_message =
                 select_restart_wake_message(restart_origin, requested_wake_message, &profile);
@@ -3029,6 +3037,210 @@ async fn prepare_agent_session_inner(
 mod durable_stop_tests {
     use super::*;
     use crate::process::worker_registry::{self, WorkerRecord};
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn managed_resume_refusal_publishes_safe_recovery_without_replacing_the_pane() {
+        use crate::tmux::test_helpers::{
+            only_pane_id, pane_field, tmux_available, wait_for_pane_command, TmuxTestSession,
+        };
+        if !tmux_available() {
+            return;
+        }
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _env = crate::session::test_support::EnvGuard::unset(&[
+            "TMUX",
+            "TMUX_PANE",
+            "OMP_SESSION_ID",
+            "PI_SESSION_ID",
+            "AOE_SESSION_ID",
+            "AOE_PROFILE",
+            "AOE_DAEMON_URL",
+            "AOE_DAEMON_TOKEN",
+            "PRIME_AGENT_SESSION_DIR",
+            "PRIME_AGENT_CODING_AGENT_SESSION_DIR",
+            "PRIME_AGENT_CODING_AGENT_DIR",
+        ])
+        .and_set("AOE_TMUX_SOCKET", root.path().join("tmux.sock"));
+        let _omp = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "omp",
+            "#!/bin/sh\nexit 97\n",
+        );
+        let _prime = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "prime-agent",
+            "#!/bin/sh\nexit 97\n",
+        );
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .unwrap();
+        crate::session::config::update_config(|config| {
+            config.systemd.enabled = false;
+            config.session.smart_rename = false;
+            config.session.auto_resume_on_restart = true;
+        })
+        .unwrap();
+        let project = root.path().join("private-project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir_all(project.join(".prime/agent")).unwrap();
+        std::fs::write(
+            project.join(".prime/agent/settings.json"),
+            r#"{"sessionDir":7}"#,
+        )
+        .unwrap();
+        let transcript = root.path().join("private-transcript.jsonl");
+        std::fs::write(&transcript, "private-conversation-body\n").unwrap();
+        let sid = "11111111-2222-4333-8444-555555555555";
+        for (tool, failed_probe) in [("omp", false), ("omp", true), ("prime-agent", false)] {
+            let mut row = Instance::new("managed refusal", project.to_str().unwrap());
+            row.tool = tool.into();
+            row.command = tool.into();
+            row.source_profile = "default".into();
+            row.status = Status::Stopped;
+            row.agent_session_id = Some(sid.into());
+            let mut binding = crate::session::ConversationBinding::unknown(sid);
+            binding.transcript_path = Some(transcript.clone());
+            row.agent_session_binding = Some(binding);
+            row.resume_probe_failed_sid = failed_probe.then(|| sid.into());
+            row.omp_capture_generation = Some("original-generation".into());
+            if tool == "omp" {
+                assert!(row.supports_native_resume());
+            } else {
+                let agent = crate::agents::get_agent("prime-agent").unwrap();
+                assert!(row.launch_invokes_resolved_agent_directly(agent));
+                assert_eq!(row.command, "prime-agent");
+                assert_eq!(row.agent_session_id.as_deref(), Some(sid));
+                assert!(row.resume_probe_failed_sid.is_none());
+                assert_eq!(
+                    std::fs::read_to_string(project.join(".prime/agent/settings.json")).unwrap(),
+                    r#"{"sessionDir":7}"#
+                );
+            }
+            assert_eq!(row.resume_intent, crate::session::ResumeIntent::Default);
+            if failed_probe {
+                assert_eq!(row.resume_probe_failed_sid, row.agent_session_id);
+            }
+            let conversation = row.conversation_state();
+            let name = crate::tmux::Session::generate_name(&row.id, &row.title);
+            let _pane = TmuxTestSession::from_name(&name);
+            assert!(crate::tmux::tmux_command()
+                .args([
+                    "-f",
+                    "/dev/null",
+                    "new-session",
+                    "-d",
+                    "-s",
+                    &name,
+                    "exec /bin/sleep 60"
+                ])
+                .output()
+                .unwrap()
+                .status
+                .success());
+            let pane = only_pane_id(&name);
+            wait_for_pane_command(&pane, "sleep");
+            let pid = pane_field(&pane, "#{pane_pid}");
+            row.agent_pane.tmux_session = Some(name.clone());
+            row.agent_pane.state = crate::session::PanePresence::Alive;
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![row.clone()],
+            );
+            let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            let before = state.runtime.publish(&state).await.unwrap();
+            let response = restart_session(
+                State(state.clone()),
+                Path(row.id.clone()),
+                Ok(Some(Json(crate::daemon::RestartSessionBody {
+                    skip_on_launch: true,
+                    wake_message: Some(String::new()),
+                    ..Default::default()
+                }))),
+            )
+            .await;
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body = axum::body::to_bytes(response.into_body(), 8192)
+                .await
+                .unwrap();
+            let stored = Storage::open_unwatched("default")
+                .unwrap()
+                .load()
+                .unwrap()
+                .remove(0);
+            assert_eq!(stored.conversation_state(), conversation);
+            assert_eq!(stored.omp_capture_generation, row.omp_capture_generation);
+            assert_eq!(stored.resume_probe_failed_sid, row.resume_probe_failed_sid);
+            assert_eq!(stored.id, row.id);
+            assert_eq!(stored.tool, row.tool);
+            assert_eq!(stored.command, row.command);
+            assert_eq!(stored.project_path, row.project_path);
+            assert!(stored.lifecycle_reservation.is_none());
+            assert_eq!(
+                std::fs::read_to_string(&transcript).unwrap(),
+                "private-conversation-body\n"
+            );
+            assert_eq!(only_pane_id(&name), pane);
+            assert_eq!(pane_field(&pane, "#{pane_pid}"), pid);
+            assert_eq!(pane_field(&pane, "#{pane_dead}"), "0");
+            assert_eq!(
+                status,
+                StatusCode::CONFLICT,
+                "{}",
+                String::from_utf8_lossy(&body)
+            );
+            assert_eq!(
+                headers[crate::daemon::ERROR_CODE_HEADER],
+                "managed_resume_refused"
+            );
+            let expected_cause = if failed_probe {
+                crate::session::ManagedResumeCause::PreviousResumeProbeFailed
+            } else {
+                crate::session::ManagedResumeCause::ExecutionContextUnattested
+            };
+            assert_eq!(
+                headers[crate::daemon::MANAGED_RESUME_CAUSE_HEADER],
+                expected_cause.as_str(),
+            );
+            let code = crate::daemon::ApiErrorCode::from_headers(status, &headers, false).unwrap();
+            assert_eq!(code.as_str(), "managed_resume_refused");
+            assert_eq!(
+                headers[crate::daemon::RUNTIME_EPOCH_HEADER],
+                before.value.cursor.epoch.as_str()
+            );
+            let revision = headers[crate::daemon::RUNTIME_REVISION_HEADER]
+                .to_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap();
+            assert!(revision > before.value.cursor.revision);
+            let published = state.runtime.publish(&state).await.unwrap();
+            assert_eq!(published.value.cursor.revision, revision);
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"], "managed_resume_refused");
+            let message = body["message"].as_str().unwrap();
+            assert!(message.contains("aoe session set-session-id"), "{message}");
+            assert!(message.contains("--store"), "{message}");
+            assert!(
+                message.contains("aoe session set-session-id <session> \"\""),
+                "{message}"
+            );
+            let public_body = body.to_string();
+            for private in [
+                sid,
+                row.id.as_str(),
+                project.to_str().unwrap(),
+                transcript.to_str().unwrap(),
+                "private-conversation-body",
+            ] {
+                assert!(!public_body.contains(private), "{public_body}");
+            }
+        }
+    }
 
     async fn live_runner(row: &Instance) -> (tokio::process::Child, WorkerRecord) {
         let child = tokio::process::Command::new("sleep")

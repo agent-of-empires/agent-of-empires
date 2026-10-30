@@ -75,17 +75,6 @@ pub enum StartOutcome {
     /// actually occurred this call depends on the caller having killed
     /// any pre-existing pane first.
     Fresh,
-    /// A resume was skipped, and the session started fresh instead, because
-    /// `sid` already failed a resume probe once before. Retrying the
-    /// identical sid would only reproduce the original `ResumeFailed`
-    /// forever, so this launch routes through `ResumeIntent::Cleared`
-    /// instead (same as a manual `aoe session set-session-id ""`): a fresh
-    /// sid is assigned and `sid` is not carried forward. Distinct from
-    /// `Fresh` so callers can tell the user their conversation did not
-    /// resume, instead of silently starting a blank session; the prior
-    /// conversation is still reachable through the agent's own resume/
-    /// history picker. See #2609.
-    FreshAfterFailedResume { sid: String },
 }
 
 /// What `start_with_size_opts` did with the agent's session id this call.
@@ -245,6 +234,13 @@ impl Instance {
         }
         self.reconcile_sidecar_into_disk_in(storage)?;
         let expected = self.apply_fresh_launch_intent_in(storage);
+        if let Err(error) = self
+            .preflight_resume_launch_in(CaptureStorage::Scoped(storage), ResumeAttemptPolicy::Allow)
+        {
+            self.adopt_conversation_state(expected);
+            self.fail_reserved_launch(storage, generation, &error, false);
+            return Err(error);
+        }
 
         let mut prepared =
             match self.prepare_launch_command_in(CaptureStorage::Scoped(storage), expected) {
@@ -1277,126 +1273,125 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
-    fn default_opencode_restart_preserves_native_resume_without_an_attested_store() {
+    fn direct_start_refuses_failed_resume_before_replacing_a_dead_pane() {
         if std::env::var_os("AOE_FROZEN_NATIVE_TEST_CHILD").is_some() {
             crate::process::exec_frozen_environment().unwrap();
             return;
         }
-        let Ok(python) = which::which("python3") else {
-            return;
+        use crate::session::instance::test_helpers::{seed_claude_transcript, tool_instance};
+        use crate::tmux::test_helpers::{
+            only_pane_id, pane_field, tmux_available, wait_for_pane_command, TmuxTestSession,
         };
-        crate::tmux::test_helpers::require_tmux!();
-        use crate::session::instance::test_helpers::{seed_disk_for_sidecar_test, tool_instance};
-        const SID: &str = "ses_saved000000000000000000000000";
-        for (legacy, yolo, version) in [
-            (false, false, "2.0.24+31bdd8e"),
-            (false, true, "2.0.24+31bdd8e"),
-            (true, false, "2.0.24+31bdd8e"),
-            (true, true, "2.0.24+31bdd8e"),
-            (false, false, "2.0.27"),
-            (false, true, "2.0.27"),
-            (false, false, "distro-build"),
-            (false, true, "distro-build"),
-        ] {
-            let directory = tempfile::tempdir().unwrap();
-            let _home = crate::session::test_support::isolate_home(directory.path());
-            let project = directory.path().join("project");
-            std::fs::create_dir(&project).unwrap();
-            let project = std::fs::canonicalize(project).unwrap();
-            let record = directory.path().join("launch.json");
-            let database = directory.path().join("opencode.db");
-            if version != "2.0.24+31bdd8e" {
-                rusqlite::Connection::open(&database)
-                    .unwrap()
-                    .execute_batch("CREATE TABLE unrelated (payload TEXT)")
-                    .unwrap();
-            }
-            let native = format!(
-                r#"#!{}
-import json, os, sys
-if sys.argv[1:] == ['--help']: print({:?}); sys.exit(0)
-if sys.argv[1:] == ['--version']: print({version:?}); sys.exit(0)
-with open(os.environ['FORK_RECORD'] + '.tmp', 'w') as log:
-    json.dump({{"argv": sys.argv[1:], "permission": os.environ.get('OPENCODE_PERMISSION'), "database": os.environ.get('OPENCODE_DB'), "cwd": os.getcwd()}}, log)
-os.replace(os.environ['FORK_RECORD'] + '.tmp', os.environ['FORK_RECORD'])
-sys.stdin.read()
-"#,
-                python.display(),
-                if legacy {
-                    "--fork --session"
-                } else {
-                    "--auto --session"
-                }
-            );
-            let _path = crate::session::test_support::install_login_shell_path_command(
-                directory.path(),
-                "opencode",
-                &native,
-            );
-            let profile = "default-unattested";
-            let config =
-                crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
-            std::fs::create_dir_all(config.parent().unwrap()).unwrap();
-            let environment = vec![
-                format!("OPENCODE_DB={}", database.display()),
-                format!("FORK_RECORD={}", record.display()),
-            ];
-            std::fs::write(config, format!("environment={}\n[session]\nagent_status_hooks=false\nsmart_rename=false\nname_agent_session=false\nopencode_preassign_session_id=false\n", serde_json::to_string(&environment).unwrap())).unwrap();
-            let mut instance = tool_instance("opencode", project.to_str().unwrap());
-            instance.source_profile = profile.into();
-            instance.yolo_mode = yolo;
-            instance.set_agent_conversation(Some(SID.into()), None, None);
-            seed_disk_for_sidecar_test(profile, &instance);
-            let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(
-                instance.tmux_session().unwrap().name(),
-            );
-            let _helper = frozen_test_helper(
-                directory.path(),
-                "default_opencode_restart_preserves_native_resume_without_an_attested_store",
-            );
-            let result = instance.start_with_size_opts(None, false).unwrap();
-            assert!(matches!(result, LaunchSidOutcome::Existing { sid } if sid == SID));
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
-            let launched: serde_json::Value = loop {
-                if let Ok(bytes) = std::fs::read(&record) {
-                    if let Ok(value) = serde_json::from_slice(&bytes) {
-                        break value;
-                    }
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "native restart did not launch"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            };
-            let argv = launched["argv"].as_array().unwrap();
-            assert_eq!(launched["database"], database.to_str().unwrap());
-            assert_eq!(launched["cwd"], project.to_str().unwrap());
-            assert_eq!(instance.agent_session_id.as_deref(), Some(SID));
-            assert!(instance.active_execution.is_none());
-            assert_eq!(
-                crate::session::storage::Storage::new_unwatched(profile)
-                    .unwrap()
-                    .load()
-                    .unwrap()[0]
-                    .agent_session_id
-                    .as_deref(),
-                Some(SID)
-            );
-            assert!(argv
-                .windows(2)
-                .any(|pair| pair[0] == "--session" && pair[1] == SID));
-            assert_eq!(argv.iter().any(|word| word == "--standalone"), !legacy);
-            assert_eq!(argv.iter().any(|word| word == "--auto"), yolo && !legacy);
-            if legacy && yolo {
-                let policy: serde_json::Value =
-                    serde_json::from_str(launched["permission"].as_str().unwrap()).unwrap();
-                assert_eq!(policy["*"], "allow");
-            } else {
-                assert!(launched["permission"].is_null());
-            }
+        if !tmux_available() {
+            return;
         }
+        let root = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(root.path());
+        let _env = crate::session::test_support::EnvGuard::unset(&[
+            "TMUX",
+            "TMUX_PANE",
+            "CLAUDE_CONFIG_DIR",
+            "AOE_DAEMON_URL",
+        ])
+        .and_set("AOE_TMUX_SOCKET", root.path().join("tmux.sock"));
+        let _agent = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "claude",
+            "#!/bin/sh\nexec /bin/sleep 60\n",
+        );
+        crate::session::config::update_config(|config| {
+            config.systemd.enabled = false;
+            config.session.smart_rename = false;
+            config.session.auto_resume_on_restart = true;
+        })
+        .unwrap();
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let mut instance = tool_instance("claude", project.to_str().unwrap());
+        instance.source_profile = "direct-failed-resume".into();
+        let sid = "11111111-2222-4333-8444-555555555555";
+        seed_claude_transcript(&mut instance, sid);
+        instance.resume_probe_failed_sid = Some(sid.into());
+        instance.omp_capture_generation = Some("outgoing-generation".into());
+        assert!(instance.supports_native_resume());
+        let before = instance.conversation_state();
+        let store = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
+        store
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let name = instance.tmux_session().unwrap().name().to_owned();
+        let _pane = TmuxTestSession::from_name(&name);
+        assert!(crate::tmux::tmux_command()
+            .args([
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
+                &name,
+                "exec /bin/sleep 60",
+            ])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        let pane = only_pane_id(&name);
+        wait_for_pane_command(&pane, "sleep");
+        assert!(crate::tmux::tmux_command()
+            .args(["set-option", "-t", &name, "remain-on-exit", "on",])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        assert!(crate::tmux::tmux_command()
+            .args(["respawn-pane", "-k", "-t", &pane, "exit 17",])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pane_field(&pane, "#{pane_dead}") != "1" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture pane did not exit"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let pid = pane_field(&pane, "#{pane_pid}");
+        let _helper = frozen_test_helper(
+            root.path(),
+            "direct_start_refuses_failed_resume_before_replacing_a_dead_pane",
+        );
+        let error = instance
+            .start_with_size_opts(None, true)
+            .expect_err("a direct Default start must not retry a previously failed conversation");
+        assert!(error.is::<ManagedResumeRefused>(), "{error:#}");
+        let public_error = instance.last_error.as_deref().unwrap();
+        assert!(!public_error.contains(sid), "{public_error}");
+        assert!(
+            public_error.contains("aoe session set-session-id <session> \"\""),
+            "{public_error}"
+        );
+        assert_eq!(only_pane_id(&name), pane);
+        assert_eq!(pane_field(&pane, "#{pane_pid}"), pid);
+        assert_eq!(pane_field(&pane, "#{pane_dead}"), "1");
+        let stored = store.load().unwrap().remove(0);
+        assert_eq!(stored.conversation_state(), before);
+        assert_eq!(stored.resume_probe_failed_sid.as_deref(), Some(sid));
+        assert_eq!(
+            stored.omp_capture_generation.as_deref(),
+            Some("outgoing-generation")
+        );
+        assert!(stored.lifecycle_reservation.is_none());
     }
+
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]

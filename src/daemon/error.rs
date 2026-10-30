@@ -1,8 +1,10 @@
 //! Fixed error discriminators shared by native clients and daemon handlers.
 
+use crate::session::ManagedResumeCause;
 use reqwest::{header::HeaderMap, StatusCode};
 
 pub const ERROR_CODE_HEADER: &str = "aoe-error-code";
+pub const MANAGED_RESUME_CAUSE_HEADER: &str = "aoe-managed-resume-cause";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApiErrorCode {
@@ -16,6 +18,7 @@ pub enum ApiErrorCode {
     TlsRequired,
     RuntimeEpochMismatch,
     ResumeFailed,
+    ManagedResumeRefused(ManagedResumeCause),
     StartFailed,
     PurgeFailed,
     NoRevive,
@@ -47,6 +50,7 @@ impl ApiErrorCode {
             Self::TlsRequired => "tls_required",
             Self::RuntimeEpochMismatch => "runtime_epoch_mismatch",
             Self::ResumeFailed => "resume_failed",
+            Self::ManagedResumeRefused(_) => "managed_resume_refused",
             Self::NoRevive => "no_revive",
             Self::CreationTrustChanged => "creation_trust_changed",
             Self::CreationCancelled => "creation_cancelled",
@@ -72,6 +76,7 @@ impl ApiErrorCode {
             | Self::LifecycleSuperseded
             | Self::RuntimeEpochMismatch
             | Self::ResumeFailed
+            | Self::ManagedResumeRefused(_)
             | Self::PurgeFailed
             | Self::NoRevive
             | Self::CreationTrustChanged
@@ -117,6 +122,7 @@ impl ApiErrorCode {
             b"tls_required" => Self::TlsRequired,
             b"runtime_epoch_mismatch" => Self::RuntimeEpochMismatch,
             b"resume_failed" => Self::ResumeFailed,
+            b"managed_resume_refused" => Self::ManagedResumeRefused(managed_resume_cause(headers)),
             b"no_revive" => Self::NoRevive,
             b"creation_trust_changed" => Self::CreationTrustChanged,
             b"creation_cancelled" => Self::CreationCancelled,
@@ -134,6 +140,20 @@ impl ApiErrorCode {
             _ => return None,
         };
         (status == code.status()).then_some(code)
+    }
+}
+
+fn managed_resume_cause(headers: &HeaderMap) -> ManagedResumeCause {
+    let mut values = headers.get_all(MANAGED_RESUME_CAUSE_HEADER).iter();
+    match (values.next(), values.next()) {
+        (Some(value), None) => match value.as_bytes() {
+            b"wrapper_contract_required" => ManagedResumeCause::WrapperContractRequired,
+            b"unsupported_managed_arguments" => ManagedResumeCause::UnsupportedManagedArguments,
+            b"opencode_schema_unattested" => ManagedResumeCause::OpenCodeSchemaUnattested,
+            b"previous_resume_probe_failed" => ManagedResumeCause::PreviousResumeProbeFailed,
+            _ => ManagedResumeCause::ExecutionContextUnattested,
+        },
+        _ => ManagedResumeCause::ExecutionContextUnattested,
     }
 }
 
@@ -218,6 +238,20 @@ mod tests {
             ),
             (StatusCode::FORBIDDEN, "session_archived", false, None),
             (
+                StatusCode::CONFLICT,
+                "managed_resume_refused",
+                false,
+                Some(ApiErrorCode::ManagedResumeRefused(
+                    ManagedResumeCause::ExecutionContextUnattested,
+                )),
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "managed_resume_refused",
+                false,
+                None,
+            ),
+            (
                 StatusCode::BAD_REQUEST,
                 "create_hook_failed",
                 false,
@@ -243,5 +277,64 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn managed_resume_cause_headers_cannot_expand_or_erase_a_refusal() {
+        use ManagedResumeCause::*;
+        for (value, expected) in [
+            ("wrapper_contract_required", WrapperContractRequired),
+            ("unsupported_managed_arguments", UnsupportedManagedArguments),
+            ("opencode_schema_unattested", OpenCodeSchemaUnattested),
+            ("previous_resume_probe_failed", PreviousResumeProbeFailed),
+            ("execution_context_unattested", ExecutionContextUnattested),
+            ("secret-token", ExecutionContextUnattested),
+            (
+                "wrapper_contract_required, secret-token",
+                ExecutionContextUnattested,
+            ),
+            ("", ExecutionContextUnattested),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(MANAGED_RESUME_CAUSE_HEADER, HeaderValue::from_static(value));
+            assert_eq!(
+                ApiErrorCode::from_headers(StatusCode::CONFLICT, &headers, false),
+                None
+            );
+            headers.insert(
+                ERROR_CODE_HEADER,
+                HeaderValue::from_static("managed_resume_refused"),
+            );
+            assert_eq!(
+                ApiErrorCode::from_headers(StatusCode::CONFLICT, &headers, false),
+                Some(ApiErrorCode::ManagedResumeRefused(expected)),
+            );
+            assert_eq!(
+                ApiErrorCode::from_headers(StatusCode::BAD_REQUEST, &headers, false),
+                None
+            );
+            headers.append(MANAGED_RESUME_CAUSE_HEADER, HeaderValue::from_static(value));
+            assert_eq!(
+                ApiErrorCode::from_headers(StatusCode::CONFLICT, &headers, false),
+                Some(ApiErrorCode::ManagedResumeRefused(
+                    ExecutionContextUnattested
+                )),
+            );
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            ERROR_CODE_HEADER,
+            HeaderValue::from_static("managed_resume_refused"),
+        );
+        headers.insert(
+            MANAGED_RESUME_CAUSE_HEADER,
+            HeaderValue::from_bytes(b"\xff").unwrap(),
+        );
+        assert_eq!(
+            ApiErrorCode::from_headers(StatusCode::CONFLICT, &headers, false),
+            Some(ApiErrorCode::ManagedResumeRefused(
+                ExecutionContextUnattested
+            )),
+        );
     }
 }

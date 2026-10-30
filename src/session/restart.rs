@@ -98,12 +98,7 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
 
 /// Whether the restart left the agent running in a live pane.
 pub(crate) fn launched_agent(outcome: &Result<StartOutcome, String>) -> bool {
-    matches!(
-        outcome,
-        Ok(StartOutcome::Fresh
-            | StartOutcome::Resumed
-            | StartOutcome::FreshAfterFailedResume { .. })
-    )
+    matches!(outcome, Ok(StartOutcome::Fresh | StartOutcome::Resumed))
 }
 
 /// Wait for the restarted pane to become live and past its boot shell, then

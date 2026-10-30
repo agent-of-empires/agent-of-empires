@@ -83,8 +83,13 @@ pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservati
 pub(crate) use identity_sidecar::FAIL_PI_PATH_WRITES;
 pub use polling::PollerStart;
 pub use ready::{EnsureReadyError, EnsureReadyOutcome, SessionGone};
-pub(crate) use resume::{LaunchReservation, ResumeAttemptPolicy, ResumeLaunchOptions};
-pub(crate) use sid_persist::{persist_session_to_storage, SidPersistOutcome, SidWrite};
+pub use resume::ManagedResumeCause;
+pub(crate) use resume::{
+    LaunchReservation, ManagedResumeRefused, ResumeAttemptPolicy, ResumeLaunchOptions,
+};
+pub(crate) use sid_persist::{
+    persist_session_to_storage, CaptureCommit, SidPersistOutcome, SidWrite,
+};
 pub use start::{LaunchSidOutcome, StartOutcome};
 pub(crate) use status::PassiveStatusPatch;
 pub use status::{Status, TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR};
@@ -701,10 +706,8 @@ pub struct Instance {
     /// agent's ids and consumes the incoming agent's entry, so the map holds at
     /// most one entry per tool the row has ever run under.
     ///
-    /// `resume_probe_failed_sid` is deliberately not parked with them: a
-    /// restored sid is worth one fresh probe (the conversation may well still
-    /// be there), and if it is gone the resume-fallback cascade already starts
-    /// a new session instead. Additive: absent in older rows, no migration.
+    /// `resume_probe_failed_sid` is not parked: restoring a conversation after
+    /// an engine swap permits one new resume probe.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub(crate) prior_tool_session_ids: HashMap<String, PriorToolSession>,
 

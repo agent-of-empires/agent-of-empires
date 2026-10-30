@@ -396,7 +396,7 @@ pub(crate) enum CaptureContext {
     PrimeStatus(crate::process::prime::PrimeRuntime),
 }
 
-use super::{Instance, ResumeIntent};
+use super::{Instance, ManagedResumeCause, ResumeIntent};
 use crate::agents::{AgentDef, AGENTS};
 use crate::session::fork::ForkParentRef;
 use anyhow::{bail, Context, Result};
@@ -1729,9 +1729,13 @@ impl Instance {
         command: &str,
         config: &crate::session::config::SessionConfig,
     ) -> Result<&'static AgentDef> {
-        anyhow::ensure!(!Self::contains_active_shell_syntax(command),
-            "managed conversation requires a direct native command or an explicitly declared wrapper");
-        let words = shell_words::split(command)?;
+        if Self::contains_active_shell_syntax(command) {
+            return Err(anyhow::anyhow!(
+                "managed conversation requires a direct native command or an explicitly declared wrapper"
+            ).context(ManagedResumeCause::UnsupportedManagedArguments));
+        }
+        let words =
+            shell_words::split(command).context(ManagedResumeCause::UnsupportedManagedArguments)?;
         let program = words.first().context("empty agent command")?;
         let direct = AGENTS.iter().find(|agent| agent.binary == program);
         let declared = config
@@ -1744,7 +1748,8 @@ impl Instance {
             .transpose()?;
         let logical = crate::agents::get_agent(tool);
         let actual = direct.or(declared).context(
-            "wrapper execution identity is unknown: set session.agent_execution_as and session.agent_config_dir; agent_detect_as is only status detection")?;
+            "wrapper execution identity is unknown: set session.agent_execution_as and session.agent_config_dir; agent_detect_as is only status detection")
+            .context(ManagedResumeCause::WrapperContractRequired)?;
         anyhow::ensure!(
             logical.is_none_or(|logical| logical.name == actual.name)
                 && declared.is_none_or(|declared| declared.name == actual.name),
@@ -1760,10 +1765,12 @@ impl Instance {
                     .any(|agent| Some(agent.binary) == basename && agent.name != actual.name),
                 "wrapper command names a different native agent"
             );
-            anyhow::ensure!(
-                config.agent_config_dir.contains_key(tool),
-                "wrapper requires an explicit session.agent_config_dir namespace"
-            );
+            if !config.agent_config_dir.contains_key(tool) {
+                return Err(anyhow::anyhow!(
+                    "wrapper requires an explicit session.agent_config_dir namespace"
+                )
+                .context(ManagedResumeCause::WrapperContractRequired));
+            }
         }
         Ok(actual)
     }
@@ -1774,13 +1781,19 @@ impl Instance {
         } else {
             self.extra_args.clone()
         };
-        anyhow::ensure!(
-            !Self::contains_active_shell_syntax(&extra),
-            "managed conversation cannot use active shell syntax in arguments"
+        if Self::contains_active_shell_syntax(&extra) {
+            return Err(anyhow::anyhow!(
+                "managed conversation cannot use active shell syntax in arguments"
+            )
+            .context(ManagedResumeCause::UnsupportedManagedArguments));
+        }
+        let mut words = shell_words::split(self.get_tool_command())
+            .context(ManagedResumeCause::UnsupportedManagedArguments)?;
+        words.extend(
+            shell_words::split(&extra).context(ManagedResumeCause::UnsupportedManagedArguments)?,
         );
-        let mut words = shell_words::split(self.get_tool_command())?;
-        words.extend(shell_words::split(&extra)?);
         validate_managed_arguments(agent, &words[1..])
+            .context(ManagedResumeCause::UnsupportedManagedArguments)
     }
 
     pub(super) fn resolve_native_execution(
@@ -2585,6 +2598,7 @@ pub(super) fn validate_managed_arguments(
                     "--dangerously-skip-permissions",
                     "--allow-dangerously-skip-permissions",
                     "--verbose",
+                    "--strict-mcp-config",
                 ],
             ),
             "codex" => (
@@ -2666,7 +2680,19 @@ pub(super) fn validate_managed_arguments(
                 ],
             ),
         };
-        if values.contains(&key) {
+        if agent.name == "claude" && key == "--mcp-config" {
+            anyhow::ensure!(
+                inline.is_none_or(|value| !value.is_empty() && !value.starts_with('-')),
+                "Claude MCP configuration is missing its value"
+            );
+            let mut has_value = inline.is_some();
+            while let Some(value) = words.get(index + 1).filter(|value| !value.starts_with('-')) {
+                anyhow::ensure!(!value.is_empty(), "Claude MCP configuration is empty");
+                index += 1;
+                has_value = true;
+            }
+            anyhow::ensure!(has_value, "Claude MCP configuration is missing its value");
+        } else if values.contains(&key) {
             anyhow::ensure!(
                 agent.name != "prime-agent" || inline.is_none(),
                 "Prime options require a separate value"
@@ -3451,6 +3477,66 @@ mod tests {
             opencode_session_row(&store, "legacy-only", SessionV2).is_err(),
             "a missing active table must not select the surviving inactive one"
         );
+    }
+
+    #[test]
+    fn claude_mcp_arguments_preserve_native_selector_admission() {
+        let claude = crate::agents::get_agent("claude").unwrap();
+        for (args, accepted) in [
+            ("--mcp-config first.json", true),
+            ("--mcp-config first.json second.json --model sonnet", true),
+            ("--mcp-config=first.json second.json", true),
+            ("--mcp-config first.json --mcp-config second.json", true),
+            (
+                "--strict-mcp-config --mcp-config '{\"mcpServers\":{}}'",
+                true,
+            ),
+            ("--mcp-config", false),
+            ("--mcp-config --model sonnet", false),
+            ("--mcp-config=", false),
+            ("--mcp-config first.json --resume foreign", false),
+            ("--mcp-config first.json --session-id foreign", false),
+            ("--mcp-config first.json --settings foreign.json", false),
+            ("--mcp-config first.json -- --resume foreign", false),
+            ("--strict-mcp-config=true", false),
+        ] {
+            assert_eq!(
+                validate_managed_arguments(claude, &shell_words::split(args).unwrap()).is_ok(),
+                accepted,
+                "{args}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn claude_mcp_resume_keeps_the_recorded_execution_namespace() {
+        use crate::session::instance::test_helpers::{seed_claude_transcript, tool_instance};
+        let root = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(root.path());
+        let _env = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        let _agent = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "claude",
+            "#!/bin/sh\nexit 97\n",
+        );
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let sid = "11111111-2222-4333-8444-555555555555";
+        let mut instance = tool_instance("claude", project.to_str().unwrap());
+        seed_claude_transcript(&mut instance, sid);
+        let original = instance.agent_session_binding.clone().unwrap();
+        instance.extra_args =
+            "--strict-mcp-config --mcp-config first.json '{\"mcpServers\":{}}'".into();
+        let execution = instance
+            .resolve_native_execution(instance.conversation_target())
+            .unwrap();
+        assert!(Instance::execution_identity_matches(
+            original.execution.as_ref().unwrap(),
+            &execution.binding,
+        ));
+        assert_eq!(execution.target_session_id.as_deref(), Some(sid));
+        assert_eq!(instance.agent_session_binding, Some(original));
     }
 
     #[test]

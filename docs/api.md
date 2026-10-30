@@ -650,12 +650,19 @@ attachment is delivered. Genuine authority loss or an unknown outcome remains
 blocked until reconciled.
 
 A failed launch can still commit a lifecycle generation. The finite
-`aoe-error-code` values `start_failed` and `resume_failed`, with valid same-epoch
-runtime receipt headers, acknowledge that preparation commit, not a successful
+`aoe-error-code` values `start_failed`, `resume_failed`, and
+`managed_resume_refused`, with valid same-epoch runtime receipt headers,
+acknowledge that preparation commit, not a successful
 launch. Clients must apply its snapshot before retrying. A later send or target
 probe failure can likewise retain a preparation cursor; it does not acknowledge
 message delivery. Transport loss or malformed mutation receipts remain unknown;
 effect-free daemon refusals do not acknowledge a commit.
+
+`409 managed_resume_refused` preserves the managed conversation. Its finite
+`aoe-managed-resume-cause` header supplies an application-owned recovery reason.
+Missing, unknown, or ambiguous cause metadata keeps the refusal generic; native
+clients do not read response bodies to derive that reason. See
+[managed resume recovery](guides/session-resume.md#common-managed-resume-and-fork-refusals).
 
 A failed purge can commit a retained-row failure marker. `409 purge_failed`
 includes the finite code header and its canonical receipt; clients wait for that
