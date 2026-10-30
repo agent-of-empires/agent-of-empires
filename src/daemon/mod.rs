@@ -35,19 +35,21 @@ pub use wire::{
     ContextResumeUnavailableReason, CreateProfileBody, CreateProjectBody, CreateSessionBody,
     CreationTrustFingerprint, CreationTrustRequest, CreationTrustReview, DefaultProfileBody,
     DeleteGroupBody, DeleteGroupMode, DeleteGroupOutcome, DeleteProfileQuery, DeleteSessionBody,
-    EnsureToolBody, GroupLocation, GroupSessionFailure, GroupSessionFailureCode,
-    GroupSessionOutcome, ListSessionsQuery, MoveDirection, MoveGroupBody, PendingApproval,
-    PlanSummary, PromptAttachmentKind, PromptAttachmentRef, PurgeOutcome, QueuedPromptEntry,
-    RenameOutcome, RenameProfileBody, RenameSessionBody, ReorderBody, ReorderOutcome,
-    RepoBaseInput, RestartOutcome, RestartSessionBody, RestoreOutcome, SessionResponse,
-    SessionsEnvelope, SetWorktreeNameBody, StartSessionBody, StopAuxiliaryBody, TerminalSize,
-    TerminalTarget, TerminalTargetStatus, TrashOutcome, TrashRelocationOutcome, TrashSessionBody,
-    Tristate, UpdateArchiveBody, UpdateColorBody, UpdateDiffBaseBody, UpdateFavoriteBody,
-    UpdateGroupBody, UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody, UpdateUnreadBody,
-    WorkspaceRepoSummary, WorktreeEditOutcome,
+    EmptyTrashBody, EmptyTrashOutcome, EnsureToolBody, GroupLocation, GroupSessionFailure,
+    GroupSessionFailureCode, GroupSessionOutcome, ListSessionsQuery, MoveDirection, MoveGroupBody,
+    PendingApproval, PlanSummary, PromptAttachmentKind, PromptAttachmentRef, PurgeOutcome,
+    QueuedPromptEntry, RenameOutcome, RenameProfileBody, RenameSessionBody, ReorderBody,
+    ReorderOutcome, RepoBaseInput, RestartOutcome, RestartSessionBody, RestoreOutcome,
+    SessionResponse, SessionsEnvelope, SetWorktreeNameBody, StartSessionBody, StopAuxiliaryBody,
+    TerminalSize, TerminalTarget, TerminalTargetStatus, TrashOutcome, TrashRelocationOutcome,
+    TrashSessionBody, Tristate, UpdateArchiveBody, UpdateColorBody, UpdateDiffBaseBody,
+    UpdateFavoriteBody, UpdateGroupBody, UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody,
+    UpdateUnreadBody, WorkspaceRepoSummary, WorktreeEditOutcome,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
+/// A destroy hook may run for minutes per row, so the bulk purge outlives `DEFAULT_TIMEOUT`.
+const EMPTY_TRASH_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
 const MAX_SUCCESS_BODY_BYTES: usize = 16 * 1024 * 1024;
 
@@ -757,6 +759,26 @@ impl DaemonClient {
             .await
     }
 
+    pub async fn empty_trash(
+        &self,
+        body: &EmptyTrashBody,
+        epoch: &str,
+    ) -> Result<MutationReceipt<EmptyTrashOutcome>, DaemonClientError> {
+        self.empty_trash_within(body, epoch, EMPTY_TRASH_TIMEOUT)
+            .await
+    }
+
+    async fn empty_trash_within(
+        &self,
+        body: &EmptyTrashBody,
+        epoch: &str,
+        timeout: Duration,
+    ) -> Result<MutationReceipt<EmptyTrashOutcome>, DaemonClientError> {
+        let url = format!("{}/empty-trash", self.sessions_url);
+        self.request_mutation_with_outcome(self.http.post(url).json(body).timeout(timeout), epoch)
+            .await
+    }
+
     pub async fn mutate_profile(
         &self,
         mutation: &ProfileMutation,
@@ -1458,6 +1480,78 @@ mod tests {
         assert_eq!(captured.path, "/api/sessions/sess-1/stop");
         assert_eq!(captured.epoch.as_deref(), Some("epoch-1"));
         assert!(captured.body.is_empty(), "stop sends no body");
+    }
+
+    #[tokio::test]
+    async fn empty_trash_posts_profile_to_the_sessions_route() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let base = serve_mutation_once(
+            "/api/sessions/empty-trash",
+            200,
+            vec![
+                (RUNTIME_EPOCH_HEADER, "epoch-1"),
+                (RUNTIME_REVISION_HEADER, "3"),
+            ],
+            r#"{"sessions":[],"failures":[]}"#,
+            tx,
+        )
+        .await;
+        let client = DaemonClient::new(&base, None).expect("test client");
+        let receipt = client
+            .empty_trash(
+                &EmptyTrashBody {
+                    profile: "work".into(),
+                },
+                "epoch-1",
+            )
+            .await
+            .expect("empty trash");
+        assert!(receipt.outcome.sessions.is_empty());
+        let captured = next_request(rx).await;
+        assert_eq!(captured.method, "POST");
+        assert_eq!(captured.path, "/api/sessions/empty-trash");
+        assert_eq!(captured.epoch.as_deref(), Some("epoch-1"));
+        let body: serde_json::Value = serde_json::from_slice(&captured.body).unwrap();
+        assert_eq!(body["profile"], "work");
+    }
+
+    #[tokio::test]
+    async fn empty_trash_waits_for_a_slow_batch_within_its_own_deadline() {
+        let app = axum::Router::new().route(
+            "/api/sessions/empty-trash",
+            axum::routing::post(|| async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                (
+                    [
+                        (RUNTIME_EPOCH_HEADER, "epoch-1"),
+                        (RUNTIME_REVISION_HEADER, "3"),
+                    ],
+                    r#"{"sessions":[],"failures":[]}"#,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind slow test server");
+        let base = format!("http://{}", listener.local_addr().expect("server addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve slow test");
+        });
+        let client = DaemonClient::new(&base, None).expect("test client");
+        let body = EmptyTrashBody {
+            profile: "work".into(),
+        };
+        let early = client
+            .empty_trash_within(&body, "epoch-1", Duration::from_millis(50))
+            .await;
+        assert!(
+            matches!(early, Err(DaemonClientError::Timeout)),
+            "{early:?}"
+        );
+        client
+            .empty_trash_within(&body, "epoch-1", Duration::from_secs(10))
+            .await
+            .expect("a slow bulk purge returns its receipt inside the request's own deadline");
     }
 
     #[tokio::test]

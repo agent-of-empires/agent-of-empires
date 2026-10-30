@@ -1844,7 +1844,14 @@ async fn start_daemon(
         crate::daemon::transport::local_socket_path()?,
     );
     let client = endpoint.daemon_client()?;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    // A remote child stops itself at the tunnel deadline with the reason in the log, so wait
+    // past it rather than killing it first with nothing to say.
+    let readiness = if args.remote {
+        crate::server::startup::TUNNEL_STARTUP_DEADLINE + std::time::Duration::from_secs(15)
+    } else {
+        std::time::Duration::from_secs(60)
+    };
+    let deadline = tokio::time::Instant::now() + readiness;
     let ready = tokio::time::timeout_at(deadline, async {
         loop {
             if let Some(status) = child.try_wait()? {

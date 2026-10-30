@@ -97,28 +97,33 @@ async fn container_running(session_id: &str) -> bool {
     .unwrap_or(false)
 }
 
+/// The command `install-agent` runs for a sandboxed session, which
+/// `install-info` also shows for running by hand.
+fn container_install_argv(session_id: &str, package: &str) -> [String; 7] {
+    [
+        crate::containers::runtime_binary(),
+        "exec",
+        crate::containers::DockerContainer::generate_name(session_id).as_str(),
+        "npm",
+        "install",
+        "-g",
+        package,
+    ]
+    .map(str::to_string)
+}
+
 /// Install inside the session's running sandbox container via `<runtime> exec`.
 async fn install_in_container(
     session_id: &str,
     package: &str,
 ) -> Result<std::process::Output, Response> {
-    use crate::containers::DockerContainer;
-
     if !container_running(session_id).await {
-        return Err(api_error(
-            StatusCode::CONFLICT,
-            "container_not_running",
-            "The session's sandbox container is not running. Open the session (which starts its container) and try again.",
-        ));
+        return Err(refusal(InstallBlock::ContainerNotRunning));
     }
 
-    let runtime_bin = crate::containers::runtime_binary();
-    let mut command = tokio::process::Command::new(runtime_bin);
-    command
-        .arg("exec")
-        .arg(DockerContainer::generate_name(session_id))
-        .args(["npm", "install", "-g"])
-        .arg(package);
+    let [runtime_bin, args @ ..] = container_install_argv(session_id, package);
+    let mut command = tokio::process::Command::new(&runtime_bin);
+    command.args(args);
     run_install(
         command,
         (
@@ -155,7 +160,11 @@ pub struct AgentInstallInfo {
     pub npm_installable: bool,
     /// Whether `install-agent` accepts requests for this Session.
     pub install_allowed: bool,
+    /// Why it doesn't, when it doesn't.
+    pub install_blocked: Option<InstallBlock>,
     pub sandboxed: bool,
+    /// The in-container install for a sandboxed session's npm adapter.
+    pub container_install_command: Option<String>,
 }
 
 /// `GET /api/sessions/{id}/acp/install-info`
@@ -168,6 +177,15 @@ pub async fn agent_install_info(
     };
     let (agent, binary) = session_adapter(&state, &instance).await;
     let binary = binary.ok();
+    let package = binary
+        .as_deref()
+        .and_then(crate::acp::install_hints::npm_package_for);
+    let install_blocked = match install_block(&state) {
+        None if instance.is_sandboxed() && !container_running(&id).await => {
+            Some(InstallBlock::ContainerNotRunning)
+        }
+        block => block,
+    };
     Json(AgentInstallInfo {
         display_name: crate::acp::display_name_for(&agent)
             .unwrap_or(&agent)
@@ -175,35 +193,67 @@ pub async fn agent_install_info(
         install_command: binary
             .as_deref()
             .and_then(crate::acp::install_hints::install_hint_for),
-        npm_installable: binary
-            .as_deref()
-            .and_then(crate::acp::install_hints::npm_package_for)
-            .is_some(),
-        install_allowed: install_gate(&state).is_ok()
-            && (!instance.is_sandboxed() || container_running(&id).await),
+        npm_installable: package.is_some(),
+        install_allowed: install_blocked.is_none(),
+        install_blocked,
         sandboxed: instance.is_sandboxed(),
+        container_install_command: package
+            .filter(|_| instance.is_sandboxed())
+            .map(|package| container_install_argv(&id, package).join(" ")),
         agent,
     })
     .into_response()
 }
 
-/// Session-independent refusals of `install-agent`. `install-info` applies the
-/// same gate plus the container check, so the banner never offers a refused install.
-fn install_gate(state: &AppState) -> Result<(), Response> {
-    if let Some(resp) = read_only_block(state).or_else(|| cityhall_block(state)) {
-        return Err(resp);
-    }
-    if !crate::session::Config::load_or_warn()
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallBlock {
+    ReadOnly,
+    Cityhall,
+    SettingOff,
+    ContainerNotRunning,
+}
+
+/// Session-independent refusals of `install-agent`. `install-info` adds the
+/// container check, so the web never offers an install that is refused.
+fn install_block(state: &AppState) -> Option<InstallBlock> {
+    if state.read_only {
+        Some(InstallBlock::ReadOnly)
+    } else if state.cityhall_mode {
+        Some(InstallBlock::Cityhall)
+    } else if !crate::session::Config::load_or_warn()
         .acp
         .allow_agent_install
     {
-        return Err(api_error(
+        Some(InstallBlock::SettingOff)
+    } else {
+        None
+    }
+}
+
+fn install_gate(state: &AppState) -> Result<(), Response> {
+    // Kept in this body, where the read-only admission audit looks for it.
+    if let Some(resp) = read_only_block(state) {
+        return Err(resp);
+    }
+    install_block(state).map_or(Ok(()), |block| Err(refusal(block)))
+}
+
+fn refusal(block: InstallBlock) -> Response {
+    match block {
+        InstallBlock::ReadOnly => crate::server::api::read_only_response(),
+        InstallBlock::Cityhall => crate::server::api::cityhall_response(),
+        InstallBlock::SettingOff => api_error(
             StatusCode::FORBIDDEN,
             "install_disabled",
             "Installing agents from the web is off. Enable acp.allow_agent_install (Settings, local only).",
-        ));
+        ),
+        InstallBlock::ContainerNotRunning => api_error(
+            StatusCode::CONFLICT,
+            "container_not_running",
+            "The session's sandbox container is not running. Open the session (which starts its container) and try again.",
+        ),
     }
-    Ok(())
 }
 
 /// `POST /api/sessions/{id}/acp/install-agent`: install the session's adapter
@@ -337,8 +387,14 @@ mod tests {
             (status, body)
         };
         let get = |id: &'static str| fetch(state.clone(), id);
+        crate::session::config::update_config(|c| {
+            c.sandbox.container_runtime = crate::session::config::ContainerRuntimeName::Podman
+        })
+        .unwrap();
         let claude_npm = "npm install -g @agentclientprotocol/claude-agent-acp@latest";
-        for (id, agent, name, command, npm, sandboxed) in [
+        let in_container =
+            "podman exec aoe-sandbox-sandboxe npm install -g @agentclientprotocol/claude-agent-acp@latest";
+        for (id, agent, name, command, npm, sandboxed, container) in [
             (
                 "claude",
                 "claude",
@@ -346,6 +402,7 @@ mod tests {
                 Some(claude_npm),
                 true,
                 false,
+                None,
             ),
             (
                 "opencode",
@@ -354,6 +411,7 @@ mod tests {
                 crate::acp::install_hints::install_hint_for("opencode"),
                 false,
                 false,
+                None,
             ),
             (
                 "override",
@@ -362,8 +420,17 @@ mod tests {
                 Some("npm install -g @agentclientprotocol/codex-acp@latest"),
                 true,
                 false,
+                None,
             ),
-            ("custom", "my-wrapper", "my-wrapper", None, false, false),
+            (
+                "custom",
+                "my-wrapper",
+                "my-wrapper",
+                None,
+                false,
+                false,
+                None,
+            ),
             (
                 "sandboxed",
                 "claude",
@@ -371,6 +438,7 @@ mod tests {
                 Some(claude_npm),
                 true,
                 true,
+                Some(in_container),
             ),
         ] {
             let (status, body) = get(id).await;
@@ -383,7 +451,9 @@ mod tests {
                     "install_command": command,
                     "npm_installable": npm,
                     "install_allowed": false,
+                    "install_blocked": "setting_off",
                     "sandboxed": sandboxed,
+                    "container_install_command": container,
                 }),
                 "{id}"
             );
@@ -399,15 +469,21 @@ mod tests {
             vec![session("claude", "claude", None, false)],
             |state| state.read_only = true,
         );
-        for (label, setting, state, allowed) in [
-            ("setting off", false, state.clone(), false),
-            ("setting on", true, state.clone(), true),
-            ("CityHall", true, cityhall, false),
-            ("read-only", true, read_only, false),
+        for (label, setting, state, blocked) in [
+            ("setting off", false, state.clone(), Some("setting_off")),
+            ("setting on", true, state.clone(), None),
+            ("CityHall", true, cityhall, Some("cityhall")),
+            ("read-only", true, read_only, Some("read_only")),
         ] {
             crate::session::config::update_config(|c| c.acp.allow_agent_install = setting).unwrap();
             let body = fetch(state.clone(), "claude").await.1;
+            let allowed = blocked.is_none();
             assert_eq!(body["install_allowed"], allowed, "{label}");
+            assert_eq!(
+                body["install_blocked"],
+                serde_json::json!(blocked),
+                "{label}"
+            );
             if !allowed {
                 let refused = install_agent(State(state), Path("claude".to_string()))
                     .await
@@ -419,9 +495,15 @@ mod tests {
         // The loop leaves the setting on; a stopped container still refuses.
         let body = fetch(state.clone(), "sandboxed").await.1;
         assert_eq!(body["install_allowed"], false, "stopped container");
+        assert_eq!(body["install_blocked"], "container_not_running");
         let refused = install_agent(State(state), Path("sandboxed".to_string()))
             .await
             .into_response();
         assert_eq!(refused.status(), StatusCode::CONFLICT, "stopped container");
+        let refused = axum::body::to_bytes(refused.into_body(), 4096)
+            .await
+            .unwrap();
+        let refused: serde_json::Value = serde_json::from_slice(&refused).unwrap();
+        assert_eq!(refused["error"], "container_not_running");
     }
 }
