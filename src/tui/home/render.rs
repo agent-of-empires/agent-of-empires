@@ -5507,7 +5507,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "web"))]
+#[cfg(test)]
 mod plugin_status_plan_tests {
     use super::plan_plugin_statuses;
     use crate::plugin::ui_state::Tone;

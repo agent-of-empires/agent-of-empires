@@ -327,6 +327,11 @@ mod tests {
                "session_id": session_id, "payload": {"text": text}})
     }
 
+    fn row_badge(session_id: &str, payload: serde_json::Value) -> serde_json::Value {
+        json!({"plugin_id": "gh", "slot": "row-badge", "id": "b",
+               "session_id": session_id, "payload": payload})
+    }
+
     /// Screen column where `needle` starts on the first row carrying it. Indexes
     /// the per-cell strings from `rows`, one character per painted cell, so it is
     /// a real column: a byte offset would be skewed by the multi-byte `▸ `
@@ -406,6 +411,32 @@ mod tests {
         let (cells, width) = row_column_cells(&state, "s1");
         assert_eq!(cells.len(), 1);
         assert_eq!(width, ROW_COLUMN_MAX_WIDTH);
+    }
+
+    #[test]
+    fn row_badges_render_items_and_tooltip_fallback() {
+        let state = state_with(
+            &["s1"],
+            json!([
+                row_badge(
+                    "s1",
+                    json!({"items": [
+                        {"text": "CI", "tone": "danger"},
+                        {"tooltip": "ico"}
+                    ]}),
+                ),
+                row_badge("s1", json!({"tooltip": "wip"})),
+            ]),
+        );
+        let (cells, width) = row_column_cells(&state, "s1");
+        assert!(width <= ROW_COLUMN_MAX_WIDTH, "{width} cells");
+        let texts: Vec<&str> = cells.iter().map(|(t, _)| t.as_str()).collect();
+        // Itemized badge: each item's text (tooltip when text is absent).
+        assert_eq!(&texts[..2], &["CI", "ico"], "{texts:?}");
+        // Badge without an items list: the top-level tooltip is the fallback.
+        assert_eq!(texts[2], "wip", "{texts:?}");
+        let painted = rows(&state);
+        assert!(painted.iter().any(|l| l.contains("CI")), "{painted:?}");
     }
 
     #[test]
