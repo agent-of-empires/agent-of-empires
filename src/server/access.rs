@@ -513,6 +513,8 @@ pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     ("POST", "/api/suggestions/dismiss"),
     ("POST", "/api/suggestions/undismiss"),
     ("PATCH", "/api/suggestions/sources"),
+    ("PUT", "/api/suggestions/templates"),
+    ("DELETE", "/api/suggestions/templates"),
     ("POST", "/api/suggestions/prepare"),
     // ACP agent / worker lifecycle + config.
     ("DELETE", "/api/sessions/{id}/acp"),

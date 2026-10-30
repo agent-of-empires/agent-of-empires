@@ -3,8 +3,9 @@
 //!
 //! Rows are keyed by `effective_profile`, resolved by the callers on publish and
 //! on read alike. A provider's display name and source metadata come from the
-//! manifest; only status, items, source overrides and dismissals are stored.
-use std::collections::{BTreeSet, HashMap, HashSet};
+//! manifest; only status, items, source overrides, dismissals and prompt
+//! templates are stored.
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use aoe_plugin_api::suggestions::MAX_KEY_BYTES;
 use aoe_plugin_api::{
@@ -25,7 +26,7 @@ const MAX_REASON_BYTES: usize = 2048;
 const MAX_URL_BYTES: usize = 2048;
 const MAX_PROJECT_BYTES: usize = 4096;
 const MAX_PREVIEW_BYTES: usize = 16 * 1024;
-const MAX_PROMPT_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_PROMPT_BYTES: usize = 64 * 1024;
 const MAX_VARIABLE_VALUE_BYTES: usize = 2048;
 const MAX_ERROR_BYTES: usize = 4096;
 const MAX_CHECKS: usize = 32;
@@ -81,6 +82,13 @@ pub(super) fn init(conn: &Connection) -> rusqlite::Result<()> {
              provider_id TEXT NOT NULL,
              item_id     TEXT NOT NULL,
              PRIMARY KEY (profile, provider_id, item_id)
+         );
+         CREATE TABLE IF NOT EXISTS suggestion_templates (
+             profile     TEXT NOT NULL,
+             provider_id TEXT NOT NULL,
+             criterion   TEXT NOT NULL,
+             template    TEXT NOT NULL,
+             PRIMARY KEY (profile, provider_id, criterion)
          );
          CREATE TABLE IF NOT EXISTS suggestion_checks (
              profile     TEXT NOT NULL,
@@ -298,6 +306,108 @@ pub(crate) fn set_source(
         params![profile, provider_id, criterion, enabled],
     )?;
     Ok(())
+}
+
+/// The user's prompt template for a criterion; no row means the provider's
+/// `draft.prompt`, while an empty template means an empty prompt.
+pub(crate) fn template(
+    conn: &Connection,
+    profile: &str,
+    provider_id: &str,
+    criterion: &str,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT template FROM suggestion_templates
+         WHERE profile = ?1 AND provider_id = ?2 AND criterion = ?3",
+        params![profile, provider_id, criterion],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+pub(crate) fn set_template(
+    conn: &Connection,
+    profile: &str,
+    provider_id: &str,
+    criterion: &str,
+    template: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO suggestion_templates (profile, provider_id, criterion, template)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (profile, provider_id, criterion) DO UPDATE SET template = ?4",
+        params![profile, provider_id, criterion, template],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn delete_template(
+    conn: &Connection,
+    profile: &str,
+    provider_id: &str,
+    criterion: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM suggestion_templates
+         WHERE profile = ?1 AND provider_id = ?2 AND criterion = ?3",
+        params![profile, provider_id, criterion],
+    )?;
+    Ok(())
+}
+
+/// Every stored template of the profile as `(provider_id, criterion, template)`.
+pub(crate) fn templates(
+    conn: &Connection,
+    profile: &str,
+) -> rusqlite::Result<Vec<(String, String, String)>> {
+    conn.prepare(
+        "SELECT provider_id, criterion, template FROM suggestion_templates
+         WHERE profile = ?1 ORDER BY provider_id, criterion",
+    )?
+    .query_map([profile], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+    .collect()
+}
+
+/// An expanded prompt would exceed [`MAX_PROMPT_BYTES`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PromptTooLong;
+
+/// Replaces `{name}` with the item's variable of that name, scanning left to
+/// right: `{a{pr_number}}` becomes `{a42}`. Anything else, including unknown
+/// names and stray braces, stays as typed, and substituted values are never
+/// scanned again: they are untrusted text. Stops once the output would pass
+/// [`MAX_PROMPT_BYTES`].
+fn expand(template: &str, variables: &BTreeMap<String, String>) -> Result<String, PromptTooLong> {
+    fn push(out: &mut String, text: &str) -> Result<(), PromptTooLong> {
+        if out.len() + text.len() > MAX_PROMPT_BYTES {
+            return Err(PromptTooLong);
+        }
+        out.push_str(text);
+        Ok(())
+    }
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        push(&mut out, &rest[..open])?;
+        let after = &rest[open + 1..];
+        // Names hold no braces, so the first brace after `{` decides.
+        let known = after
+            .find(['{', '}'])
+            .filter(|&i| after.as_bytes()[i] == b'}')
+            .and_then(|close| variables.get(&after[..close]).map(|value| (value, close)));
+        match known {
+            Some((value, close)) => {
+                push(&mut out, value)?;
+                rest = &after[close + 1..];
+            }
+            None => {
+                push(&mut out, "{")?;
+                rest = after;
+            }
+        }
+    }
+    push(&mut out, rest)?;
+    Ok(out)
 }
 
 /// Stored items whose criterion is currently enabled.
@@ -532,8 +642,17 @@ fn resolve_project(profile: &str, wanted: &str) -> Option<Project> {
 }
 
 /// Wizard prefill for `item`, resolved through the normal config cascade of its
-/// project, or the saved profile settings when it names none.
-pub(crate) fn prepare(profile: &str, item: &Suggestion) -> Value {
+/// project, or the saved profile settings when it names none. A `template`
+/// replaces the provider's prompt, expanded from the item's variables.
+pub(crate) fn prepare(
+    profile: &str,
+    item: &Suggestion,
+    template: Option<&str>,
+) -> Result<Value, PromptTooLong> {
+    let prompt = match template {
+        Some(t) => expand(t, &item.variables)?,
+        None => item.draft.prompt.clone(),
+    };
     let project = item
         .project
         .as_deref()
@@ -550,16 +669,16 @@ pub(crate) fn prepare(profile: &str, item: &Suggestion) -> Value {
             config.sandbox.enabled_by_default = enabled;
         }
     }
-    json!({
+    Ok(json!({
         "title": item.draft.title,
-        "initial_prompt": item.draft.prompt,
+        "initial_prompt": prompt,
         "source_ref": item.source_ref,
         "project": project.map(|p| json!({ "name": p.name, "path": p.path })),
         "tool": config.session.default_tool.unwrap_or_else(|| "claude".to_string()),
         "yolo": config.session.yolo_mode_default,
         "sandbox": config.sandbox.enabled_by_default,
         "worktree": config.worktree.enabled,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -806,7 +925,7 @@ mod tests {
         let prepared = |project: Option<&str>| {
             let mut i = item("a", "assigned");
             i.project = project.map(String::from);
-            prepare("default", &i)
+            prepare("default", &i, None).unwrap()
         };
         for hit in ["widgets", "/tmp/aoe-widgets"] {
             assert_eq!(prepared(Some(hit))["project"]["name"], "widgets", "{hit}");
@@ -901,6 +1020,87 @@ mod tests {
             snap(&conn, "p")["providers"][0]["checks"],
             json!([check("cli", "ok")])
         );
+    }
+
+    #[test]
+    fn expand_substitutes_only_known_names_once() {
+        let vars: BTreeMap<String, String> = [
+            ("pr_number".to_string(), "42".to_string()),
+            ("repo".to_string(), "{pr_number}".to_string()),
+            ("name".to_string(), "日本語".to_string()),
+        ]
+        .into();
+        let cases = [
+            ("/aoe-review #{pr_number}", "/aoe-review #42"),
+            ("{pr_number}{pr_number}", "4242"),
+            ("{repo}", "{pr_number}"),
+            ("{bogus} {} { {pr_number", "{bogus} {} { {pr_number"),
+            ("{a{pr_number}}", "{a42}"),
+            ("no placeholders", "no placeholders"),
+            ("", ""),
+            ("é{pr_number}日 {é}", "é42日 {é}"),
+            ("{name}é{", "日本語é{"),
+        ];
+        for (template, expected) in cases {
+            assert_eq!(
+                expand(template, &vars).as_deref(),
+                Ok(expected),
+                "{template:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn expand_stops_at_the_prompt_bound() {
+        let vars: BTreeMap<String, String> = [("x".to_string(), "ab".to_string())].into();
+        assert!(expand(&"a".repeat(MAX_PROMPT_BYTES), &vars).is_ok());
+        assert_eq!(
+            expand(&"a".repeat(MAX_PROMPT_BYTES + 1), &vars),
+            Err(PromptTooLong)
+        );
+        // Exactly at the bound, then one byte over, through substitution.
+        let at = format!("{}{{x}}", "a".repeat(MAX_PROMPT_BYTES - 2));
+        assert_eq!(expand(&at, &vars).unwrap().len(), MAX_PROMPT_BYTES);
+        let over = format!("{}{{x}}", "a".repeat(MAX_PROMPT_BYTES - 1));
+        assert_eq!(expand(&over, &vars), Err(PromptTooLong));
+        // Many braces stay linear and verbatim.
+        let braces = "{".repeat(MAX_PROMPT_BYTES);
+        assert_eq!(expand(&braces, &vars).unwrap(), braces);
+    }
+
+    #[test]
+    fn templates_are_stored_per_profile_and_criterion() {
+        let conn = store();
+        let get = |profile, criterion| template(&conn, profile, "acme.github", criterion).unwrap();
+        assert_eq!(get("p", "assigned"), None);
+        set_template(&conn, "p", "acme.github", "assigned", "first").unwrap();
+        set_template(&conn, "p", "acme.github", "assigned", "").unwrap();
+        set_template(&conn, "p", "acme.github", "quiet", "q").unwrap();
+        assert_eq!(get("p", "assigned").as_deref(), Some(""));
+        assert_eq!(get("other", "assigned"), None);
+        assert_eq!(templates(&conn, "p").unwrap().len(), 2);
+        delete_template(&conn, "p", "acme.github", "assigned").unwrap();
+        assert_eq!(get("p", "assigned"), None);
+        assert_eq!(get("p", "quiet").as_deref(), Some("q"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn prepare_applies_the_template_in_place_of_the_draft_prompt() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let i = item("a", "assigned");
+        let prompt =
+            |template| prepare("default", &i, template).map(|v| v["initial_prompt"].clone());
+        assert_eq!(prompt(None), Ok(json!("Do work")));
+        assert_eq!(
+            prompt(Some("Fix {repo} {nope}")),
+            Ok(json!("Fix acme/widgets {nope}"))
+        );
+        assert_eq!(prompt(Some("")), Ok(json!("")));
+        // 12-byte value, template within the stored bound: expansion is not.
+        let bomb = "{repo}".repeat(MAX_PROMPT_BYTES / "{repo}".len());
+        assert!(bomb.len() <= MAX_PROMPT_BYTES);
+        assert_eq!(prompt(Some(&bomb)), Err(PromptTooLong));
     }
 
     #[test]
