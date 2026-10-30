@@ -187,8 +187,11 @@ pub fn spawn_tailer(
 
 /// Like [`spawn_tailer`], for a sub-agent whose end someone else reports (a
 /// workflow agent, ended by its run's journal): only progress is emitted, and
-/// the tailer runs until `stop` fires or the session goes away. The publisher
-/// is weak so a reader never keeps a dead connection's channel open.
+/// the tailer runs until `stop` fires or the session goes away. On `stop` it
+/// reads the transcript once more and publishes that progress before the
+/// returned task finishes, so a completion published after it keeps the
+/// agent's final tools. The publisher is weak so a reader never keeps a dead
+/// connection's channel open.
 pub(crate) fn spawn_progress_tailer(
     agent_id: String,
     output_file: String,
@@ -226,8 +229,19 @@ async fn run_progress_tailer(
     let mut last_growth = Utc::now();
     let mut stalled_emitted = false;
     loop {
+        let stopping = stop.is_cancelled();
         let grew = source.exists(&output_file).await
             && read_new_lines(&source, &output_file, &mut offset, &mut line_buf, &mut snap).await;
+        if stopping {
+            if snap.parsed_any {
+                if let Some(tx) = event_tx.upgrade() {
+                    let _ = tx
+                        .send(progress(agent_id, BackgroundAgentStatus::Running, &snap))
+                        .await;
+                }
+            }
+            return;
+        }
         let now = Utc::now();
         if grew {
             last_growth = now;
@@ -262,7 +276,7 @@ async fn run_progress_tailer(
         }
         tokio::select! {
             _ = tokio::time::sleep(POLL_INTERVAL) => {}
-            _ = stop.cancelled() => return,
+            _ = stop.cancelled() => {}
         }
     }
 }
@@ -707,8 +721,26 @@ mod tests {
             Some(Event::BackgroundAgentProgress { tool_count, .. }) => assert_eq!(tool_count, 1),
             other => panic!("expected progress, got {other:?}"),
         }
+        // Written after the last progress: the stop's final read still reports it.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(
+            &mut file,
+            concat!(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Read"}]}}"#,
+                "\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
         stop.cancel();
         tailer.await.unwrap();
+        match rx.try_recv() {
+            Ok(Event::BackgroundAgentProgress { tool_count, .. }) => assert_eq!(tool_count, 2),
+            other => panic!("expected the final progress, got {other:?}"),
+        }
         assert!(
             rx.try_recv().is_err(),
             "no completion from a progress tailer"

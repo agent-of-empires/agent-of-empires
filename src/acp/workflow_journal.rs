@@ -167,7 +167,7 @@ struct Follower {
     skipping_line: bool,
     launched: HashSet<String>,
     completed: HashSet<String>,
-    tailers: HashMap<String, CancellationToken>,
+    tailers: HashMap<String, (CancellationToken, Option<tokio::task::JoinHandle<()>>)>,
 }
 
 impl Follower {
@@ -257,14 +257,14 @@ impl Follower {
                 }
                 if !self.completed.contains(agent_id) && !self.tailers.contains_key(agent_id) {
                     let stop = CancellationToken::new();
-                    self.tailers.insert(agent_id.to_string(), stop.clone());
-                    let _ = spawn_progress_tailer(
+                    let tailer = spawn_progress_tailer(
                         agent_id.to_string(),
                         output_file.to_string_lossy().into_owned(),
                         self.journal.event_tx.clone(),
                         self.journal.bg_agents.clone(),
-                        stop,
+                        stop.clone(),
                     );
+                    self.tailers.insert(agent_id.to_string(), (stop, tailer));
                 }
                 true
             }
@@ -272,9 +272,7 @@ impl Follower {
                 if !self.completed.insert(agent_id.to_string()) {
                     return true;
                 }
-                if let Some(stop) = self.tailers.remove(agent_id) {
-                    stop.cancel();
-                }
+                self.finish_tailer(agent_id).await;
                 let result = entry.get("result").and_then(result_text);
                 self.send(completed(
                     agent_id,
@@ -293,6 +291,7 @@ impl Follower {
             self.launched.difference(&self.completed).cloned().collect();
         unreported.sort();
         for agent_id in unreported {
+            self.finish_tailer(&agent_id).await;
             let event = completed(
                 &agent_id,
                 BackgroundAgentStatus::Detached,
@@ -306,10 +305,22 @@ impl Follower {
         }
     }
 
+    /// Stops an agent's tailer and waits for its final progress, which then
+    /// precedes the completion.
+    async fn finish_tailer(&mut self, agent_id: &str) {
+        if let Some((stop, tailer)) = self.tailers.remove(agent_id) {
+            stop.cancel();
+            if let Some(tailer) = tailer {
+                let _ = tailer.await;
+            }
+        }
+    }
+
     fn stop_tailers(&mut self) {
-        for (_, stop) in self.tailers.drain() {
+        for (stop, _) in self.tailers.values() {
             stop.cancel();
         }
+        self.tailers.clear();
     }
 
     async fn send(&self, event: Event) -> bool {
@@ -534,6 +545,36 @@ mod tests {
             .await
             .expect("the journal follower outlived its connection")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_result_keeps_the_agents_final_tools() {
+        let fx = Fixture::new();
+        std::fs::write(
+            fx.dir.join("agent-a1.jsonl"),
+            concat!(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#,
+                "\n",
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":false}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        // Both entries are read in one batch, before the tailer ever runs.
+        fx.append(&[STARTED_A1, RESULT_A1]);
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let journal = fx.journal(&fx.dir, WorkflowAgents::default(), &tx);
+        let events = run_ended(journal, tx, rx).await;
+        let mut state = crate::acp::AcpState::default();
+        for (seq, event) in events.into_iter().enumerate() {
+            state.apply_event(seq as u64 + 1, event).unwrap();
+        }
+        let agent = &state.background_agents[0];
+        assert_eq!(agent.status, BackgroundAgentStatus::Completed);
+        assert_eq!(agent.tool_count, 1);
+        assert_eq!(agent.tools.len(), 1);
+        assert_eq!(agent.tools[0].ok, Some(true));
+        assert_eq!(agent.result.as_deref(), Some("drafted"));
     }
 
     #[tokio::test]
