@@ -192,6 +192,22 @@ impl PluginHost {
         .await
     }
 
+    /// Send the fix method the provider stored with its current error to that
+    /// worker. `None` when the provider has no fix; otherwise whether a live
+    /// worker was notified.
+    pub async fn run_suggestion_fix(&self, provider_id: &str) -> anyhow::Result<Option<bool>> {
+        let method = self.with_suggestions_db(|conn, profile| {
+            crate::plugin::suggestions::fix_method(conn, profile, provider_id)
+        })?;
+        let Some(method) = method else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.notify_worker(provider_id, &method, serde_json::json!({}))
+                .await,
+        ))
+    }
+
     /// Ask every suggestions worker to report its setup checks again.
     /// Returns how many workers were notified.
     pub async fn run_suggestion_checks(&self) -> usize {

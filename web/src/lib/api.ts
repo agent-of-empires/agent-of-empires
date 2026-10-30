@@ -3244,6 +3244,9 @@ async function suggestionRequest<T>(url: string, method: string, body?: unknown)
 
 export const refreshSuggestions = () => suggestionRequest("/api/suggestions/refresh", "POST");
 
+export const runSuggestionFix = (providerId: string) =>
+  suggestionRequest("/api/suggestions/fix", "POST", { provider_id: providerId });
+
 export const dismissSuggestion = (providerId: string, id: string, dismissed: boolean) =>
   suggestionRequest(`/api/suggestions/${dismissed ? "dismiss" : "undismiss"}`, "POST", { provider_id: providerId, id });
 

@@ -9,6 +9,7 @@ import type { SuggestionsSnapshot } from "../../../lib/types";
 
 const api = vi.hoisted(() => ({
   fetchSuggestions: vi.fn(),
+  runSuggestionFix: vi.fn(),
   updateSuggestionPrefs: vi.fn(),
   updateSuggestionSource: vi.fn(),
   fetchSuggestionTemplates: vi.fn(),
@@ -140,6 +141,22 @@ describe("SuggestionsSettings", () => {
     fireEvent.click(screen.getByRole("button", { name: "Show" }));
     expect(openFull).toHaveBeenCalledWith(true);
     expect((screen.getByRole("switch", { name: "Start without review" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("shows the agent-usage note and runs the plugin's fix", async () => {
+    const snap = snapshot();
+    snap.providers[0].uses_agent = true;
+    snap.providers[1].fix = { label: "Fix in Linear settings" };
+    api.fetchSuggestions.mockResolvedValue(snap);
+    api.fetchSuggestionTemplates.mockResolvedValue([]);
+    api.fetchSuggestionMappings.mockResolvedValue([]);
+    api.fetchProjects.mockResolvedValue([]);
+    api.runSuggestionFix.mockResolvedValue(ok);
+    render(<Harness readOnly={false} onOpenSuggestions={vi.fn()} />);
+    expect((await screen.findByText(/uses an Agent to read the codebase/)).textContent).toContain("Plugin");
+    expect(screen.getAllByText(/uses an Agent/)).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Fix in Linear settings" }));
+    await waitFor(() => expect(api.runSuggestionFix).toHaveBeenCalledWith("lin"));
   });
 
   it("disables every control when read-only", async () => {
