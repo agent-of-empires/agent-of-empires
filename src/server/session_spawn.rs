@@ -66,6 +66,7 @@ pub(crate) struct StructuredSessionSpec {
     pub fork_seed: Option<crate::session::ForkSeed>,
     /// Where the web wizard polls this create's stage and hook output.
     pub progress: Option<Arc<crate::server::create_progress::CreateProgress>>,
+    pub cli: Option<crate::daemon::CliCreationOptions>,
 }
 
 /// Created session and transient warnings; HTTP row authority is the runtime snapshot.
@@ -73,6 +74,10 @@ pub(crate) struct SpawnOutcome {
     pub instance: Instance,
     pub warnings: Vec<String>,
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct CliDuplicateSession(anyhow::Error);
 
 /// Marker error the core returns when the blocking build task panicked, so the
 /// HTTP handler can keep answering `500 Internal Server Error` for that case
@@ -152,6 +157,7 @@ pub(crate) async fn spawn_structured_session(
             import_binding,
             fork_seed,
             progress,
+            cli,
         } = spec;
 
 
@@ -227,6 +233,10 @@ pub(crate) async fn spawn_structured_session(
             },
             scratch,
             fork_seed,
+            generated_name: cli.as_ref().is_some_and(|options| options.generated_name),
+            no_submodules: cli.as_ref().is_some_and(|options| options.no_submodules),
+            tie_workdir_to_name: cli.is_some(),
+            worktree_path_id: cli.as_ref().and_then(|options| options.worktree_path_id.clone()),
         };
 
         let namespace = runtime.block_on(worker_state.profile_namespace.read());
@@ -250,6 +260,13 @@ pub(crate) async fn spawn_structured_session(
         let mut plan = builder::plan_instance(params, &title_refs, &branch_refs, &profile)?;
         let instance = &mut plan.result.instance;
         instance.source_profile = profile.clone();
+        if let Some(parent) = cli.as_ref().and_then(|options| options.parent.as_deref()) {
+            let rows = worker_state.instances.blocking_read();
+            let parent = super::api::sessions::resolve_cli_session(&rows, &profile, parent)?;
+            anyhow::ensure!(parent.parent_session_id.is_none(), "Cannot create a sub-session of a sub-session");
+            instance.parent_session_id = Some(parent.id.clone());
+            instance.group_path = parent.group_path.clone();
+        }
         instance.file_watch = Some(worker_state.file_watch.clone());
         native.set_status_id(instance.id.clone());
         instance.created_by_plugin = created_by_plugin;
@@ -324,6 +341,9 @@ pub(crate) async fn spawn_structured_session(
             instance.status = Status::Creating;
             store.update(|rows, groups| {
                 anyhow::ensure!(!rows.iter().any(|row| row.id == instance.id), "created session already exists");
+                if cli.is_some() && crate::session::is_duplicate_session(rows.iter(), &instance.title, &instance.project_path, None) {
+                    return Err(CliDuplicateSession(crate::session::duplicate_session_error(&instance.title)).into());
+                }
                 rows.push(instance.clone());
                 *groups = crate::session::GroupTree::new_with_groups(std::slice::from_ref(instance), groups).get_all_groups();
                 Ok(())
@@ -560,6 +580,27 @@ pub(crate) async fn spawn_structured_session(
         if let Err(error) = creation {
             rollback(native, instance, provisioning_failed);
             return Err(error);
+        }
+
+        if cli.is_some() && !instance.is_structured() {
+            creation_guard.commit()?;
+            let _namespace = runtime.block_on(worker_state.profile_namespace.read());
+            let _submission = runtime.block_on(worker_state.session_service.prompt_submission(&instance.id));
+            let _guard = lock.blocking_lock();
+            store.update(|rows, _| {
+                let row = rows.iter_mut().find(|row| row.id == instance.id)
+                    .ok_or(crate::session::LifecycleReservationError::Superseded)?;
+                anyhow::ensure!(row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation),
+                    crate::session::LifecycleReservationError::Superseded);
+                row.sandbox_info = instance.sandbox_info.clone();
+                row.status = Status::Stopped;
+                row.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
+                instance = row.clone();
+                Ok(())
+            })?;
+            native.adopt_runtime_fields(&instance)?;
+            crate::tips::record_session_creations(1);
+            return Ok((instance, build_warnings, agent_effort, native, creation_profile, None));
         }
 
         if let Some(progress) = progress.as_deref() {
@@ -1055,6 +1096,7 @@ mod tests {
             import_binding: None,
             fork_seed: None,
             progress: None,
+            cli: None,
         };
         let result = spawn_structured_session(&state.session_service, spec).await;
         assert!(

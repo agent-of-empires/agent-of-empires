@@ -31,20 +31,21 @@ use thiserror::Error;
 pub use wire::{
     AbandonPurgeBody, AcpWorkerStart, AcpWorkerStartKind, AcpWorkerState, AttachProjectBody,
     AttachProjectOutcome, AttachedProject, AttachedWorkerOutcome, CleanupDefaults,
-    CollapseGroupBody, ContextResumeAvailability, ContextResumeIndeterminateReason,
-    ContextResumeUnavailableReason, CreateProfileBody, CreateProjectBody, CreateSessionBody,
-    CreationTrustFingerprint, CreationTrustRequest, CreationTrustReview, DefaultProfileBody,
-    DeleteGroupBody, DeleteGroupMode, DeleteGroupOutcome, DeleteProfileQuery, DeleteSessionBody,
-    EmptyTrashBody, EmptyTrashOutcome, EnsureToolBody, GroupLocation, GroupSessionFailure,
-    GroupSessionFailureCode, GroupSessionOutcome, ListSessionsQuery, MoveDirection, MoveGroupBody,
-    PendingApproval, PlanSummary, PromptAttachmentKind, PromptAttachmentRef, PurgeOutcome,
-    QueuedPromptEntry, RenameOutcome, RenameProfileBody, RenameSessionBody, ReorderBody,
-    ReorderOutcome, RepoBaseInput, RestartOutcome, RestartSessionBody, RestoreOutcome,
-    SessionResponse, SessionsEnvelope, SetWorktreeNameBody, StartSessionBody, StopAuxiliaryBody,
-    TerminalSize, TerminalTarget, TerminalTargetStatus, TrashOutcome, TrashRelocationOutcome,
-    TrashSessionBody, Tristate, UpdateArchiveBody, UpdateColorBody, UpdateDiffBaseBody,
-    UpdateFavoriteBody, UpdateGroupBody, UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody,
-    UpdateUnreadBody, WorkspaceRepoSummary, WorktreeEditOutcome,
+    CliCreationOptions, CollapseGroupBody, ContextResumeAvailability,
+    ContextResumeIndeterminateReason, ContextResumeUnavailableReason, CreateProfileBody,
+    CreateProjectBody, CreateSessionBody, CreationTrustFingerprint, CreationTrustRequest,
+    CreationTrustReview, DefaultProfileBody, DeleteGroupBody, DeleteGroupMode, DeleteGroupOutcome,
+    DeleteProfileQuery, DeleteSessionBody, EmptyTrashBody, EmptyTrashOutcome, EnsureToolBody,
+    GroupLocation, GroupSessionFailure, GroupSessionFailureCode, GroupSessionOutcome,
+    ListSessionsQuery, MoveDirection, MoveGroupBody, PendingApproval, PlanSummary,
+    PromptAttachmentKind, PromptAttachmentRef, PurgeOutcome, QueuedPromptEntry, RenameOutcome,
+    RenameProfileBody, RenameSessionBody, ReorderBody, ReorderOutcome, RepoBaseInput,
+    RestartOutcome, RestartSessionBody, RestoreOutcome, SessionResponse, SessionsEnvelope,
+    SetWorktreeNameBody, StartSessionBody, StopAuxiliaryBody, TerminalSize, TerminalTarget,
+    TerminalTargetStatus, TrashOutcome, TrashRelocationOutcome, TrashSessionBody, Tristate,
+    UpdateArchiveBody, UpdateColorBody, UpdateDiffBaseBody, UpdateFavoriteBody, UpdateGroupBody,
+    UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody, UpdateUnreadBody,
+    WorkspaceRepoSummary, WorktreeEditOutcome,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -155,6 +156,8 @@ fn committed_failure_message(code: ApiErrorCode) -> &'static str {
 fn daemon_status_message(status: StatusCode, code: Option<ApiErrorCode>, body: &str) -> String {
     match code {
         Some(ApiErrorCode::ManagedResumeRefused(cause)) => cause.message().into(),
+        Some(ApiErrorCode::AgentHooksNotApproved) =>
+            "Agent hook paths have not been approved; run `aoe hooks approve` on the Daemon host before launching".into(),
         Some(ApiErrorCode::SmartRenameSkipped) => {
             "Auto-name is unavailable for this session; check its repository and tool configuration"
                 .into()
@@ -178,6 +181,42 @@ fn daemon_status_message(status: StatusCode, code: Option<ApiErrorCode>, body: &
         }
         _ => format!("daemon returned HTTP {status}: {body}"),
     }
+}
+
+fn public_creation_failure(body: &str, local_owner: bool) -> String {
+    #[derive(serde::Deserialize)]
+    struct Failure {
+        error: String,
+        message: String,
+        stage: Option<String>,
+        reference: Option<String>,
+    }
+    let Ok(failure) = serde_json::from_str::<Failure>(body) else {
+        return "Session creation failed; inspect the Daemon log".to_owned();
+    };
+    let public = matches!(
+        failure.error.as_str(),
+        "create_failed"
+            | "internal"
+            | "hook_failed"
+            | "sandbox_unavailable"
+            | "sandbox_image_pull_failed"
+            | "working_dir_missing"
+            | "create_outcome_unknown"
+            | "creation_cancelled"
+            | "creation_trust_changed"
+    );
+    if !public && !local_owner {
+        return "Session creation refused; inspect the Daemon log".to_owned();
+    }
+    let mut message = failure.message;
+    if let Some(stage) = failure.stage {
+        message.push_str(&format!(" [stage: {stage}]"));
+    }
+    if let Some(reference) = failure.reference {
+        message.push_str(&format!(" [reference: {reference}]"));
+    }
+    message
 }
 
 impl DaemonClient {
@@ -252,6 +291,24 @@ impl DaemonClient {
         self.request_json(self.http.get(url)).await
     }
 
+    /// Publish and read canonical state from the same Daemon epoch.
+    pub async fn runtime_snapshot(
+        &self,
+        epoch: &str,
+    ) -> Result<RuntimeSnapshot, DaemonClientError> {
+        let url = self
+            .sessions_url
+            .join("runtime/snapshot")
+            .map_err(|_| DaemonClientError::Transport)?;
+        let snapshot: RuntimeSnapshot = self
+            .request_json(self.http.get(url).header(RUNTIME_EPOCH_HEADER, epoch))
+            .await?;
+        if snapshot.cursor.epoch != epoch {
+            return Err(DaemonClientError::InvalidMutationReceipt);
+        }
+        Ok(snapshot)
+    }
+
     /// The daemon's own default profile, which can differ from this client's config.
     pub async fn default_profile(&self) -> Result<String, DaemonClientError> {
         let url = self
@@ -310,6 +367,19 @@ impl DaemonClient {
             && namespace.is_some_and(|expected| expected == info.namespace)
     }
 
+    /// Advisory output only; absence never proves a create failed.
+    pub async fn creation_progress(
+        &self,
+        key: &str,
+    ) -> Result<wire::CreationOutput, DaemonClientError> {
+        let url = format!(
+            "{}/create-progress/{}",
+            self.sessions_url,
+            transport::path_segment(key)?
+        );
+        self.request_json(self.http.get(url)).await
+    }
+
     /// Review executable repository configuration without provisioning or granting trust.
     pub async fn review_creation_trust(
         &self,
@@ -333,7 +403,10 @@ impl DaemonClient {
         epoch: &str,
     ) -> Result<MutationReceipt<SessionResponse>, DaemonClientError> {
         self.request_mutation_with_outcome(
-            self.http.post(self.sessions_url.clone()).json(body),
+            self.http
+                .post(self.sessions_url.clone())
+                .timeout(Duration::from_secs(30 * 60))
+                .json(body),
             epoch,
         )
         .await
@@ -865,6 +938,8 @@ impl DaemonClient {
             request = request.header(name.clone(), value.clone());
         }
         let mut request = request.build().map_err(|_| DaemonClientError::Transport)?;
+        let creating =
+            request.method() == reqwest::Method::POST && request.url() == &self.sessions_url;
         if request.timeout().is_none() {
             *request.timeout_mut() = Some(DEFAULT_TIMEOUT);
         }
@@ -929,6 +1004,19 @@ impl DaemonClient {
                     code,
                     body: String::new(),
                     truncated: false,
+                });
+            }
+            if creating {
+                let (body, truncated) = self.read_error_body(&mut response).await?;
+                let body = public_creation_failure(
+                    &body,
+                    self.unix_path.is_some() && !self.authenticated(),
+                );
+                return Err(DaemonClientError::Status {
+                    status,
+                    code,
+                    body,
+                    truncated,
                 });
             }
             if !self.should_read_error_body(code) {
@@ -1259,6 +1347,20 @@ mod tests {
         assert_eq!(default_of(Vec::new()), None);
     }
 
+    #[test]
+    fn creation_failure_discloses_only_the_public_contract_remotely() {
+        let private = r#"{"error":"validation_failed","message":"private configured command SECRET","stage":"SECRET","reference":"SECRET"}"#;
+        let remote = public_creation_failure(private, false);
+        assert!(!remote.contains("SECRET"));
+        assert!(public_creation_failure(private, true).contains("private configured command"));
+        assert!(!public_creation_failure("raw stderr SECRET", false).contains("SECRET"));
+        let public = r#"{"error":"hook_failed","message":"An on_create hook exited with code 7.","stage":"running_hooks","reference":"creation-ref"}"#;
+        let rendered = public_creation_failure(public, false);
+        assert!(rendered.contains("exited with code 7"));
+        assert!(rendered.contains("running_hooks"));
+        assert!(rendered.contains("creation-ref"));
+    }
+
     #[tokio::test]
     async fn native_admission_preserves_degraded_reads_without_relaxing_identity() {
         let root = tempfile::tempdir().unwrap();
@@ -1270,6 +1372,7 @@ mod tests {
             owner_diagnostics: Vec::new(),
             owner_instance_id: None,
             protocol_version: RUNTIME_PROTOCOL_VERSION,
+            cli_creation: true,
             epoch: "native-epoch".into(),
             namespace: root.path().to_str().unwrap().into(),
             tmux_socket: None,

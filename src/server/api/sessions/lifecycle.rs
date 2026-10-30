@@ -2910,6 +2910,11 @@ async fn prepare_agent_session_inner(
                 response
             } else if error.is::<crate::session::NativeStoreUnavailable>() {
                 StatusCode::SERVICE_UNAVAILABLE.into_response()
+            } else if error.is::<crate::session::HostHookApprovalRequired>() {
+                crate::server::api::api_error_with_code_header(
+                    crate::daemon::ApiErrorCode::AgentHooksNotApproved,
+                    "Agent hook paths have not been approved; run `aoe hooks approve` on the Daemon host",
+                )
             } else if let Some(refusal) =
                 error.downcast_ref::<crate::session::ManagedResumeRefused>()
             {

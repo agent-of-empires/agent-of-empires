@@ -84,8 +84,8 @@ pub(crate) use instance::test_helpers::publish_host_pi_transcript;
 #[cfg(test)]
 pub(crate) use instance::ActiveExecution;
 pub(crate) use instance::{
-    duplicate_session_error, is_duplicate_session, PassiveStatusPatch, ResumeIntent, SidWrite,
-    ToolLaunchUnavailable,
+    duplicate_session_error, is_duplicate_session, HostHookApprovalRequired, PassiveStatusPatch,
+    ResumeIntent, SidWrite, ToolLaunchUnavailable,
 };
 pub(crate) use instance::{
     host_hook_agent, host_hook_disclosure, host_hook_disclosure_config_with_repo,

@@ -2524,6 +2524,7 @@ mod tests {
             import_binding: None,
             fork_seed: None,
             progress: None,
+            cli: None,
         }
     }
 

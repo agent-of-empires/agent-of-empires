@@ -65,6 +65,18 @@ pub trait SessionRef {
     fn project_path(&self) -> &str;
 }
 
+impl<T: SessionRef + ?Sized> SessionRef for &T {
+    fn id(&self) -> &str {
+        T::id(self)
+    }
+    fn title(&self) -> &str {
+        T::title(self)
+    }
+    fn project_path(&self) -> &str {
+        T::project_path(self)
+    }
+}
+
 impl SessionRef for Instance {
     fn id(&self) -> &str {
         &self.id

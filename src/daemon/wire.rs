@@ -18,6 +18,10 @@ pub struct CreationTrustRequest {
     pub profile: Option<String>,
     #[serde(default)]
     pub scratch: bool,
+    #[serde(default)]
+    pub generated_worktree_branch: Option<String>,
+    #[serde(default)]
+    pub create_new_branch: bool,
 }
 
 /// Captured configuration, rechecked before approval or provisioning.
@@ -37,6 +41,32 @@ pub struct CreationTrustReview {
     pub mcp_summaries: Vec<String>,
     pub hooks_need_trust: bool,
     pub mcp_need_trust: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_path_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct CreationOutput {
+    pub stage: String,
+    pub hook: Option<String>,
+    pub output: Vec<String>,
+}
+
+/// Additional selection intent used by the CLI. All paths refer to the Daemon host.
+#[derive(Default, Serialize, Deserialize)]
+pub struct CliCreationOptions {
+    pub parent: Option<String>,
+    #[serde(default)]
+    pub projects: Vec<String>,
+    pub command: Option<String>,
+    pub fork_source: Option<String>,
+    #[serde(default)]
+    pub generated_name: bool,
+    #[serde(default)]
+    pub no_submodules: bool,
+    pub worktree_path_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -120,6 +150,9 @@ pub struct CreateSessionBody {
     /// whether it ran, so it refuses rather than run it, and its hooks, again.
     #[serde(default)]
     pub retry_origin: Option<String>,
+    /// CLI selection and deferred-launch policy; omission retains API launch behavior.
+    #[serde(default)]
+    pub cli: Option<CliCreationOptions>,
 }
 
 #[derive(Serialize, Deserialize)]

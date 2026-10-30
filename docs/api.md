@@ -398,6 +398,19 @@ HTTP requests wait for the admitted creation to finish.
 Repository hook and MCP approvals are persisted against the source repository
 before provisioning begins. Failure to persist approval aborts creation.
 
+The optional `cli` object carries CLI selection intent: `parent`, `projects`,
+`command`, `fork_source`, `generated_name`, `no_submodules`, and `worktree_path_id`.
+Selectors, project registries, configuration and paths are resolved on the Daemon host.
+A terminal creation with `cli` runs creation hooks and finishes **Stopped**, without
+launching the agent. Launch is a separate epoch-checked request. Requests without
+`cli` keep the existing lifecycle. `GET /api/runtime` advertises `cli_creation: true`;
+clients must require it before sending CLI intent to avoid an older Daemon ignoring it.
+Concurrent CLI requests with the same title and working directory cannot create duplicates.
+
+Host launches that need agent-hook approval return `409` with
+`aoe-error-code: agent_hooks_not_approved`. Run `aoe hooks approve` on the Daemon
+host before retrying launch; repository creation trust does not grant this approval.
+
 For `trust_hooks`, omission refuses unapproved repository hooks with
 `hooks_need_trust`; `true` approves hooks and project MCP; `false` explicitly
 skips untrusted hooks and MCP. Skipping retains global/profile hooks and any
@@ -409,6 +422,12 @@ granting trust or provisioning a session. It returns merged and repository-only
 hooks, MCP summaries with environment/header names but not their values,
 `hooks_need_trust`, `mcp_need_trust`, and a `fingerprint`. Unknown profiles are
 rejected without creating them; read-only and CityHall modes refuse this route.
+
+For an interactive generated worktree title, the review may also receive
+`generated_worktree_branch` and `create_new_branch`. It returns `suggested_title`
+and `worktree_path_id`, computed without provisioning. Pass the accepted title and
+`cli.worktree_path_id` to creation so templates containing `{session-id}` use the
+same identity. Creation rechecks collisions; the suggestion does not reserve a path.
 
 Pass the returned fingerprint as `trust_review` with the chosen `trust_hooks`
 decision in the creation request. A changed source repository, global/profile

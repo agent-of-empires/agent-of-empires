@@ -92,20 +92,35 @@ fn init_repo_isolated(repo: &Path, home: &Path, xdg: &Path) {
 }
 
 fn run_aoe(home: &Path, xdg: &Path, stub: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_aoe"))
-        .args(args)
-        .env(
-            "PATH",
-            format!(
-                "{}:{}",
-                stub.display(),
-                std::env::var("PATH").unwrap_or_default()
-            ),
-        )
-        .env("HOME", home)
-        .env("XDG_CONFIG_HOME", xdg)
-        .output()
-        .expect("run aoe")
+    let command = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_aoe"));
+        command
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    stub.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env("HOME", home)
+            .env("XDG_CONFIG_HOME", xdg)
+            .env("XDG_DATA_HOME", home.join("data"))
+            .env("XDG_RUNTIME_DIR", home.join("runtime"))
+            .env("AOE_TMUX_SOCKET", home.join("tmux.sock"))
+            .env_remove("AOE_DAEMON_URL")
+            .env_remove("AOE_NO_AUTOSTART");
+        command
+    };
+    let output = command().args(args).output().expect("run aoe");
+    if args.first() == Some(&"add") {
+        let stopped = command()
+            .args(["serve", "--stop"])
+            .output()
+            .expect("stop isolated Daemon");
+        assert!(stopped.status.success(), "{stopped:?}");
+    }
+    output
 }
 
 /// `aoe agents` and `aoe acp doctor` both render the deprecation notice for

@@ -132,8 +132,10 @@ impl CommandFailure {
     fn classify(error: crate::daemon::DaemonClientError, submitted: bool) -> Self {
         use crate::daemon::DaemonClientError;
         let rejected = match &error {
-            DaemonClientError::Status { status, .. } => {
-                status.is_client_error() && *status != reqwest::StatusCode::REQUEST_TIMEOUT
+            DaemonClientError::Status { status, code, .. } => {
+                status.is_client_error()
+                    && *status != reqwest::StatusCode::REQUEST_TIMEOUT
+                    && *code != Some(crate::daemon::ApiErrorCode::CreateOutcomeUnknown)
             }
             DaemonClientError::InvalidBaseUrl { .. }
             | DaemonClientError::InvalidPathSegment

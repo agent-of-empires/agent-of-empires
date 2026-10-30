@@ -163,6 +163,10 @@ impl From<NewSessionData> for crate::session::builder::InstanceParams {
             repo_base_branches: Vec::new(),
             scratch: data.scratch,
             fork_seed: data.fork_seed,
+            generated_name: false,
+            no_submodules: false,
+            tie_workdir_to_name: false,
+            worktree_path_id: None,
         }
     }
 }
