@@ -55,6 +55,7 @@ import { CreateProgressView } from "./CreateProgressView";
 import { FieldRow, NavRow, PanelHeader, ROW_INPUT, RowGroup, SwitchRow } from "./WizardRows";
 import { LaunchFooter } from "./LaunchFooter";
 import { initialData, reducer, type WizardData } from "./wizardReducer";
+import { slugifyBranch } from "./sessionNames";
 import { buildCreateRequest } from "./createRequest";
 import { commandMapsFromSettings, EMPTY_COMMAND_MAPS, type CommandMaps } from "./commandMaps";
 import { profileDefaults, type ProfileDefaults } from "./profileDefaults";
@@ -83,6 +84,9 @@ export interface WizardPrefill {
   /** The registered project's worktree override for `path`; `undefined` means none. */
   worktreeEnabled?: boolean;
   initialPrompt?: string;
+  title?: string;
+  /** Where a suggested session came from, shown as the "From" strip. */
+  source?: { label: string; title: string; url: string };
 }
 
 function initialWizardData(prefill: WizardPrefill | undefined, nameOnly: boolean): WizardData {
@@ -104,6 +108,8 @@ function initialWizardData(prefill: WizardPrefill | undefined, nameOnly: boolean
     profile: prefill.profile || "",
     group: prefill.group || "",
     initialPrompt: prefill.initialPrompt ?? "",
+    title: prefill.title ?? "",
+    worktreeBranch: prefill.title ? slugifyBranch(prefill.title) : base.worktreeBranch,
     scratch: prefill.scratch ?? false,
     useWorktree: prefill.scratch ? false : (prefill.worktreeEnabled ?? base.useWorktree),
     // Seeded here rather than dispatched so APPLY_PROFILE_DEFAULTS cannot clobber it.
@@ -180,6 +186,24 @@ interface Props {
 }
 
 const NO_GROUPS: GroupInfo[] = [];
+
+function SourceStrip({ source }: { source: NonNullable<WizardPrefill["source"]> }) {
+  return (
+    <div
+      data-testid="wizard-source"
+      className="flex flex-wrap items-center gap-2 rounded-md border border-surface-700/60 bg-surface-900 px-2.5 py-2 text-xs text-text-secondary"
+    >
+      <span className="font-mono font-medium">{source.label}</span>
+      <span className="min-w-[200px] flex-1 text-text-primary">{source.title}</span>
+      <span className="text-[11px] text-text-dim">issue text not included</span>
+      {/^https?:\/\//i.test(source.url) && (
+        <a href={source.url} target="_blank" rel="noreferrer" className="text-brand-500 hover:underline">
+          Open &#8599;
+        </a>
+      )}
+    </div>
+  );
+}
 
 export function SessionWizard({
   onClose,
@@ -780,6 +804,7 @@ export function SessionWizard({
     <RowGroup>{titleRow}</RowGroup>
   ) : (
     <div className="space-y-4">
+      {prefill?.source && <SourceStrip source={prefill.source} />}
       <RowGroup>
         {state.profiles.length > 1 && (
           <NavRow
