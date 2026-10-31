@@ -25,6 +25,7 @@ The full view lists every suggestion:
 - One status line per provider: "updated 2 min ago", "waiting for first results", "nothing new", "refreshing…", or "couldn't refresh, <error>". Items from a failing provider stay listed from the last fetch.
 - Items group under the registered Project they resolve to; items with none sit last under "No project".
 - **Refresh** asks every provider to look again.
+- **Map projects** opens the [mapping wizard](#mapping-wizard).
 - The gear opens Settings › Suggestions.
 
 ### Starting one
@@ -71,6 +72,16 @@ Each kind of suggestion has a prompt template that replaces the plugin's draft p
 ### Projects
 
 **Project mapping** pins a source key (for example a repository) to one or more registered Projects. Unmapped keys show "no mapping: the wizard asks". Rules for how a Project is resolved are in the [API reference](../plugin-api.md#project-mappings).
+
+#### Mapping wizard
+
+**Map projects** on `/suggestions`, or **Map projects automatically…** under Project mapping, lists every source key in the current suggestions that has no mapping and proposes a Project for it:
+
+1. A Project whose git `origin` is the key (`owner/repo`, ignoring case) is proposed and checked.
+2. Otherwise a Project whose name or folder equals the key's last part, ignoring case, `-` and `_`, is proposed unchecked.
+3. Keys with no proposal are listed under "No match"; choosing a Project checks them.
+
+Change any proposal with its select, then **Save** stores every checked row as a mapping to that one Project. Saving is refused on read-only dashboards and in CityHall mode.
 
 ### Start without review
 

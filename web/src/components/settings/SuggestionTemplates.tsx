@@ -22,6 +22,7 @@ import type {
 import { expandTemplate } from "../../lib/suggestionTemplate";
 import { TemplateEditor } from "./TemplateEditor";
 import { SectionHeader, SuggestionSwitch } from "./suggestionsShared";
+import { SuggestionMappingWizard } from "../SuggestionMappingWizard";
 
 const GHOST =
   "inline-flex h-8 items-center rounded-md px-3 text-xs font-medium text-text-secondary hover:bg-surface-800 disabled:opacity-50";
@@ -245,6 +246,7 @@ export function SuggestionTemplates({ snapshot, disabled, onBack, onReturn, focu
   const [mappings, setMappings] = useState<SuggestionMapping[]>([]);
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [wizard, setWizard] = useState(false);
   const mounted = useRef(true);
 
   const load = useCallback(async () => {
@@ -313,6 +315,14 @@ export function SuggestionTemplates({ snapshot, disabled, onBack, onReturn, focu
       ))}
       <section aria-label="Project mapping">
         <SectionHeader>Project mapping</SectionHeader>
+        <button
+          type="button"
+          className={`${GHOST} mb-2`}
+          disabled={disabled || !snapshot.items.some((i) => i.mapping_key)}
+          onClick={() => setWizard(true)}
+        >
+          Map projects automatically…
+        </button>
         <MappingRows
           providers={snapshot.providers}
           items={snapshot.items}
@@ -322,6 +332,15 @@ export function SuggestionTemplates({ snapshot, disabled, onBack, onReturn, focu
           onChange={mutate}
         />
       </section>
+      {wizard && (
+        <SuggestionMappingWizard
+          items={snapshot.items}
+          providers={snapshot.providers}
+          disabled={disabled}
+          onClose={() => setWizard(false)}
+          onSaved={() => void load()}
+        />
+      )}
     </div>
   );
 }

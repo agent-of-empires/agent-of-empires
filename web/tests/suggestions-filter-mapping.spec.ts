@@ -57,3 +57,39 @@ test("search and source chips narrow unmapped suggestions", async ({ page }) => 
   await page.getByLabel("Search suggestions").fill("TOOL#3");
   await expect(titles).toHaveText(["Tool chore"]);
 });
+
+test("the Map projects wizard proposes Projects and saves the checked ones", async ({ page }) => {
+  await page.route("**/api/suggestions/projects", (route) =>
+    route.fulfill({
+      json: {
+        projects: [
+          { name: "website", path: "/w/site", origin: "Acme/Web" },
+          { name: "api", path: "/w/api", origin: null },
+        ],
+      },
+    }),
+  );
+  const puts: unknown[] = [];
+  await page.route("**/api/suggestions/mappings", (route) => {
+    if (route.request().method() === "PUT") {
+      puts.push(route.request().postDataJSON());
+      return route.fulfill({ json: route.request().postDataJSON() });
+    }
+    return route.fulfill({ json: { mappings: [] } });
+  });
+  await page.goto("/suggestions");
+  await page.getByRole("button", { name: "Map projects" }).click();
+
+  const wizard = page.getByRole("dialog", { name: "Map projects" });
+  await expect(wizard.getByLabel("Map acme/web")).toBeChecked();
+  await expect(wizard.getByLabel("Map acme/api")).not.toBeChecked();
+  await expect(wizard.getByLabel("Map other/tool")).toBeDisabled();
+  await wizard.getByLabel("Map acme/api").check();
+  await wizard.getByRole("button", { name: "Save 2 mappings" }).click();
+
+  await expect(wizard).toHaveCount(0);
+  expect(puts).toEqual([
+    { provider_id: "github", mapping_key: "acme/api", projects: ["/w/api"] },
+    { provider_id: "github", mapping_key: "acme/web", projects: ["/w/site"] },
+  ]);
+});
