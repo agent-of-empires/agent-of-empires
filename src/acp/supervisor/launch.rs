@@ -1555,7 +1555,7 @@ time.sleep(60)
     async fn ordinary_spawn_is_rejected_while_restart_claim_is_held() {
         let supervisor = Supervisor::new(VecSink::new());
         let _restart = supervisor
-            .try_begin_restart("s-restart")
+            .try_begin_restart_with_reason("s-restart")
             .await
             .expect("restart claims the session");
 
@@ -1580,7 +1580,7 @@ time.sleep(60)
     async fn cancelled_restart_claim_does_not_admit_a_replacement() {
         let supervisor = Supervisor::new(VecSink::new());
         let restart = supervisor
-            .try_begin_restart("s-restart")
+            .try_begin_restart_with_reason("s-restart")
             .await
             .expect("restart claims the session");
 

@@ -1690,7 +1690,7 @@ mod tests {
         let request = state.acp_supervisor.begin_spawn_request(&row.id).unwrap();
         let restart = state
             .acp_supervisor
-            .try_begin_restart(&row.id)
+            .try_begin_restart_with_reason(&row.id)
             .await
             .unwrap();
         let exclusion = crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &row.id, true)
@@ -2056,7 +2056,7 @@ mod tests {
         let id = "restart-in-flight".to_string();
         let first = state
             .acp_supervisor
-            .try_begin_restart(&id)
+            .try_begin_restart_with_reason(&id)
             .await
             .expect("the first restart claims the session");
 
@@ -2080,7 +2080,11 @@ mod tests {
         assert!(String::from_utf8_lossy(&body).starts_with("restart_in_progress:"));
 
         drop(first);
-        assert!(state.acp_supervisor.try_begin_restart(&id).await.is_some());
+        assert!(state
+            .acp_supervisor
+            .try_begin_restart_with_reason(&id)
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
@@ -2099,7 +2103,11 @@ mod tests {
         crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
         let state = crate::server::test_support::build_test_app_state(vec![row]);
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
-        let claim = state.acp_supervisor.try_begin_restart(&id).await.unwrap();
+        let claim = state
+            .acp_supervisor
+            .try_begin_restart_with_reason(&id)
+            .await
+            .unwrap();
         let provider = crate::session::environment::AGENT_PROVIDERS
             .iter()
             .find(|provider| **provider != "anthropic")

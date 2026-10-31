@@ -837,11 +837,6 @@ impl<S: BroadcastSink> Supervisor<S> {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) async fn try_begin_restart(&self, session_id: &str) -> Option<RestartRequestGuard> {
-        self.try_begin_restart_with_reason(session_id).await.ok()
-    }
-
     /// Serialize with resume admission, then cancel any restart that has not settled yet.
     pub(crate) async fn cancel_restart_request(&self, session_id: &str) {
         let _workers = self.workers.lock().await;
@@ -877,24 +872,24 @@ mod tests {
     async fn explicit_restart_guard_serializes_same_session_and_releases_on_drop() {
         let sup = Supervisor::new(VecSink::new());
         let first = sup
-            .try_begin_restart("s-restart")
+            .try_begin_restart_with_reason("s-restart")
             .await
             .expect("first restart claims the session");
 
-        assert!(sup.try_begin_restart("s-restart").await.is_none());
-        assert!(sup.try_begin_restart("s-other").await.is_some());
+        assert!(sup.try_begin_restart_with_reason("s-restart").await.is_err());
+        assert!(sup.try_begin_restart_with_reason("s-other").await.is_ok());
 
         drop(first);
-        assert!(sup.try_begin_restart("s-restart").await.is_some());
+        assert!(sup.try_begin_restart_with_reason("s-restart").await.is_ok());
     }
 
     #[tokio::test]
     async fn restart_and_switch_claims_exclude_each_other() {
         let sup = Supervisor::new(VecSink::new());
         let switching = sup.begin_switch_request("s").unwrap();
-        assert!(sup.try_begin_restart("s").await.is_none());
+        assert!(sup.try_begin_restart_with_reason("s").await.is_err());
         drop(switching);
-        let restart = sup.try_begin_restart("s").await.unwrap();
+        let restart = sup.try_begin_restart_with_reason("s").await.unwrap();
         assert!(matches!(
             sup.begin_switch_request("s"),
             Err(SupervisorError::RestartInProgress(_))
