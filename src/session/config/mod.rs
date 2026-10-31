@@ -3133,7 +3133,7 @@ pub struct SystemdSettings {
     #[setting(label = "Use systemd scopes", widget = "toggle", global_only)]
     pub enabled: bool,
 
-    /// Slice for the session scopes; must end in `.slice`. `{profile}` expands to the escaped profile name. Applies after an aoe restart.
+    /// Slice for the session scopes; must end in `.slice`. `{profile}` and `{session}` expand to the escaped profile name and session id. Applies after an aoe restart.
     #[serde(default = "default_systemd_slice")]
     #[setting(
         label = "Systemd slice",
@@ -4868,7 +4868,10 @@ mod tests {
     fn systemd_settings_defaults() {
         let cfg = Config::default();
         assert!(cfg.systemd.enabled);
-        assert_eq!(cfg.systemd.slice, "background-aoe-{profile}.slice");
+        assert_eq!(
+            cfg.systemd.slice,
+            "background-aoe-{profile}-{session}.slice"
+        );
         assert!(cfg.systemd.survive_daemon_restart);
         assert_eq!(cfg.systemd.memory_max, None);
         assert_eq!(cfg.systemd.tasks_max, 0);

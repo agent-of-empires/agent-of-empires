@@ -416,6 +416,12 @@ mod tests {
             ),
             (&K::SystemdSlice, json!("{profile}"), false),
             (&K::SystemdSlice, json!("a-{profile}-b.slice"), true),
+            (
+                &K::SystemdSlice,
+                json!("aoe-{profile}-{session}.slice"),
+                true,
+            ),
+            (&K::SystemdSlice, json!("{session}"), false),
             (&K::SystemdSlice, json!("{prof}.slice"), false),
             (&K::SystemdSlice, json!("-a.slice"), false),
             (&K::SystemdSlice, json!("a-.slice"), false),

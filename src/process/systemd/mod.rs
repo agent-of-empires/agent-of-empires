@@ -14,7 +14,7 @@ use crate::session::config::SystemdSettings;
 #[cfg(unix)]
 pub(crate) mod notify;
 
-pub(crate) const DEFAULT_SLICE_TEMPLATE: &str = "background-aoe-{profile}.slice";
+pub(crate) const DEFAULT_SLICE_TEMPLATE: &str = "background-aoe-{profile}-{session}.slice";
 const UNIT_PREFIX: &str = "aoe-session-";
 /// `systemd-run --scope` sets this for the command; wrappers restore the
 /// caller's value so the agent environment is unchanged.
@@ -140,11 +140,16 @@ fn first_time(flag: &AtomicBool) -> bool {
     !flag.swap(true, Ordering::Relaxed)
 }
 
-/// Expands `{profile}` in the configured template; an invalid result falls
-/// back to the default template. Warns once per process.
-pub(crate) fn resolve_slice(template: &str, profile: &str) -> String {
+/// Expands `{profile}` and `{session}` in the configured template; an invalid
+/// result falls back to the default template. Warns once per process.
+pub(crate) fn resolve_slice(template: &str, profile: &str, session_id: &str) -> String {
     static WARNED: AtomicBool = AtomicBool::new(false);
-    let slice = template.replace("{profile}", &escape_profile(profile));
+    let expand = |template: &str| {
+        template
+            .replace("{profile}", &escape_profile(profile))
+            .replace("{session}", &escape(session_id))
+    };
+    let slice = expand(template);
     if valid_slice(&slice) {
         return slice;
     }
@@ -155,7 +160,7 @@ pub(crate) fn resolve_slice(template: &str, profile: &str) -> String {
             "invalid systemd.slice; using {DEFAULT_SLICE_TEMPLATE}"
         );
     }
-    DEFAULT_SLICE_TEMPLATE.replace("{profile}", &escape_profile(profile))
+    expand(DEFAULT_SLICE_TEMPLATE)
 }
 
 /// Parses exactly what the `memory_max` settings validator accepts: digits
@@ -296,6 +301,7 @@ pub(crate) fn scope_args(
     unit: &str,
     description: &str,
     profile: &str,
+    session_id: &str,
 ) -> Vec<String> {
     let mut a: Vec<String> = [
         "--user",
@@ -310,7 +316,7 @@ pub(crate) fn scope_args(
     .collect();
     a.push(format!(
         "--slice={}",
-        resolve_slice(&cfg.slice_template, profile)
+        resolve_slice(&cfg.slice_template, profile, session_id)
     ));
     a.push(format!("--unit={unit}"));
     a.push(format!("--description={description}"));
@@ -349,7 +355,13 @@ fn probe_with(
 ) -> Result<(), ProbeFailure> {
     let unit = format!("aoe-probe-{}-{}.scope", std::process::id(), now_ms());
     let mut argv = vec!["systemd-run".to_string()];
-    argv.extend(scope_args(cfg, &unit, "aoe capability probe", profile));
+    argv.extend(scope_args(
+        cfg,
+        &unit,
+        "aoe capability probe",
+        profile,
+        "probe",
+    ));
     argv.push("true".into());
     run(&argv)
 }
@@ -506,6 +518,7 @@ pub(crate) fn scope_prefix_for(session_id: &str, profile: &str) -> Option<ScopeP
         &unit,
         &description(session_id),
         &profile,
+        session_id,
     ));
     Some(ScopePrefix {
         argv,
@@ -522,13 +535,14 @@ fn resolved_profile(profile: &str) -> String {
     }
 }
 
-/// The slice `scope_prefix_for` puts a session of `profile` in, or `None`
-/// when scopes are unavailable. Blocking on the first call.
-pub(crate) fn slice_for(profile: &str) -> Option<String> {
+/// The slice `scope_prefix_for` puts the session in, or `None` when scopes
+/// are unavailable. Blocking on the first call.
+pub(crate) fn slice_for(profile: &str, session_id: &str) -> Option<String> {
     let cap = capability()?;
     Some(resolve_slice(
         &cap.cfg.slice_template,
         &resolved_profile(profile),
+        session_id,
     ))
 }
 
@@ -1134,13 +1148,13 @@ esac
     #[test]
     fn slice_template_substitutes_escaped_profile() {
         let t = "background-aoe-{profile}.slice";
-        assert_eq!(resolve_slice(t, "main"), "background-aoe-main.slice");
+        assert_eq!(resolve_slice(t, "main", "abc"), "background-aoe-main.slice");
         assert_eq!(
-            resolve_slice(t, "my-profile"),
+            resolve_slice(t, "my-profile", "abc"),
             "background-aoe-my_2dprofile.slice"
         );
-        assert_eq!(resolve_slice(t, ""), "background-aoe-_.slice");
-        assert_eq!(resolve_slice("aoe.slice", "main"), "aoe.slice");
+        assert_eq!(resolve_slice(t, "", "abc"), "background-aoe-_.slice");
+        assert_eq!(resolve_slice("aoe.slice", "main", "abc"), "aoe.slice");
         for bad in [
             "",
             "foo",
@@ -1151,17 +1165,36 @@ esac
             "a--b.slice",
         ] {
             assert_eq!(
-                resolve_slice(bad, "main"),
-                "background-aoe-main.slice",
+                resolve_slice(bad, "main", "abc"),
+                "background-aoe-main-abc.slice",
                 "{bad:?}"
             );
         }
     }
 
     #[test]
+    fn default_slice_is_per_session_under_the_profile_slice() {
+        assert_eq!(
+            resolve_slice(DEFAULT_SLICE_TEMPLATE, "main", "3de822568e6d4d99"),
+            "background-aoe-main-3de822568e6d4d99.slice"
+        );
+        assert_eq!(
+            resolve_slice(DEFAULT_SLICE_TEMPLATE, "my-profile", "a-b"),
+            "background-aoe-my_2dprofile-a_2db.slice"
+        );
+        assert_eq!(
+            resolve_slice("aoe-{session}.slice", "main", "abc"),
+            "aoe-abc.slice"
+        );
+    }
+
+    #[test]
     fn bad_slice_falls_back_every_time_and_the_log_gate_fires_once() {
         for _ in 0..5 {
-            assert_eq!(resolve_slice("bogus", "main"), "background-aoe-main.slice");
+            assert_eq!(
+                resolve_slice("bogus", "main", "abc"),
+                "background-aoe-main-abc.slice"
+            );
         }
         let flag = AtomicBool::new(false);
         let fired = (0..5).filter(|_| first_time(&flag)).count();
@@ -1231,6 +1264,7 @@ esac
             "aoe-session-abc123-1.scope",
             "aoe session abc123de",
             "main",
+            "abc123",
         );
         assert_eq!(args, want);
         let bare = ScopeConfig {
@@ -1238,7 +1272,7 @@ esac
             part_of: None,
             ..cfg
         };
-        assert_eq!(scope_args(&bare, "u.scope", "d", "main").len(), 10);
+        assert_eq!(scope_args(&bare, "u.scope", "d", "main", "abc").len(), 10);
     }
 
     #[test]

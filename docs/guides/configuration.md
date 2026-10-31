@@ -475,7 +475,7 @@ Detection for the per-option modes (`mouse`, `clipboard`) reads `~/.tmux.conf`, 
 ```toml
 [systemd]
 enabled = true
-slice = "background-aoe-{profile}.slice"
+slice = "background-aoe-{profile}-{session}.slice"
 survive_daemon_restart = true
 # memory_max = "4G"
 tasks_max = 0
@@ -484,19 +484,19 @@ tasks_max = 0
 | Option | Default | Description |
 |--------|---------|-------------|
 | `enabled` | `true` | Start every session through `systemd-run --user --scope`, so it runs in its own transient systemd scope. Sessions start unscoped when `systemd-run` is missing or the user manager is unreachable. `false` only prevents new scopes and skips the check below; stopping, deleting and trashing sessions still stop their existing scopes. Global only. |
-| `slice` | `"background-aoe-{profile}.slice"` | Template for the slice the session scopes live in; must end in `.slice`. `{profile}` expands to the session's profile name, escaped for systemd: every byte other than ASCII alphanumerics, `:` and `.` becomes `_<hex>` (so `-` and `_` are escaped too, as are spaces, `/` and non-ASCII characters). A value without `{profile}` is used as is. An invalid value falls back to the default with a warning. Global only. |
+| `slice` | `"background-aoe-{profile}-{session}.slice"` | Template for the slice a session's scopes live in; must end in `.slice`. `{profile}` expands to the session's profile name and `{session}` to its id, both escaped for systemd: every byte other than ASCII alphanumerics, `:` and `.` becomes `_<hex>` (so `-` and `_` are escaped too, as are spaces, `/` and non-ASCII characters). A value without a placeholder is used as is. An invalid value falls back to the default with a warning. Global only. |
 | `survive_daemon_restart` | `true` | Keep sessions running when the aoe daemon service stops: agents live in their own scopes, outside the daemon's cgroup. `false` binds the scopes the daemon creates to its service with `PartOf=`, so stopping or restarting the daemon service stops them, and systemd does not start them again; this only takes effect when the daemon itself runs as a `.service`, otherwise it is ignored with a warning. Scopes created from the CLI or TUI are never bound. Global only. |
 | `memory_max` | unset | Memory cap for each session scope, a number followed by `b`, `k`, `m`, or `g` (e.g. `4G`, `512M`, `512b`). Unset or empty means unlimited; any other value is ignored with a warning. Global only. |
 | `tasks_max` | `0` | Task cap for each session scope (0 to 4194304). `0` means unlimited. Global only. |
 
-Each session start runs the agent through a fresh unit named `aoe-session-<escaped-id>-<app-namespace>-<start-ms>-<nonce>.scope`. The app-directory namespace and random per-launch nonce distinguish separate installations and repeated starts; they are ownership-consistency keys, not authentication. The scope description contains only the first eight id characters, and `aoe list` maps the id to the title. With the default `slice` template the scopes sit in `background.slice/background-aoe.slice/background-aoe-<profile>.slice`; a custom slice has its own hierarchy. Inspect them with:
+Each session start runs the agent through a fresh unit named `aoe-session-<escaped-id>-<app-namespace>-<start-ms>-<nonce>.scope`. The app-directory namespace and random per-launch nonce distinguish separate installations and repeated starts; they are ownership-consistency keys, not authentication. The scope description contains only the first eight id characters, and `aoe list` maps the id to the title. With the default `slice` template each session gets its own slice, `background.slice/background-aoe.slice/background-aoe-<profile>.slice/background-aoe-<profile>-<id>.slice`; a custom slice has its own hierarchy. Inspect them with:
 
 ```sh
 systemctl --user status 'aoe-session-*'
 systemd-cgls --user
 ```
 
-A session that changes profile keeps its old slice until its next start. To cap a whole profile or all of aoe, put limits on the slice itself with `systemctl --user set-property background-aoe-<profile>.slice MemoryMax=8G` or a drop-in. There `<profile>` is the escaped profile name, for example `my_2dprofile` for `my-profile`. The `memory_max` and `tasks_max` settings apply to each session scope on its own. Set `slice` to group sessions elsewhere, for example `aoe.slice`.
+A session that changes profile keeps its old slice until its next start, and a sandbox container keeps the slice it was created in. To cap one session, a whole profile or all of aoe, put limits on the slice itself with `systemctl --user set-property background-aoe-<profile>-<id>.slice MemoryMax=8G`, `background-aoe-<profile>.slice` or `background-aoe.slice`, or a drop-in. There `<profile>` is the escaped profile name, for example `my_2dprofile` for `my-profile`. The `memory_max` and `tasks_max` settings apply to each session scope on its own. Set `slice` to group sessions elsewhere, for example `aoe.slice`, or to `background-aoe-{profile}.slice` for one slice per profile.
 
 aoe checks once per process that `systemd-run` works with the configured limits, with `--expand-environment=no` so `$` in session commands stays literal. The check is one attempt of at most 5 seconds. Sessions start unscoped, with one line in the log, when `systemd-run` or `env` is not on `PATH`, when `systemd-run` cannot reach the user manager or times out, when it rejects the configured `memory_max`/`tasks_max` (a warning naming them), or when `enabled` is `false` (`systemd.enabled=false`). If `systemd-run` fails after that check passed, the session start fails visibly: the tmux pane dies, and an ACP session reports an attach error after the dial deadline, with the `systemd-run` error in the runner log.
 
