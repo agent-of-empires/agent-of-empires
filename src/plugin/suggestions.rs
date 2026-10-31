@@ -19,6 +19,7 @@ use super::host_api::DispatchError;
 use crate::session::config::profile_config::resolve_config_or_warn;
 use crate::session::config::repo_config::resolve_config_with_repo_or_warn;
 use crate::session::projects::{self, Project};
+use crate::session::Instance;
 use std::path::Path;
 
 const MAX_ITEMS: usize = 500;
@@ -32,6 +33,8 @@ pub(crate) const MAX_PROMPT_BYTES: usize = 64 * 1024;
 const MAX_VARIABLE_VALUE_BYTES: usize = 2048;
 const MAX_ERROR_BYTES: usize = 4096;
 const MAX_CHECKS: usize = 32;
+/// How long an item stays listed after its provider marked it stale.
+const STALE_TTL_SECS: i64 = 24 * 60 * 60;
 const MAX_CHECK_TEXT_BYTES: usize = 2048;
 pub(crate) const MAX_MAPPING_PROJECTS: usize = 16;
 
@@ -106,6 +109,13 @@ pub(super) fn init(conn: &Connection) -> rusqlite::Result<()> {
              label       TEXT NOT NULL,
              method      TEXT NOT NULL,
              PRIMARY KEY (profile, provider_id)
+         );
+         CREATE TABLE IF NOT EXISTS suggestion_stale (
+             profile     TEXT NOT NULL,
+             provider_id TEXT NOT NULL,
+             item_id     TEXT NOT NULL,
+             since       INTEGER NOT NULL,
+             PRIMARY KEY (profile, provider_id, item_id)
          );
          CREATE TABLE IF NOT EXISTS suggestion_checks (
              profile     TEXT NOT NULL,
@@ -185,6 +195,24 @@ pub(super) fn set(
     spec: &SuggestionsSpec,
     params: &Value,
 ) -> Result<Value, DispatchError> {
+    set_at(
+        conn,
+        profile,
+        provider_id,
+        spec,
+        params,
+        chrono::Utc::now().timestamp(),
+    )
+}
+
+fn set_at(
+    conn: &Connection,
+    profile: &str,
+    provider_id: &str,
+    spec: &SuggestionsSpec,
+    params: &Value,
+    now: i64,
+) -> Result<Value, DispatchError> {
     let request: SetSuggestions = serde_json::from_value(params.clone()).map_err(|e| {
         DispatchError::invalid_params(format!("invalid suggestions.set params: {e}"))
     })?;
@@ -192,14 +220,51 @@ pub(super) fn set(
     let overrides = overrides(conn, profile, provider_id).map_err(db_error)?;
     let accepted =
         validate_items(spec, &overrides, request.items).map_err(DispatchError::invalid_params)?;
+    let first_stale: HashMap<String, i64> = conn
+        .prepare(
+            "SELECT item_id, since FROM suggestion_stale WHERE profile = ?1 AND provider_id = ?2",
+        )
+        .and_then(|mut q| {
+            q.query_map(params![profile, provider_id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect()
+        })
+        .map_err(db_error)?;
+    // A stale item keeps the time it first went stale and expires after the TTL.
+    // An expired item's time is kept too, so republishing it stale cannot start a new day.
+    let mut stale_since: Vec<(&str, i64)> = Vec::new();
+    let mut kept = Vec::with_capacity(accepted.len());
+    for item in &accepted {
+        if item.stale {
+            let since = first_stale.get(&item.id).copied().unwrap_or(now);
+            stale_since.push((item.id.as_str(), since));
+            if now - since > STALE_TTL_SECS {
+                continue;
+            }
+        }
+        kept.push(item);
+    }
     // `unchecked_`: the connection is only reachable as `&Connection` behind the host mutex.
     let tx = conn.unchecked_transaction().map_err(db_error)?;
+    tx.execute(
+        "DELETE FROM suggestion_stale WHERE profile = ?1 AND provider_id = ?2",
+        params![profile, provider_id],
+    )
+    .map_err(db_error)?;
+    for (id, since) in &stale_since {
+        tx.execute(
+            "INSERT INTO suggestion_stale (profile, provider_id, item_id, since) VALUES (?1, ?2, ?3, ?4)",
+            params![profile, provider_id, id, since],
+        )
+        .map_err(db_error)?;
+    }
     tx.execute(
         "DELETE FROM suggestion_items WHERE profile = ?1 AND provider_id = ?2",
         params![profile, provider_id],
     )
     .map_err(db_error)?;
-    for item in &accepted {
+    for item in &kept {
         let json = serde_json::to_string(item)
             .map_err(|e| DispatchError::internal(format!("encode suggestion: {e}")))?;
         tx.execute(
@@ -210,7 +275,7 @@ pub(super) fn set(
     }
     record_status(&tx, profile, provider_id, None).map_err(db_error)?;
     tx.commit().map_err(db_error)?;
-    Ok(json!({ "ok": true, "accepted": accepted.len(), "dropped": total - accepted.len() }))
+    Ok(json!({ "ok": true, "accepted": kept.len(), "dropped": total - kept.len() }))
 }
 
 /// Drops what a provider's worker published, in every profile, so a
@@ -221,6 +286,7 @@ pub(super) fn forget_publication(conn: &Connection, provider_id: &str) -> rusqli
     for table in [
         "suggestion_fixes",
         "suggestion_checks",
+        "suggestion_stale",
         "suggestion_items",
         "suggestion_providers",
     ] {
@@ -469,6 +535,14 @@ pub(crate) fn templates(
     )?
     .query_map([profile], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
     .collect()
+}
+
+/// Why `prepare` refused an item.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PrepareRefusal {
+    PromptTooLong,
+    /// The source closed or changed, so the item cannot start.
+    Stale,
 }
 
 /// An expanded prompt would exceed [`MAX_PROMPT_BYTES`].
@@ -837,6 +911,61 @@ pub(crate) fn snapshot(
     Ok(json!({ "providers": out_providers, "items": out_items, "prefs": prefs }))
 }
 
+/// The oldest live Session of `profile` started from each item, as snapshot
+/// JSON keyed by `(provider_id, id)`. Trashed Sessions do not count; a tie
+/// on `created_at` goes to the smaller id.
+pub(crate) fn started_sessions(
+    instances: &[Instance],
+    profile: &str,
+) -> HashMap<(String, String), Value> {
+    let mut oldest: HashMap<(&str, &str), &Instance> = HashMap::new();
+    for inst in instances {
+        let Some(origin) = &inst.suggestion else {
+            continue;
+        };
+        if inst.is_trashed() || inst.source_profile != profile {
+            continue;
+        }
+        let slot = oldest
+            .entry((origin.provider_id.as_str(), origin.id.as_str()))
+            .or_insert(inst);
+        if (inst.created_at, &inst.id) < (slot.created_at, &slot.id) {
+            *slot = inst;
+        }
+    }
+    oldest
+        .into_iter()
+        .map(|((provider_id, id), inst)| {
+            (
+                (provider_id.to_string(), id.to_string()),
+                json!({
+                    "id": inst.id,
+                    "title": inst.title,
+                    "status": inst.status.wire_str(),
+                    "archived": inst.is_archived(),
+                    "created_at": inst.created_at,
+                }),
+            )
+        })
+        .collect()
+}
+
+/// Sets `started_session` on the snapshot items that have one.
+pub(crate) fn attach_started(snapshot: &mut Value, started: &HashMap<(String, String), Value>) {
+    let Some(items) = snapshot["items"].as_array_mut() else {
+        return;
+    };
+    for item in items {
+        let key = (
+            item["provider_id"].as_str().unwrap_or_default().to_string(),
+            item["id"].as_str().unwrap_or_default().to_string(),
+        );
+        if let Some(session) = started.get(&key) {
+            item["started_session"] = session.clone();
+        }
+    }
+}
+
 /// Returns the items of enabled criteria, or the first contract violation.
 fn validate_items(
     spec: &SuggestionsSpec,
@@ -1077,6 +1206,91 @@ pub(crate) fn list_mappings(conn: &Connection, profile: &str) -> anyhow::Result<
     Ok(json!({ "mappings": mappings }))
 }
 
+/// The primary project and extras an item resolves to. A mapping whose first
+/// path resolves supplies both; otherwise the provider's `hint` applies and an
+/// extra is never promoted to primary.
+fn resolve_projects(
+    registered: &[Project],
+    hint: Option<&str>,
+    mapped: Option<&[String]>,
+) -> (Option<Project>, Vec<Project>) {
+    let from_mapping = mapped
+        .and_then(|paths| paths.split_first())
+        .and_then(|(first, rest)| {
+            let primary = resolve_path(registered, first)?;
+            let extras = rest
+                .iter()
+                .filter_map(|path| resolve_path(registered, path))
+                .collect();
+            Some((primary, extras))
+        });
+    match from_mapping {
+        Some((primary, extras)) => (Some(primary), extras),
+        None => (
+            hint.and_then(|wanted| resolve_hint(registered, wanted)),
+            Vec::new(),
+        ),
+    }
+}
+
+/// Sets `resolved_project` (`{ name, path }` or `null`) on every snapshot item,
+/// through the same rules `prepare` applies.
+pub(crate) fn attach_projects(
+    conn: &Connection,
+    profile: &str,
+    snapshot: &mut Value,
+    registered: &[Project],
+) -> anyhow::Result<()> {
+    let mut mappings: HashMap<(String, String), Vec<String>> = HashMap::new();
+    let rows: Vec<(String, String, String)> = conn
+        .prepare(
+            "SELECT provider_id, mapping_key, projects_json FROM suggestion_mappings
+             WHERE profile = ?1",
+        )?
+        .query_map([profile], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    for (provider_id, key, paths) in rows {
+        if let Ok(paths) = serde_json::from_str(&paths) {
+            mappings.insert((provider_id, key), paths);
+        }
+    }
+    let Some(items) = snapshot["items"].as_array_mut() else {
+        return Ok(());
+    };
+    for item in items {
+        let provider_id = item["provider_id"].as_str().unwrap_or_default().to_string();
+        let mapped = item["mapping_key"]
+            .as_str()
+            .and_then(|key| mappings.get(&(provider_id, key.to_string())));
+        let (project, _) = resolve_projects(
+            registered,
+            item["project"].as_str(),
+            mapped.map(Vec::as_slice),
+        );
+        item["resolved_project"] = match project {
+            Some(p) => json!({ "name": p.name, "path": p.path }),
+            None => Value::Null,
+        };
+    }
+    Ok(())
+}
+
+/// Sets `refreshing` on every snapshot provider: asked to refresh (unix seconds in
+/// `requested`) and not reported since, so an earlier publish does not end it.
+pub(crate) fn attach_refreshing(snapshot: &mut Value, requested: &HashMap<String, i64>) {
+    let Some(providers) = snapshot["providers"].as_array_mut() else {
+        return;
+    };
+    for provider in providers {
+        let updated = provider["updated_at"].as_i64();
+        let is = provider["id"]
+            .as_str()
+            .and_then(|id| requested.get(id))
+            .is_some_and(|&at| updated.is_none_or(|u| at > u));
+        provider["refreshing"] = json!(is);
+    }
+}
+
 /// The live item plus the mapping its `mapping_key` names, if any.
 pub(crate) fn find_item_with_mapping(
     conn: &Connection,
@@ -1106,28 +1320,18 @@ pub(crate) fn prepare(
     item: &Suggestion,
     template: Option<&str>,
     mapped: Option<&[String]>,
-) -> Result<Value, PromptTooLong> {
+) -> Result<Value, PrepareRefusal> {
+    if item.stale {
+        return Err(PrepareRefusal::Stale);
+    }
     let prompt = match template {
-        Some(t) => expand(t, &item.variables)?,
+        Some(t) => {
+            expand(t, &item.variables).map_err(|PromptTooLong| PrepareRefusal::PromptTooLong)?
+        }
         None => item.draft.prompt.clone(),
     };
     let registered = projects::load_merged(profile).unwrap_or_default();
-    let from_mapping = mapped
-        .and_then(|paths| paths.split_first())
-        .and_then(|(first, rest)| {
-            let primary = resolve_path(&registered, first)?;
-            let extras: Vec<Project> = rest
-                .iter()
-                .filter_map(|path| resolve_path(&registered, path))
-                .collect();
-            Some((primary, extras))
-        });
-    let (project, extras) = from_mapping.unzip();
-    let project = project.or_else(|| {
-        item.project
-            .as_deref()
-            .and_then(|wanted| resolve_hint(&registered, wanted))
-    });
+    let (project, extras) = resolve_projects(&registered, item.project.as_deref(), mapped);
     let mut config = match &project {
         Some(p) => resolve_config_with_repo_or_warn(profile, Path::new(&p.path)),
         None => resolve_config_or_warn(profile),
@@ -1148,7 +1352,7 @@ pub(crate) fn prepare(
         "templated": template.is_some(),
         "source_ref": item.source_ref,
         "project": project.as_ref().map(describe),
-        "extra_projects": extras.unwrap_or_default().iter().map(describe).collect::<Vec<_>>(),
+        "extra_projects": extras.iter().map(describe).collect::<Vec<_>>(),
         "tool": config.session.default_tool.unwrap_or_else(|| "claude".to_string()),
         "yolo": config.session.yolo_mode_default,
         "sandbox": config.sandbox.enabled_by_default,
@@ -1189,6 +1393,7 @@ mod tests {
             project: None,
             mapping_key: None,
             criterion: criterion.into(),
+            stale: false,
             variables: if criterion == "assigned" {
                 [("repo".to_string(), "acme/widgets".to_string())].into()
             } else {
@@ -1871,7 +2076,7 @@ mod tests {
         // 12-byte value, template within the stored bound: expansion is not.
         let bomb = "{repo}".repeat(MAX_PROMPT_BYTES / "{repo}".len());
         assert!(bomb.len() <= MAX_PROMPT_BYTES);
-        assert_eq!(prompt(Some(&bomb)), Err(PromptTooLong));
+        assert_eq!(prompt(Some(&bomb)), Err(PrepareRefusal::PromptTooLong));
     }
 
     #[test]
@@ -2013,6 +2218,153 @@ mod tests {
         assert!(fix_method(&conn, "p", "acme.github").unwrap().is_none());
         let entry = snapshot(&conn, "p", &[provider()]).unwrap()["providers"][0].clone();
         assert!(entry.get("fix").is_none() && entry.get("uses_agent").is_none());
+    }
+
+    #[test]
+    fn started_session_is_the_oldest_live_one_of_the_profile() {
+        let linked = |id: &str, age: i64, profile: &str| {
+            let mut i = Instance::new(id, "/tmp/x");
+            i.id = id.to_string();
+            i.created_at = chrono::Utc::now() - chrono::Duration::seconds(age);
+            i.source_profile = profile.to_string();
+            i.suggestion = Some(crate::session::SuggestionOrigin {
+                provider_id: "acme.github".into(),
+                id: "a".into(),
+            });
+            i
+        };
+        let mut trashed = linked("trashed", 300, "p");
+        trashed.trash();
+        let mut archived = linked("archived", 200, "p");
+        archived.archived_at = Some(chrono::Utc::now());
+        let instances = [
+            linked("newest", 10, "p"),
+            archived,
+            trashed,
+            linked("other-profile", 400, "q"),
+            Instance::new("unlinked", "/tmp/x"),
+        ];
+        let key = ("acme.github".to_string(), "a".to_string());
+        let started = started_sessions(&instances, "p");
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[&key]["id"], "archived");
+        assert_eq!(started[&key]["archived"], true);
+
+        let mut snapshot = json!({ "items": [
+            { "provider_id": "acme.github", "id": "a" },
+            { "provider_id": "acme.github", "id": "b" },
+        ]});
+        attach_started(&mut snapshot, &started);
+        assert_eq!(snapshot["items"][0]["started_session"]["id"], "archived");
+        assert!(snapshot["items"][1].get("started_session").is_none());
+        assert!(started_sessions(&instances[2..3], "p").is_empty());
+    }
+
+    #[test]
+    fn a_stale_item_keeps_its_first_time_and_expires_after_a_day() {
+        let conn = store();
+        let publish_at = |items: &[Suggestion], now: i64| {
+            set_at(
+                &conn,
+                "p",
+                "acme.github",
+                &spec(),
+                &json!({ "items": items }),
+                now,
+            )
+            .unwrap()
+        };
+        let stale = |id: &str| Suggestion {
+            stale: true,
+            ..item(id, "assigned")
+        };
+        let day = STALE_TTL_SECS;
+        publish_at(&[stale("a"), item("b", "assigned")], 1_000);
+        // Republished stale later: the clock keeps running from the first time.
+        let out = publish_at(&[stale("a"), item("b", "assigned")], 1_000 + day);
+        assert_eq!(out["dropped"], 0, "exactly a day is still listed");
+        assert_eq!(snap(&conn, "p")["items"][0]["stale"], true);
+        assert!(snap(&conn, "p")["items"][1].get("stale").is_none());
+        let out = publish_at(&[stale("a"), item("b", "assigned")], 1_001 + day);
+        assert_eq!(out["dropped"], 1);
+        assert_eq!(ids(&snap(&conn, "p")), ["b"]);
+        // Still published stale after expiring: still dropped, not given a fresh day.
+        for later in [2_000 + day, 1_000 + 3 * day] {
+            let out = publish_at(&[stale("a"), item("b", "assigned")], later);
+            assert_eq!(out["dropped"], 1, "at {later}");
+        }
+        // Fresh again, then stale again: a new clock starts.
+        publish_at(&[item("a", "assigned")], 2_000 + day);
+        let out = publish_at(&[stale("a")], 3_000 + day);
+        assert_eq!(out["dropped"], 0);
+    }
+
+    #[test]
+    fn prepare_refuses_a_stale_item() {
+        let mut stale = item("a", "assigned");
+        stale.stale = true;
+        assert_eq!(
+            prepare("default", &stale, None, None),
+            Err(PrepareRefusal::Stale)
+        );
+    }
+
+    #[test]
+    fn refreshing_marks_every_provider() {
+        let mut snapshot = json!({ "providers": [
+            { "id": "a" },
+            { "id": "b", "updated_at": 90 },
+            { "id": "c", "updated_at": 110 },
+            { "id": "d", "updated_at": 100 },
+            { "id": "e" },
+        ]});
+        let requested = HashMap::from(["b", "c", "d", "e"].map(|id| (id.to_string(), 100)));
+        attach_refreshing(&mut snapshot, &requested);
+        let flags: Vec<bool> = (0..5)
+            .map(|i| snapshot["providers"][i]["refreshing"].as_bool().unwrap())
+            .collect();
+        // a never asked; b not heard since; c and d reported at or after the request; e never reported.
+        assert_eq!(flags, [false, true, false, false, true]);
+    }
+
+    #[test]
+    fn items_get_the_project_prepare_would_resolve() {
+        let conn = store();
+        let project = |name: &str, path: &str| {
+            let scope = projects::ProjectScope::Global;
+            Project::new(name, path, scope)
+        };
+        let registered = [
+            project("api", "/tmp/aoe-api"),
+            project("web", "/tmp/aoe-web"),
+            project("twin", "/tmp/aoe-twin-a"),
+            project("twin", "/tmp/aoe-twin-b"),
+        ];
+        put_mapping(
+            &conn,
+            "p",
+            "acme.github",
+            "o/r",
+            &["/tmp/aoe-web".to_string()],
+        )
+        .unwrap();
+        let mut snapshot = json!({ "items": [
+            { "provider_id": "acme.github", "id": "hint", "project": "api" },
+            { "provider_id": "acme.github", "id": "mapped", "project": "api", "mapping_key": "o/r" },
+            { "provider_id": "acme.github", "id": "ambiguous", "project": "twin" },
+            { "provider_id": "acme.github", "id": "none" },
+            { "provider_id": "other", "id": "unmapped", "mapping_key": "o/r" },
+        ]});
+        attach_projects(&conn, "p", &mut snapshot, &registered).unwrap();
+        let resolved = |i: usize| snapshot["items"][i]["resolved_project"].clone();
+        assert_eq!(resolved(0)["name"], "api");
+        assert_eq!(
+            resolved(1),
+            json!({ "name": "web", "path": "/tmp/aoe-web" })
+        );
+        assert!(resolved(2).is_null(), "an ambiguous hint is never guessed");
+        assert!(resolved(3).is_null());
+        assert!(resolved(4).is_null(), "a mapping belongs to its provider");
     }
 
     #[test]

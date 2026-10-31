@@ -308,6 +308,13 @@ struct PendingCreation {
     receipt: Option<Box<MutationReceipt<crate::daemon::SessionResponse>>>,
 }
 
+/// Why the daemon refuses mutations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MutationBlock {
+    ReadOnly,
+    Offline,
+}
+
 fn set_grant(grant: &AtomicU64, allowed: bool) {
     // Renamed to try_update in the standard library; the MSRV this builds against
     // does not have it yet. Upstream carries the same allowance.
@@ -787,6 +794,22 @@ impl SessionFeed {
             generation: self.native_grant.load(Ordering::SeqCst),
             cancelled: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Why mutations are unavailable; `None` when they are available.
+    pub(crate) fn mutation_block(&self) -> Option<MutationBlock> {
+        if self.mutations_available() {
+            return None;
+        }
+        let connected = self
+            .commands
+            .as_ref()
+            .is_some_and(|commands| !commands.is_closed());
+        Some(if connected {
+            MutationBlock::ReadOnly
+        } else {
+            MutationBlock::Offline
+        })
     }
 
     pub(crate) fn mutations_available(&self) -> bool {

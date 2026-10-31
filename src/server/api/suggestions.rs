@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::{api_error, AppState};
-use crate::plugin::suggestions::{self, PromptTooLong, Provider};
+use crate::plugin::suggestions::{self, PrepareRefusal, Provider};
 use axum::http::StatusCode;
 
 #[derive(Deserialize)]
@@ -111,13 +111,26 @@ pub async fn get_suggestions(State(state): State<Arc<AppState>>) -> impl IntoRes
         }))
         .into_response();
     };
+    let profile = host.suggestions_profile();
+    let started = suggestions::started_sessions(&state.instances.read().await, &profile);
+    let refreshing = host.refreshing_suggestions();
     let result = tokio::task::spawn_blocking(move || {
         let providers = suggestions::providers();
-        host.with_suggestions_db(|conn, profile| suggestions::snapshot(conn, profile, &providers))
+        // Disk reads stay off the store lock.
+        let registered = crate::session::projects::load_merged(&profile).unwrap_or_default();
+        host.with_suggestions_db(|conn, profile| {
+            let mut snapshot = suggestions::snapshot(conn, profile, &providers)?;
+            suggestions::attach_projects(conn, profile, &mut snapshot, &registered)?;
+            Ok::<_, anyhow::Error>(snapshot)
+        })
     })
     .await;
     match result {
-        Ok(Ok(snapshot)) => Json(snapshot).into_response(),
+        Ok(Ok(mut snapshot)) => {
+            suggestions::attach_started(&mut snapshot, &started);
+            suggestions::attach_refreshing(&mut snapshot, &refreshing);
+            Json(snapshot).into_response()
+        }
         Ok(Err(error)) => internal(error),
         Err(error) => internal(error),
     }
@@ -356,7 +369,12 @@ pub async fn prepare_suggestion(
     .await;
     match result {
         Ok(Ok(Some(Ok(prefill)))) => Json(prefill).into_response(),
-        Ok(Ok(Some(Err(PromptTooLong)))) => api_error(
+        Ok(Ok(Some(Err(PrepareRefusal::Stale)))) => api_error(
+            StatusCode::BAD_REQUEST,
+            "stale",
+            "That suggestion is no longer open at its source",
+        ),
+        Ok(Ok(Some(Err(PrepareRefusal::PromptTooLong)))) => api_error(
             StatusCode::BAD_REQUEST,
             "validation_failed",
             format!(

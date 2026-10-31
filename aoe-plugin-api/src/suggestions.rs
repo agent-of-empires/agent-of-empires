@@ -35,6 +35,10 @@ pub struct Suggestion {
     pub mapping_key: Option<String>,
     /// Which declared [`SuggestionSource`] produced this item.
     pub criterion: String,
+    /// The source closed or changed since the item was found. Core keeps a
+    /// stale item for 24 hours, then drops it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stale: bool,
     /// Values for the placeholders the source declared; untrusted provider
     /// text, never instructions.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

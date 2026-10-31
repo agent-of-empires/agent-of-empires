@@ -1,9 +1,14 @@
-import { useEffect, useRef, useState } from "react";
-import { dismissSuggestion } from "../lib/api";
-import type { SessionResponse, SuggestionItem } from "../lib/types";
-import { suggestionKey, useSuggestions } from "../hooks/useSuggestions";
+import type { SessionResponse } from "../lib/types";
+import { updateSuggestionSource } from "../lib/api";
+import { suggestionKey, useDismissUndo, useSuggestions } from "../hooks/useSuggestions";
 import { useIsWideViewport } from "../hooks/useIsWideViewport";
-import { SUGGESTION_NOTE_CLASS, SuggestionActions, SuggestionRow, SuggestionStatusNotes } from "./SuggestionRow";
+import {
+  SUGGESTION_NOTE_CLASS,
+  SuggestionActions,
+  SuggestionRow,
+  SuggestionStatusNotes,
+  UndoBar,
+} from "./SuggestionRow";
 import type { WizardPrefill } from "./session-wizard/SessionWizard";
 
 interface Props {
@@ -11,20 +16,16 @@ interface Props {
   onPrepare: (prefill: WizardPrefill) => void;
   onStarted?: (session: SessionResponse) => void;
   onViewAll: () => void;
+  onOpenSession: (sessionId: string) => void;
 }
 
-const UNDO_MS = 10_000;
-
-export function DashboardSuggestions({ readOnly = false, onPrepare, onStarted, onViewAll }: Props) {
+export function DashboardSuggestions({ readOnly = false, onPrepare, onStarted, onViewAll, onOpenSession }: Props) {
   const wide = useIsWideViewport();
-  const { snapshot, loadFailed, busy, refreshing, notice, offline, act, refresh, start } = useSuggestions(
+  const { snapshot, loadFailed, busy, refreshing, notice, failures, offline, act, refresh, start } = useSuggestions(
     onPrepare,
     onStarted,
   );
-  const [undo, setUndo] = useState<SuggestionItem | null>(null);
-  const undoTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
-
-  useEffect(() => () => clearTimeout(undoTimer.current), []);
+  const { undo, dismiss, clearUndo } = useDismissUndo(act);
 
   if (!snapshot || snapshot.providers.length === 0) return null;
 
@@ -32,19 +33,12 @@ export function DashboardSuggestions({ readOnly = false, onPrepare, onStarted, o
   const rows = active.slice(0, wide ? 3 : 2);
   const nameOf = (id: string) => snapshot.providers.find((p) => p.id === id)?.name ?? id;
   const pending = snapshot.providers.filter((p) => p.status === "pending");
+  const kindOf = (item: { provider_id: string; criterion: string }) =>
+    snapshot.providers
+      .find((p) => p.id === item.provider_id)
+      ?.sources.find((src) => src.criterion === item.criterion)
+      ?.label.toLowerCase();
   const alert = notice ?? (loadFailed ? "Could not load suggestions." : null);
-
-  const dismiss = async (item: SuggestionItem, dismissed: boolean) => {
-    const ok = await act(suggestionKey(item), () => dismissSuggestion(item.provider_id, item.id, dismissed));
-    if (!ok) return;
-    clearTimeout(undoTimer.current);
-    if (dismissed) {
-      setUndo(item);
-      undoTimer.current = setTimeout(() => setUndo(null), UNDO_MS);
-    } else {
-      setUndo(null);
-    }
-  };
 
   return (
     <section className="mb-4 mt-3 w-full max-w-2xl" aria-labelledby="suggested-sessions-heading">
@@ -74,14 +68,27 @@ export function DashboardSuggestions({ readOnly = false, onPrepare, onStarted, o
             title={item.title}
             source={nameOf(item.provider_id)}
             reason={item.reason}
-            project={item.project}
+            project={item.resolved_project?.name ?? item.project}
+            session={item.started_session}
+            stale={item.stale}
+            failure={failures[suggestionKey(item)]?.message}
             actions={
               <SuggestionActions
                 readOnly={readOnly}
                 offline={offline}
                 busy={busy !== null}
-                onStart={() => void start(item)}
+                onStart={() => void start(item, failures[suggestionKey(item)]?.another)}
+                stale={item.stale}
+                failed={suggestionKey(item) in failures}
                 onToggleDismiss={() => void dismiss(item, true)}
+                started={
+                  item.started_session && {
+                    onOpen: () => onOpenSession(item.started_session!.id),
+                    onStartAnother: () => void start(item, true),
+                    providerName: nameOf(item.provider_id),
+                    sourceUrl: item.source_url,
+                  }
+                }
               />
             }
           />
@@ -117,17 +124,18 @@ export function DashboardSuggestions({ readOnly = false, onPrepare, onStarted, o
         </p>
       )}
       {undo && (
-        <div className="mt-2 flex w-max max-w-full items-baseline gap-1 rounded-md bg-surface-800 px-3 py-1.5 text-[13px] text-text-secondary">
-          <span className="min-w-0 truncate">Dismissed &ldquo;{undo.title}&rdquo;.</span>
-          <button
-            type="button"
-            onClick={() => void dismiss(undo, false)}
-            disabled={busy !== null || readOnly || offline}
-            className="flex-none cursor-pointer text-brand-500 hover:underline disabled:opacity-50"
-          >
-            Undo
-          </button>
-        </div>
+        <UndoBar
+          title={undo.title}
+          disabled={busy !== null || readOnly || offline}
+          onUndo={() => void dismiss(undo, false)}
+          stopLabel={kindOf(undo)}
+          onStop={() => {
+            void act(`stop:${suggestionKey(undo)}`, () =>
+              updateSuggestionSource(undo.provider_id, undo.criterion, false),
+            );
+            clearUndo();
+          }}
+        />
       )}
     </section>
   );

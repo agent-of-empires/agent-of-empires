@@ -90,6 +90,8 @@ export interface WizardPrefill {
   source?: { label: string; title: string; url: string };
   /** Set when a stored template produced `initialPrompt`. */
   template?: { providerId: string; criterion: string };
+  /** Suggestion to link the created Session to. */
+  suggestion?: { provider_id: string; id: string };
 }
 
 function initialWizardData(prefill: WizardPrefill | undefined, nameOnly: boolean): WizardData {
@@ -640,6 +642,7 @@ export function SessionWizard({
           state.agents.find((a) => a.name === d.tool),
         ),
       ),
+      suggestion: prefill?.suggestion,
       idempotency_key: newIdempotencyKey(),
     };
     // A failed preview counts as nothing to confirm, so it never blocks creation.

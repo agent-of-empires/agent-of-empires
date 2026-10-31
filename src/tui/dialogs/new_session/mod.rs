@@ -111,6 +111,8 @@ pub struct PromptOrigin {
     pub reason: String,
     /// Untrusted provider text behind the prompt, shown on Ctrl+P.
     pub source_text: Option<String>,
+    /// Links the created Session to the suggestion; `None` for "Start another".
+    pub suggestion: Option<crate::session::SuggestionOrigin>,
 }
 
 #[derive(Clone)]
@@ -147,6 +149,7 @@ pub struct NewSessionData {
     pub structured: bool,
     /// First turn typed into the agent once it is ready.
     pub initial_prompt: Option<String>,
+    pub suggestion: Option<crate::session::SuggestionOrigin>,
 }
 
 /// The one conversion from wizard output to builder input, so a new field
@@ -2337,6 +2340,10 @@ impl NewSessionDialog {
             initial_prompt: (self.prompt_origin.is_some()
                 && !self.prompt.value().trim().is_empty())
             .then(|| self.prompt.value().to_string()),
+            suggestion: self
+                .prompt_origin
+                .as_ref()
+                .and_then(|origin| origin.suggestion.clone()),
         })
     }
 

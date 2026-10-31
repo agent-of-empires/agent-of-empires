@@ -9,10 +9,12 @@ export function toWizardPrefill(
   p: SuggestionPrepared,
   source: NonNullable<WizardPrefill["source"]>,
   providerId?: string,
+  suggestion?: WizardPrefill["suggestion"],
 ): WizardPrefill {
   return {
     source,
     template: p.template_criterion && providerId ? { providerId, criterion: p.template_criterion } : undefined,
+    suggestion,
     title: p.title || undefined,
     path: p.project?.path,
     tool: p.tool,
