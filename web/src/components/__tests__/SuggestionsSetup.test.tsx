@@ -224,6 +224,14 @@ describe("setup sheet", () => {
     expect(screen.queryByTestId("suggestions-setup-checks")).toBeNull();
   });
 
+  it("unlocks the sheet when an install preview fails", async () => {
+    api.previewPluginInstall.mockResolvedValueOnce({ kind: "error", message: "rate limit" });
+    await openSheet();
+    fireEvent.click(screen.getByTestId("suggestions-setup-install"));
+    await waitFor(() => expect(screen.getByTestId("suggestions-setup-close")).not.toHaveProperty("disabled", true));
+    expect(screen.getByTestId("suggestions-setup-install")).toHaveProperty("disabled", false);
+  });
+
   it("shows a failed check with its fix, stops polling, and re-runs on Check again", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const { onFinished } = await openSheet();
