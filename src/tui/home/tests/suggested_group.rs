@@ -155,8 +155,9 @@ fn terminal_view_config() {
 #[test]
 #[serial]
 fn enter_on_a_suggestion_opens_the_prefilled_dialog() {
-    terminal_view_config();
+    // After expanded_env: it creates the isolated home this must land in.
     let (mut env, requests) = expanded_env(2);
+    terminal_view_config();
     env.view.cursor += 1;
     env.view.update_selected();
     env.view.handle_key(key(KeyCode::Enter), None);
