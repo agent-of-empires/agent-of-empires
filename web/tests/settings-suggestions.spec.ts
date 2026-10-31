@@ -12,7 +12,13 @@ const source = (criterion: string, label: string, enabled: boolean, variables: s
 
 function store() {
   return {
-    prefs: { homepage: true, sidebar: false, refresh_minutes: 15, provider_order: ["github", "linear"] },
+    prefs: {
+      homepage: true,
+      sidebar: false,
+      refresh_minutes: 15,
+      start_without_review: false,
+      provider_order: ["github", "linear"],
+    },
     providers: [
       {
         id: "github",
@@ -106,4 +112,13 @@ test("375px shows an arrow button instead of the drag handle", async ({ page }) 
   await expect(page.getByRole("button", { name: "Drag GitHub to reorder" })).toBeHidden();
   await page.getByRole("button", { name: "Move Linear up" }).click();
   await expect.poll(() => bodies).toContainEqual({ provider_order: ["linear", "github"] });
+});
+
+test("the Start without review switch persists through the prefs PATCH", async ({ page }) => {
+  const bodies = await setup(page);
+  await page.goto("/settings/suggestions");
+  const sw = page.getByRole("switch", { name: "Start without review" });
+  await expect(sw).toBeEnabled();
+  await sw.click();
+  await expect.poll(() => bodies).toContainEqual({ start_without_review: true });
 });

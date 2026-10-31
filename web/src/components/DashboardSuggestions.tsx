@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { dismissSuggestion } from "../lib/api";
-import type { SuggestionItem } from "../lib/types";
+import type { SessionResponse, SuggestionItem } from "../lib/types";
 import { suggestionKey, useSuggestions } from "../hooks/useSuggestions";
 import { useIsWideViewport } from "../hooks/useIsWideViewport";
 import { SUGGESTION_NOTE_CLASS, SuggestionActions, SuggestionRow, SuggestionStatusNotes } from "./SuggestionRow";
@@ -9,14 +9,18 @@ import type { WizardPrefill } from "./session-wizard/SessionWizard";
 interface Props {
   readOnly?: boolean;
   onPrepare: (prefill: WizardPrefill) => void;
+  onStarted?: (session: SessionResponse) => void;
   onViewAll: () => void;
 }
 
 const UNDO_MS = 10_000;
 
-export function DashboardSuggestions({ readOnly = false, onPrepare, onViewAll }: Props) {
+export function DashboardSuggestions({ readOnly = false, onPrepare, onStarted, onViewAll }: Props) {
   const wide = useIsWideViewport();
-  const { snapshot, loadFailed, busy, refreshing, notice, offline, act, refresh, start } = useSuggestions(onPrepare);
+  const { snapshot, loadFailed, busy, refreshing, notice, offline, act, refresh, start } = useSuggestions(
+    onPrepare,
+    onStarted,
+  );
   const [undo, setUndo] = useState<SuggestionItem | null>(null);
   const undoTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
 

@@ -24,6 +24,7 @@ interface Props {
   readOnly?: boolean;
   /** Both required to show the Suggested sessions section. */
   onPrepareSuggestion?: (prefill: WizardPrefill) => void;
+  onSuggestionStarted?: (session: SessionResponse) => void;
   onViewAllSuggestions?: () => void;
   /** The onboarding tour is running; the first-run hint stays out of it. */
   tourActive?: boolean;
@@ -40,6 +41,7 @@ export function Dashboard({
   readOnly,
   canManageProjects = true,
   onPrepareSuggestion,
+  onSuggestionStarted,
   onViewAllSuggestions,
   onOpenSuggestionsMarketplace,
   tourActive = false,
@@ -161,6 +163,7 @@ export function Dashboard({
           key={suggestionsEpoch}
           readOnly={readOnly}
           onPrepare={onPrepareSuggestion}
+          onStarted={onSuggestionStarted}
           onViewAll={onViewAllSuggestions}
         />
       )}

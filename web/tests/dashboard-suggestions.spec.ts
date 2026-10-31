@@ -21,6 +21,13 @@ const items = [
   mk(4, "Fourth item stays out of the homepage list", "Assigned to you", "aoe"),
 ];
 const provider = { id: "github", name: "GitHub", status: "ok", sources: [] };
+const prefs = {
+  homepage: true,
+  sidebar: false,
+  refresh_minutes: 15,
+  start_without_review: false,
+  provider_order: ["github"],
+};
 const CURSOR = { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" };
 
 async function mockHome(page: import("@playwright/test").Page) {
@@ -28,7 +35,7 @@ async function mockHome(page: import("@playwright/test").Page) {
   await page.route("**/api/sessions", (route) =>
     route.fulfill({ headers: CURSOR, json: { sessions: [], workspace_ordering: [] } }),
   );
-  await page.route("**/api/suggestions", (route) => route.fulfill({ json: { providers: [provider], items } }));
+  await page.route("**/api/suggestions", (route) => route.fulfill({ json: { providers: [provider], items, prefs } }));
 }
 
 test("homepage shows 3 suggestions and View all opens the full view", async ({ page }) => {

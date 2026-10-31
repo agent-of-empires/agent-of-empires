@@ -37,6 +37,7 @@ import {
   claimPendingCreate,
   isPendingCreateExpired,
   PENDING_CREATE_EXPIRED_MESSAGE,
+  newIdempotencyKey,
   peekPendingCreate,
   registerPendingCreate,
   releasePendingCreate,
@@ -147,12 +148,6 @@ const profileMissingError = (profile: string) =>
 
 const REGISTRY_UNRESOLVED_ERROR =
   "Could not load this project's settings, so its sandbox and worktree defaults are unknown. Select the project again to retry.";
-
-function newIdempotencyKey(): string {
-  // randomUUID needs a secure context, which a LAN or tunnel dashboard may not be.
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
-}
 
 function waitUntilOnline(): Promise<void> {
   if (typeof navigator === "undefined" || navigator.onLine !== false) return Promise.resolve();
