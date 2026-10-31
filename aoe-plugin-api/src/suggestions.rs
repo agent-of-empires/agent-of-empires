@@ -5,8 +5,12 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Host-to-worker notification asking the worker to discover again.
+/// Host-to-worker notification asking the worker to discover again. Params are
+/// `{ "refresh_minutes": u32 }`, the user's refresh interval hint.
 pub const SUGGESTIONS_REFRESH: &str = "suggestions.refresh";
+
+/// Prefix of the worker methods a provider's fix action may name.
+pub const SUGGESTIONS_FIX_PREFIX: &str = "suggestions.fix.";
 
 /// Host-to-worker notification asking the worker to run its setup checks again.
 pub const SUGGESTIONS_CHECKS_RUN: &str = "suggestions.checks.run";
@@ -56,6 +60,10 @@ pub struct SuggestionDraft {
 pub struct SuggestionsSpec {
     #[serde(default)]
     pub sources: Vec<SuggestionSource>,
+    /// The provider runs an agent itself, which spends the user's agent usage.
+    /// Informational: the host only displays it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub uses_agent: bool,
 }
 
 /// One criterion a provider publishes.
@@ -91,6 +99,19 @@ pub struct SetSuggestions {
 #[serde(deny_unknown_fields)]
 pub struct SuggestionsError {
     pub message: String,
+    /// A one-step way out of the error the user can run from Settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix: Option<SuggestionFix>,
+}
+
+/// A fix action for a provider error. `method` is a worker method in the
+/// [`SUGGESTIONS_FIX_PREFIX`] namespace; the host sends it, with `{}`, as a
+/// notification when the user asks for the fix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuggestionFix {
+    pub label: String,
+    pub method: String,
 }
 
 /// Outcome of one setup check.
@@ -126,6 +147,24 @@ pub struct SetChecks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uses_agent_defaults_off_and_fix_rejects_unknown_fields() {
+        let spec: SuggestionsSpec = serde_json::from_str(r#"{"sources":[]}"#).unwrap();
+        assert!(!spec.uses_agent);
+        let spec: SuggestionsSpec =
+            serde_json::from_str(r#"{"sources":[],"uses_agent":true}"#).unwrap();
+        assert!(spec.uses_agent);
+        let err: SuggestionsError = serde_json::from_str(
+            r#"{"message":"x","fix":{"label":"Fix","method":"suggestions.fix.a"}}"#,
+        )
+        .unwrap();
+        assert_eq!(err.fix.unwrap().label, "Fix");
+        assert!(serde_json::from_str::<SuggestionsError>(
+            r#"{"message":"x","fix":{"label":"Fix","method":"m","extra":1}}"#
+        )
+        .is_err());
+    }
 
     #[test]
     fn checks_params_use_lowercase_status_and_reject_unknown_fields() {

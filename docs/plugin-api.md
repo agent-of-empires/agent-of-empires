@@ -320,6 +320,7 @@ A worker declares the criteria it publishes in a `[suggestions]` block:
 
 ```toml
 [suggestions]
+uses_agent = true                # optional; the provider runs an agent itself
 [[suggestions.sources]]
 criterion = "review_requested"   # stable key, matches each item's `criterion`
 label = "Review requests"        # plural, user-facing
@@ -331,16 +332,16 @@ label = "Failing checks on your PRs"
 default_enabled = false
 ```
 
-At least one source is required. Criteria are unique, non-empty and at most 256 bytes; labels are non-empty. The block grants no session authority: it needs only `runtime.worker`, not `session.create` or `session.prompt`.
+`uses_agent` (default `false`) is informational: Settings shows that the provider spends the user's agent usage, and the host changes nothing. At least one source is required. Criteria are unique, non-empty and at most 256 bytes; labels are non-empty. The block grants no session authority: it needs only `runtime.worker`, not `session.create` or `session.prompt`.
 
 | Method | Params | Result |
 |---|---|---|
 | `suggestions.sources` | `{}` | `{ sources: [{ criterion, enabled }] }` |
 | `suggestions.set` | `{ items }` | `{ ok, accepted, dropped }` |
-| `suggestions.error` | `{ message }` | `{ ok }` |
+| `suggestions.error` | `{ message, fix?: { label, method } }` | `{ ok }` |
 | `suggestions.checks.set` | `{ checks }` | `{ ok, stored }` |
 
-Call `suggestions.sources` before discovering and skip every criterion that is not enabled. A source is enabled when the user's stored switch says so, else when its `default_enabled` (default `true`) does. The host sends the `suggestions.refresh` notification (`{}`); on it, discover again and call `suggestions.set` or `suggestions.error`.
+Call `suggestions.sources` before discovering and skip every criterion that is not enabled. A source is enabled when the user's stored switch says so, else when its `default_enabled` (default `true`) does. The host sends the `suggestions.refresh` notification with `{ refresh_minutes }`, the user's refresh interval (5, 15, 30, 60 or 120; 15 until they choose); on it, discover again and call `suggestions.set` or `suggestions.error`. `refresh_minutes` is a hint for how often to discover on your own: refresh less often if your rate limits need it, never more often. The host re-sends `suggestions.refresh` when the user changes it, but not when a worker starts, so use 15 until the first one arrives.
 
 An item is `{ id, title, reason, source_url, source_ref, preview, project?, mapping_key?, criterion, stale?, variables, draft: { title, prompt } }`. `variables` holds exactly the names the item's source declares. Treat `preview`, `variables` and `draft` as untrusted source content. `projects.list` returns the registered projects so a provider can map its own keys to a `project` name or path. A user's [mapping](#project-mappings) for `mapping_key` takes precedence over `project`.
 
@@ -377,14 +378,17 @@ Suggestions are stored per profile. The routes below list and act on them; none 
 | `GET /api/suggestions/templates` | query `provider_id` and `criterion`, or neither | one: `{ provider_id, criterion, template, default }`; none: `{ templates: [{ provider_id, criterion, template }] }` |
 | `PUT /api/suggestions/templates` | `{ provider_id, criterion, template }` | `{ provider_id, criterion, template, default }` |
 | `DELETE /api/suggestions/templates` | `{ provider_id, criterion }` | `{ ok }` |
-| `POST /api/suggestions/prepare` | `{ provider_id, id }` | `{ title, initial_prompt, templated, source_ref, project, extra_projects, tool, yolo, sandbox, worktree }` |
+| `POST /api/suggestions/fix` | `{ provider_id }` | `{ ok, notified }` |
+| `POST /api/suggestions/prepare` | `{ provider_id, id }` | `{ title, initial_prompt, templated, template_criterion, source_ref, project, extra_projects, tool, yolo, sandbox, worktree }` |
 | `GET /api/suggestions/mappings` | none | `{ mappings: [{ provider_id, mapping_key, projects }] }` |
 | `PUT /api/suggestions/mappings` | `{ provider_id, mapping_key, projects }` | `{ provider_id, mapping_key, projects }` |
 | `DELETE /api/suggestions/mappings?provider_id=&mapping_key=` | none | `{ ok, deleted }` |
 
 Providers are listed in the user's `provider_order`; a provider never ordered follows, sorted by id. `prefs` defaults to `{ homepage: true, sidebar: false, refresh_minutes: 15, start_without_review: false, provider_order: [] }` and is per profile. `start_without_review` lets the web Start button create the session from the prepared draft instead of opening the wizard; clients only do so when `prepare` returns `templated: true` and a `project`. `PATCH /api/suggestions/prefs` is partial: `refresh_minutes` is one of 5, 15, 30, 60 or 120, `provider_order` must list every provider exactly once, and `provider_enabled` maps provider ids to booleans. Other values fail with 400 `validation_failed`, and nothing is stored. `refresh_minutes` is a hint for plugins; core does not schedule refreshes yet. The route is denied in read-only (403 `read_only`) and CityHall mode.
 
-A provider's `status` is `pending` before its first publish, `ok`, or `error`. Uninstalling a plugin, or updating it to a build whose `[suggestions]` block differs, clears its items, checks and status so it is `pending` again until its next publish; source switches, dismissals, templates and mappings are kept. Each item is the published item plus `provider_id` and `dismissed`; dismissed items are still returned. Items of a disabled source or provider are hidden, and `refresh` skips a disabled provider. `updated_at` is Unix seconds of the provider's last report. `refresh` and a `sources` change send `suggestions.refresh` to the affected workers.
+`suggestions.error` may carry a `fix`: a `label` (non-empty, at most 64 bytes) shown on a button beside the error, and a `method` named `suggestions.fix.<name>` (at most 64 bytes, `a-z 0-9 . _ -`). Anything else fails with invalid params and stores nothing. `POST /api/suggestions/fix` sends that method, with `{}`, to the provider's worker as a notification; clients never choose the method, and the route fails with 400 `validation_failed` when the provider has no fix. The worker should open its own fix flow and publish again afterwards. The fix is dropped on the provider's next `suggestions.set` or `suggestions.error`. `GET /api/suggestions` lists `uses_agent: true` and `fix: { label }` (error only) on a provider; the method is never exposed. The route is denied in read-only (403 `read_only`) and CityHall mode.
+
+A provider's `status` is `pending` before its first publish, `ok`, or `error`. Uninstalling a plugin, or updating it to a build whose `[suggestions]` block differs, clears its items, checks and status so it is `pending` again until its next publish; source switches, dismissals, templates and mappings are kept. Each item is the published item plus `provider_id` and `dismissed`; dismissed items are still returned. Items of a disabled source or provider are hidden, and `refresh` skips a disabled provider. `updated_at` is Unix seconds of the provider's last report. `refresh`, a `sources` change and a `refresh_minutes` change send `suggestions.refresh` to the affected workers.
 
 `refreshing` is true while a refresh the host requested is unanswered, for at most two minutes, and is not stored. Each item has `resolved_project: { name, path }`, or `null`, the registered project a [mapping](#project-mappings) or the unambiguous `project` hint resolves to; group by `path`, never by the provider's `project` text.
 
@@ -392,7 +396,7 @@ A provider's `status` is `pending` before its first publish, `ok`, or `error`. U
 
 `prepare` resolves settings through the normal repo and profile config. `project` is `{ name, path }` or `null`, resolved in this order: the user's mapping for the item's `mapping_key`, then the item's `project` hint (exactly one registered project by name or exact path), else `null`; an item is never given a scratch project.
 
-`templated` is `true` when a stored template produced `initial_prompt`, `false` when it is the provider's `draft.prompt`.
+`templated` is `true` when a stored template produced `initial_prompt`, `false` when it is the provider's `draft.prompt`. `template_criterion` is then the item's criterion, else `null`.
 
 A template is stored per profile and criterion and replaces the provider's `draft.prompt` in `prepare`'s `initial_prompt`, nowhere else. `{name}` expands to the item's variable of that name, scanning left to right (`{a{pr_number}}` becomes `{a42}`); unknown names and stray braces stay as typed, and expanded values are never scanned again. No stored template (`default: true`) uses `draft.prompt`; an empty template gives an empty prompt, so a client must then omit `initial_prompt` when creating the session, which rejects a blank one. A template and its expansion are each limited to 64 KiB; `prepare` fails with 400 `validation_failed` when the expansion is longer.
 

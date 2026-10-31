@@ -4,6 +4,7 @@ import { SortableContext, arrayMove, useSortable, verticalListSortingStrategy } 
 import { CSS } from "@dnd-kit/utilities";
 import { ArrowUp, GripVertical } from "lucide-react";
 import {
+  runSuggestionFix,
   updateSuggestionPrefs,
   updateSuggestionSource,
   type SuggestionPrefsPatch,
@@ -12,7 +13,7 @@ import {
 import type { SuggestionProvider, SuggestionsSnapshot } from "../../lib/types";
 import { OFFLINE_TITLE, useServerDown } from "../../lib/connectionState";
 import { SectionHeader, SuggestionSwitch } from "./suggestionsShared";
-import { SuggestionTemplates } from "./SuggestionTemplates";
+import { SuggestionTemplates, type TemplateFocus } from "./SuggestionTemplates";
 
 const REFRESH_OPTIONS = [5, 15, 30, 60, 120];
 
@@ -48,9 +49,19 @@ interface ProviderRowProps {
   onMove: (id: string, delta: -1 | 1) => void;
   onEnabled: (id: string, enabled: boolean) => void;
   onSource: (providerId: string, criterion: string, enabled: boolean) => void;
+  onFix: (id: string) => void;
 }
 
-function ProviderRow({ provider, disabled, reorderLocked, first, onMove, onEnabled, onSource }: ProviderRowProps) {
+function ProviderRow({
+  provider,
+  disabled,
+  reorderLocked,
+  first,
+  onMove,
+  onEnabled,
+  onSource,
+  onFix,
+}: ProviderRowProps) {
   const { setNodeRef, attributes, listeners, transform, transition } = useSortable({
     id: provider.id,
     disabled: reorderLocked,
@@ -59,7 +70,7 @@ function ProviderRow({ provider, disabled, reorderLocked, first, onMove, onEnabl
     provider.status === "error" ? (
       <span className="text-status-error-text">Couldn&apos;t refresh: {provider.error ?? "provider error"}</span>
     ) : (
-      `Plugin${provider.updated_at ? ` · updated ${ago(provider.updated_at)}` : provider.status === "pending" ? " · waiting for first results" : ""}`
+      `Plugin${provider.updated_at ? ` · updated ${ago(provider.updated_at)}` : provider.status === "pending" ? " · waiting for first results" : ""}${provider.uses_agent ? " · uses an Agent to read the codebase, which uses your Agent's usage" : ""}`
     );
   return (
     <li
@@ -98,6 +109,18 @@ function ProviderRow({ provider, disabled, reorderLocked, first, onMove, onEnabl
           <div className="text-sm text-text-primary">{provider.name}</div>
           <div className="text-xs text-text-dim">{status}</div>
         </div>
+        {provider.status === "error" && provider.fix && (
+          <button
+            type="button"
+            aria-label={provider.fix.label}
+            disabled={disabled}
+            onClick={() => onFix(provider.id)}
+            className={`${BUTTON} min-h-11 md:min-h-0`}
+          >
+            <span className="md:hidden">Fix</span>
+            <span className="hidden md:inline">{provider.fix.label}</span>
+          </button>
+        )}
         <SuggestionSwitch
           checked={provider.enabled}
           disabled={disabled}
@@ -136,14 +159,22 @@ interface Props {
   reload: () => Promise<void>;
   readOnly: boolean;
   onOpenSuggestions?: (dismissed: boolean) => void;
+  templateFocus?: TemplateFocus;
 }
 
-export function SuggestionsSettings({ snapshot, failed, reload, readOnly, onOpenSuggestions }: Props) {
+export function SuggestionsSettings({ snapshot, failed, reload, readOnly, onOpenSuggestions, templateFocus }: Props) {
   const offline = useServerDown();
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [templates, setTemplates] = useState(false);
+  const [templates, setTemplates] = useState(Boolean(templateFocus));
   const mounted = useRef(true);
+  // Keyed on primitives: App rebuilds `templateFocus` every render, which must not reopen the view.
+  const focusKey = templateFocus && `${templateFocus.providerId}/${templateFocus.criterion}`;
+  const [seenFocus, setSeenFocus] = useState(focusKey);
+  if (focusKey !== seenFocus) {
+    setSeenFocus(focusKey);
+    if (focusKey) setTemplates(true);
+  }
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 4 } }));
 
   useEffect(() => {
@@ -176,7 +207,9 @@ export function SuggestionsSettings({ snapshot, failed, reload, readOnly, onOpen
       <SuggestionTemplates
         snapshot={snapshot}
         disabled={disabled}
+        focus={templateFocus}
         onBack={() => setTemplates(false)}
+        onReturn={templateFocus?.returnToSuggestions ? () => onOpenSuggestions?.(false) : undefined}
         onSource={(providerId, criterion, enabled) => act(() => updateSuggestionSource(providerId, criterion, enabled))}
       />
     );
@@ -251,6 +284,7 @@ export function SuggestionsSettings({ snapshot, failed, reload, readOnly, onOpen
                   onMove={move}
                   onEnabled={(id, enabled) => void patch({ provider_enabled: { [id]: enabled } })}
                   onSource={(id, criterion, enabled) => void act(() => updateSuggestionSource(id, criterion, enabled))}
+                  onFix={(id) => void act(() => runSuggestionFix(id))}
                 />
               ))}
             </ul>

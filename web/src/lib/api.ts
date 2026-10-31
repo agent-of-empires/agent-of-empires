@@ -3244,6 +3244,9 @@ async function suggestionRequest<T>(url: string, method: string, body?: unknown)
 
 export const refreshSuggestions = () => suggestionRequest("/api/suggestions/refresh", "POST");
 
+export const runSuggestionFix = (providerId: string) =>
+  suggestionRequest("/api/suggestions/fix", "POST", { provider_id: providerId });
+
 /** Asks every provider to re-run its setup checks; results arrive on the next snapshot. */
 export const runSuggestionChecks = () => suggestionRequest("/api/suggestions/checks/run", "POST");
 

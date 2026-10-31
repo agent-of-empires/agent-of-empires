@@ -510,6 +510,7 @@ pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     // Plugin suggestions.
     ("POST", "/api/suggestions/refresh"),
     ("POST", "/api/suggestions/checks/run"),
+    ("POST", "/api/suggestions/fix"),
     ("POST", "/api/suggestions/dismiss"),
     ("POST", "/api/suggestions/undismiss"),
     ("PATCH", "/api/suggestions/sources"),

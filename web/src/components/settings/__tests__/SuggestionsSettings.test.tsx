@@ -2,12 +2,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { SuggestionsSettings } from "../SuggestionsSettings";
+import type { TemplateFocus } from "../SuggestionTemplates";
 import { useSuggestionsSnapshot } from "../useSuggestionsSnapshot";
 import { expandTemplate } from "../../../lib/suggestionTemplate";
 import type { SuggestionsSnapshot } from "../../../lib/types";
 
 const api = vi.hoisted(() => ({
   fetchSuggestions: vi.fn(),
+  runSuggestionFix: vi.fn(),
   updateSuggestionPrefs: vi.fn(),
   updateSuggestionSource: vi.fn(),
   fetchSuggestionTemplates: vi.fn(),
@@ -67,7 +69,15 @@ const snapshot = (): SuggestionsSnapshot => ({
   ],
 });
 
-function Harness({ readOnly, onOpenSuggestions }: { readOnly: boolean; onOpenSuggestions: () => void }) {
+function Harness({
+  readOnly,
+  onOpenSuggestions,
+  templateFocus,
+}: {
+  readOnly: boolean;
+  onOpenSuggestions: () => void;
+  templateFocus?: TemplateFocus;
+}) {
   const { snapshot, failed, reload } = useSuggestionsSnapshot();
   return (
     <SuggestionsSettings
@@ -76,11 +86,12 @@ function Harness({ readOnly, onOpenSuggestions }: { readOnly: boolean; onOpenSug
       reload={reload}
       readOnly={readOnly}
       onOpenSuggestions={onOpenSuggestions}
+      templateFocus={templateFocus}
     />
   );
 }
 
-function open(props: { readOnly?: boolean } = {}) {
+function open(props: { readOnly?: boolean; templateFocus?: TemplateFocus } = {}) {
   api.fetchSuggestions.mockResolvedValue(snapshot());
   api.fetchSuggestionTemplates.mockResolvedValue([]);
   api.fetchSuggestionMappings.mockResolvedValue([]);
@@ -96,7 +107,13 @@ function open(props: { readOnly?: boolean } = {}) {
     f.mockResolvedValue(ok);
   }
   const onOpenSuggestions = vi.fn();
-  render(<Harness readOnly={props.readOnly ?? false} onOpenSuggestions={onOpenSuggestions} />);
+  render(
+    <Harness
+      readOnly={props.readOnly ?? false}
+      onOpenSuggestions={onOpenSuggestions}
+      templateFocus={props.templateFocus}
+    />,
+  );
   return onOpenSuggestions;
 }
 
@@ -131,6 +148,22 @@ describe("SuggestionsSettings", () => {
     expect(openFull).toHaveBeenCalledWith(true);
     fireEvent.click(screen.getByRole("switch", { name: "Start without review" }));
     await waitFor(() => expect(api.updateSuggestionPrefs).toHaveBeenCalledWith({ start_without_review: true }));
+  });
+
+  it("shows the agent-usage note and runs the plugin's fix", async () => {
+    const snap = snapshot();
+    snap.providers[0].uses_agent = true;
+    snap.providers[1].fix = { label: "Fix in Linear settings" };
+    api.fetchSuggestions.mockResolvedValue(snap);
+    api.fetchSuggestionTemplates.mockResolvedValue([]);
+    api.fetchSuggestionMappings.mockResolvedValue([]);
+    api.fetchProjects.mockResolvedValue([]);
+    api.runSuggestionFix.mockResolvedValue(ok);
+    render(<Harness readOnly={false} onOpenSuggestions={vi.fn()} />);
+    expect((await screen.findByText(/uses an Agent to read the codebase/)).textContent).toContain("Plugin");
+    expect(screen.getAllByText(/uses an Agent/)).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Fix in Linear settings" }));
+    await waitFor(() => expect(api.runSuggestionFix).toHaveBeenCalledWith("lin"));
   });
 
   it("disables every control when read-only", async () => {
@@ -188,6 +221,31 @@ describe("SuggestionsSettings", () => {
     fireEvent.blur(field);
     expect((await screen.findByRole("alert")).textContent).toContain("too long");
     expect(field.value).toBe("typed");
+  });
+
+  it("opens straight on a focused template and returns to the suggestions view", async () => {
+    const openFull = open({
+      templateFocus: { providerId: "gh", criterion: "review-requested", returnToSuggestions: true },
+    });
+    await screen.findByLabelText("GitHub review-requested template");
+    fireEvent.click(screen.getByRole("button", { name: /Suggested sessions/ }));
+    expect(openFull).toHaveBeenCalledWith(false);
+  });
+
+  it("opens the templates view when a focus arrives after mount, once per focus", async () => {
+    api.fetchSuggestions.mockResolvedValue(snapshot());
+    api.fetchSuggestionTemplates.mockResolvedValue([]);
+    api.fetchSuggestionMappings.mockResolvedValue([]);
+    api.fetchProjects.mockResolvedValue([]);
+    const focus = () => ({ providerId: "gh", criterion: "review-requested" });
+    const view = render(<Harness readOnly={false} onOpenSuggestions={vi.fn()} />);
+    await screen.findByText("Plugin · updated 2 min ago");
+    view.rerender(<Harness readOnly={false} onOpenSuggestions={vi.fn()} templateFocus={focus()} />);
+    fireEvent.click(await screen.findByRole("button", { name: /Suggestions/ }));
+    await screen.findByText("Plugin · updated 2 min ago");
+    // A fresh object with the same values (an App re-render) must not reopen it.
+    view.rerender(<Harness readOnly={false} onOpenSuggestions={vi.fn()} templateFocus={focus()} />);
+    expect(screen.queryByLabelText("GitHub review-requested template")).toBeNull();
   });
 
   it("maps a source to a Project and clears it", async () => {
