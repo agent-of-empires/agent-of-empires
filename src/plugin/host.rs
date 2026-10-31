@@ -175,13 +175,50 @@ impl PluginHost {
     }
 
     /// Ask the worker of `provider_id`, or of every suggestions provider, to
-    /// publish again. Returns how many workers were notified.
+    /// publish again, passing the user's `refresh_minutes` hint. Returns how
+    /// many workers were notified.
     pub async fn refresh_suggestions(&self, provider_id: Option<&str>) -> usize {
-        self.notify_suggestion_workers(
+        self.refresh_providers(provider_id, Self::provider_ids())
+            .await
+    }
+
+    fn provider_ids() -> Vec<String> {
+        crate::plugin::suggestions::providers()
+            .into_iter()
+            .map(|p| p.id)
+            .collect()
+    }
+
+    async fn refresh_providers(&self, provider_id: Option<&str>, ids: Vec<String>) -> usize {
+        let minutes = self
+            .with_suggestions_db(crate::plugin::suggestions::refresh_minutes)
+            .unwrap_or_else(|error| {
+                tracing::warn!(target: "plugin.host", error = %error, "suggestions: refresh_minutes unreadable");
+                crate::plugin::suggestions::DEFAULT_REFRESH_MINUTES
+            });
+        self.notify_providers(
             aoe_plugin_api::suggestions::SUGGESTIONS_REFRESH,
+            serde_json::json!({ "refresh_minutes": minutes }),
             provider_id,
+            ids,
         )
         .await
+    }
+
+    /// Send the fix method the provider stored with its current error to that
+    /// worker. `None` when the provider has no fix; otherwise whether a live
+    /// worker was notified.
+    pub async fn run_suggestion_fix(&self, provider_id: &str) -> anyhow::Result<Option<bool>> {
+        let method = self.with_suggestions_db(|conn, profile| {
+            crate::plugin::suggestions::fix_method(conn, profile, provider_id)
+        })?;
+        let Some(method) = method else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.notify_worker(provider_id, &method, serde_json::json!({}))
+                .await,
+        ))
     }
 
     /// Providers with a refresh in flight.
@@ -192,11 +229,22 @@ impl PluginHost {
     /// Ask every suggestions worker to report its setup checks again.
     /// Returns how many workers were notified.
     pub async fn run_suggestion_checks(&self) -> usize {
-        self.notify_suggestion_workers(aoe_plugin_api::suggestions::SUGGESTIONS_CHECKS_RUN, None)
-            .await
+        self.notify_providers(
+            aoe_plugin_api::suggestions::SUGGESTIONS_CHECKS_RUN,
+            serde_json::json!({}),
+            None,
+            Self::provider_ids(),
+        )
+        .await
     }
 
-    async fn notify_suggestion_workers(&self, method: &str, provider_id: Option<&str>) -> usize {
+    async fn notify_providers(
+        &self,
+        method: &str,
+        params: Value,
+        provider_id: Option<&str>,
+        ids: Vec<String>,
+    ) -> usize {
         // An unreadable switch store notifies nobody rather than a provider the user turned off.
         let disabled =
             match self.with_suggestions_db(crate::plugin::suggestions::disabled_providers) {
@@ -209,20 +257,18 @@ impl PluginHost {
                 }
             };
         let mut sent = 0;
-        for provider in crate::plugin::suggestions::providers() {
-            if provider_id.is_some_and(|id| id != provider.id) || disabled.contains(&provider.id) {
+        for id in ids {
+            if provider_id.is_some_and(|only| only != id) || disabled.contains(&id) {
                 continue;
             }
             let refresh = method == aoe_plugin_api::suggestions::SUGGESTIONS_REFRESH;
             // Marked first, so a report that races the notification still clears it.
             if refresh {
-                self.api.mark_refreshing(&provider.id);
+                self.api.mark_refreshing(&id);
             }
-            let notified = self
-                .notify_worker(&provider.id, method, serde_json::json!({}))
-                .await;
+            let notified = self.notify_worker(&id, method, params.clone()).await;
             if refresh && !notified {
-                self.api.clear_refreshing(&provider.id);
+                self.api.clear_refreshing(&id);
             }
             sent += usize::from(notified);
         }
@@ -1139,6 +1185,31 @@ impl PluginHost {
         rx
     }
 
+    /// A worker that records every line the host writes to its stdin.
+    pub(crate) async fn register_inbound_test_worker(
+        &self,
+        plugin_id: &str,
+    ) -> mpsc::UnboundedReceiver<String> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut table = self.state.lock().await;
+        let supervisor_id = table.next_supervisor_id;
+        table.next_supervisor_id += 1;
+        table.running.insert(
+            plugin_id.to_string(),
+            RunningWorker {
+                supervisor_id,
+                pid: 0,
+                task: tokio::spawn(async {}),
+                inbound: Some(tx),
+                ui_generation: None,
+                events_inbound: None,
+                lifecycle_events: false,
+                dropped_events: 0,
+            },
+        );
+        rx
+    }
+
     /// Status events dropped for `plugin_id` since it last accepted one.
     pub(crate) async fn dropped_events(&self, plugin_id: &str) -> Option<u64> {
         let table = self.state.lock().await;
@@ -1296,6 +1367,48 @@ mod tests {
         assert!(msg.get("id").is_none(), "must be a notification");
         assert_eq!(msg["params"]["kind"], json!("archived"));
         assert!(status_only.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn refresh_carries_the_stored_interval_and_only_an_interval_change_asks_for_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(
+            tmp.path(),
+            "default",
+            None,
+            Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
+        let mut worker = host.register_inbound_test_worker("acme.github").await;
+        let ids = || vec!["acme.github".to_string()];
+        let patch = |value: Value| -> crate::plugin::suggestions::PrefsPatch {
+            serde_json::from_value(value).unwrap()
+        };
+        let apply = |value: Value| {
+            let known = ids();
+            host.with_suggestions_db(|conn, profile| {
+                crate::plugin::suggestions::apply_prefs(conn, profile, &known, &patch(value))
+            })
+            .unwrap()
+            .unwrap()
+        };
+
+        // A PATCH that leaves the interval alone asks for no refresh.
+        assert!(!apply(json!({ "homepage": false })));
+        assert!(worker.try_recv().is_err());
+
+        assert!(apply(json!({ "refresh_minutes": 60 })));
+        assert_eq!(host.refresh_providers(None, ids()).await, 1);
+        let line = worker.try_recv().expect("worker gets a refresh");
+        let msg: Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(msg["method"], json!("suggestions.refresh"));
+        assert!(msg.get("id").is_none(), "must be a notification");
+        assert_eq!(msg["params"], json!({ "refresh_minutes": 60 }));
+        assert!(line.contains("\"refresh_minutes\":60"));
+
+        // The same value again changes nothing.
+        assert!(!apply(json!({ "refresh_minutes": 60 })));
+        assert!(worker.try_recv().is_err());
     }
 
     #[tokio::test]

@@ -88,6 +88,8 @@ export interface WizardPrefill {
   title?: string;
   /** Where a suggested session came from, shown as the "From" strip. */
   source?: { label: string; title: string; url: string };
+  /** Set when a stored template produced `initialPrompt`. */
+  template?: { providerId: string; criterion: string };
   /** Suggestion to link the created Session to. */
   suggestion?: { provider_id: string; id: string };
 }
@@ -180,6 +182,8 @@ interface Props {
   onRetryServedProfile?: () => Promise<void>;
   /** CityHall client mode: only a title is asked; the server derives the rest. */
   nameOnly?: boolean;
+  /** Opens the template that produced the prefilled prompt for editing. */
+  onEditTemplate?: (template: NonNullable<WizardPrefill["template"]>) => void;
 }
 
 const NO_GROUPS: GroupInfo[] = [];
@@ -210,6 +214,7 @@ export function SessionWizard({
   servedProfile,
   onRetryServedProfile,
   nameOnly = false,
+  onEditTemplate,
 }: Props) {
   const [state, dispatch] = useReducer(reducer, {
     data: initialWizardData(prefill, nameOnly),
@@ -912,6 +917,19 @@ export function SessionWizard({
             rows={2}
             className={`${ROW_INPUT} resize-y`}
           />
+          {prefill?.template && onEditTemplate && (
+            <p data-testid="wizard-template" className="pb-2 text-[11px] text-text-dim">
+              From template: <span className="font-mono">{prefill.template.criterion}</span>
+              {" \u00b7 "}
+              <button
+                type="button"
+                onClick={() => onEditTemplate(prefill.template!)}
+                className="cursor-pointer text-brand-500 hover:underline"
+              >
+                Edit template
+              </button>
+            </p>
+          )}
         </FieldRow>
       </RowGroup>
     </div>

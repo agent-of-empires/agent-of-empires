@@ -581,6 +581,10 @@ export interface SuggestionProvider {
   enabled: boolean;
   /** Unix seconds of the last report; absent before the first one. */
   updated_at?: number;
+  /** The provider runs an agent itself, which spends the user's agent usage. */
+  uses_agent?: boolean;
+  /** Present with an error: the plugin's own one-step fix. */
+  fix?: { label: string };
   /** A refresh the host requested is unanswered. */
   refreshing?: boolean;
   sources: SuggestionSource[];
@@ -650,6 +654,8 @@ export interface SuggestionsSnapshot {
 export interface SuggestionPrepared {
   title: string;
   initial_prompt: string;
+  /** The item's criterion when a stored template produced `initial_prompt`, else null. */
+  template_criterion: string | null;
   /** The prompt is the user's saved template, not the provider's draft text. */
   templated: boolean;
   source_ref: string;

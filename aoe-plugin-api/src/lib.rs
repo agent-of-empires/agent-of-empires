@@ -16,7 +16,7 @@ pub use manifest::{
     SettingType, StatusContribution, ThemeContribution, UiContribution, UiSlot, MAX_SCREENSHOTS,
 };
 pub use suggestions::{
-    CheckStatus, SetChecks, SetSuggestions, SetupCheck, Suggestion, SuggestionDraft,
+    CheckStatus, SetChecks, SetSuggestions, SetupCheck, Suggestion, SuggestionDraft, SuggestionFix,
     SuggestionSource, SuggestionsError, SuggestionsSpec,
 };
 

@@ -158,6 +158,42 @@ pub async fn run_suggestion_checks(State(state): State<Arc<AppState>>) -> impl I
     Json(json!({ "ok": true, "notified": notified })).into_response()
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRef {
+    provider_id: String,
+}
+
+pub async fn run_suggestion_fix(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<ProviderRef>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let Some(host) = &state.plugin_host else {
+        return unavailable();
+    };
+    if find_provider(&body.provider_id).is_none() {
+        return unknown_provider();
+    }
+    match host.run_suggestion_fix(&body.provider_id).await {
+        Ok(Some(notified)) => {
+            Json(json!({ "ok": true, "notified": usize::from(notified) })).into_response()
+        }
+        Ok(None) => api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "The provider has no fix for its current error",
+        ),
+        Err(error) => internal(error),
+    }
+}
+
 async fn set_dismissed(
     state: Arc<AppState>,
     item: ItemRef,
@@ -281,15 +317,23 @@ pub async fn patch_suggestion_prefs(
     let Some(host) = state.plugin_host.clone() else {
         return unavailable();
     };
-    let result = tokio::task::spawn_blocking(move || {
-        let known: Vec<String> = suggestions::providers().into_iter().map(|p| p.id).collect();
-        host.with_suggestions_db(|conn, profile| {
-            suggestions::apply_prefs(conn, profile, &known, &patch)
-        })
+    let result = tokio::task::spawn_blocking({
+        let host = host.clone();
+        move || {
+            let known: Vec<String> = suggestions::providers().into_iter().map(|p| p.id).collect();
+            host.with_suggestions_db(|conn, profile| {
+                suggestions::apply_prefs(conn, profile, &known, &patch)
+            })
+        }
     })
     .await;
     match result {
-        Ok(Ok(Ok(()))) => Json(json!({ "ok": true })).into_response(),
+        Ok(Ok(Ok(refresh_changed))) => {
+            if refresh_changed {
+                host.refresh_suggestions(None).await;
+            }
+            Json(json!({ "ok": true })).into_response()
+        }
         Ok(Ok(Err(message))) => api_error(StatusCode::BAD_REQUEST, "validation_failed", message),
         Ok(Err(error)) => internal(error),
         Err(error) => internal(error),
@@ -639,6 +683,7 @@ mod tests {
                     variables: vec![],
                     default_enabled: true,
                 }],
+                uses_agent: false,
             },
         }
     }

@@ -26,19 +26,43 @@ import { SectionHeader, SuggestionSwitch } from "./suggestionsShared";
 const GHOST =
   "inline-flex h-8 items-center rounded-md px-3 text-xs font-medium text-text-secondary hover:bg-surface-800 disabled:opacity-50";
 
+/** A template block to scroll to; `returnToSuggestions` swaps Back for a link to the suggestions view. */
+export interface TemplateFocus {
+  providerId: string;
+  criterion: string;
+  returnToSuggestions?: boolean;
+}
+
 interface BlockProps {
   provider: SuggestionProvider;
   source: SuggestionSource;
   override: string | null;
   item: SuggestionItem | undefined;
   disabled: boolean;
+  focused: boolean;
   onSource: (providerId: string, criterion: string, enabled: boolean) => Promise<void>;
   onSaved: () => Promise<void>;
   onError: (message: string) => void;
 }
 
-function TemplateBlock({ provider, source, override, item, disabled, onSource, onSaved, onError }: BlockProps) {
+function TemplateBlock({
+  provider,
+  source,
+  override,
+  item,
+  disabled,
+  focused,
+  onSource,
+  onSaved,
+  onError,
+}: BlockProps) {
   const [edited, setEdited] = useState<string | null>(null);
+  const block = useCallback(
+    (el: HTMLDivElement | null) => {
+      if (focused) el?.scrollIntoView?.({ block: "center" });
+    },
+    [focused],
+  );
   const value = edited ?? override ?? "";
   const effective = edited ?? override;
 
@@ -66,7 +90,10 @@ function TemplateBlock({ provider, source, override, item, disabled, onSource, o
     ? source.label
     : source.label.charAt(0).toLowerCase() + source.label.slice(1);
   return (
-    <div className="rounded-lg border border-surface-700/40 bg-surface-900 p-3">
+    <div
+      ref={block}
+      className={`rounded-lg border bg-surface-900 p-3 ${focused ? "border-brand-600" : "border-surface-700/40"}`}
+    >
       <div className={`flex flex-wrap items-center gap-2 ${source.enabled ? "" : "opacity-60"}`}>
         <code className="font-mono text-xs text-text-secondary">{source.criterion}</code>
         {source.description && (
@@ -208,10 +235,12 @@ interface Props {
   snapshot: SuggestionsSnapshot;
   disabled: boolean;
   onBack: () => void;
+  onReturn?: () => void;
+  focus?: TemplateFocus;
   onSource: (providerId: string, criterion: string, enabled: boolean) => Promise<void>;
 }
 
-export function SuggestionTemplates({ snapshot, disabled, onBack, onSource }: Props) {
+export function SuggestionTemplates({ snapshot, disabled, onBack, onReturn, focus, onSource }: Props) {
   const [templates, setTemplates] = useState<SuggestionTemplate[]>([]);
   const [mappings, setMappings] = useState<SuggestionMapping[]>([]);
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
@@ -247,8 +276,8 @@ export function SuggestionTemplates({ snapshot, disabled, onBack, onSource }: Pr
 
   return (
     <div className="space-y-6">
-      <button type="button" onClick={onBack} className="cursor-pointer text-sm text-brand-500">
-        &larr; Suggestions
+      <button type="button" onClick={onReturn ?? onBack} className="cursor-pointer text-sm text-brand-500">
+        &larr; {onReturn ? "Suggested sessions" : "Suggestions"}
       </button>
       {error && (
         <div
@@ -273,6 +302,7 @@ export function SuggestionTemplates({ snapshot, disabled, onBack, onSource }: Pr
                 }
                 item={snapshot.items.find((i) => i.provider_id === provider.id && i.criterion === source.criterion)}
                 disabled={disabled}
+                focused={focus?.providerId === provider.id && focus.criterion === source.criterion}
                 onSource={onSource}
                 onSaved={load}
                 onError={setError}

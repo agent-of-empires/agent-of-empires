@@ -1092,6 +1092,28 @@ describe("SessionWizard suggestion source", () => {
     expect(payload()).toMatchObject({ title: "Review RFC 4562" });
   });
 
+  it("offers Edit template only for a templated prompt", () => {
+    const onEditTemplate = vi.fn();
+    const template = { providerId: "gh", criterion: "review-requested" };
+    const mount = (prefill: WizardPrefill) =>
+      render(
+        <SessionWizard
+          servedProfile="default"
+          onClose={vi.fn()}
+          onCreated={vi.fn()}
+          prefill={prefill}
+          onEditTemplate={onEditTemplate}
+        />,
+      );
+    mount({ path: "/tmp/proj", tool: "claude", initialPrompt: "/aoe-review", source, template });
+    expect(screen.getByTestId("wizard-template").textContent).toContain("review-requested");
+    fireEvent.click(screen.getByRole("button", { name: "Edit template" }));
+    expect(onEditTemplate).toHaveBeenCalledWith(template);
+    cleanup();
+    mount({ path: "/tmp/proj", tool: "claude", initialPrompt: "draft", source });
+    expect(screen.queryByTestId("wizard-template")).toBeNull();
+  });
+
   it("does not link a non-http source url, and shows no strip without a source", () => {
     renderWizard({ path: "/tmp/proj", tool: "claude", source: { ...source, url: "javascript:alert(1)" } });
     expect(screen.getByTestId("wizard-source").querySelector("a")).toBeNull();
