@@ -2,9 +2,8 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
-use tokio::time::timeout;
+use tokio::time::timeout_at;
 
 use super::{is_resumable, query_store, AppState, ResumeOutcome};
 use crate::acp::supervisor::{
@@ -92,6 +91,7 @@ impl ResumeTarget {
             } else {
                 crate::acp::state::NativeObservationScope {
                     context,
+                    choice: None,
                     fence: crate::session::NativeInputFence::capture_route(
                         storage.profile(),
                         &id,
@@ -226,14 +226,26 @@ pub(super) async fn resume_one(state: Arc<AppState>, mut target: ResumeTarget) -
 
     // Take the lease before any preparation so a stop landing from here on is honored.
     let probe_id = id.clone();
-    let record =
-        match tokio::task::spawn_blocking(move || worker_registry::control_admission(&probe_id))
-            .await
-        {
-            Ok(Ok(record)) => record,
-            Ok(Err(refusal)) => return target.unavailable(refusal, None),
-            Err(_) => return ResumeOutcome::Retry,
-        };
+    let record = match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let registry =
+            worker_registry::try_registry_lock(&probe_id)?.ok_or(worker_registry::RegistryBusy)?;
+        Ok(registry.control_admission())
+    })
+    .await
+    {
+        Ok(Ok(Ok(record))) => record,
+        Ok(Ok(Err(refusal))) => return target.unavailable(refusal, None),
+        Ok(Err(error)) if error.is::<worker_registry::RegistryBusy>() => {
+            return ResumeOutcome::RegistryBusy
+        }
+        Ok(Err(_)) => {
+            return target.unavailable(
+                worker_registry::ControlAdmissionRefusal::unconfirmed(None),
+                None,
+            )
+        }
+        Err(_) => return ResumeOutcome::Retry,
+    };
     let decision = record.as_ref().map_or(AdoptDecision::FreshSpawn, |r| {
         adopt_decision(
             worker_registry::is_record_live(r),
@@ -258,6 +270,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, mut target: ResumeTarget) -
     let mut reservation = match admit(&state, &id, kind, predecessor).await {
         Ok(Some(reservation)) => reservation,
         Ok(None) => return ResumeOutcome::SpawnFinished,
+        Err(error) if error.is_registry_busy() => return ResumeOutcome::RegistryBusy,
         Err(SupervisorError::Acp(
             crate::acp::acp_client::AcpError::RetainedRuntimeUnavailable(refusal),
         )) => return target.unavailable(*refusal, None),
@@ -312,6 +325,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, mut target: ResumeTarget) -
                         .find(|i| i.id == id)
                         .and_then(|i| i.sandbox_info.clone())
                 };
+                let attach_deadline = reservation.admission_deadline();
                 let attach = state.acp_supervisor.attach_inner(
                     id.clone(),
                     PathBuf::from(&target.project_path),
@@ -320,7 +334,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, mut target: ResumeTarget) -
                     sandbox,
                     reservation,
                 );
-                match timeout(Duration::from_secs(3), attach).await {
+                match timeout_at(attach_deadline, attach).await {
                     Ok(Ok(())) => {
                         // Flagged only once attached: a failed attach respawns on the current binary.
                         if decision == AdoptDecision::AdoptStaleForDrain {
@@ -337,6 +351,9 @@ pub(super) async fn resume_one(state: Arc<AppState>, mut target: ResumeTarget) -
                             seed_in_flight_status(&state, &id).await;
                         }
                         return ResumeOutcome::Attached;
+                    }
+                    Ok(Err(error)) if error.is_registry_busy() => {
+                        return ResumeOutcome::RegistryBusy
                     }
                     Ok(Err(SupervisorError::SpawnCancelled(_))) => {
                         return ResumeOutcome::SpawnFinished
@@ -364,11 +381,14 @@ pub(super) async fn resume_one(state: Arc<AppState>, mut target: ResumeTarget) -
                         }
                         tracing::warn!(target: "acp.supervisor", session = %id,
                             "dead runner attachment failed; following existing retirement policy: {e}");
-                        if worker_registry::terminate_record_and_wait(record, ())
-                            .await
-                            .is_err()
+                        if let Err(error) =
+                            worker_registry::terminate_record_and_wait(record, ()).await
                         {
-                            return ResumeOutcome::Retry;
+                            return if error.is::<worker_registry::RegistryBusy>() {
+                                ResumeOutcome::RegistryBusy
+                            } else {
+                                ResumeOutcome::Retry
+                            };
                         }
                     }
                     Err(_) => {
@@ -381,6 +401,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, mut target: ResumeTarget) -
                 reservation = match admit(&state, &id, target.spawn_kind(), None).await {
                     Ok(Some(reservation)) => reservation,
                     Ok(None) => return ResumeOutcome::SpawnFinished,
+                    Err(error) if error.is_registry_busy() => return ResumeOutcome::RegistryBusy,
                     Err(SupervisorError::Acp(
                         crate::acp::acp_client::AcpError::RetainedRuntimeUnavailable(refusal),
                     )) => return target.unavailable(*refusal, None),
@@ -407,11 +428,12 @@ pub(super) async fn resume_one(state: Arc<AppState>, mut target: ResumeTarget) -
                     new_runner_version = worker_registry::RUNNER_VERSION,
                     "replacing incompatible structured view runner"
                 );
-                if worker_registry::terminate_record_and_wait(record, ())
-                    .await
-                    .is_err()
-                {
-                    return ResumeOutcome::Retry;
+                if let Err(error) = worker_registry::terminate_record_and_wait(record, ()).await {
+                    return if error.is::<worker_registry::RegistryBusy>() {
+                        ResumeOutcome::RegistryBusy
+                    } else {
+                        ResumeOutcome::Retry
+                    };
                 }
             }
             AdoptDecision::RespawnStaleIdle => {
@@ -422,20 +444,22 @@ pub(super) async fn resume_one(state: Arc<AppState>, mut target: ResumeTarget) -
                     new_build = crate::build_info::BUILD_VERSION,
                     "respawning idle build-stale structured view worker on current binary"
                 );
-                if worker_registry::terminate_record_and_wait(record, ())
-                    .await
-                    .is_err()
-                {
-                    return ResumeOutcome::Retry;
+                if let Err(error) = worker_registry::terminate_record_and_wait(record, ()).await {
+                    return if error.is::<worker_registry::RegistryBusy>() {
+                        ResumeOutcome::RegistryBusy
+                    } else {
+                        ResumeOutcome::Retry
+                    };
                 }
             }
             // A dead record can still hold a live pid whose socket vanished.
             AdoptDecision::FreshSpawn => {
-                if worker_registry::terminate_record_and_wait(record, ())
-                    .await
-                    .is_err()
-                {
-                    return ResumeOutcome::Retry;
+                if let Err(error) = worker_registry::terminate_record_and_wait(record, ()).await {
+                    return if error.is::<worker_registry::RegistryBusy>() {
+                        ResumeOutcome::RegistryBusy
+                    } else {
+                        ResumeOutcome::Retry
+                    };
                 }
             }
         }
@@ -450,6 +474,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, mut target: ResumeTarget) -
     };
     let agent = req.agent.clone();
     match state.acp_supervisor.spawn_inner(req, reservation).await {
+        Err(error) if error.is_registry_busy() => return ResumeOutcome::RegistryBusy,
         Err(SupervisorError::Acp(
             crate::acp::acp_client::AcpError::RetainedRuntimeUnavailable(refusal),
         )) => return target.unavailable(*refusal, Some(&originating_lease)),
@@ -488,7 +513,10 @@ async fn report_spawn_failure(
 ) {
     if matches!(
         error,
-        SupervisorError::AlreadyRunning(_) | SupervisorError::SpawnCancelled(_)
+        SupervisorError::AlreadyRunning(_)
+            | SupervisorError::SpawnCancelled(_)
+            | SupervisorError::RegistryBusy
+            | SupervisorError::Acp(crate::acp::acp_client::AcpError::RegistryBusy)
     ) {
         return;
     }
@@ -681,6 +709,7 @@ pub(crate) async fn trigger_resume_background(
     service: &Arc<SessionService>,
     id: &str,
     authority: crate::process::worker_registry::ResumeAuthority,
+    reservation: Option<crate::acp::supervisor::ResumeReservation>,
 ) -> Result<ResumeTrigger, SupervisorError> {
     if service
         .instances
@@ -697,13 +726,21 @@ pub(crate) async fn trigger_resume_background(
         .await
         .iter()
         .any(|i| i.id == id && i.acp_session_id.is_some());
-    let reservation = match service
-        .acp_supervisor
-        .begin_resume(id, spawn_kind(has_stored_id), authority)
-        .await?
-    {
-        ResumeReservationOutcome::Reserved(r) => r,
-        ResumeReservationOutcome::AlreadyPresent => return Ok(ResumeTrigger::AlreadyResuming),
+    let reservation = match reservation {
+        Some(reservation) => {
+            service
+                .acp_supervisor
+                .validate_reserved_resume(&reservation)?;
+            reservation
+        }
+        None => match service
+            .acp_supervisor
+            .begin_resume(id, spawn_kind(has_stored_id), authority)
+            .await?
+        {
+            ResumeReservationOutcome::Reserved(reservation) => reservation,
+            ResumeReservationOutcome::AlreadyPresent => return Ok(ResumeTrigger::AlreadyResuming),
+        },
     };
     let Some(target) = resume_target_for_session(service, id).await else {
         return Ok(ResumeTrigger::NotFound);
@@ -782,7 +819,11 @@ pub(super) async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
             });
         // With nothing naming the runner, a marker written by the stop that removed the record stands.
         if let Some(generation) = generation {
-            worker_registry::mark_restart_pending(&id, generation);
+            if let Err(error) = worker_registry::mark_restart_pending(&id, generation) {
+                tracing::debug!(target: "acp.supervisor", session = %id, %error,
+                    "restart publication refused; retaining the current owner");
+                continue;
+            }
         }
         if let Err(error) = worker_registry::terminate_and_wait(&id).await {
             tracing::warn!(target: "acp.supervisor", session = %id, %error, "runtime termination unproven; retaining restart marker");
@@ -796,6 +837,7 @@ pub(super) async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
 mod tests {
     use super::super::test_fixtures::{structured_instance, test_state};
     use super::*;
+    use std::time::Duration;
 
     #[tokio::test]
     #[serial_test::serial]
@@ -991,7 +1033,7 @@ mod tests {
             .await;
         for id in ["s-drain", "s-drain-gone"] {
             state.acp_supervisor.mark_build_respawn_pending(id);
-            worker_registry::mark_restart_pending(id, 4);
+            worker_registry::mark_restart_pending(id, 4).unwrap();
         }
 
         respawn_drained_stale_workers(&state).await;
@@ -1021,6 +1063,7 @@ mod tests {
             &state.session_service,
             id,
             crate::process::worker_registry::ResumeAuthority::Explicit,
+            None,
         )
         .await
         .expect("resume is admitted");

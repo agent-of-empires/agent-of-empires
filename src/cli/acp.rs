@@ -1011,7 +1011,7 @@ async fn restart(session: &str) -> Result<()> {
             &Some(intent),
         )?;
     }
-    worker_registry::mark_restart_pending(session, record.generation);
+    worker_registry::mark_restart_pending(session, record.generation)?;
 
     println!(
         "Stopped runner for {} (PID {}). `aoe serve` will respawn on its next reconciler tick.",
@@ -1413,7 +1413,7 @@ mod tests {
                 .await
                 .unwrap();
                 assert!(admitted.wait().unwrap().success());
-                worker_registry::clear_restart_marker(&row.id);
+                let _ = worker_registry::claim_restart_marker(&row.id);
             }
         }
     }

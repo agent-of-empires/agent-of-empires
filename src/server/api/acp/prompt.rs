@@ -109,12 +109,16 @@ pub async fn acp_prompt(
     else {
         return session_not_found();
     };
-    let woke_idle_dormant = match state
+    let (woke_idle_dormant, resume_reservation) = match state
         .session_service
         .touch_and_wake_on_prompt(&id, req.no_revive)
         .await
     {
-        PromptTouch::Touched { idle_dormant } => idle_dormant,
+        PromptTouch::Touched {
+            idle_dormant,
+            resume_reservation,
+        } => (idle_dormant, resume_reservation),
+        PromptTouch::AdmissionRefused(response) => return response,
         PromptTouch::Unavailable(unavailability) => {
             return (
                 StatusCode::CONFLICT,
@@ -190,49 +194,54 @@ pub async fn acp_prompt(
         // leave it in place (#4081 review).
         state.session_service.clear_pending_initial_turn(&id).await;
         // The named row is already the parked copy; queueing again would duplicate it.
-        if let Some(row) = &queued_row {
-            return (
-                StatusCode::ACCEPTED,
-                Json(PromptDispatchResponse {
-                    dispatch,
-                    queued_id: Some(row.id.clone()),
-                }),
+        let queued_id = if let Some(row) = &queued_row {
+            row.id.clone()
+        } else {
+            let prompt_id = req
+                .prompt_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            match super::super::queue::buffer_and_enqueue(
+                &state,
+                &id,
+                &prompt_id,
+                req.text.clone(),
+                &attachments,
+                None,
+                origin_plugin.clone(),
             )
-                .into_response();
-        }
-        let prompt_id = req
-            .prompt_id
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        return match super::super::queue::buffer_and_enqueue(
-            &state,
-            &id,
-            &prompt_id,
-            req.text.clone(),
-            &attachments,
-            None,
-            origin_plugin.clone(),
-        )
-        .await
-        {
-            Ok(entry) => (
-                StatusCode::ACCEPTED,
-                Json(PromptDispatchResponse {
-                    dispatch,
-                    queued_id: Some(entry.id),
-                }),
-            )
-                .into_response(),
-            Err((status, msg)) => {
-                tracing::warn!(
-                    target: "http.api.acp",
-                    session = %id,
-                    ?reason,
-                    "prompt dispatch chose the queue but enqueue failed: {msg}"
-                );
-                (status, msg).into_response()
+            .await
+            {
+                Ok(entry) => entry.id,
+                Err((status, msg)) => {
+                    tracing::warn!(target: "http.api.acp", session = %id, ?reason,
+                        "prompt dispatch chose the queue but enqueue failed: {msg}");
+                    return (status, msg).into_response();
+                }
             }
         };
+        if let Some(reservation) = resume_reservation {
+            if let Err(error) = crate::server::acp_reconciler::trigger_resume_background(
+                &state.session_service,
+                &id,
+                crate::process::worker_registry::ResumeAuthority::Explicit,
+                Some(reservation),
+            )
+            .await
+            {
+                // Queue acceptance already committed; retain its receipt and intent.
+                tracing::warn!(target: "http.api.acp", session = %id, %error,
+                    "queued intent retained; prepared wake was refused");
+            }
+        }
+        return (
+            StatusCode::ACCEPTED,
+            Json(PromptDispatchResponse {
+                dispatch,
+                queued_id: Some(queued_id),
+            }),
+        )
+            .into_response();
     }
     // A named row is delivered with the bytes the daemon stored for it, never the request's.
     let attachments = match &queued_row {
@@ -261,6 +270,7 @@ pub async fn acp_prompt(
             &caller,
             &id,
             SendTurnRequest {
+                resume_reservation,
                 resume_authority: crate::process::worker_registry::ResumeAuthority::Explicit,
                 text: &req.text,
                 attachments: &attachments,
@@ -360,12 +370,16 @@ pub async fn acp_prompt_diff_comments(
     else {
         return session_not_found();
     };
-    let woke_idle_dormant = match state
+    let (woke_idle_dormant, resume_reservation) = match state
         .session_service
         .touch_and_wake_on_prompt(&id, false)
         .await
     {
-        PromptTouch::Touched { idle_dormant } => idle_dormant,
+        PromptTouch::Touched {
+            idle_dormant,
+            resume_reservation,
+        } => (idle_dormant, resume_reservation),
+        PromptTouch::AdmissionRefused(response) => return response,
         PromptTouch::Unavailable(unavailability) => {
             return (
                 StatusCode::CONFLICT,
@@ -392,13 +406,16 @@ pub async fn acp_prompt_diff_comments(
         return diff_comments_not_now(reason);
     }
     // Idle-dormant sessions and rate-limit parks are sendable with no live worker.
-    let needs_resume = woke_idle_dormant || !state.acp_supervisor.is_running(&id).await;
+    let needs_resume = resume_reservation.is_some()
+        || woke_idle_dormant
+        || !state.acp_supervisor.is_running(&id).await;
     if needs_resume {
         use crate::server::acp_reconciler::ResumeTrigger;
         match crate::server::acp_reconciler::trigger_resume_background(
             &state.session_service,
             &id,
             crate::process::worker_registry::ResumeAuthority::Explicit,
+            resume_reservation,
         )
         .await
         {

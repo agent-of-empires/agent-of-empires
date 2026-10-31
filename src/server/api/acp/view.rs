@@ -690,7 +690,7 @@ fn claim_handoff_in(
         if target.lease.as_ref().is_some_and(|lease| {
             lease
                 .retirement()
-                .has_handoff_identity_scope(expected, target.identity)
+                .has_handoff_identity_scope(expected, target.identity, row)
         }) && row.terminal_handoff.as_ref().is_some_and(|intent| {
             intent.stage == HandoffStage::RetirementPending
                 && intent.source_conversation.matches(row)
@@ -701,11 +701,17 @@ fn claim_handoff_in(
                         && *birth_fingerprint == actor.birth_fingerprint)
         }) {
             if let (Some(lease), Some(actor)) = (&target.lease, target.identity) {
-                prepared_scope = Some(lease.retirement().prepare_handoff_identity_scope(
-                    row,
-                    &observation_storage,
-                    actor,
-                )?);
+                prepared_scope = Some(
+                    lease.retirement().prepare_handoff_identity_scope(
+                        row,
+                        &observation_storage,
+                        actor,
+                        lease
+                            .native_scope()
+                            .map_err(|_| anyhow::anyhow!("native source unavailable"))?
+                            .map(|scope| scope.context),
+                    )?,
+                );
             }
         }
         Ok(HandoffKey {
@@ -838,11 +844,17 @@ fn reserve_handoff_in(
             launch: None,
         }));
         if let (Some(lease), Some(identity)) = (&target.lease, target.identity) {
-            prepared_scope = Some(lease.retirement().prepare_handoff_identity_scope(
-                row,
-                &observation_storage,
-                identity,
-            )?);
+            prepared_scope = Some(
+                lease.retirement().prepare_handoff_identity_scope(
+                    row,
+                    &observation_storage,
+                    identity,
+                    lease
+                        .native_scope()
+                        .map_err(|_| anyhow::anyhow!("native source unavailable"))?
+                        .map(|scope| scope.context),
+                )?,
+            );
         }
         Ok(HandoffKey {
             id: intent_id,
@@ -864,7 +876,8 @@ fn record_retired_handoff_in(
     key: HandoffKey,
     completed_runner: crate::session::purge_owners::RunnerCapture,
     final_event_seq: u64,
-    final_context_event: Option<crate::acp::Event>,
+    receipt: Option<Arc<crate::acp::supervisor::QualifiedBindingReceipt>>,
+    target: &crate::acp::supervisor::RetirementTarget,
 ) -> anyhow::Result<()> {
     use crate::session::{
         LifecycleOperation, LifecycleReservationError, TerminalHandoffContext, TerminalHandoffStage,
@@ -882,18 +895,57 @@ fn record_retired_handoff_in(
             intent.stage == TerminalHandoffStage::RetirementPending
                 && row.view == View::Structured
                 && row.tool == intent.source_conversation.tool
-                && row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, key.generation),
+                && row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, key.generation)
+                && intent.source_conversation.matches_checkpoint(row),
             LifecycleReservationError::Superseded
         );
-        if let Some(event) = final_context_event.as_ref() {
-            let change = crate::server::acp_events::derive_acp_session_change(event);
-            // The matched handoff owns this final context from the original retired worker.
+        if let Some(receipt) = receipt
+            .as_ref()
+            .filter(|_| matches!(intent.context, HandoffContext::Keep { .. }))
+        {
+            let lease = target
+                .lease
+                .as_ref()
+                .ok_or(LifecycleReservationError::Superseded)?;
+            let source = lease
+                .native_scope()
+                .map_err(|_| LifecycleReservationError::Superseded)?
+                .ok_or(LifecycleReservationError::Superseded)?;
+            anyhow::ensure!(
+                receipt.producer == lease.epoch()
+                    && Some(receipt.owner) == target.identity
+                    && receipt.owner.birth_fingerprint.is_some()
+                    && receipt.source_context == source.context
+                    && lease.retirement().handoff_identity_scope_matches(row)
+                    && lease
+                        .retirement()
+                        .binding_checkpoint()
+                        .as_ref()
+                        .is_some_and(|checkpoint| checkpoint.source_context == source.context
+                            && checkpoint
+                                .destination
+                                .choice
+                                .as_ref()
+                                .is_some_and(|choice| choice.matches(row)))
+                    && crate::server::acp_events::receipt_source_route_matches(
+                        receipt,
+                        &intent.source_conversation,
+                        source.choice.as_deref()
+                    ),
+                LifecycleReservationError::Superseded
+            );
             crate::server::acp_events::apply_acp_session_change(
                 row,
                 session_id,
-                change.as_ref(),
+                Some(&receipt.change),
                 true,
             );
+            row.attest_launch_default_store(receipt.store.as_ref());
+            if let crate::acp::state::AcpSessionChange::Assigned(assigned) = &receipt.change {
+                if receipt.store.is_some() {
+                    row.record_observed_acp_store(assigned, receipt.store.as_ref());
+                }
+            }
         }
         let terminal = match &intent.context {
             TerminalHandoffContext::Keep { native_store } => {
@@ -1301,10 +1353,13 @@ fn drive_terminal_handoff(
                             .await?;
                     }
                     let final_seq = state.acp_event_store.highest_seq_checked(&id)?;
-                    let final_event = state
-                        .acp_event_store
-                        .handoff_context_event(&id, intent.source_event_seq, final_seq)?
-                        .map(|(_, event)| event);
+                    let receipt = target.binding_receipt();
+                    anyhow::ensure!(
+                        receipt.is_none()
+                            || state.acp_supervisor.binding_producer_is_current(&target),
+                        crate::session::LifecycleReservationError::Superseded
+                    );
+                    let receipt_target = target.clone();
                     held.native
                         .as_mut()
                         .expect("owned store")
@@ -1323,7 +1378,8 @@ fn drive_terminal_handoff(
                                 key,
                                 completed,
                                 final_seq,
-                                final_event,
+                                receipt,
+                                &receipt_target,
                             )?;
                             Ok(held)
                         })
@@ -2842,10 +2898,8 @@ mod tests {
             .all(|(signalled, _)| *signalled == pid));
         let completed = intent.completed_runner(&row.id, &target)?;
         let final_seq = state.acp_event_store.highest_seq_checked(&row.id)?;
-        let final_event = state
-            .acp_event_store
-            .handoff_context_event(&row.id, floor, final_seq)?
-            .map(|(_, event)| event);
+        let receipt = target.binding_receipt();
+        let receipt_target = target.clone();
         let save_id = row.id.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let _title = crate::session::acquire_session_title_lock(&save_id)?;
@@ -2859,7 +2913,8 @@ mod tests {
                 key,
                 completed,
                 final_seq,
-                final_event,
+                receipt,
+                &receipt_target,
             )?;
             commit_terminal_in(owner.store(), &save_id, key)?;
             // Release exclusion before the owner's tracked exact-generation cleanup.

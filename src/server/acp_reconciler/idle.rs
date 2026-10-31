@@ -4,9 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::{is_resumable, query_store, resolve_per_profile, AppState};
-use crate::session::Instance;
 
-/// The idle threshold is hours, so the batched activity query runs coarsely.
+/// The idle threshold is hours; probe it coarsely.
 pub(super) const IDLE_REAP_INTERVAL: Duration = Duration::from_secs(60);
 
 pub(super) const TERMINAL_REPAIR_INTERVAL: Duration = Duration::from_secs(30);
@@ -15,6 +14,16 @@ pub(super) const TERMINAL_REPAIR_INTERVAL: Duration = Duration::from_secs(30);
 /// the turn counts as finished. Far more patient than `acp_client`'s 3s watchdog
 /// because this writes a terminal into the canonical log.
 const TERMINAL_REPAIR_GRACE_SECS: u32 = 60;
+
+#[cfg(test)]
+type IdleDecisionGate = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+#[cfg(test)]
+static IDLE_DECISION_GATE: std::sync::Mutex<Option<IdleDecisionGate>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+static IDLE_PROBE_GATE: std::sync::Mutex<Option<IdleDecisionGate>> = std::sync::Mutex::new(None);
 
 /// Publishes the `Stopped` an agent-initiated turn never got, inferred from the
 /// adapter's end-of-turn marker being latest, never from silence alone. It
@@ -116,44 +125,7 @@ fn should_auto_stop(
             .is_some_and(|ms| now_ms.saturating_sub(ms) >= i64::from(threshold_secs) * 1000)
 }
 
-fn set_dormant(inst: &mut Instance, dormant: bool) {
-    if dormant {
-        inst.mark_idle_dormant();
-    } else {
-        inst.idle_dormant_since = None;
-    }
-}
-
-/// Returns false when the session is gone.
-async fn set_dormant_in_memory(state: &AppState, id: &str, dormant: bool) -> bool {
-    let mut instances = state.instances.write().await;
-    instances
-        .iter_mut()
-        .find(|i| i.id == id)
-        .map(|inst| set_dormant(inst, dormant))
-        .is_some()
-}
-
-async fn persist_dormant(state: &AppState, profile: &str, id: &str, dormant: bool) -> bool {
-    let Ok(storage) = crate::session::Storage::new(profile, state.file_watch.clone()) else {
-        return false;
-    };
-    let id = id.to_string();
-    tokio::task::spawn_blocking(move || {
-        storage.update(|instances, _groups| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                set_dormant(inst, dormant);
-            }
-            Ok(())
-        })
-    })
-    .await
-    .is_ok_and(|r| r.is_ok())
-}
-
-/// Shuts down idle workers and marks them dormant so the resume pass skips
-/// them. Dormancy is persisted before shutdown so a persist failure leaves the
-/// worker alive rather than orphaned.
+/// Persist a bound dormancy stamp before deciding the exact idle retirement.
 pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
     // Queued work is not idle: reaping would fight wake-on-drain.
     let candidates: Vec<(String, String)> = {
@@ -171,66 +143,101 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
         c.acp.auto_stop_idle_secs
     })
     .await;
-    let mut live = Vec::new();
     for (id, profile) in candidates {
         let idle_secs = idle_by_profile.get(&profile).copied().unwrap_or(0);
         if idle_secs == 0 {
             continue;
         }
-        // Only a running epoch; the lease pins the stop to the worker observed here.
-        if let Some(lease) = state.acp_supervisor.running_lease(&id) {
-            live.push((id, profile, idle_secs, lease));
-        }
-    }
-    if live.is_empty() {
-        return;
-    }
-    let ids: Vec<String> = live.iter().map(|(id, ..)| id.clone()).collect();
-    let store = Arc::clone(&state.acp_event_store);
-    let latest = match tokio::task::spawn_blocking(move || store.last_event_at_for_sessions(&ids))
-        .await
-    {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!(target: "acp.supervisor", error = %e, "idle-reap activity query failed");
-            return;
-        }
-    };
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    for (id, profile, idle_secs, lease) in live {
-        // A resume is activity: its prompt is recorded only after the worker is ready.
-        let last_ms = latest.get(&id).map(|&ms| ms.max(lease.idle_baseline_ms()));
-        if !should_auto_stop(now_ms, last_ms, idle_secs, false) {
+        let Some(submission) = state.session_service.try_prompt_submission(&id).await else {
             continue;
+        };
+        #[cfg(test)]
+        let probe_gate = { IDLE_PROBE_GATE.lock().unwrap().take() };
+        #[cfg(test)]
+        if let Some((entered, release)) = probe_gate {
+            let _ = entered.send(());
+            let _ = release.await;
         }
-        // Re-check mid-turn: a turn may have started since the snapshot.
-        let in_flight = query_store(
+        let Some((lease, activity_seq)) = state.acp_supervisor.idle_observation(&id) else {
+            continue;
+        };
+        let Some(scope) = lease.native_scope().ok().flatten() else {
+            continue;
+        };
+        let probe = query_store(
             &state.acp_event_store,
             &id,
-            "idle-reap in-flight",
-            |s, id| s.has_in_flight_turn(id),
+            "idle-reap eligibility",
+            |store, id| {
+                (
+                    store
+                        .last_event_at_for_sessions(&[id.to_owned()])
+                        .remove(id),
+                    store.has_in_flight_turn(id),
+                    store.has_open_tool_call_in_epoch(id),
+                    !store.unresolved_approval_nonces(id).is_empty()
+                        || !store.unresolved_elicitation_nonces(id).is_empty(),
+                )
+            },
         )
-        .await
-        .unwrap_or(false);
-        if !should_auto_stop(now_ms, last_ms, idle_secs, in_flight)
-            || !set_dormant_in_memory(state, &id, true).await
+        .await;
+        let Some((latest, in_flight, open_tool, awaiting_user)) = probe else {
+            continue;
+        };
+        let last_ms = latest.map(|last| last.max(lease.idle_baseline_ms()));
+        if open_tool
+            || awaiting_user
+            || !should_auto_stop(
+                chrono::Utc::now().timestamp_millis(),
+                last_ms,
+                idle_secs,
+                in_flight,
+            )
         {
             continue;
         }
-        if !persist_dormant(state, &profile, &id, true).await {
-            set_dormant_in_memory(state, &id, false).await;
-            tracing::warn!(target: "acp.supervisor", session = %id, "idle-reap persist failed; leaving worker alive");
-            continue;
-        }
-        match state.acp_supervisor.shutdown_idle(&id, Some(&lease)).await {
-            Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {
-                tracing::info!(target: "acp.supervisor", session = %id, idle_secs, "auto-stopped idle structured view worker");
+        let receipt = match state.session_service.mark_idle_dormant(&id, scope).await {
+            Ok(Some(receipt)) => receipt,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(target: "acp.supervisor", session = %id, %error,
+                    "idle dormancy persistence declined; worker retained");
+                continue;
             }
-            Err(e) => {
-                // The worker may still run; clear dormancy so it is not blocked forever.
-                set_dormant_in_memory(state, &id, false).await;
-                persist_dormant(state, &profile, &id, false).await;
-                tracing::warn!(target: "acp.supervisor", session = %id, "idle-reap shutdown failed; cleared dormant marker: {e}");
+        };
+        #[cfg(test)]
+        let gate = { IDLE_DECISION_GATE.lock().unwrap().take() };
+        #[cfg(test)]
+        if let Some((entered, release)) = gate {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
+        match state
+            .acp_supervisor
+            .shutdown_idle(&id, &lease, activity_seq, receipt.stamp)
+            .await
+        {
+            Ok(retirement) => {
+                drop(receipt);
+                drop(submission);
+                state
+                    .acp_supervisor
+                    .settle_idle_retirement(retirement)
+                    .await;
+                tracing::info!(target: "acp.supervisor", session = %id, idle_secs,
+                    "accepted idle structured worker retirement");
+            }
+            Err(error) => {
+                if let Err(rollback) = state
+                    .session_service
+                    .rollback_idle_dormancy(&id, receipt)
+                    .await
+                {
+                    tracing::warn!(target: "acp.supervisor", session = %id, %rollback,
+                        "idle dormancy rollback remains unconfirmed");
+                }
+                tracing::debug!(target: "acp.supervisor", session = %id, %error,
+                    "idle retirement declined; newer activity or ownership retained");
             }
         }
     }
@@ -276,6 +283,67 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    async fn idle_fixture(
+        id: &str,
+    ) -> (
+        crate::session::test_support::AppDirGuard,
+        Arc<AppState>,
+        tempfile::TempDir,
+        crate::acp::runner_lifecycle::Lease,
+    ) {
+        let (home, state, project) = super::super::test_fixtures::test_state(id);
+        std::fs::write(
+            crate::session::get_app_dir().unwrap().join("config.toml"),
+            "[acp]\nauto_stop_idle_secs = 60\n",
+        )
+        .unwrap();
+        state.acp_supervisor.test_insert_worker(id).await;
+        let lease = state.acp_supervisor.running_lease(id).unwrap();
+        let row = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == id)
+            .unwrap()
+            .clone();
+        state.acp_supervisor.test_bind_native_scope(&lease, &row);
+        let stale = Utc::now().timestamp_millis() - 3_600_000;
+        lease.test_backdate_idle_baseline(stale);
+        state
+            .acp_event_store
+            .record_at(
+                id,
+                1,
+                &Event::Stopped {
+                    reason: "prompt_complete".into(),
+                },
+                stale,
+            )
+            .unwrap();
+        state
+            .acp_supervisor
+            .hydrate_seqs(state.acp_event_store.all_session_seqs());
+        (home, state, project, lease)
+    }
+
+    async fn wait_for_worker_sequence(state: &AppState, id: &str, expected: u64) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if state
+                    .acp_supervisor
+                    .idle_observation(id)
+                    .is_some_and(|(_, seq)| seq >= expected)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actual worker publication reaches the activity fence");
     }
 
     /// A prompt resuming a long-quiet session has no newer event until its
@@ -350,6 +418,17 @@ mod tests {
                     (None, Running)
                 }
             };
+            if let Some(lease) = sup.running_lease(id) {
+                let row = state
+                    .instances
+                    .read()
+                    .await
+                    .iter()
+                    .find(|row| row.id == id)
+                    .unwrap()
+                    .clone();
+                sup.test_bind_native_scope(&lease, &row);
+            }
 
             reap_idle_workers(&state).await;
 
@@ -373,10 +452,236 @@ mod tests {
         let observed = sup.running_lease(id).unwrap();
         sup.test_respawn_worker(id).await;
         assert!(matches!(
-            sup.shutdown_idle(id, Some(&observed)).await,
+            sup.shutdown_idle(id, &observed, 0, Utc::now()).await,
             Err(crate::acp::supervisor::SupervisorError::Superseded(_))
         ));
         assert_eq!(sup.worker_state(id).await, Running);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn same_lease_worker_activity_cancels_idle_decision_without_losing_queued_intent() {
+        let id = "idle-worker-activity";
+        let (_home, state, _project, lease) = idle_fixture(id).await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *IDLE_DECISION_GATE.lock().unwrap() = Some((entered_tx, release_rx));
+        let reap_state = Arc::clone(&state);
+        let reaper = tokio::spawn(async move { reap_idle_workers(&reap_state).await });
+        tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            state
+                .session_service
+                .try_prompt_submission(id)
+                .await
+                .is_none(),
+            "direct prompt admission cannot cross the idle decision"
+        );
+        let memory_stamp = state.instances.read().await[0].idle_dormant_since.unwrap();
+        let storage = crate::session::Storage::open_reference("default").unwrap();
+        assert_eq!(
+            storage.load().unwrap()[0].idle_dormant_since,
+            Some(memory_stamp)
+        );
+        let (events, inbound) = tokio::sync::mpsc::channel(4);
+        let pump = state
+            .acp_supervisor
+            .test_start_worker_pump(id, lease.clone(), inbound);
+        events
+            .send(Event::AgentMessageChunk {
+                text: "late native output".into(),
+                message_id: None,
+            })
+            .await
+            .unwrap();
+        wait_for_worker_sequence(&state, id, 2).await;
+        let service = Arc::clone(&state.session_service);
+        let queued = tokio::spawn(async move {
+            service
+                .enqueue_prompt(
+                    id,
+                    "queued-after-idle-probe".into(),
+                    "keep this intent".into(),
+                    vec![],
+                    None,
+                    None,
+                )
+                .await
+        });
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), reaper)
+            .await
+            .unwrap()
+            .unwrap();
+        let queued = tokio::time::timeout(Duration::from_secs(5), queued)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.acp_supervisor.running_lease(id), Some(lease));
+        let memory = state.instances.read().await[0].clone();
+        let persisted = storage.load().unwrap().remove(0);
+        for row in [&memory, &persisted] {
+            assert!(
+                row.idle_dormant_since.is_none(),
+                "only the old mark is rolled back"
+            );
+            assert_eq!(row.queued_prompts.as_slice(), std::slice::from_ref(&queued));
+        }
+        assert!(
+            state
+                .session_service
+                .try_prompt_submission(id)
+                .await
+                .is_some(),
+            "the decision barrier is released independently of retirement"
+        );
+        pump.abort();
+        drop(events);
+        let _ = pump.await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn fresh_substantive_completion_before_sequence_capture_vetoes_idle_retirement() {
+        let id = "idle-fresh-completion";
+        let (_home, state, _project, lease) = idle_fixture(id).await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *IDLE_PROBE_GATE.lock().unwrap() = Some((entered_tx, release_rx));
+        let reap_state = Arc::clone(&state);
+        let reaper = tokio::spawn(async move { reap_idle_workers(&reap_state).await });
+        tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let (events, inbound) = tokio::sync::mpsc::channel(4);
+        let pump = state
+            .acp_supervisor
+            .test_start_worker_pump(id, lease.clone(), inbound);
+        events
+            .send(Event::AgentMessageChunk {
+                text: "new substantive output".into(),
+                message_id: None,
+            })
+            .await
+            .unwrap();
+        events
+            .send(Event::Stopped {
+                reason: "prompt_complete".into(),
+            })
+            .await
+            .unwrap();
+        wait_for_worker_sequence(&state, id, 3).await;
+        assert!(!state.acp_event_store.has_in_flight_turn(id));
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), reaper)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.acp_supervisor.running_lease(id), Some(lease));
+        assert!(state.instances.read().await[0].idle_dormant_since.is_none());
+        assert!(crate::session::Storage::open_reference("default")
+            .unwrap()
+            .load()
+            .unwrap()[0]
+            .idle_dormant_since
+            .is_none());
+        pump.abort();
+        drop(events);
+        let _ = pump.await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn idle_mark_and_rollback_decline_replaced_native_ownership_or_newer_state() {
+        for after_mark in [false, true] {
+            for change in [
+                "creation",
+                "generation",
+                "wake",
+                "queue",
+                "profile",
+                "absent",
+            ] {
+                if change == "wake" && !after_mark {
+                    continue;
+                }
+                let id = "idle-native-witness";
+                let (_home, state, project, lease) = idle_fixture(id).await;
+                let scope = lease.native_scope().unwrap().unwrap();
+                let receipt = if after_mark {
+                    Some(
+                        state
+                            .session_service
+                            .mark_idle_dormant(id, scope.clone())
+                            .await
+                            .unwrap()
+                            .unwrap(),
+                    )
+                } else {
+                    None
+                };
+                let storage = crate::session::Storage::open_reference("default").unwrap();
+                let mut replacement = storage.load().unwrap().remove(0);
+                match change {
+                    "creation" => replacement.created_at += chrono::Duration::nanoseconds(1),
+                    "generation" => replacement.lifecycle_generation += 1,
+                    "wake" => replacement.idle_dormant_since = None,
+                    "queue" => {
+                        replacement.idle_dormant_since =
+                            Some(Utc::now() + chrono::Duration::seconds(1));
+                        replacement
+                            .queued_prompts
+                            .push(super::super::test_fixtures::queued_prompt());
+                    }
+                    "profile" | "absent" => {}
+                    _ => unreachable!(),
+                }
+                if change == "profile" {
+                    std::fs::rename(
+                        crate::session::get_profile_dir("default").unwrap(),
+                        project.path().join("retained-old-profile"),
+                    )
+                    .unwrap();
+                    crate::server::test_support::seed_instances_on_disk_for_test(
+                        "default",
+                        vec![replacement.clone()],
+                    );
+                } else {
+                    storage
+                        .update_complete(|rows, _| {
+                            rows.clear();
+                            if change != "absent" {
+                                rows.push(replacement.clone());
+                            }
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+                let current = crate::session::Storage::open_reference("default").unwrap();
+                let before = current.load().unwrap();
+                if let Some(receipt) = receipt {
+                    let rolled_back = state
+                        .session_service
+                        .rollback_idle_dormancy(id, receipt)
+                        .await;
+                    assert!(!matches!(rolled_back, Ok(true)), "{change}");
+                } else {
+                    let marked = state.session_service.mark_idle_dormant(id, scope).await;
+                    assert!(!matches!(marked, Ok(Some(_))), "{change}");
+                }
+                assert_eq!(
+                    serde_json::to_value(current.load().unwrap()).unwrap(),
+                    serde_json::to_value(before).unwrap(),
+                    "{change}, after_mark={after_mark}"
+                );
+                assert_eq!(state.acp_supervisor.running_lease(id), Some(lease));
+            }
+        }
     }
 
     /// Case 0 replays the real occurrence: an agent-initiated turn after the

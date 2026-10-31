@@ -433,9 +433,58 @@ impl NativeEventContext {
     }
 }
 
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub(crate) enum AcpSessionChange {
+    Assigned(String),
+    Reset(String),
+    Cleared,
+}
+
+impl AcpSessionChange {
+    pub(crate) fn from_event(event: &Event) -> Option<Self> {
+        match event {
+            Event::AcpSessionAssigned { acp_session_id, .. } => {
+                Some(Self::Assigned(acp_session_id.clone()))
+            }
+            Event::SessionContextReset { reason } => Some(Self::Reset(reason.clone())),
+            Event::SessionCleared => Some(Self::Cleared),
+            _ => None,
+        }
+    }
+}
+
+/// Exact metadata selection at a controller checkpoint. The general
+/// conversation equality intentionally omits ACP identity and route provenance.
+#[derive(Debug, Clone)]
+pub(crate) struct NativeBindingState {
+    pub choice: crate::session::ConversationState,
+    pub acp_session_id: Option<String>,
+    pub fork_pending: Option<String>,
+    pub import_pending: Option<bool>,
+}
+
+impl NativeBindingState {
+    pub(crate) fn capture(row: &crate::session::Instance) -> Self {
+        Self {
+            choice: row.conversation_state(),
+            acp_session_id: row.acp_session_id.clone(),
+            fork_pending: row.fork_pending.clone(),
+            import_pending: row.import_pending,
+        }
+    }
+
+    pub(crate) fn matches(&self, row: &crate::session::Instance) -> bool {
+        self.choice.matches_checkpoint(row)
+            && self.acp_session_id == row.acp_session_id
+            && self.fork_pending == row.fork_pending
+            && self.import_pending == row.import_pending
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct NativeObservationScope {
     pub context: NativeEventContext,
+    pub choice: Option<std::sync::Arc<NativeBindingState>>,
     pub fence: std::sync::Arc<crate::session::NativeInputFence>,
 }
 
@@ -444,8 +493,35 @@ impl NativeObservationScope {
         row: &crate::session::Instance,
         storage: &crate::session::Storage,
     ) -> anyhow::Result<Self> {
+        Self::capture_choice(
+            row,
+            storage,
+            std::sync::Arc::new(NativeBindingState::capture(row)),
+        )
+    }
+
+    pub(crate) fn retarget(
+        &self,
+        row: &crate::session::Instance,
+        storage: &crate::session::Storage,
+    ) -> anyhow::Result<Self> {
+        let choice = self
+            .choice
+            .as_ref()
+            .filter(|choice| choice.matches(row))
+            .cloned()
+            .unwrap_or_else(|| std::sync::Arc::new(NativeBindingState::capture(row)));
+        Self::capture_choice(row, storage, choice)
+    }
+
+    fn capture_choice(
+        row: &crate::session::Instance,
+        storage: &crate::session::Storage,
+        choice: std::sync::Arc<NativeBindingState>,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
             context: NativeEventContext::capture(row, storage)?,
+            choice: Some(choice),
             fence: crate::session::NativeInputFence::capture_route(
                 storage.profile(),
                 &row.id,

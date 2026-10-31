@@ -351,7 +351,7 @@ impl RunnerCapture {
                 target.scopes.push(scope.clone());
             }
         }
-        target.journalled = true;
+        target.claim_journal_ack();
         Ok(())
     }
 

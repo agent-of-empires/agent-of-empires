@@ -120,6 +120,17 @@ impl Drop for PersistedMutation {
     }
 }
 
+pub(crate) struct IdleDormancy {
+    pub stamp: chrono::DateTime<chrono::Utc>,
+    context: crate::acp::state::NativeEventContext,
+    storage: crate::session::Storage,
+    _transaction: PersistedMutation,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("idle dormancy observation changed")]
+struct IdleDormancyDeclined;
+
 /// Result of `SessionService::edit_queued_prompt`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EditQueuedOutcome {
@@ -325,6 +336,7 @@ pub(crate) enum PromptTouch {
     /// `prompt_dispatch_under_submission` and `send_turn` need.
     Touched {
         idle_dormant: bool,
+        resume_reservation: Option<crate::acp::supervisor::ResumeReservation>,
     },
     /// `no_revive` was set and the session needed snoozed/idle-dormant
     /// revival to accept this prompt; refused before any mutation.
@@ -334,6 +346,7 @@ pub(crate) enum PromptTouch {
     /// Known native/control unavailability is not permission to wake or queue.
     Unavailable(crate::acp::state::AcpConnectionUnavailability),
     WorkerNotReady,
+    AdmissionRefused(axum::response::Response),
 }
 
 /// Everything [`SessionService::send_turn`] needs beyond the caller and
@@ -341,6 +354,7 @@ pub(crate) enum PromptTouch {
 /// lint.
 pub(crate) struct SendTurnRequest<'a> {
     pub resume_authority: crate::process::worker_registry::ResumeAuthority,
+    pub resume_reservation: Option<crate::acp::supervisor::ResumeReservation>,
     pub text: &'a str,
     pub attachments: &'a [crate::acp::event_store::AttachmentBlob],
     /// Forces the resume trigger even when the worker looks alive, mirroring
@@ -812,6 +826,7 @@ impl SessionService {
                 row.is_idle_dormant(),
             )
         };
+        let mut resume_reservation = None;
         // Ordinary live prompts retain their single existing commit producer.
         let (native, worker_id, profile, title, generation, provider, view, namespace, guard) =
             if needs_resume {
@@ -861,13 +876,19 @@ impl SessionService {
                     }
                 };
                 // No lifecycle/title flock crosses late-construction retirement.
-                let expected =
-                    match crate::server::api::sessions::resume_structured_stop(&state, expected)
-                        .await
+                let (expected, reservation) =
+                    match crate::server::api::sessions::resume_structured_stop(
+                        &state, expected, None,
+                    )
+                    .await
                     {
-                        Ok(expected) => expected,
-                        Err(_) => return PromptTouch::WorkerNotReady,
+                        Ok(prepared) => prepared,
+                        Err(response) => return PromptTouch::AdmissionRefused(response),
                     };
+                if reservation.is_some() {
+                    current_native = None;
+                }
+                resume_reservation = reservation;
                 (
                     Some(native),
                     expected.id,
@@ -933,7 +954,7 @@ impl SessionService {
                         tracing::info!(target: "acp.supervisor", session = %worker_id,
                             "waking idle-dormant structured view session on prompt; spawning a fresh worker");
                     }
-                    Ok(PromptTouch::Touched { idle_dormant })
+                    Ok(PromptTouch::Touched { idle_dormant, resume_reservation })
                 }
                 Err(error) => match refused {
                     Some(outcome) => Ok(outcome),
@@ -970,6 +991,7 @@ impl SessionService {
     ) -> Result<(), SendTurnError> {
         let SendTurnRequest {
             resume_authority,
+            resume_reservation,
             text,
             attachments,
             woke_idle_dormant,
@@ -1004,7 +1026,9 @@ impl SessionService {
             return Err(SendTurnError::RevivalRefused);
         }
         // Resume a worker that is not currently live.
-        let needs_resume = woke_idle_dormant || !self.acp_supervisor.is_running(id).await;
+        let needs_resume = resume_reservation.is_some()
+            || woke_idle_dormant
+            || !self.acp_supervisor.is_running(id).await;
         if no_revive && needs_resume {
             return Err(SendTurnError::RevivalRefused);
         }
@@ -1013,6 +1037,7 @@ impl SessionService {
                 self,
                 id,
                 resume_authority,
+                resume_reservation,
             )
             .await
             {
@@ -1201,6 +1226,7 @@ impl SessionService {
                 &caller,
                 id,
                 SendTurnRequest {
+                    resume_reservation: None,
                     resume_authority: crate::process::worker_registry::ResumeAuthority::Automatic,
                     text: &text,
                     attachments: &attachments,
@@ -1461,6 +1487,157 @@ impl SessionService {
             }
         }
         Some(result)
+    }
+
+    pub(crate) async fn mark_idle_dormant(
+        self: &Arc<Self>,
+        id: &str,
+        scope: crate::acp::state::NativeObservationScope,
+    ) -> anyhow::Result<Option<IdleDormancy>> {
+        let ordered = self.persist_lock(id).await.lock_owned().await;
+        let reload = Arc::clone(&self.reload_gate).read_owned().await;
+        let profile = {
+            let rows = self.instances.read().await;
+            let Some(row) = rows.iter().find(|row| row.id == id) else {
+                return Ok(None);
+            };
+            if !super::acp_reconciler::is_resumable(row) || !row.queued_prompts.is_empty() {
+                return Ok(None);
+            }
+            row.source_profile.clone()
+        };
+        let state = self.native_state()?;
+        let service = self.clone();
+        let id = id.to_owned();
+        let stamp = chrono::Utc::now();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let Some(_native) = scope.fence.try_lock_observation_matching(|_| true)? else {
+                return Ok(None);
+            };
+            let storage = crate::session::Storage::open_reference(&profile)?;
+            {
+                let registry = crate::process::worker_registry::try_registry_lock(&id)?
+                    .ok_or(crate::process::worker_registry::RegistryBusy)?;
+                if registry.stop()?.is_some() {
+                    return Ok(None);
+                }
+            }
+            let _publication = state.publication.blocking_write();
+            let mut memory = service.instances.blocking_write();
+            let Some(row) = memory.iter_mut().find(|row| row.id == id) else {
+                return Ok(None);
+            };
+            if crate::acp::state::NativeEventContext::capture(row, &storage)? != scope.context
+                || !super::acp_reconciler::is_resumable(row)
+                || !row.queued_prompts.is_empty()
+            {
+                return Ok(None);
+            }
+            let saved = storage.update_complete(|rows, _| {
+                let persisted = rows
+                    .iter_mut()
+                    .find(|row| row.id == id)
+                    .ok_or(IdleDormancyDeclined)?;
+                anyhow::ensure!(
+                    crate::acp::state::NativeEventContext::capture(persisted, &storage)?
+                        == scope.context
+                        && super::acp_reconciler::is_resumable(persisted)
+                        && persisted.queued_prompts.is_empty(),
+                    IdleDormancyDeclined
+                );
+                persisted.idle_dormant_since = Some(stamp);
+                Ok(())
+            });
+            if let Err(error) = saved {
+                if error.is::<IdleDormancyDeclined>() {
+                    return Ok(None);
+                }
+                // A failed post-write check may still have installed this stamp.
+                if let Err(rollback_error) = storage.update_complete(|rows, _| {
+                    let row = rows
+                        .iter_mut()
+                        .find(|row| row.id == id)
+                        .ok_or(IdleDormancyDeclined)?;
+                    anyhow::ensure!(
+                        crate::acp::state::NativeEventContext::capture(row, &storage)?
+                            == scope.context
+                            && row.idle_dormant_since == Some(stamp),
+                        IdleDormancyDeclined
+                    );
+                    row.idle_dormant_since = None;
+                    Ok(())
+                }) {
+                    if !rollback_error.is::<IdleDormancyDeclined>() {
+                        tracing::warn!(target: "acp.supervisor", session = %id, %rollback_error,
+                            "failed idle mark rollback remains unconfirmed");
+                    }
+                }
+                return Err(error);
+            }
+            row.idle_dormant_since = Some(stamp);
+            service.invalidate_disk_snapshots();
+            state.runtime.request_publish();
+            Ok(Some(IdleDormancy {
+                stamp,
+                context: scope.context,
+                storage,
+                _transaction: PersistedMutation {
+                    epoch: service.mutation_epoch.clone(),
+                    _ordered: ordered,
+                    _reload: reload,
+                },
+            }))
+        })
+        .await?
+    }
+
+    pub(crate) async fn rollback_idle_dormancy(
+        self: &Arc<Self>,
+        id: &str,
+        receipt: IdleDormancy,
+    ) -> anyhow::Result<bool> {
+        let service = self.clone();
+        let state = self.native_state()?;
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            let _publication = state.publication.blocking_write();
+            let mut memory = service.instances.blocking_write();
+            let Some(row) = memory.iter_mut().find(|row| row.id == id) else {
+                return Ok(false);
+            };
+            if crate::acp::state::NativeEventContext::capture(row, &receipt.storage)?
+                != receipt.context
+                || row.idle_dormant_since != Some(receipt.stamp)
+            {
+                return Ok(false);
+            }
+            let saved = receipt.storage.update_complete(|rows, _| {
+                let persisted = rows
+                    .iter_mut()
+                    .find(|row| row.id == id)
+                    .ok_or(IdleDormancyDeclined)?;
+                anyhow::ensure!(
+                    crate::acp::state::NativeEventContext::capture(persisted, &receipt.storage)?
+                        == receipt.context
+                        && persisted.idle_dormant_since == Some(receipt.stamp),
+                    IdleDormancyDeclined
+                );
+                persisted.idle_dormant_since = None;
+                Ok(())
+            });
+            if let Err(error) = saved {
+                return if error.is::<IdleDormancyDeclined>() {
+                    Ok(false)
+                } else {
+                    Err(error)
+                };
+            }
+            row.idle_dormant_since = None;
+            service.invalidate_disk_snapshots();
+            state.runtime.request_publish();
+            Ok(true)
+        })
+        .await?
     }
 
     /// Append a prompt to the session's server-owned queue and return the
@@ -1956,6 +2133,7 @@ impl SessionService {
                 &caller,
                 id,
                 SendTurnRequest {
+                    resume_reservation: None,
                     resume_authority: crate::process::worker_registry::ResumeAuthority::Automatic,
                     text: &combined,
                     attachments: &attachments,
@@ -2998,6 +3176,7 @@ mod tests {
                     &cron,
                     "sess-user",
                     SendTurnRequest {
+                        resume_reservation: None,
                         resume_authority:
                             crate::process::worker_registry::ResumeAuthority::Explicit,
                         text: "hi",
@@ -3017,6 +3196,7 @@ mod tests {
                     &other,
                     "sess-cron",
                     SendTurnRequest {
+                        resume_reservation: None,
                         resume_authority:
                             crate::process::worker_registry::ResumeAuthority::Explicit,
                         text: "hi",
@@ -3036,6 +3216,7 @@ mod tests {
                     &cron,
                     "sess-gone",
                     SendTurnRequest {
+                        resume_reservation: None,
                         resume_authority:
                             crate::process::worker_registry::ResumeAuthority::Explicit,
                         text: "hi",
@@ -3059,6 +3240,7 @@ mod tests {
                     &cron,
                     "sess-cron",
                     SendTurnRequest {
+                        resume_reservation: None,
                         resume_authority:
                             crate::process::worker_registry::ResumeAuthority::Explicit,
                         text: "hi",
@@ -3078,6 +3260,7 @@ mod tests {
                     &SessionCaller::User,
                     "sess-user",
                     SendTurnRequest {
+                        resume_reservation: None,
                         resume_authority:
                             crate::process::worker_registry::ResumeAuthority::Explicit,
                         text: "hi",
@@ -4140,7 +4323,7 @@ mod tests {
                     .session_service
                     .touch_and_wake_on_prompt(&row.id, true)
                     .await;
-                assert!(matches!(outcome, PromptTouch::RevivalRefused));
+                assert!(!matches!(outcome, PromptTouch::Touched { .. }));
                 assert!(!state.acp_supervisor.test_cancel_requested(&lease));
                 assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
                 drop(reservation);
@@ -4184,19 +4367,39 @@ mod tests {
             } else {
                 None
             };
+            let memory_before = serde_json::to_value(&state.instances.read().await[0]).unwrap();
+            let disk_before = std::fs::read(storage.sessions_path()).unwrap();
+            let stop_before = crate::process::worker_registry::stop_intent(&row.id).unwrap();
+            let mut status_rx = state.status_tx.subscribe();
             drop(reservation);
             state.acp_supervisor.retry_pending_teardowns().await;
             let outcome = wake.await.unwrap();
             let stored = storage.load().unwrap().remove(0);
             if let Some(newer) = newer {
-                assert!(matches!(outcome, PromptTouch::WorkerNotReady));
+                assert!(
+                    !matches!(outcome, PromptTouch::Touched { .. }),
+                    "a newer native Stop cannot authorize the old wake"
+                );
+                assert_eq!(
+                    serde_json::to_value(&state.instances.read().await[0]).unwrap(),
+                    memory_before
+                );
+                assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), disk_before);
+                assert_eq!(
+                    crate::process::worker_registry::stop_intent(&row.id).unwrap(),
+                    stop_before
+                );
+                assert!(status_rx.try_recv().is_err());
                 assert_eq!(stored.lifecycle_generation, newer);
                 assert_eq!(stored.status, Status::Stopped);
                 assert!(stored.is_idle_dormant());
             } else {
                 assert!(matches!(
                     outcome,
-                    PromptTouch::Touched { idle_dormant: true }
+                    PromptTouch::Touched {
+                        idle_dormant: true,
+                        ..
+                    }
                 ));
                 assert!(stored.lifecycle_generation > observed);
                 assert_eq!(stored.status, Status::Idle);
@@ -4221,6 +4424,85 @@ mod tests {
                 assert!(child.wait().unwrap().success());
             }
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stopped_prompt_without_dormancy_launches_its_existing_reservation_once() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let mut row = Instance::new("stopped-without-dormancy", project.path().to_str().unwrap());
+        row.source_profile = "default".into();
+        row.view = crate::session::View::Structured;
+        row.agent_name = Some("claude".into());
+        row.acp_session_id = Some("retain-the-native-conversation".into());
+        row.status = crate::session::Status::Stopped;
+        assert!(row.idle_dormant_since.is_none());
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let (launcher, launches) = crate::server::test_support::counting_failing_launcher();
+        let state = crate::server::test_support::build_test_app_state_with_launcher(
+            vec![row.clone()],
+            launcher,
+        );
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let _submission = state.session_service.prompt_submission(&row.id).await;
+        let PromptTouch::Touched {
+            idle_dormant,
+            resume_reservation,
+        } = state
+            .session_service
+            .touch_and_wake_on_prompt(&row.id, false)
+            .await
+        else {
+            panic!("the stopped native row must prepare its explicit resume");
+        };
+        assert!(!idle_dormant);
+        assert!(resume_reservation.is_some());
+        assert!(
+            state.acp_supervisor.is_running(&row.id).await,
+            "the admitted construction already counts as coming up"
+        );
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state.session_service.send_turn(
+                &SessionCaller::User,
+                &row.id,
+                SendTurnRequest {
+                    resume_authority: crate::process::worker_registry::ResumeAuthority::Explicit,
+                    resume_reservation,
+                    text: "one explicit wake",
+                    attachments: &[],
+                    woke_idle_dormant: false,
+                    prompt_id: None,
+                    synthesized: false,
+                    no_revive: false,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.is_err(),
+            "the controlled launcher is a real construction failure"
+        );
+        assert_eq!(
+            launches.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the same admitted reservation, not a second admission or an idle wait, reaches launch"
+        );
+        assert_eq!(
+            crate::session::Storage::open_reference("default")
+                .unwrap()
+                .load()
+                .unwrap()[0]
+                .acp_session_id,
+            row.acp_session_id
+        );
+        assert!(!state
+            .acp_event_store
+            .replay_from(&row.id, 0)
+            .iter()
+            .any(|(_, event)| matches!(event, crate::acp::Event::UserPromptSent { .. })));
     }
 
     #[tokio::test]
@@ -4324,6 +4606,7 @@ mod tests {
         let permissions = std::fs::metadata(directory).unwrap().permissions();
         let memory_before = serde_json::to_value(&instance).unwrap();
         let disk_before = std::fs::read(storage.sessions_path()).unwrap();
+        let stop_before = crate::process::worker_registry::stop_intent(&instance.id).unwrap();
         let mut status_rx = state.status_tx.subscribe();
         std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o555)).unwrap();
         let outcome = state
@@ -4331,7 +4614,14 @@ mod tests {
             .touch_and_wake_on_prompt(&instance.id, false)
             .await;
         std::fs::set_permissions(directory, permissions).unwrap();
-        assert!(matches!(outcome, PromptTouch::WorkerNotReady));
+        assert!(
+            !matches!(outcome, PromptTouch::Touched { .. }),
+            "a failed native commit cannot accept the prompt wake"
+        );
+        assert_eq!(
+            crate::process::worker_registry::stop_intent(&instance.id).unwrap(),
+            stop_before
+        );
         assert_eq!(
             serde_json::to_value(&state.instances.read().await[0]).unwrap(),
             memory_before

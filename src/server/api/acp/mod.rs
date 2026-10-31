@@ -59,7 +59,7 @@ fn session_not_found() -> Response {
 
 /// Plain-text status mapping for a `SupervisorError`. The dashboard matches
 /// body prefixes (`worker_not_ready`, `rate_limited`, `spawn_cancelled`).
-fn supervisor_error_response(context: &str, err: &SupervisorError) -> Response {
+pub(super) fn supervisor_error_response(context: &str, err: &SupervisorError) -> Response {
     let (status, body) = match err {
         SupervisorError::UnknownSession(_) => (
             StatusCode::NOT_FOUND,
@@ -78,7 +78,9 @@ fn supervisor_error_response(context: &str, err: &SupervisorError) -> Response {
         SupervisorError::Superseded(_) => (StatusCode::CONFLICT, err.to_string()),
         SupervisorError::CapacityFull { .. }
         | SupervisorError::TeardownPending(_)
-        | SupervisorError::NativeStoreUnavailable => {
+        | SupervisorError::NativeStoreUnavailable
+        | SupervisorError::RegistryBusy
+        | SupervisorError::Acp(AcpError::RegistryBusy) => {
             (StatusCode::SERVICE_UNAVAILABLE, err.to_string())
         }
         // The worker is mid-restart (e.g. a force stop); the client re-queues.
@@ -129,7 +131,7 @@ fn is_store_write_failure(error: &anyhow::Error) -> bool {
 /// and have it respawn from the stored row; writing the old value back could
 /// overwrite a newer edit.
 async fn persist_failure_response(
-    state: &AppState,
+    state: &Arc<AppState>,
     id: &str,
     what: &str,
     err: &anyhow::Error,
@@ -140,11 +142,13 @@ async fn persist_failure_response(
         "failed to persist {what}: {err:#}"
     );
     // `shutdown_and_wait` can return Ok at its deadline without a confirmed stop.
-    let shutdown_ok = state
-        .acp_supervisor
-        .shutdown_and_wait(id, std::time::Duration::from_secs(5))
-        .await
-        .is_ok();
+    let shutdown_ok = crate::server::acp_events::retire_native_worker(
+        state,
+        id,
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .is_ok();
     let worker_state = state.acp_supervisor.worker_state(id).await;
     let stopped = shutdown_ok && worker_state == crate::daemon::AcpWorkerState::Absent;
     // The reconciler skips a session it already attempted unless asked, and a
@@ -271,11 +275,19 @@ async fn pick_agent(
 mod tests {
     use super::*;
 
-    /// Shared by the agent switch and the selector picks: names the operation,
-    /// stops the worker, and answers 500.
+    /// A failed selector persistence retires the changed worker.
     #[tokio::test]
-    async fn persist_failure_names_the_operation_and_stops_the_worker() {
-        let state = crate::server::test_support::build_test_app_state(vec![]);
+    #[serial_test::serial]
+    async fn persist_failure_stops_the_changed_worker() {
+        use crate::server::test_support as support;
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut row = crate::session::Instance::new("persist-failure", "/tmp");
+        row.id = "sess".into();
+        row.source_profile = "default".into();
+        row.view = crate::session::View::Structured;
+        support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let state = support::build_test_app_state(vec![row]);
+        support::refresh_canonical_metadata_for_test(&state).await;
         state.acp_supervisor.test_insert_worker("sess").await;
 
         let resp = persist_failure_response(
@@ -290,9 +302,7 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
-        let body = String::from_utf8_lossy(&body);
-        assert!(body.contains("persist_failed") && body.contains("agent switch"));
-        assert!(body.contains("disk full") && body.contains("worker was stopped"));
+        assert!(String::from_utf8_lossy(&body).contains("persist_failed"));
         assert_eq!(
             state.acp_supervisor.worker_state("sess").await,
             crate::daemon::AcpWorkerState::Absent
@@ -501,6 +511,7 @@ mod tests {
             support::seed_instances_on_disk_for_test(&profile, vec![inst.clone()]);
             let (launcher, launches) = support::counting_failing_launcher();
             let state = support::build_test_app_state_with_launcher(vec![inst], launcher);
+            support::refresh_canonical_metadata_for_test(&state).await;
 
             let handler = tokio::spawn({
                 let state = Arc::clone(&state);

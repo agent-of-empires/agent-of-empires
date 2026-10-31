@@ -185,6 +185,14 @@ impl SessionResources {
     }
 }
 
+#[cfg(test)]
+pub(crate) static OWNED_REGISTRATION_GATE: std::sync::Mutex<
+    Option<(
+        oneshot::Sender<crate::acp::runner_lifecycle::RunnerIdentity>,
+        oneshot::Receiver<()>,
+    )>,
+> = std::sync::Mutex::new(None);
+
 /// Everything a launch or attach hands the connection task.
 struct Launch {
     session_id: AcpSessionId,
@@ -270,6 +278,169 @@ impl Launch {
             _prime_runtime: None,
         };
         (client, ready_rx)
+    }
+}
+
+/// The original connection phase, with no strong lifecycle lease.
+pub(crate) struct PendingRunnerConnection {
+    socket_path: PathBuf,
+    launch: Option<Launch>,
+    owner: crate::acp::runner_lifecycle::RunnerIdentity,
+    native_store: Option<crate::session::ExecutionBinding>,
+    newborn: bool,
+    client: Option<AcpClient>,
+    handshake:
+        Option<std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AcpError>> + Send>>>,
+    control: Option<ShutdownControlOnDrop>,
+}
+
+impl PendingRunnerConnection {
+    fn new(
+        socket_path: PathBuf,
+        launch: Launch,
+        owner: crate::acp::runner_lifecycle::RunnerIdentity,
+        native_store: Option<crate::session::ExecutionBinding>,
+    ) -> Result<Self, AcpError> {
+        let newborn = matches!(launch.mode, ConnectMode::Fresh { .. });
+        #[cfg(debug_assertions)]
+        if newborn && take_injected_fresh_handshake_failure() {
+            return Err(AcpError::Spawn(
+                "injected fresh-handshake failure (AOE_ACP_TEST_FAIL_FIRST_HANDSHAKES)".into(),
+            ));
+        }
+        Ok(Self {
+            socket_path,
+            launch: Some(launch),
+            owner,
+            native_store,
+            newborn,
+            client: None,
+            handshake: None,
+            control: None,
+        })
+    }
+
+    pub(crate) async fn advance(
+        &mut self,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<(), AcpError> {
+        let owned = self.newborn;
+        if let Some(launch) = self.launch.as_ref() {
+            let label = launch.session_id.0.clone();
+            let terminal_claim = Arc::new(TerminalClaim::new());
+            let prompt_in_flight = Arc::new(AtomicBool::new(matches!(
+                &launch.mode,
+                ConnectMode::Resume {
+                    in_flight_turn: true,
+                    ..
+                }
+            )));
+            let control_path = crate::process::worker::control_socket_sibling(&self.socket_path);
+            let connected = tokio::select! {
+                biased;
+                _ = launch.cancellation.cancelled() =>
+                    return Err(AcpError::Spawn("runner construction cancelled".into())),
+                result = async {
+                    wait_runner_registration(&label, self.owner, self.newborn, deadline).await?;
+                    let connect = connect_runner_control_v4(&control_path, label.clone(),
+                        terminal_claim.clone(), prompt_in_flight.clone(), self.owner);
+                    match deadline {
+                        Some(end) => tokio::time::timeout_at(end, connect).await
+                            .map_err(|_| if owned { AcpError::RegistryBusy } else { AcpError::AttachTimedOut })?,
+                        None => connect.await,
+                    }
+                } => result,
+            }?;
+            let (control, transport) = connected;
+            let (read_half, write_half) = tokio::io::split(transport);
+            let transport = ByteStreams::new(write_half.compat_write(), read_half.compat());
+            let launch = self.launch.take().expect("one original connection");
+            let install_binary = launch.install_binary.clone();
+            let (mut client, ready) = launch.start(
+                mpsc::channel(64),
+                transport,
+                None,
+                Some(RunnerLink {
+                    control: control.clone(),
+                    terminal_claim,
+                    prompt_in_flight,
+                }),
+            );
+            if self.newborn {
+                client.runner_pid = Some(self.owner.pid);
+                client.native_store = self.native_store.take();
+            }
+            self.client = Some(client);
+            self.control = Some(ShutdownControlOnDrop(Some(control)));
+            self.handshake = Some(Box::pin(async move {
+                wait_for_handshake(&label, ready, None, &install_binary, None).await
+            }));
+        }
+        let handshake = self
+            .handshake
+            .as_mut()
+            .expect("retained original handshake");
+        let result = match deadline {
+            Some(end) => tokio::time::timeout_at(end, handshake).await.map_err(|_| {
+                if owned {
+                    AcpError::RegistryBusy
+                } else {
+                    AcpError::AttachTimedOut
+                }
+            })?,
+            None => handshake.await,
+        };
+        self.handshake.take();
+        if let Err(error) = result {
+            let client = self.client.as_ref().expect("original SDK actor");
+            if !matches!(&error, AcpError::ConnectionUnavailable(_))
+                && (client.connection_unavailable().is_none()
+                    || client.connection_state.driver_finished())
+            {
+                return Err(error);
+            }
+        }
+        self.control
+            .as_mut()
+            .expect("original socket guard")
+            .0
+            .take();
+        Ok(())
+    }
+
+    pub(crate) fn attest_owner(
+        &mut self,
+        owner: crate::acp::runner_lifecycle::RunnerIdentity,
+    ) -> Result<(), AcpError> {
+        if owner.pid != self.owner.pid
+            || owner.generation != self.owner.generation
+            || owner.birth_fingerprint.is_none()
+            || self
+                .owner
+                .birth_fingerprint
+                .is_some_and(|birth| Some(birth) != owner.birth_fingerprint)
+        {
+            return Err(AcpError::RetainedRuntimeUnavailable(Box::new(
+                crate::process::worker_registry::ControlAdmissionRefusal::unconfirmed(Some(
+                    self.owner,
+                )),
+            )));
+        }
+        self.owner = owner;
+        Ok(())
+    }
+
+    pub(crate) fn take_client(&mut self) -> AcpClient {
+        self.client.take().expect("completed original connection")
+    }
+
+    pub(crate) fn take_retiring_client(&mut self) -> Option<AcpClient> {
+        if self.client.is_some() {
+            if let Some(control) = self.control.as_mut() {
+                control.0.take();
+            }
+        }
+        self.client.take()
     }
 }
 
@@ -372,6 +543,26 @@ impl AcpClient {
     /// A client that spawns nothing, for structured view state tests.
     pub fn fake_for_test(session_id: AcpSessionId) -> (Self, mpsc::Sender<Event>) {
         Self::fake(session_id, None)
+    }
+
+    /// Model the SDK task's ownership of a fixture's sole event producer.
+    /// Shutdown joins this task; queued events remain available to the drainer.
+    #[cfg(test)]
+    pub(crate) fn with_test_owned_event_producer(mut self, producer: mpsc::Sender<Event>) -> Self {
+        let shutdown = self.connection_shutdown.clone();
+        let task = self
+            .connection_task
+            .get_mut()
+            .expect("connection task mutex poisoned");
+        assert!(
+            task.is_none(),
+            "fake client must not already own a producer"
+        );
+        *task = Some(tokio::spawn(async move {
+            shutdown.cancelled().await;
+            drop(producer);
+        }));
+        self
     }
 
     #[cfg(test)]
@@ -479,6 +670,17 @@ impl AcpClient {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) async fn spawn_with_test_runner(
+        config: SpawnConfig,
+        session_id: AcpSessionId,
+        executable: PathBuf,
+    ) -> Result<Self, AcpError> {
+        runner::TEST_RUNNER_EXECUTABLE
+            .scope(executable, Self::spawn(config, session_id))
+            .await
+    }
+
     /// Launch an agent: a detached runner when `socket_path` is set, else an
     /// in-proc stdio subprocess (tests).
     pub async fn spawn(config: SpawnConfig, session_id: AcpSessionId) -> Result<Self, AcpError> {
@@ -570,16 +772,35 @@ impl AcpClient {
             let (runner_identity, native_store) =
                 spawn_runner_detached(&config, &socket_path, session_id.0.clone(), runner_sandbox)
                     .await?;
-            let mut client = Self::connect_via_socket(
+            #[cfg(test)]
+            let gate = { OWNED_REGISTRATION_GATE.lock().unwrap().take() };
+            #[cfg(test)]
+            if let Some((entered, release)) = gate {
+                let _ = entered.send(runner_identity);
+                let _ = release.await;
+            }
+            let mut pending = PendingRunnerConnection::new(
                 socket_path,
                 launch(sandbox, &native_store),
-                None,
                 runner_identity,
-            )
-            .await?;
-            client.runner_pid = Some(runner_identity.pid);
-            client.native_store = native_store;
-            return Ok(client);
+                native_store,
+            )?;
+            if let Err(error) = pending.advance(None).await {
+                if matches!(
+                    &error,
+                    AcpError::RegistryBusy | AcpError::RetainedRuntimeUnavailable(_)
+                ) {
+                    if let Some(lease) = config.launch_lease.as_ref() {
+                        lease.retirement().defer_registration(pending);
+                        return Err(error);
+                    }
+                }
+                if let Some(client) = pending.client.as_ref() {
+                    let _ = client.shutdown().await;
+                }
+                return Err(error);
+            }
+            return Ok(pending.take_client());
         }
 
         let (mut child, native_store, prime_runtime) = spawn_subprocess(&config)?;
@@ -625,72 +846,14 @@ impl AcpClient {
         deadline: Option<tokio::time::Instant>,
         expected_owner: crate::acp::runner_lifecycle::RunnerIdentity,
     ) -> Result<Self, AcpError> {
-        let control_path = crate::process::worker::control_socket_sibling(&socket_path);
-        let newborn = matches!(launch.mode, ConnectMode::Fresh { .. });
-        // Debug-only #1890 hook: fail a fresh handshake after the runner is up.
-        #[cfg(debug_assertions)]
-        if matches!(launch.mode, ConnectMode::Fresh { .. })
-            && take_injected_fresh_handshake_failure()
-        {
-            return Err(AcpError::Spawn(
-                "injected fresh-handshake failure (AOE_ACP_TEST_FAIL_FIRST_HANDSHAKES)".into(),
-            ));
-        }
-        let label = launch.session_id.0.clone();
-        let terminal_claim = Arc::new(TerminalClaim::new());
-        // The reader may see a cached completion right after Attach, before
-        // the handshake marks the adopted turn.
-        let prompt_in_flight = Arc::new(AtomicBool::new(matches!(
-            &launch.mode,
-            ConnectMode::Resume {
-                in_flight_turn: true,
-                ..
-            }
-        )));
-        let events = mpsc::channel(64);
-        let connected = tokio::select! {
-            biased;
-            _ = launch.cancellation.cancelled() => {
-                return Err(AcpError::Spawn("runner construction cancelled".into()));
-            }
-            connected = async {
-                wait_runner_registration(&label, expected_owner, newborn, deadline).await?;
-                let connect = connect_runner_control_v4(
-                    &control_path, label.clone(),
-                    terminal_claim.clone(), prompt_in_flight.clone(), expected_owner,
-                );
-                match deadline {
-                    Some(end) => tokio::time::timeout_at(end, connect)
-                        .await.map_err(|_| AcpError::AttachTimedOut)?,
-                    None => connect.await,
-                }
-            } => connected,
-        };
-        let (control, crate_transport) = connected?;
-        let (read_half, write_half) = tokio::io::split(crate_transport);
-        let transport = ByteStreams::new(write_half.compat_write(), read_half.compat());
-        // Shuts the runner channel down if the handshake fails or is dropped.
-        let mut handshake_control = ShutdownControlOnDrop(Some(control.clone()));
-        let install_binary = launch.install_binary.clone();
-        let runner = RunnerLink {
-            control,
-            terminal_claim,
-            prompt_in_flight,
-        };
-        let (client, ready_rx) = launch.start(events, transport, None, Some(runner));
-        if let Err(error) =
-            wait_for_handshake(&label, ready_rx, None, &install_binary, deadline).await
-        {
-            if !matches!(&error, AcpError::ConnectionUnavailable(_))
-                && (client.connection_unavailable().is_none()
-                    || client.connection_state.driver_finished())
-            {
+        let mut pending = PendingRunnerConnection::new(socket_path, launch, expected_owner, None)?;
+        if let Err(error) = pending.advance(deadline).await {
+            if let Some(client) = pending.client.as_ref() {
                 let _ = client.shutdown().await;
-                return Err(error);
             }
+            return Err(error);
         }
-        handshake_control.0.take();
-        Ok(client)
+        Ok(pending.take_client())
     }
 
     /// Reattach to a live runner on `aoe serve` startup. The agent still holds

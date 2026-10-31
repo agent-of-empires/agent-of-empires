@@ -1,6 +1,7 @@
 //! The ACP event listener: turning agent events into session status,
 //! unread marks, and stored session ids.
 
+use crate::acp::state::AcpSessionChange;
 use crate::server::push::{publish_status_change, StatusChange};
 use crate::session::Instance;
 use crate::session::Status;
@@ -790,6 +791,387 @@ async fn persist_native_runtime_observation(
     }
 }
 
+/// Native controllers own this checkpoint; the actor supplies only its SDK receipt.
+pub(crate) struct BindingRetirement {
+    pub target: crate::acp::supervisor::RetirementTarget,
+    pub checkpoint: Option<crate::acp::supervisor::NativeBindingCheckpoint>,
+    supervisor:
+        std::sync::Weak<crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>>,
+}
+
+impl BindingRetirement {
+    pub(crate) fn captured(
+        state: &AppState,
+        mut target: crate::acp::supervisor::RetirementTarget,
+        checkpoint: Option<crate::acp::supervisor::NativeBindingCheckpoint>,
+    ) -> Self {
+        target.journalled |= target.lease.is_some();
+        Self {
+            target,
+            checkpoint,
+            supervisor: Arc::downgrade(&state.acp_supervisor),
+        }
+    }
+
+    pub(crate) fn prepare(
+        state: &AppState,
+        row: &Instance,
+        storage: &crate::session::Storage,
+    ) -> anyhow::Result<Self> {
+        let target = state.acp_supervisor.capture_retirement(&row.id)?;
+        Self::prepare_captured(state, target, row, storage)
+    }
+
+    pub(crate) fn prepare_captured(
+        state: &AppState,
+        target: crate::acp::supervisor::RetirementTarget,
+        row: &Instance,
+        storage: &crate::session::Storage,
+    ) -> anyhow::Result<Self> {
+        let checkpoint = if let Some(saved) = target
+            .lease
+            .as_ref()
+            .and_then(|lease| lease.retirement().binding_checkpoint())
+        {
+            (crate::acp::state::NativeEventContext::capture(row, storage)?
+                == saved.destination.context
+                && saved
+                    .destination
+                    .choice
+                    .as_ref()
+                    .is_some_and(|choice| choice.matches(row)))
+            .then_some(saved)
+        } else {
+            target.prepare_binding_checkpoint(row, storage)?
+        };
+        Ok(Self::captured(state, target, checkpoint))
+    }
+
+    pub(crate) fn promote(
+        &mut self,
+        row: &Instance,
+        storage: &crate::session::Storage,
+    ) -> anyhow::Result<()> {
+        if let Some(checkpoint) = &mut self.checkpoint {
+            checkpoint.destination = checkpoint.destination.retarget(row, storage)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn activate(&self) {
+        if let Some(lease) = &self.target.lease {
+            lease.retirement().delegate_binding_checkpoint(true);
+        }
+        if let Some(checkpoint) = &self.checkpoint {
+            self.target.record_binding_checkpoint(checkpoint.clone());
+        }
+    }
+
+    /// Physical/current-producer completion, not proof that every SDK result
+    /// reached an installed worker's drain before its existing retirement abort.
+    fn ensure_settled(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.target.lease.is_none()
+                || self.supervisor.upgrade().is_some_and(|supervisor| {
+                    supervisor.binding_producer_is_current(&self.target)
+                }),
+            crate::session::LifecycleReservationError::Superseded
+        );
+        Ok(())
+    }
+
+    /// Caller holds native lifecycle exclusion after original retirement.
+    /// Preserve captured receipts and the deferred original-receiver drain;
+    /// lossless ingestion of installed SDK results is a separate requirement.
+    pub(crate) fn commit_under_native_lock(
+        &self,
+        native: &dyn crate::session::SessionStore,
+        id: &str,
+    ) -> anyhow::Result<()> {
+        self.ensure_settled()?;
+        if self.target.binding_receipt().is_none() || self.checkpoint.is_none() {
+            return Ok(());
+        }
+        native.update(|rows, _| {
+            let row = rows
+                .iter_mut()
+                .find(|row| row.id == id)
+                .ok_or(crate::session::SessionGone)?;
+            self.apply(row, native.storage())
+        })
+    }
+
+    pub(crate) fn apply(
+        &self,
+        row: &mut Instance,
+        storage: &crate::session::Storage,
+    ) -> anyhow::Result<()> {
+        let Some(receipt) = self.target.binding_receipt() else {
+            return Ok(());
+        };
+        let Some(checkpoint) = self.checkpoint.as_ref() else {
+            return Ok(());
+        };
+        let lease = self
+            .target
+            .lease
+            .as_ref()
+            .ok_or(crate::session::LifecycleReservationError::Superseded)?;
+        let original = lease
+            .native_scope()
+            .ok()
+            .flatten()
+            .ok_or(crate::session::LifecycleReservationError::Superseded)?;
+        anyhow::ensure!(
+            receipt.producer == lease.epoch()
+                && Some(receipt.owner) == self.target.identity
+                && receipt.owner.birth_fingerprint.is_some()
+                && receipt.source_context == checkpoint.source_context
+                && crate::acp::state::NativeEventContext::capture(row, storage)?
+                    == checkpoint.destination.context
+                && original.context == checkpoint.source_context
+                && self
+                    .supervisor
+                    .upgrade()
+                    .is_some_and(|supervisor| supervisor.binding_producer_is_current(&self.target)),
+            crate::session::LifecycleReservationError::Superseded
+        );
+        let source_matches = checkpoint
+            .destination
+            .choice
+            .as_ref()
+            .is_some_and(|choice| choice.matches(row))
+            && receipt_source_route_matches(
+                &receipt,
+                &checkpoint.source.choice,
+                original.choice.as_deref(),
+            );
+        // Same SID alone never enriches a changed route. This is a decline of
+        // an obsolete receipt, not an idempotence claim about the current row.
+        if !source_matches
+            && matches!(&receipt.change, AcpSessionChange::Assigned(id)
+            if row.acp_session_id.as_deref() == Some(id.as_str()))
+        {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            source_matches,
+            crate::session::LifecycleReservationError::Superseded
+        );
+        let id = row.id.clone();
+        apply_acp_session_change(row, &id, Some(&receipt.change), true);
+        row.attest_launch_default_store(receipt.store.as_ref());
+        if let AcpSessionChange::Assigned(assigned) = &receipt.change {
+            if receipt.store.is_some() {
+                row.record_observed_acp_store(assigned, receipt.store.as_ref());
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn receipt_source_route_matches(
+    receipt: &crate::acp::supervisor::QualifiedBindingReceipt,
+    source: &crate::session::ConversationState,
+    original: Option<&crate::acp::state::NativeBindingState>,
+) -> bool {
+    receipt.store.as_ref().is_none_or(|observed| {
+        let admitted = original.map(|source| &source.choice);
+        [&source.binding, &source.resume_binding]
+            .into_iter()
+            .zip([
+                admitted.map(|source| &source.binding),
+                admitted.map(|source| &source.resume_binding),
+            ])
+            .all(|(binding, before)| {
+                let Some(route) = binding
+                    .as_ref()
+                    .and_then(|binding| binding.execution.as_ref())
+                else {
+                    return true;
+                };
+                route == observed
+                    && (route.exported_default_store == observed.exported_default_store
+                        || (route.exported_default_store.is_none()
+                            && before.is_some_and(|before| {
+                                before == binding
+                                    && before
+                                        .as_ref()
+                                        .and_then(|binding| binding.execution.as_ref())
+                                        .is_some_and(|execution| {
+                                            execution.exported_default_store.is_none()
+                                        })
+                            })))
+            })
+    })
+}
+
+pub(crate) fn commit_retired_binding(
+    native: &dyn crate::session::SessionStore,
+    id: &str,
+    retirement: &BindingRetirement,
+) -> anyhow::Result<()> {
+    let _lifecycle = native.storage().acquire_instance_lifecycle_lock(id)?;
+    retirement.commit_under_native_lock(native, id)
+}
+
+/// Caller retains its namespace and operation exclusion, never a native flock.
+pub(crate) async fn retire_native_worker(
+    state: &Arc<AppState>,
+    id: &str,
+    deadline: std::time::Duration,
+) -> anyhow::Result<()> {
+    use crate::session::SessionStore as _;
+    let retirement =
+        BindingRetirement::captured(state, state.acp_supervisor.capture_retirement(id)?, None);
+    retirement.activate();
+    let captured = state.clone();
+    let id_owned = id.to_owned();
+    let target = retirement.target.clone();
+    let prepared = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let profile = captured
+            .instances
+            .blocking_read()
+            .iter()
+            .find(|row| row.id == id_owned)
+            .map(|row| row.source_profile.clone())
+            .ok_or(crate::session::SessionGone)?;
+        let native = crate::server::session_store::NativeSessionStore::open(
+            captured.clone(),
+            &profile,
+            None,
+        )?;
+        let lifecycle = native
+            .storage()
+            .acquire_instance_lifecycle_lock(&id_owned)?;
+        let row = native
+            .load()?
+            .into_iter()
+            .find(|row| row.id == id_owned)
+            .ok_or(crate::session::SessionGone)?;
+        let binding =
+            BindingRetirement::prepare_captured(&captured, target, &row, native.storage())?;
+        binding.activate();
+        drop(lifecycle);
+        Ok((native, binding))
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|result| result);
+    // An enqueued selector may already be applied when persistence fails.
+    // Failed preparation cannot leave that original actor alive; a genuine
+    // unconfirmed metadata obligation still retains its exact retirement lease.
+    state
+        .acp_supervisor
+        .shutdown_captured_and_wait(id, &retirement.target, deadline)
+        .await?;
+    retirement.ensure_settled()?;
+    if retirement.target.binding_receipt().is_none() {
+        // No captured binding obligation remains after owned retirement.
+        // This does not establish lossless ingestion of installed SDK results.
+        state
+            .acp_supervisor
+            .acknowledge_retirement(&retirement.target)?;
+        return Ok(());
+    }
+    let (native, binding) = prepared?;
+    let captured = state.clone();
+    let id_owned = id.to_owned();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let _lifecycle = native
+            .storage()
+            .acquire_instance_lifecycle_lock(&id_owned)?;
+        binding.commit_under_native_lock(&native, &id_owned)?;
+        captured
+            .acp_supervisor
+            .acknowledge_retirement(&binding.target)?;
+        Ok(())
+    })
+    .await?
+}
+
+pub(crate) async fn commit_background_bindings(state: &Arc<AppState>) {
+    if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
+        return;
+    }
+    for (id, target) in state.acp_supervisor.retired_binding_targets() {
+        let _namespace = state.profile_namespace.read().await;
+        let instance = state.instance_lock(&id).await;
+        let _instance = instance.lock().await;
+        let owner = state.clone();
+        let captured = target.clone();
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            use crate::session::SessionStore as _;
+            let Some(row) = owner
+                .instances
+                .blocking_read()
+                .iter()
+                .find(|row| row.id == id)
+                .cloned()
+            else {
+                // Only its explicit deletion journal may acknowledge an absent row.
+                return Ok(());
+            };
+            if row.terminal_handoff.is_some() {
+                return Ok(());
+            }
+            let native = crate::server::session_store::NativeSessionStore::open(
+                owner.clone(),
+                &row.source_profile,
+                None,
+            )?;
+            let _lifecycle = native.storage().acquire_instance_lifecycle_lock(&id)?;
+            if captured
+                .lease
+                .as_ref()
+                .is_none_or(|lease| !lease.retirement().binding_checkpoint_delegated())
+            {
+                return Ok(());
+            }
+            let Some(current) = native.load()?.into_iter().find(|row| row.id == id) else {
+                return Ok(());
+            };
+            if current.terminal_handoff.is_some() {
+                return Ok(());
+            }
+            let checkpoint = captured
+                .lease
+                .as_ref()
+                .and_then(|lease| lease.retirement().binding_checkpoint());
+            let retirement = if let Some(checkpoint) = checkpoint {
+                BindingRetirement::captured(&owner, captured, Some(checkpoint))
+            } else {
+                BindingRetirement::prepare_captured(&owner, captured, &current, native.storage())?
+            };
+            let committed = retirement.commit_under_native_lock(&native, &id);
+            if let Err(error) = committed {
+                if !matches!(
+                    error.downcast_ref::<crate::session::LifecycleReservationError>(),
+                    Some(crate::session::LifecycleReservationError::Superseded)
+                ) {
+                    return Err(error);
+                }
+            }
+            // The native exclusion serializes this ACK with a journal's claim.
+            if retirement
+                .target
+                .lease
+                .as_ref()
+                .is_some_and(|lease| lease.retirement().binding_checkpoint_delegated())
+            {
+                owner
+                    .acp_supervisor
+                    .acknowledge_retirement(&retirement.target)?;
+            }
+            Ok(())
+        })
+        .await;
+        if !matches!(result, Ok(Ok(()))) {
+            tracing::warn!(target: "acp.reconciler", ?result, "native binding checkpoint remains unconfirmed");
+        }
+    }
+}
+
 async fn persist_identity_observation(
     state: &Arc<AppState>,
     frame: &crate::acp::protocol::AcpBroadcastFrame,
@@ -1410,29 +1792,8 @@ pub(super) fn apply_acp_session_change(
     Some(inst.source_profile.clone())
 }
 
-/// What an event tells the ACP-session-id listener to do. `None` means
-/// the event is irrelevant. Extracted so the JSON-shape parsing has a
-/// pure-function test surface.
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub(super) enum AcpSessionChange {
-    Assigned(String),
-    Reset(String),
-    /// A user `/clear`: drop the stored resume id so the next worker
-    /// restart starts a fresh `session/new` instead of resurrecting the
-    /// pre-clear conversation via `session/load`. See #3080.
-    Cleared,
-}
-
 pub(super) fn derive_acp_session_change(event: &crate::acp::Event) -> Option<AcpSessionChange> {
-    use crate::acp::Event;
-    match event {
-        Event::AcpSessionAssigned { acp_session_id, .. } => {
-            Some(AcpSessionChange::Assigned(acp_session_id.clone()))
-        }
-        Event::SessionContextReset { reason } => Some(AcpSessionChange::Reset(reason.clone())),
-        Event::SessionCleared => Some(AcpSessionChange::Cleared),
-        _ => None,
-    }
+    AcpSessionChange::from_event(event)
 }
 
 /// How an event's projected sidebar status may overwrite the row's current

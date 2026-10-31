@@ -214,6 +214,7 @@ impl ControlStateCache {
             }
             let scope = crate::acp::state::NativeObservationScope {
                 context,
+                choice: None,
                 fence: crate::session::NativeInputFence::capture_route(
                     storage.profile(),
                     session_id,

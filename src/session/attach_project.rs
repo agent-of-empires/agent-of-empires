@@ -1104,10 +1104,14 @@ pub(crate) fn resume_after_conversion(
     }
 
     if quiesced.worker_was_running {
-        crate::process::worker_registry::mark_restart_pending(
+        if let Err(error) = crate::process::worker_registry::mark_restart_pending(
             session_id,
             quiesced.worker_generation,
-        );
+        ) {
+            warnings.push(format!(
+                "the structured worker restart could not be scheduled ({error}); start it from the session list"
+            ));
+        }
     }
 
     warnings

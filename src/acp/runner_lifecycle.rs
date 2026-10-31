@@ -854,6 +854,12 @@ impl LifecycleTable {
             .get(session_id)
             .map(|entry| self.lease(session_id, entry.epoch))
     }
+    pub(crate) fn owned_leases(&self) -> Vec<Lease> {
+        self.entries
+            .keys()
+            .filter_map(|id| self.current_lease(id))
+            .collect()
+    }
     fn current(&mut self, lease: &Lease) -> Option<&mut Entry> {
         self.entries.get_mut(&lease.session_id).filter(|entry| {
             entry.epoch == lease.epoch && Arc::ptr_eq(&entry.construction, &lease.construction)
@@ -1084,11 +1090,22 @@ impl LifecycleTable {
         lease.claim_runner_ownership();
         lease.owe_stop_completion(Some(reason));
         lease.owe_previous_retirement();
+        lease.retirement().cancel_deferred_driver();
         match &mut entry.phase {
             Phase::Starting { cancel, .. } | Phase::Respawning { cancel, .. } => {
                 cancel.get_or_insert_with(|| reason.to_string());
                 lease.cancellation().cancel();
-                StopDecision::CancelRequested
+                if lease.retirement().has_deferred() {
+                    let identity = lease.spawned_runner().or_else(|| lease.previous_runner());
+                    entry.phase = Phase::Stopping {
+                        attempts: 0,
+                        since: Instant::now(),
+                    };
+                    entry.sweep_owed = true;
+                    StopDecision::TearDown { lease, identity }
+                } else {
+                    StopDecision::CancelRequested
+                }
             }
             Phase::Running { identity } => {
                 let identity = *identity;
@@ -1135,6 +1152,14 @@ impl LifecycleTable {
             );
         }
         true
+    }
+
+    pub(crate) fn retirement_ack_required(&self, lease: &Lease) -> bool {
+        self.entries.get(lease.session_id()).is_some_and(|entry| {
+            entry.epoch == lease.epoch()
+                && Arc::ptr_eq(&entry.construction, &lease.construction)
+                && entry.journal_ack_required
+        })
     }
 
     /// The caller has durably acknowledged this exact completed construction.
@@ -1491,9 +1516,19 @@ impl LifecycleTable {
         let Some(entry) = self.current(lease) else {
             return StopDecision::NotOwned;
         };
-        let Phase::Running { identity } = entry.phase else {
-            return StopDecision::AlreadyStopping;
+        let identity = match entry.phase {
+            Phase::Running { identity } => identity,
+            Phase::Starting { .. } | Phase::Respawning { .. }
+                if !lease.is_borrowed_attach()
+                    && (lease.retirement().has_deferred()
+                        || lease.retirement().deferred_is_claimed()) =>
+            {
+                lease.cancellation().cancel();
+                lease.spawned_runner()
+            }
+            _ => return StopDecision::AlreadyStopping,
         };
+        lease.retirement().cancel_deferred_driver();
         lease.owe_stop_completion(None);
         entry.sweep_owed = true;
         entry.phase = Phase::Stopping {

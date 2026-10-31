@@ -76,6 +76,40 @@ impl<S: BroadcastSink> Supervisor<S> {
             .await;
     }
 
+    pub(crate) async fn test_assert_installed_client(&self, id: &str, original: &Arc<AcpClient>) {
+        let installed = self
+            .client_for_session(id)
+            .await
+            .expect("effective installed client");
+        assert!(
+            Arc::ptr_eq(&installed, original),
+            "installation replaced the original SDK client"
+        );
+    }
+
+    pub(crate) fn test_bind_native_scope(&self, lease: &Lease, row: &crate::session::Instance) {
+        assert_eq!(self.running_lease(&row.id).as_ref(), Some(lease));
+        assert!(lease.admission().is_none(), "fixture already bound");
+        let storage =
+            Arc::new(crate::session::Storage::open_reference(&row.source_profile).unwrap());
+        let scope = crate::acp::state::NativeObservationScope::capture(row, &storage).unwrap();
+        lease.set_admission(Some(super::LaunchAdmission {
+            store: storage,
+            generation: row.lifecycle_generation,
+            namespace: None,
+            native_scope: Some(scope),
+        }));
+    }
+
+    pub(crate) fn test_start_worker_pump(
+        &self,
+        id: &str,
+        lease: Lease,
+        events: tokio::sync::mpsc::Receiver<Event>,
+    ) -> tokio::task::JoinHandle<()> {
+        self.start_drain_task(id.to_owned(), lease, events, None)
+    }
+
     /// Occupy a slot with a fake in-memory worker; returns its epoch.
     pub(crate) async fn test_insert_worker(&self, session_id: &str) -> u64 {
         let (client, _tx) = AcpClient::fake_for_test(AcpSessionId(format!("acp-{session_id}")));
@@ -409,6 +443,15 @@ pub(crate) fn save_attested_test_record(session_id: &str, pid: u32, generation: 
     worker_registry::save(&record).unwrap();
 }
 
+pub(crate) fn request_attested_test_stop(
+    session_id: &str,
+    identity: RunnerIdentity,
+) -> worker_registry::StopIntent {
+    save_attested_test_record(session_id, identity.pid, identity.generation);
+    worker_registry::request_stop(&worker_registry::load_strict(session_id).unwrap().unwrap())
+        .unwrap()
+}
+
 /// Holds a gated launch until the test opens it.
 #[derive(Default)]
 pub(crate) struct Gate {
@@ -417,15 +460,13 @@ pub(crate) struct Gate {
 }
 
 /// Freeze the fake producer's proof, then park before registry publication.
-/// Event senders are retained so drains never see a close.
+/// Event production remains alive until the fake SDK client is shut down.
 pub(super) fn gated_launcher(gate: &Gate, pid: u32) -> Launcher {
     let entered = Arc::clone(&gate.entered);
     let open = Arc::clone(&gate.open);
-    let senders: Arc<std::sync::Mutex<Vec<mpsc::Sender<Event>>>> = Default::default();
     Arc::new(move |config: SpawnConfig, session_id: AcpSessionId| {
         let entered = Arc::clone(&entered);
         let open = Arc::clone(&open);
-        let senders = Arc::clone(&senders);
         Box::pin(async move {
             let lease = config
                 .launch_lease
@@ -436,9 +477,10 @@ pub(super) fn gated_launcher(gate: &Gate, pid: u32) -> Launcher {
             entered.notify_one();
             open.notified().await;
             save_attested_test_record(&session_id.0, pid, config.generation);
-            let (client, tx) = AcpClient::fake_for_test(session_id);
-            senders.lock().unwrap().push(tx);
-            Ok(client.with_runner_pid(pid))
+            let (client, producer) = AcpClient::fake_for_test(session_id);
+            Ok(client
+                .with_test_owned_event_producer(producer)
+                .with_runner_pid(pid))
         })
     })
 }
@@ -451,9 +493,11 @@ pub(crate) fn recording_gated_launcher(
     native_id: &str,
     runner_identity: Option<crate::process::ProcessBirthIdentity>,
 ) -> (Launcher, Arc<std::sync::atomic::AtomicBool>) {
-    let (client, sender, deleted) =
+    let (client, producer, deleted) =
         AcpClient::fake_for_test_recording(AcpSessionId(session_id.into()));
-    let client = Arc::new(std::sync::Mutex::new(Some(client)));
+    let client = Arc::new(std::sync::Mutex::new(Some(
+        client.with_test_owned_event_producer(producer),
+    )));
     let entered = gate.entered.clone();
     let open = gate.open.clone();
     let native_id = native_id.to_owned();
@@ -462,10 +506,8 @@ pub(crate) fn recording_gated_launcher(
         let entered = entered.clone();
         let open = open.clone();
         let native_id = native_id.clone();
-        let sender = sender.clone();
         let runner_identity = runner_identity.clone();
         Box::pin(async move {
-            let _sender = sender;
             let socket = worker_registry::socket_path_for(&session_id.0).unwrap();
             let mut record = worker_record(&session_id.0, pid, socket.clone())
                 .with_generation(config.generation);
@@ -659,6 +701,16 @@ for attempt in range(2):
                         "content": {"type": "text", "text": "original producer completed"}}}})
                     send(s, {"kind": "prompt_completed", "prompt_req_id": 77,
                              "outcome": {"status": "completed", "stop_reason": "end_turn"}})
+            elif kind == "prompt":
+                request = frame["request"]
+                assert request["sessionId"] == native
+                text = "".join(part["text"] for part in request["prompt"] if part.get("type") == "text")
+                send(s, {"kind": "prompt_started", "prompt_req_id": 101})
+                send(s, {"kind": "notify", "method": "session/update", "params": {
+                    "sessionId": request["sessionId"], "update": {"sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "control peer received: " + text}}}})
+                send(s, {"kind": "prompt_completed", "prompt_req_id": 101,
+                    "outcome": {"status": "completed", "stop_reason": "end_turn"}})
             else:
                 raise AssertionError("unexpected attach request: " + kind)
 "#;
@@ -755,6 +807,11 @@ for attempt in range(2):
         self.resumed.recv().await.unwrap()
     }
 
+    pub(crate) fn exit_owner(&mut self) {
+        self.child.kill().unwrap();
+        self.child.wait().unwrap();
+    }
+
     pub(crate) fn complete_turn(&mut self) {
         use std::io::Write as _;
         self.completion
@@ -771,4 +828,379 @@ impl Drop for HeldAttachRunner {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// A native JSON-RPC peer, used through the real SDK and optionally a real runner.
+pub(crate) struct ScriptedAcpAgent {
+    _directory: tempfile::TempDir,
+    script: PathBuf,
+    capture: PathBuf,
+    pid_file: PathBuf,
+    leases: Arc<std::sync::Mutex<Vec<Lease>>>,
+    native: std::sync::Mutex<
+        Option<(
+            u32,
+            crate::process::ProcessBirthIdentity,
+            crate::process::CapturedProcess,
+        )>,
+    >,
+}
+
+impl ScriptedAcpAgent {
+    pub(crate) fn new() -> Self {
+        let directory = tempfile::TempDir::with_prefix_in("aoe-native-", "/tmp").unwrap();
+        let script = directory.path().join("agent.py");
+        let capture = directory.path().join("requests.ndjson");
+        let pid_file = directory.path().join("native.pid");
+        std::fs::write(
+            &script,
+            r#"
+import json, os, sys
+if "--version" in sys.argv:
+    print("0.99.1")
+    sys.exit(0)
+capture, pid_file = sys.argv[1:3]
+with open(pid_file, "w") as output:
+    output.write(str(os.getpid()))
+native = None
+new_count = 0
+modes = {"currentModeId": "default", "availableModes": [
+    {"id": "default", "name": "Default"}, {"id": "plan", "name": "Plan"}]}
+def send(frame):
+    print(json.dumps(frame), flush=True)
+for line in sys.stdin:
+    request = json.loads(line)
+    with open(capture, "a") as output:
+        output.write(json.dumps(dict(request, native_pid=os.getpid())) + "\n")
+    method, params = request.get("method"), request.get("params", {})
+    if "id" not in request:
+        continue
+    if method == "initialize":
+        result = {"protocolVersion": 1, "agentCapabilities": {"loadSession": True}}
+    elif method == "session/new":
+        new_count += 1
+        native = "native-%s-%s" % (os.getpid(), new_count)
+        result = {"sessionId": native, "modes": modes}
+    elif method == "session/load":
+        native = params["sessionId"]
+        result = {"modes": modes}
+    elif method == "session/prompt":
+        assert params["sessionId"] == native
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": native, "update": {"sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "native acknowledged this prompt"}}}})
+        result = {"stopReason": "end_turn"}
+    elif method == "session/set_mode":
+        assert params["sessionId"] == native
+        result = {}
+    elif method == "session/set_config_option":
+        assert params["sessionId"] == native
+        result = {"configOptions": []}
+    elif method == "session/set_model":
+        assert params["sessionId"] == native
+        result = {}
+    else:
+        send({"jsonrpc": "2.0", "id": request["id"],
+              "error": {"code": -32601, "message": "unsupported fixture method: " + str(method)}})
+        continue
+    send({"jsonrpc": "2.0", "id": request["id"], "result": result})
+"#,
+        )
+        .unwrap();
+        Self {
+            _directory: directory,
+            script,
+            capture,
+            pid_file,
+            leases: Default::default(),
+            native: Default::default(),
+        }
+    }
+
+    pub(crate) fn launcher(&self, owned_runner: bool) -> Launcher {
+        let script = self.script.clone();
+        let capture = self.capture.clone();
+        let pid_file = self.pid_file.clone();
+        let leases = self.leases.clone();
+        let executable = owned_runner.then(cargo_runner_executable);
+        Arc::new(move |mut config, session_id| {
+            let script = script.clone();
+            let capture = capture.clone();
+            let pid_file = pid_file.clone();
+            let executable = executable.clone();
+            if let Some(lease) = config.launch_lease.as_ref() {
+                leases.lock().unwrap().push(lease.clone());
+            }
+            Box::pin(async move {
+                config.spec = AgentSpec {
+                    command: "python3".into(),
+                    args: vec![
+                        "-u".into(),
+                        script.to_string_lossy().into_owned(),
+                        capture.to_string_lossy().into_owned(),
+                        pid_file.to_string_lossy().into_owned(),
+                    ],
+                    description: "native JSON-RPC fixture".into(),
+                    env_allowlist: None,
+                };
+                config.socket_path = if owned_runner {
+                    Some(worker_registry::socket_path_for(&session_id.0).unwrap())
+                } else {
+                    None
+                };
+                match executable {
+                    Some(executable) => {
+                        AcpClient::spawn_with_test_runner(config, session_id, executable).await
+                    }
+                    None => AcpClient::spawn(config, session_id).await,
+                }
+            })
+        })
+    }
+
+    pub(crate) fn calls(&self) -> Vec<serde_json::Value> {
+        let text = std::fs::read_to_string(&self.capture).unwrap_or_default();
+        let Some((complete, _)) = text.rsplit_once('\n') else {
+            return Vec::new();
+        };
+        complete
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    pub(crate) async fn started(&self) -> (u32, crate::process::ProcessBirthFingerprint) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let pid = std::fs::read_to_string(&self.pid_file)
+                    .ok()
+                    .and_then(|pid| pid.parse::<u32>().ok());
+                if let Some(pid) = pid {
+                    if let Some(birth) = crate::process::process_birth_identity(pid).unwrap() {
+                        if let Some(process) =
+                            crate::process::CapturedProcess::capture(pid, &birth).unwrap()
+                        {
+                            let fingerprint = birth.fingerprint();
+                            let mut native = self.native.lock().unwrap();
+                            if let Some((original, original_birth, _)) = native.as_ref() {
+                                assert_eq!(
+                                    (*original, original_birth.fingerprint()),
+                                    (pid, fingerprint),
+                                    "the native actor was replaced"
+                                );
+                            } else {
+                                *native = Some((pid, birth, process));
+                            }
+                            return (pid, fingerprint);
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the actual native peer started")
+    }
+
+    pub(crate) async fn wait_for_call(&self, method: &str, count: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while self
+                .calls()
+                .iter()
+                .filter(|call| call["method"] == method)
+                .count()
+                < count
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("native peer did not receive {count} {method} calls"));
+    }
+
+    pub(crate) fn owned_runner(&self) -> RunnerIdentity {
+        self.leases
+            .lock()
+            .unwrap()
+            .last()
+            .and_then(Lease::spawned_runner)
+            .expect("the real constructor captured its physical runner")
+    }
+
+    pub(crate) async fn registered_runner<'a>(
+        &self,
+        id: &'a str,
+    ) -> (worker_registry::RegistryGuard<'a>, WorkerRecord) {
+        let owner = self.owned_runner();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                {
+                    match worker_registry::try_registry_lock(id) {
+                        Ok(Some(registry)) => match registry.record() {
+                            Ok(Some(record)) => {
+                                assert!(
+                                    owner.owns_record(&record),
+                                    "registration belongs to a different physical runner"
+                                );
+                                return (registry, record);
+                            }
+                            Ok(None) => {}
+                            Err(error) => panic!("reading registered runner: {error:#}"),
+                        },
+                        Ok(None) => {}
+                        Err(error) if error.is::<worker_registry::RegistryBusy>() => {}
+                        Err(error) => panic!("observing runner registry: {error:#}"),
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the exact original runner registered within the fixture budget")
+    }
+
+    pub(crate) fn native_reaped(&self) -> bool {
+        let identity = self
+            .native
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(pid, birth, _)| (*pid, birth.fingerprint()));
+        identity.is_some_and(|(pid, birth)| !original_process_present(pid, birth))
+    }
+
+    pub(crate) async fn settle<S: BroadcastSink>(&self, supervisor: &Supervisor<S>, id: &str) {
+        // A captured signal is fallback cleanup; the qualified wait below proves settlement.
+        let _ = supervisor
+            .shutdown_and_wait(id, std::time::Duration::from_secs(5))
+            .await;
+        let native = {
+            let native = self.native.lock().unwrap();
+            native.as_ref().map(|(pid, birth, process)| {
+                if original_process_present(*pid, birth.fingerprint()) {
+                    let _ = process.signal(libc::SIGKILL);
+                }
+                (*pid, birth.fingerprint())
+            })
+        };
+        if let Some((pid, birth)) = native {
+            wait_original_reaped(pid, birth).await;
+        }
+        let owners: Vec<_> = self
+            .leases
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(Lease::spawned_runner)
+            .collect();
+        let control = crate::acp::runner_lifecycle::SystemProcessControl::default();
+        for owner in owners {
+            let birth = owner
+                .birth_fingerprint
+                .expect("fixture runner birth is attested");
+            if original_process_present(owner.pid, birth) {
+                control.terminate_group(owner);
+                let exited = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    while original_process_present(owner.pid, birth) {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .is_ok();
+                if !exited {
+                    control.kill_group(owner);
+                }
+            }
+            wait_original_reaped(owner.pid, birth).await;
+        }
+        self.native.lock().unwrap().take();
+        self.leases.lock().unwrap().clear();
+    }
+}
+
+impl Drop for ScriptedAcpAgent {
+    fn drop(&mut self) {
+        if let Some((_, _, process)) = self.native.lock().unwrap().as_ref() {
+            let _ = process.signal(libc::SIGKILL);
+        }
+        for lease in self.leases.lock().unwrap().iter() {
+            if let Some(owner) = lease.spawned_runner() {
+                crate::acp::runner_lifecycle::SystemProcessControl::default().kill_group(owner);
+            }
+        }
+    }
+}
+
+fn cargo_runner_executable() -> PathBuf {
+    let candidate = std::env::var_os("AOE_TEST_ACP_RUNNER_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let executable = std::env::current_exe().expect("current Cargo test executable");
+            let deps = executable.parent().expect("Cargo test executable parent");
+            assert_eq!(
+                deps.file_name(),
+                Some(std::ffi::OsStr::new("deps")),
+                "set AOE_TEST_ACP_RUNNER_EXE to this candidate's freshly built aoe binary"
+            );
+            let profile = deps.parent().expect("Cargo profile directory");
+            let binary = format!("aoe{}", std::env::consts::EXE_SUFFIX);
+            if let Some(target) = std::env::var_os("CARGO_TARGET_DIR") {
+                let target = PathBuf::from(target);
+                let target = if target.is_absolute() {
+                    target
+                } else {
+                    std::env::current_dir()
+                        .expect("Cargo test working directory")
+                        .join(target)
+                };
+                target.join(profile.file_name().unwrap()).join(binary)
+            } else {
+                profile.join(binary)
+            }
+        });
+    assert!(candidate.is_file(),
+        "real owned-runner fixture requires this candidate's aoe binary at {}; run cargo build --bin aoe before a targeted --lib run, or supply AOE_TEST_ACP_RUNNER_EXE; full cargo test/nextest builds the integration binary",
+        candidate.display());
+    candidate
+}
+
+pub(crate) fn pause_owned_installation() -> (
+    tokio::sync::oneshot::Receiver<Arc<AcpClient>>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    *super::launch::OWNED_INSTALL_GATE.lock().unwrap() = Some((entered, released));
+    (waiting, release)
+}
+
+fn original_process_present(pid: u32, birth: crate::process::ProcessBirthFingerprint) -> bool {
+    crate::process::process_birth_identity(pid)
+        .expect("qualified fixture process observation")
+        .is_some_and(|current| current.fingerprint() == birth)
+}
+
+async fn wait_original_reaped(pid: u32, birth: crate::process::ProcessBirthFingerprint) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while original_process_present(pid, birth) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("captured fixture process {pid} was not reaped"));
+}
+
+pub(crate) async fn runner_record(id: &str) -> Option<WorkerRecord> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            match worker_registry::load_strict(id) {
+                Ok(record) => return record,
+                Err(error) if error.is::<worker_registry::RegistryBusy>() => {}
+                Err(error) => panic!("reading fixture runner record: {error:#}"),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("fixture registry observation did not become readable")
 }

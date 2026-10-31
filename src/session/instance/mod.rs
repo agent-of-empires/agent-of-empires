@@ -358,7 +358,7 @@ impl TerminalHandoffIntent {
         } else {
             target.prime = crate::acp::runner_lifecycle::PrimeOwnership::NotPrime;
         }
-        target.journalled = true;
+        target.claim_journal_ack();
         Ok(())
     }
 

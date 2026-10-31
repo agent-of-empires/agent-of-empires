@@ -31,7 +31,9 @@ use super::runner_lifecycle::{
 use super::state::AcpSessionId;
 use crate::daemon::{AcpWorkerStart, AcpWorkerStartKind, AcpWorkerState};
 use crate::session::SandboxInfo;
-pub(crate) use teardown::{RetirementResources, RetirementTarget};
+pub(crate) use teardown::{
+    NativeBindingCheckpoint, QualifiedBindingReceipt, RetirementResources, RetirementTarget,
+};
 
 pub(crate) use agents::apply_agent_command_override;
 pub(crate) use launch::{host_spawn_environment, with_durable_launch};
@@ -105,6 +107,14 @@ pub enum SupervisorError {
     SessionGone(String),
     #[error("native session authority unavailable")]
     NativeStoreUnavailable,
+    #[error("worker registry admission busy")]
+    RegistryBusy,
+}
+
+impl SupervisorError {
+    pub(crate) fn is_registry_busy(&self) -> bool {
+        matches!(self, Self::RegistryBusy | Self::Acp(AcpError::RegistryBusy))
+    }
 }
 
 /// What the caller does with prompt text after it was published.
@@ -212,6 +222,54 @@ pub struct Supervisor<S: BroadcastSink> {
     max_concurrent_workers: u32,
 }
 
+pub(crate) struct ConstructionFinish {
+    kind: WorkerKind,
+    context_reset: Option<PendingContextReset>,
+    mode: Option<String>,
+    respawn: bool,
+}
+
+impl ConstructionFinish {
+    fn new(
+        mut kind: WorkerKind,
+        context_reset: Option<PendingContextReset>,
+        mode: Option<String>,
+        respawn: bool,
+    ) -> Self {
+        if let WorkerKind::Runner { spawn_config } = &mut kind {
+            spawn_config.launch_lease = None;
+        }
+        Self {
+            kind,
+            context_reset,
+            mode,
+            respawn,
+        }
+    }
+}
+
+pub(crate) struct ConstructionInstallation {
+    client: Arc<AcpClient>,
+    inbound: tokio::sync::mpsc::Receiver<crate::acp::state::Event>,
+    identity: Option<RunnerIdentity>,
+    finish: ConstructionFinish,
+}
+
+pub(crate) enum DeferredConstruction {
+    Registration {
+        connection: Box<crate::acp::acp_client::PendingRunnerConnection>,
+        finish: Option<Box<ConstructionFinish>>,
+    },
+    Installation(Box<ConstructionInstallation>),
+    PostInstall(std::pin::Pin<Box<dyn std::future::Future<Output = Arc<AcpClient>> + Send>>),
+}
+
+impl DeferredConstruction {
+    fn complete(&self) -> bool {
+        !matches!(self, Self::Registration { finish: None, .. })
+    }
+}
+
 /// RAII guard over a `Starting` or `Respawning` epoch. A dropped attach
 /// abandons only its observation unless an explicit stop claimed the runner.
 pub(crate) struct ResumeReservation {
@@ -221,6 +279,21 @@ pub(crate) struct ResumeReservation {
     lifecycle: Arc<std::sync::Mutex<LifecycleTable>>,
     notify: Arc<tokio::sync::Notify>,
     preserve_owner: bool,
+    registry_deadline: tokio::time::Instant,
+    resume_stop: Option<Option<crate::process::worker_registry::StopIntent>>,
+    resume_authority: crate::process::worker_registry::ResumeAuthority,
+    deferred: Option<DeferredConstruction>,
+    deferred_claim: bool,
+    deferred_gate: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl std::fmt::Debug for ResumeReservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResumeReservation")
+            .field("lease", &self.lease)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ResumeReservation {
@@ -228,18 +301,64 @@ impl ResumeReservation {
         &self.lease
     }
 
+    pub(crate) fn admission_deadline(&self) -> tokio::time::Instant {
+        self.registry_deadline
+    }
+
+    pub(crate) fn observed_stop(
+        &self,
+    ) -> Option<&Option<crate::process::worker_registry::StopIntent>> {
+        self.resume_stop.as_ref()
+    }
+
+    pub(crate) fn stop_committed(&mut self) {
+        self.resume_stop = None;
+    }
+
     fn preserve_refused_owner(&mut self) {
         self.preserve_owner =
             !self.lease.is_borrowed_attach() && self.lease.spawned_runner().is_some();
+    }
+
+    fn yield_to_retirement(&mut self) {
+        {
+            let mut lifecycle = lock_recover(&self.lifecycle);
+            if let Some(pending) = self.deferred.take() {
+                self.lease.retirement().put_deferred(pending);
+            }
+            lifecycle.convert_to_stopping(&self.lease);
+            if self.deferred_claim {
+                self.lease.retirement().release_deferred_claim();
+                self.deferred_claim = false;
+            }
+        }
+        self.deferred_gate.take();
     }
 }
 
 impl Drop for ResumeReservation {
     fn drop(&mut self) {
-        if self.preserve_owner {
+        let mut lifecycle = lock_recover(&self.lifecycle);
+        if self.deferred_claim {
+            self.lease.retirement().release_deferred_claim();
+        }
+        if let Some(pending) = self.deferred.take() {
+            if !self.lease.is_borrowed_attach() {
+                self.lease.retirement().put_deferred(pending);
+                if lifecycle.current_lease(self.lease.session_id()).as_ref() == Some(&self.lease)
+                    && lifecycle.cancel_requested(&self.lease).is_none()
+                    && (lifecycle.construction_is_pending(&self.lease)
+                        || lifecycle
+                            .running(self.lease.session_id())
+                            .is_some_and(|(lease, _)| lease == self.lease))
+                {
+                    return;
+                }
+            }
+        }
+        if self.preserve_owner && lifecycle.cancel_requested(&self.lease).is_none() {
             return;
         }
-        let mut lifecycle = lock_recover(&self.lifecycle);
         if !lifecycle.construction_is_pending(&self.lease) {
             return;
         }
@@ -478,6 +597,19 @@ impl<S: BroadcastSink> Supervisor<S> {
         lock_recover(&self.lifecycle).current_lease(session_id)
     }
 
+    pub(crate) fn idle_observation(&self, session_id: &str) -> Option<(Lease, u64)> {
+        let lifecycle = lock_recover(&self.lifecycle);
+        let (lease, _) = lifecycle.running(session_id)?;
+        let activity = self
+            .next_seqs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(session_id)
+            .copied()
+            .unwrap_or(0);
+        Some((lease, activity))
+    }
+
     /// Recheck the worker epoch at canonical mutation, without reversing the
     /// producer's lifecycle -> native lock order. The caller releases its
     /// native lock before reacquiring after contention.
@@ -503,6 +635,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         mutation()
     }
 
+    #[cfg(test)]
     /// The running epoch, for a caller that must stop only that epoch.
     pub(crate) fn running_lease(&self, session_id: &str) -> Option<Lease> {
         lock_recover(&self.lifecycle)

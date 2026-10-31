@@ -477,7 +477,20 @@ pub(super) async fn wait_runner_registration(
         ))
     };
     loop {
-        match crate::process::worker_registry::load_strict(session_id) {
+        let observed = {
+            let registry =
+                crate::process::worker_registry::registry_lock_until(session_id, deadline)
+                    .await
+                    .map_err(|error| {
+                        if error.is::<crate::process::worker_registry::RegistryBusy>() {
+                            AcpError::RegistryBusy
+                        } else {
+                            unconfirmed()
+                        }
+                    })?;
+            registry.record()
+        };
+        match observed {
             Ok(Some(record)) if expected_owner.owns_record(&record) => {
                 if let Some(refusal) =
                     crate::process::worker_registry::control_protocol_refusal(&record)
