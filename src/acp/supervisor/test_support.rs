@@ -424,11 +424,20 @@ pub(super) fn gated_launcher(gate: &Gate, pid: u32) -> Launcher {
             lease.record_scope(worker_registry::ScopeOwnership::Unscoped);
             assert!(lease.record_runner(attested_test_identity(pid, config.generation)));
             entered.notify_one();
-            open.notified().await;
-            save_attested_test_record(&session_id.0, pid, config.generation);
-            let (client, tx) = AcpClient::fake_for_test(session_id);
-            senders.lock().unwrap().push(tx);
-            Ok(client.with_runner_pid(pid))
+            tokio::select! {
+                biased;
+                _ = lease.cancellation().cancelled() => {
+                    Err(crate::acp::acp_client::AcpError::Spawn(
+                        "constructor cancelled before registry publication".into(),
+                    ))
+                }
+                _ = open.notified() => {
+                    save_attested_test_record(&session_id.0, pid, config.generation);
+                    let (client, tx) = AcpClient::fake_for_test(session_id);
+                    senders.lock().unwrap().push(tx);
+                    Ok(client.with_runner_pid(pid))
+                }
+            }
         })
     })
 }
@@ -754,5 +763,87 @@ impl Drop for HeldAttachRunner {
         self.peer.abort();
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::daemon::AcpWorkerState;
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stop_request_observes_a_gated_respawn_install_as_running() {
+        let supervisor = Arc::new(Supervisor::new(VecSink::new()));
+        let id = "gated-respawn-install".to_owned();
+        supervisor.test_install_stdio(&id).await;
+        let respawning_lease = {
+            let mut workers = supervisor.workers.lock().await;
+            let handle = workers.get_mut(&id).expect("test worker");
+            let (lease, _) = lock_recover(&supervisor.lifecycle)
+                .begin_respawn(&handle.lease)
+                .expect("running worker can begin a respawn");
+            handle.lease = lease.clone();
+            lease
+        };
+        assert_eq!(supervisor.worker_state(&id).await, AcpWorkerState::Resuming);
+
+        let workers_gate = supervisor.workers.lock().await;
+        let (install_started_tx, install_started_rx) = oneshot::channel();
+        let installing = {
+            let supervisor = Arc::clone(&supervisor);
+            let id = id.clone();
+            tokio::spawn(async move {
+                let (client, _events) = AcpClient::fake_for_test(AcpSessionId(format!("acp-{id}")));
+                install_started_tx.send(()).expect("test is waiting");
+                let mut workers = supervisor.workers.lock().await;
+                lock_recover(&supervisor.lifecycle)
+                    .install(&respawning_lease, None)
+                    .expect("the gated respawn installs before stop admission");
+                let handle = workers.get_mut(&id).expect("test worker");
+                handle.client = Arc::new(client);
+                handle.lease = respawning_lease;
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(3), install_started_rx)
+            .await
+            .expect("respawn reaches its gated install")
+            .expect("install task remains alive");
+
+        let stopping = {
+            let supervisor = Arc::clone(&supervisor);
+            let id = id.clone();
+            tokio::spawn(async move {
+                supervisor
+                    .begin_stop_request(&id, "user_stopped", None, false)
+                    .await
+            })
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !lock_recover(&supervisor.spawn_requests)
+            .stop_fences
+            .contains_key(&id)
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "stop request did not register its fence"
+            );
+            tokio::task::yield_now().await;
+        }
+        drop(workers_gate);
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), installing)
+            .await
+            .expect("respawn install completes")
+            .expect("install task does not panic");
+        let stop_request = tokio::time::timeout(std::time::Duration::from_secs(3), stopping)
+            .await
+            .expect("stop request observes the installed worker")
+            .expect("stop request task does not panic");
+        assert_eq!(supervisor.worker_state(&id).await, AcpWorkerState::Running);
+        assert!(!stop_request.cancelled_launch());
+        drop(stop_request);
+        supervisor.test_remove_worker(&id).await;
     }
 }

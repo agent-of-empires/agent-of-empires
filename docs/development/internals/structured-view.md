@@ -254,6 +254,21 @@ With `[acp] rate_limit_auto_resume`, the reconciler resumes the same worker once
 
 A worker that exits within ~10s (broken command, missing adapter, failed handshake) logs a `warn` on the `acp.runner` target and counts against a respawn budget: more than 5 spawns in a rolling 60s parks the session, publishes one `AgentStartupError`, and stops auto-respawning. Recovery is a dashboard retry, `aoe acp restart <session>`, or an `aoe serve` restart.
 
+## Restart
+
+`POST /api/sessions/{id}/acp/restart` restarts the structured-view worker without
+changing the selected agent. It first validates the stored session and requested
+agent, then fences new launches, cancels or stops the current worker, waits for
+the worker to become absent, and starts a replacement with explicit resume
+authority. A concurrent restart returns `409 restart_in_progress`; if the old
+worker cannot settle before the bounded shutdown wait, the endpoint returns a
+`503` settlement error and leaves the replacement admission to a retry. A
+separate `409 worker_not_stopped` response is used when the worker is still
+present after a successful shutdown wait. The restart request is runtime-owned,
+so disconnecting the HTTP client does not leave the session half-restarted. Web
+startup and Retry adoption of this endpoint are follow-up UI work; the current
+Retry flow still uses `/acp/spawn`.
+
 ## Agent switching
 
 `POST /api/sessions/{id}/acp/switch-agent` stops the current worker, spawns the target, persists `agent_name`, clears `acp_session_id` (the old id belongs to a different vendor), resolves the model from the request alone so the old backend's pick does not follow the session across vendors (as `Instance::swap_tool` does), and emits `AgentSwitched { from, to, reason }` so reducers drop backend-specific transient state and the transcript shows a divider. The composer is pre-filled with a context-primer recap, never auto-sent. CLI: `aoe acp switch-agent <session> <target> [--model <name>]`. `reason` is `manual` or `rate_limited`. Completion commits through the scoped native store under canonical exclusion. An automatic respawn retains the originating launch intent; an independent launch supersedes it and refuses the old completion.

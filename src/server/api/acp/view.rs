@@ -1499,6 +1499,26 @@ pub(crate) async fn publish_startup_error_if_current(
 mod tests {
     use super::*;
 
+    fn handoff_test_event_store(session_id: &str) -> Arc<crate::acp::event_store::EventStore> {
+        let db_path = crate::session::get_app_dir()
+            .expect("isolated app directory")
+            .join(format!("acp-events-{session_id}.db"));
+        Arc::new(crate::acp::event_store::EventStore::open(&db_path, 100).expect("event store"))
+    }
+
+    fn handoff_test_app_state(prior: Vec<Instance>) -> Arc<AppState> {
+        let event_store = handoff_test_event_store(&prior[0].id);
+        crate::server::test_support::build_test_app_state_impl_with_event_store(
+            prior,
+            Vec::new(),
+            Vec::new(),
+            None,
+            Some(event_store),
+            |_| {},
+            |supervisor| supervisor,
+        )
+    }
+
     async fn pending_handoff(
         row: &Instance,
         pid: u32,
@@ -1554,12 +1574,13 @@ mod tests {
             &row.source_profile,
             vec![row.clone()],
         );
+        let event_store = event_store.unwrap_or_else(|| handoff_test_event_store(&row.id));
         let state = crate::server::test_support::build_test_app_state_impl_with_event_store(
             vec![row.clone()],
             Vec::new(),
             Vec::new(),
             None,
-            event_store,
+            Some(event_store),
             |_| {},
             |supervisor| {
                 supervisor
@@ -1690,7 +1711,7 @@ mod tests {
             crate::tmux::Session::generate_name(&row.id, &row.title),
         );
         crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
-        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        let state = handoff_test_app_state(vec![row.clone()]);
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
         let producer = state
             .acp_supervisor
@@ -2708,6 +2729,10 @@ mod tests {
             ),
             original
         );
+        gate.open.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), spawner)
+            .await??
+            .expect("gated producer installs");
         let (native, expected) = load_handoff_row(&state, &row.source_profile, &row.id).await?;
         let driver =
             Arc::new(crate::session::try_acquire_terminal_handoff_driver(&row.id)?.unwrap());
@@ -2747,8 +2772,6 @@ mod tests {
                 )
                 .await
         });
-        tokio::time::timeout(Duration::from_secs(5), lease.cancellation().cancelled()).await?;
-        gate.open.notify_one();
         tokio::time::timeout(Duration::from_secs(5), control.terminated()).await?;
         assert!(
             child.try_wait()?.is_none(),
@@ -2758,7 +2781,6 @@ mod tests {
         child.wait().await?;
         control.exit(pid);
         stopping.await??;
-        assert!(spawner.await?.is_err());
         assert!(deleted.load(Ordering::SeqCst));
         assert!(control
             .signals()
