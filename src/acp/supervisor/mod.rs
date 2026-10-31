@@ -876,7 +876,10 @@ mod tests {
             .await
             .expect("first restart claims the session");
 
-        assert!(sup.try_begin_restart_with_reason("s-restart").await.is_err());
+        assert!(sup
+            .try_begin_restart_with_reason("s-restart")
+            .await
+            .is_err());
         assert!(sup.try_begin_restart_with_reason("s-other").await.is_ok());
 
         drop(first);
