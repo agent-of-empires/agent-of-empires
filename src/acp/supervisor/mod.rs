@@ -33,7 +33,7 @@ use crate::daemon::{AcpWorkerStart, AcpWorkerStartKind, AcpWorkerState};
 use crate::session::SandboxInfo;
 pub(crate) use teardown::{RetirementResources, RetirementTarget};
 
-pub(crate) use agents::apply_agent_command_override;
+pub(crate) use agents::{apply_agent_command_override, command_override_for_spawn};
 pub(crate) use launch::{host_spawn_environment, with_durable_launch};
 pub use sink::{BroadcastSink, ChannelSink};
 

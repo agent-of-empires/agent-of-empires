@@ -300,6 +300,8 @@ export interface AgentInfo {
   kind: "builtin" | "custom";
   binary: string;
   host_only: boolean;
+  /** Always runs in Yolo mode, so the wizard locks the switch on. */
+  always_yolo?: boolean;
   installed: boolean;
   install_hint: string;
   /** Has a one-shot mode for smart rename. Always false for custom agents. */
@@ -376,6 +378,8 @@ export interface ProjectInfo {
 export interface DockerStatusResponse {
   available: boolean;
   runtime: string | null;
+  /** The configured runtime's display name ("Apple Container"), also when it is down. */
+  runtime_name?: string | null;
 }
 
 export interface CreationTrustFingerprint {

@@ -25,6 +25,8 @@ pub enum DockerError {
     #[error("Image not found: {0}")]
     ImageNotFound(String),
 
+    /// A pull that failed or timed out. `image` and `runtime` alone are safe to show remotely;
+    /// `detail` is the runtime's own output.
     #[error("{runtime} couldn't pull image {image}: {detail}")]
     ImagePullFailed {
         runtime: &'static str,

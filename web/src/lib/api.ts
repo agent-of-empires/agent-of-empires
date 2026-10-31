@@ -1958,8 +1958,10 @@ export async function signOutAllDevices(): Promise<boolean> {
 
 // --- Wizard APIs ---
 
-export async function fetchAgents(): Promise<AgentInfo[]> {
-  return (await fetchJson<AgentInfo[]>("/api/agents")) ?? [];
+/** Null when the request failed, so callers can tell "no agents" from "unknown". */
+export async function fetchAgents(profile?: string): Promise<AgentInfo[] | null> {
+  const query = profile ? `?profile=${encodeURIComponent(profile)}` : "";
+  return fetchJson<AgentInfo[]>(`/api/agents${query}`);
 }
 
 export async function fetchProfiles(): Promise<ProfileInfo[]> {
@@ -2148,7 +2150,13 @@ export async function updateProject(
 }
 
 export async function fetchDockerStatus(): Promise<DockerStatusResponse> {
-  return (await fetchJson<DockerStatusResponse>("/api/docker/status")) ?? { available: false, runtime: null };
+  return (
+    (await fetchJson<DockerStatusResponse>("/api/docker/status")) ?? {
+      available: false,
+      runtime: null,
+      runtime_name: null,
+    }
+  );
 }
 
 /** The repo's hooks need approval before this session can be created

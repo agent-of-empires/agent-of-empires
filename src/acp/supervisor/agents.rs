@@ -165,6 +165,18 @@ fn command_matches_binary(command: &str, binary: &str) -> bool {
             .is_some_and(|name| name == binary)
 }
 
+/// Command override from a persisted launch command; `None` keeps the registry default.
+pub(crate) fn command_override_for_spawn(
+    tool: &str,
+    command: &str,
+) -> Option<AgentCommandOverride> {
+    let command = command.trim();
+    (!command.is_empty()).then(|| AgentCommandOverride {
+        logical_tool: tool.to_string(),
+        command: command.to_string(),
+    })
+}
+
 /// Overlay an instance command override onto a registry spec, keeping the
 /// registry args after the override's own. Skipped unless the spec is the
 /// logical tool's own built-in adapter binary.

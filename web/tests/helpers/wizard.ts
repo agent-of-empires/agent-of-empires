@@ -99,6 +99,8 @@ export function sessionStub(overrides: Record<string, unknown> = {}) {
 export interface WizardMockOptions {
   servedProfile?: string;
   agents?: unknown[];
+  /** Per-profile agent lists keyed by the `?profile=` query param. */
+  profileAgents?: Record<string, unknown[]>;
   profiles?: unknown[];
   /** Default `/api/settings` body; `worktree.enabled` drives the "Create a worktree" default (#2423). */
   settings?: Record<string, unknown>;
@@ -135,10 +137,16 @@ export async function mockWizardApis(page: Page, opts: WizardMockOptions = {}) {
   await page.route("**/api/recent-projects", (r) => r.fulfill({ json: { projects: [] } }));
   await page.route("**/api/projects**", (r) => r.fulfill({ json: projects }));
   await page.route("**/api/docker/status", (r) =>
-    r.fulfill({ json: { available: !!opts.docker, runtime: opts.docker ? "docker" : null } }),
+    r.fulfill({ json: { available: !!opts.docker, runtime: "docker", runtime_name: "Docker" } }),
   );
   await page.route("**/api/groups**", (r) => r.fulfill({ json: opts.groups ?? [] }));
-  await page.route("**/api/agents", (r) => r.fulfill({ json: opts.agents ?? [CLAUDE_AGENT] }));
+  await page.route(
+    (url) => url.pathname === "/api/agents",
+    (r) => {
+      const profile = new URL(r.request().url()).searchParams.get("profile");
+      return r.fulfill({ json: (profile && opts.profileAgents?.[profile]) || opts.agents || [CLAUDE_AGENT] });
+    },
+  );
   await page.route("**/api/sessions/creation-trust", (r) =>
     r.fulfill({ json: opts.creationTrustReview ?? DEFAULT_CREATION_TRUST_REVIEW }),
   );

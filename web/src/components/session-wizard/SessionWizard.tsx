@@ -129,6 +129,8 @@ const NETWORK_RETRIES = 3;
 const MAX_RETRY_DELAY_MS = 30_000;
 const UNKNOWN_OUTCOME_ERROR =
   "Lost connection while creating. The session may still be created; Launch retries the same request.";
+const AGENTS_UNAVAILABLE_ERROR = "Couldn't load the agent list, so Yolo mode can't be shown yet. Retrying…";
+
 const REGISTRY_UNRESOLVED_ERROR =
   "Could not load this project's settings, so its sandbox and worktree defaults are unknown. Select the project again to retry.";
 
@@ -193,10 +195,12 @@ export function SessionWizard({
     isSubmitting: false,
     error: null,
     agents: [],
+    agentsStatus: "loading",
     groups: [],
     groupsFor: null,
     profiles: [],
     dockerAvailable: false,
+    dockerRuntimeName: null,
     dockerChecked: false,
   });
 
@@ -282,14 +286,36 @@ export function SessionWizard({
     };
   }, [state.data.profile, groupsKey]);
 
+  // A custom agent's base comes from the profile the session is created in.
+  const agentsProfile = state.data.profile || servedProfile;
+  useEffect(() => {
+    let alive = true;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    dispatch({ type: "AGENTS_LOADING" });
+    const load = (attempt: number) =>
+      void fetchAgents(agentsProfile || undefined).then((agents) => {
+        if (!alive) return;
+        if (agents) {
+          // The app-wide names describe the served profile, not the one being created in.
+          if (agentsProfile === servedProfile) setAgentNames(agents);
+          return dispatch({ type: "SET_AGENTS", agents });
+        }
+        dispatch({ type: "AGENTS_FAILED" });
+        retry = setTimeout(() => load(attempt + 1), Math.min(1000 * 2 ** attempt, 15000));
+      });
+    load(0);
+    return () => {
+      alive = false;
+      clearTimeout(retry);
+    };
+  }, [agentsProfile, servedProfile]);
+
   useEffect(() => {
     const generations = defaultsGeneration;
     const switches = profileSwitchRef;
-    fetchAgents().then((a) => {
-      setAgentNames(a);
-      dispatch({ type: "SET_AGENTS", agents: a });
-    });
-    fetchDockerStatus().then((d) => dispatch({ type: "SET_DOCKER", available: d.available }));
+    fetchDockerStatus().then((d) =>
+      dispatch({ type: "SET_DOCKER", available: d.available, runtimeName: d.runtime_name ?? null }),
+    );
     fetchProfiles()
       .then((profiles) => dispatch({ type: "SET_PROFILES", profiles }))
       .catch(() => {});
@@ -694,7 +720,13 @@ export function SessionWizard({
       : isHostOnly
         ? hostOnlyReason
         : null;
-  const sandboxBlocked = isHostOnly ? hostOnlyReason : !state.dockerAvailable ? "Docker is not running" : null;
+  const sandboxBlocked = isHostOnly
+    ? hostOnlyReason
+    : !state.dockerAvailable
+      ? `${state.dockerRuntimeName ?? "Container runtime"} is not running`
+      : null;
+  // Locked on without touching the stored value, so another agent gets it back.
+  const alwaysYolo = selectedAgent?.always_yolo === true;
   const agentCustomized = !!(d.extraArgs || d.commandOverride || d.customInstruction);
   const openPanel = (next: Panel) => () => setPanel(next);
   const effectiveProfile = d.profile || servedProfile;
@@ -843,11 +875,21 @@ export function SessionWizard({
           />
         )}
         <SwitchRow
-          label="Auto-approve"
-          switchLabel="Auto-approve actions"
-          checked={d.yoloMode}
+          label="Yolo mode"
+          switchLabel="Yolo mode"
+          testId="wizard-yolo-row"
+          checked={alwaysYolo || d.yoloMode}
           onChange={(v) => handleChange("yoloMode", v)}
-          summary="skip permission prompts"
+          disabled={alwaysYolo}
+          summary={
+            state.agentsStatus !== "ready"
+              ? "checking the agent…"
+              : alwaysYolo
+                ? `always on for ${d.tool}`
+                : d.yoloMode
+                  ? "skips permission prompts"
+                  : "asks before running commands"
+          }
         />
         <SwitchRow
           label="Worktree"
@@ -945,12 +987,18 @@ export function SessionWizard({
               error={
                 state.error ??
                 (projectUnresolved ? REGISTRY_UNRESOLVED_ERROR : null) ??
+                (!nameOnly && state.agentsStatus === "failed" ? AGENTS_UNAVAILABLE_ERROR : null) ??
                 (unknownOutcome ? UNKNOWN_OUTCOME_ERROR : null)
               }
               onSubmit={handleSubmit}
               nameOnly={nameOnly}
               defaultsReady={
-                defaultsReady && !profileSwitching && !projectUnresolved && !(d.sandboxEnabled && !state.dockerChecked)
+                defaultsReady &&
+                // Only the Yolo row needs the agent list, and a name-only form has none.
+                (nameOnly || state.agentsStatus === "ready") &&
+                !profileSwitching &&
+                !projectUnresolved &&
+                !(d.sandboxEnabled && !state.dockerChecked)
               }
               onBackground={creating && onCreatedInBackground ? handleBackground : undefined}
             />

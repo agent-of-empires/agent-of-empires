@@ -829,6 +829,7 @@ async fn create_receipts_include_published_rows_and_idempotent_retries() -> anyh
             State(state.clone()),
             axum::extract::Query(create::CreateSessionQuery { wait: None }),
             None,
+            None,
             Ok(Json(body)),
         )
         .await
@@ -887,11 +888,94 @@ async fn create_receipts_include_published_rows_and_idempotent_retries() -> anyh
 
 #[tokio::test]
 #[serial_test::serial]
+async fn an_always_yolo_agent_records_yolo_mode_whatever_the_request_says() -> anyhow::Result<()> {
+    if !crate::tmux::is_tmux_available() {
+        return Ok(());
+    }
+    let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })?;
+    let adapters = crate::session::test_support::stub_claude_adapter_on_agent_path();
+    crate::session::test_support::write_stub_adapter(adapters.path(), "pi-acp");
+    crate::session::config::update_config(|config| {
+        config
+            .session
+            .custom_agents
+            .insert("my-pi".into(), "pi".into());
+        config
+            .session
+            .agent_detect_as
+            .insert("my-pi".into(), "pi".into());
+    })?;
+    let project = tempfile::tempdir()?;
+    let (launcher, _launches) = crate::server::test_support::counting_failing_launcher();
+    let state =
+        crate::server::test_support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    let storage = Storage::new("always-yolo", state.file_watch.clone())?;
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+    let mut panes = Vec::new();
+    let mut guarded = std::collections::HashSet::new();
+    // A structured session runs the agent `agent_name` picks, not `tool`.
+    let terminal = serde_json::json!({ "command_override": "sleep 120" });
+    let structured = |agent: &str| serde_json::json!({ "view": "structured", "agent_name": agent });
+    for (tool, extra, expected) in [
+        ("pi", terminal.clone(), true),
+        ("claude", terminal, false),
+        ("pi", structured("claude"), false),
+        ("claude", structured("pi"), true),
+        // A custom agent without its own adapter runs the base it inherits.
+        ("claude", structured("my-pi"), true),
+    ] {
+        let label = format!("{tool} {extra}");
+        let mut body = serde_json::json!({
+            "title": format!("yolo {tool}"), "path": project.path(),
+            "tool": tool, "profile": "always-yolo", "yolo_mode": false,
+        });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let body = serde_json::from_value(body)?;
+        let response = create_session(
+            State(state.clone()),
+            axum::extract::Query(create::CreateSessionQuery { wait: None }),
+            None,
+            None,
+            Ok(Json(body)),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        for instance in storage.load()? {
+            if !guarded.insert(instance.id.clone()) {
+                continue;
+            }
+            panes.push(crate::tmux::test_helpers::TmuxTestSession::from_name(
+                crate::tmux::Session::generate_name(&instance.id, &instance.title),
+            ));
+        }
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{label}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let row: SessionResponse = serde_json::from_slice(&bytes)?;
+        assert_eq!(row.yolo_mode, expected, "{label}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn canonical_fork_refusals_do_not_create_sessions() -> anyhow::Result<()> {
     async fn request(state: Arc<AppState>, body: serde_json::Value) -> axum::response::Response {
         create_session(
             State(state),
             axum::extract::Query(create::CreateSessionQuery { wait: None }),
+            None,
             None,
             Ok(Json(create_body_from_json(body))),
         )
@@ -4323,6 +4407,7 @@ async fn create_hook_failure_details_are_local_owner_only() {
     let error = anyhow::Error::new(CreateHookFailed::new(
         anyhow::anyhow!("command exited with status 1"),
         Some("Defined in /tmp/project/.agent-of-empires.yml"),
+        true,
     ));
     assert!(local_create_hook_error_response(&error, false).is_none());
 
@@ -4342,56 +4427,222 @@ async fn create_hook_failure_details_are_local_owner_only() {
 }
 
 #[test]
-fn public_create_session_error_forwards_whitelisted_git_errors_only() {
-    let dup: anyhow::Error =
-        GitError::WorktreeAlreadyExists(std::path::PathBuf::from("/tmp/repo-worktrees/foo")).into();
-    assert_eq!(
-        public_create_session_error(&dup),
-        "Worktree already exists at /tmp/repo-worktrees/foo"
-    );
-
-    let in_use: anyhow::Error = GitError::BranchAlreadyCheckedOut("feature/foo".to_string()).into();
-    assert_eq!(
-        public_create_session_error(&in_use),
-        "Branch 'feature/foo' is already in use by another worktree"
-    );
-
-    let template: anyhow::Error =
-        GitError::InvalidTemplate("environment variable `X` is unset or empty".to_string()).into();
-    assert_eq!(
-        public_create_session_error(&template),
-        "Invalid worktree path template: environment variable `X` is unset or empty"
-    );
-
-    // Whitelisted variants survive an anyhow::Context wrapper too.
-    let wrapped = anyhow::Error::from(GitError::BranchNotFound("nope".to_string()))
-        .context("while creating worktree");
-    assert_eq!(
-        public_create_session_error(&wrapped),
-        "Branch 'nope' not found"
-    );
-
-    // Raw git stderr (even already-sanitized) must not reach the client.
-    let cmd: anyhow::Error = GitError::WorktreeCommandFailed(
-        "fatal: unable to access 'https://<redacted>@host/repo.git'".to_string(),
+#[serial_test::serial]
+fn public_create_session_error_forwards_typed_causes_as_fixed_templates() {
+    use crate::containers::error::DockerError;
+    use crate::session::builder::BuildRefusal;
+    const SECRET: &str = "ghp_sekrit";
+    let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::config::update_config(|c| {
+        c.sandbox.container_runtime = crate::session::config::ContainerRuntimeName::Podman
+    })
+    .unwrap();
+    // A real hook failure whose output carries a secret and a path.
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join("out.txt"),
+        format!("token {SECRET} in /home/alice/.ssh"),
     )
+    .unwrap();
+    let hook = |cmd: &str| {
+        crate::session::config::repo_config::execute_hooks(&[cmd.to_string()], project.path(), &[])
+            .unwrap_err()
+    };
+    let generic = ("create_failed", "Failed to create session".to_string());
+    let rows: Vec<(&str, anyhow::Error, (&str, String))> = vec![
+        (
+            "repo hook exit code",
+            anyhow::Error::new(CreateHookFailed::new(
+                hook("cat out.txt; cat out.txt >&2; exit 3"),
+                Some("Defined in .agent-of-empires.yml"),
+                true,
+            )),
+            (
+                "hook_failed",
+                "The Repo hook `cat out.txt; cat out.txt >&2; exit 3` exited with code 3.".into(),
+            ),
+        ),
+        (
+            "repo hook under context",
+            anyhow::Error::new(CreateHookFailed::new(hook("exit 7"), None, true))
+                .context("create failed"),
+            (
+                "hook_failed",
+                "The Repo hook `exit 7` exited with code 7.".into(),
+            ),
+        ),
+        (
+            "global or profile hook",
+            anyhow::Error::new(CreateHookFailed::new(
+                hook(&format!("echo {SECRET}; exit 5")),
+                Some("Defined in config.toml"),
+                false,
+            )),
+            (
+                "hook_failed",
+                "An on_create hook exited with code 5.".into(),
+            ),
+        ),
+        (
+            "hook outside the create path",
+            hook(&format!("echo {SECRET}; exit 6")),
+            (
+                "hook_failed",
+                "An on_create hook exited with code 6.".into(),
+            ),
+        ),
+        (
+            "runtime not installed",
+            BuildRefusal::RuntimeNotInstalled.into(),
+            (
+                "sandbox_unavailable",
+                "Podman isn't installed where the Daemon runs, so the Sandbox can't start.".into(),
+            ),
+        ),
+        (
+            "runtime down at the pre-check",
+            BuildRefusal::RuntimeNotRunning.into(),
+            (
+                "sandbox_unavailable",
+                "Podman isn't running, so the Sandbox can't start. Start Podman, then try again."
+                    .into(),
+            ),
+        ),
+        (
+            "runtime down while starting the container",
+            anyhow::Error::from(DockerError::DaemonNotRunning).context("ensure container"),
+            (
+                "sandbox_unavailable",
+                "Podman isn't running, so the Sandbox can't start. Start Podman, then try again."
+                    .into(),
+            ),
+        ),
+        (
+            "runtime missing while starting the container",
+            DockerError::NotInstalled.into(),
+            (
+                "sandbox_unavailable",
+                "Podman isn't installed where the Daemon runs, so the Sandbox can't start.".into(),
+            ),
+        ),
+        (
+            "runtime permission",
+            DockerError::PermissionDenied.into(),
+            (
+                "sandbox_unavailable",
+                "The Daemon's user isn't allowed to use Podman, so the Sandbox can't start.".into(),
+            ),
+        ),
+        (
+            "image pull",
+            anyhow::Error::from(DockerError::ImagePullFailed {
+                runtime: "Podman",
+                image: "ghcr.io/acme/sandbox:1".into(),
+                detail: format!("denied: token {SECRET} at /root/.docker/config.json"),
+            })
+            .context("ensure image"),
+            (
+                "sandbox_image_pull_failed",
+                "Couldn't pull the Sandbox image ghcr.io/acme/sandbox:1.".into(),
+            ),
+        ),
+        (
+            "working dir missing",
+            BuildRefusal::WorkingDirMissing("/home/alice/secret-project".into()).into(),
+            (
+                "working_dir_missing",
+                "The Working directory doesn't exist where the Daemon runs.".into(),
+            ),
+        ),
+        // The git whitelist is unchanged.
+        (
+            "git: worktree exists",
+            GitError::WorktreeAlreadyExists(std::path::PathBuf::from("/tmp/repo-worktrees/foo"))
+                .into(),
+            (
+                "create_failed",
+                "Worktree already exists at /tmp/repo-worktrees/foo".into(),
+            ),
+        ),
+        (
+            "git: branch in use",
+            GitError::BranchAlreadyCheckedOut("feature/foo".into()).into(),
+            (
+                "create_failed",
+                "Branch 'feature/foo' is already in use by another worktree".into(),
+            ),
+        ),
+        (
+            "git: under context",
+            anyhow::Error::from(GitError::BranchNotFound("nope".into()))
+                .context("while creating worktree"),
+            ("create_failed", "Branch 'nope' not found".into()),
+        ),
+        (
+            "git: worktree path template",
+            GitError::InvalidTemplate("environment variable `X` is unset or empty".into()).into(),
+            (
+                "create_failed",
+                "Invalid worktree path template: environment variable `X` is unset or empty".into(),
+            ),
+        ),
+        // Raw git stderr (even already-sanitized) must not reach the client.
+        (
+            "git: command output",
+            GitError::WorktreeCommandFailed(format!(
+                "fatal: unable to access 'https://{SECRET}@host'"
+            ))
+            .into(),
+            generic.clone(),
+        ),
+        (
+            "git: clone credentials",
+            GitError::CloneFailed(format!("https://alice:{SECRET}@host/repo.git")).into(),
+            generic.clone(),
+        ),
+        (
+            "untyped",
+            anyhow::anyhow!("something internal at /home/user/.config/{SECRET}"),
+            generic.clone(),
+        ),
+        // An image inspect miss is not a pull failure.
+        (
+            "image not found",
+            DockerError::ImageNotFound(format!("img {SECRET}")).into(),
+            generic.clone(),
+        ),
+    ];
+    for (label, error, expected) in rows {
+        let got = public_create_session_error(&error);
+        assert!(!got.1.contains(SECRET), "{label}: leaked into {got:?}");
+        assert!(
+            !got.1.contains("/home/alice"),
+            "{label}: leaked a path into {got:?}"
+        );
+        assert!(
+            !got.1.contains("Docker"),
+            "{label}: named Docker, not Podman: {got:?}"
+        );
+        assert_eq!(got, expected, "{label}");
+    }
+
+    // A direct response is capped like a stored one; a long image reference would exceed it.
+    let long = DockerError::ImagePullFailed {
+        runtime: "Docker",
+        image: "x".repeat(2000),
+        detail: String::new(),
+    }
     .into();
+    let failure = create_failure(
+        &long,
+        crate::server::create_progress::CreateStage::StartingContainer,
+        "ref",
+    )
+    .unwrap();
+    assert_eq!(failure.code, "sandbox_image_pull_failed");
     assert_eq!(
-        public_create_session_error(&cmd),
-        "Failed to create session"
-    );
-
-    let clone: anyhow::Error =
-        GitError::CloneFailed("https://alice:supersecret@host/repo.git".to_string()).into();
-    let msg = public_create_session_error(&clone);
-    assert_eq!(msg, "Failed to create session");
-    assert!(!msg.contains("supersecret"));
-
-    // A non-GitError anyhow also stays generic.
-    let other = anyhow::anyhow!("something internal at /home/user/.config/secret");
-    assert_eq!(
-        public_create_session_error(&other),
-        "Failed to create session"
+        failure.message.chars().count(),
+        crate::server::create_progress::MAX_FAILURE_MESSAGE_CHARS
     );
 }
 
@@ -8485,6 +8736,7 @@ async fn post_create_bytes(
         axum::extract::State(state.clone()),
         axum::extract::Query(CreateSessionQuery { wait: None }),
         None,
+        None,
         Ok(axum::Json(serde_json::from_value(body).unwrap())),
     )
     .await
@@ -8507,6 +8759,7 @@ async fn post_create_raw(
     let response = create_session(
         axum::extract::State(state.clone()),
         axum::extract::Query(CreateSessionQuery { wait: None }),
+        None,
         None,
         Ok(axum::Json(serde_json::from_value(body).unwrap())),
     )
@@ -8722,6 +8975,7 @@ async fn a_dropped_create_finishes_and_its_retry_returns_the_same_session() {
                             uid: nix::unistd::geteuid().as_raw(),
                         },
                     )),
+                    None,
                     Ok(Json(serde_json::from_value(body).unwrap())),
                 )
                 .await
@@ -8833,13 +9087,158 @@ async fn a_failed_create_is_replayed_to_a_same_key_retry() {
         })
     };
 
+    let (_logs, log) = crate::server::test_helpers::capture_logs();
     let (status, failed) = post_create(&state, body("k1")).await;
     assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{failed}");
-    // A re-run would now succeed, so a matching 400 proves the replay.
+    assert_eq!(failed["error"], "working_dir_missing", "{failed}");
+    assert_eq!(failed["stage"], "preparing", "{failed}");
+    // The reference shown in the browser finds the failure's one log line.
+    let reference = failed["reference"].as_str().unwrap();
+    assert_eq!(failure_log_lines(&log, reference), 1);
+    // A re-run would now succeed, so a matching 400, stage and reference included,
+    // proves the replay.
     std::fs::create_dir_all(&path).unwrap();
     assert_eq!(post_create(&state, body("k1")).await, (status, failed));
     let (fresh, session) = post_create(&state, body("k2")).await;
     assert_eq!(fresh, axum::http::StatusCode::CREATED, "{session}");
+}
+
+/// Failure events carrying `reference`; a hook's message can span lines, so events are
+/// split on the "Session creation failed" text rather than on newlines.
+fn failure_log_lines(log: &std::sync::Mutex<Vec<u8>>, reference: &str) -> usize {
+    String::from_utf8(log.lock().unwrap().clone())
+        .unwrap()
+        .split("Session creation failed")
+        .skip(1)
+        .filter(|event| event.contains(&format!("reference={reference}")))
+        .count()
+}
+
+/// A create whose request is dropped still logs its failure under the reference its
+/// retry replays.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_dropped_failing_create_logs_the_reference_its_retry_replays() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .expect("acknowledge the agent hook paths");
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    let gate = tempfile::tempdir().unwrap();
+    let (ready, release) = (gate.path().join("ready"), gate.path().join("release"));
+    let runs = gate.path().join("runs");
+    let hook = format!(
+        "echo run >> '{}'; : > '{}'; while [ ! -e '{}' ]; do sleep 0.01; done; exit 1",
+        runs.display(),
+        ready.display(),
+        release.display()
+    );
+    let project = project_with_on_create_hooks(&[hook.as_str()]);
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let (launcher, _launches) = support::counting_failing_launcher();
+    let state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let review = reviewed_creation_trust("test", project.path());
+    let body = serde_json::json!({
+        "title": "dropped-failure", "path": project.path(), "tool": "claude",
+        "view": "structured", "profile": "test", "trust_hooks": true,
+        "trust_review": review, "idempotency_key": "drop-fail",
+    });
+
+    let (_logs, log) = crate::server::test_helpers::capture_logs();
+    let first = tokio::spawn({
+        let (state, body) = (state.clone(), body.clone());
+        async move { post_create(&state, body).await }
+    });
+    wait_for("the on_create hook to start", || ready.exists()).await;
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    std::fs::write(&release, "").unwrap();
+
+    let (status, failed) = post_create(&state, body).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{failed}");
+    assert_eq!(failed["stage"], "running_hooks", "{failed}");
+    assert_eq!(std::fs::read_to_string(&runs).unwrap().lines().count(), 1);
+    let reference = failed["reference"].as_str().unwrap();
+    assert_eq!(failure_log_lines(&log, reference), 1);
+}
+
+/// Repo approval covers only the repo's own commands, so a failing global or profile
+/// on_create hook reaches a remote client without its command, even when the repo
+/// declares other hook types.
+#[tokio::test]
+#[serial_test::serial]
+async fn only_an_approved_repo_on_create_hook_is_named_to_a_remote_client() {
+    use crate::server::test_support as support;
+    const SENTINEL: &str = "global-hook-sentinel";
+    let global_hook = format!("echo {SENTINEL}; exit 4 # {SENTINEL}");
+    let repo_hooks = |toml: &str| {
+        let project = tempfile::tempdir().unwrap();
+        let cfg_dir = project.path().join(".agent-of-empires");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(cfg_dir.join("config.toml"), toml).unwrap();
+        project
+    };
+    let neutral = "An on_create hook exited with code 4.".to_string();
+    let rows = [
+        (
+            "no repo hooks",
+            tempfile::tempdir().unwrap(),
+            false,
+            neutral.clone(),
+        ),
+        (
+            "repo declares only on_launch",
+            repo_hooks("[hooks]\non_launch = [\"true\"]\n"),
+            true,
+            neutral,
+        ),
+        (
+            "repo declares on_create",
+            repo_hooks("[hooks]\non_create = [\"exit 4\"]\n"),
+            true,
+            "The Repo hook `exit 4` exited with code 4.".to_string(),
+        ),
+    ];
+    for (label, project, trust, expected) in rows {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .expect("acknowledge the agent hook paths");
+        crate::session::config::update_config(|c| c.hooks.on_create = vec![global_hook.clone()])
+            .unwrap();
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        support::seed_instances_on_disk_for_test("test", Vec::new());
+        let (launcher, _launches) = support::counting_failing_launcher();
+        let state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+        support::refresh_canonical_metadata_for_test(&state).await;
+        let mut body = serde_json::json!({
+            "title": "hook-origin", "path": project.path(), "tool": "claude",
+            "view": "structured", "profile": "test",
+        });
+        if trust {
+            body["trust_hooks"] = true.into();
+            body["trust_review"] =
+                serde_json::to_value(reviewed_creation_trust("test", project.path())).unwrap();
+        }
+
+        let (status, failed) = post_create(&state, body).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "{label}: {failed}"
+        );
+        assert_eq!(failed["error"], "hook_failed", "{label}: {failed}");
+        assert_eq!(failed["message"], expected.as_str(), "{label}");
+        assert!(!failed.to_string().contains(SENTINEL), "{label}: {failed}");
+    }
 }
 
 /// A full replay map must not forget a live failure: its retry would run the create,
@@ -8886,6 +9285,8 @@ async fn a_full_failure_map_replays_its_oldest_key_and_refuses_new_ones() {
 
     let (status, failed) = post_create(&state, body("oldest")).await;
     assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{failed}");
+    assert_eq!(failed["error"], "hook_failed", "{failed}");
+    assert_eq!(failed["stage"], "running_hooks", "{failed}");
     assert_eq!(hook_runs(), 1);
 
     // More live failures than the map holds.
@@ -8896,6 +9297,8 @@ async fn a_full_failure_map_replays_its_oldest_key_and_refuses_new_ones() {
                 status: axum::http::StatusCode::BAD_REQUEST,
                 code: "create_failed",
                 message: "filler".to_string(),
+                stage: crate::server::create_progress::CreateStage::Preparing,
+                reference: format!("filler-{n}"),
             },
         );
     }

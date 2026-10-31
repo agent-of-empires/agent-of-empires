@@ -154,7 +154,6 @@ pub(crate) async fn spawn_structured_session(
             progress,
         } = spec;
 
-
         let sandbox_image = sandbox_image.unwrap_or_else(|| {
             if config.sandbox.default_image.is_empty() {
                 "ubuntu:latest".to_string()
@@ -415,6 +414,19 @@ pub(crate) async fn spawn_structured_session(
                 }
             }
 
+            // An always-Yolo agent skips permission prompts whatever the client asked, so record
+            // that for the agent this session actually runs.
+            let runs = if instance.is_structured() {
+                agent_key.as_str()
+            } else {
+                instance.tool.as_str()
+            };
+            instance.yolo_mode |= crate::acp::runs_always_yolo(
+                runs,
+                &resolved_config.session.agent_acp_cmd,
+                &resolved_config.session.agent_detect_as,
+            );
+
             if !instance.is_structured() {
                 agent_effort = None;
                 // Terminal sessions keep only an explicitly requested model,
@@ -510,6 +522,7 @@ pub(crate) async fn spawn_structured_session(
                     _ => return Err(crate::session::LifecycleReservationError::Superseded.into()),
                 }
                 row.view = instance.view;
+                row.yolo_mode = instance.yolo_mode;
                 row.agent_model = instance.agent_model.clone();
                 row.acp_effort = instance.acp_effort.clone();
                 row.fork_pending = instance.fork_pending.clone();
@@ -551,6 +564,7 @@ pub(crate) async fn spawn_structured_session(
                             crate::server::api::sessions::CreateHookFailed::new(
                                 error,
                                 hint.as_deref(),
+                                hook_plan.on_create_from_repo,
                             ),
                         )
                     })
@@ -744,7 +758,7 @@ pub(crate) async fn spawn_structured_session(
                     )
                     .await;
                 let command_override =
-                    crate::server::acp_reconciler::command_override_for_spawn(&tool, &command);
+                    crate::acp::supervisor::command_override_for_spawn(&tool, &command);
                 let cwd = std::path::PathBuf::from(project_path);
                 let supervisor = service.acp_supervisor.clone();
                 let service_for_check = service.clone();
@@ -1120,6 +1134,7 @@ mod tests {
                     State(state),
                     Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
                     None,
+                    None,
                     Ok(Json(body)),
                 )
                 .await
@@ -1204,6 +1219,7 @@ mod tests {
         let response = crate::server::api::sessions::create_session(
             State(Arc::clone(&state)),
             Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
+            None,
             None,
             Ok(Json(body)),
         )
