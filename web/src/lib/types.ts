@@ -562,6 +562,15 @@ export interface SuggestionSource {
   variables: string[];
 }
 
+/** One setup check a provider reports. `detail` and `fix` are provider text and untrusted. */
+export interface SuggestionSetupCheck {
+  id: string;
+  label: string;
+  status: "ok" | "warn" | "fail";
+  detail: string;
+  fix: string;
+}
+
 export interface SuggestionProvider {
   id: string;
   name: string;
@@ -575,12 +584,15 @@ export interface SuggestionProvider {
   /** Present with an error: the plugin's own one-step fix. */
   fix?: { label: string };
   sources: SuggestionSource[];
+  checks?: SuggestionSetupCheck[];
 }
 
 export interface SuggestionPrefs {
   homepage: boolean;
   sidebar: boolean;
   refresh_minutes: number;
+  /** Start creates the session from the prepared draft instead of opening the wizard. */
+  start_without_review: boolean;
   /** Every provider id, in the order the user set. */
   provider_order: string[];
 }
@@ -626,6 +638,8 @@ export interface SuggestionPrepared {
   initial_prompt: string;
   /** The item's criterion when a stored template produced `initial_prompt`, else null. */
   template_criterion: string | null;
+  /** The prompt is the user's saved template, not the provider's draft text. */
+  templated: boolean;
   source_ref: string;
   project: { name: string; path: string } | null;
   tool: string;

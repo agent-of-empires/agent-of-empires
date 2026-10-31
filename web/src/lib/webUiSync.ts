@@ -16,6 +16,7 @@ const EXACT_KEYS = new Set<string>([
   "aoe-acp-last-tool", // last agent picked in the wizard
   "aoe-last-browse-dir", // last dir browsed (paths are identical across devices)
   "aoe-web-settings", // dashboard prefs (persistent terminals, auto-open keyboard, fonts)
+  "aoe-suggestions-hint-dismissed", // first-run "Set up suggestions" hint hidden
 ]);
 
 // Group-collapse keys are per repo/group and Settings intro folds per tab, so match by prefix.

@@ -24,7 +24,13 @@ vi.mock("../../../lib/api", () => api);
 
 const ok = { ok: true, data: undefined };
 const snapshot = (): SuggestionsSnapshot => ({
-  prefs: { homepage: true, sidebar: false, refresh_minutes: 15, provider_order: ["gh", "lin"] },
+  prefs: {
+    homepage: true,
+    sidebar: false,
+    refresh_minutes: 15,
+    start_without_review: false,
+    provider_order: ["gh", "lin"],
+  },
   providers: [
     {
       id: "gh",
@@ -140,7 +146,8 @@ describe("SuggestionsSettings", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Show" }));
     expect(openFull).toHaveBeenCalledWith(true);
-    expect((screen.getByRole("switch", { name: "Start without review" }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole("switch", { name: "Start without review" }));
+    await waitFor(() => expect(api.updateSuggestionPrefs).toHaveBeenCalledWith({ start_without_review: true }));
   });
 
   it("shows the agent-usage note and runs the plugin's fix", async () => {

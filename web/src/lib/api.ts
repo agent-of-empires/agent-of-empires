@@ -3247,6 +3247,9 @@ export const refreshSuggestions = () => suggestionRequest("/api/suggestions/refr
 export const runSuggestionFix = (providerId: string) =>
   suggestionRequest("/api/suggestions/fix", "POST", { provider_id: providerId });
 
+/** Asks every provider to re-run its setup checks; results arrive on the next snapshot. */
+export const runSuggestionChecks = () => suggestionRequest("/api/suggestions/checks/run", "POST");
+
 export const dismissSuggestion = (providerId: string, id: string, dismissed: boolean) =>
   suggestionRequest(`/api/suggestions/${dismissed ? "dismiss" : "undismiss"}`, "POST", { provider_id: providerId, id });
 

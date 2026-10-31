@@ -1666,6 +1666,15 @@ function AppContent({
     }
   }, [navigate, activeSessionId]);
 
+  const handleSuggestionStarted = useCallback(
+    (session: SessionResponse) => {
+      injectSession(session);
+      navigate(`/session/${encodeURIComponent(session.id)}`);
+      if (window.innerWidth < 768) setSidebarOpen(false);
+    },
+    [injectSession, navigate],
+  );
+
   const handleClosePluginPage = useCallback(() => {
     // A deep link has no in-app history to pop.
     if (location.key !== "default") navigate(-1);
@@ -2182,11 +2191,15 @@ function AppContent({
           </div>
           <SuggestionsView
             readOnly={serverAbout?.read_only ?? false}
+            onOpenMarketplace={
+              caps.canManageProjects ? () => requestNavigate("/settings/plugins?marketplace=suggestions") : undefined
+            }
             initialDismissed={searchParams.get("dismissed") === "1"}
             onPrepare={(prefill) => {
               setWizardPrefill(prefill);
               setShowSessionWizard(true);
             }}
+            onStarted={handleSuggestionStarted}
           />
         </div>
       );
@@ -2264,7 +2277,10 @@ function AppContent({
             setWizardPrefill(prefill);
             setShowSessionWizard(true);
           }}
+          onSuggestionStarted={handleSuggestionStarted}
           onViewAllSuggestions={() => requestNavigate("/suggestions")}
+          onOpenSuggestionsMarketplace={() => requestNavigate("/settings/plugins?marketplace=suggestions")}
+          tourActive={tour.isTourActive}
         />
       );
     }
