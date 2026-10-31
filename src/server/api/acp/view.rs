@@ -165,6 +165,13 @@ pub async fn acp_enable(
     {
         return resp;
     }
+    tracing::info!(
+        target: "acp.switch",
+        session = %id,
+        to = "structured",
+        agent = %agent_name,
+        "view switched"
+    );
     spawn_enabled_worker(state.clone(), instance, agent_name, selected_conversation);
     view_response(&state, id, View::Structured).await
 }
@@ -1149,7 +1156,10 @@ async fn terminal_handoff_request(state: Arc<AppState>, id: String) -> Response 
     )
     .await
     {
-        Ok(()) => view_response(&state, id, View::Terminal).await,
+        Ok(()) => {
+            tracing::info!(target: "acp.switch", session = %id, to = "terminal", "view switched");
+            view_response(&state, id, View::Terminal).await
+        }
         Err(error) => handoff_unavailable(&error),
     }
 }

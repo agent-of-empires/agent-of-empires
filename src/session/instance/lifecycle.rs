@@ -698,7 +698,9 @@ impl Instance {
             return;
         }
         let scope_failure = if cleanup_pane {
-            let _ = self.kill_clean_locked();
+            if let Err(error) = self.kill_clean_locked() {
+                tracing::debug!(target: "session.lifecycle", session = %self.id, %error, "pane cleanup failed");
+            }
             self.release_scope().err()
         } else {
             None
@@ -734,12 +736,16 @@ impl Instance {
                 }
             },
         );
-        let _ = self.commit_lifecycle_status(
+        if let Err(commit_error) = self.commit_lifecycle_status(
             storage,
             LifecycleOperation::Launch,
             generation,
             Status::Error,
-        );
+        ) {
+            tracing::warn!(target: "session.lifecycle", session = %self.id, error = %commit_error,
+                "launch-failure status commit failed"
+            );
+        }
     }
 }
 

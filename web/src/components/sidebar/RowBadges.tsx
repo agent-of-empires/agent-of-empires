@@ -140,7 +140,7 @@ export function RowTrailingBadges({ workspace, model }: { workspace: Workspace; 
       )}
       {queuedCount > 0 && (
         <Chip
-          title={`${queuedCount} queued prompt${queuedCount === 1 ? "" : "s"}`}
+          title={`${queuedCount} queued message${queuedCount === 1 ? "" : "s"}`}
           label={`${queuedCount} queued`}
           className={`${CHIP} border-sky-700/40 bg-sky-950/30 font-mono font-medium tabular-nums text-sky-300`}
         >

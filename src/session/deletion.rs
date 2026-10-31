@@ -2500,7 +2500,11 @@ fn run_on_destroy_hooks(instance: &Instance, detach: bool, configured_hooks: &[S
                 }
             }
         }
-        Err(_) => {}
+        Err(error) => {
+            tracing::warn!(target: "session.delete", session = %instance.id, %error,
+                "could not check repo trust; skipping repo on_destroy hooks"
+            );
+        }
     }
 
     if resolved_on_destroy.is_empty() {

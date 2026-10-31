@@ -201,12 +201,16 @@ impl Instance {
                 Ok(generation)
             }
             Err(error) => {
-                let _ = lifecycle.commit_lifecycle_status(
+                if let Err(commit_error) = lifecycle.commit_lifecycle_status(
                     storage,
                     LifecycleOperation::Stop,
                     generation,
                     Status::Error,
-                );
+                ) {
+                    tracing::warn!(target: "session.lifecycle", session = %self.id, error = %commit_error,
+                        "failed to persist Error after stop failure"
+                    );
+                }
                 Err(error)
             }
         }
@@ -246,12 +250,16 @@ impl Instance {
                 Status::Stopped,
             ),
             Err(error) => {
-                let _ = lifecycle.commit_lifecycle_status(
+                if let Err(commit_error) = lifecycle.commit_lifecycle_status(
                     &storage,
                     LifecycleOperation::Stop,
                     generation,
                     Status::Error,
-                );
+                ) {
+                    tracing::warn!(target: "session.lifecycle", session = %self.id, error = %commit_error,
+                        "failed to persist Error after stop failure"
+                    );
+                }
                 Err(error)
             }
         }
@@ -521,12 +529,16 @@ impl Instance {
                 Ok(())
             }
             Err(error) => {
-                let _ = lifecycle.commit_lifecycle_status(
+                if let Err(commit_error) = lifecycle.commit_lifecycle_status(
                     &storage,
                     LifecycleOperation::Stop,
                     generation,
                     Status::Error,
-                );
+                ) {
+                    tracing::warn!(target: "session.lifecycle", session = %self.id, error = %commit_error,
+                        "failed to persist Error after stop failure"
+                    );
+                }
                 Err(error)
             }
         }

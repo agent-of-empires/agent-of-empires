@@ -110,7 +110,7 @@ pub use instance::{
     ErrorBlockingScope, ErrorEvidenceGeneration, ErrorEvidenceSource, ErrorOperation, ErrorOrigin,
     OperationErrorEvidence, RuntimeEvidence,
 };
-pub(crate) use instance::{Handoff, Held, Unserved};
+pub(crate) use instance::{Handoff, Held, SandboxPin, Unserved};
 pub(crate) use instance::{
     TerminalHandoffContext, TerminalHandoffIntent, TerminalHandoffKey, TerminalHandoffStage,
     TerminalHandoffUnbornFence,

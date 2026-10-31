@@ -260,7 +260,10 @@ async fn handle(
                             store.replay_from(&session_for_read, 0)
                         })
                         .await
-                        .unwrap_or_default();
+                        .unwrap_or_else(|error| {
+                            warn!(target: "acp.ws", %error, "replay rebuild task failed");
+                            Vec::new()
+                        });
                         let mut highest = 0;
                         for (seq, event) in entries {
                             let _ = rebuilt.apply_event(seq, event);
@@ -686,6 +689,13 @@ where
     if subs.is_empty() {
         return;
     }
+    tracing::info!(
+        target: "push",
+        session = %session_id,
+        silent,
+        subs = subs.len(),
+        "acp push fired"
+    );
     let client = match super::push_send::build_client() {
         Ok(c) => c,
         Err(e) => {
@@ -729,6 +739,7 @@ mod tests {
             destructive: false,
             options: Vec::new(),
             choice: false,
+            plan: None,
             requested_at: chrono::Utc::now(),
             resolved: None,
         };
@@ -1068,6 +1079,7 @@ mod tests {
             destructive: false,
             options: Vec::new(),
             choice: false,
+            plan: None,
             requested_at: chrono::Utc::now(),
             resolved: None,
         };
