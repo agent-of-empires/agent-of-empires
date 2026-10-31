@@ -1235,9 +1235,6 @@ pub mod structured {
         trust_hooks: Option<bool>,
     ) -> bool {
         use crate::session::config::repo_config::{check_repo_trust, TrustSurface};
-        let prepares = |hooks: &crate::session::HooksConfig| {
-            !hooks.on_create.is_empty() || !hooks.on_launch.is_empty()
-        };
         if prepares(profile_hooks) {
             return true;
         }
@@ -1251,6 +1248,10 @@ pub mod structured {
             }
             _ => false,
         }
+    }
+
+    fn prepares(hooks: &crate::session::HooksConfig) -> bool {
+        !hooks.on_create.is_empty() || !hooks.on_launch.is_empty()
     }
 
     /// Pre-create validation for an explicit structured-view choice, run BEFORE any worktree,
@@ -1353,11 +1354,14 @@ pub mod structured {
     }
 
     /// Whether `agent` is ACP-capable and its adapter passes the create check, for the agent
-    /// list. There is no project to search from, so relative PATH entries pass.
+    /// list. There is no project to search from, so relative PATH entries pass. With
+    /// `count_profile_hooks`, `config`'s own hooks may install the adapter first; the
+    /// repository's depend on the project.
     pub fn adapter_installed(
         agent: &str,
         config: &crate::session::Config,
         host_environment: &[(String, String)],
+        count_profile_hooks: bool,
     ) -> bool {
         let choice = StructuredChoice {
             tool: agent,
@@ -1365,7 +1369,7 @@ pub mod structured {
             command_override: "",
             sandboxed: false,
             project_path: None,
-            preparation_hooks: &|| false,
+            preparation_hooks: &|| count_profile_hooks && prepares(&config.hooks),
         };
         validate_structured_choice_with(
             &choice,
@@ -2015,6 +2019,51 @@ mod tests {
                     "{label}: asked about hooks for a reachable adapter"
                 );
             }
+        }
+    }
+
+    /// Only the create-ready answer counts the profile's own preparation hooks, as the create
+    /// check does; the strict one reports whether the adapter runs now.
+    #[test]
+    #[serial_test::serial]
+    fn adapter_installed_counts_profile_preparation_hooks_only_when_asked() {
+        use crate::session::HooksConfig;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let hook = || vec!["npm install".to_string()];
+        for (label, hooks, create_ready) in [
+            ("no hooks", HooksConfig::default(), false),
+            (
+                "on_create",
+                HooksConfig {
+                    on_create: hook(),
+                    ..Default::default()
+                },
+                true,
+            ),
+            (
+                "on_launch",
+                HooksConfig {
+                    on_launch: hook(),
+                    ..Default::default()
+                },
+                true,
+            ),
+        ] {
+            let mut config = crate::session::Config::default();
+            config.session.agent_acp_cmd.insert(
+                "fake".into(),
+                format!("aoe-test-missing-adapter-{}", std::process::id()),
+            );
+            config.hooks = hooks;
+            assert!(
+                !structured::adapter_installed("fake", &config, &[], false),
+                "{label}: strict"
+            );
+            assert_eq!(
+                structured::adapter_installed("fake", &config, &[], true),
+                create_ready,
+                "{label}: create-ready"
+            );
         }
     }
 
