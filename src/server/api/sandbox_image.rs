@@ -416,6 +416,7 @@ pub async fn sandbox_image_pull(
         let runtime = configured.runtime;
         tokio::spawn(async move {
             let pulled = key.image.clone();
+            let started = std::time::Instant::now();
             let result = tokio::task::spawn_blocking(move || {
                 ContainerRuntime::from(runtime).pull_image(&pulled)
             })
@@ -429,6 +430,15 @@ pub async fn sandbox_image_pull(
                     error: format!("pull task failed: {e}"),
                 },
             };
+            let duration_ms = started.elapsed().as_millis();
+            match &outcome {
+                PullState::Failed { error } => {
+                    tracing::warn!(target: "containers.image", image = %key.image, ok = false, duration_ms, %error, "image pull finished")
+                }
+                _ => {
+                    tracing::info!(target: "containers.image", image = %key.image, ok = true, duration_ms, "image pull finished")
+                }
+            }
             STATUS
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -483,7 +493,10 @@ pub async fn sandbox_image_dismiss(
     })
     .await;
     match result {
-        Ok(Ok(())) => Json(serde_json::json!({ "dismissed_image_digest": digest })).into_response(),
+        Ok(Ok(())) => {
+            tracing::debug!(target: "containers.image", %digest, "image update dismissed");
+            Json(serde_json::json!({ "dismissed_image_digest": digest })).into_response()
+        }
         Ok(Err(e)) => {
             tracing::warn!(target: "http.api.sandbox_image", "dismissing image update failed: {e}");
             api_error(

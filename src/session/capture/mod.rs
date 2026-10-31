@@ -220,7 +220,8 @@ fn build_exclusion_set(
             }
             Ok(())
         })();
-        if loaded.is_err() {
+        if let Err(error) = loaded {
+            tracing::debug!(target: "session.capture", %error, "capture owner scan failed");
             owners.clear();
         }
     }

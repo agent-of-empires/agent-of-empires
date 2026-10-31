@@ -4,7 +4,9 @@ use std::collections::HashMap;
 
 use rusqlite::{params, OptionalExtension};
 
-use super::{decode, logged, query_strings, EventStore, NON_SUBSTANTIVE_EVENT_DISCRIMINANTS};
+use super::{
+    decode_logged, logged, query_strings, EventStore, NON_SUBSTANTIVE_EVENT_DISCRIMINANTS,
+};
 use crate::acp::approvals::{Approval, Nonce};
 use crate::acp::state::{BackgroundTaskLaunch, Event, Plan};
 use crate::events;
@@ -78,7 +80,7 @@ impl EventStore {
     pub fn latest_plan(&self, session_id: &str) -> Option<Plan> {
         let (_, json) =
             events::latest_by_discriminant(&self.conn(), &self.schema, session_id, "PlanUpdated")?;
-        match decode(&json)? {
+        match decode_logged(&json, session_id, "latest_plan")? {
             Event::PlanUpdated { plan } => Some(plan),
             _ => None,
         }
@@ -92,7 +94,7 @@ impl EventStore {
             session_id,
             "PromptCapabilities",
         )?;
-        match decode(&json)? {
+        match decode_logged(&json, session_id, "latest_prompt_capabilities")? {
             Event::PromptCapabilities {
                 image,
                 audio,
@@ -135,7 +137,7 @@ impl EventStore {
             session_id,
         )
         .flatten()?;
-        match decode(&json)? {
+        match decode_logged(&json, session_id, "first_user_prompt")? {
             Event::UserPromptSent { text, .. } => Some(text),
             _ => None,
         }
@@ -158,7 +160,10 @@ impl EventStore {
         );
         let mut first_prompt: Option<String> = None;
         let mut agent = String::new();
-        for event in rows.iter().filter_map(|json| decode(json)) {
+        for event in rows
+            .iter()
+            .filter_map(|json| decode_logged(json, session_id, "first_turn_context"))
+        {
             match event {
                 Event::UserPromptSent { text, .. } if first_prompt.is_none() => {
                     first_prompt = Some(text);
@@ -321,10 +326,12 @@ impl EventStore {
             session_id,
         )
         .iter()
-        .filter_map(|json| match decode(json)? {
-            Event::ApprovalRequested { approval } => Some(approval),
-            _ => None,
-        })
+        .filter_map(
+            |json| match decode_logged(json, session_id, "pending_approval_requests")? {
+                Event::ApprovalRequested { approval } => Some(approval),
+                _ => None,
+            },
+        )
         .collect()
     }
 
@@ -466,7 +473,7 @@ impl EventStore {
         .flatten()?;
         Some(TerminalRepairProbe {
             latest_seq: latest_seq as u64,
-            substantive: decode(&json)?,
+            substantive: decode_logged(&json, session_id, "terminal_repair_probe")?,
             substantive_at_ms,
         })
     }

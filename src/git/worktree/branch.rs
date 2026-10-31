@@ -331,7 +331,9 @@ impl GitWorktree {
     /// session's worktree (the over-reap #2414's lock prevents).
     fn reap_worktree_entry(&self, path: &Path) {
         self.unlock_worktree(path);
-        let _ = self.prune_worktrees();
+        if let Err(error) = self.prune_worktrees() {
+            tracing::debug!(target: "git.worktree", %error, "prune after branch delete failed");
+        }
     }
 
     /// Whether `refs/heads/<branch>` exists. `Err` means the check itself

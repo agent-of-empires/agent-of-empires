@@ -538,6 +538,11 @@ pub async fn lock_for_startup(profile: &str, args: &mut ServeArgs) -> Result<Opt
             validate_launch_args(profile, args).await?;
             let passphrase = recall_serve_passphrase(&launch)?;
             retain_rollback_launch(&transaction, &launch, passphrase.as_deref())?;
+            tracing::info!(
+                target: "serve.lifecycle",
+                old_pid = pid,
+                "replacing core-only daemon with full daemon"
+            );
             stop_daemon_locked(&transaction, true).await?;
         }
         DaemonStatus::Unverified => {
@@ -796,6 +801,7 @@ async fn rollback_daemon() -> Result<()> {
         DaemonStatus::Absent => {}
     }
     let transaction = migrate_managed_launch(transaction, true).await?;
+    tracing::info!(target: "serve.lifecycle", "rolling back to retained launch");
     complete_rollback_after(start_daemon(&launch.profile, &args, &transaction, true).await)
 }
 
@@ -1950,10 +1956,13 @@ pub(crate) async fn restart_daemon_with_receipt(
     if announce {
         println!("Restarting aoe serve daemon (PID {pid})…");
     }
+    tracing::info!(target: "serve.lifecycle", old_pid = pid, "restarting daemon");
     stop_daemon_locked(&transaction, announce).await?;
     let transaction = migrate_managed_launch(transaction, true).await?;
     complete_rollback_after(start_daemon(&launch.profile, &args, &transaction, announce).await)?;
-    managed_launch(daemon_pid().context("Restart successor is unavailable")?)
+    let new_pid = daemon_pid().context("Restart successor is unavailable")?;
+    tracing::info!(target: "serve.lifecycle", old_pid = pid, new_pid, "daemon restarted");
+    managed_launch(new_pid)
 }
 
 fn stale_cleanup_notice(pid: i32, announce: bool) -> Option<&'static str> {
