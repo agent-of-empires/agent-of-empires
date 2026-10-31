@@ -149,25 +149,25 @@ pub fn install_id() -> Option<String> {
     load_state().install_id.filter(|s| !s.trim().is_empty())
 }
 
-pub fn ensure_install_id() -> Option<String> {
+fn try_ensure_install_id() -> Result<Option<String>> {
     if super::do_not_track() {
-        return None;
+        return Ok(None);
     }
-    let result = update_state_locked(|state| {
+    update_state_locked(|state| {
         if let Some(id) = state.install_id.as_ref().filter(|s| !s.trim().is_empty()) {
             return (Some(id.clone()), false);
         }
         let id = uuid::Uuid::new_v4().to_string();
         state.install_id = Some(id.clone());
         (Some(id), true)
-    });
-    match result {
-        Ok(value) => value,
-        Err(e) => {
-            tracing::debug!(target: "telemetry", "failed to persist install id: {e}");
-            None
-        }
-    }
+    })
+}
+
+pub fn ensure_install_id() -> Option<String> {
+    try_ensure_install_id().unwrap_or_else(|e| {
+        tracing::debug!(target: "telemetry", "failed to persist install id: {e}");
+        None
+    })
 }
 
 pub fn delete_install_id() -> Result<()> {
@@ -182,11 +182,9 @@ pub fn delete_install_id() -> Result<()> {
     Ok(())
 }
 
-pub fn reset_install_id() -> Option<String> {
-    if let Err(e) = delete_install_id() {
-        tracing::debug!(target: "telemetry", "failed to delete install id during reset: {e}");
-    }
-    ensure_install_id()
+pub fn reset_install_id() -> Result<Option<String>> {
+    delete_install_id()?;
+    try_ensure_install_id()
 }
 
 pub fn record_cli_command(name: &str) {

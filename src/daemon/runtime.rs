@@ -80,6 +80,9 @@ pub enum ProjectMutation {
     Remove {
         target: ProjectTarget,
         name_or_path: String,
+        /// The client's absolute reading of a path-like argument, matched
+        /// against entry paths while `name_or_path` stays a candidate name.
+        anchored_path: Option<String>,
     },
 }
 

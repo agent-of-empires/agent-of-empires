@@ -181,15 +181,21 @@ fn telemetry_toggle_migrates_before_rewriting_config() {
     )
     .expect("write config");
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_aoe"))
-        .args(["telemetry", "disable"])
-        .output()
-        .expect("run aoe telemetry disable");
+    let aoe = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_aoe"))
+            .args(args)
+            .output()
+            .expect("run aoe")
+    };
+    let output = aoe(&["telemetry", "disable"]);
+    // The command auto-started a Daemon on this isolated home.
+    let stopped = aoe(&["serve", "--stop"]);
     assert!(
         output.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(stopped.status.success());
 
     let config: toml::Table = std::fs::read_to_string(app.join("config.toml"))
         .expect("read config")

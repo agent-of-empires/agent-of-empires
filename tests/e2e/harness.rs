@@ -1407,7 +1407,7 @@ last_seen_version = "{}"
         );
     }
 
-    fn cli_command(&self, args: &[&str]) -> Command {
+    pub fn cli_command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(&self.binary_path);
         command
             .args(args)

@@ -269,6 +269,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/settings/resolved", get(api::get_settings_resolved))
         // The CityHall config bundle an admin hands to CityHall.
         .route("/api/cityhall/bundle", get(api::get_cityhall_bundle))
+        .route("/api/cityhall/apply", post(api::apply_cityhall_bundle))
         .route("/api/tips", get(api::get_tips))
         .route("/api/tips/show", post(api::set_show_tips))
         .route("/api/app-state/tip-seen", post(api::mark_tip_seen))
@@ -410,6 +411,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         // posts to the telemetry backend directly).
         .route("/api/telemetry/status", get(api::get_telemetry_status))
         .route("/api/telemetry/consent", post(api::set_telemetry_consent))
+        .route("/api/telemetry/reset-id", post(api::reset_telemetry_id))
         .route("/api/telemetry/seen", post(api::post_telemetry_seen))
         .route(
             "/api/telemetry/structured-interaction",
