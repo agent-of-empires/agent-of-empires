@@ -1371,6 +1371,7 @@ impl App {
             needs_full_refresh |= self.home.apply_structured_approval_results();
 
             needs_full_refresh |= self.home.apply_restart_results();
+            needs_full_refresh |= self.home.apply_suggestions_results();
 
             let store_move = self.home.poll_store_move();
             needs_full_refresh |= store_move.changed;

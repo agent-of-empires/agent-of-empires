@@ -24,6 +24,8 @@ export interface SessionResponse {
   /** Last transition into Idle; unlike `last_accessed_at`, viewing does not bump it. */
   idle_entered_at: string | null;
   last_error: string | null;
+  /** Why the initial prompt was not typed into this terminal session. */
+  initial_prompt_error?: string | null;
   branch: string | null;
   main_repo_path: string | null;
   /** Base branch of an AoE-created worktree; null for pre-existing or default branches. */
@@ -408,6 +410,10 @@ export interface CreateSessionRequest {
   repo_bases?: { repo: string; base_branch: string }[];
   command_override?: string;
   custom_instruction?: string;
+  /** Typed into the agent as its first turn once it is ready. */
+  initial_prompt?: string;
+  /** Links the new Session to the suggestion it starts from; omitted by "Start another". */
+  suggestion?: { provider_id: string; id: string };
   profile?: string;
   view?: "structured" | "terminal";
   agent_model?: string;
@@ -549,4 +555,115 @@ export interface SettingsFieldDescriptor {
   default?: unknown;
   /** Plugin field that can also be set per registered project. */
   per_project?: boolean;
+}
+
+export interface SuggestionSource {
+  criterion: string;
+  label: string;
+  description: string;
+  enabled: boolean;
+  /** Placeholder names every item of this criterion carries. */
+  variables: string[];
+}
+
+/** One setup check a provider reports. `detail` and `fix` are provider text and untrusted. */
+export interface SuggestionSetupCheck {
+  id: string;
+  label: string;
+  status: "ok" | "warn" | "fail";
+  detail: string;
+  fix: string;
+}
+
+export interface SuggestionProvider {
+  id: string;
+  name: string;
+  status: "pending" | "ok" | "error";
+  error?: string;
+  enabled: boolean;
+  /** Unix seconds of the last report; absent before the first one. */
+  updated_at?: number;
+  /** The provider runs an agent itself, which spends the user's agent usage. */
+  uses_agent?: boolean;
+  /** Present with an error: the plugin's own one-step fix. */
+  fix?: { label: string };
+  /** A refresh the host requested is unanswered. */
+  refreshing?: boolean;
+  sources: SuggestionSource[];
+  checks?: SuggestionSetupCheck[];
+}
+
+/** The oldest live Session started from a suggestion. */
+export interface StartedSession {
+  id: string;
+  title: string;
+  status: SessionStatus;
+  archived: boolean;
+  created_at: string;
+}
+
+export interface SuggestionPrefs {
+  homepage: boolean;
+  sidebar: boolean;
+  refresh_minutes: number;
+  /** Start creates the session from the prepared draft instead of opening the wizard. */
+  start_without_review: boolean;
+  /** Every provider id, in the order the user set. */
+  provider_order: string[];
+}
+
+export interface SuggestionTemplate {
+  provider_id: string;
+  criterion: string;
+  template: string;
+}
+
+export interface SuggestionMapping {
+  provider_id: string;
+  mapping_key: string;
+  /** Registered Project paths; the first is primary. */
+  projects: string[];
+}
+
+/** `preview` and `reason` are provider text and untrusted; only `draft` seeds a prompt. */
+export interface SuggestionItem {
+  id: string;
+  provider_id: string;
+  title: string;
+  reason: string;
+  source_url: string;
+  source_ref: string;
+  preview: string;
+  project?: string | null;
+  criterion: string;
+  mapping_key?: string | null;
+  variables?: Record<string, string>;
+  draft: { title: string; prompt: string };
+  dismissed: boolean;
+  started_session?: StartedSession;
+  /** The source closed or changed; the row is dimmed and cannot start. */
+  stale?: boolean;
+  /** The registered Project the item resolves to; the provider's `project` is only a hint. */
+  resolved_project?: { name: string; path: string } | null;
+}
+
+export interface SuggestionsSnapshot {
+  providers: SuggestionProvider[];
+  items: SuggestionItem[];
+  prefs: SuggestionPrefs;
+}
+
+export interface SuggestionPrepared {
+  title: string;
+  initial_prompt: string;
+  /** The item's criterion when a stored template produced `initial_prompt`, else null. */
+  template_criterion: string | null;
+  /** The prompt is the user's saved template, not the provider's draft text. */
+  templated: boolean;
+  source_ref: string;
+  project: { name: string; path: string } | null;
+  tool: string;
+  yolo: boolean;
+  sandbox: boolean;
+  worktree: boolean;
 }

@@ -2019,7 +2019,7 @@ impl PluginManagerDialog {
             .discover_rows
             .iter()
             .map(|r| {
-                let spans = vec![
+                let mut spans = vec![
                     Span::styled(
                         format!("{:<10}", r.badge.as_str()),
                         Style::default().fg(theme.accent),
@@ -2029,11 +2029,15 @@ impl PluginManagerDialog {
                         Style::default().fg(theme.dimmed),
                     ),
                     Span::styled(format!("{:<30}", r.slug), Style::default().fg(theme.text)),
-                    Span::styled(
-                        r.description.clone().unwrap_or_default(),
-                        Style::default().fg(theme.dimmed),
-                    ),
                 ];
+                spans.push(Span::styled(
+                    format!("{:<14}", if r.suggestions { "✦ Suggestions" } else { "" }),
+                    Style::default().fg(theme.accent),
+                ));
+                spans.push(Span::styled(
+                    r.description.clone().unwrap_or_default(),
+                    Style::default().fg(theme.dimmed),
+                ));
                 ListItem::new(Line::from(spans))
             })
             .collect();
@@ -2160,9 +2164,27 @@ mod mouse_tests {
             stars: 0,
             badge: DiscoveryBadge::Unvetted,
             featured: false,
+            suggestions: false,
             install_command: String::new(),
             source_avatar_url: String::new(),
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn discover_rows_mark_only_suggestions_plugins() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp.path());
+        let mut d = PluginManagerDialog::new();
+        d.mode = Mode::Discover;
+        let mut flagged = result("owner/flagged");
+        flagged.suggestions = true;
+        d.discover_rows = vec![result("owner/plain"), flagged];
+
+        let buf = draw(120, 30, |f, theme| d.render(f, f.area(), theme));
+        let (_, marked) = find(&buf, "✦ Suggestions");
+        assert_eq!(marked, find(&buf, "owner/flagged").1);
+        assert_ne!(marked, find(&buf, "owner/plain").1);
     }
 
     #[test]

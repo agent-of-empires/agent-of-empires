@@ -151,6 +151,58 @@ async fn sensitive_routes_are_blocked() {
             "/api/plugins/x/enabled",
             r#"{"enabled":true}"#,
         ),
+        (Method::POST, "/api/suggestions/refresh", "{}"),
+        (Method::POST, "/api/suggestions/checks/run", "{}"),
+        (
+            Method::POST,
+            "/api/suggestions/fix",
+            r#"{"provider_id":"x"}"#,
+        ),
+        (
+            Method::POST,
+            "/api/suggestions/dismiss",
+            r#"{"provider_id":"x","id":"y"}"#,
+        ),
+        (
+            Method::POST,
+            "/api/suggestions/undismiss",
+            r#"{"provider_id":"x","id":"y"}"#,
+        ),
+        (
+            Method::PATCH,
+            "/api/suggestions/sources",
+            r#"{"provider_id":"x","criterion":"c","enabled":true}"#,
+        ),
+        (
+            Method::PATCH,
+            "/api/suggestions/prefs",
+            r#"{"sidebar":true}"#,
+        ),
+        (
+            Method::PUT,
+            "/api/suggestions/templates",
+            r#"{"provider_id":"x","criterion":"c","template":"t"}"#,
+        ),
+        (
+            Method::DELETE,
+            "/api/suggestions/templates",
+            r#"{"provider_id":"x","criterion":"c"}"#,
+        ),
+        (
+            Method::POST,
+            "/api/suggestions/prepare",
+            r#"{"provider_id":"x","id":"y"}"#,
+        ),
+        (
+            Method::PUT,
+            "/api/suggestions/mappings",
+            r#"{"provider_id":"x","mapping_key":"k","projects":["/tmp/p"]}"#,
+        ),
+        (
+            Method::DELETE,
+            "/api/suggestions/mappings?provider_id=x&mapping_key=k",
+            "",
+        ),
         // Session lifecycle on a foreign or unknown target. With no structured
         // session seeded, an enumerated / crafted id resolves to a
         // non-structured-or-unknown target, so a pre-existing plain/terminal
@@ -349,6 +401,36 @@ async fn allowlisted_route_stays_reachable() {
         "an allowlisted route must not be refused by the CityHall gate (got: {})",
         String::from_utf8_lossy(&bytes)
     );
+}
+
+// The suggestions reads stay open in CityHall mode, like `GET /api/projects`;
+// only the mutations are denied.
+#[tokio::test]
+#[serial_test::parallel]
+async fn suggestion_reads_stay_reachable_in_cityhall() {
+    let state = build_test_app_state_cityhall(Vec::new());
+    let app = build_router_for_test(state);
+    for uri in [
+        "/api/suggestions",
+        "/api/suggestions/templates",
+        "/api/suggestions/mappings",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(request(Method::GET, uri, Body::empty()))
+            .await
+            .unwrap();
+        let status = resp.status();
+        assert_ne!(status, StatusCode::FORBIDDEN, "{uri}");
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains("cityhall_mode"),
+            "{uri} must not be refused by the CityHall gate (got: {status} {text})"
+        );
+    }
 }
 
 // paste_image stays allowlisted for the CityHall composer, but only against a

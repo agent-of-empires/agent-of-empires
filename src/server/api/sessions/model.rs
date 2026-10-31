@@ -88,6 +88,10 @@ impl SessionResponse {
             last_accessed_at: timestamp(row.last_accessed_at),
             idle_entered_at: timestamp(row.idle_entered_at),
             last_error: row.last_error.map(str::to_string),
+            initial_prompt_error: inst
+                .pending_initial_turn
+                .as_ref()
+                .and_then(|turn| turn.error.clone()),
             branch: row.worktree.map(|w| w.branch.clone()),
             main_repo_path: row.worktree.map(|w| w.main_repo_path.clone()),
             base_branch: row.worktree.and_then(|w| w.base_branch.clone()),

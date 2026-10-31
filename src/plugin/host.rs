@@ -142,7 +142,7 @@ impl PluginHost {
             .with_context(|| format!("prepare {}", workers_dir.display()))?;
         worker_logs::prune_legacy(&workers_dir);
         let api = HostApiState::open(
-            &app_dir.join("plugin_events.db"),
+            &app_dir.join(crate::plugin::host_api::EVENTS_DB),
             profile,
             EVENT_RETENTION_PER_TOPIC,
         )?;
@@ -159,6 +159,120 @@ impl PluginHost {
             session_rpc,
             work,
         }))
+    }
+
+    /// The profile workers publish suggestions under; takes no lock.
+    pub(crate) fn suggestions_profile(&self) -> String {
+        self.api.suggestions_profile()
+    }
+
+    /// Run `f` on the suggestions store, keyed by the profile workers publish under.
+    pub(crate) fn with_suggestions_db<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Connection, &str) -> T,
+    ) -> T {
+        self.api.with_suggestions_db(f)
+    }
+
+    /// Ask the worker of `provider_id`, or of every suggestions provider, to
+    /// publish again, passing the user's `refresh_minutes` hint. Returns how
+    /// many workers were notified.
+    pub async fn refresh_suggestions(&self, provider_id: Option<&str>) -> usize {
+        self.refresh_providers(provider_id, Self::provider_ids())
+            .await
+    }
+
+    fn provider_ids() -> Vec<String> {
+        crate::plugin::suggestions::providers()
+            .into_iter()
+            .map(|p| p.id)
+            .collect()
+    }
+
+    async fn refresh_providers(&self, provider_id: Option<&str>, ids: Vec<String>) -> usize {
+        let minutes = self
+            .with_suggestions_db(crate::plugin::suggestions::refresh_minutes)
+            .unwrap_or_else(|error| {
+                tracing::warn!(target: "plugin.host", error = %error, "suggestions: refresh_minutes unreadable");
+                crate::plugin::suggestions::DEFAULT_REFRESH_MINUTES
+            });
+        self.notify_providers(
+            aoe_plugin_api::suggestions::SUGGESTIONS_REFRESH,
+            serde_json::json!({ "refresh_minutes": minutes }),
+            provider_id,
+            ids,
+        )
+        .await
+    }
+
+    /// Send the fix method the provider stored with its current error to that
+    /// worker. `None` when the provider has no fix; otherwise whether a live
+    /// worker was notified.
+    pub async fn run_suggestion_fix(&self, provider_id: &str) -> anyhow::Result<Option<bool>> {
+        let method = self.with_suggestions_db(|conn, profile| {
+            crate::plugin::suggestions::fix_method(conn, profile, provider_id)
+        })?;
+        let Some(method) = method else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.notify_worker(provider_id, &method, serde_json::json!({}))
+                .await,
+        ))
+    }
+
+    /// Providers with a refresh in flight.
+    pub(crate) fn refreshing_suggestions(&self) -> std::collections::HashMap<String, i64> {
+        self.api.refreshing_providers()
+    }
+
+    /// Ask every suggestions worker to report its setup checks again.
+    /// Returns how many workers were notified.
+    pub async fn run_suggestion_checks(&self) -> usize {
+        self.notify_providers(
+            aoe_plugin_api::suggestions::SUGGESTIONS_CHECKS_RUN,
+            serde_json::json!({}),
+            None,
+            Self::provider_ids(),
+        )
+        .await
+    }
+
+    async fn notify_providers(
+        &self,
+        method: &str,
+        params: Value,
+        provider_id: Option<&str>,
+        ids: Vec<String>,
+    ) -> usize {
+        // An unreadable switch store notifies nobody rather than a provider the user turned off.
+        let disabled =
+            match self.with_suggestions_db(crate::plugin::suggestions::disabled_providers) {
+                Ok(disabled) => disabled,
+                Err(error) => {
+                    tracing::warn!(
+                        "suggestions: provider switches unreadable, skipping {method}: {error}"
+                    );
+                    return 0;
+                }
+            };
+        let mut sent = 0;
+        for id in ids {
+            if provider_id.is_some_and(|only| only != id) || disabled.contains(&id) {
+                continue;
+            }
+            let refresh = method == aoe_plugin_api::suggestions::SUGGESTIONS_REFRESH;
+            // Marked first, so a report that races the notification still clears it.
+            if refresh {
+                self.api.mark_refreshing(&id);
+            }
+            let notified = self.notify_worker(&id, method, params.clone()).await;
+            if refresh && !notified {
+                self.api.clear_refreshing(&id);
+            }
+            sent += usize::from(notified);
+        }
+        sent
     }
 
     /// The aggregated UI-state snapshot for the web to render. Read
@@ -425,7 +539,39 @@ impl PluginHost {
             drained
         };
 
+        let uninstalled: Vec<String> = to_teardown
+            .iter()
+            .map(|(id, _)| id.clone())
+            .filter(|id| registry.get(id).is_none())
+            .collect();
         self.teardown_workers(to_teardown).await;
+        for id in uninstalled {
+            self.forget_suggestions(id).await;
+        }
+    }
+
+    /// Clear what a plugin gone from the registry published. Runs after its
+    /// worker is stopped, so the worker cannot publish again behind the clear.
+    async fn forget_suggestions(&self, plugin_id: String) {
+        let api = self.api.clone();
+        let id = plugin_id.clone();
+        let cleared = tokio::task::spawn_blocking(move || {
+            api.with_suggestions_db(|conn, _| {
+                crate::plugin::suggestions::forget_publication(conn, &id)
+            })
+        })
+        .await;
+        match cleared {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(
+                target: "plugin.host", plugin = %plugin_id,
+                "could not clear published suggestions: {e}"
+            ),
+            Err(e) => tracing::warn!(
+                target: "plugin.host", plugin = %plugin_id,
+                "clearing published suggestions did not finish: {e}"
+            ),
+        }
     }
 
     /// Replace one plugin's worker so it runs the build now on disk, clearing its
@@ -1059,6 +1205,31 @@ impl PluginHost {
         rx
     }
 
+    /// A worker that records every line the host writes to its stdin.
+    pub(crate) async fn register_inbound_test_worker(
+        &self,
+        plugin_id: &str,
+    ) -> mpsc::UnboundedReceiver<String> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut table = self.state.lock().await;
+        let supervisor_id = table.next_supervisor_id;
+        table.next_supervisor_id += 1;
+        table.running.insert(
+            plugin_id.to_string(),
+            RunningWorker {
+                supervisor_id,
+                pid: 0,
+                task: tokio::spawn(async {}),
+                inbound: Some(tx),
+                ui_generation: None,
+                events_inbound: None,
+                lifecycle_events: false,
+                dropped_events: 0,
+            },
+        );
+        rx
+    }
+
     /// Status events dropped for `plugin_id` since it last accepted one.
     pub(crate) async fn dropped_events(&self, plugin_id: &str) -> Option<u64> {
         let table = self.state.lock().await;
@@ -1216,6 +1387,48 @@ mod tests {
         assert!(msg.get("id").is_none(), "must be a notification");
         assert_eq!(msg["params"]["kind"], json!("archived"));
         assert!(status_only.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn refresh_carries_the_stored_interval_and_only_an_interval_change_asks_for_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(
+            tmp.path(),
+            "default",
+            None,
+            Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
+        let mut worker = host.register_inbound_test_worker("acme.github").await;
+        let ids = || vec!["acme.github".to_string()];
+        let patch = |value: Value| -> crate::plugin::suggestions::PrefsPatch {
+            serde_json::from_value(value).unwrap()
+        };
+        let apply = |value: Value| {
+            let known = ids();
+            host.with_suggestions_db(|conn, profile| {
+                crate::plugin::suggestions::apply_prefs(conn, profile, &known, &patch(value))
+            })
+            .unwrap()
+            .unwrap()
+        };
+
+        // A PATCH that leaves the interval alone asks for no refresh.
+        assert!(!apply(json!({ "homepage": false })));
+        assert!(worker.try_recv().is_err());
+
+        assert!(apply(json!({ "refresh_minutes": 60 })));
+        assert_eq!(host.refresh_providers(None, ids()).await, 1);
+        let line = worker.try_recv().expect("worker gets a refresh");
+        let msg: Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(msg["method"], json!("suggestions.refresh"));
+        assert!(msg.get("id").is_none(), "must be a notification");
+        assert_eq!(msg["params"], json!({ "refresh_minutes": 60 }));
+        assert!(line.contains("\"refresh_minutes\":60"));
+
+        // The same value again changes nothing.
+        assert!(!apply(json!({ "refresh_minutes": 60 })));
+        assert!(worker.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1682,6 +1895,74 @@ command = ["sleep", "600"]
         })
         .await;
 
+        host.shutdown().await;
+    }
+
+    /// A plugin that is gone from the registry has its published suggestions
+    /// cleared once its worker stops; a merely disabled one keeps them.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reconcile_clears_suggestions_of_an_uninstalled_plugin_only() {
+        use crate::session::update_config;
+
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("XDG_CONFIG_HOME", temp.path().to_path_buf()),
+            ("HOME", temp.path().to_path_buf()),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        let plugin_id = "acme.sleeper";
+        install_sleeper(plugin_id);
+        let registry = crate::plugin::reload_registry();
+        let host = PluginHost::new(
+            &temp.path().join("host"),
+            "default",
+            None,
+            std::sync::Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
+        host.start(&registry).await;
+        wait_until("the worker", || async {
+            worker_pid(&host, plugin_id).await.is_some()
+        })
+        .await;
+        let published = || {
+            host.api.with_suggestions_db(|conn, _| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM suggestion_providers WHERE provider_id = ?1",
+                    [plugin_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+            })
+        };
+        host.api.with_suggestions_db(|conn, _| {
+            conn.execute(
+                "INSERT INTO suggestion_providers (profile, provider_id, updated_at) VALUES ('p', ?1, 0)",
+                [plugin_id],
+            )
+            .unwrap();
+        });
+
+        update_config(|config| config.plugins.get_mut(plugin_id).unwrap().enabled = false).unwrap();
+        host.reconcile(&crate::plugin::reload_registry()).await;
+        assert!(host.state.lock().await.running.is_empty());
+        assert_eq!(published(), 1);
+
+        update_config(|config| config.plugins.get_mut(plugin_id).unwrap().enabled = true).unwrap();
+        host.reconcile(&crate::plugin::reload_registry()).await;
+        wait_until("the worker again", || async {
+            worker_pid(&host, plugin_id).await.is_some()
+        })
+        .await;
+
+        update_config(|config| config.plugins.remove(plugin_id)).unwrap();
+        std::fs::remove_dir_all(crate::plugin::plugins_dir().unwrap().join(plugin_id)).unwrap();
+        host.reconcile(&crate::plugin::reload_registry()).await;
+        assert!(host.state.lock().await.running.is_empty());
+        assert_eq!(published(), 0);
         host.shutdown().await;
     }
 

@@ -283,6 +283,36 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/plugins/{id}/pages/{page_id}/ticket",
             post(api::mint_plugin_page_ticket),
         )
+        .route("/api/suggestions", get(api::get_suggestions))
+        .route("/api/suggestions/refresh", post(api::refresh_suggestions))
+        .route(
+            "/api/suggestions/checks/run",
+            post(api::run_suggestion_checks),
+        )
+        .route("/api/suggestions/fix", post(api::run_suggestion_fix))
+        .route("/api/suggestions/dismiss", post(api::dismiss_suggestion))
+        .route(
+            "/api/suggestions/undismiss",
+            post(api::undismiss_suggestion),
+        )
+        .route(
+            "/api/suggestions/sources",
+            patch(api::update_suggestion_source),
+        )
+        .route("/api/suggestions/prefs", patch(api::patch_suggestion_prefs))
+        .route(
+            "/api/suggestions/templates",
+            get(api::get_suggestion_templates)
+                .put(api::put_suggestion_template)
+                .delete(api::delete_suggestion_template),
+        )
+        .route("/api/suggestions/prepare", post(api::prepare_suggestion))
+        .route(
+            "/api/suggestions/mappings",
+            get(api::list_suggestion_mappings)
+                .put(api::put_suggestion_mapping)
+                .delete(api::delete_suggestion_mapping),
+        )
         .route("/api/plugins/commands", get(api::plugin_commands))
         .route(
             "/api/plugins/commands/{fqid}/invoke",

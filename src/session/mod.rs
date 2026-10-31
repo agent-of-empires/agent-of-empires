@@ -68,12 +68,13 @@ pub use fork::{ForkDenied, ForkParentRef, ForkSeed};
 /// favorite exactly when it is pinned as one.
 pub(crate) use groups::is_live_favorite;
 pub use groups::{
-    append_archived_section, append_archived_section_by_project, append_trash_section,
-    archived_project_sub_path, flatten_sessions_by_attention, flatten_tree,
-    flatten_tree_all_profiles, is_archived_section_path, is_synthetic_project_header,
-    is_trash_section_path, is_within_archived_section, is_within_trash_section,
-    project_group_display_name, Group, GroupTree, Item, ARCHIVED_SECTION_NAME,
-    ARCHIVED_SECTION_PATH, SCRATCH_GROUP_NAME, SCRATCH_GROUP_PATH, TRASH_SECTION_NAME,
+    append_archived_section, append_archived_section_by_project, append_suggested_section,
+    append_trash_section, archived_project_sub_path, flatten_sessions_by_attention, flatten_tree,
+    flatten_tree_all_profiles, is_archived_section_path, is_suggested_section_path,
+    is_synthetic_project_header, is_trash_section_path, is_within_archived_section,
+    is_within_trash_section, project_group_display_name, Group, GroupTree, Item,
+    ARCHIVED_SECTION_NAME, ARCHIVED_SECTION_PATH, SCRATCH_GROUP_NAME, SCRATCH_GROUP_PATH,
+    SUGGESTED_PREVIEW_ROWS, SUGGESTED_SECTION_NAME, SUGGESTED_SECTION_PATH, TRASH_SECTION_NAME,
     TRASH_SECTION_PATH,
 };
 #[cfg(test)]
@@ -98,8 +99,8 @@ pub use instance::{
     LegacyToolObservation, LifecycleOperation, LifecycleReservation, LifecycleReservationError,
     ManagedResumeCause, PaneObservation, PanePresence, PendingInitialTurn, PluginCreateIdempotency,
     PollerStart, SandboxInfo, SessionBucket, SessionGone, StartBlocked, StartOutcome, Status,
-    TerminalInfo, TmuxServerIdentity, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
-    SESSION_COLORS, TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR,
+    SuggestionOrigin, TerminalInfo, TmuxServerIdentity, View, WorkspaceInfo, WorkspaceRepo,
+    WorktreeInfo, SESSION_COLORS, TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR,
 };
 pub(crate) use instance::{
     ConversationState, LaunchReservation, ManagedResumeRefused, ResumeAttemptPolicy,

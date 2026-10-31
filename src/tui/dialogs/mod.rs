@@ -56,7 +56,7 @@ pub use hooks_install::HooksInstallDialog;
 pub use info::InfoDialog;
 pub use intro::{IntroDialog, IntroOutcome};
 pub(crate) use new_session::project_picker_label;
-pub use new_session::{NewSessionData, NewSessionDialog};
+pub use new_session::{NewSessionData, NewSessionDialog, PromptOrigin};
 pub use no_agents::{NoAgentsAction, NoAgentsDialog};
 pub use option_picker::{GroupPickerDialog, SortPickerDialog};
 pub use permission_response::{PermissionResponseChoice, PermissionResponseDialog};

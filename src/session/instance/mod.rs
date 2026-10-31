@@ -125,7 +125,8 @@ pub(crate) enum TerminalContextResume {
 pub use types::{
     AuxiliaryObservation, AuxiliaryTarget, LegacyToolAdoption, LegacyToolIdentity,
     LegacyToolObservation, PaneObservation, PanePresence, PluginCreateIdempotency, SandboxInfo,
-    TerminalInfo, TmuxServerIdentity, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
+    SuggestionOrigin, TerminalInfo, TmuxServerIdentity, View, WorkspaceInfo, WorkspaceRepo,
+    WorktreeInfo,
 };
 pub(crate) use types::{
     PrimeAgentCapturePlan, PriorToolSession, ResumeIntent, SandboxPin, SandboxStoreTransitionPath,
@@ -203,6 +204,10 @@ pub struct PendingInitialTurn {
     /// once, before the park.
     #[serde(default)]
     pub synthesized: bool,
+    /// Why a terminal session's initial prompt was not typed. An errored turn
+    /// is not retried; the user's next terminal send discards it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -595,6 +600,11 @@ pub struct Instance {
     /// releases the key. Additive: absent in older rows, no migration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin_create_idempotency: Option<PluginCreateIdempotency>,
+
+    /// Suggestion this session was started from. Additive: absent in older
+    /// rows, so no migration is needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggestion: Option<SuggestionOrigin>,
     /// Set by a plugin's `sessions.turn.send` right before waking a resting session, under the
     /// same `instances` write lock that decides to revive it, so the plugin active-session cap
     /// treats it as occupying a slot immediately rather than waiting for a status to land.
