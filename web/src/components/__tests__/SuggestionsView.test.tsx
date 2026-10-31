@@ -72,6 +72,7 @@ const snapshot = (over: Partial<SuggestionsSnapshot> = {}): SuggestionsSnapshot 
     sidebar: false,
     refresh_minutes: 15,
     start_without_review: false,
+    show_source_ref: true,
     provider_order: ["github"],
   },
   ...over,
@@ -180,7 +181,7 @@ describe("SuggestionsView", () => {
       expect(screen.queryByRole("button", { name: "Start" })).toBeNull();
       const row = (await screen.findByText("Fix lifecycle")).closest("li") as HTMLElement;
       expect(row.querySelector("p:nth-of-type(2)")?.textContent).toBe(
-        "GitHub · ⠋ Session running · Review RFC 4562 · started 3 min ago · aoe",
+        "GitHub · example/1 · ⠋ Session running · Review RFC 4562 · started 3 min ago · aoe",
       );
       fireEvent.click(screen.getByRole("button", { name: "Open" }));
       expect(onPrepare.onOpenSession).toHaveBeenCalledWith("sess-1");
@@ -276,13 +277,13 @@ describe("SuggestionsView", () => {
     expect(onPrepare).not.toHaveBeenCalled();
   });
 
-  it("renders one compact row: title, then Source, reason and Project, with no preview or chip", async () => {
+  it("renders one compact row: title, then Source, reference, reason and Project, with no preview or chip", async () => {
     await open(snapshot());
     const row = (await screen.findByText("Fix lifecycle")).closest("li") as HTMLElement;
     expect(row.textContent).not.toContain("UNTRUSTED BODY");
     expect(row.querySelector("a")).toBeNull();
     const meta = row.querySelector("p:nth-of-type(2)") as HTMLElement;
-    expect(meta.textContent).toBe("GitHub · Assigned to you · aoe");
+    expect(meta.textContent).toBe("GitHub · example/1 · Assigned to you · aoe");
     expect(meta.firstElementChild?.className).toContain("font-mono");
   });
 

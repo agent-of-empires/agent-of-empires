@@ -29,6 +29,7 @@ const snapshot = (): SuggestionsSnapshot => ({
     sidebar: false,
     refresh_minutes: 15,
     start_without_review: false,
+    show_source_ref: true,
     provider_order: ["gh", "lin"],
   },
   providers: [
@@ -131,6 +132,8 @@ describe("SuggestionsSettings", () => {
 
     fireEvent.click(screen.getByRole("switch", { name: "Show in sidebar" }));
     await waitFor(() => expect(api.updateSuggestionPrefs).toHaveBeenCalledWith({ sidebar: true }));
+    fireEvent.click(screen.getByRole("switch", { name: "Show source reference" }));
+    await waitFor(() => expect(api.updateSuggestionPrefs).toHaveBeenCalledWith({ show_source_ref: false }));
     fireEvent.click(screen.getByRole("switch", { name: "Show Linear suggestions" }));
     await waitFor(() => expect(api.updateSuggestionPrefs).toHaveBeenCalledWith({ provider_enabled: { lin: false } }));
     fireEvent.change(screen.getByLabelText("Refresh every"), { target: { value: "60" } });

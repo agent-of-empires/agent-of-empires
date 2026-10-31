@@ -55,6 +55,7 @@ If a provider is switched off, its items are hidden and the view says "<provider
 | Setting | What it does |
 |---|---|
 | Show suggestions on the homepage | The homepage section. |
+| Show source reference | Shows where each suggestion comes from, such as `owner/repo#123`, after the provider name on the web and TUI rows. On by default. |
 | Providers | Drag to order (Alt+↑/↓ on a focused row, a move-up button on a phone). Each has an on/off switch and a **Show** checkbox per kind of suggestion. A provider that uses an agent says so, since it spends your agent usage. A provider error can carry a fix button from the plugin. |
 | Refresh every | 5 min, 15 min, 30 min, 1 h or 2 h. A hint sent to plugins; they may refresh less often. |
 | Dismissed suggestions | **Show** opens the Dismissed filter. |

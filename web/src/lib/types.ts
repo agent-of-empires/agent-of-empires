@@ -608,6 +608,8 @@ export interface SuggestionPrefs {
   refresh_minutes: number;
   /** Start creates the session from the prepared draft instead of opening the wizard. */
   start_without_review: boolean;
+  /** Rows show each item's `source_ref`. */
+  show_source_ref: boolean;
   /** Every provider id, in the order the user set. */
   provider_order: string[];
 }

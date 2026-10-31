@@ -17,6 +17,7 @@ function store() {
       sidebar: false,
       refresh_minutes: 15,
       start_without_review: false,
+      show_source_ref: true,
       provider_order: ["github", "linear"],
     },
     providers: [
