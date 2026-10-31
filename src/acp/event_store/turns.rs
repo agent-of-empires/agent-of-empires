@@ -442,7 +442,8 @@ impl EventStore {
             conn.query_row(
                 "SELECT MAX(seq) FROM acp_events
                  WHERE session_id = ?1
-                   AND json_extract(event_json, '$.UserPromptSent') IS NOT NULL",
+                   AND (json_extract(event_json, '$.UserPromptSent') IS NOT NULL
+                     OR json_extract(event_json, '$.UserDiffCommentsPrompt') IS NOT NULL)",
                 params![session_id],
                 |row| row.get::<_, Option<i64>>(0),
             ),
@@ -469,6 +470,33 @@ impl EventStore {
             session_id,
         )?;
         Some(terminator.is_none())
+    }
+
+    /// A native prompt completion may be adopted only for an open main turn.
+    /// Background work is restored independently and does not reopen its parent.
+    pub fn has_in_flight_main_turn(&self, session_id: &str) -> bool {
+        self.latest_prompt_state(session_id) == Some(true)
+    }
+
+    /// Restore the unsuccessful-main fence, not display activity or replay
+    /// permission. Ambient/administrative stops and diagnostics cannot erase a
+    /// real failure; a new input, conversation boundary or genuine outcome can.
+    pub fn has_unsuccessful_main_outcome(&self, session_id: &str) -> bool {
+        logged(
+            self.conn().query_row(
+                "SELECT COALESCE(json_extract(event_json, '$.Stopped.reason')
+                    IN ('prompt_failed', 'rate_limited', ?2), 0)
+                 FROM acp_events WHERE session_id = ?1 AND (
+                    discriminant IN ('UserPromptSent', 'UserDiffCommentsPrompt', 'SessionCleared', 'AgentSwitched')
+                    OR (discriminant = 'Stopped' AND json_extract(event_json, '$.Stopped.reason')
+                        IN ('prompt_failed', 'rate_limited', ?2, 'prompt_complete',
+                            'cancelled', 'max_tokens', 'refusal', 'max_turn_requests')))
+                 ORDER BY seq DESC LIMIT 1",
+                params![session_id, crate::acp::state::RATE_LIMIT_EXHAUSTED_RETRIES_REASON],
+                |row| row.get::<_, bool>(0),
+            ).optional(),
+            "unsuccessful main outcome", session_id,
+        ).flatten().unwrap_or(false)
     }
 
     /// True while a main turn, background task, or recently reporting background agent is open.
@@ -704,10 +732,10 @@ mod tests {
             message: "boom".into(),
             native_subject: None,
         };
-        // (events, in flight)
+        // (events, any native work, adoptable main prompt)
         let cases = [
-            (vec![], false),
-            (vec![user_prompt("go"), agent_chunk("thinking")], true),
+            (vec![], false, false),
+            (vec![user_prompt("go"), agent_chunk("thinking")], true, true),
             (
                 vec![
                     user_prompt("go"),
@@ -715,8 +743,9 @@ mod tests {
                     stopped("prompt_complete"),
                 ],
                 false,
+                false,
             ),
-            (vec![user_prompt("go"), startup_error], false),
+            (vec![user_prompt("go"), startup_error], false, false),
             (
                 vec![
                     user_prompt("first"),
@@ -725,16 +754,40 @@ mod tests {
                     agent_chunk("mid"),
                 ],
                 true,
+                true,
             ),
             (
                 vec![user_prompt("go"), stopped("prompt_complete"), progress()],
                 true,
+                false,
+            ),
+            (
+                vec![user_prompt("go"), stopped("rate_limited"), progress()],
+                true,
+                false,
+            ),
+            (
+                vec![
+                    user_prompt("completed main"),
+                    stopped("prompt_complete"),
+                    progress(),
+                    Event::UserDiffCommentsPrompt {
+                        intro: "review changes".into(),
+                        outro: String::new(),
+                        is_multi_repo: false,
+                        comments: Vec::new(),
+                        assembled_markdown: "review these changes".into(),
+                    },
+                ],
+                true,
+                true,
             ),
         ];
-        for (i, (events, in_flight)) in cases.into_iter().enumerate() {
+        for (i, (events, in_flight, main_active)) in cases.into_iter().enumerate() {
             let id = format!("s-{i}");
             record_from(&store, &id, 1, events);
             assert_eq!(store.has_in_flight_turn(&id), in_flight, "case {i}");
+            assert_eq!(store.has_in_flight_main_turn(&id), main_active, "case {i}");
         }
 
         let completed = Event::BackgroundAgentCompleted {
@@ -763,6 +816,92 @@ mod tests {
         assert!(
             !store.has_in_flight_turn("stale"),
             "a silent background agent is gone"
+        );
+    }
+
+    #[test]
+    fn unsuccessful_main_outcome_survives_ambient_progress_until_a_genuine_boundary() {
+        let (_tmp, store) = open_store(1000);
+        for reason in [
+            "prompt_failed",
+            "rate_limited",
+            crate::acp::state::RATE_LIMIT_EXHAUSTED_RETRIES_REASON,
+        ] {
+            let boundaries = [
+                user_prompt("next explicit prompt"),
+                Event::UserDiffCommentsPrompt {
+                    intro: "review".into(),
+                    outro: String::new(),
+                    is_multi_repo: false,
+                    comments: Vec::new(),
+                    assembled_markdown: "review changes".into(),
+                },
+                stopped("prompt_complete"),
+                Event::SessionCleared,
+                Event::AgentSwitched {
+                    from: "claude".into(),
+                    to: "codex".into(),
+                    reason: "explicit".into(),
+                },
+            ];
+            for (index, boundary) in boundaries.into_iter().enumerate() {
+                let id = format!("failed-{reason}-{index}");
+                let prefix = [
+                    user_prompt("original"),
+                    stopped(reason),
+                    Event::BackgroundAgentProgress {
+                        agent_id: "survivor".into(),
+                        status: BackgroundAgentStatus::Running,
+                        tool_count: 1,
+                        tools: Vec::new(),
+                        last_tool: None,
+                        last_text: None,
+                        at: chrono::Utc::now(),
+                    },
+                    agent_chunk("ambient progress after the failed turn"),
+                    stopped("agent_idle"),
+                    Event::PromptRuntimeError {
+                        message: "a later diagnostic is not a main outcome".into(),
+                        evidence: None,
+                        native_subject: None,
+                    },
+                    Event::AcpSessionAssigned {
+                        acp_session_id: "same-native".into(),
+                        connection_ready: false,
+                        native_subject: None,
+                    },
+                ];
+                record_from(&store, &id, 1, prefix);
+                assert!(store.has_unsuccessful_main_outcome(&id));
+                assert!(!store.has_in_flight_main_turn(&id));
+                assert!(
+                    store.has_in_flight_turn(&id),
+                    "surviving background work is independent"
+                );
+                store.record(&id, 8, &boundary).unwrap();
+                assert!(
+                    !store.has_unsuccessful_main_outcome(&id),
+                    "genuine boundary {index} supersedes {reason}"
+                );
+            }
+        }
+        record_from(
+            &store,
+            "diagnostic-only",
+            1,
+            [
+                user_prompt("unfinished main"),
+                Event::PromptRuntimeError {
+                    message: "diagnostic before terminal".into(),
+                    evidence: None,
+                    native_subject: None,
+                },
+            ],
+        );
+        assert!(store.has_in_flight_main_turn("diagnostic-only"));
+        assert!(
+            !store.has_unsuccessful_main_outcome("diagnostic-only"),
+            "a diagnostic is not a completed main outcome"
         );
     }
 

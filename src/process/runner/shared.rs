@@ -6,8 +6,8 @@ use super::jsonrpc::{
     parse_response_id,
 };
 use crate::acp::control_protocol::{
-    self, ControlBody, NativeChannelAvailability, NativeChannelLossCause, NativeChannelLostMarker,
-    PromptCompletedMarker, SessionReplayed,
+    self, ControlBody, HandshakeFailure, HandshakeFailureOrigin, NativeChannelAvailability,
+    NativeChannelLossCause, NativeChannelLostMarker, PromptCompletedMarker, SessionReplayed,
 };
 use crate::process::worker_registry;
 use agent_client_protocol::JsonRpcMessage;
@@ -1141,19 +1141,27 @@ impl RunnerShared {
         agent_stdin: &Mutex<tokio::process::ChildStdin>,
         request: serde_json::Value,
         dispatch_release: &mut Option<tokio::sync::oneshot::Sender<()>>,
-    ) -> Result<serde_json::Value, serde_json::Value> {
+    ) -> Result<serde_json::Value, HandshakeFailure> {
         let _gate = self.handshake_gate.lock().await;
         if let Some(cached) = self.handshake.lock().await.initialized.clone() {
             return Ok(cached);
         }
         if self.native_loss().is_some() {
-            return Err(transport_error("native channel unavailable"));
+            return Err(HandshakeFailure::new(
+                HandshakeFailureOrigin::LocalTransport,
+                transport_error("native channel unavailable"),
+            ));
         }
         let response = self
             .agent_request(agent_stdin, "initialize", request, dispatch_release)
             .await
-            .ok_or_else(|| transport_error("agent closed before answering initialize"))?;
-        let result = handshake_result(&response)?;
+            .ok_or_else(|| {
+                HandshakeFailure::new(
+                    HandshakeFailureOrigin::LocalTransport,
+                    transport_error("agent closed before answering initialize"),
+                )
+            })?;
+        let result = handshake_result(response)?;
         self.handshake.lock().await.initialized = Some(result.clone());
         Ok(result)
     }
@@ -1164,22 +1172,36 @@ impl RunnerShared {
         method: &str,
         request: serde_json::Value,
         dispatch_release: &mut Option<tokio::sync::oneshot::Sender<()>>,
-    ) -> Result<(String, serde_json::Value), serde_json::Value> {
+    ) -> Result<(String, serde_json::Value), HandshakeFailure> {
         let _gate = self.handshake_gate.lock().await;
         if let Some(cached) = self.handshake.lock().await.session.clone() {
             return Ok(cached);
         }
         if self.native_loss().is_some() {
-            return Err(transport_error("native channel unavailable"));
+            return Err(HandshakeFailure::new(
+                HandshakeFailureOrigin::LocalTransport,
+                transport_error("native channel unavailable"),
+            ));
         }
         let response = self
             .agent_request(agent_stdin, method, request.clone(), dispatch_release)
             .await
-            .ok_or_else(|| transport_error(&format!("agent closed before answering {method}")))?;
-        let result = handshake_result(&response)?;
-        let acp_session_id = established_session_id(method, &request, &result)?;
+            .ok_or_else(|| {
+                HandshakeFailure::new(
+                    HandshakeFailureOrigin::LocalTransport,
+                    transport_error(&format!("agent closed before answering {method}")),
+                )
+            })?;
+        let result = handshake_result(response)?;
+        let acp_session_id = established_session_id(method, &request, &result)
+            .map_err(|error| HandshakeFailure::new(HandshakeFailureOrigin::LocalResult, error))?;
         self.persist_acp_session_id(&acp_session_id)
-            .map_err(|error| serde_json::to_value(error).expect("JSON-RPC error serializes"))?;
+            .map_err(|error| {
+                HandshakeFailure::new(
+                    HandshakeFailureOrigin::LocalState,
+                    serde_json::to_value(error).expect("JSON-RPC error serializes"),
+                )
+            })?;
         let cached = (acp_session_id, result);
         self.handshake.lock().await.session = Some(cached.clone());
         Ok(cached)
@@ -1194,33 +1216,32 @@ impl RunnerShared {
     /// registered, so its sent resets are visible here.
     pub(super) async fn resume_session(
         &self,
-    ) -> Result<(String, serde_json::Value), serde_json::Value> {
+    ) -> Result<(String, serde_json::Value), HandshakeFailure> {
         loop {
             let finished = self.reset_finished.notified();
             tokio::pin!(finished);
             finished.as_mut().enable();
             if self.native_loss().is_some() {
-                return self
-                    .handshake
-                    .lock()
-                    .await
-                    .session
-                    .clone()
-                    .ok_or_else(|| transport_error("native channel unavailable"));
+                return self.handshake.lock().await.session.clone().ok_or_else(|| {
+                    HandshakeFailure::new(
+                        HandshakeFailureOrigin::LocalTransport,
+                        transport_error("native channel unavailable"),
+                    )
+                });
             }
             if self.pending_resets.load(Ordering::Acquire) == 0 {
                 if self.fatal.load(Ordering::Acquire) {
-                    return Err(transport_error(
-                        "runner session state could not be committed",
+                    return Err(HandshakeFailure::new(
+                        HandshakeFailureOrigin::LocalState,
+                        transport_error("runner session state could not be committed"),
                     ));
                 }
-                return self
-                    .handshake
-                    .lock()
-                    .await
-                    .session
-                    .clone()
-                    .ok_or_else(|| transport_error("runner has no established session to resume"));
+                return self.handshake.lock().await.session.clone().ok_or_else(|| {
+                    HandshakeFailure::new(
+                        HandshakeFailureOrigin::LocalState,
+                        transport_error("runner has no established session to resume"),
+                    )
+                });
             }
             finished.await;
         }
@@ -1329,15 +1350,37 @@ pub(super) fn rpc_request(id: i64, method: &str, params: serde_json::Value) -> s
 }
 
 pub(super) fn handshake_result(
-    response: &serde_json::Value,
-) -> Result<serde_json::Value, serde_json::Value> {
-    if let Some(err) = response.get("error") {
-        return Err(err.clone());
+    mut response: serde_json::Value,
+) -> Result<serde_json::Value, HandshakeFailure> {
+    let invalid = || {
+        HandshakeFailure::new(
+            HandshakeFailureOrigin::LocalResult,
+            transport_error("invalid native handshake response"),
+        )
+    };
+    if response.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0") {
+        return Err(invalid());
     }
-    response
-        .get("result")
-        .cloned()
-        .ok_or_else(|| transport_error("response had neither result nor error"))
+    let object = response.as_object_mut().ok_or_else(invalid)?;
+    let result = object.remove("result");
+    if let Some(error) = object.remove("error") {
+        let valid = result.is_none()
+            && error.as_object().is_some_and(|error| {
+                error
+                    .get("code")
+                    .and_then(serde_json::Value::as_i64)
+                    .is_some_and(|code| i32::try_from(code).is_ok())
+                    && error
+                        .get("message")
+                        .is_some_and(serde_json::Value::is_string)
+            });
+        return Err(if valid {
+            HandshakeFailure::new(HandshakeFailureOrigin::NativeResponse, error)
+        } else {
+            invalid()
+        });
+    }
+    result.ok_or_else(invalid)
 }
 
 /// `session/load` responses carry no id per ACP; an extension id must agree with the request.
@@ -1439,6 +1482,129 @@ mod tests {
         })
         .await
         .expect("agent echo did not reach the stream fence")
+    }
+
+    #[tokio::test]
+    async fn fork_failure_origin_requires_the_correlated_native_response() {
+        for malformed in [false, true] {
+            let (shared, stdin, mut child) = shared_with_stdin().await;
+            let stdin = Arc::new(stdin);
+            let requester = shared.clone();
+            let input = stdin.clone();
+            let call = tokio::spawn(async move {
+                let mut release = None;
+                let result = requester
+                    .run_or_replay_session(
+                        &input,
+                        "session/fork",
+                        serde_json::json!({"sessionId":"original-parent"}),
+                        &mut release,
+                    )
+                    .await;
+                drop(release);
+                result
+            });
+            // Read a real newline from the child pipe instead of inserting a
+            // fence ahead of the still-scheduled request writer.
+            use tokio::io::{AsyncBufReadExt as _, BufReader};
+            let mut output = BufReader::new(child.stdout.take().unwrap());
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(10), output.read_line(&mut line))
+                .await
+                .unwrap()
+                .unwrap();
+            let sent: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(sent["method"], "session/fork");
+            assert_eq!(sent["params"]["sessionId"], "original-parent");
+            let id = sent["id"].as_i64().unwrap();
+            let unrelated = serde_json::to_vec(&serde_json::json!({
+                "jsonrpc":"2.0","id":id + 100,
+                "error":{"code":-32603,"message":"unrelated native rejection"}
+            }))
+            .unwrap();
+            shared.deliver_line(&unrelated, &stdin).await;
+            assert!(shared
+                .pending_client_responses
+                .lock()
+                .await
+                .contains_key(&id));
+            assert!(
+                !call.is_finished(),
+                "an unrelated response grants no fork authority"
+            );
+            let code = if malformed {
+                serde_json::json!("invalid")
+            } else {
+                serde_json::json!(-32603)
+            };
+            let response = serde_json::to_vec(&serde_json::json!({
+                "jsonrpc":"2.0","id":id,
+                "error":{"code":code,"message":"native fork rejected",
+                    "data":{"origin":"native_response","method":"session/fork"}}
+            }))
+            .unwrap();
+            shared.deliver_line(&response, &stdin).await;
+            let failure = tokio::time::timeout(Duration::from_secs(10), call)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(
+                failure.origin,
+                if malformed {
+                    HandshakeFailureOrigin::LocalResult
+                } else {
+                    HandshakeFailureOrigin::NativeResponse
+                }
+            );
+            assert!(shared.pending_client_responses.lock().await.is_empty());
+            assert!(shared.acp_session_id().await.is_none());
+            assert!(shared.handshake.lock().await.session.is_none());
+            child.kill().await.unwrap();
+            child.wait().await.unwrap();
+        }
+        let (shared, stdin, mut child) = shared_with_stdin().await;
+        child.kill().await.unwrap();
+        child.wait().await.unwrap();
+        let mut release = None;
+        let failure = tokio::time::timeout(
+            Duration::from_secs(10),
+            shared.run_or_replay_session(
+                &stdin,
+                "session/fork",
+                serde_json::json!({"sessionId":"original-parent"}),
+                &mut release,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(failure.origin, HandshakeFailureOrigin::LocalTransport);
+        assert!(shared.pending_client_responses.lock().await.is_empty());
+        assert!(shared.acp_session_id().await.is_none());
+        assert!(shared.handshake.lock().await.session.is_none());
+    }
+
+    #[test]
+    fn handshake_failure_origin_requires_a_genuine_error_response() {
+        let rejected = handshake_result(serde_json::json!({
+            "jsonrpc":"2.0","id":1,
+            "error":{"code":-32603,"message":"native rejection","data":{"origin":"local_transport"}}
+        }))
+        .unwrap_err();
+        assert_eq!(rejected.origin, HandshakeFailureOrigin::NativeResponse);
+        assert_eq!(rejected.error["message"], "native rejection");
+        for invalid in [
+            serde_json::json!({"jsonrpc":"2.0","id":1,"result":{},"error":{"code":-32603,"message":"ambiguous"}}),
+            serde_json::json!({"jsonrpc":"2.0","id":1,"error":{"code":"-32603","message":"invalid","data":{"origin":"native_response"}}}),
+            serde_json::json!({"id":1,"error":{"code":-32603,"message":"invalid protocol"}}),
+            serde_json::json!({"jsonrpc":"2.0","id":1}),
+        ] {
+            assert_eq!(
+                handshake_result(invalid).unwrap_err().origin,
+                HandshakeFailureOrigin::LocalResult
+            );
+        }
     }
 
     #[test]
@@ -1953,6 +2119,7 @@ mod tests {
                 vec![],
                 "same-native".into(),
                 true,
+                false,
                 AcpSessionId("retained-bytes".into()),
                 None,
                 "codex".into(),

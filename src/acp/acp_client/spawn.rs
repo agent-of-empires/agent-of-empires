@@ -1001,7 +1001,7 @@ mod tests {
             .expect("timed out waiting for the connection to end")
         {
             match event {
-                Event::SessionContextReset { reason } => kinds.push(format!("reset:{reason}")),
+                Event::SessionContextReset { reason, .. } => kinds.push(format!("reset:{reason}")),
                 Event::RateLimit { info } => kinds.push(format!("rate_limit:{}", info.kind)),
                 Event::Stopped { reason } => kinds.push(format!("stopped:{reason}")),
                 Event::AgentStartupError { message, .. } => {

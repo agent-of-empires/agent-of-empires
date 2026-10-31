@@ -1371,6 +1371,12 @@ pub(crate) trait SessionStore: Send + Sync {
     /// Runs synchronously, at most once and exactly once on success.
     /// Mutation errors must prevent the write.
     fn commit(&self, mutation: &mut SessionMutation<'_>) -> Result<()>;
+    /// Canonical post-launch metadata checkpoint on this already bound store.
+    /// The mutation must fence its original physical context, producer and full
+    /// selection. Launch-only presentation fields are not metadata authority.
+    fn commit_metadata_checkpoint(&self, mutation: &mut SessionMutation<'_>) -> Result<()> {
+        self.commit(mutation)
+    }
     fn release_lifecycle_reservation(
         &self,
         id: &str,

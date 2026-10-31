@@ -1033,7 +1033,9 @@ async fn a_manual_prompt_cannot_overtake_a_continuation_install() {
                 // B is blocked on the guard, so the queue is still empty here
                 // and the producer must decide the continuation stands.
                 let outcome = crate::server::acp_reconciler::install_rate_limit_continuation(
-                    &state, &id, submission,
+                    &state,
+                    &id,
+                    &submission,
                 )
                 .await;
                 assert!(matches!(
@@ -1682,17 +1684,21 @@ async fn current_owned_native_receipt_needs_no_historical_ready_and_refreshes_be
         .await
         .unwrap();
     carried.client.test_observe_native_loss();
-    let projection = state.session_service.acp_control_cache.native_projection(
-        id,
-        None,
-        0,
-        Some((
-            row.source_profile.clone(),
-            row.created_at,
-            row.lifecycle_generation,
-        )),
-        Some(carried),
-    );
+    let projection = state
+        .session_service
+        .acp_control_cache
+        .native_projection(
+            id,
+            None,
+            0,
+            Some((
+                row.source_profile.clone(),
+                row.created_at,
+                row.lifecycle_generation,
+            )),
+            Some(carried),
+        )
+        .unwrap();
     assert!(!projection.ready);
     assert_eq!(
         projection.unavailable.unwrap().cause,

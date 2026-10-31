@@ -36,7 +36,8 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     /// What the drain task records for a worker that failed before establishing a session.
     pub(crate) fn note_startup_failure(&self, session_id: &str) {
-        lock_recover(&self.startup_failures).insert(session_id.to_string());
+        lock_recover(&self.startup_failures)
+            .insert(session_id.to_string(), super::StartupFailure::Retry);
     }
 
     /// Leave the session mid-teardown, where an unproven settlement parks it.
@@ -549,8 +550,19 @@ impl ProcessControl for ObservedProcessControl {
     }
 }
 
-/// A real child identity and compatible control socket. The first initialize stays
-/// unanswered until its exact connection closes. The second resumes the same turn.
+enum AttachPeerMode {
+    Normal,
+    FailedMain,
+    IncompatibleHello(Lease),
+    RecordPrompt,
+}
+
+enum HeldChild {
+    Retained(std::process::Child),
+    Constructor(Option<tokio::process::Child>),
+}
+
+/// A real child-owned control peer with causal handshake, replay and prompt gates.
 pub(crate) struct HeldAttachRunner {
     pub(crate) record: WorkerRecord,
     pub(crate) identity: RunnerIdentity,
@@ -558,8 +570,9 @@ pub(crate) struct HeldAttachRunner {
     disconnected: Option<tokio::sync::oneshot::Receiver<()>>,
     completion: Option<std::process::ChildStdin>,
     resumed: mpsc::Receiver<String>,
+    prompts: mpsc::Receiver<serde_json::Value>,
     peer: tokio::task::JoinHandle<()>,
-    child: std::process::Child,
+    child: HeldChild,
     _socket_dir: tempfile::TempDir,
 }
 
@@ -570,7 +583,16 @@ impl HeldAttachRunner {
         generation: u64,
         profile: Option<&str>,
     ) -> Self {
-        Self::with_initialize_hold(session_id, cwd, generation, profile, true, None).await
+        Self::with_initialize_hold(
+            session_id,
+            cwd,
+            generation,
+            profile,
+            true,
+            None,
+            AttachPeerMode::Normal,
+        )
+        .await
     }
 
     /// Complete both real attach handshakes without an outstanding native prompt.
@@ -581,7 +603,72 @@ impl HeldAttachRunner {
         profile: Option<&str>,
         native_id: Option<&str>,
     ) -> Self {
-        Self::with_initialize_hold(session_id, cwd, generation, profile, false, native_id).await
+        Self::with_initialize_hold(
+            session_id,
+            cwd,
+            generation,
+            profile,
+            false,
+            native_id,
+            AttachPeerMode::Normal,
+        )
+        .await
+    }
+
+    pub(crate) async fn failed_main_replay(
+        session_id: &str,
+        cwd: &std::path::Path,
+        generation: u64,
+        profile: Option<&str>,
+        native_id: &str,
+    ) -> Self {
+        Self::with_initialize_hold(
+            session_id,
+            cwd,
+            generation,
+            profile,
+            false,
+            Some(native_id),
+            AttachPeerMode::FailedMain,
+        )
+        .await
+    }
+
+    pub(crate) async fn incompatible_hello(
+        session_id: &str,
+        cwd: &std::path::Path,
+        lease: &Lease,
+        profile: Option<&str>,
+    ) -> Self {
+        Self::with_initialize_hold(
+            session_id,
+            cwd,
+            lease.epoch(),
+            profile,
+            false,
+            None,
+            AttachPeerMode::IncompatibleHello(lease.clone()),
+        )
+        .await
+    }
+
+    pub(crate) async fn recording_prompt(
+        session_id: &str,
+        cwd: &std::path::Path,
+        generation: u64,
+        profile: Option<&str>,
+        native_id: &str,
+    ) -> Self {
+        Self::with_initialize_hold(
+            session_id,
+            cwd,
+            generation,
+            profile,
+            false,
+            Some(native_id),
+            AttachPeerMode::RecordPrompt,
+        )
+        .await
     }
 
     async fn with_initialize_hold(
@@ -591,6 +678,7 @@ impl HeldAttachRunner {
         profile: Option<&str>,
         hold_first_initialize: bool,
         native_id: Option<&str>,
+        mode: AttachPeerMode,
     ) -> Self {
         use std::os::unix::process::CommandExt as _;
         use std::process::Stdio;
@@ -604,8 +692,10 @@ impl HeldAttachRunner {
         // not an unrelated sleeper, must match the retained registry owner.
         let script = r#"
 import json, socket, struct, sys
-path, sid, native, version, hold = sys.argv[1:]
-version, hold = int(version), hold == "true"
+path, sid, native, version, hold, mode = sys.argv[1:]
+version, hold, failed = int(version), hold == "true", mode == "failed"
+if mode == "incompatible":
+    version -= 1
 def read_exact(s, count):
     data = b""
     while len(data) < count:
@@ -636,6 +726,8 @@ for attempt in range(2):
         while True:
             frame = receive(s)
             if frame is None:
+                if mode == "incompatible":
+                    print("disconnected", flush=True)
                 break
             kind = frame["kind"]
             if kind == "attach":
@@ -646,12 +738,20 @@ for attempt in range(2):
                 print("disconnected", flush=True)
                 break
             elif kind == "initialize":
-                send(s, {"kind": "initialized", "result": {"protocolVersion": 1, "agentCapabilities": {}}})
+                caps = {"promptCapabilities": {"image": True}} if mode == "record" else {}
+                send(s, {"kind": "initialized", "result": {"protocolVersion": 1, "agentCapabilities": caps}})
             elif kind == "resume_session":
                 send(s, {"kind": "session_ready", "acp_session_id": native,
                          "result": {}, "native_channel": {"state": "available"}})
                 send(s, {"kind": "notify", "method": "_aoe/session_replayed", "params": {}})
                 print("resumed", flush=True)
+                if failed:
+                    send(s, {"kind": "prompt_completed", "prompt_req_id": 77,
+                             "outcome": {"status": "error", "code": -32603,
+                                         "message": "original failed main", "data": None}})
+                    send(s, {"kind": "notify", "method": "session/update", "params": {
+                        "sessionId": native, "update": {"sessionUpdate": "usage_update",
+                        "used": 10, "size": 100, "cost": {"amount": 0.1, "currency": "USD"}}}})
                 if hold:
                     assert sys.stdin.readline() == "complete\n"
                     send(s, {"kind": "notify", "method": "session/update", "params": {
@@ -659,25 +759,55 @@ for attempt in range(2):
                         "content": {"type": "text", "text": "original producer completed"}}}})
                     send(s, {"kind": "prompt_completed", "prompt_req_id": 77,
                              "outcome": {"status": "completed", "stop_reason": "end_turn"}})
+            elif mode == "record" and kind == "prompt":
+                print("prompt:" + json.dumps(frame["request"]), flush=True)
+                send(s, {"kind": "prompt_started", "prompt_req_id": 78})
+                assert sys.stdin.readline() == "complete\n"
+                send(s, {"kind": "prompt_completed", "prompt_req_id": 78,
+                         "outcome": {"status": "completed", "stop_reason": "end_turn"}})
+            elif failed and kind == "prompt":
+                send(s, {"kind": "prompt_started", "prompt_req_id": 78})
+                send(s, {"kind": "prompt_completed", "prompt_req_id": 78,
+                         "outcome": {"status": "completed", "stop_reason": "end_turn"}})
             else:
                 raise AssertionError("unexpected attach request: " + kind)
 "#;
-        let mut child = std::process::Command::new("python3")
+        let mut command = std::process::Command::new("python3");
+        command
             .args(["-u", "-c", script])
             .arg(crate::process::worker::control_socket_sibling(&socket))
             .args([session_id, &native_id])
             .arg(crate::acp::control_protocol::CONTROL_PROTOCOL_VERSION.to_string())
             .arg(hold_first_initialize.to_string())
+            .arg(match &mode {
+                AttachPeerMode::Normal => "normal",
+                AttachPeerMode::FailedMain => "failed",
+                AttachPeerMode::IncompatibleHello(_) => "incompatible",
+                AttachPeerMode::RecordPrompt => "record",
+            })
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .process_group(0)
-            .spawn()
-            .unwrap();
-        let completion = child.stdin.take();
-        let stdout = tokio::process::ChildStdout::from_std(child.stdout.take().unwrap()).unwrap();
+            .process_group(0);
+        let (child, pid, completion, stdout) =
+            if matches!(&mode, AttachPeerMode::IncompatibleHello(_)) {
+                let mut child = tokio::process::Command::from(command)
+                    .kill_on_drop(true)
+                    .spawn()
+                    .unwrap();
+                let pid = child.id().unwrap();
+                let stdout = child.stdout.take().unwrap();
+                (HeldChild::Constructor(Some(child)), pid, None, stdout)
+            } else {
+                let mut child = command.spawn().unwrap();
+                let pid = child.id();
+                let completion = child.stdin.take();
+                let stdout =
+                    tokio::process::ChildStdout::from_std(child.stdout.take().unwrap()).unwrap();
+                (HeldChild::Retained(child), pid, completion, stdout)
+            };
         let mut record = WorkerRecord::new(
             session_id.into(),
-            child.id(),
+            pid,
             socket,
             "test-agent-acp".into(),
             "test-agent".into(),
@@ -695,11 +825,11 @@ for attempt in range(2):
             unit: format!("aoe-attach-{session_id}-{generation}.scope"),
         };
         let identity = RunnerIdentity::from_record(&record);
-        assert!(identity.birth_fingerprint.is_some());
         let (ready_tx, ready) = tokio::sync::oneshot::channel();
         let (entered_tx, entered) = tokio::sync::oneshot::channel();
         let (disconnected_tx, disconnected) = tokio::sync::oneshot::channel();
         let (resumed_tx, resumed) = mpsc::channel(2);
+        let (prompt_tx, prompts) = mpsc::channel(2);
         let peer = tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             let mut ready_tx = Some(ready_tx);
@@ -719,26 +849,51 @@ for attempt in range(2):
                     "resumed" => {
                         resumed_tx.send(native_id.clone()).await.unwrap();
                     }
+                    value if value.starts_with("prompt:") => {
+                        prompt_tx
+                            .send(serde_json::from_str(&value["prompt:".len()..]).unwrap())
+                            .await
+                            .unwrap();
+                    }
                     _ => panic!("unexpected fixture observation: {line}"),
                 }
             }
         });
-        let runner = Self {
+        let mut runner = Self {
             record,
             identity,
             entered: Some(entered),
             disconnected: Some(disconnected),
             completion,
             resumed,
+            prompts,
             peer,
             child,
             _socket_dir: socket_dir,
         };
-        tokio::time::timeout(std::time::Duration::from_secs(10), ready)
-            .await
-            .expect("fixture bound its actual child-owned socket")
-            .unwrap();
-        worker_registry::save(&runner.record).unwrap();
+        use futures_util::FutureExt as _;
+        let prepared = std::panic::AssertUnwindSafe(async {
+            assert!(identity.birth_fingerprint.is_some());
+            if let AttachPeerMode::IncompatibleHello(lease) = &mode {
+                let HeldChild::Constructor(child) = &mut runner.child else {
+                    unreachable!()
+                };
+                lease.record_spawned_child(child.take().unwrap(), identity);
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(10), ready)
+                .await
+                .expect("fixture bound its actual child-owned socket")
+                .unwrap();
+            worker_registry::save(&runner.record).unwrap();
+        })
+        .catch_unwind()
+        .await;
+        if let Err(panic) = prepared {
+            if let AttachPeerMode::IncompatibleHello(lease) = &mode {
+                runner.cleanup_constructor(lease).await;
+            }
+            std::panic::resume_unwind(panic);
+        }
         runner
     }
 
@@ -755,6 +910,10 @@ for attempt in range(2):
         self.resumed.recv().await.unwrap()
     }
 
+    pub(crate) async fn next_prompt(&mut self) -> serde_json::Value {
+        self.prompts.recv().await.unwrap()
+    }
+
     pub(crate) fn complete_turn(&mut self) {
         use std::io::Write as _;
         self.completion
@@ -763,12 +922,142 @@ for attempt in range(2):
             .write_all(b"complete\n")
             .unwrap();
     }
+
+    pub(crate) async fn wait_for_constructor(&self, lease: &Lease) {
+        let mut waited = lease.test_child_wait_completed();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            waited.wait_for(|outcome| outcome.is_some()),
+        )
+        .await
+        .expect("the original production child waiter completes")
+        .unwrap();
+        assert_eq!(*outcome, Some(true), "the original child wait succeeds");
+    }
+
+    pub(crate) async fn cleanup_constructor(&mut self, lease: &Lease) {
+        match &mut self.child {
+            HeldChild::Constructor(Some(child)) => {
+                let _ = child.kill().await;
+                child
+                    .wait()
+                    .await
+                    .expect("reap the untransferred original child");
+            }
+            HeldChild::Constructor(None) => {
+                assert_eq!(lease.spawned_runner(), Some(self.identity));
+                crate::acp::runner_lifecycle::SystemProcessControl::default()
+                    .kill_group(self.identity);
+                self.wait_for_constructor(lease).await;
+            }
+            HeldChild::Retained(_) => panic!("cleanup requires original constructor custody"),
+        }
+    }
+
+    pub(crate) fn exit_peer(&mut self) {
+        let HeldChild::Retained(child) = &mut self.child else {
+            panic!("constructor has transferred its original child");
+        };
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+}
+
+/// Reproduce an owned constructor's genuine control refusal, retaining its
+/// reservation at the exact boundary before Drop records producer completion.
+pub(crate) async fn refused_owned_constructor<S: BroadcastSink>(
+    supervisor: &Supervisor<S>,
+    row: &crate::session::Instance,
+) -> (ResumeReservation, HeldAttachRunner) {
+    let mut reservation = supervisor
+        .reserve_spawn(
+            &row.id,
+            ResumeKind::SpawnFirst,
+            worker_registry::ResumeAuthority::Explicit,
+        )
+        .await
+        .unwrap();
+    let lease = reservation.lease().clone();
+    let mut runner = HeldAttachRunner::incompatible_hello(
+        &row.id,
+        std::path::Path::new(&row.project_path),
+        &lease,
+        Some(&row.source_profile),
+    )
+    .await;
+    use futures_util::FutureExt as _;
+    let refused = std::panic::AssertUnwindSafe(async {
+        runner.record.stored_acp_session_id = None;
+        runner.record.scope = worker_registry::ScopeOwnership::Unscoped;
+        worker_registry::save(&runner.record).unwrap();
+        lease.record_scope(runner.record.scope.clone());
+        lease.record_prime(crate::acp::runner_lifecycle::PrimeOwnership::NotPrime);
+        assert_eq!(lease.spawned_runner(), Some(runner.identity));
+        let storage =
+            Arc::new(crate::session::Storage::open_reference(&row.source_profile).unwrap());
+        let scope = crate::acp::state::NativeObservationScope::capture(row, &storage).unwrap();
+        lease.set_admission(Some(super::LaunchAdmission {
+            store: storage,
+            generation: row.lifecycle_generation,
+            namespace: None,
+            native_scope: Some(scope),
+        }));
+        let result = AcpClient::attach(
+            runner.record.socket_path.clone(),
+            PathBuf::from(&row.project_path),
+            Vec::new(),
+            String::new(),
+            false,
+            false,
+            AcpSessionId(row.id.clone()),
+            None,
+            runner.record.agent_key.clone(),
+            Some(row.source_profile.clone()),
+            Some(tokio::time::Instant::now() + std::time::Duration::from_secs(3)),
+            Some(lease.clone()),
+            None,
+        )
+        .await;
+        let crate::acp::acp_client::AcpError::RetainedRuntimeUnavailable(refusal) = result
+            .err()
+            .expect("the actual child greets with the prior private protocol")
+        else {
+            panic!("expected a typed retained control refusal");
+        };
+        assert_eq!(
+            refusal.reason,
+            worker_registry::ControlRefusalReason::ProtocolIncompatible
+        );
+        assert_eq!(refusal.owner, Some(runner.identity));
+        tokio::time::timeout(std::time::Duration::from_secs(10), runner.disconnected())
+            .await
+            .expect("the refused observer closes without native initialization");
+        reservation.preserve_refused_owner();
+    })
+    .catch_unwind()
+    .await;
+    if let Err(panic) = refused {
+        runner.cleanup_constructor(&lease).await;
+        std::panic::resume_unwind(panic);
+    }
+    (reservation, runner)
 }
 
 impl Drop for HeldAttachRunner {
     fn drop(&mut self) {
         self.peer.abort();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        match &mut self.child {
+            HeldChild::Retained(child) => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            HeldChild::Constructor(Some(child)) => {
+                let _ = child.start_kill();
+            }
+            HeldChild::Constructor(None) => {
+                crate::acp::runner_lifecycle::SystemProcessControl::default()
+                    .kill_group(self.identity);
+            }
+        }
     }
 }

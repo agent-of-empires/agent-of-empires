@@ -910,6 +910,7 @@ mod tests {
             },
             crate::acp::Event::SessionContextReset {
                 reason: "late".into(),
+                fork_rejection: None,
             },
             crate::acp::Event::SessionCleared,
         ]

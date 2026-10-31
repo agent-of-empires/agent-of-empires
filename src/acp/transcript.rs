@@ -390,7 +390,7 @@ impl TranscriptModel {
                     None => vec![self.push(id, TranscriptRowKind::CompactionSummary, text.clone())],
                 }
             }
-            Event::SessionContextReset { reason } => {
+            Event::SessionContextReset { reason, .. } => {
                 let has_prior_prompt = self.rows.iter().any(|r| {
                     matches!(
                         r.kind,
@@ -1031,6 +1031,7 @@ mod tests {
         // A context-reset divider needs a reason or a prior prompt.
         let reset = |reason: &str| Event::SessionContextReset {
             reason: reason.into(),
+            fork_rejection: None,
         };
         assert!(fold([reset("")]).rows().is_empty());
         assert!(fold([reset("session/load failed: bad id")])

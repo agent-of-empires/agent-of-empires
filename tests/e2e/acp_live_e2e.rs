@@ -416,9 +416,31 @@ fn wait_for_session_loads(log: &Path, minimum: usize) -> usize {
 #[test]
 #[parallel]
 fn selected_claude_store_survives_stop_and_respawn() {
+    assert_selected_claude_store_survives_stop_and_respawn(false);
+}
+
+#[test]
+#[parallel]
+fn selected_claude_store_survives_stop_during_load() {
+    assert_selected_claude_store_survives_stop_and_respawn(true);
+}
+
+fn assert_selected_claude_store_survives_stop_and_respawn(hold_load: bool) {
     require_tmux!();
     require_node!();
-    let (h, selected, capture_dir, id) = asserted_claude_store_harness("handoff_respawn");
+    let name = if hold_load {
+        "handoff_interrupted_load"
+    } else {
+        "handoff_respawn"
+    };
+    let (h, selected, capture_dir, id) = asserted_claude_store_harness(name);
+    if hold_load {
+        std::fs::write(
+            h.home_path().join("agent.json"),
+            r#"{"turns":[],"holdLoad":true}"#,
+        )
+        .unwrap();
+    }
     let port = start_daemon(&h);
     let base = format!("http://127.0.0.1:{port}/api/sessions/{id}");
     let log = app_dir_in(h.home_path()).join("fake-acp.log");
@@ -436,6 +458,44 @@ fn selected_claude_store_survives_stop_and_respawn() {
         );
     });
     assert_eq!(wait_for_session_loads(&log, 1), 1);
+    let selected_sid = "11111111-1111-4111-8111-111111111111";
+    let held_marker = format!("session/load held sessionId={selected_sid} pid=");
+    if hold_load {
+        wait_until(Duration::from_secs(75), Duration::from_millis(50), || {
+            let contents = std::fs::read_to_string(&log).unwrap_or_default();
+            contents
+                .contains(&held_marker)
+                .then_some(())
+                .ok_or_else(|| {
+                    format!("original native Load did not enter its response gate: {contents}")
+                })
+        });
+    }
+    let enabled_row = h
+        .read_sessions()
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == id)
+        .unwrap()
+        .clone();
+    let enabled_generation = enabled_row["lifecycle_generation"]
+        .as_u64()
+        .expect("the enable transaction persists its native generation");
+    let enabled_resume_binding = enabled_row["resume_binding"].clone();
+    let enabled: agent_of_empires::session::Instance = serde_json::from_value(enabled_row).unwrap();
+    if hold_load {
+        assert_eq!(enabled.acp_session_id.as_deref(), Some(selected_sid));
+        assert_eq!(enabled.import_pending, Some(true));
+        assert_eq!(
+            enabled.agent_session_binding.as_ref().unwrap().provenance,
+            agent_of_empires::session::ConversationProvenance::Asserted,
+            "a selected target is not evidence that native Load succeeded",
+        );
+        assert!(!std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("session/load released"));
+    }
     let original: agent_of_empires::process::worker_registry::WorkerRecord =
         serde_json::from_slice(
             &std::fs::read(
@@ -456,18 +516,59 @@ fn selected_claude_store_survives_stop_and_respawn() {
 
     runtime.block_on(async {
         let client = reqwest::Client::new();
-        let response = client.delete(format!("{base}/acp")).send().await.unwrap();
+        let stopping = client.delete(format!("{base}/acp")).send();
+        tokio::pin!(stopping);
+        let mut completed_stop = None;
+        if hold_load {
+            tokio::time::timeout(Duration::from_secs(75), async {
+                loop {
+                    tokio::select! {
+                        response = &mut stopping, if completed_stop.is_none() => {
+                            completed_stop = Some(response.unwrap());
+                        },
+                        _ = tokio::task::yield_now() => {
+                            let committed_rows = h.read_sessions();
+                            let committed = committed_rows.as_array().unwrap().iter()
+                                .find(|row| row["id"] == id).unwrap();
+                            if committed["status"] == "stopped"
+                                && committed["lifecycle_generation"].as_u64()
+                                    .expect("the Stop transaction persists its native generation")
+                                    > enabled_generation
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("Stop commits while the original native Load response is held");
+            // Opening the response gate does not promise a result from an already-retired actor.
+            std::fs::write(h.home_path().join("agent.json.load-release"), "").unwrap();
+        }
+        let response = match completed_stop {
+            Some(response) => response,
+            None => stopping.await.unwrap(),
+        };
         assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
-        let stopped: agent_of_empires::session::Instance = serde_json::from_value(
-            h.read_sessions()
-                .as_array()
-                .and_then(|rows| rows.iter().find(|row| row["id"] == id))
-                .cloned()
-                .unwrap(),
-        )
-        .unwrap();
+        let stopped_row = h
+            .read_sessions()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == id)
+            .unwrap()
+            .clone();
+        let stopped_resume_binding = stopped_row["resume_binding"].clone();
+        let stopped: agent_of_empires::session::Instance =
+            serde_json::from_value(stopped_row).unwrap();
         assert_eq!(stopped.status, agent_of_empires::session::Status::Stopped);
         assert!(stopped.is_idle_dormant());
+        assert_eq!(stopped.acp_session_id.as_deref(), Some(selected_sid));
+        if hold_load {
+            assert_eq!(stopped.agent_session_binding, enabled.agent_session_binding);
+            assert_eq!(stopped_resume_binding, enabled_resume_binding);
+        }
         use agent_of_empires::acp::runner_lifecycle::ProcessControl as _;
         assert!(
             !agent_of_empires::acp::runner_lifecycle::SystemProcessControl::default()
@@ -485,7 +586,54 @@ fn selected_claude_store_survives_stop_and_respawn() {
             response.text().await.unwrap()
         );
     });
-    assert_eq!(wait_for_session_loads(&log, 2), 2);
+    let native_log = if hold_load {
+        wait_until(Duration::from_secs(75), Duration::from_millis(50), || {
+            let contents = std::fs::read_to_string(&log).unwrap_or_default();
+            if contents.matches(&held_marker).count() >= 2 {
+                Ok(contents)
+            } else {
+                Err(format!(
+                    "both selected Load handlers have not entered their gates: {contents}"
+                ))
+            }
+        })
+    } else {
+        assert_eq!(wait_for_session_loads(&log, 2), 2);
+        std::fs::read_to_string(&log).unwrap()
+    };
+    assert_eq!(
+        native_log
+            .matches("handleRequest method=session/load")
+            .count(),
+        2,
+        "{native_log}",
+    );
+    assert_eq!(
+        native_log
+            .matches("handleRequest method=session/new")
+            .count(),
+        0,
+        "{native_log}"
+    );
+    if hold_load {
+        assert_eq!(
+            native_log.matches(&held_marker).count(),
+            2,
+            "both actors must load the original selected SID: {native_log}",
+        );
+        for line in native_log
+            .lines()
+            .filter(|line| line.contains(&held_marker))
+        {
+            let native_pid = line.rsplit_once(" pid=").unwrap().1;
+            let capture = std::fs::read_to_string(capture_dir.join(native_pid)).unwrap();
+            assert_eq!(
+                env_value(&capture, "CLAUDE_CONFIG_DIR").as_deref(),
+                Some(selected.to_str().unwrap()),
+                "the actual Load producer must use the selected native store: {line}",
+            );
+        }
+    }
     let respawned = capture_files(&capture_dir)
         .into_iter()
         .any(|(path, capture)| {

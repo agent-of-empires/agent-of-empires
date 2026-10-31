@@ -1,7 +1,7 @@
 // Composer footer controls: toolbar, mode picker, usage hint, attachments, send/stop, popover list.
 
 import { useEffect, useRef, useState } from "react";
-import { ComposerPrimitive, useAui } from "@assistant-ui/react";
+import { ComposerPrimitive } from "@assistant-ui/react";
 import { ChevronUp, Paperclip, ShieldCheck, Square, X } from "lucide-react";
 
 import type { AcpState, PromptAttachmentInput } from "../../lib/acpTypes";
@@ -401,20 +401,21 @@ export function SendButton({
   );
 }
 
-export function StopButton() {
-  const aui = useAui();
+export function StopButton({ disabled, onCancel }: { disabled: boolean; onCancel: () => void }) {
   return (
     <button
       type="button"
       aria-label="Stop"
       title="Stop the agent"
-      onClick={() => aui.thread.cancelRun()}
+      disabled={disabled}
+      onClick={onCancel}
       className={[
         "inline-flex items-center justify-center gap-1.5",
         "rounded-lg border border-surface-600 bg-surface-800",
         "px-2.5 py-1.5 text-[12px] font-medium text-text-secondary",
-        "hover:border-rose-700/60 hover:bg-rose-950/30 hover:text-rose-300",
-        "active:scale-[0.98] transition-all duration-100",
+        "disabled:cursor-not-allowed disabled:opacity-40",
+        disabled ? "" : "hover:border-rose-700/60 hover:bg-rose-950/30 hover:text-rose-300 active:scale-[0.98]",
+        "transition-colors duration-100",
       ].join(" ")}
     >
       <Square className="h-3.5 w-3.5 fill-current" strokeWidth={0} />

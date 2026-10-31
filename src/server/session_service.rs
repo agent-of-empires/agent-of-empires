@@ -169,6 +169,21 @@ fn queue_drain_batch<'a>(
     (sub, combined)
 }
 
+pub(crate) struct NativeControlObservation {
+    pub projection: crate::acp::state::NativeAvailabilityProjection,
+    wait: Option<crate::acp::state::NativeObservationWait>,
+    identity: Option<(String, chrono::DateTime<chrono::Utc>, u64)>,
+    current: Option<crate::acp::state::CurrentNativeAvailability>,
+    historical: Option<(u64, crate::acp::state::NativeEventSubject)>,
+    control_seq: u64,
+}
+
+impl NativeControlObservation {
+    pub(crate) fn is_contended(&self) -> bool {
+        self.wait.is_some()
+    }
+}
+
 pub struct SessionService {
     pub(crate) work: Arc<super::runtime::RuntimeWork>,
     native_state: std::sync::OnceLock<std::sync::Weak<super::AppState>>,
@@ -902,7 +917,7 @@ impl SessionService {
                     .ok_or(crate::session::SessionGone)?;
                 let unavailable = if let Some(current) = current_native.as_mut() {
                     if current.context != crate::acp::state::NativeEventContext::capture(row, native.storage())?
-                        || !current.refresh(&worker_id)
+                        || !current.refresh(&worker_id).unwrap_or(false)
                     {
                         refused = Some(PromptTouch::WorkerNotReady);
                         anyhow::bail!(crate::session::LifecycleReservationError::Superseded);
@@ -1123,22 +1138,35 @@ impl SessionService {
     /// disk clear re-delivers after restart, which is the documented
     /// at-least-once contract.
     pub(crate) async fn drain_pending_initial_turn(self: &Arc<Self>, id: &str) {
+        let Some(submission) = self.prompt_submission_for_session(id).await else {
+            return;
+        };
+        let _ = self
+            .drain_pending_initial_turn_with_submission(id, &submission, None)
+            .await;
+    }
+
+    pub(crate) async fn drain_pending_initial_turn_with_submission(
+        self: &Arc<Self>,
+        id: &str,
+        _submission: &tokio::sync::OwnedMutexGuard<()>,
+        quota: Option<&crate::server::acp_reconciler::QuotaDelivery>,
+    ) -> bool {
+        if !self.quota_delivery_allowed(id, quota).await {
+            return false;
+        }
         {
             let mut drains = self
                 .pending_drains
                 .lock()
                 .expect("pending_drains mutex poisoned");
             if !drains.insert(id.to_string()) {
-                return;
+                return false;
             }
         }
         let _claim = PendingDrainGuard {
             service: Arc::clone(self),
             id: id.to_string(),
-        };
-        // Non-vivifying.
-        let Some(_submission) = self.prompt_submission_for_session(id).await else {
-            return;
         };
         let Some((text, attachment_refs, synthesized, profile, caller)) = ({
             let instances = self.instances.read().await;
@@ -1166,7 +1194,7 @@ impl SessionService {
                     })
                 })
         }) else {
-            return;
+            return true;
         };
         // Reload the attachment blobs so a rate-limit resume continuation replays the
         // interrupted prompt's images/files, not just its text.
@@ -1175,10 +1203,10 @@ impl SessionService {
         } else {
             let store = Arc::clone(&self.acp_event_store);
             let id_load = id.to_string();
-            tokio::task::spawn_blocking(move || {
+            let loaded = tokio::task::spawn_blocking(move || {
                 attachment_refs
                     .into_iter()
-                    .filter_map(|r| {
+                    .map(|r| {
                         store
                             .load_attachment(&id_load, &r.id)
                             .map(
@@ -1191,10 +1219,15 @@ impl SessionService {
                                 },
                             )
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Option<Vec<_>>>()
             })
-            .await
-            .unwrap_or_default()
+            .await;
+            let Ok(Some(attachments)) = loaded else {
+                tracing::warn!(target: "acp.supervisor", session = %id,
+                    "pending turn attachments are unavailable; preserving the complete turn");
+                return false;
+            };
+            attachments
         };
         if let Err(e) = self
             .send_turn(
@@ -1217,7 +1250,7 @@ impl SessionService {
                 session = %id,
                 "pending initial turn delivery failed; the reconciler will retry: {e}"
             );
-            return;
+            return false;
         }
         {
             let mut instances = self.instances.write().await;
@@ -1254,6 +1287,7 @@ impl SessionService {
                 );
             }
         }
+        true
     }
 
     /// Queue `text` (with its `attachments` refs) as the session's next turn,
@@ -1710,7 +1744,7 @@ impl SessionService {
     /// for the whole scan, which stalls event recording daemon-wide.
     pub(crate) async fn fold_control_state(&self, id: &str) -> crate::acp::state::AcpState {
         use crate::acp::state::{AcpSessionId, AcpState, AgentName};
-        let (agent, model, identity) = {
+        let (agent, model) = {
             let instances = self.instances.read().await;
             instances
                 .iter()
@@ -1719,25 +1753,17 @@ impl SessionService {
                     (
                         AgentName(i.agent_name.clone().unwrap_or_else(|| i.tool.clone())),
                         i.agent_model.clone(),
-                        i.is_structured().then(|| {
-                            (
-                                i.source_profile.clone(),
-                                i.created_at,
-                                i.lifecycle_generation,
-                            )
-                        }),
                     )
                 })
-                .unwrap_or_else(|| (AgentName(String::new()), None, None))
+                .unwrap_or_else(|| (AgentName(String::new()), None))
         };
-        let current = self.acp_supervisor.current_native_availability(id).await;
         let store = Arc::clone(&self.acp_event_store);
         let cache = Arc::clone(&self.acp_control_cache);
         let sid = id.to_string();
         // The hydrate closure runs under the cache's per-session lock and does a locking
         // SQLite scan, so the whole thing goes off the runtime rather than just the scan.
-        tokio::task::spawn_blocking(move || {
-            let reduced = cache.get_or_hydrate(&sid, || {
+        let mut reduced = tokio::task::spawn_blocking(move || {
+            cache.get_or_hydrate(&sid, || {
                 let mut reduced = AcpState::new(AcpSessionId(sid.clone()), agent, model);
                 let mut last_seq = 0;
                 for (seq, event) in store.replay_from(&sid, 0) {
@@ -1745,8 +1771,7 @@ impl SessionService {
                     last_seq = seq;
                 }
                 (reduced, last_seq)
-            });
-            cache.project_native(&sid, reduced, identity, current)
+            })
         })
         .await
         .unwrap_or_else(|_| {
@@ -1755,7 +1780,12 @@ impl SessionService {
                 AcpState::new(AcpSessionId(id.to_string()), AgentName(String::new()), None);
             fallback.turn_active = true;
             fallback
-        })
+        });
+        let projection = self
+            .native_control_projection(id, reduced.native_availability, reduced.native_control_seq)
+            .await;
+        reduced.apply_native_availability(projection);
+        reduced
     }
 
     pub(crate) async fn native_control_projection(
@@ -1764,6 +1794,19 @@ impl SessionService {
         historical: Option<(u64, crate::acp::state::NativeEventSubject)>,
         control_seq: u64,
     ) -> crate::acp::state::NativeAvailabilityProjection {
+        let observation = self
+            .native_control_observation(id, historical, control_seq)
+            .await;
+        self.settle_native_control_observation(id, observation)
+            .await
+    }
+
+    pub(crate) async fn native_control_observation(
+        &self,
+        id: &str,
+        historical: Option<(u64, crate::acp::state::NativeEventSubject)>,
+        control_seq: u64,
+    ) -> NativeControlObservation {
         let identity = self
             .instances
             .read()
@@ -1783,14 +1826,68 @@ impl SessionService {
                 .known_prompt_wake_eligibility(id, identity.as_ref())
                 .await;
         let cache = Arc::clone(&self.acp_control_cache);
-        let id = id.to_owned();
-        tokio::task::spawn_blocking(move || {
-            cache
-                .native_projection(&id, historical, control_seq, identity, current)
-                .with_prompt_wake_eligibility(prompt_wake_eligible)
+        let sid = id.to_owned();
+        let captured_identity = identity.clone();
+        let captured_current = current.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            cache.native_projection(
+                &sid,
+                historical,
+                control_seq,
+                captured_identity,
+                captured_current,
+            )
         })
-        .await
-        .unwrap_or_default()
+        .await;
+        let (projection, wait) = match result {
+            Ok(Ok(projection)) => (
+                projection.with_prompt_wake_eligibility(prompt_wake_eligible),
+                None,
+            ),
+            Ok(Err(wait)) => (Default::default(), Some(wait)),
+            Err(_) => (Default::default(), None),
+        };
+        NativeControlObservation {
+            projection,
+            wait,
+            identity,
+            current,
+            historical,
+            control_seq,
+        }
+    }
+
+    pub(crate) async fn settle_native_control_observation(
+        &self,
+        id: &str,
+        mut observation: NativeControlObservation,
+    ) -> crate::acp::state::NativeAvailabilityProjection {
+        let mut context = observation.wait.as_ref().map(|wait| wait.context);
+        while let Some(wait) = observation.wait.take() {
+            if !wait.settle().await {
+                return Default::default();
+            }
+            let next = self
+                .native_control_observation(id, observation.historical, observation.control_seq)
+                .await;
+            let same_actor = match (&observation.current, &next.current) {
+                (Some(original), Some(current)) => original.same_actor(current),
+                (None, None) => true,
+                _ => false,
+            };
+            let next_context = next
+                .wait
+                .as_ref()
+                .map(|wait| wait.context)
+                .or_else(|| next.projection.context());
+            if observation.identity != next.identity || !same_actor || context != next_context {
+                return Default::default();
+            }
+            observation.projection = next.projection;
+            observation.wait = next.wait;
+            context = next_context;
+        }
+        observation.projection
     }
 
     /// Existing WorkerDown/startup prompt-intent admission, not native health.
@@ -1828,24 +1925,9 @@ impl SessionService {
         seq: u64,
     ) -> Option<crate::session::Status> {
         use crate::acp::state::{AcpSessionId, AcpState, AgentName};
-        let identity = self
-            .instances
-            .read()
-            .await
-            .iter()
-            .find(|row| row.id == id && row.is_structured())
-            .map(|row| {
-                (
-                    row.source_profile.clone(),
-                    row.created_at,
-                    row.lifecycle_generation,
-                )
-            });
-        let current = self.acp_supervisor.current_native_availability(id).await;
-        let cache = Arc::clone(&self.acp_control_cache);
         let store = Arc::clone(&self.acp_event_store);
         let sid = id.to_string();
-        tokio::task::spawn_blocking(move || {
+        let state = tokio::task::spawn_blocking(move || {
             let mut state =
                 AcpState::new(AcpSessionId(sid.clone()), AgentName(String::new()), None);
             let mut folded = false;
@@ -1853,15 +1935,17 @@ impl SessionService {
                 let _ = state.apply_event(at, event);
                 folded = true;
             }
-            folded.then(|| {
-                cache
-                    .project_native(&sid, state, identity, current)
-                    .sidebar_status()
-            })
+            folded.then_some(state)
         })
         .await
         .ok()
-        .flatten()
+        .flatten()?;
+        let projection = self
+            .native_control_projection(id, state.native_availability, state.native_control_seq)
+            .await;
+        let mut state = state;
+        state.apply_native_availability(projection);
+        Some(state.sidebar_status())
     }
 
     /// Drain the leading batch of a session's server-owned queue into the live
@@ -1889,45 +1973,62 @@ impl SessionService {
     /// run of non-clear rows combines into one with blank-line separators.
     /// A batch's buffered attachment bytes are reloaded and forwarded with it.
     pub(crate) async fn drain_queued_prompts_once(self: &Arc<Self>, id: &str) {
+        let Some(submission) = self.prompt_submission_for_session(id).await else {
+            return;
+        };
+        let _ = self
+            .drain_queued_prompts_with_submission(id, &submission, None)
+            .await;
+    }
+
+    pub(crate) async fn drain_queued_prompts_with_submission(
+        self: &Arc<Self>,
+        id: &str,
+        _submission: &tokio::sync::OwnedMutexGuard<()>,
+        quota: Option<&crate::server::acp_reconciler::QuotaDelivery>,
+    ) -> bool {
+        if !self.quota_delivery_allowed(id, quota).await {
+            return false;
+        }
         {
             let mut drains = self
                 .pending_drains
                 .lock()
                 .expect("pending_drains mutex poisoned");
             if !drains.insert(id.to_string()) {
-                return;
+                return false;
             }
         }
         let _claim = PendingDrainGuard {
             service: Arc::clone(self),
             id: id.to_string(),
         };
-        // Non-vivifying, for the same reason as the pending-initial drain.
-        let Some(_submission) = self.prompt_submission_for_session(id).await else {
-            return;
-        };
 
         let (caller, agent_key, queue) = {
             let instances = self.instances.read().await;
             let Some(inst) = instances.iter().find(|i| i.id == id) else {
-                return;
+                return false;
             };
             if inst.terminal_handoff.is_some()
                 || !inst.is_structured()
                 || inst.is_archived()
                 || inst.is_snoozed()
                 || inst.is_trashed()
-                || !matches!(
+                || !(matches!(
                     inst.status,
                     crate::session::Status::Idle | crate::session::Status::Error
-                )
+                ) || (quota.is_some()
+                    && matches!(
+                        inst.status,
+                        crate::session::Status::Stopped | crate::session::Status::Running
+                    )))
             {
-                return;
+                return false;
             }
             let mut queue = inst.queued_prompts.clone();
             queue.sort_by_key(|e| e.seq);
             if queue.is_empty() {
-                return;
+                return true;
             }
             let caller = match &inst.created_by_plugin {
                 Some(plugin_id) => SessionCaller::Plugin {
@@ -1939,17 +2040,18 @@ impl SessionService {
             (caller, agent_key, queue)
         };
 
-        // `Status::Idle` above is a mirror the broadcast listener applies one serial task
-        // behind every session's events, so it still reads Idle for as long as that task is
-        // behind.
+        // Status is a lagging display mirror. Only an authorized quota release
+        // may also pass a background-driven Running mirror; it must still prove
+        // current native availability and an idle main turn below.
         let control = self.fold_control_state(id).await;
         if control.turn_active
             || control.connection_unavailable.is_some()
+            || (quota.is_some() && !control.connection_ready)
             || control.sidebar_phase == crate::acp::state::SidebarPhase::Error
             || (control.sidebar_phase == crate::acp::state::SidebarPhase::PromptFailed
                 && !control.connection_ready)
         {
-            return;
+            return false;
         }
 
         // Leading batch up to a clear or compact boundary.
@@ -1989,7 +2091,7 @@ impl SessionService {
                  retiring them so the queue behind them can drain"
             );
             self.retire_drained_rows(id, sent_ids).await;
-            return;
+            return true;
         }
 
         // Deliver as a fresh turn on the live worker.
@@ -2010,7 +2112,7 @@ impl SessionService {
             .await
         {
             tracing::warn!(target: "acp.queue", session = %id, "queue drain delivery failed; will retry: {e}");
-            return;
+            return false;
         }
         tracing::info!(
             target: "acp.queue",
@@ -2021,6 +2123,23 @@ impl SessionService {
         // Retire only the delivered rows; prompts enqueued during the send
         // survive into the next drain.
         self.retire_drained_rows(id, sent_ids).await;
+        true
+    }
+
+    async fn quota_delivery_allowed(
+        &self,
+        id: &str,
+        release: Option<&crate::server::acp_reconciler::QuotaDelivery>,
+    ) -> bool {
+        let expected = release.map(|release| release.park_seq());
+        let store = Arc::clone(&self.acp_event_store);
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || match store.rate_limit_park(&id) {
+            Some(park) => expected == Some(park.seq),
+            None => expected.is_none(),
+        })
+        .await
+        .unwrap_or(false)
     }
 
     /// Drop a set of queue rows and the attachment bytes buffered for them.

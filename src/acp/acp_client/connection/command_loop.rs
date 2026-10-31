@@ -182,9 +182,7 @@ impl Session {
                     }
                     cmd = self.cmd_rx.recv() => cmd,
                     _ = idle_tick.tick() => {
-                        if self.between_prompt_idle_tick().await {
-                            break;
-                        }
+                        self.between_prompt_idle_tick().await;
                         continue;
                     }
                 },
@@ -288,36 +286,25 @@ impl Session {
             .unwrap_or(false)
     }
 
-    /// Returns true when the turn ended on a rate limit: the connection must
-    /// then end so the drain loop drops the worker and the reaper can resume it.
-    async fn between_prompt_idle_tick(&self) -> bool {
+    async fn between_prompt_idle_tick(&self) {
         let shared = &self.shared;
         if shared.connection_state.loss().is_some() {
-            return false;
+            return;
         }
         let Some(cost_seen) = shared.between_prompt.take_idle_fire(now_ms()) else {
-            return false;
+            return;
         };
-        // An adopted turn races the detached resume-idle task for its
-        // terminal; state is reset either way.
         let adopted = shared.adopted_turn_active.swap(false, Ordering::Relaxed);
-        if adopted && !shared.terminal_claim.claim() {
-            return false;
-        }
-        // The limit arrives as agent text with no prompt error; park like the
-        // prompt path so the reaper can resume after the reset (#4373).
         let captured = take_rate_limit_from_captured_rejection(
             &shared.rate_limit_rejections,
             chrono::Utc::now(),
         );
         if let Some(info) = captured {
-            info!(
-                target: "acp.protocol",
-                session = %shared.session_label,
-                resets_at = ?info.resets_at,
-                "agent-initiated turn ended on a rejected rate-limit window; emitting RateLimit + Stopped"
-            );
-            return shared
+            if !shared.terminal_claim.claim_failed() {
+                return;
+            }
+            shared.between_prompt.deactivate();
+            shared
                 .emit_while_available([
                     Event::RateLimit { info },
                     Event::Stopped {
@@ -325,6 +312,10 @@ impl Session {
                     },
                 ])
                 .await;
+            return;
+        }
+        if adopted && !shared.terminal_claim.claim() {
+            return;
         }
         let reason = between_prompt_stop_reason(adopted, cost_seen);
         info!(
@@ -338,7 +329,6 @@ impl Session {
                 reason: reason.into(),
             }])
             .await;
-        false
     }
 
     /// Open a fresh session on the live worker for a clear command whose
@@ -440,6 +430,7 @@ impl Session {
                 self.shared
                     .emit(Event::SessionContextReset {
                         reason: "conversation cleared; the agent started a fresh session".into(),
+                        fork_rejection: None,
                     })
                     .await;
                 self.shared

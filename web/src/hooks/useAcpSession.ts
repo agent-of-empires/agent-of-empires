@@ -1,7 +1,7 @@
 // Structured view session: reduces the ACP stream into AcpState and exposes the user's actions.
 // Failed actions surface through transient interaction errors without replacing operation diagnostics.
 
-import { useCallback, useEffect, useMemo, useReducer, useRef, type Dispatch } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, type Dispatch } from "react";
 import {
   emptyAcpState,
   nativeInputAvailable,
@@ -78,10 +78,10 @@ async function postReportingErrors(
   init: RequestInit,
   [verb, gerund]: [string, string],
   onFail?: () => void,
-): Promise<void> {
+): Promise<boolean> {
   try {
     const res = await fetch(url, init);
-    if (res.ok) return;
+    if (res.ok) return true;
     const detail = await safeText(res);
     onFail?.();
     dispatch({ kind: "error", message: `Could not ${verb} (${res.status}). ${detail}`.trim() });
@@ -89,6 +89,7 @@ async function postReportingErrors(
     onFail?.();
     dispatch({ kind: "error", message: `Network error ${gerund}: ${describeError(e)}` });
   }
+  return false;
 }
 
 // A UUID v4 even on plain-HTTP LAN hosts, where `crypto.randomUUID` is unavailable.
@@ -124,8 +125,12 @@ export function useAcpSession(
   const queuedPromptsRef = useLatestRef(state.queuedPrompts);
   const connection = useAcpConnection(sessionId, sessionIdRef, state, dispatch);
   const { status, lastActivityRef } = connection;
-  const inputStateRef = useLatestRef(state);
-  const connectionStatusRef = useLatestRef(status);
+  const inputStateRef = useRef(state);
+  const connectionStatusRef = useRef(status);
+  useLayoutEffect(() => {
+    inputStateRef.current = state;
+    connectionStatusRef.current = status;
+  }, [state, status]);
   const requireNativeInput = useCallback(
     (
       target?: NonNullable<AcpState["interactionError"]>["target"],
@@ -432,9 +437,8 @@ export function useAcpSession(
 
   // Never bind this to Escape: an accidental press would abort work the user meant to keep.
   const cancelPrompt = useCallback(async () => {
-    if (!sessionId) return;
-    if (!requireNativeInput()) return;
-    await postReportingErrors(dispatch, acpUrl(sessionId, "cancel"), { method: "POST" }, ["cancel", "cancelling"]);
+    if (!sessionId || !requireNativeInput()) return false;
+    return postReportingErrors(dispatch, acpUrl(sessionId, "cancel"), { method: "POST" }, ["cancel", "cancelling"]);
   }, [sessionId, requireNativeInput]);
 
   const steerable = !!state.promptCapabilities?.steering && !state.cancelling && !state.compacting;

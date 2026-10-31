@@ -458,6 +458,12 @@ impl NativeObservationScope {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct NativeForkRejection {
+    pub(crate) owner: crate::acp::runner_lifecycle::RunnerIdentity,
+    pub(crate) parent: String,
+}
+
 /// Kept only in the private journal and runtime fold, never public JSON.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeEventSubject {
@@ -533,6 +539,7 @@ impl NativeEventSubject {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct CurrentNativeAvailability {
     pub context: NativeEventContext,
     pub owner: Option<crate::acp::runner_lifecycle::RunnerIdentity>,
@@ -540,28 +547,87 @@ pub(crate) struct CurrentNativeAvailability {
     pub ready: bool,
     pub client: std::sync::Arc<crate::acp::acp_client::AcpClient>,
     pub lifecycle: std::sync::Arc<std::sync::Mutex<crate::acp::runner_lifecycle::LifecycleTable>>,
-    pub epoch: u64,
+    pub lease: crate::acp::runner_lifecycle::Lease,
 }
 
 impl CurrentNativeAvailability {
-    /// Refresh after blocking hydration/fence acquisition. The native fence is
-    /// already held, so contention must become Unknown, never invert lifecycle
-    /// -> native ordering or reuse a stale positive receipt.
-    pub(crate) fn refresh(&mut self, session_id: &str) -> bool {
-        let Ok(lifecycle) = self.lifecycle.try_lock() else {
-            return false;
+    pub(crate) fn same_actor(&self, other: &Self) -> bool {
+        self.context == other.context
+            && self.owner == other.owner
+            && self.lease == other.lease
+            && std::sync::Arc::ptr_eq(&self.client, &other.client)
+    }
+
+    /// Called with the native fence held; lifecycle contention must not invert
+    /// the producer's lifecycle-to-native lock order.
+    pub(crate) fn refresh(&mut self, session_id: &str) -> Result<bool, NativeObservationWait> {
+        let lifecycle = match self.lifecycle.try_lock() {
+            Ok(lifecycle) => lifecycle,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(NativeObservationWait {
+                    context: self.context,
+                    lock: NativeObservationLock::Lifecycle(self.lifecycle.clone()),
+                });
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => return Ok(false),
         };
         if lifecycle.phase(session_id) != crate::acp::runner_lifecycle::WorkerPhase::Running
-            || !lifecycle
-                .current_lease(session_id)
-                .is_some_and(|lease| lease.epoch() == self.epoch)
+            || lifecycle.current_lease(session_id).as_ref() != Some(&self.lease)
+            || self.owner != self.client.connected_runner()
         {
-            return false;
+            return Ok(false);
         }
         self.ready = self.client.connection_ready();
         self.unavailable = self.client.connection_unavailable();
         self.ready &= self.unavailable.is_none();
-        self.ready || self.unavailable.is_some()
+        Ok(self.ready || self.unavailable.is_some())
+    }
+}
+
+pub(crate) struct NativeObservationWait {
+    pub context: NativeEventContext,
+    lock: NativeObservationLock,
+}
+
+impl std::fmt::Debug for NativeObservationWait {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeObservationWait")
+            .finish_non_exhaustive()
+    }
+}
+
+enum NativeObservationLock {
+    Native(std::sync::Arc<crate::session::NativeInputFence>),
+    Lifecycle(std::sync::Arc<std::sync::Mutex<crate::acp::runner_lifecycle::LifecycleTable>>),
+}
+
+impl NativeObservationWait {
+    pub(crate) fn native(scope: &NativeObservationScope) -> Self {
+        Self {
+            context: scope.context,
+            lock: NativeObservationLock::Native(scope.fence.clone()),
+        }
+    }
+
+    pub(crate) fn lifecycle(
+        context: NativeEventContext,
+        lifecycle: std::sync::Arc<std::sync::Mutex<crate::acp::runner_lifecycle::LifecycleTable>>,
+    ) -> Self {
+        Self {
+            context,
+            lock: NativeObservationLock::Lifecycle(lifecycle),
+        }
+    }
+
+    /// Only the contended lock survives into this wait, never a publication guard.
+    pub(crate) async fn settle(self) -> bool {
+        tokio::task::spawn_blocking(move || match self.lock {
+            NativeObservationLock::Native(fence) => fence.lock_observation().is_ok(),
+            NativeObservationLock::Lifecycle(lifecycle) => lifecycle.lock().is_ok(),
+        })
+        .await
+        .unwrap_or(false)
     }
 }
 
@@ -633,6 +699,10 @@ impl NativeAvailabilityProjection {
         self.prompt_wake_eligible =
             eligible && self.context.is_some() && !self.ready && self.unavailable.is_none();
         self
+    }
+
+    pub(crate) fn context(&self) -> Option<NativeEventContext> {
+        self.context
     }
 }
 
@@ -1212,6 +1282,8 @@ pub enum Event {
     /// Native context continuity was lost or a fork could not be established.
     SessionContextReset {
         reason: String,
+        #[serde(skip)]
+        fork_rejection: Option<std::sync::Arc<NativeForkRejection>>,
     },
     /// The agent called the Claude SDK's `ScheduleWakeup` tool.
     WakeupScheduled {
@@ -2273,17 +2345,17 @@ mod tests {
             unavailable: None,
             client: Arc::clone(&client),
             lifecycle: Arc::clone(&lifecycle),
-            epoch: lease.epoch(),
+            lease: lease.clone(),
         };
-        assert!(carried.refresh("receipt") && carried.ready);
+        assert!(carried.refresh("receipt").unwrap() && carried.ready);
         let held = lifecycle.lock().unwrap();
         assert!(
-            !carried.refresh("receipt"),
-            "native-to-lifecycle contention becomes Unknown without waiting"
+            carried.refresh("receipt").is_err(),
+            "identified lifecycle contention is distinguishable from stable Unknown"
         );
         drop(held);
         client.test_observe_native_loss();
-        assert!(carried.refresh("receipt"));
+        assert!(carried.refresh("receipt").unwrap());
         assert!(!carried.ready);
         assert_eq!(
             carried.unavailable.unwrap().cause,
@@ -2295,7 +2367,7 @@ mod tests {
         table.install(&replacement, None).unwrap();
         drop(table);
         assert!(
-            !carried.refresh("receipt"),
+            !carried.refresh("receipt").unwrap(),
             "a replacement cannot reuse the captured client's receipt"
         );
     }

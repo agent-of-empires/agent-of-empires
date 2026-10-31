@@ -758,6 +758,7 @@ mod tests {
         };
         let reset = || Event::SessionContextReset {
             reason: "worker restarted".into(),
+            fork_rejection: None,
         };
         let cases: [(&str, Vec<Event>, bool); 5] = [
             ("empty", vec![], false),

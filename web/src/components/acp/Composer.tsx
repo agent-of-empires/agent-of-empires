@@ -80,6 +80,8 @@ interface Props {
   availableCommands: AcpState["availableCommands"];
   /** Current live daemon snapshot permits native input; a socket alone is insufficient. */
   connected: boolean;
+  canForceEndTurn: boolean;
+  stopTurn: () => void;
   /** Explicit managed wake/queue intent; the daemon still rechecks admission. */
   canSubmit: boolean;
   /** For a Session that has never started: the Agent it waits for. */
@@ -382,7 +384,7 @@ export function Composer(props: Props) {
                 <PluginComposerActions sessionId={sessionId} getSnapshot={() => pluginSnapshot(client, taRef)} />
                 {turnActive ? (
                   <>
-                    <StopButton />
+                    <StopButton disabled={!connected && !props.canForceEndTurn} onCancel={props.stopTurn} />
                     <QueueSendButton
                       connected={connected}
                       waitingFor={props.waitingFor}

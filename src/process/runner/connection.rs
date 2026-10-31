@@ -228,8 +228,8 @@ pub(super) async fn handle_control_connection(
                     {
                         Ok(result) => ControlBody::Initialized { result },
                         Err(error) => {
-                            warn!(target: "acp.runner", session = %handshake_session, "initialize failed: {error}");
-                            ControlBody::HandshakeFailed { error }
+                            warn!(target: "acp.runner", session = %handshake_session, ?error, "initialize failed");
+                            error.into_frame("initialize")
                         }
                     },
                     HandshakeCommand::ResumeSession => {
@@ -239,7 +239,7 @@ pub(super) async fn handle_control_connection(
                                 result,
                                 native_channel: handshake_shared.native_availability(),
                             },
-                            Err(error) => ControlBody::HandshakeFailed { error },
+                            Err(error) => error.into_frame("resume_session"),
                         }
                     }
                     HandshakeCommand::EstablishSession { method, request } => {
@@ -262,8 +262,8 @@ pub(super) async fn handle_control_connection(
                                 }
                             }
                             Err(error) => {
-                                warn!(target: "acp.runner", session = %handshake_session, "{method} failed: {error}");
-                                ControlBody::HandshakeFailed { error }
+                                warn!(target: "acp.runner", session = %handshake_session, ?error, method, "native establishment failed");
+                                error.into_frame(&method)
                             }
                         }
                     }

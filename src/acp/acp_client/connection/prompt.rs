@@ -393,7 +393,6 @@ impl Session {
                     if let Some(info) = self.take_parking_rejection() {
                         self.shared.emit(Event::RateLimit { info }).await;
                         turn.flags.rate_limited = true;
-                        turn.flags.shutdown = true;
                     }
                 }
                 return Ok(Flow::Break);
@@ -417,7 +416,6 @@ impl Session {
             );
             self.shared.emit(Event::RateLimit { info }).await;
             turn.flags.rate_limited = true;
-            turn.flags.shutdown = true;
             return Ok(Flow::Break);
         }
         warn!(target: "acp.protocol", session = %label, error = ?e, "prompt operation failed; preserving connection and conversation");
@@ -770,12 +768,15 @@ impl Session {
                 f.orphan_cancel_sent && finished,
             )
         };
-        let claimed = if f.prompt_failed {
+        let claimed = if f.prompt_failed || f.rate_limited {
             shared.terminal_claim.claim_failed()
         } else {
             shared.terminal_claim.claim()
         };
         if claimed {
+            if f.prompt_failed || f.rate_limited {
+                shared.between_prompt.deactivate();
+            }
             let event = Event::Stopped {
                 reason: reason.into(),
             };

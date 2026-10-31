@@ -1,11 +1,13 @@
 // @vitest-environment jsdom
 
 import { act, renderHook } from "@testing-library/react";
+import { useLayoutEffect } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { emptyAcpState } from "../lib/acpTypes";
+import { emptyAcpState, nativeInputAvailable } from "../lib/acpTypes";
 import { STATE_TTL_MS, STORAGE_KEY_PREFIX } from "../lib/acpStateStorage";
 import { reportAcpInteraction, type ServerQueuedPrompt } from "../lib/api";
+import { useCancelEscalation } from "../components/acp/useCancelEscalation";
 import { ACP_DIAL_TIMEOUT_MS, ACP_MAX_RETRIES, ACP_WS_STALE_MS, acpRetryDelayMs } from "./acpSession/useAcpConnection";
 import {
   FakeWebSocket,
@@ -849,6 +851,92 @@ describe("setConfigOption", () => {
 });
 
 describe("current native admission", () => {
+  it.each([
+    [false, true, 1],
+    [true, false, 0],
+  ] as const)(
+    "admits %s→%s native readiness from the committed active turn before passive effects (%i cancels)",
+    async (before, after, expectedCancels) => {
+      const id = "sess-native-commit";
+      const admission = Promise.withResolvers<Response>();
+      calls = installAcpFakes(({ method, url }) => {
+        if (method === "POST" && url.endsWith("/acp/cancel")) return admission.promise;
+        if (method === "POST" && url.endsWith("/acp/prompt")) return json({ disposition: "sent" }, 202);
+        return undefined;
+      });
+      let armed: boolean | null = null;
+      let gesture: Promise<void> | undefined;
+      let gestures = 0;
+      let observed: { available: boolean; active: boolean; status: string; seq: number; turn: number } | undefined;
+      const hook = renderHook(
+        () => {
+          const acp = useAcpSession(id);
+          const escalation = useCancelEscalation(
+            id,
+            acp.state.promptSeq,
+            acp.state.cancelling,
+            acp.cancelPrompt,
+            acp.forceEndTurn,
+          );
+          const { onCancel } = escalation;
+          // Host layout follows both real hooks, before their passive effects.
+          useLayoutEffect(() => {
+            if (armed === null || acp.state.connectionReady !== armed) return;
+            armed = null;
+            gestures += 1;
+            observed = {
+              available: nativeInputAvailable(acp.state),
+              active: acp.state.turnActive,
+              status: acp.status,
+              seq: acp.state.lastSeq,
+              turn: acp.state.promptSeq,
+            };
+            gesture = onCancel();
+          }, [acp.state, acp.status, onCancel]);
+          return { acp, escalation };
+        },
+        { wrapper: profileWrapper },
+      );
+      await flushAsync();
+      lastSocket().open();
+      await flushAsync();
+      lastSocket().message(currentControlSnapshot(hook.result.current.acp.state, { ready: true }));
+      await flushAsync();
+      await act(() => hook.result.current.acp.sendPrompt("a genuinely active turn"));
+      lastSocket().message({
+        session_id: id,
+        seq: 1,
+        event: { UserPromptSent: { text: "a genuinely active turn" } },
+      });
+      await flushAsync();
+      expect(posts("/acp/prompt")).toHaveLength(1);
+      expect(hook.result.current.acp.state.turnActive).toBe(true);
+      expect(hook.result.current.acp.state.serverTurnActive).toBe(true);
+      const frontier = hook.result.current.acp.state.lastSeq;
+      const turn = hook.result.current.acp.state.promptSeq;
+      expect(turn).toBeGreaterThan(0);
+      lastSocket().message(currentControlSnapshot(hook.result.current.acp.state, { ready: before }, frontier));
+      await flushAsync();
+      expect(nativeInputAvailable(hook.result.current.acp.state)).toBe(before);
+      armed = after;
+      lastSocket().message(currentControlSnapshot(hook.result.current.acp.state, { ready: after }, frontier));
+      const forceBeforeAcceptance = hook.result.current.escalation.canForceEndTurn;
+      await act(async () => {
+        admission.resolve(json({}, 202));
+        await gesture;
+      });
+      expect(gestures).toBe(1);
+      expect(observed).toEqual({ available: after, active: true, status: "open", seq: frontier, turn });
+      expect(posts("/acp/cancel")).toHaveLength(expectedCancels);
+      expect(forceBeforeAcceptance).toBe(false);
+      expect(hook.result.current.escalation.canForceEndTurn).toBe(after);
+      expect(posts("/acp/force_end_turn")).toEqual([]);
+      expect(hook.result.current.acp.state.promptSeq).toBe(turn);
+      expect(hook.result.current.acp.state.nativeSnapshotSeq).toBe(frontier);
+      hook.unmount();
+    },
+  );
+
   it("does not treat socket-open as a native receipt or wake permission", async () => {
     const { result, unmount } = render("sess-open-unknown", "absent", null, "2099-01-01T00:00:00Z");
     await flushAsync();

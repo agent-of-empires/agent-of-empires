@@ -12,6 +12,7 @@ import type { PluginUiEntry } from "../../lib/api";
 import type { PromptAttachmentInput, QueuedPrompt } from "../../lib/acpTypes";
 import { buildSkillIndex, type SkillIndex } from "../../lib/skillProvenance";
 import { Composer } from "./Composer";
+import { useCancelEscalation } from "./useCancelEscalation";
 
 const { skillIndexRef, entriesRef } = vi.hoisted(() => ({
   skillIndexRef: { current: { labelsByKey: new Map<string, Set<string>>() } as SkillIndex },
@@ -55,6 +56,8 @@ function Harness({
         authStatus={null}
         availableCommands={[]}
         connected
+        canForceEndTurn={false}
+        stopTurn={() => {}}
         canSubmit
         turnActive={isRunning}
         enqueuePrompt={() => {}}
@@ -184,6 +187,72 @@ describe("toolbar and send", () => {
     entriesRef.current = [entry({ kind: "insert-text", id: "op-2", text: " world" })];
     rerender(<Harness />);
     await waitFor(() => expect(textarea().value).toBe("hello world"));
+  });
+});
+
+describe("Stop admission", () => {
+  it("keeps graceful Stop disabled during native Unknown even when prompt intent may queue", async () => {
+    const cancel = vi.fn();
+    const { rerender } = mount({ isRunning: true, connected: false, canSubmit: true, stopTurn: cancel });
+    const stop = screen.getByRole("button", { name: "Stop" }) as HTMLButtonElement;
+    expect(stop.disabled).toBe(true);
+    fireEvent.click(stop);
+    expect(cancel).not.toHaveBeenCalled();
+    rerender(<Harness isRunning connected canSubmit stopTurn={cancel} />);
+    expect(stop.disabled).toBe(false);
+    fireEvent.click(stop);
+    await waitFor(() => expect(cancel).toHaveBeenCalledTimes(1));
+  });
+
+  it("preserves current-turn explicit local force after accepted cancel loses native readiness", async () => {
+    const admission = Promise.withResolvers<boolean>();
+    const entered = Promise.withResolvers<void>();
+    const cancel = vi.fn(() => {
+      entered.resolve();
+      return admission.promise;
+    });
+    const force = vi.fn().mockResolvedValue(undefined);
+    function Escalating({
+      connected,
+      turnSeq = 1,
+      cancelling = false,
+    }: {
+      connected: boolean;
+      turnSeq?: number;
+      cancelling?: boolean;
+    }) {
+      const escalation = useCancelEscalation("sess", turnSeq, cancelling, cancel, force);
+      return (
+        <Harness
+          isRunning
+          connected={connected}
+          canSubmit
+          canForceEndTurn={escalation.canForceEndTurn}
+          stopTurn={() => void escalation.onCancel()}
+        />
+      );
+    }
+    const { rerender } = render(<Escalating connected />);
+    const stop = () => screen.getByRole("button", { name: "Stop" }) as HTMLButtonElement;
+    fireEvent.click(stop());
+    await entered.promise;
+    rerender(<Escalating connected={false} />);
+    expect(stop().disabled).toBe(true);
+    await act(async () => {
+      admission.resolve(true);
+      await admission.promise;
+    });
+    expect(stop().disabled).toBe(false);
+    fireEvent.click(stop());
+    await waitFor(() => expect(force).toHaveBeenCalledTimes(1));
+    expect(cancel).toHaveBeenCalledTimes(1);
+    rerender(<Escalating connected={false} turnSeq={2} />);
+    expect(stop().disabled).toBe(true);
+    rerender(<Escalating connected={false} turnSeq={2} cancelling />);
+    expect(stop().disabled).toBe(false);
+    fireEvent.click(stop());
+    await waitFor(() => expect(force).toHaveBeenCalledTimes(2));
+    expect(cancel).toHaveBeenCalledTimes(1);
   });
 });
 

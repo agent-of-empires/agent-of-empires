@@ -81,6 +81,141 @@ async fn structured_purge_waits_for_a_pending_runner_retirement() -> anyhow::Res
 
 #[tokio::test]
 #[serial_test::serial]
+async fn permanent_delete_reaps_a_refused_owned_constructor_before_removing_its_scratch() {
+    use crate::acp::runner_lifecycle::ProcessControl as _;
+    use crate::acp::supervisor::test_support::{refused_owned_constructor, ObservedProcessControl};
+    use futures_util::FutureExt as _;
+    for stop_before_drop in [false, true] {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        let mut row = Instance::new("refused owned constructor", "");
+        let scratch = crate::session::scratch::provision_scratch_dir(&row.id).unwrap();
+        std::fs::write(scratch.join("retained-until-stop"), b"original scratch").unwrap();
+        row.project_path = scratch.to_str().unwrap().into();
+        row.scratch = true;
+        row.view = crate::session::View::Structured;
+        row.source_profile = "default".into();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let control = std::sync::Arc::new(ObservedProcessControl::default());
+        let state = crate::server::test_support::build_test_app_state_impl(
+            vec![row.clone()],
+            Vec::new(),
+            Vec::new(),
+            None,
+            false,
+            |_| {},
+            |supervisor| supervisor.with_process_control(control.clone()),
+        );
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let (reservation, mut runner) =
+            refused_owned_constructor(&state.acp_supervisor, &row).await;
+        let lease = reservation.lease().clone();
+        let mut reservation = Some(reservation);
+        let mut deleting = None;
+        let checked = std::panic::AssertUnwindSafe(async {
+            assert!(!lease.constructor_finished());
+            assert!(control.is_alive(runner.identity));
+            assert!(
+                control.signals().is_empty(),
+                "admission refusal is not physical loss"
+            );
+            assert!(scratch.join("retained-until-stop").exists());
+            if !stop_before_drop {
+                drop(reservation.take());
+                assert!(lease.constructor_finished());
+                assert!(control.is_alive(runner.identity));
+                assert!(
+                    control.signals().is_empty(),
+                    "producer completion is not actor retirement"
+                );
+            }
+            let deleting_state = state.clone();
+            let deleting_id = row.id.clone();
+            deleting = Some(tokio::spawn(async move {
+                super::delete::delete_session(
+                    State(deleting_state),
+                    Path(deleting_id),
+                    Some(Json(DeleteSessionBody {
+                        force_delete: true,
+                        ..Default::default()
+                    })),
+                )
+                .await
+                .into_response()
+            }));
+            if stop_before_drop {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    lease.cancellation().cancelled(),
+                )
+                .await
+                .expect("permanent deletion requests Stop from the original constructor");
+                assert!(!lease.constructor_finished());
+                assert!(
+                    !deleting.as_ref().unwrap().is_finished(),
+                    "Stop cannot acknowledge before the producer's Drop"
+                );
+                drop(reservation.take());
+            }
+            let response = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                runner.wait_for_constructor(&lease).await;
+                deleting.as_mut().unwrap().await
+            })
+            .await
+            .expect("the exact retired constructor must not strand permanent deletion");
+            drop(deleting.take());
+            let response = response.unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["status"], "deleted", "{body}");
+            assert_eq!(body["cleanup_errors"], serde_json::json!([]), "{body}");
+            assert!(!control.is_alive(runner.identity));
+            assert!(!control.signals().is_empty());
+            assert!(control
+                .signals()
+                .iter()
+                .all(|(identity, _)| *identity == runner.identity));
+            assert!(crate::process::worker_registry::load(&row.id)
+                .unwrap()
+                .is_none());
+            assert!(!state.acp_supervisor.is_owned(&row.id).await);
+            assert!(!scratch.exists());
+            assert!(state
+                .instances
+                .read()
+                .await
+                .iter()
+                .all(|current| current.id != row.id));
+            let stored = crate::session::Storage::open_reference("default")
+                .unwrap()
+                .load_complete_with_groups()
+                .unwrap()
+                .0;
+            assert!(stored.iter().all(|current| current.id != row.id));
+        })
+        .catch_unwind()
+        .await;
+        drop(reservation.take());
+        if checked.is_err() {
+            runner.cleanup_constructor(&lease).await;
+            if let Some(task) = deleting.take() {
+                let _ = task.await;
+            }
+        }
+        state.shutdown.cancel();
+        if let Err(panic) = checked {
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn committed_purge_preserves_a_reused_rows_structured_projection() -> anyhow::Result<()> {
     use crate::session::deletion::{DeletionRequest, PurgeTransaction};
     for recovered_with_replacement_worker in [false, true] {

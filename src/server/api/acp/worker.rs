@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::acp::protocol::{
     SwitchAgentRequest, SwitchAgentResponse, SwitchProviderRequest, SwitchProviderResponse,
 };
-use crate::server::acp_reconciler::install_rate_limit_continuation;
+use crate::server::acp_reconciler::{resume_rate_limited, QuotaResume};
 use crate::server::api::find_instance;
 
 use super::*;
@@ -112,7 +112,7 @@ pub async fn spawn_acp(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
-    let exclusion =
+    let mut exclusion =
         match crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &id, true).await {
             Ok(exclusion) => exclusion,
             Err(_) => return session_not_found(),
@@ -135,6 +135,24 @@ pub async fn spawn_acp(
             "error": "creation_not_finalized", "message": "The structured session launch is not finalized",
         }))).into_response();
     }
+    if rate_limit_resume_probe(&state, &id).await.is_some() {
+        let explicit = req.agent.as_deref().or(instance.agent_name.as_deref());
+        let agent = pick_agent(&state, &instance, explicit).await;
+        let submission = exclusion
+            .take_submission()
+            .expect("launch owns prompt submission");
+        drop(exclusion);
+        if let Err(error) = resume_rate_limited(&state, &id, submission, QuotaResume::Manual).await
+        {
+            return supervisor_error_response("quota continuation failed", &error);
+        }
+        return Json(SpawnAcpResponse {
+            session_id: id,
+            agent,
+            status: "running",
+        })
+        .into_response();
+    }
 
     let instance =
         match crate::server::api::sessions::resume_structured_stop(&state, instance).await {
@@ -147,7 +165,7 @@ pub async fn spawn_acp(
         Ok(store) => store,
         Err(response) => return response,
     };
-    let (sandbox_info, mut exclusion) = match crate::acp::sandbox::ensure_container_for_session(
+    let (sandbox_info, exclusion) = match crate::acp::sandbox::ensure_container_for_session(
         native.clone(),
         instance.clone(),
         exclusion,
@@ -157,7 +175,6 @@ pub async fn spawn_acp(
         Ok(info) => info,
         Err(e) => return launch_error_response("sandbox container ensure", &e),
     };
-    let rate_limit_resume_resets_at = rate_limit_resume_probe(&state, &id).await;
 
     // Explicit resume has settled and consumed only the observed native stop.
 
@@ -193,27 +210,12 @@ pub async fn spawn_acp(
         )
         .await
     {
-        Ok(reservation) => Some(reservation),
-        Err(SupervisorError::AlreadyRunning(_)) if rate_limit_resume_resets_at.is_some() => None,
+        Ok(reservation) => reservation,
         Err(e) => return supervisor_error_response("spawn failed", &e),
     };
-    if rate_limit_resume_resets_at.is_some() {
-        if let Some(submission) = exclusion.take_submission() {
-            let _ = install_rate_limit_continuation(&state, &id, submission).await;
-        }
-    }
     drop(exclusion);
-    if let Some(reservation) = reservation {
-        if let Err(e) = state.acp_supervisor.spawn_inner(request, reservation).await {
-            return supervisor_error_response("spawn failed", &e);
-        }
-    }
-    if let Some(resets_at) = rate_limit_resume_resets_at {
-        // The manual breadcrumb is the budget's disarm step, so it fires
-        // whether or not a queued prompt superseded the continuation.
-        state
-            .acp_supervisor
-            .publish_rate_limit_auto_resumed(&id, resets_at, true);
+    if let Err(e) = state.acp_supervisor.spawn_inner(request, reservation).await {
+        return supervisor_error_response("spawn failed", &e);
     }
     Json(SpawnAcpResponse {
         session_id: id,
@@ -2285,6 +2287,7 @@ mod tests {
             kind: "rate_limit".to_string(),
         };
         let park = |info, cap_reached| RateLimitPark {
+            seq: 1,
             info,
             recorded_at_ms: 0,
             cap_reached,

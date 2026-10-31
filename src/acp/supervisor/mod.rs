@@ -3,6 +3,7 @@
 
 mod agents;
 mod drain;
+mod fork_rejection;
 mod launch;
 mod publish;
 mod requests;
@@ -179,6 +180,24 @@ pub(crate) enum ResumeReservationOutcome {
 #[error("native observation epoch is busy")]
 pub(crate) struct NativeObservationBusy;
 
+#[derive(Debug)]
+pub(crate) enum StartupFailure {
+    Retry,
+    ForkRejected(Arc<fork_rejection::QualifiedForkRejection>),
+}
+
+impl PartialEq for StartupFailure {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Retry, Self::Retry) => true,
+            (Self::ForkRejected(left), Self::ForkRejected(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for StartupFailure {}
+
 pub struct Supervisor<S: BroadcastSink> {
     sink: Arc<S>,
     registry: Arc<Mutex<AgentRegistry>>,
@@ -204,7 +223,7 @@ pub struct Supervisor<S: BroadcastSink> {
     /// Sessions the reconciler must fresh-spawn next tick, bypassing its `attempted` guard.
     force_respawn: SharedSet,
     /// Sessions whose worker failed before establishing a session.
-    startup_failures: SharedSet,
+    startup_failures: Arc<std::sync::Mutex<HashMap<String, StartupFailure>>>,
     /// Sessions whose isolated native identity is not durable yet.
     pending_context_resets: SharedSet,
     /// Sessions whose crashed worker the drain task relaunched in place.
@@ -236,10 +255,11 @@ impl ResumeReservation {
 
 impl Drop for ResumeReservation {
     fn drop(&mut self) {
-        if self.preserve_owner {
+        let mut lifecycle = lock_recover(&self.lifecycle);
+        if self.preserve_owner && lifecycle.finish_preserved_construction(&self.lease) {
+            self.notify.notify_waiters();
             return;
         }
-        let mut lifecycle = lock_recover(&self.lifecycle);
         if !lifecycle.construction_is_pending(&self.lease) {
             return;
         }
@@ -409,7 +429,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         lock_recover(&self.force_respawn).drain().collect()
     }
 
-    pub fn take_startup_failures(&self) -> Vec<String> {
+    pub(crate) fn take_startup_failures(&self) -> Vec<(String, StartupFailure)> {
         lock_recover(&self.startup_failures).drain().collect()
     }
 

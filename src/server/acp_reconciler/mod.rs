@@ -18,9 +18,9 @@ use crate::acp::event_store::EventStore;
 use crate::daemon::AcpWorkerState;
 use crate::session::Instance;
 
-pub(crate) use rate_limit::install_rate_limit_continuation;
 #[cfg(test)]
-pub(crate) use rate_limit::ContinuationOutcome;
+pub(crate) use rate_limit::{install_rate_limit_continuation, ContinuationOutcome};
+pub(crate) use rate_limit::{resume_rate_limited, QuotaDelivery, QuotaResume};
 pub(crate) use resume::{command_override_for_spawn, trigger_resume_background, ResumeTrigger};
 
 use resume::{resume_one, ResumeTarget};
@@ -248,6 +248,7 @@ pub async fn reconcile_acp_workers(
     resume_deferred: &mut HashMap<String, ResumeDeferral>,
 ) {
     let supervisor = &state.acp_supervisor;
+    supervisor.settle_fork_rejections().await;
     supervisor.retry_pending_teardowns().await;
     crate::server::api::recover_pending_terminal_handoffs(
         state,
@@ -275,9 +276,34 @@ pub async fn reconcile_acp_workers(
         }
         forget_session_budget(&id, attempted, parked, respawn_history, resume_deferred);
     }
-    // Pre-session startup failures re-arm under the ordinary budget.
-    for id in supervisor.take_startup_failures() {
-        attempted.remove(&id);
+    for (id, failure) in supervisor.take_startup_failures() {
+        match failure {
+            crate::acp::supervisor::StartupFailure::Retry => {
+                attempted.remove(&id);
+            }
+            crate::acp::supervisor::StartupFailure::ForkRejected(receipt) => {
+                let matches = state
+                    .instances
+                    .read()
+                    .await
+                    .iter()
+                    .find(|row| row.id == id)
+                    .is_some_and(|row| receipt.matches_postimage(row));
+                if matches && !supervisor.fork_rejection_superseded(&id, &receipt) {
+                    let current = state
+                        .session_service
+                        .native_control_projection(&id, None, 0)
+                        .await;
+                    if current
+                        .context()
+                        .is_none_or(|context| context == receipt.context())
+                    {
+                        attempted.insert(id.clone());
+                        parked.insert(id);
+                    }
+                }
+            }
+        }
     }
     for id in supervisor.take_respawned_in_place() {
         resume::requeue_interrupted_monitor(state, &id).await;
@@ -291,15 +317,12 @@ pub async fn reconcile_acp_workers(
     if due(&mut cadence.terminal_repair, idle::TERMINAL_REPAIR_INTERVAL) {
         idle::repair_missing_terminal(state).await;
     }
-    // Before the snapshot so a released park respawns this same tick.
-    let released_from_park = if due(
+    if due(
         &mut cadence.rate_limit,
         rate_limit::RATE_LIMIT_RESUME_INTERVAL,
     ) {
-        rate_limit::reap_rate_limit_resumes(state, attempted, parked).await
-    } else {
-        HashSet::new()
-    };
+        rate_limit::reap_rate_limit_resumes(state, attempted, parked).await;
+    }
 
     // Triaged sessions are excluded so an archive/snooze teardown is not undone (#1581).
     let (targets, with_queued_prompts): (Vec<ResumeTarget>, HashSet<String>) = {
@@ -394,6 +417,21 @@ pub async fn reconcile_acp_workers(
                 }
             }
         }
+        if let Some(park) = query_store(
+            &state.acp_event_store,
+            &id,
+            "rate-limit hold",
+            |store, id| store.rate_limit_park(id),
+        )
+        .await
+        .flatten()
+        {
+            if park.cap_reached && with_queued_prompts.contains(&id) {
+                rate_limit::schedule_capped_queue(state, &id, park.seq).await;
+            }
+            attempted.insert(id.clone());
+            continue;
+        }
         if attempted.contains(&id) {
             // A restart marker can land after the reaper ran: add-project (#3103)
             // writes it only once the moved workspace is durable.
@@ -406,7 +444,7 @@ pub async fn reconcile_acp_workers(
         }
         match supervisor.worker_state(&id).await {
             AcpWorkerState::Running | AcpWorkerState::Resuming => {
-                // Already owned; a live worker is also the user's retry, so un-park.
+                // Current ownership clears crash bookkeeping only after quota hold ends.
                 forget_session_budget(&id, attempted, parked, respawn_history, resume_deferred);
                 attempted.insert(id);
                 continue;
@@ -420,27 +458,6 @@ pub async fn reconcile_acp_workers(
         if parked.contains(&id) {
             attempted.insert(id);
             continue;
-        }
-        // A rate-limit park (#3514) is left to the auto-resume pass; a cap park
-        // (#3688) is released by a queued prompt.
-        if !released_from_park.contains(&id) {
-            let park = query_store(&state.acp_event_store, &id, "rate-limit park", |s, id| {
-                s.rate_limit_park(id)
-            })
-            .await
-            .flatten();
-            if let Some(park) =
-                park.filter(|p| !p.cap_reached || !with_queued_prompts.contains(&id))
-            {
-                tracing::debug!(
-                    target: "acp.supervisor",
-                    session = %id,
-                    cap_reached = park.cap_reached,
-                    "holding respawn: session is parked on a rate limit"
-                );
-                attempted.insert(id);
-                continue;
-            }
         }
         if record_and_check_respawn_budget(respawn_history, &id, Instant::now()) {
             tracing::warn!(
@@ -960,12 +977,29 @@ mod tests {
             let mut tick = Tick::default();
             tick.respawn_history.insert(id.into(), prior.clone());
             tick.attempted.insert(id.into());
-            let released =
-                rate_limit::reap_rate_limit_resumes(&state, &mut tick.attempted, &tick.parked)
-                    .await;
-            assert!(
-                released.is_empty(),
-                "qualified refusal cannot spend a provider redelivery"
+            let park_seq = state.acp_event_store.rate_limit_park(id).unwrap().seq;
+            let streak = state.acp_event_store.rate_limit_redelivery_streak(id);
+            let queued = state.session_service.queued_prompts_snapshot(id).await;
+            rate_limit::reap_rate_limit_resumes(&state, &mut tick.attempted, &tick.parked).await;
+            drop(
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    state.session_service.prompt_submission(id),
+                )
+                .await
+                .expect("the scheduled quota refusal releases submission ownership"),
+            );
+            assert_eq!(
+                state.acp_event_store.rate_limit_park(id).unwrap().seq,
+                park_seq
+            );
+            assert_eq!(
+                state.acp_event_store.rate_limit_redelivery_streak(id),
+                streak
+            );
+            assert_eq!(
+                state.session_service.queued_prompts_snapshot(id).await,
+                queued
             );
             assert_eq!(state.acp_event_store.replay_from(id, 0).len(), 3);
             assert!(state.instances.read().await[0]
@@ -973,6 +1007,29 @@ mod tests {
                 .is_none());
             for _ in 0..RECONCILER_MAX_RESPAWNS_IN_WINDOW + 2 {
                 tick.run(&state).await;
+                drop(
+                    tokio::time::timeout(
+                        Duration::from_secs(5),
+                        state.session_service.prompt_submission(id),
+                    )
+                    .await
+                    .expect("the tick's quota task settles before negative assertions"),
+                );
+                assert_eq!(
+                    state.acp_event_store.rate_limit_park(id).unwrap().seq,
+                    park_seq,
+                    "{shape}"
+                );
+                assert_eq!(
+                    state.acp_event_store.rate_limit_redelivery_streak(id),
+                    streak,
+                    "{shape}"
+                );
+                assert_eq!(
+                    state.session_service.queued_prompts_snapshot(id).await,
+                    queued,
+                    "{shape}"
+                );
                 assert_eq!(tick.respawn_history.get(id), Some(&prior), "{shape}");
                 assert!(
                     !tick.attempted.contains(id) && !tick.parked.contains(id),

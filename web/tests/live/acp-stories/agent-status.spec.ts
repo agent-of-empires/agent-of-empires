@@ -45,7 +45,7 @@ async function expectResetBanner(page: Page, resetSecs: number, timeout: number)
 }
 
 test("resume re-issues the interrupted prompt so the agent continues", async ({ page, spawnServe }) => {
-  // #3028: resume must respawn the worker and re-send the rate-limited prompt.
+  // Resume delivers the interrupted prompt on the retained native conversation.
   const reset = resetIn(2, 37);
   const { serve, sessionId } = await startAcpSession(spawnServe, {
     title: "rl-resume",

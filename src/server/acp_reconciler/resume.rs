@@ -8,8 +8,8 @@ use tokio::time::timeout;
 
 use super::{is_resumable, query_store, AppState, ResumeOutcome};
 use crate::acp::supervisor::{
-    AgentCommandOverride, BroadcastSink, ResumeKind, ResumeReservationOutcome, SpawnRequest,
-    Supervisor, SupervisorError,
+    AgentCommandOverride, BroadcastSink, ResumeKind, ResumeReservation, ResumeReservationOutcome,
+    SpawnRequest, Supervisor, SupervisorError,
 };
 use crate::process::worker_registry;
 use crate::server::session_service::SessionService;
@@ -314,21 +314,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, mut target: ResumeTarget) -
                         "adopting build-stale structured view worker to drain in-flight turn before respawn"
                     );
                 }
-                let sandbox = {
-                    let instances = state.instances.read().await;
-                    instances
-                        .iter()
-                        .find(|i| i.id == id)
-                        .and_then(|i| i.sandbox_info.clone())
-                };
-                let attach = state.acp_supervisor.attach_inner(
-                    id.clone(),
-                    PathBuf::from(&target.project_path),
-                    vec![],
-                    in_flight_turn,
-                    sandbox,
-                    reservation,
-                );
+                let attach = attach_retained_target(&state.session_service, &target, reservation);
                 match timeout(Duration::from_secs(3), attach).await {
                     Ok(Ok(())) => {
                         // Flagged only once attached: a failed attach respawns on the current binary.
@@ -664,6 +650,103 @@ pub(crate) fn command_override_for_spawn(
         logical_tool: tool.to_string(),
         command: command.to_string(),
     })
+}
+
+async fn attach_retained_target(
+    service: &Arc<SessionService>,
+    target: &ResumeTarget,
+    reservation: ResumeReservation,
+) -> Result<(), SupervisorError> {
+    let sandbox = {
+        let instances = service.instances.read().await;
+        let row = instances
+            .iter()
+            .find(|row| {
+                row.id == target.id
+                    && is_resumable(row)
+                    && row.source_profile == target.source_profile
+                    && row.created_at == target.created_at
+                    && row.lifecycle_generation == target.lifecycle_generation
+            })
+            .ok_or_else(|| SupervisorError::SpawnCancelled(target.id.clone()))?;
+        row.sandbox_info.clone()
+    };
+    // Attached workers resume their background tailers independently in
+    // install_worker. Only an actual main turn owns a cached prompt completion.
+    let in_flight_turn = query_store(
+        &service.acp_event_store,
+        &target.id,
+        "retained main-turn adoption",
+        |store, id| store.has_in_flight_main_turn(id),
+    )
+    .await
+    .ok_or(SupervisorError::NativeStoreUnavailable)?;
+    service
+        .acp_supervisor
+        .attach_inner(
+            target.id.clone(),
+            PathBuf::from(&target.project_path),
+            vec![],
+            in_flight_turn,
+            sandbox,
+            reservation,
+        )
+        .await
+}
+
+pub(super) async fn ensure_rate_limit_worker(
+    state: &Arc<AppState>,
+    id: &str,
+    authority: worker_registry::ResumeAuthority,
+) -> Result<(), SupervisorError> {
+    if !state.acp_supervisor.is_running(id).await {
+        let target = resume_target_for_session(&state.session_service, id)
+            .await
+            .ok_or_else(|| SupervisorError::SpawnCancelled(id.to_owned()))?;
+        let probe_id = id.to_owned();
+        let record =
+            tokio::task::spawn_blocking(move || worker_registry::control_admission(&probe_id))
+                .await
+                .map_err(|_| SupervisorError::NativeStoreUnavailable)?
+                .map_err(|refusal| {
+                    SupervisorError::Acp(
+                        crate::acp::acp_client::AcpError::RetainedRuntimeUnavailable(Box::new(
+                            refusal,
+                        )),
+                    )
+                })?;
+        if record
+            .as_ref()
+            .is_some_and(worker_registry::retained_process_may_be_alive)
+        {
+            match state
+                .acp_supervisor
+                .begin_resume(id, ResumeKind::Attach, authority)
+                .await?
+            {
+                ResumeReservationOutcome::AlreadyPresent => {}
+                ResumeReservationOutcome::Reserved(mut reservation) => {
+                    reservation.expected_lifecycle_generation = Some(target.lifecycle_generation);
+                    timeout(
+                        Duration::from_secs(3),
+                        attach_retained_target(&state.session_service, &target, reservation),
+                    )
+                    .await
+                    .map_err(|_| {
+                        SupervisorError::Acp(crate::acp::acp_client::AcpError::AttachTimedOut)
+                    })??;
+                }
+            }
+        } else {
+            match trigger_resume_background(&state.session_service, id, authority).await? {
+                ResumeTrigger::NotFound => {
+                    return Err(SupervisorError::UnknownSession(id.to_owned()))
+                }
+                ResumeTrigger::Started | ResumeTrigger::AlreadyResuming => {}
+            }
+        }
+    }
+    state.acp_supervisor.wait_until_ready(id).await
 }
 
 async fn resume_target_for_session(service: &SessionService, id: &str) -> Option<ResumeTarget> {

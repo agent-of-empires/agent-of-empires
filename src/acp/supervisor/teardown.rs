@@ -70,6 +70,7 @@ pub(crate) struct RetirementResources {
     clients: std::sync::Mutex<[Option<Arc<RetiringClient>>; 2]>,
     drain: std::sync::Mutex<Option<RetiringDrain>>,
     identity_scope: std::sync::Mutex<Option<Arc<RetiringIdentityScope>>>,
+    fork: std::sync::Mutex<super::fork_rejection::ForkCustody>,
     emit_events: std::sync::atomic::AtomicBool,
 }
 
@@ -80,12 +81,31 @@ impl Default for RetirementResources {
             clients: std::sync::Mutex::new([None, None]),
             drain: std::sync::Mutex::new(None),
             identity_scope: std::sync::Mutex::new(None),
+            fork: std::sync::Mutex::default(),
             emit_events: std::sync::atomic::AtomicBool::new(true),
         }
     }
 }
 
 impl RetirementResources {
+    pub(super) fn prepare_fork_seed(&self, seed: Arc<super::fork_rejection::ForkSeed>) {
+        lock_recover(&self.fork).prepare(seed);
+    }
+
+    pub(super) fn receive_fork_rejection(
+        &self,
+        lease: &Lease,
+        proof: &Arc<crate::acp::state::NativeForkRejection>,
+    ) -> Option<Arc<super::fork_rejection::QualifiedForkRejection>> {
+        lock_recover(&self.fork).receive(lease, proof)
+    }
+
+    pub(super) fn fork_rejection(
+        &self,
+    ) -> Option<Arc<super::fork_rejection::QualifiedForkRejection>> {
+        lock_recover(&self.fork).receipt()
+    }
+
     /// Prepare under native exclusion; installation follows a committed row.
     pub(crate) fn prepare_handoff_identity_scope(
         &self,
@@ -600,6 +620,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         delete_adapter_state: bool,
         expected: Option<&RetirementTarget>,
     ) -> Result<(), SupervisorError> {
+        let constructor = lock_recover(&self.lifecycle).current_lease(session_id);
         let record_before = if expected.is_none() {
             worker_registry::load_strict(session_id).map_err(|error| {
                 SupervisorError::Acp(crate::acp::acp_client::AcpError::Spawn(error.to_string()))
@@ -654,6 +675,29 @@ impl<S: BroadcastSink> Supervisor<S> {
             notified.as_mut().enable();
             if !still_owned() {
                 break;
+            }
+            if let Some(lease) = constructor
+                .as_ref()
+                .filter(|lease| lease.constructor_finished())
+            {
+                let original = RetirementTarget {
+                    lease: Some(lease.clone()),
+                    identity: lease.spawned_runner(),
+                    scopes: lease.scopes(),
+                    prime: lease.prime(),
+                    journalled: false,
+                };
+                self.shutdown_with_reason(
+                    session_id,
+                    "user_stopped",
+                    delete_adapter_state,
+                    Some(expected.unwrap_or(&original)),
+                    None,
+                )
+                .await?;
+                if !still_owned() {
+                    break;
+                }
             }
             if tokio::time::timeout_at(deadline, notified).await.is_err() && still_owned() {
                 return Err(SupervisorError::TeardownPending(session_id.into()));

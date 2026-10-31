@@ -203,6 +203,17 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
         if !should_auto_stop(now_ms, last_ms, idle_secs, false) {
             continue;
         }
+        if query_store(
+            &state.acp_event_store,
+            &id,
+            "idle-reap quota hold",
+            |store, id| store.rate_limit_park(id).is_some(),
+        )
+        .await
+        .unwrap_or(true)
+        {
+            continue;
+        }
         // Re-check mid-turn: a turn may have started since the snapshot.
         let in_flight = query_store(
             &state.acp_event_store,
@@ -327,11 +338,12 @@ mod tests {
                     id,
                     1,
                     &Event::Stopped {
-                        reason: "rate_limited".into(),
+                        reason: "prompt_complete".into(),
                     },
                     stale_ms,
                 )
                 .unwrap();
+            assert!(state.acp_event_store.rate_limit_park(id).is_none());
             let sup = &state.acp_supervisor;
             let (_hold, before) = match worker {
                 Worker::Starting => (Some(sup.test_hold_starting(id)), Resuming),

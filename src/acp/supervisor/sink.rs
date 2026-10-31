@@ -29,6 +29,9 @@ pub trait BroadcastSink: Send + Sync + 'static {
     }
     /// Drop all stored events for a session (import retry).
     fn clear_session_events(&self, _session_id: &str) {}
+    fn unsuccessful_main(&self, _session_id: &str) -> bool {
+        false
+    }
     /// Nonces of approvals requested on disk but never resolved.
     fn unresolved_approval_nonces(&self, _session_id: &str) -> Vec<Nonce> {
         Vec::new()
@@ -94,6 +97,10 @@ impl BroadcastSink for ChannelSink {
     fn clear_session_events(&self, session_id: &str) {
         self.event_store.delete_session(session_id);
         self.control_cache.forget(session_id);
+    }
+
+    fn unsuccessful_main(&self, session_id: &str) -> bool {
+        self.event_store.has_unsuccessful_main_outcome(session_id)
     }
 
     fn publish_persisted(&self, session_id: &str, seq: u64, event: &Event) -> bool {

@@ -560,6 +560,7 @@ mod tests {
 
         let reset = Event::SessionContextReset {
             reason: "load failed".into(),
+            fork_rejection: None,
         };
         let p = with_options(
             vec![

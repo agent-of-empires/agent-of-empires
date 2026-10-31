@@ -10,6 +10,7 @@ use crate::events;
 /// A session parked on a provider rate limit.
 #[derive(Debug, Clone)]
 pub struct RateLimitPark {
+    pub seq: u64,
     /// The latest reported limit; `None` for a park whose `RateLimit` row was pruned.
     pub info: Option<RateLimitInfo>,
     /// When the latest `RateLimit` was recorded (epoch ms), 0 when unknown.
@@ -44,7 +45,7 @@ impl EventStore {
     }
 
     /// The session's current rate-limit park, unless a real continuation
-    /// (a prompt, an agent switch, a new session, or an organic stop) superseded it.
+    /// (a prompt, an agent switch, an explicit clear, or an organic stop) superseded it.
     pub fn rate_limit_park(&self, session_id: &str) -> Option<RateLimitPark> {
         let conn = self.conn();
         let latest_rate_limit: Option<(i64, String, i64)> = conn
@@ -101,7 +102,7 @@ impl EventStore {
                    SELECT 1 FROM acp_events
                    WHERE session_id = ?1 AND seq > ?2
                      AND (discriminant IN ('UserPromptSent', 'UserDiffCommentsPrompt',
-                                           'AgentSwitched', 'AcpSessionAssigned')
+                                           'AgentSwitched', 'SessionCleared')
                        OR (discriminant = 'Stopped'
                            AND json_extract(event_json, '$.Stopped.reason')
                                NOT IN ('rate_limited', ?3))))",
@@ -122,6 +123,7 @@ impl EventStore {
             )
             .unwrap_or(None);
         Some(RateLimitPark {
+            seq: u64::try_from(park_seq).ok()?,
             info,
             recorded_at_ms,
             cap_reached: cap_seq.is_some(),
@@ -485,7 +487,7 @@ mod tests {
                 false,
             ),
             (
-                "resumed with nothing to redeliver",
+                "read-only reattach",
                 vec![
                     Event::RateLimitAutoResumed {
                         resets_at: Utc::now(),
@@ -497,9 +499,10 @@ mod tests {
                         native_subject: None,
                     },
                 ],
-                false,
+                true,
                 false,
             ),
+            ("explicit clear", vec![Event::SessionCleared], false, false),
             ("user stopped", vec![stopped("user_stopped")], false, false),
             (
                 "cap reached",
@@ -527,7 +530,7 @@ mod tests {
                 assert!(got.info.is_some(), "{label}: carries the limit");
                 assert_eq!(
                     got.last_resume_attempt_ms.is_some(),
-                    label == "failed resume",
+                    matches!(label, "failed resume" | "read-only reattach"),
                     "{label}: resume attempt"
                 );
             }

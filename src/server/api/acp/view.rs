@@ -81,6 +81,43 @@ fn resolve_structured_seed(
     }
 }
 
+fn structured_seed_for(
+    instance: &Instance,
+    agent_name: &str,
+    selected_session_id: Option<&str>,
+) -> (
+    StructuredSeed,
+    Option<crate::session::capture::ClaudeStorePin>,
+) {
+    let claude_store_pin = instance.selected_claude_store_pin();
+    let resume_sid = selected_session_id.or(instance.agent_session_id.as_deref());
+    let transcript_present = instance.is_sandboxed()
+        || resume_sid
+            .map(|sid| {
+                !crate::session::capture::claude_host_transcript_confirmed_absent(
+                    &instance.project_path,
+                    sid,
+                    &instance.resolved_host_environment(),
+                    claude_store_pin
+                        .as_ref()
+                        .map(|pin| pin.store.as_path())
+                        .or(instance
+                            .declared_agent_config_dir_for(&instance.tool)
+                            .as_deref()),
+                )
+            })
+            .unwrap_or(false);
+    let seed = resolve_structured_seed(
+        &instance.tool,
+        agent_name,
+        instance.acp_session_id.as_deref(),
+        resume_sid,
+        instance.import_pending == Some(true),
+        transcript_present,
+    );
+    (seed, claude_store_pin)
+}
+
 fn adopt_persisted_structured_instance(
     cached: Instance,
     mut persisted: Instance,
@@ -160,11 +197,18 @@ pub async fn acp_enable(
     }
 
     let agent_name = pick_agent(&state, &instance, instance.agent_name.as_deref()).await;
-    if let Err(resp) =
-        commit_structured_view(&state, &mut instance, selected_binding.as_ref(), namespace).await
+    let import_terminal = match commit_structured_view(
+        &state,
+        &mut instance,
+        selected_binding.as_ref(),
+        &agent_name,
+        namespace,
+    )
+    .await
     {
-        return resp;
-    }
+        Ok(import_terminal) => import_terminal,
+        Err(response) => return response,
+    };
     tracing::info!(
         target: "acp.switch",
         session = %id,
@@ -172,7 +216,13 @@ pub async fn acp_enable(
         agent = %agent_name,
         "view switched"
     );
-    spawn_enabled_worker(state.clone(), instance, agent_name, selected_conversation);
+    spawn_enabled_worker(
+        state.clone(),
+        instance,
+        agent_name,
+        selected_conversation,
+        import_terminal,
+    );
     view_response(&state, id, View::Structured).await
 }
 
@@ -181,13 +231,15 @@ async fn commit_structured_view(
     state: &Arc<AppState>,
     instance: &mut Instance,
     selected_binding: Option<&crate::session::ConversationBinding>,
+    agent_name: &str,
     namespace: tokio::sync::OwnedRwLockReadGuard<()>,
-) -> Result<(), Response> {
+) -> Result<bool, Response> {
     let inst_for_transition = instance.clone();
     let profile = instance.source_profile.clone();
     let commit_state = state.clone();
     let binding_for_transition = selected_binding.cloned();
-    let transition = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+    let agent_for_transition = agent_name.to_owned();
+    let transition = tokio::task::spawn_blocking(move || -> anyhow::Result<(u64, bool)> {
         let _namespace = namespace;
         use crate::session::SessionStore;
         let storage = crate::server::session_store::NativeSessionStore::open(
@@ -198,15 +250,33 @@ async fn commit_structured_view(
             .map_err(|error| {
                 anyhow::anyhow!("failed to acquire terminal-to-ACP lifecycle lock: {error}")
             })?;
+        let source_conversation = inst_for_transition.conversation_state();
+        let matches_source = |row: &Instance| {
+            row.created_at == inst_for_transition.created_at
+                && row.effective_profile() == profile
+                && row.lifecycle_generation == inst_for_transition.lifecycle_generation
+                && row.view == inst_for_transition.view
+                && row.terminal_handoff.is_none()
+                && row.project_path == inst_for_transition.project_path
+                && row.agent_name == inst_for_transition.agent_name
+                && row.agent_provider == inst_for_transition.agent_provider
+                && row.acp_session_id == inst_for_transition.acp_session_id
+                && row.fork_pending == inst_for_transition.fork_pending
+                && row.import_pending == inst_for_transition.import_pending
+                && source_conversation.matches_checkpoint(row)
+        };
         let current = storage.load()?.into_iter()
             .find(|row| row.id == inst_for_transition.id)
             .ok_or(crate::session::SessionGone)?;
         current.ensure_startable()?;
         anyhow::ensure!(
-            current.lifecycle_generation == inst_for_transition.lifecycle_generation
-                && current.view == inst_for_transition.view
-                && current.terminal_handoff.is_none(),
+            matches_source(&current),
             crate::session::LifecycleReservationError::Superseded
+        );
+        let (seed, _) = structured_seed_for(
+            &current,
+            &agent_for_transition,
+            current.selected_claude_conversation().map(|(sid, _)| sid),
         );
         let generation = current.lifecycle_generation.checked_add(1)
             .ok_or(crate::session::LifecycleReservationError::GenerationOverflow)?;
@@ -227,9 +297,7 @@ async fn commit_structured_view(
                 anyhow::bail!("session disappeared during terminal-to-ACP transition");
             };
             anyhow::ensure!(
-                slot.lifecycle_generation == inst_for_transition.lifecycle_generation
-                    && slot.view == inst_for_transition.view
-                    && slot.terminal_handoff.is_none(),
+                matches_source(slot),
                 crate::session::LifecycleReservationError::Superseded
             );
             slot.ensure_startable()?;
@@ -238,6 +306,10 @@ async fn commit_structured_view(
             if let Some(binding) = &binding_for_transition {
                 slot.agent_session_id = Some(binding.session_id.clone());
                 slot.agent_session_binding = Some(binding.clone());
+            }
+            slot.acp_session_id.clone_from(&seed.stored_acp_session_id);
+            if seed.seed_history_replay {
+                slot.import_pending = Some(true);
             }
             // Structured status is event-driven and the tmux poller skips
             // structured rows, so a Running/Waiting status would never settle.
@@ -248,13 +320,13 @@ async fn commit_structured_view(
             slot.last_error_evidence = None;
             slot.lifecycle_generation = generation;
             slot.acp_load_session_capable = None;
-            Ok(slot.lifecycle_generation)
+            Ok((slot.lifecycle_generation, seed.import_terminal))
         })
     })
     .await;
     let id = instance.id.clone();
-    let lifecycle_generation = match transition {
-        Ok(Ok(generation)) => generation,
+    let (lifecycle_generation, import_terminal) = match transition {
+        Ok(Ok(committed)) => committed,
         Ok(Err(error)) => {
             tracing::error!(target: "acp.switch", session = %id, "terminal-to-ACP transition failed: {error:#}");
             return Err(internal_error(
@@ -277,7 +349,7 @@ async fn commit_structured_view(
         tracing::error!(target: "acp.switch", session = %id, %error, "view publication failed");
         internal_error("failed to publish structured view")
     })?;
-    Ok(())
+    Ok(import_terminal)
 }
 
 /// Spawn the worker in the background so the response does not wait on a
@@ -288,6 +360,7 @@ fn spawn_enabled_worker(
     expected: Instance,
     agent_name: String,
     selected_conversation: Option<(String, crate::session::ExecutionBinding)>,
+    import_terminal: bool,
 ) {
     let session_id = expected.id.clone();
     let work = state.runtime.work.clone();
@@ -305,6 +378,7 @@ fn spawn_enabled_worker(
             &expected,
             agent_name.clone(),
             selected_conversation,
+            import_terminal,
             exclusion,
         )
         .await
@@ -340,6 +414,7 @@ async fn deferred_enable_request(
     expected: &Instance,
     agent_name: String,
     selected_conversation: Option<(String, crate::session::ExecutionBinding)>,
+    import_terminal: bool,
     exclusion: crate::acp::sandbox::LaunchExclusion,
 ) -> Option<Result<(SpawnRequest, crate::acp::supervisor::ResumeReservation), String>> {
     let session_id = expected.id.as_str();
@@ -351,34 +426,10 @@ async fn deferred_enable_request(
             && row.source_profile == expected.source_profile
             && row.ensure_startable().is_ok()
     })?;
-    let claude_store_pin = instance.selected_claude_store_pin();
-    let resume_sid = selected_conversation
-        .as_ref()
-        .map(|(sid, _)| sid.as_str())
-        .or(instance.agent_session_id.as_deref());
-    let transcript_present = instance.is_sandboxed()
-        || resume_sid
-            .map(|sid| {
-                !crate::session::capture::claude_host_transcript_confirmed_absent(
-                    &instance.project_path,
-                    sid,
-                    &instance.resolved_host_environment(),
-                    claude_store_pin
-                        .as_ref()
-                        .map(|pin| pin.store.as_path())
-                        .or(instance
-                            .declared_agent_config_dir_for(&instance.tool)
-                            .as_deref()),
-                )
-            })
-            .unwrap_or(false);
-    let seed = resolve_structured_seed(
-        &instance.tool,
+    let (seed, claude_store_pin) = structured_seed_for(
+        &instance,
         &agent_name,
-        instance.acp_session_id.as_deref(),
-        resume_sid,
-        instance.import_pending == Some(true),
-        transcript_present,
+        selected_conversation.as_ref().map(|(sid, _)| sid.as_str()),
     );
     let (native, exclusion) = match launch_store_for(state, &instance, exclusion).await {
         Ok(store) => store,
@@ -428,7 +479,7 @@ async fn deferred_enable_request(
                 || instance.agent_session_id.is_some()
                 || instance.pi_session_path.is_some()
                 || selected_conversation.is_some(),
-            sandbox_continuation: if seed.import_terminal {
+            sandbox_continuation: if import_terminal || seed.import_terminal {
                 crate::acp::supervisor::SandboxContinuation::ImportTerminal
             } else {
                 crate::acp::supervisor::SandboxContinuation::Persisted
@@ -3415,7 +3466,20 @@ mod tests {
     #[serial_test::serial]
     async fn enabling_a_stopped_terminal_clears_only_its_observed_native_park() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        for case in ["fresh", "superseded", "overflow"] {
+        crate::tmux::test_helpers::require_tmux!();
+        for case in [
+            "fresh",
+            "superseded",
+            "overflow",
+            "recreated",
+            "source_sid",
+            "choice",
+            "provenance",
+            "route",
+            "import",
+            "fork",
+            "provider",
+        ] {
             let _home = crate::session::test_support::isolate_app_dir();
             let project = tempfile::tempdir().unwrap();
             let mut row = Instance::new(case, project.path().to_str().unwrap());
@@ -3426,9 +3490,69 @@ mod tests {
             row.agent_name = Some("claude".into());
             row.mark_idle_dormant();
             row.lifecycle_generation = if case == "overflow" { u64::MAX } else { 14 };
+            if matches!(case, "choice" | "provenance" | "route") {
+                row.resume_intent = ResumeIntent::Use("selected".into());
+                row.resume_binding = Some(crate::session::ConversationBinding {
+                    session_id: "selected".into(),
+                    execution: Some(crate::session::ExecutionBinding {
+                        agent: "claude".into(),
+                        stores: vec![project.path().join("selected-store")],
+                        configuration: Vec::new(),
+                        cwd: project.path().to_owned(),
+                        cwd_filesystem: "host".into(),
+                        filesystem: "host".into(),
+                        exported_default_store: Some(false),
+                    }),
+                    provenance: crate::session::ConversationProvenance::Asserted,
+                    transcript_path: None,
+                });
+            }
+            let terminal = row.tmux_session().unwrap();
+            let _terminal_guard =
+                crate::tmux::test_helpers::TmuxTestSession::from_name(terminal.name());
+            terminal
+                .create(&row.project_path, Some("exec sleep 60"), "default")
+                .unwrap();
+            let pane = crate::tmux::test_helpers::only_pane_id(terminal.name());
+            crate::tmux::test_helpers::wait_for_pane_command(&pane, "sleep");
+            assert_eq!(
+                crate::tmux::test_helpers::pane_field(&pane, "#{pane_dead}"),
+                "0"
+            );
+            let terminal_pid = crate::tmux::test_helpers::pane_field(&pane, "#{pane_pid}")
+                .parse::<u32>()
+                .unwrap();
+            let terminal_birth = crate::process::process_birth_identity(terminal_pid)
+                .unwrap()
+                .expect("the managed terminal is physically alive before the transition");
             let mut persisted = row.clone();
-            if case == "superseded" {
-                persisted.lifecycle_generation += 1;
+            match case {
+                "superseded" => persisted.lifecycle_generation += 1,
+                "recreated" => persisted.created_at += chrono::Duration::seconds(1),
+                "source_sid" => persisted.acp_session_id = Some("replacement".into()),
+                "choice" => {
+                    persisted.resume_intent = ResumeIntent::Use("replacement".into());
+                    persisted.resume_binding.as_mut().unwrap().session_id = "replacement".into();
+                }
+                "provenance" => {
+                    persisted.resume_binding.as_mut().unwrap().provenance =
+                        crate::session::ConversationProvenance::Observed
+                }
+                "route" => {
+                    persisted
+                        .resume_binding
+                        .as_mut()
+                        .unwrap()
+                        .execution
+                        .as_mut()
+                        .unwrap()
+                        .exported_default_store = Some(true);
+                    assert_eq!(row.resume_binding, persisted.resume_binding);
+                }
+                "import" => persisted.import_pending = Some(true),
+                "fork" => persisted.fork_pending = Some("replacement-parent".into()),
+                "provider" => persisted.agent_provider = Some("vertex".into()),
+                _ => {}
             }
             crate::server::test_support::seed_instances_on_disk_for_test(
                 "default",
@@ -3456,19 +3580,41 @@ mod tests {
             crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
             let mut working = row.clone();
             let namespace = state.profile_namespace.clone().read_owned().await;
-            let result = commit_structured_view(&state, &mut working, None, namespace).await;
+            let result =
+                commit_structured_view(&state, &mut working, None, "claude", namespace).await;
             let storage = crate::session::Storage::open_unwatched("default").unwrap();
             if case != "fresh" {
                 assert!(result.is_err(), "{case}");
                 let stored = storage.load().unwrap().remove(0);
+                assert_eq!(
+                    serde_json::to_value(&stored).unwrap(),
+                    serde_json::to_value(&persisted).unwrap(),
+                    "a changed source choice must remain untouched: {case}",
+                );
                 assert_eq!(stored.view, View::Terminal);
                 assert_eq!(stored.lifecycle_generation, persisted.lifecycle_generation);
                 assert_eq!(stored.status, Status::Stopped);
                 assert!(stored.is_idle_dormant());
-                assert_eq!(births.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    crate::tmux::test_helpers::only_pane_id(terminal.name()),
+                    pane
+                );
+                assert_eq!(
+                    crate::tmux::test_helpers::pane_field(&pane, "#{pane_dead}"),
+                    "0"
+                );
+                assert_eq!(
+                    crate::process::process_birth_identity(terminal_pid).unwrap(),
+                    Some(terminal_birth),
+                    "refusal must not kill or replace the original terminal: {case}",
+                );
                 continue;
             }
             assert!(result.is_ok());
+            assert!(
+                !terminal.exists_live(),
+                "the accepted transition terminates its real pane"
+            );
             assert_eq!(working.view, View::Structured);
             assert_eq!(working.status, Status::Idle);
             assert!(!working.is_idle_dormant());
@@ -3478,7 +3624,7 @@ mod tests {
                     .await
                     .unwrap();
             let (request, reservation) =
-                deferred_enable_request(&state, &working, "claude".into(), None, exclusion)
+                deferred_enable_request(&state, &working, "claude".into(), None, false, exclusion)
                     .await
                     .expect("fresh enable target")
                     .unwrap();
@@ -3500,11 +3646,16 @@ mod tests {
                 crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &row.id, true)
                     .await
                     .unwrap();
-            assert!(
-                deferred_enable_request(&state, &working, "claude".into(), None, exclusion)
-                    .await
-                    .is_none()
-            );
+            assert!(deferred_enable_request(
+                &state,
+                &working,
+                "claude".into(),
+                None,
+                false,
+                exclusion
+            )
+            .await
+            .is_none());
             let retained = storage.load().unwrap().remove(0);
             assert_eq!(retained.lifecycle_generation, stopped.lifecycle_generation);
             assert_eq!(retained.status, Status::Stopped);
@@ -3541,7 +3692,13 @@ mod tests {
 
         let inst_lock = state.instance_lock(&id).await;
         let guard = inst_lock.lock().await;
-        spawn_enabled_worker(state.clone(), inst.clone(), "claude".to_string(), None);
+        spawn_enabled_worker(
+            state.clone(),
+            inst.clone(),
+            "claude".to_string(),
+            None,
+            false,
+        );
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
         let (store, ()) = crate::server::session_store::NativeSessionStore::open_for_launch(
             state.clone(),
@@ -3589,7 +3746,7 @@ mod tests {
 
         let namespace = state.profile_namespace.clone().read_owned().await;
         assert!(
-            commit_structured_view(&state, &mut working, None, namespace)
+            commit_structured_view(&state, &mut working, None, "claude", namespace)
                 .await
                 .is_ok()
         );
