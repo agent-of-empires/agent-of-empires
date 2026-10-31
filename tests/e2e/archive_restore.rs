@@ -712,7 +712,10 @@ fn trash_retained_transcript_is_read_only() {
         let event = if seq == 1008 {
             Event::ToolCallContent {
                 tool_call_id: "retained-tool".into(),
-                content: "retained-tool-output".into(),
+                content: (0..40)
+                    .map(|i| format!("success-output-{i:02}\n"))
+                    .collect::<String>()
+                    + "SUCCESS-OUTPUT-END",
             }
         } else {
             Event::AgentMessageChunk {
@@ -728,6 +731,33 @@ fn trash_retained_transcript_is_read_only() {
             1015,
             &Event::ToolCallCompleted {
                 tool_call_id: "retained-tool".into(),
+                is_error: false,
+                content: String::new(),
+                output: Vec::new(),
+                completed_at: chrono::Utc::now(),
+                async_subagent: false,
+            },
+        )
+        .unwrap();
+    store
+        .record(
+            &id,
+            1016,
+            &Event::ToolCallContent {
+                tool_call_id: "failed-tool".into(),
+                content: (0..40)
+                    .map(|i| format!("error-output-{i:02}\n"))
+                    .collect::<String>()
+                    + "ERROR-OUTPUT-END",
+            },
+        )
+        .unwrap();
+    store
+        .record(
+            &id,
+            1017,
+            &Event::ToolCallCompleted {
+                tool_call_id: "failed-tool".into(),
                 is_error: true,
                 content: String::new(),
                 output: Vec::new(),
@@ -736,6 +766,17 @@ fn trash_retained_transcript_is_read_only() {
             },
         )
         .unwrap();
+    for seq in [1, 3] {
+        store
+            .record(
+                &empty_id,
+                seq,
+                &Event::AvailableCommandsUpdated {
+                    commands: Vec::new(),
+                },
+            )
+            .unwrap();
+    }
     drop(store);
     let launch_marker = h.home_path().join("agent-launched");
     let bin = h.install_path_command("claude");
@@ -774,11 +815,30 @@ fn trash_retained_transcript_is_read_only() {
         + 1;
     h.send_mouse_click(0, 7, row);
     h.send_keys("Enter");
-    h.wait_for("retained-1014");
-    h.wait_for("retained-tool-output");
+    h.wait_for("ERROR-OUTPUT-END");
     h.assert_screen_contains("history is incomplete");
     h.assert_screen_contains("Trash · read-only");
     let before = h.read_sessions();
+    h.send_keys("PageUp");
+    h.send_keys("PageUp");
+    h.send_keys("PageUp");
+    h.send_keys("PageUp");
+    h.wait_for("SUCCESS-OUTPUT-END");
+    let screen = h.capture_screen();
+    let (y, line) = screen
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains("SUCCESS-OUTPUT-END"))
+        .unwrap();
+    let byte = line.find("SUCCESS-OUTPUT-END").unwrap();
+    let x = unicode_width::UnicodeWidthStr::width(&line[..byte]) as u16 + 1;
+    h.send_mouse_drag((x, y as u16 + 1), (x + 17, y as u16 + 1));
+    wait_until(Duration::from_secs(5), Duration::from_millis(10), || {
+        let copied = std::fs::read_to_string(&clipboard).unwrap_or_default();
+        (copied == "SUCCESS-OUTPUT-END")
+            .then_some(())
+            .ok_or_else(|| format!("expected full retained tool tail, got {copied:?}"))
+    });
     h.send_keys("C-q");
     h.wait_for("Enter: read");
     h.send_keys("Enter");
@@ -852,7 +912,7 @@ fn trash_retained_transcript_is_read_only() {
     h.send_mouse_click(0, 7, row);
     h.wait_for("No readable retained ACP content");
     h.assert_screen_contains("Trash · read-only");
-    h.assert_screen_contains("Native history");
+    h.assert_screen_contains("history is incomplete");
     h.run_cli_ok(&["session", "restore", &empty_id]);
     h.wait_for_absent("No readable retained ACP content", Duration::from_secs(5));
     h.wait_for("Archived (");
@@ -863,10 +923,10 @@ fn trash_retained_transcript_is_read_only() {
         .unwrap() as u16
         + 1;
     h.send_mouse_click(0, 7, row);
-    h.wait_for("retained-1014");
+    h.wait_for("ERROR-OUTPUT-END");
     h.run_cli_ok(&["rm", &id, "--purge"]);
     h.wait_for_absent("TrashRetained", Duration::from_secs(5));
-    h.wait_for_absent("retained-1014", Duration::from_secs(5));
+    h.wait_for_absent("ERROR-OUTPUT-END", Duration::from_secs(5));
     assert!(
         !launch_marker.exists(),
         "restore or purge restarted an agent"

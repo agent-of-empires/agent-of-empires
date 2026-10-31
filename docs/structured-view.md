@@ -160,13 +160,17 @@ Scroll with the mouse wheel, or press **Enter** to focus the reader and use
 **Esc** returns to the session list. Restore and permanent deletion remain
 separate management actions shown in the footer.
 
+Tool arguments, structured changes, and retained text output are shown without
+the active view's preview limits, including successful calls. Scroll and drag to
+copy their full retained text. Media stays represented by descriptive placeholders.
+
 Rename and workdir dialogs, quick permission replies, and pending Trash
 confirmations close if their session changes lifecycle or disappears. A pending
 dialog cannot retarget another session when the list updates.
 
 The reader folds persisted ACP events across all retained pages, including events
 recorded before a switch to terminal view. Missing or unreadable event ranges are
-marked explicitly, even when older metadata survives retention. It does not
+marked explicitly, even when no readable transcript rows remain. It does not
 import native agent history files: their formats and availability vary by agent
 and execution environment.
 Missing content and read failures are shown without restarting the agent.

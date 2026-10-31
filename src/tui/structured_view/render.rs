@@ -719,7 +719,7 @@ fn render_transcript(
         );
     }
 
-    let text = wrapped_transcript(state, theme, text_area.width);
+    let text = wrapped_transcript(state, theme, text_area.width, ToolOutputMode::Compact);
     // Pre-wrapped at the render width, so visual rows are logical rows.
     let total = text.lines.len().min(u16::MAX as usize) as u16;
     let max = total.saturating_sub(text_area.height);
@@ -867,14 +867,26 @@ pub struct TranscriptGeometry {
     pub total_lines: usize,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ToolOutputMode {
+    Compact,
+    Retained,
+}
+
 /// The transcript pre-wrapped at `width`: the single source of transcript
 /// geometry for painting, scroll clamping, and selection.
-pub(crate) fn wrapped_transcript(
+pub(super) fn wrapped_transcript(
     state: &StructuredViewState,
     theme: &Theme,
     width: u16,
+    tool_output: ToolOutputMode,
 ) -> Text<'static> {
-    let lines = transcript_lines(&state.transcript, theme, state.path_roots.as_ref());
+    let lines = transcript_lines(
+        &state.transcript,
+        theme,
+        state.path_roots.as_ref(),
+        tool_output,
+    );
     let mut wrapped: Vec<Line<'static>> = Vec::with_capacity(lines.len());
     for line in lines {
         wrap_line_into(own_line(line), width, &mut wrapped);
@@ -930,7 +942,7 @@ fn own_line(line: Line<'_>) -> Line<'static> {
 
 /// Word-wrap a styled line at the last space, hard-breaking long words.
 /// Unlike `markdown::wrap_line_into`, tabs are not expanded.
-fn wrap_line_into(line: Line<'static>, width: u16, out: &mut Vec<Line<'static>>) {
+pub(super) fn wrap_line_into(line: Line<'static>, width: u16, out: &mut Vec<Line<'static>>) {
     use unicode_width::UnicodeWidthChar;
 
     let width = width.max(1) as usize;
@@ -1344,6 +1356,7 @@ fn transcript_lines(
     transcript: &AcpTranscript,
     theme: &Theme,
     path_roots: Option<&SessionPathRoots>,
+    tool_output: ToolOutputMode,
 ) -> Vec<Line<'static>> {
     let rows = &transcript.server_rows;
     // One card per tool call at its start row; the last terminal row wins.
@@ -1394,8 +1407,17 @@ fn transcript_lines(
                 out.push(Line::default());
             }
             TranscriptRowKind::ToolStart => {
-                let card = tool_card_from_rows(row, &completions);
-                out.extend(render_tool_lines(&card, theme, path_roots));
+                if tool_output == ToolOutputMode::Retained {
+                    let completion = row
+                        .tool_call_id
+                        .as_deref()
+                        .and_then(|id| completions.get(id))
+                        .copied();
+                    out.extend(retained_tool_lines(row, completion, theme, path_roots));
+                } else {
+                    let card = tool_card_from_rows(row, &completions);
+                    out.extend(render_tool_lines(&card, theme, path_roots));
+                }
                 out.push(Line::default());
             }
             TranscriptRowKind::ToolComplete
@@ -1472,6 +1494,50 @@ fn note_line(kind: NoteKind, text: &str) -> Line<'static> {
         format!("· {text}"),
         Style::default().add_modifier(modifier),
     ))
+}
+
+fn retained_tool_lines(
+    start: &TranscriptRow,
+    completion: Option<&TranscriptRow>,
+    theme: &Theme,
+    path_roots: Option<&SessionPathRoots>,
+) -> Vec<Line<'static>> {
+    let marker = match completion.map(|row| row.kind) {
+        Some(TranscriptRowKind::ToolComplete) => "✓ ",
+        Some(TranscriptRowKind::ToolError) => "✗ ",
+        Some(TranscriptRowKind::ToolStopped) => "◼ ",
+        _ => "",
+    };
+    let mut lines = vec![Line::styled(
+        format!("tool {marker}· {}", start.text),
+        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+    )];
+    if let Some(tool) = &start.tool {
+        lines.extend(styled_output_lines(&tool.args_preview));
+        for diff in &tool.diffs {
+            let path = relative_display_path(&diff.path, path_roots);
+            if let Some(before) = &diff.old_text {
+                lines.push(Line::from(format!("Before: {path}")));
+                lines.extend(styled_output_lines(before));
+            }
+            if let Some(after) = &diff.new_text {
+                lines.push(Line::from(format!("After: {path}")));
+                lines.extend(styled_output_lines(after));
+            }
+        }
+    }
+    if let Some(completion) = completion {
+        if completion.async_subagent {
+            lines.push(Line::from("runs in background"));
+        } else if completion.output.is_empty() {
+            lines.extend(styled_output_lines(&completion.text));
+        } else {
+            lines.extend(styled_output_lines(&summarize_output_blocks(
+                &completion.output,
+            )));
+        }
+    }
+    lines
 }
 
 fn tool_card_from_rows(
@@ -2370,7 +2436,12 @@ mod tests {
             chunk("Build", "m-c"),
             chunk("ing now", "m-c"),
         ]);
-        let out = joined(&transcript_lines(&t, &Theme::default(), None));
+        let out = joined(&transcript_lines(
+            &t,
+            &Theme::default(),
+            None,
+            ToolOutputMode::Compact,
+        ));
         assert!(!out.contains("#4656.The waiter"), "{out:?}");
         assert!(
             out.contains("for #4656.") && out.contains("The waiter has the lock."),
@@ -2418,7 +2489,12 @@ mod tests {
                 text: String::new(),
             },
         ]);
-        let out = joined(&transcript_lines(&t, &Theme::default(), None));
+        let out = joined(&transcript_lines(
+            &t,
+            &Theme::default(),
+            None,
+            ToolOutputMode::Compact,
+        ));
         assert_eq!(out.matches("Compaction summary").count(), 1, "{out:?}");
         for want in [
             "working on it",
