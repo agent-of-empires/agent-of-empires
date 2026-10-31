@@ -10917,7 +10917,8 @@ async fn cli_relative_adapter_uses_the_provisioned_directory_and_effective_hooks
     }
 
     crate::session::config::update_config(|config| {
-        config.hooks.on_create = vec!["cp /bin/true ./adapter".into()];
+        config.hooks.on_create =
+            vec!["printf '%s\\n' '#!/bin/sh' 'exit 0' > ./adapter && chmod +x ./adapter".into()];
     })
     .unwrap();
     support::refresh_canonical_metadata_for_test(&state).await;
