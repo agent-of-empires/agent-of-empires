@@ -368,19 +368,21 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
         onRestart={readOnly ? undefined : retryEnsure}
       />
 
-      {ensureWarning && (
-        <div className="absolute left-0 right-0 top-12 z-20 flex justify-center px-3 pointer-events-none">
-          <span className="text-xs text-status-warning bg-surface-900/90 border border-surface-700/60 rounded-full px-4 py-2 max-w-md break-words text-center">
-            {ensureWarning}
-          </span>
-        </div>
-      )}
-
-      {session.initial_prompt_error && (
-        <div role="alert" className="absolute left-0 right-0 top-12 z-20 flex justify-center px-3 pointer-events-none">
-          <span className="text-xs text-status-warning bg-surface-900/90 border border-surface-700/60 rounded-full px-4 py-2 max-w-md break-words text-center">
-            Initial prompt not sent: {session.initial_prompt_error}
-          </span>
+      {(ensureWarning || session.initial_prompt_error) && (
+        <div className="absolute left-0 right-0 top-12 z-20 flex flex-col items-center gap-2 px-3 pointer-events-none">
+          {ensureWarning && (
+            <span className="text-xs text-status-warning bg-surface-900/90 border border-surface-700/60 rounded-full px-4 py-2 max-w-md break-words text-center">
+              {ensureWarning}
+            </span>
+          )}
+          {session.initial_prompt_error && (
+            <span
+              role="alert"
+              className="text-xs text-status-warning bg-surface-900/90 border border-surface-700/60 rounded-full px-4 py-2 max-w-md break-words text-center"
+            >
+              Initial prompt not sent: {session.initial_prompt_error}
+            </span>
+          )}
         </div>
       )}
 
