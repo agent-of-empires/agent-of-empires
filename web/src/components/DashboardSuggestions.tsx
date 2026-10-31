@@ -19,7 +19,8 @@ interface Props {
 
 export function DashboardSuggestions({ readOnly = false, onPrepare, onViewAll, onOpenSession }: Props) {
   const wide = useIsWideViewport();
-  const { snapshot, loadFailed, busy, refreshing, notice, offline, act, refresh, start } = useSuggestions(onPrepare);
+  const { snapshot, loadFailed, busy, refreshing, notice, failures, offline, act, refresh, start } =
+    useSuggestions(onPrepare);
   const { undo, dismiss, clearUndo } = useDismissUndo(act);
 
   if (!snapshot || snapshot.providers.length === 0) return null;
@@ -65,12 +66,16 @@ export function DashboardSuggestions({ readOnly = false, onPrepare, onViewAll, o
             reason={item.reason}
             project={item.project}
             session={item.started_session}
+            stale={item.stale}
+            failure={failures[suggestionKey(item)]}
             actions={
               <SuggestionActions
                 readOnly={readOnly}
                 offline={offline}
                 busy={busy !== null}
                 onStart={() => void start(item)}
+                stale={item.stale}
+                failed={suggestionKey(item) in failures}
                 onToggleDismiss={() => void dismiss(item, true)}
                 started={
                   item.started_session && {

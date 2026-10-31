@@ -623,6 +623,8 @@ export interface SuggestionItem {
   draft: { title: string; prompt: string };
   dismissed: boolean;
   started_session?: StartedSession;
+  /** The source closed or changed; the row is dimmed and cannot start. */
+  stale?: boolean;
   /** The registered Project the item resolves to; the provider's `project` is only a hint. */
   resolved_project?: { name: string; path: string } | null;
 }

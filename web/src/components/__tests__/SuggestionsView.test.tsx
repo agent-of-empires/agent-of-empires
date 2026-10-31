@@ -185,6 +185,98 @@ describe("SuggestionsView", () => {
     await waitFor(() => expect(dismissSuggestion).toHaveBeenCalledWith("github", "issue-1", false));
   });
 
+  describe("edge states", () => {
+    it("a stale item is dimmed and can only be dismissed", async () => {
+      await open(snapshot({ items: [{ ...item, stale: true }] }));
+      const row = (await screen.findByText("Fix lifecycle")).closest("li") as HTMLElement;
+      expect(row.querySelector("p")?.className).toContain("opacity-[0.55]");
+      expect(screen.queryByRole("button", { name: "Start" })).toBeNull();
+      expect(screen.getByRole("button", { name: "Dismiss" })).toBeTruthy();
+    });
+
+    it("a failed start stays on its row with Open wizard as the only way to retry", async () => {
+      prepareSuggestion.mockResolvedValueOnce({ ok: false, error: "worktree branch already exists", stale: false });
+      const onPrepare = await open(snapshot());
+      fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+      expect(await screen.findByText(/Couldn't start: worktree branch already exists/)).toBeTruthy();
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(screen.queryByRole("button", { name: "Start" })).toBeNull();
+      expect(onPrepare).not.toHaveBeenCalled();
+
+      prepareSuggestion.mockResolvedValueOnce({
+        ok: true,
+        data: {
+          title: "Fix lifecycle",
+          initial_prompt: "p",
+          source_ref: "example/1",
+          project: { name: "aoe", path: "/work/aoe" },
+          tool: "claude",
+          yolo: false,
+          sandbox: false,
+          worktree: true,
+        },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Open wizard" }));
+      await waitFor(() => expect(onPrepare).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(screen.queryByText(/Couldn't start/)).toBeNull());
+    });
+
+    it("a disabled provider is explained with a way to turn it on", async () => {
+      const base = snapshot();
+      const onOpenSettings = vi.fn();
+      fetchSuggestions.mockResolvedValue({
+        ...base,
+        items: [],
+        providers: [...base.providers, { id: "linear", name: "Linear", status: "ok", enabled: false, sources: [] }],
+      });
+      render(<SuggestionsView onPrepare={vi.fn()} onOpenSession={vi.fn()} onOpenSettings={onOpenSettings} />);
+      expect(
+        await screen.findByText(/Linear suggestions are hidden because Linear is off in Settings › Suggestions\./),
+      ).toBeTruthy();
+      fireEvent.click(screen.getByRole("button", { name: "Turn it on" }));
+      expect(onOpenSettings).toHaveBeenCalled();
+    });
+  });
+
+  describe("provider text is untrusted", () => {
+    const hostile = {
+      ...item,
+      title: "[click me](javascript:alert(1)) **bold**",
+      reason: "<img src=x onerror=alert(1)> _em_ https://evil.test/x",
+      project: "<b>proj</b>",
+      source_url: "javascript:alert(1)",
+      preview: "# heading\n[link](https://evil.test)",
+      started_session: {
+        id: "s1",
+        title: "<script>1</script> [t](https://evil.test)",
+        status: "Running" as const,
+        archived: false,
+        created_at: new Date().toISOString(),
+      },
+    };
+
+    it("renders title, reason, project and session title as literal text with no links", async () => {
+      const plain = { ...hostile, id: "plain", started_session: undefined };
+      await open(snapshot({ items: [plain, hostile] }));
+      const [fresh, started] = (await screen.findAllByText(/click me/)).map((el) => el.closest("li") as HTMLElement);
+      expect(fresh!.textContent).toContain("[click me](javascript:alert(1)) **bold**");
+      expect(fresh!.textContent).toContain("<img src=x onerror=alert(1)> _em_ https://evil.test/x");
+      expect(fresh!.textContent).toContain("<b>proj</b>");
+      expect(started!.textContent).toContain("<script>1</script> [t](https://evil.test)");
+      for (const row of [fresh!, started!]) {
+        expect(row.querySelector("a, img, b, strong, em, script, h1")).toBeNull();
+        expect(row.textContent).not.toContain("# heading");
+      }
+    });
+
+    it("never links a source_url that is not http(s)", async () => {
+      await open(snapshot({ items: [hostile] }));
+      fireEvent.click(await screen.findByRole("button", { name: "More" }));
+      expect(screen.queryByRole("menuitem", { name: /Open in/ })).toBeNull();
+      expect(document.querySelector('a[href^="javascript"]')).toBeNull();
+    });
+  });
+
   describe("grouping, filters and provider status", () => {
     const linear = {
       id: "linear",
@@ -383,7 +475,10 @@ describe("SuggestionsView", () => {
       prepareSuggestion.mockResolvedValue(failure);
       const onPrepare = await open(snapshot());
       fireEvent.click(await screen.findByRole("button", { name: "Start" }));
-      await expectReleased("Start", "Dismiss");
+      expect(await screen.findByText("Couldn't start: boom")).toBeTruthy();
+      for (const name of ["Open wizard", "Dismiss"]) {
+        await waitFor(() => expect((screen.getByRole("button", { name }) as HTMLButtonElement).disabled).toBe(false));
+      }
       expect(onPrepare).not.toHaveBeenCalled();
     });
   });

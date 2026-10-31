@@ -61,7 +61,7 @@ export function SuggestionsView({
   onOpenSession,
   onOpenSettings,
 }: Props) {
-  const { snapshot, loading, loadFailed, refreshing, busy, notice, offline, act, refresh, start } =
+  const { snapshot, loading, loadFailed, refreshing, busy, notice, failures, offline, act, refresh, start } =
     useSuggestions(onPrepare);
   const { undo, dismiss } = useDismissUndo(act);
   const [filter, setFilter] = useState<Filter>(initialDismissed ? "dismissed" : "all");
@@ -218,6 +218,8 @@ export function SuggestionsView({
                         reason={item.reason}
                         project={item.project}
                         session={item.started_session}
+                        stale={item.stale}
+                        failure={failures[key]}
                         actions={
                           <SuggestionActions
                             dismissed={item.dismissed}
@@ -225,6 +227,8 @@ export function SuggestionsView({
                             offline={offline}
                             busy={busy !== null}
                             onStart={() => void start(item)}
+                            stale={item.stale}
+                            failed={key in failures}
                             started={
                               item.started_session && {
                                 onOpen: () => onOpenSession(item.started_session!.id),
@@ -252,6 +256,22 @@ export function SuggestionsView({
                       : "Nothing to suggest right now."}
                 </li>
               )}
+              {snapshot.providers
+                .filter((p) => !p.enabled)
+                .map((p) => (
+                  <li key={p.id} className={SUGGESTION_NOTE_CLASS}>
+                    {p.name} suggestions are hidden because {p.name} is off in Settings › Suggestions.{" "}
+                    {onOpenSettings && (
+                      <button
+                        type="button"
+                        onClick={onOpenSettings}
+                        className="cursor-pointer text-brand-500 hover:underline"
+                      >
+                        Turn it on
+                      </button>
+                    )}
+                  </li>
+                ))}
               <SuggestionStatusNotes readOnly={readOnly} offline={offline} />
             </ul>
             {undo && (

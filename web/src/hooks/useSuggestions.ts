@@ -25,6 +25,7 @@ export function useSuggestions(onPrepare: (prefill: WizardPrefill) => void) {
   const [refreshing, setRefreshing] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [failures, setFailures] = useState<Record<string, string>>({});
   const mounted = useRef(true);
   const loadSeq = useRef(0);
   const failed = useRef(false);
@@ -87,12 +88,14 @@ export function useSuggestions(onPrepare: (prefill: WizardPrefill) => void) {
 
   // `another` starts a further Session without claiming the suggestion's link.
   const start = async (item: SuggestionItem, another = false) => {
-    setBusy(suggestionKey(item));
+    const key = suggestionKey(item);
+    setBusy(key);
     setNotice(null);
     const result = await prepareSuggestion(item.provider_id, item.id);
     if (!mounted.current) return;
     if (result.ok) {
       setBusy(null);
+      setFailures(({ [key]: _gone, ...rest }) => rest);
       const label = snapshot?.providers.find((p) => p.id === item.provider_id)?.name ?? item.provider_id;
       onPrepare(
         toWizardPrefill(
@@ -103,12 +106,14 @@ export function useSuggestions(onPrepare: (prefill: WizardPrefill) => void) {
       );
       return;
     }
-    setNotice(result.stale ? STALE_NOTICE : result.error);
+    // A stale item is explained by the reload; any other failure stays on its row.
+    if (result.stale) setNotice(STALE_NOTICE);
+    else setFailures((f) => ({ ...f, [key]: result.error }));
     await load();
     if (mounted.current) setBusy(null);
   };
 
-  return { snapshot, loading, loadFailed, refreshing, busy, notice, offline, load, act, refresh, start };
+  return { snapshot, loading, loadFailed, refreshing, busy, notice, failures, offline, load, act, refresh, start };
 }
 
 /** Dismiss that can be undone for 10 s; `act` is the one from {@link useSuggestions}. */

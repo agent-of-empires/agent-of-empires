@@ -43,16 +43,24 @@ interface RowProps {
   project?: string | null;
   /** Replaces the reason with the started Session's state. */
   session?: StartedSession;
+  /** Dims the row: the source closed or changed. */
+  stale?: boolean;
+  /** A start that failed; shown on the row, which stays startable. */
+  failure?: string;
   actions: ReactNode;
 }
 
-export function SuggestionRow({ title, source, reason, project, session, actions }: RowProps) {
+export function SuggestionRow({ title, source, reason, project, session, stale, failure, actions }: RowProps) {
   return (
-    <li className="flex items-center gap-3 border-t border-surface-700/40 px-3 py-2.5 first:border-t-0">
+    <li
+      className={`flex items-center gap-3 border-t border-surface-700/40 px-3 py-2.5 first:border-t-0 ${
+        failure ? "bg-status-error/[0.07]" : ""
+      }`}
+    >
       <div className="min-w-0 flex-1">
-        <p className="truncate text-sm text-text-primary">{title}</p>
-        <p className="mt-0.5 truncate text-xs text-text-muted">
-          <span className="font-mono font-medium text-text-secondary">{source}</span>
+        <p className={`truncate text-sm text-text-primary ${stale ? "opacity-[0.55]" : ""}`}>{title}</p>
+        <p className={`mt-0.5 truncate text-xs ${stale ? "text-text-dim" : "text-text-muted"}`}>
+          <span className={`font-mono font-medium text-text-secondary ${stale ? "opacity-[0.55]" : ""}`}>{source}</span>
           {" · "}
           {session ? <StartedReason session={session} /> : reason}
           {project && (
@@ -62,6 +70,7 @@ export function SuggestionRow({ title, source, reason, project, session, actions
             </>
           )}
         </p>
+        {failure && <p className="mt-0.5 break-words text-xs text-status-error">Couldn&apos;t start: {failure}</p>}
       </div>
       <div className="flex flex-none gap-1">{actions}</div>
     </li>
@@ -77,6 +86,10 @@ interface ActionsProps {
   onToggleDismiss: () => void;
   /** A started item: Open replaces Start, and the others move into a menu. */
   started?: { onOpen: () => void; onStartAnother: () => void; providerName: string; sourceUrl: string };
+  /** The source closed or changed: Start is removed. */
+  stale?: boolean;
+  /** The last start failed: the only action besides Dismiss is Open wizard. */
+  failed?: boolean;
 }
 
 const MENU_ITEM_CLASS =
@@ -130,16 +143,18 @@ function MoreMenu({
           >
             Start another Session…
           </button>
-          <a
-            role="menuitem"
-            href={started.sourceUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-            className={MENU_ITEM_CLASS}
-            onClick={() => setOpen(false)}
-          >
-            Open in {started.providerName} ↗
-          </a>
+          {/^https?:\/\//i.test(started.sourceUrl) && (
+            <a
+              role="menuitem"
+              href={started.sourceUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className={MENU_ITEM_CLASS}
+              onClick={() => setOpen(false)}
+            >
+              Open in {started.providerName} ↗
+            </a>
+          )}
           {!readOnly && (
             <>
               <hr className="my-1 border-surface-700/60" />
@@ -172,10 +187,12 @@ export function SuggestionActions({
   onStart,
   onToggleDismiss,
   started,
+  stale = false,
+  failed = false,
 }: ActionsProps) {
   const disabled = busy || readOnly || offline;
   const label = dismissed ? "Restore" : "Dismiss";
-  if (started && !dismissed) {
+  if (started && !dismissed && !failed) {
     return (
       <>
         <button
@@ -197,7 +214,7 @@ export function SuggestionActions({
   }
   return (
     <>
-      {!dismissed && (
+      {!dismissed && !stale && (
         <button
           type="button"
           onClick={onStart}
@@ -205,7 +222,7 @@ export function SuggestionActions({
           title={readOnly ? "Read-only: can't create Sessions" : offline ? OFFLINE_TITLE : undefined}
           className="inline-flex h-8 items-center rounded-md border border-surface-700 bg-surface-800 px-3 text-xs font-medium text-text-primary hover:bg-surface-700/50 disabled:opacity-50"
         >
-          Start
+          {failed ? "Open wizard" : "Start"}
         </button>
       )}
       {!readOnly && (
