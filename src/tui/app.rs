@@ -2497,6 +2497,7 @@ impl App {
     /// debounced and only while a daemon is already reachable. Returns true if
     /// the mount set changed.
     async fn reconcile_structured_preview(&mut self) -> bool {
+        self.home.enforce_trash_read_only();
         let retained = self
             .home
             .selected_session
@@ -2521,7 +2522,6 @@ impl App {
                 self.home.retained_preview = Some(view);
                 self.home.clear_preview_selection();
             }
-            self.home.enforce_trash_read_only();
             self.clear_preview_mount_pending();
             self.close_embedded_structured();
             let changed = self

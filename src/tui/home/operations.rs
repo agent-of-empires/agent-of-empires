@@ -410,10 +410,15 @@ impl HomeView {
         Ok(())
     }
 
-    pub(super) fn delete_selected(&mut self, options: &DeleteOptions) -> anyhow::Result<()> {
-        let Some(id) = self.selected_session.clone() else {
+    pub(super) fn submit_session_delete(&mut self, options: &DeleteOptions) -> anyhow::Result<()> {
+        if self.reconcile_delete_confirmation() {
             return Ok(());
-        };
+        }
+        let pending = self
+            .unified_delete_dialog
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Delete confirmation is no longer available"))?;
+        let id = pending.target.session_id.clone();
         if self.restart_in_flight.contains(&id) {
             self.info_dialog = Some(InfoDialog::new(
                 "Restart in progress",
@@ -421,30 +426,12 @@ impl HomeView {
             ));
             return Ok(());
         }
-        let mut body = crate::daemon::DeleteSessionBody {
-            delete_worktree: options.delete_worktree,
-            delete_branch: options.delete_branch,
-            delete_sandbox: options.delete_sandbox,
-            force_delete: options.force_delete,
-            keep_scratch: options.keep_scratch,
-            ..Default::default()
-        };
-        if let Some(row) = self.session_feed.applied_session(&id) {
-            if let Some(stamp) = row.trashed_at.as_ref() {
-                body.expected_trash = true;
-                body.expected_trashed_at =
-                    Some(chrono::DateTime::parse_from_rfc3339(stamp)?.with_timezone(&chrono::Utc));
-                body.expected_generation = Some(row.lifecycle_generation);
-                body.expected_trash_lifecycle_id = Some(
-                    row.trash_lifecycle_id
-                        .as_ref()
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("Canonical trash identity is not available")
-                        })?
-                        .clone(),
-                );
-            }
-        }
+        let mut body = pending.request.clone();
+        body.delete_worktree = options.delete_worktree;
+        body.delete_branch = options.delete_branch;
+        body.delete_sandbox = options.delete_sandbox;
+        body.force_delete = options.force_delete;
+        body.keep_scratch = options.keep_scratch;
         self.session_feed
             .submit_request(id, crate::tui::session_feed::SessionRequest::Purge(body))
     }

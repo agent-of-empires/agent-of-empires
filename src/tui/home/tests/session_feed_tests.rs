@@ -3446,3 +3446,125 @@ fn observed_legacy_tool(
         }),
     }
 }
+
+#[test]
+#[serial]
+fn purge_dialog_rejects_stale_target_on_keyboard_and_mouse() {
+    for change in [
+        "restore",
+        "generation",
+        "timestamp",
+        "uuid",
+        "purge",
+        "selection",
+    ] {
+        for mouse in [false, true] {
+            let mut env = create_test_env_with_sessions(2);
+            let id = env.view.selected_session.clone().unwrap();
+            let SessionFeedResult::Snapshot(mut snapshot) =
+                daemon_snapshot(&env.view, &id, "Stopped")
+            else {
+                unreachable!()
+            };
+            let row = &mut Arc::make_mut(&mut snapshot).contents.sessions[0];
+            row.trashed_at = Some(chrono::Utc::now().to_rfc3339());
+            row.trash_lifecycle_id = Some(uuid::Uuid::new_v4().to_string());
+            row.lifecycle_generation = 7;
+            env.view
+                .session_feed
+                .publish_for_test(SessionFeedResult::Snapshot(snapshot));
+            env.view.apply_session_feed();
+            env.view.trashed_section_collapsed = false;
+            env.view.rebuild_flat_items();
+            env.view.select_session_by_id(&id);
+            env.view.view_mode = ViewMode::Terminal;
+            let other = env
+                .view
+                .instances()
+                .find(|row| row.id != id)
+                .unwrap()
+                .id
+                .clone();
+            let mut requests = env.view.session_feed.request_driver_for_test();
+            env.view
+                .handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE), None);
+            assert!(env.view.unified_delete_dialog.is_some());
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+            terminal
+                .draw(|frame| {
+                    env.view.render(
+                        frame,
+                        frame.area(),
+                        &crate::tui::styles::Theme::default(),
+                        None,
+                        None,
+                        None,
+                    );
+                })
+                .unwrap();
+            let yes = (0..30)
+                .find_map(|y| {
+                    let line: String = (0..100)
+                        .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                        .collect();
+                    line.find("Yes").map(|byte| {
+                        (
+                            unicode_width::UnicodeWidthStr::width(&line[..byte]) as u16,
+                            y,
+                        )
+                    })
+                })
+                .expect("delete confirmation must expose its Yes button");
+            let SessionFeedResult::Snapshot(mut snapshot) =
+                daemon_snapshot(&env.view, &id, "Stopped")
+            else {
+                unreachable!()
+            };
+            if change == "purge" {
+                Arc::make_mut(&mut snapshot)
+                    .contents
+                    .sessions
+                    .retain(|row| row.id != id);
+            } else {
+                let row = &mut Arc::make_mut(&mut snapshot).contents.sessions[0];
+                match change {
+                    "restore" => {
+                        row.trashed_at = None;
+                        row.trash_lifecycle_id = None;
+                        row.lifecycle_generation += 1;
+                    }
+                    "generation" => row.lifecycle_generation += 1,
+                    "timestamp" => {
+                        row.trashed_at =
+                            Some((chrono::Utc::now() + chrono::Duration::seconds(1)).to_rfc3339())
+                    }
+                    "uuid" => row.trash_lifecycle_id = Some(uuid::Uuid::new_v4().to_string()),
+                    "selection" => {}
+                    _ => unreachable!(),
+                }
+            }
+            env.view
+                .session_feed
+                .publish_for_test(SessionFeedResult::Snapshot(snapshot));
+            env.view.apply_session_feed();
+            if change == "selection" {
+                env.view.select_session_by_id(&other);
+            }
+            if mouse {
+                env.view.handle_dialog_click(yes.0, yes.1);
+            } else {
+                env.view
+                    .handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), None);
+            }
+            assert!(
+                requests(Err("stale purge must not be sent".into())).is_none(),
+                "{change}, mouse={mouse}",
+            );
+            assert!(
+                env.view.unified_delete_dialog.is_none(),
+                "{change}, mouse={mouse}"
+            );
+        }
+    }
+}

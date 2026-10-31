@@ -1014,9 +1014,10 @@ async fn selected_trash_purge_submits_exact_native_identity() {
     assert!(body.expected_trash_lifecycle_id.is_some());
     env.view.selected_session = Some(id.clone());
     let mut respond = env.view.session_feed.request_driver_for_test();
+    env.view.open_delete_for_selected();
     let before = payload_bytes("test");
     env.view
-        .delete_selected(&crate::tui::dialogs::DeleteOptions::default())
+        .submit_session_delete(&crate::tui::dialogs::DeleteOptions::default())
         .unwrap();
     assert_eq!(payload_bytes("test"), before);
     let (status, headers, value) = request_with_headers(
@@ -1045,6 +1046,65 @@ async fn selected_trash_purge_submits_exact_native_identity() {
     apply_published(&mut env.view, &state).await;
     assert!(env.view.get_instance(&id).is_none());
     assert!(!storage.load().unwrap().iter().any(|row| row.id == id));
+}
+
+#[tokio::test]
+#[serial]
+async fn captured_trash_purge_keeps_a_peer_restored_or_retrashed_row() {
+    use crate::daemon::PurgeOutcome;
+    use crate::tui::session_feed::SessionRequest;
+    for retrash in [false, true] {
+        let mut env = create_test_env_with_sessions(1);
+        let id = env.view.instance_at(0).id.clone();
+        let storage = Storage::new_unwatched("test").unwrap();
+        storage
+            .update(|rows, _| {
+                rows.iter_mut().find(|row| row.id == id).unwrap().trash();
+                Ok(())
+            })
+            .unwrap();
+        let state = native_state(&["test"]).await;
+        apply_published(&mut env.view, &state).await;
+        env.view.selected_session = Some(id.clone());
+        env.view.view_mode = ViewMode::Terminal;
+        let mut requests = env.view.session_feed.request_driver_for_test();
+        env.view.open_delete_for_selected();
+        env.view
+            .handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), None);
+        let (_, SessionRequest::Purge(body)) =
+            requests(Err("capture before peer restore".into())).unwrap()
+        else {
+            panic!("expected captured purge");
+        };
+        assert!(body.expected_trash);
+        storage
+            .update(|rows, _| {
+                let row = rows.iter_mut().find(|row| row.id == id).unwrap();
+                row.untrash();
+                if retrash {
+                    row.trash();
+                }
+                Ok(())
+            })
+            .unwrap();
+        let before = payload_bytes("test");
+        let (status, value) = request(
+            &state,
+            "DELETE",
+            &format!("/api/sessions/{id}"),
+            serde_json::to_value(body).unwrap(),
+        )
+        .await;
+        assert!(status.is_success(), "{status}: {value}");
+        assert!(matches!(
+            serde_json::from_value::<PurgeOutcome>(value).unwrap(),
+            PurgeOutcome::Kept {
+                teardown_started: false,
+                ..
+            }
+        ));
+        assert_eq!(payload_bytes("test"), before, "retrash={retrash}");
+    }
 }
 
 /// Canonical failure history and stale removal consent are invalidated by a new UUID,

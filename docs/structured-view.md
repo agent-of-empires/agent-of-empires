@@ -188,6 +188,11 @@ Rename and workdir dialogs, quick permission replies, and pending Trash
 confirmations close if their session changes lifecycle or disappears. A pending
 dialog cannot retarget another session when the list updates.
 
+A Trash permanent-delete confirmation keeps its original session and Trash
+identity. Selection or lifecycle changes cancel it. A purge already queued
+still carries that original consent, so a concurrent restore cannot silently
+turn it into an ordinary session purge.
+
 The reader folds persisted ACP events across all retained pages, including events
 recorded before a switch to terminal view. Missing or unreadable event ranges are
 marked explicitly, even when no readable transcript rows remain. It does not

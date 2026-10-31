@@ -486,9 +486,12 @@ async fn delete_selected_refused_during_restart() {
     let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
     env.view.restart_in_flight.insert(id.clone());
+    disable_delete_to_trash();
+    env.view.view_mode = ViewMode::Structured;
+    env.view.open_delete_for_selected();
 
     let before = payload_bytes("test");
-    let result = env.view.delete_selected(&DeleteOptions::default());
+    let result = env.view.submit_session_delete(&DeleteOptions::default());
     assert!(result.is_ok());
     assert_ne!(
         env.view.instance_at(0).status,

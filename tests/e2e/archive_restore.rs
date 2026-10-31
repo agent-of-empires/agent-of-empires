@@ -1145,7 +1145,33 @@ fn trash_retained_transcript_is_read_only() {
     h.wait_for("No readable retained ACP content");
     h.assert_screen_contains("Trash · read-only");
     h.assert_screen_contains("history is incomplete");
+    h.send_keys("d");
+    h.wait_for("Yes");
     h.run_cli_ok(&["session", "restore", &empty_id]);
+    h.wait_for("Session Changed");
+    h.send_keys("y");
+    let restored = h.read_sessions();
+    let restored = restored
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == empty_id)
+        .expect("peer-restored session must survive old confirmation");
+    assert!(restored["trashed_at"].is_null());
+    if std::env::var_os("RECORD_E2E").is_some() {
+        let directory = std::path::Path::new("target/e2e-recordings");
+        std::fs::write(
+            directory.join("trash-purge-cancelled.ansi"),
+            h.capture_screen_styled(),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("trash-purge-cancelled.txt"),
+            h.capture_screen(),
+        )
+        .unwrap();
+    }
+    h.send_keys("Enter");
     h.wait_for_absent("No readable retained ACP content", Duration::from_secs(5));
     h.wait_for("Archived (");
     let screen = h.capture_screen();

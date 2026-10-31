@@ -91,6 +91,12 @@ pub(super) struct SessionDialogTarget {
     lifecycle_generation: u64,
 }
 
+pub(super) struct SessionDeleteDialog {
+    dialog: UnifiedDeleteDialog,
+    target: SessionDialogTarget,
+    request: crate::daemon::DeleteSessionBody,
+}
+
 pub(super) enum PermissionResponseTarget {
     Terminal(String),
     Structured { session_id: String, nonce: String },
@@ -254,7 +260,7 @@ pub struct HomeView {
     pub(super) help_scroll: u16,
     pub(super) new_dialog: Option<NewSessionDialog>,
     pub(super) confirm_dialog: Option<ConfirmDialog>,
-    pub(super) unified_delete_dialog: Option<UnifiedDeleteDialog>,
+    pub(super) unified_delete_dialog: Option<SessionDeleteDialog>,
     pub(super) group_delete_options_dialog: Option<GroupDeleteOptionsDialog>,
     pub(super) rename_dialog: Option<RenameDialog>,
     pub(super) worktree_name_dialog: Option<WorktreeNameDialog>,

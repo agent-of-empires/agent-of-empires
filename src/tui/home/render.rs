@@ -1242,10 +1242,6 @@ impl HomeView {
             );
         }
 
-        // Every `Option<Dialog>` field renders the same way, so the macro keeps the list
-        // of active dialog types in one place. `&mut self.$field` lets a dialog whose
-        // `render` records screen rects (currently `unified_delete_dialog`) mutate self;
-        // `&self` render methods still work through auto-deref.
         macro_rules! render_dialogs {
             ($($field:ident),* $(,)?) => {
                 $(
@@ -1260,8 +1256,10 @@ impl HomeView {
         if self.snooze_duration_dialog.is_none() {
             render_dialogs!(confirm_dialog);
         }
+        if let Some(pending) = &mut self.unified_delete_dialog {
+            pending.dialog.render(frame, area, theme);
+        }
         render_dialogs!(
-            unified_delete_dialog,
             group_delete_options_dialog,
             rename_dialog,
             worktree_name_dialog,

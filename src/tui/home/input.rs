@@ -14,7 +14,7 @@ use crate::session::config::repo_config;
 use crate::session::config::{
     load_config, update_app_state, update_config, GroupByMode, SidebarPosition, SortOrder,
 };
-use crate::session::{list_profiles_for_display, Item, LifecycleOperation, Status};
+use crate::session::{list_profiles_for_display, Instance, Item, LifecycleOperation, Status};
 use crate::tui::app::Action;
 use crate::tui::dialogs::{
     builtin_commands, CommandPaletteDialog, ConfirmDialog, ContextMenuAction, ContextMenuDialog,
@@ -502,6 +502,109 @@ impl HomeView {
         ));
     }
 
+    fn new_session_delete_dialog(
+        &self,
+        instance: &Instance,
+        config: DeleteDialogConfig,
+    ) -> anyhow::Result<super::SessionDeleteDialog> {
+        let row = self
+            .session_feed
+            .applied_session(&instance.id)
+            .ok_or_else(|| anyhow::anyhow!("Current session identity is not available"))?;
+        anyhow::ensure!(
+            row.profile == instance.source_profile
+                && row.lifecycle_generation == instance.lifecycle_generation,
+            "Session changed; reopen the delete confirmation"
+        );
+        let trashed_at = row
+            .trashed_at
+            .as_deref()
+            .map(chrono::DateTime::parse_from_rfc3339)
+            .transpose()?
+            .map(|stamp| stamp.with_timezone(&chrono::Utc));
+        anyhow::ensure!(
+            trashed_at == instance.trashed_at,
+            "Trash identity changed; reopen the delete confirmation"
+        );
+        let mut request = crate::daemon::DeleteSessionBody::default();
+        if let Some(stamp) = trashed_at {
+            let identity = row
+                .trash_lifecycle_id
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Canonical trash identity is not available"))?;
+            anyhow::ensure!(
+                instance.trash_lifecycle_id.as_ref() == Some(identity),
+                "Trash identity changed; reopen the delete confirmation"
+            );
+            request.expected_trash = true;
+            request.expected_trashed_at = Some(stamp);
+            request.expected_generation = Some(row.lifecycle_generation);
+            request.expected_trash_lifecycle_id = Some(identity.clone());
+        }
+        Ok(super::SessionDeleteDialog {
+            dialog: UnifiedDeleteDialog::new(
+                instance.title.clone(),
+                config,
+                &instance.source_profile,
+            ),
+            target: super::SessionDialogTarget {
+                session_id: instance.id.clone(),
+                source_profile: instance.source_profile.clone(),
+                lifecycle_generation: instance.lifecycle_generation,
+            },
+            request,
+        })
+    }
+
+    fn delete_confirmation_is_current(&self, pending: &super::SessionDeleteDialog) -> bool {
+        let target = &pending.target;
+        if self.selected_session.as_deref() != Some(target.session_id.as_str()) {
+            return false;
+        }
+        let Some(instance) = self.get_instance(&target.session_id) else {
+            return false;
+        };
+        let Some(row) = self.session_feed.applied_session(&target.session_id) else {
+            return false;
+        };
+        if instance.source_profile != target.source_profile
+            || row.profile != target.source_profile
+            || instance.lifecycle_generation != target.lifecycle_generation
+            || row.lifecycle_generation != target.lifecycle_generation
+            || matches!(instance.status, Status::Creating | Status::Deleting)
+            || instance.is_trashed() != pending.request.expected_trash
+            || row.trashed_at.is_some() != pending.request.expected_trash
+        {
+            return false;
+        }
+        !pending.request.expected_trash
+            || (instance.trashed_at == pending.request.expected_trashed_at
+                && instance.trash_lifecycle_id == pending.request.expected_trash_lifecycle_id
+                && row.trash_lifecycle_id == pending.request.expected_trash_lifecycle_id
+                && row
+                    .trashed_at
+                    .as_deref()
+                    .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
+                    .map(|stamp| stamp.with_timezone(&chrono::Utc))
+                    == pending.request.expected_trashed_at)
+    }
+
+    pub(super) fn reconcile_delete_confirmation(&mut self) -> bool {
+        if self
+            .unified_delete_dialog
+            .as_ref()
+            .is_none_or(|pending| self.delete_confirmation_is_current(pending))
+        {
+            return false;
+        }
+        self.unified_delete_dialog = None;
+        self.info_dialog = Some(InfoDialog::new(
+            "Session Changed",
+            "The session changed or is no longer selected. The pending deletion was cancelled.",
+        ));
+        true
+    }
+
     fn trash_confirmation_is_current(&self, target: &super::SessionDialogTarget) -> bool {
         self.get_instance(&target.session_id)
             .is_some_and(|instance| {
@@ -544,6 +647,7 @@ impl HomeView {
     pub(in crate::tui) fn enforce_trash_read_only(&mut self) {
         self.reconcile_trash_confirmation();
         self.reconcile_session_dialog();
+        self.reconcile_delete_confirmation();
         if !self.selected_is_trashed() {
             return;
         }
@@ -1535,6 +1639,9 @@ impl HomeView {
     }
 
     pub fn handle_dialog_click(&mut self, col: u16, row: u16) -> bool {
+        if self.reconcile_delete_confirmation() {
+            return true;
+        }
         if let Some(serve) = &mut self.serve_view {
             let key = serve.handle_click(col, row);
             self.press_dialog_key(key);
@@ -1574,13 +1681,13 @@ impl HomeView {
             return true;
         }
         if let Some(dialog) = &mut self.unified_delete_dialog {
-            if let Some(result) = dialog.handle_click(col, row) {
+            if let Some(result) = dialog.dialog.handle_click(col, row) {
                 match result {
                     DialogResult::Continue => {}
                     DialogResult::Cancel => {
                         self.unified_delete_dialog = None;
                     }
-                    DialogResult::Submit(options) => match self.delete_selected(&options) {
+                    DialogResult::Submit(options) => match self.submit_session_delete(&options) {
                         Ok(()) => self.unified_delete_dialog = None,
                         Err(error) => {
                             self.info_dialog = Some(InfoDialog::new(
@@ -2540,12 +2647,12 @@ impl HomeView {
         }
 
         if let Some(dialog) = &mut self.unified_delete_dialog {
-            match dialog.handle_key(key) {
+            match dialog.dialog.handle_key(key) {
                 DialogResult::Continue => {}
                 DialogResult::Cancel => {
                     self.unified_delete_dialog = None;
                 }
-                DialogResult::Submit(options) => match self.delete_selected(&options) {
+                DialogResult::Submit(options) => match self.submit_session_delete(&options) {
                     Ok(()) => self.unified_delete_dialog = None,
                     Err(error) => {
                         self.info_dialog = Some(InfoDialog::new(
@@ -5959,19 +6066,15 @@ impl HomeView {
                     is_scratch: inst.scratch,
                 };
 
-                let profile = self.config_profile();
-                self.unified_delete_dialog = Some(UnifiedDeleteDialog::new(
-                    inst.title.clone(),
-                    config,
-                    &profile,
-                ));
-            } else {
-                let profile = self.config_profile();
-                self.unified_delete_dialog = Some(UnifiedDeleteDialog::new(
-                    "Unknown Session".to_string(),
-                    DeleteDialogConfig::default(),
-                    &profile,
-                ));
+                match self.new_session_delete_dialog(inst, config) {
+                    Ok(pending) => self.unified_delete_dialog = Some(pending),
+                    Err(error) => {
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Could Not Delete Session",
+                            &error.to_string(),
+                        ));
+                    }
+                }
             }
         } else if let Some(group_path) = &self.selected_group {
             if let Some((title, hint)) = self.automatic_group_hint() {
@@ -6238,7 +6341,7 @@ impl HomeView {
             overlay_changed |= menu.handle_hover(col, row);
         }
         if let Some(dialog) = &mut self.unified_delete_dialog {
-            overlay_changed |= dialog.handle_hover(col, row);
+            overlay_changed |= dialog.dialog.handle_hover(col, row);
         }
         if let Some(dialog) = &mut self.new_dialog {
             overlay_changed |= dialog.handle_hover(col, row);
