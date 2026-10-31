@@ -2,6 +2,20 @@
 
 use super::*;
 
+/// Re-enter one libtest entry to execute the real frozen-environment helper.
+#[cfg(unix)]
+pub(super) fn frozen_test_helper(
+    root: &std::path::Path,
+    entry: &str,
+) -> crate::process::test_support::NativeLaunchExecutable {
+    use std::os::unix::fs::PermissionsExt;
+    let helper = root.join("native-helper");
+    let entry = entry.split_once("::").expect("full Rust test path").1;
+    std::fs::write(&helper, format!("#!/bin/sh\nAOE_FROZEN_NATIVE_TEST_CHILD=1 exec {} --exact {} --nocapture --test-threads=1\n", crate::session::environment::shell_escape(std::env::current_exe().unwrap().to_str().unwrap()), crate::session::environment::shell_escape(entry))).unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    crate::process::test_support::NativeLaunchExecutable::install(helper)
+}
+
 /// Makes `Session::existence()` resolve to `Absent` whatever tmux server is up
 /// (#2936). Keep the guard bound and mark the test serial: the cache is global.
 #[must_use]

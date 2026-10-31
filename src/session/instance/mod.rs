@@ -83,7 +83,7 @@ pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservati
 pub(crate) use identity_sidecar::FAIL_PI_PATH_WRITES;
 pub use polling::PollerStart;
 pub use ready::{EnsureReadyError, EnsureReadyOutcome, SessionGone};
-pub use resume::ManagedResumeCause;
+pub use resume::{LaunchIndeterminateCause, ManagedResumeCause};
 pub(crate) use resume::{
     LaunchReservation, ManagedResumeRefused, ResumeAttemptPolicy, ResumeLaunchOptions,
 };
@@ -92,7 +92,11 @@ pub(crate) use sid_persist::{
 };
 pub use start::{LaunchSidOutcome, StartOutcome};
 pub(crate) use status::PassiveStatusPatch;
-pub use status::{Status, TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR};
+pub use status::{
+    ErrorBlockingScope, ErrorEvidenceGeneration, ErrorEvidenceSource, ErrorOperation, ErrorOrigin,
+    OperationErrorEvidence, RuntimeEvidence, Status, TMUX_SERVER_UNREACHABLE_ERROR,
+    TMUX_SESSION_GONE_ERROR,
+};
 pub(crate) use terminal::ToolLaunchUnavailable;
 #[cfg(test)]
 pub(crate) use test_helpers::install_aliases;
@@ -947,6 +951,8 @@ pub struct Instance {
 
     #[serde(skip)]
     pub last_error: Option<String>,
+    #[serde(skip)]
+    pub last_error_evidence: Option<OperationErrorEvidence>,
     #[serde(skip)]
     pub(crate) capture_poller: capture_slot::CapturePollerSlot,
     /// Session IDs invalidated at a fresh-generation boundary. Persisting this
