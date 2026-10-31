@@ -669,6 +669,202 @@ async fn a_direct_prompt_and_the_queue_drain_cannot_both_own_the_same_turn() {
     assert_eq!(*cmds.lock().expect("cmd log mutex poisoned"), ["prompt"]);
 }
 
+#[tokio::test]
+async fn queued_explicit_work_follows_a_failed_prompt_but_not_a_failed_runtime() {
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    for (reason, interaction, late) in [
+        ("prompt_failed", None, false),
+        ("prompt_failed", Some("approval"), false),
+        ("prompt_failed", Some("elicitation"), false),
+        ("prompt_failed", Some("approval"), true),
+        ("prompt_failed", Some("elicitation"), true),
+        ("session_reset_failed", None, false),
+        ("startup_error", None, false),
+    ] {
+        let id = format!(
+            "queued-after-{reason}-{}-{late}",
+            interaction.unwrap_or("none")
+        );
+        let state = structured_state(&id, true).await;
+        let commands = state
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(&id)
+            .await;
+        let row = state.instances.read().await[0].clone();
+        let storage =
+            Arc::new(crate::session::Storage::open_reference(&row.source_profile).unwrap());
+        let scope = crate::acp::state::NativeObservationScope::capture(&row, &storage).unwrap();
+        state
+            .acp_supervisor
+            .current_lease(&id)
+            .unwrap()
+            .set_admission(Some(crate::acp::supervisor::LaunchAdmission {
+                store: storage,
+                generation: row.lifecycle_generation,
+                namespace: Some(state.profile_namespace.clone()),
+                native_scope: Some(scope),
+            }));
+        state.acp_supervisor.test_observe_native_ready(&id).await;
+        let first = acp_prompt(
+            State(state.clone()),
+            Path(id.clone()),
+            prompt_req("first explicit request"),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let second = acp_prompt(
+            State(state.clone()),
+            Path(id.clone()),
+            prompt_req("second explicit request"),
+        )
+        .await
+        .into_response();
+        assert_eq!(second.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            state
+                .session_service
+                .queued_prompts_snapshot(&id)
+                .await
+                .len(),
+            1
+        );
+        let inject = |event: Event| {
+            let seq = state.acp_event_store.highest_seq_checked(&id).unwrap() + 1;
+            state.acp_event_store.record(&id, seq, &event).unwrap();
+            state.acp_control_cache.apply_if_cached(&id, seq, &event);
+            state.acp_supervisor.hydrate_seqs([(id.clone(), seq)]);
+        };
+        let (mut requested, resolved) = match interaction {
+            Some("approval") => {
+                let approval = crate::acp::permissions::build_approval(
+                    crate::acp::state::ToolCall {
+                        id: "pending-tool".into(),
+                        name: "shell".into(),
+                        kind: "execute".into(),
+                        args_preview: "{}".into(),
+                        started_at: chrono::Utc::now(),
+                        parent_tool_call_id: None,
+                        memory_recall: None,
+                        diffs: Vec::new(),
+                    },
+                    Vec::new(),
+                );
+                let nonce = approval.nonce.clone();
+                (
+                    Some(Event::ApprovalRequested { approval }),
+                    Some(Event::ApprovalResolved {
+                        nonce,
+                        decision: crate::acp::approvals::ApprovalDecision::Allow,
+                    }),
+                )
+            }
+            Some("elicitation") => {
+                let nonce = crate::acp::approvals::Nonce("pending-question".into());
+                (
+                    Some(Event::ElicitationRequested {
+                        elicitation: crate::acp::elicitations::Elicitation {
+                            nonce: nonce.clone(),
+                            message: "Choose".into(),
+                            title: None,
+                            description: None,
+                            tool_call_id: None,
+                            questions: Vec::new(),
+                            requested_at: chrono::Utc::now(),
+                            resolved: None,
+                        },
+                    }),
+                    Some(Event::ElicitationResolved {
+                        nonce,
+                        outcome: crate::acp::elicitations::ElicitationOutcome::Declined,
+                        answers: Vec::new(),
+                    }),
+                )
+            }
+            _ => (None, None),
+        };
+        if !late {
+            if let Some(event) = requested.take() {
+                inject(event);
+            }
+        }
+        if reason == "prompt_failed" {
+            inject(Event::PromptRuntimeError {
+                message: "first request failed".into(),
+                evidence: None,
+                native_subject: None,
+            });
+        }
+        if reason == "startup_error" {
+            state
+                .acp_supervisor
+                .publish_startup_error(&id, "transport closed".into());
+        } else {
+            state
+                .acp_supervisor
+                .synthesize_stopped_for_orphan(&id, reason);
+        }
+        if let Some(event) = requested.take() {
+            inject(event);
+        }
+        if let Some(event) = resolved {
+            inject(event);
+        }
+        let control = state.session_service.fold_control_state(&id).await;
+        assert!(!control.turn_active);
+        assert_eq!(control.sidebar_status(), crate::session::Status::Error);
+        if reason == "prompt_failed" {
+            assert_eq!(
+                control.sidebar_phase,
+                crate::acp::state::SidebarPhase::PromptFailed
+            );
+            assert!(
+                control.pending_approvals.is_empty() && control.pending_elicitations.is_empty()
+            );
+        }
+        state.instances.write().await[0].status = crate::session::Status::Error;
+        state.session_service.drain_queued_prompts_once(&id).await;
+        state.acp_supervisor.test_flush_worker_commands(&id).await;
+        let follows = reason == "prompt_failed";
+        assert_eq!(
+            commands.lock().unwrap().len(),
+            if follows { 2 } else { 1 },
+            "{reason}"
+        );
+        assert_eq!(
+            state
+                .session_service
+                .queued_prompts_snapshot(&id)
+                .await
+                .len(),
+            usize::from(!follows),
+            "{reason}"
+        );
+        let prompts: Vec<_> = state
+            .acp_event_store
+            .replay_from(&id, 0)
+            .into_iter()
+            .filter_map(|(_, event)| match event {
+                Event::UserPromptSent {
+                    text, synthesized, ..
+                } => {
+                    assert!(!synthesized, "failed work is not redelivered");
+                    Some(text)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            prompts,
+            if follows {
+                vec!["first explicit request", "second explicit request"]
+            } else {
+                vec!["first explicit request"]
+            }
+        );
+    }
+}
+
 /// #3649: a review that loses the guard to a turn-starting submission is
 /// refused, with nothing sent or published.
 #[tokio::test]
@@ -1241,4 +1437,449 @@ async fn send_now_behind_a_busy_agent_keeps_the_one_queued_row() {
     assert_eq!(queue.len(), 1);
     assert_eq!(queue[0].id, "q1");
     assert_eq!(queue[0].origin_plugin.as_deref(), Some("cron"));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn native_loss_and_legacy_refusal_precede_prompt_touch_queue_or_launch() {
+    use crate::acp::state::{
+        AcpConnectionCause, AcpConnectionPhase, AcpConnectionSource, NativeEventContext,
+        NativeEventSubject,
+    };
+    use crate::process::worker_registry::{self, WorkerRecord};
+    for native_loss in [false, true] {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let id = if native_loss {
+            "sess-native-loss"
+        } else {
+            "sess-legacy-owner"
+        };
+        let (state, launches) = failing_start_state(id, false).await;
+        {
+            let mut rows = state.instances.write().await;
+            rows[0].mark_idle_dormant();
+            rows[0].snoozed_until = Some(chrono::Utc::now() + chrono::Duration::days(3));
+            rows[0].pending_initial_turn = Some(crate::session::PendingInitialTurn {
+                text: "existing continuation".into(),
+                attachments: Vec::new(),
+                synthesized: true,
+            });
+        }
+        seed_native_row(&state).await;
+        state
+            .session_service
+            .enqueue_prompt(
+                id,
+                "retained".into(),
+                "existing queued intent".into(),
+                vec![],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        state.instances.write().await[0].last_error = Some("retained operation diagnostic".into());
+        let row = state.instances.read().await[0].clone();
+        let socket = worker_registry::socket_path_for(id).unwrap();
+        let mut record = WorkerRecord::new(
+            id.into(),
+            std::process::id(),
+            socket.clone(),
+            "retained-agent".into(),
+            "claude".into(),
+            std::env::temp_dir(),
+            None,
+            vec![],
+            vec![],
+            Some("retained-native".into()),
+            Some("default".into()),
+        )
+        .with_generation(41);
+        record.control_protocol_version =
+            native_loss.then_some(crate::acp::control_protocol::CONTROL_PROTOCOL_VERSION);
+        worker_registry::save(&record).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(
+            crate::process::worker::control_socket_sibling(&socket),
+        )
+        .unwrap();
+        listener.set_nonblocking(true).unwrap();
+        if native_loss {
+            let storage = crate::session::Storage::open_reference(&row.source_profile).unwrap();
+            let context = NativeEventContext::capture(&row, &storage).unwrap();
+            let mut event = Event::AcpConnectionUnavailable {
+                source: AcpConnectionSource::Native,
+                cause: AcpConnectionCause::StdoutEof,
+                phase: AcpConnectionPhase::Established,
+                native_subject: None,
+            };
+            event.set_native_subject(NativeEventSubject::channel(
+                context,
+                Some(crate::acp::runner_lifecycle::RunnerIdentity::from_record(
+                    &record,
+                )),
+                &event,
+            ));
+            state.acp_event_store.record(id, 1, &event).unwrap();
+            state.acp_supervisor.hydrate_seqs([(id.into(), 1)]);
+        }
+        let before = serde_json::to_value(&state.instances.read().await[0]).unwrap();
+        let bytes = std::fs::read(worker_registry::record_path(id).unwrap()).unwrap();
+        let queue_before =
+            serde_json::to_value(state.session_service.queued_prompts_snapshot(id).await).unwrap();
+        for diff_comments in [false, true] {
+            let response = if diff_comments {
+                acp_prompt_diff_comments(
+                    State(state.clone()),
+                    Path(id.into()),
+                    diff_req("must not wake"),
+                )
+                .await
+                .into_response()
+            } else {
+                acp_prompt(
+                    State(state.clone()),
+                    Path(id.into()),
+                    prompt_req("must not wake"),
+                )
+                .await
+                .into_response()
+            };
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(
+                serde_json::to_value(&state.instances.read().await[0]).unwrap(),
+                before
+            );
+            assert_eq!(
+                serde_json::to_value(state.session_service.queued_prompts_snapshot(id).await)
+                    .unwrap(),
+                queue_before
+            );
+            assert_eq!(
+                state.instances.read().await[0].last_error.as_deref(),
+                Some("retained operation diagnostic")
+            );
+            assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(
+                std::fs::read(worker_registry::record_path(id).unwrap()).unwrap(),
+                bytes
+            );
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            assert!(!published(&state, id, |event| matches!(
+                event,
+                Event::UserPromptSent { .. } | Event::AgentStartupError { .. }
+            )));
+        }
+        state.session_service.wake_dormant_for_queue_drain(id).await;
+        state.session_service.drain_pending_initial_turn(id).await;
+        assert_eq!(
+            serde_json::to_value(&state.instances.read().await[0]).unwrap(),
+            before
+        );
+        assert_eq!(
+            state.instances.read().await[0].last_error.as_deref(),
+            Some("retained operation diagnostic")
+        );
+        assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(!published(&state, id, |event| matches!(
+            event,
+            Event::UserPromptSent { .. }
+        )));
+    }
+}
+
+#[tokio::test]
+async fn current_owned_native_receipt_needs_no_historical_ready_and_refreshes_before_fold() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let id = "sess-current-native";
+    let state = structured_state(id, true).await;
+    let _commands = state
+        .acp_supervisor
+        .test_insert_worker_cmd_recording(id)
+        .await;
+    let row = state.instances.read().await[0].clone();
+    let storage = Arc::new(crate::session::Storage::open_reference(&row.source_profile).unwrap());
+    let scope = crate::acp::state::NativeObservationScope::capture(&row, &storage).unwrap();
+    state
+        .acp_supervisor
+        .current_lease(id)
+        .unwrap()
+        .set_admission(Some(crate::acp::supervisor::LaunchAdmission {
+            store: storage,
+            generation: row.lifecycle_generation,
+            namespace: Some(state.profile_namespace.clone()),
+            native_scope: Some(scope),
+        }));
+    state.acp_supervisor.test_observe_native_ready(id).await;
+    assert!(state.acp_event_store.replay_from(id, 0).is_empty());
+    for _ in 0..2 {
+        let folded = state.session_service.fold_control_state(id).await;
+        assert!(folded.connection_ready && folded.connection_unavailable.is_none());
+        assert!(
+            state
+                .session_service
+                .native_control_projection(
+                    id,
+                    folded.native_availability,
+                    folded.native_control_seq
+                )
+                .await
+                .ready
+        );
+    }
+    let current = state
+        .acp_supervisor
+        .current_native_availability(id)
+        .await
+        .unwrap();
+    let failure = Event::PromptRuntimeError {
+        message: "unpersisted diagnostic".into(),
+        evidence: None,
+        native_subject: None,
+    };
+    state
+        .session_service
+        .acp_control_cache
+        .record_failed_observation(
+            id,
+            1,
+            Some(crate::acp::state::NativeEventSubject::channel(
+                current.context,
+                current.owner,
+                &failure,
+            )),
+        );
+    let failed = state.session_service.fold_control_state(id).await;
+    assert!(failed.connection_ready && !failed.turn_active);
+    assert_eq!(failed.sidebar_status(), crate::session::Status::Error);
+    assert!(
+        state.acp_event_store.replay_from(id, 0).is_empty(),
+        "failed-append semantics need no fabricated durable event or duplicate message"
+    );
+    let accepted = crate::acp::state::test_support::prompt("next explicit accepted intent");
+    state.acp_event_store.record(id, 2, &accepted).unwrap();
+    state
+        .session_service
+        .acp_control_cache
+        .apply_if_cached(id, 2, &accepted);
+    assert!(
+        state
+            .session_service
+            .fold_control_state(id)
+            .await
+            .turn_active,
+        "the old append-error hint cannot override a newer accepted main turn"
+    );
+    let carried = state
+        .acp_supervisor
+        .current_native_availability(id)
+        .await
+        .unwrap();
+    carried.client.test_observe_native_loss();
+    let projection = state.session_service.acp_control_cache.native_projection(
+        id,
+        None,
+        0,
+        Some((
+            row.source_profile.clone(),
+            row.created_at,
+            row.lifecycle_generation,
+        )),
+        Some(carried),
+    );
+    assert!(!projection.ready);
+    assert_eq!(
+        projection.unavailable.unwrap().cause,
+        crate::acp::state::AcpConnectionCause::StdoutEof
+    );
+    let folded = state.session_service.fold_control_state(id).await;
+    assert!(
+        !folded.connection_ready && folded.connection_unavailable.is_some(),
+        "a warm fold cannot heal loss that is latched before its public event"
+    );
+}
+
+#[tokio::test]
+async fn readable_known_worker_down_keeps_explicit_queue_admission_without_native_health() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let id = "sess-known-worker-down";
+    let state = structured_state(id, true).await;
+    let projection = state
+        .session_service
+        .native_control_projection(id, None, 0)
+        .await;
+    assert!(!projection.ready && projection.unavailable.is_none());
+    assert!(projection.prompt_wake_eligible);
+    let response = acp_prompt(
+        State(state.clone()),
+        Path(id.into()),
+        prompt_req("explicit queued intent"),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        state.session_service.queued_prompts_snapshot(id).await[0].text,
+        "explicit queued intent"
+    );
+    assert!(!published(&state, id, |event| matches!(
+        event,
+        Event::UserPromptSent { .. } | Event::AgentStartupError { .. }
+    )));
+    let _starting = state.acp_supervisor.test_hold_starting(id);
+    let starting = state
+        .session_service
+        .native_control_projection(id, None, 0)
+        .await;
+    assert!(
+        starting.prompt_wake_eligible && !starting.ready,
+        "an existing initial-start claim admits intent without claiming native health"
+    );
+    let before = serde_json::to_value(&state.instances.read().await[0]).unwrap();
+    let path = crate::process::worker_registry::record_path(id).unwrap();
+    crate::session::atomic_write(&path, b"privateTokenMarker malformed registry").unwrap();
+    let projection = state
+        .session_service
+        .native_control_projection(id, None, 0)
+        .await;
+    assert!(!projection.ready && !projection.prompt_wake_eligible);
+    assert_eq!(
+        projection.unavailable.unwrap().cause,
+        crate::acp::state::AcpConnectionCause::OwnershipUnconfirmed
+    );
+    let response = acp_prompt(
+        State(state.clone()),
+        Path(id.into()),
+        prompt_req("must not become known absence"),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        serde_json::to_value(&state.instances.read().await[0]).unwrap(),
+        before
+    );
+    assert_eq!(
+        state
+            .session_service
+            .queued_prompts_snapshot(id)
+            .await
+            .len(),
+        1
+    );
+    assert_eq!(
+        std::fs::read(path).unwrap(),
+        b"privateTokenMarker malformed registry"
+    );
+    let public = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(!std::str::from_utf8(&public)
+        .unwrap()
+        .contains("privateTokenMarker"));
+}
+
+#[tokio::test]
+async fn native_loss_after_final_precheck_preserves_pending_and_named_queue_intent() {
+    for text in ["explicit next request", "/clear"] {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let id = "sess-late-native-loss";
+        let state = structured_state(id, true).await;
+        {
+            let mut rows = state.instances.write().await;
+            rows[0].acp_session_id = Some("retained-native-sid".into());
+            rows[0].pending_initial_turn = Some(crate::session::PendingInitialTurn {
+                text: "existing governed continuation".into(),
+                attachments: vec![],
+                synthesized: true,
+            });
+        }
+        seed_native_row(&state).await;
+        let commands = state
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(id)
+            .await;
+        let row = state.instances.read().await[0].clone();
+        let storage =
+            Arc::new(crate::session::Storage::open_reference(&row.source_profile).unwrap());
+        let scope = crate::acp::state::NativeObservationScope::capture(&row, &storage).unwrap();
+        state
+            .acp_supervisor
+            .current_lease(id)
+            .unwrap()
+            .set_admission(Some(crate::acp::supervisor::LaunchAdmission {
+                store: storage,
+                generation: row.lifecycle_generation,
+                namespace: Some(state.profile_namespace.clone()),
+                native_scope: Some(scope),
+            }));
+        state.acp_supervisor.test_observe_native_ready(id).await;
+        state
+            .session_service
+            .enqueue_prompt(id, "retained".into(), text.into(), vec![], None, None)
+            .await
+            .unwrap();
+        let current = state
+            .acp_supervisor
+            .current_native_availability(id)
+            .await
+            .unwrap();
+        assert!(current.ready);
+        let (arrived, release) = state.session_service.arm_native_prompt_send_gate();
+        let request = tokio::spawn({
+            let state = state.clone();
+            async move {
+                acp_prompt(
+                    State(state),
+                    Path(id.into()),
+                    send_now_req(text, "retained"),
+                )
+                .await
+                .into_response()
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), arrived)
+            .await
+            .unwrap()
+            .unwrap();
+        current.client.test_observe_native_loss();
+        release.send(()).unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(5), request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT, "{text}");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["disposition"], "unavailable");
+        assert_eq!(body["unavailability"]["cause"], "stdout_eof");
+        assert_eq!(
+            persisted_pending_turn(&state, id).await.unwrap().text,
+            "existing governed continuation"
+        );
+        assert_eq!(
+            state
+                .session_service
+                .queued_prompts_snapshot(id)
+                .await
+                .len(),
+            1
+        );
+        assert!(
+            commands.lock().unwrap().is_empty(),
+            "no native prompt/reset after loss"
+        );
+        assert_eq!(
+            state.instances.read().await[0].acp_session_id.as_deref(),
+            Some("retained-native-sid")
+        );
+    }
 }

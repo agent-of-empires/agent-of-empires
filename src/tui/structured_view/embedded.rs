@@ -169,8 +169,7 @@ impl EmbeddedView {
             EmbeddedEvent::Ws(None) => {
                 // Channel closed without an error frame: treat as a disconnect so
                 // `next_event` stops polling the dead handle.
-                self.state.ws = None;
-                self.state.in_flight = false;
+                self.state.disconnect_management();
                 set_toast(
                     &mut self.state,
                     &mut self.toast_deadline,

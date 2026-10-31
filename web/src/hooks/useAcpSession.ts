@@ -1,9 +1,11 @@
 // Structured view session: reduces the ACP stream into AcpState and exposes the user's actions.
-// Failed actions surface through `state.lastError` rather than being silently lost.
+// Failed actions surface through transient interaction errors without replacing operation diagnostics.
 
 import { useCallback, useEffect, useMemo, useReducer, useRef, type Dispatch } from "react";
 import {
   emptyAcpState,
+  nativeInputAvailable,
+  canSubmitPromptIntent,
   type AcpAttachment,
   type AcpState,
   type ApprovalDecision,
@@ -101,9 +103,12 @@ function optimisticPromptId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
+const NATIVE_INPUT_UNCONFIRMED =
+  "Native input is not currently confirmed. The retained conversation has not been replaced.";
+
 export function useAcpSession(
   sessionId: string | null,
-  /** Queued prompts can be sent immediately only while the worker is running. */
+  /** Explicit worker shutdown also disables queue delivery while it is in progress. */
   workerState: "absent" | "resuming" | "running" | "stopping" = "running",
   archivedAt: string | null = null,
   snoozedUntil: string | null = null,
@@ -119,38 +124,72 @@ export function useAcpSession(
   const queuedPromptsRef = useLatestRef(state.queuedPrompts);
   const connection = useAcpConnection(sessionId, sessionIdRef, state, dispatch);
   const { status, lastActivityRef } = connection;
+  const inputStateRef = useLatestRef(state);
+  const connectionStatusRef = useLatestRef(status);
+  const requireNativeInput = useCallback(
+    (
+      target?: NonNullable<AcpState["interactionError"]>["target"],
+      mode: "native" | "prompt_intent" | "authorized_snooze_wake" = "native",
+    ): boolean => {
+      const current = inputStateRef.current;
+      const allowed =
+        mode === "native"
+          ? nativeInputAvailable(current)
+          : mode === "prompt_intent"
+            ? canSubmitPromptIntent(current)
+            : current.nativeSnapshotSeq != null && current.connectionUnavailable === null;
+      if (connectionStatusRef.current === "open" && allowed) return true;
+      dispatch({ kind: "error", message: NATIVE_INPUT_UNCONFIRMED, target });
+      return false;
+    },
+    [inputStateRef, connectionStatusRef],
+  );
 
+  // Reject failures so the card rolls back and the same nonce remains retryable.
   const resolveApproval = useCallback(
     async (nonce: string, decision: ApprovalDecision, optionId?: string) => {
       if (!sessionId) return;
+      if (!requireNativeInput({ kind: "approval", nonce })) throw new Error(NATIVE_INPUT_UNCONFIRMED);
+      let res: Response;
       try {
-        const res = await fetch(
+        res = await fetch(
           acpUrl(sessionId, `approvals/${encodeURIComponent(nonce)}`),
           jsonPost(optionId === undefined ? { decision } : { decision, option_id: optionId }),
         );
-        const detail = res.ok ? "" : await safeText(res);
-        const outcome = classifyResolveResponse("approval", res.ok, res.status, detail, nonce);
-        dispatch(
-          outcome.kind === "resolved"
-            ? { kind: "approval_resolved_locally", nonce }
-            : { kind: "error", message: outcome.message },
-        );
       } catch (e) {
-        dispatch({ kind: "error", message: `Network error resolving approval: ${describeError(e)}` });
+        dispatch({
+          kind: "error",
+          message: `Network error resolving approval: ${describeError(e)}`,
+          target: { kind: "approval", nonce },
+        });
+        throw e;
       }
+      const detail = res.ok ? "" : await safeText(res);
+      const outcome = classifyResolveResponse("approval", res.ok, res.status, detail, nonce);
+      if (outcome.kind === "resolved") {
+        dispatch({ kind: "approval_resolved_locally", nonce });
+        return;
+      }
+      dispatch({ kind: "error", message: outcome.message, target: { kind: "approval", nonce } });
+      throw new Error(outcome.message);
     },
-    [sessionId],
+    [sessionId, requireNativeInput],
   );
 
   // Throws on failure so the card re-enables and the same nonce can be resubmitted.
   const resolveElicitation = useCallback(
     async (nonce: string, resolution: ElicitationResolution) => {
       if (!sessionId) return;
+      if (!requireNativeInput({ kind: "elicitation", nonce })) throw new Error(NATIVE_INPUT_UNCONFIRMED);
       let res: Response;
       try {
         res = await fetch(acpUrl(sessionId, `elicitations/${encodeURIComponent(nonce)}`), jsonPost(resolution));
       } catch (e) {
-        dispatch({ kind: "error", message: `Network error resolving question: ${describeError(e)}` });
+        dispatch({
+          kind: "error",
+          message: `Network error resolving question: ${describeError(e)}`,
+          target: { kind: "elicitation", nonce },
+        });
         throw e;
       }
       const detail = res.ok ? "" : await safeText(res);
@@ -159,15 +198,20 @@ export function useAcpSession(
         dispatch({ kind: "elicitation_resolved_locally", nonce, resolution });
         return;
       }
-      dispatch({ kind: "error", message: outcome.message });
+      dispatch({ kind: "error", message: outcome.message, target: { kind: "elicitation", nonce } });
       throw new Error(outcome.message);
     },
-    [sessionId],
+    [sessionId, requireNativeInput],
   );
 
   // POST a prompt behind an optimistic overlay row keyed by its prompt_id and report the outcome.
   const dispatchPromptNow = useCallback(
-    async (text: string, attachments?: PromptAttachmentInput[], queuedPromptId?: string): Promise<PromptSendResult> => {
+    async (
+      text: string,
+      attachments?: PromptAttachmentInput[],
+      queuedPromptId?: string,
+      admission: "prompt_intent" | "authorized_snooze_wake" = "prompt_intent",
+    ): Promise<PromptSendResult> => {
       if (!sessionId) return { kind: "retryable_failure" };
       const previews: AcpAttachment[] = (attachments ?? []).map((a, i) => ({
         id: `local-${Date.now()}-${i}`,
@@ -179,6 +223,10 @@ export function useAcpSession(
       }));
       const promptId = optimisticPromptId();
       dispatch({ kind: "user_prompt", id: promptId, text, attachments: previews.length > 0 ? previews : undefined });
+      if (!requireNativeInput(undefined, admission)) {
+        dispatch({ kind: "prompt_send_rejected", id: promptId });
+        return { kind: "non_retryable_failure" };
+      }
       lastActivityRef.current = Date.now();
       try {
         const res = await fetch(
@@ -235,7 +283,7 @@ export function useAcpSession(
         return { kind: "retryable_failure" };
       }
     },
-    [sessionId, lastActivityRef],
+    [sessionId, lastActivityRef, requireNativeInput],
   );
 
   const enqueueServer = useCallback(
@@ -272,6 +320,13 @@ export function useAcpSession(
         dispatch({ kind: "error", message: "session is archived; unarchive it first" });
         return;
       }
+      // Refuse before waking or touching the queue. Opening a socket, replay,
+      // and cached lifecycle flags are not current intent admission.
+      if (connectionStatusRef.current !== "open" || !canSubmitPromptIntent(inputStateRef.current)) {
+        await dispatchPromptNow(text, attachments);
+        return;
+      }
+      const authorizedSnoozeWake = !!snoozedUntilRef.current && inputStateRef.current.promptWakeEligible;
       // The reconciler skips snoozed sessions, so wake them before sending.
       if (snoozedUntilRef.current && !(await setSessionSnooze(sessionId, null))) {
         dispatch({
@@ -280,7 +335,15 @@ export function useAcpSession(
         });
         return;
       }
-      const result = await dispatchPromptNow(text, attachments);
+      // Our own authorized unsnooze can consume its eligibility before the POST.
+      // Carry only that single existing wake intent, never generic Unknown;
+      // loss still refuses here and actual delivery rechecks the core fences.
+      const result = await dispatchPromptNow(
+        text,
+        attachments,
+        undefined,
+        authorizedSnoozeWake ? "authorized_snooze_wake" : "prompt_intent",
+      );
       if (result.kind === "queued") {
         showServerQueued(result.queuedId, text, attachments);
         reportAcpInteraction("prompt_queued");
@@ -292,21 +355,31 @@ export function useAcpSession(
         enqueueServer(text, attachments);
       }
     },
-    [sessionId, archivedAtRef, snoozedUntilRef, dispatchPromptNow, enqueueServer, showServerQueued],
+    [
+      sessionId,
+      archivedAtRef,
+      snoozedUntilRef,
+      dispatchPromptNow,
+      enqueueServer,
+      showServerQueued,
+      inputStateRef,
+      connectionStatusRef,
+    ],
   );
 
-  // The daemon owns and drains the queue; re-list on connect and at each turn change. The first
-  // list per session re-sends rows the server never confirmed; a confirmed row missing from the
-  // server was drained and must not be re-created.
+  // Listing is safe on socket open. Re-sending unconfirmed cached intent must
+  // wait for the current native/governed-intent receipt; confirmed drained rows
+  // must never be re-created.
   const queueMigratedRef = useRef<Set<string>>(new Set());
+  const queueMigrationEligible = status === "open" && canSubmitPromptIntent(state);
   useEffect(() => {
     if (!sessionId || status !== "open") return;
     let cancelled = false;
     void (async () => {
-      if (!queueMigratedRef.current.has(sessionId)) {
-        queueMigratedRef.current.add(sessionId);
+      if (!queueMigratedRef.current.has(sessionId) && queueMigrationEligible) {
         for (const q of queuedPromptsRef.current) {
-          if (cancelled) return;
+          if (cancelled || connectionStatusRef.current !== "open" || !canSubmitPromptIntent(inputStateRef.current))
+            return;
           if (!q.pending) continue;
           await enqueueServerPrompt(sessionId, {
             id: q.id,
@@ -314,14 +387,26 @@ export function useAcpSession(
             attachments: q.attachments,
           });
         }
+        if (cancelled || connectionStatusRef.current !== "open" || !canSubmitPromptIntent(inputStateRef.current))
+          return;
+        queueMigratedRef.current.add(sessionId);
       }
+      const queueAtRead = queuedPromptsRef.current;
       const rows = await listServerQueue(sessionId);
-      if (!cancelled) dispatch({ kind: "hydrate_server_queue", rows });
+      if (!cancelled) dispatch({ kind: "hydrate_server_queue", rows, queueAtRead });
     })();
     return () => {
       cancelled = true;
     };
-  }, [sessionId, status, state.turnActive, queuedPromptsRef]);
+  }, [
+    sessionId,
+    status,
+    state.turnActive,
+    queuedPromptsRef,
+    queueMigrationEligible,
+    inputStateRef,
+    connectionStatusRef,
+  ]);
 
   // Queue mutations are optimistic; a failed server call is corrected by the next hydrate.
   const removeQueuedPrompt = useCallback(
@@ -348,8 +433,9 @@ export function useAcpSession(
   // Never bind this to Escape: an accidental press would abort work the user meant to keep.
   const cancelPrompt = useCallback(async () => {
     if (!sessionId) return;
+    if (!requireNativeInput()) return;
     await postReportingErrors(dispatch, acpUrl(sessionId, "cancel"), { method: "POST" }, ["cancel", "cancelling"]);
-  }, [sessionId]);
+  }, [sessionId, requireNativeInput]);
 
   const steerable = !!state.promptCapabilities?.steering && !state.cancelling && !state.compacting;
 
@@ -358,6 +444,7 @@ export function useAcpSession(
     async (prompt: QueuedPrompt) => {
       const sid = sessionIdRef.current;
       if (!sid) return;
+      if (!requireNativeInput(undefined, "prompt_intent")) return;
       if (state.turnActive && !steerable) {
         await cancelPrompt();
         return;
@@ -368,6 +455,9 @@ export function useAcpSession(
       // and a plugin-sent row keeps the sender it stored.
       dispatch({ kind: "dequeue_prompt", id: prompt.id });
       const result = await dispatchPromptNow(prompt.text, prompt.attachments, prompt.id);
+      // A concurrent list can have reintroduced the row while delivery awaited
+      // the daemon. Settle it again at acknowledgement before any retained-row upsert.
+      dispatch({ kind: "dequeue_prompt", id: prompt.id });
       // The daemon keeps the row until it accepts the send, so a refusal or a re-park leaves it queued.
       if (result.kind === "queued") {
         showServerQueued(result.queuedId, prompt.text, prompt.attachments);
@@ -379,13 +469,14 @@ export function useAcpSession(
         showServerQueued(prompt.id, prompt.text, prompt.attachments);
       }
     },
-    [sessionIdRef, state.turnActive, steerable, cancelPrompt, dispatchPromptNow, showServerQueued],
+    [sessionIdRef, state.turnActive, steerable, cancelPrompt, dispatchPromptNow, showServerQueued, requireNativeInput],
   );
 
   // Pessimistic: the value changes when the adapter confirms; pending only dims the clicked option.
   const setConfigOption = useCallback(
     async (configId: string, value: string) => {
       if (!sessionId) return;
+      if (!requireNativeInput()) return;
       dispatch({ kind: "set_pending_config_option", configId, value });
       await postReportingErrors(
         dispatch,
@@ -395,7 +486,7 @@ export function useAcpSession(
         () => dispatch({ kind: "clear_pending_config_option_if_match", configId, value }),
       );
     },
-    [sessionId],
+    [sessionId, requireNativeInput],
   );
 
   // The server publishes the resulting Stopped event; no client-side Stopped is fabricated.
@@ -435,16 +526,7 @@ export function useAcpSession(
     editQueuedPrompt,
     clearQueue,
     sendQueuedNow,
-    canSendQueuedNow:
-      status === "open" &&
-      !state.workerStopped &&
-      !state.workerRestarting &&
-      // Same mirror: "Send now" is offered wherever a prompt can start a worker, which is what
-      // lets a row queued before the park drain without waiting out the reset window.
-      (workerState === "running" ||
-        state.workerIdleStopped ||
-        state.rateLimitRetriesExhausted ||
-        state.rateLimitParked),
+    canSendQueuedNow: status === "open" && canSubmitPromptIntent(state) && workerState !== "stopping",
     /** Send now would cancel a running, non-steerable turn rather than send immediately. */
     sendNowInterruptsTurn: state.turnActive && !steerable,
     setConfigOption,

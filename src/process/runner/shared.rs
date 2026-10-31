@@ -5,7 +5,10 @@ use super::jsonrpc::{
     parse_agent_call_outcome, parse_notification, parse_request_value_id, parse_response,
     parse_response_id,
 };
-use crate::acp::control_protocol::{self, ControlBody, PromptCompletedMarker, SessionReplayed};
+use crate::acp::control_protocol::{
+    self, ControlBody, NativeChannelAvailability, NativeChannelLossCause, NativeChannelLostMarker,
+    PromptCompletedMarker, SessionReplayed,
+};
 use crate::process::worker_registry;
 use agent_client_protocol::JsonRpcMessage;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -39,6 +42,9 @@ pub(super) struct RunnerShared {
     /// A durability failure makes further runner state unsafe to expose.
     pub(super) fatal: AtomicBool,
     pub(super) fatal_wake: tokio::sync::Notify,
+    native_channel: std::sync::Mutex<NativeChannelState>,
+    native_changed: tokio::sync::Notify,
+    native_dispatch_finished: tokio::sync::Notify,
 }
 
 pub(super) struct PendingServerCall {
@@ -57,6 +63,28 @@ pub(super) struct PendingAgentCall {
 pub(super) struct HandshakeResponse {
     pub(super) value: serde_json::Value,
     pub(super) release: tokio::sync::oneshot::Sender<()>,
+}
+
+#[derive(Default)]
+struct NativeChannelState {
+    loss: Option<NativeChannelLossCause>,
+    dispatching: bool,
+}
+
+/// There is one stdout dispatcher. Its accepted message may finish publication
+/// after a concurrent stdin failure, but unrelated commands cannot borrow it.
+struct NativeDispatch<'a>(&'a RunnerShared);
+
+impl Drop for NativeDispatch<'_> {
+    fn drop(&mut self) {
+        self.0
+            .native_channel
+            .lock()
+            .expect("native channel lock")
+            .dispatching = false;
+        self.0.native_dispatch_finished.notify_waiters();
+        self.0.control_wake.notify_one();
+    }
 }
 
 #[derive(Default)]
@@ -81,6 +109,14 @@ pub(super) enum QueuedKind {
     AgentReply,
     // Not `Notify`: shedding it would leave the daemon's session/load waiting.
     SessionReplayed,
+    NativeLoss,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativePublication {
+    Work,
+    Dispatch,
+    CachedReceipt,
 }
 
 pub(super) struct QueuedControl {
@@ -99,6 +135,8 @@ pub(super) struct ControlChannel {
     pub(super) next_entry_id: u64,
     pub(super) in_flight: Option<u64>,
     pub(super) last_prompt_completion: Option<Arc<[u8]>>,
+    native_loss: Option<QueuedControl>,
+    native_loss_delivered: Option<u64>,
 }
 
 impl ControlChannel {
@@ -109,9 +147,19 @@ impl ControlChannel {
     }
 
     pub(super) fn make_room(&mut self, incoming_bytes: usize) -> bool {
-        while self.queue.len() >= control_protocol::MAX_CONTROL_QUEUE_FRAMES
-            || self.queued_bytes.saturating_add(incoming_bytes)
+        while self.queue.len()
+            >= control_protocol::MAX_CONTROL_QUEUE_FRAMES
+                - control_protocol::CONTROL_REPLAY_RESERVED_FRAMES
+            || self
+                .queued_bytes
+                .saturating_add(incoming_bytes)
+                .saturating_add(
+                    self.last_prompt_completion
+                        .as_ref()
+                        .map_or(0, |wire| wire.len()),
+                )
                 > control_protocol::MAX_CONTROL_QUEUE_BYTES
+                    - control_protocol::MAX_NATIVE_LOSS_FRAME_BYTES
         {
             let Some(index) = self.queue.iter().position(|frame| {
                 frame.kind == QueuedKind::Notify && self.in_flight != Some(frame.id)
@@ -212,6 +260,9 @@ impl RunnerShared {
             registry_owner,
             fatal: AtomicBool::new(false),
             fatal_wake: tokio::sync::Notify::new(),
+            native_channel: std::sync::Mutex::new(NativeChannelState::default()),
+            native_changed: tokio::sync::Notify::new(),
+            native_dispatch_finished: tokio::sync::Notify::new(),
         }
     }
 
@@ -250,11 +301,98 @@ impl RunnerShared {
             notified.await;
         }
     }
+
+    pub(super) fn native_loss(&self) -> Option<NativeChannelLossCause> {
+        self.native_channel
+            .lock()
+            .expect("native channel lock")
+            .loss
+    }
+
+    pub(super) fn native_availability(&self) -> NativeChannelAvailability {
+        match self.native_loss() {
+            Some(cause) => NativeChannelAvailability::Unavailable { cause },
+            None => NativeChannelAvailability::Available,
+        }
+    }
+
+    /// First loss closes native admission synchronously. No async queue or
+    /// ordinary backlog is needed to retain the observation.
+    pub(super) fn observe_native_loss(&self, cause: NativeChannelLossCause) {
+        let mut native = self.native_channel.lock().expect("native channel lock");
+        if native.loss.is_some() {
+            return;
+        }
+        native.loss = Some(cause);
+        drop(native);
+        self.native_changed.notify_waiters();
+        self.reset_finished.notify_waiters();
+        self.control_space.notify_waiters();
+        self.control_wake.notify_one();
+    }
+
+    pub(super) async fn wait_native_loss(&self) -> NativeChannelLossCause {
+        loop {
+            let changed = self.native_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if let Some(cause) = self.native_loss() {
+                return cause;
+            }
+            changed.await;
+        }
+    }
+
+    async fn wait_native_dispatch(&self) {
+        loop {
+            let finished = self.native_dispatch_finished.notified();
+            tokio::pin!(finished);
+            finished.as_mut().enable();
+            if !self
+                .native_channel
+                .lock()
+                .expect("native channel lock")
+                .dispatching
+            {
+                return;
+            }
+            finished.await;
+        }
+    }
+
+    fn begin_native_dispatch(&self) -> Option<NativeDispatch<'_>> {
+        let mut native = self.native_channel.lock().expect("native channel lock");
+        if native.loss.is_some() {
+            return None;
+        }
+        debug_assert!(!native.dispatching, "stdout has one dispatcher");
+        native.dispatching = true;
+        Some(NativeDispatch(self))
+    }
+
+    /// Internal retirement only: dropping correlations does not invent a peer
+    /// error, permission decision, aborted prompt, or process-exit observation.
+    pub(super) async fn retire_native_waiters(&self) {
+        self.wait_native_loss().await;
+        self.wait_native_dispatch().await;
+        self.pending_client_responses.lock().await.clear();
+        self.prompt_requests.lock().await.clear();
+        self.pending_server_calls.lock().await.clear();
+        let mut pending = self.pending_agent_calls.lock().await;
+        for (_, call) in pending.drain() {
+            if call.method == "session/new" {
+                self.finish_reset();
+            }
+        }
+    }
     pub(super) async fn deliver_line(
         &self,
         line: &[u8],
         agent_stdin: &Mutex<tokio::process::ChildStdin>,
     ) {
+        let Some(_dispatch) = self.begin_native_dispatch() else {
+            return;
+        };
         if let Some(id) = parse_response_id(line) {
             let responder = self.pending_client_responses.lock().await.remove(&id);
             if let Some(tx) = responder {
@@ -273,13 +411,14 @@ impl RunnerShared {
         if !self.prompt_requests.lock().await.is_empty() {
             if let Some((id, outcome)) = parse_response(line) {
                 if self.prompt_requests.lock().await.remove(&id) {
-                    self.enqueue(
+                    self.enqueue_native(
                         DeliveryScope::Persistent,
                         QueuedKind::PromptCompleted,
                         ControlBody::PromptCompleted {
                             prompt_req_id: id,
                             outcome,
                         },
+                        NativePublication::Dispatch,
                     )
                     .await;
                     return;
@@ -312,10 +451,11 @@ impl RunnerShared {
                 if pending.method == "session/new" {
                     self.finish_reset();
                 }
-                self.enqueue(
+                self.enqueue_native(
                     DeliveryScope::Attachment(pending.attachment_id),
                     QueuedKind::AgentReply,
                     frame,
+                    NativePublication::Dispatch,
                 )
                 .await;
                 return;
@@ -331,13 +471,15 @@ impl RunnerShared {
         if let Some((method, params)) = parse_notification(line) {
             if SessionReplayed::matches_method(&method)
                 || PromptCompletedMarker::matches_method(&method)
+                || NativeChannelLostMarker::matches_method(&method)
             {
                 return;
             }
-            self.enqueue(
+            self.enqueue_native(
                 DeliveryScope::Persistent,
                 QueuedKind::Notify,
                 ControlBody::Notify { method, params },
+                NativePublication::Dispatch,
             )
             .await;
         }
@@ -394,6 +536,7 @@ impl RunnerShared {
                     if channel.active_attachment != Some(attachment_id)
                         || channel.session_announced
                         || self.pending_resets.load(Ordering::Acquire) != 0
+                        || self.native_loss().is_some()
                     {
                         break;
                     }
@@ -402,6 +545,9 @@ impl RunnerShared {
                 // disables this wait so its response can still reach stdout.
                 changed.await;
             }
+        }
+        if self.native_loss().is_some() {
+            return;
         }
         let call_id = self.next_call_id.fetch_add(1, Ordering::Relaxed);
         let body = ControlBody::ServerCall {
@@ -438,6 +584,9 @@ impl RunnerShared {
             return;
         }
         let mut pending = self.pending_server_calls.lock().await;
+        if self.native_loss().is_some() {
+            return;
+        }
         if pending.len() >= MAX_OUTSTANDING_REQUESTS || !channel.make_room(wire.len()) {
             warn!(
                 target: "acp.runner",
@@ -560,6 +709,9 @@ impl RunnerShared {
             drained
         };
         self.control_space.notify_waiters();
+        if self.native_loss().is_some() {
+            return;
+        }
         if !drained.is_empty() {
             info!(
                 target: "acp.runner",
@@ -583,47 +735,30 @@ impl RunnerShared {
         }
     }
 
-    pub(super) async fn abort_agent_calls(&self, session_id: &str) {
-        let drained: Vec<PendingAgentCall> = {
-            let mut map = self.pending_agent_calls.lock().await;
-            map.drain().map(|(_, pending)| pending).collect()
-        };
-        if drained.is_empty() {
-            return;
-        }
-        info!(
-            target: "acp.runner",
-            session = %session_id,
-            count = drained.len(),
-            "failing in-flight forward calls; agent is gone"
-        );
-        for pending in drained {
-            if pending.method == "session/new" {
-                self.finish_reset();
-            }
-            self.enqueue(
-                DeliveryScope::Attachment(pending.attachment_id),
-                QueuedKind::AgentReply,
-                ControlBody::AgentError {
-                    call_id: pending.call_id,
-                    error: control_protocol::JsonRpcError::new(
-                        control_protocol::DAEMON_GONE,
-                        "agent exited before answering",
-                    ),
-                },
-            )
-            .await;
-        }
-    }
-
     pub(super) async fn enqueue(
         &self,
         scope: DeliveryScope,
         kind: QueuedKind,
         body: ControlBody,
     ) -> bool {
+        self.enqueue_native(scope, kind, body, NativePublication::Work)
+            .await
+    }
+
+    /// Only the current dispatch and genuine cached management receipts may
+    /// publish after loss. Neither permits new native work.
+    async fn enqueue_native(
+        &self,
+        scope: DeliveryScope,
+        kind: QueuedKind,
+        mut body: ControlBody,
+        publication: NativePublication,
+    ) -> bool {
+        if publication == NativePublication::Work && self.native_loss().is_some() {
+            return false;
+        }
         let announces_session = matches!(&body, ControlBody::SessionReady { .. });
-        let wire: Arc<[u8]> = match control_protocol::encode_frame(&body) {
+        let mut wire: Arc<[u8]> = match control_protocol::encode_frame(&body) {
             Ok(frame) => frame.into(),
             Err(error) => {
                 warn!(target: "acp.runner", %error, "dropping unrepresentable control frame");
@@ -632,6 +767,8 @@ impl RunnerShared {
         };
         loop {
             let space = self.control_space.notified();
+            tokio::pin!(space);
+            space.as_mut().enable();
             {
                 let mut channel = self.control.lock().await;
                 if let DeliveryScope::Attachment(attachment_id) = scope {
@@ -639,11 +776,34 @@ impl RunnerShared {
                         return false;
                     }
                 }
+                let native = self.native_channel.lock().expect("native channel lock");
+                if let Some(cause) = native.loss {
+                    if publication == NativePublication::Work {
+                        return false;
+                    }
+                    if let ControlBody::SessionReady { native_channel, .. } = &mut body {
+                        let unavailable = NativeChannelAvailability::Unavailable { cause };
+                        if *native_channel != unavailable {
+                            *native_channel = unavailable;
+                            drop(native);
+                            drop(channel);
+                            // Only a concurrent loss changes an already encoded
+                            // receipt. Do not serialize a large result under the
+                            // synchronous admission lock.
+                            wire = match control_protocol::encode_frame(&body) {
+                                Ok(frame) => frame.into(),
+                                Err(_) => return false,
+                            };
+                            continue;
+                        }
+                    }
+                }
                 if channel.make_room(wire.len()) {
                     channel.push(scope, kind, Arc::clone(&wire));
                     if announces_session {
                         channel.session_announced = true;
                     }
+                    drop(native);
                     #[cfg(debug_assertions)]
                     if kind == QueuedKind::PromptCompleted {
                         if let Some(path) = std::env::var_os("AOE_E2E_PROMPT_COMPLETED_FILE") {
@@ -671,17 +831,33 @@ impl RunnerShared {
         attachment_id: u64,
         frame: ControlBody,
         established: bool,
+        before_loss: bool,
     ) {
         let scope = DeliveryScope::Attachment(attachment_id);
-        if self.enqueue(scope, QueuedKind::Handshake, frame).await && established {
+        let publication = if before_loss {
+            NativePublication::Dispatch
+        } else if matches!(
+            &frame,
+            ControlBody::Initialized { .. } | ControlBody::SessionReady { .. }
+        ) {
+            NativePublication::CachedReceipt
+        } else {
+            NativePublication::Work
+        };
+        if self
+            .enqueue_native(scope, QueuedKind::Handshake, frame, publication)
+            .await
+            && established
+        {
             let marker = SessionReplayed::default();
-            self.enqueue(
+            self.enqueue_native(
                 scope,
                 QueuedKind::SessionReplayed,
                 ControlBody::Notify {
                     method: marker.method().into(),
                     params: serde_json::json!({}),
                 },
+                publication,
             )
             .await;
         }
@@ -702,10 +878,6 @@ impl RunnerShared {
         self.control.lock().await.last_prompt_completion.clone()
     }
 
-    pub(super) async fn clear_prompt_completion(&self) {
-        self.control.lock().await.last_prompt_completion = None;
-    }
-
     pub(super) async fn install_control(
         &self,
         out: &mut Option<tokio::net::unix::OwnedWriteHalf>,
@@ -723,22 +895,56 @@ impl RunnerShared {
         if channel.active_attachment != Some(attachment_id) || channel.in_flight.is_some() {
             return None;
         }
-        // Handshake frames go first, and Persistent frames wait for SessionReady, so the
-        // daemon never buffers unbounded pre-identity session updates.
-        let announced = channel.session_announced;
-        let index = channel
-            .queue
-            .iter()
-            .position(|frame| frame.kind == QueuedKind::Handshake)
-            .or_else(|| {
-                channel.queue.iter().position(|frame| {
-                    announced || !matches!(frame.scope, DeliveryScope::Persistent)
-                })
-            })?;
-        let (id, wire) = {
-            let frame = channel.queue.get(index)?;
-            (frame.id, Arc::clone(&frame.wire))
+        let (loss, dispatching) = {
+            let native = self.native_channel.lock().expect("native channel lock");
+            (native.loss, native.dispatching)
         };
+        let selected = if let Some(cause) = loss {
+            if !dispatching && channel.native_loss.is_none() {
+                let cached_session = self.handshake.lock().await.session.is_some();
+                let wire: Arc<[u8]> =
+                    control_protocol::encode_frame(&ControlBody::NativeChannelLost {
+                        cause,
+                        cached_session,
+                    })
+                    .expect("bounded native loss frame serializes")
+                    .into();
+                assert!(wire.len() <= control_protocol::MAX_NATIVE_LOSS_FRAME_BYTES);
+                let id = channel.next_entry_id;
+                channel.next_entry_id = id.wrapping_add(1);
+                channel.native_loss = Some(QueuedControl {
+                    id,
+                    scope: DeliveryScope::Persistent,
+                    kind: QueuedKind::NativeLoss,
+                    wire,
+                });
+            }
+            // Management replies retain their routing priority. Buffered native
+            // updates still drain before loss, without requiring SessionReady.
+            channel
+                .queue
+                .iter()
+                .find(|frame| frame.kind == QueuedKind::Handshake)
+                .or_else(|| channel.queue.front())
+                .or_else(|| {
+                    (!dispatching && channel.native_loss_delivered != Some(attachment_id))
+                        .then_some(channel.native_loss.as_ref())
+                        .flatten()
+                })
+        } else {
+            let announced = channel.session_announced;
+            channel
+                .queue
+                .iter()
+                .find(|frame| frame.kind == QueuedKind::Handshake)
+                .or_else(|| {
+                    channel.queue.iter().find(|frame| {
+                        announced || !matches!(frame.scope, DeliveryScope::Persistent)
+                    })
+                })
+        };
+        let frame = selected?;
+        let (id, wire) = (frame.id, Arc::clone(&frame.wire));
         channel.in_flight = Some(id);
         Some((id, wire))
     }
@@ -746,6 +952,13 @@ impl RunnerShared {
     pub(super) async fn commit_outbound(&self, attachment_id: u64, entry_id: u64) {
         let mut channel = self.control.lock().await;
         if channel.active_attachment == Some(attachment_id) && channel.in_flight == Some(entry_id) {
+            if channel
+                .native_loss
+                .as_ref()
+                .is_some_and(|frame| frame.id == entry_id)
+            {
+                channel.native_loss_delivered = Some(attachment_id);
+            }
             if let Some(index) = channel.queue.iter().position(|frame| frame.id == entry_id) {
                 if channel.queue[index].kind == QueuedKind::PromptCompleted {
                     channel.last_prompt_completion = Some(Arc::clone(&channel.queue[index].wire));
@@ -771,13 +984,51 @@ impl RunnerShared {
         agent_stdin: &Mutex<tokio::process::ChildStdin>,
         value: &serde_json::Value,
     ) -> bool {
+        if self.native_loss().is_some() {
+            return false;
+        }
         let mut bytes = match serde_json::to_vec(value) {
-            Ok(b) => b,
-            Err(_) => return false,
+            Ok(bytes) => bytes,
+            _ => return false,
         };
         bytes.push(b'\n');
-        let mut stdin = agent_stdin.lock().await;
-        stdin.write_all(&bytes).await.is_ok() && stdin.flush().await.is_ok()
+        let mut stdin = tokio::select! {
+            biased;
+            _ = self.wait_native_loss() => return false,
+            stdin = agent_stdin.lock() => stdin,
+        };
+        let write = async {
+            stdin.write_all(&bytes).await?;
+            stdin.flush().await
+        };
+        tokio::pin!(write);
+        // Polling native I/O and closing admission share one short synchronous
+        // gate. No guard survives Pending/await, and accepted prefixes are never
+        // retried after loss.
+        let guarded = std::future::poll_fn(|cx| {
+            let mut native = self.native_channel.lock().expect("native channel lock");
+            if native.loss.is_some() {
+                return std::task::Poll::Ready(false);
+            }
+            match std::future::Future::poll(write.as_mut(), cx) {
+                std::task::Poll::Pending => std::task::Poll::Pending,
+                std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(true),
+                std::task::Poll::Ready(Err(_)) => {
+                    native.loss = Some(NativeChannelLossCause::WriteFailed);
+                    drop(native);
+                    self.native_changed.notify_waiters();
+                    self.reset_finished.notify_waiters();
+                    self.control_space.notify_waiters();
+                    self.control_wake.notify_one();
+                    std::task::Poll::Ready(false)
+                }
+            }
+        });
+        tokio::select! {
+            biased;
+            _ = self.wait_native_loss() => false,
+            written = guarded => written,
+        }
     }
 
     pub(super) async fn agent_request(
@@ -787,20 +1038,41 @@ impl RunnerShared {
         params: serde_json::Value,
         dispatch_release: &mut Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Option<serde_json::Value> {
-        let id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending_client_responses.lock().await.insert(id, tx);
+        let (id, rx) = {
+            let mut pending = self.pending_client_responses.lock().await;
+            let native = self.native_channel.lock().expect("native channel lock");
+            if native.loss.is_some() {
+                return None;
+            }
+            let id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            pending.insert(id, tx);
+            (id, rx)
+        };
         if !self
             .write_agent_line(agent_stdin, &rpc_request(id, method, params))
             .await
+            && self
+                .pending_client_responses
+                .lock()
+                .await
+                .remove(&id)
+                .is_some()
         {
-            self.pending_client_responses.lock().await.remove(&id);
             return None;
         }
+        let response = tokio::select! {
+            biased;
+            response = rx => response.ok()?,
+            _ = async {
+                self.wait_native_loss().await;
+                self.wait_native_dispatch().await;
+            } => return None,
+        };
         let HandshakeResponse {
             value: response,
             release,
-        } = rx.await.ok()?;
+        } = response;
         *dispatch_release = Some(release);
         Some(response)
     }
@@ -811,7 +1083,13 @@ impl RunnerShared {
         attachment_id: u64,
         params: serde_json::Value,
     ) -> Option<i64> {
-        let id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
+        let id = {
+            let native = self.native_channel.lock().expect("native channel lock");
+            if native.loss.is_some() {
+                return None;
+            }
+            self.next_req_id.fetch_add(1, Ordering::Relaxed)
+        };
         if !self
             .enqueue(
                 DeliveryScope::Attachment(attachment_id),
@@ -822,8 +1100,17 @@ impl RunnerShared {
         {
             return None;
         }
-        self.clear_prompt_completion().await;
-        self.prompt_requests.lock().await.insert(id);
+        {
+            let mut channel = self.control.lock().await;
+            let mut prompts = self.prompt_requests.lock().await;
+            let native = self.native_channel.lock().expect("native channel lock");
+            if native.loss.is_some() {
+                return None;
+            }
+            channel.last_prompt_completion = None;
+            prompts.insert(id);
+        }
+        self.control_space.notify_waiters();
         if !self
             .write_agent_line(agent_stdin, &rpc_request(id, PROMPT_METHOD, params))
             .await
@@ -859,6 +1146,9 @@ impl RunnerShared {
         if let Some(cached) = self.handshake.lock().await.initialized.clone() {
             return Ok(cached);
         }
+        if self.native_loss().is_some() {
+            return Err(transport_error("native channel unavailable"));
+        }
         let response = self
             .agent_request(agent_stdin, "initialize", request, dispatch_release)
             .await
@@ -878,6 +1168,9 @@ impl RunnerShared {
         let _gate = self.handshake_gate.lock().await;
         if let Some(cached) = self.handshake.lock().await.session.clone() {
             return Ok(cached);
+        }
+        if self.native_loss().is_some() {
+            return Err(transport_error("native channel unavailable"));
         }
         let response = self
             .agent_request(agent_stdin, method, request.clone(), dispatch_release)
@@ -904,6 +1197,17 @@ impl RunnerShared {
     ) -> Result<(String, serde_json::Value), serde_json::Value> {
         loop {
             let finished = self.reset_finished.notified();
+            tokio::pin!(finished);
+            finished.as_mut().enable();
+            if self.native_loss().is_some() {
+                return self
+                    .handshake
+                    .lock()
+                    .await
+                    .session
+                    .clone()
+                    .ok_or_else(|| transport_error("native channel unavailable"));
+            }
             if self.pending_resets.load(Ordering::Acquire) == 0 {
                 if self.fatal.load(Ordering::Acquire) {
                     return Err(transport_error(
@@ -938,19 +1242,27 @@ impl RunnerShared {
         method: &str,
         params: serde_json::Value,
     ) {
-        let req_id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
-        if method == "session/new" {
-            self.pending_resets.fetch_add(1, Ordering::AcqRel);
-            self.control_space.notify_waiters();
-        }
-        self.pending_agent_calls.lock().await.insert(
-            req_id,
-            PendingAgentCall {
-                call_id,
-                attachment_id,
-                method: method.to_string(),
-            },
-        );
+        let req_id = {
+            let mut pending = self.pending_agent_calls.lock().await;
+            let native = self.native_channel.lock().expect("native channel lock");
+            if native.loss.is_some() {
+                return;
+            }
+            let req_id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
+            if method == "session/new" {
+                self.pending_resets.fetch_add(1, Ordering::AcqRel);
+                self.control_space.notify_waiters();
+            }
+            pending.insert(
+                req_id,
+                PendingAgentCall {
+                    call_id,
+                    attachment_id,
+                    method: method.to_string(),
+                },
+            );
+            req_id
+        };
         if !self
             .write_agent_line(agent_stdin, &rpc_request(req_id, method, params))
             .await
@@ -961,6 +1273,9 @@ impl RunnerShared {
                 }
             } else {
                 return; // The agent already answered while the write was finishing.
+            }
+            if self.native_loss().is_some() {
+                return;
             }
             self.enqueue(
                 DeliveryScope::Attachment(attachment_id),
@@ -1486,8 +1801,10 @@ mod tests {
             QueuedKind::PromptCompleted,
             wire(16),
         );
+        let budget = control_protocol::MAX_CONTROL_QUEUE_BYTES
+            - control_protocol::MAX_NATIVE_LOSS_FRAME_BYTES;
 
-        assert!(channel.make_room(control_protocol::MAX_CONTROL_QUEUE_BYTES - 32));
+        assert!(channel.make_room(budget - 32));
         assert_eq!(channel.queued_bytes, 32);
         assert_eq!(channel.queue.len(), 2);
         assert!(channel
@@ -1495,9 +1812,190 @@ mod tests {
             .iter()
             .all(|frame| frame.kind != QueuedKind::Notify));
         assert!(
-            !channel.make_room(control_protocol::MAX_CONTROL_QUEUE_BYTES - 31),
+            !channel.make_room(budget - 31),
             "correlation frames must apply backpressure rather than be evicted"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn retained_large_completion_and_later_backlog_fit_the_actual_consumer() {
+        use crate::acp::acp_client::AcpClient;
+        use crate::acp::state::AcpSessionId;
+        use crate::acp::Event;
+        use crate::process::{worker, worker_registry};
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("retained-bytes.sock");
+        let mut record = worker_registry::WorkerRecord::new(
+            "retained-bytes".into(),
+            std::process::id(),
+            socket.clone(),
+            "fixture".into(),
+            "codex".into(),
+            temp.path().into(),
+            None,
+            vec![],
+            vec![],
+            Some("same-native".into()),
+            None,
+        );
+        record.control_protocol_version = Some(control_protocol::CONTROL_PROTOCOL_VERSION);
+        worker_registry::save(&record).unwrap();
+        let listener =
+            tokio::net::UnixListener::bind(worker::control_socket_sibling(&socket)).unwrap();
+        let (shared, stdin, _child) = shared_with_stdin().await;
+        {
+            let mut handshake = shared.handshake.lock().await;
+            handshake.initialized =
+                Some(serde_json::json!({"protocolVersion":1,"agentCapabilities":{}}));
+            handshake.session = Some(("same-native".into(), serde_json::json!({})));
+        }
+        let first = shared.begin_attachment().await;
+        shared
+            .enqueue_handshake(
+                first,
+                ControlBody::SessionReady {
+                    acp_session_id: "same-native".into(),
+                    result: serde_json::json!({}),
+                    native_channel: NativeChannelAvailability::Available,
+                },
+                true,
+                false,
+            )
+            .await;
+        assert!(
+            shared
+                .enqueue(
+                    DeliveryScope::Persistent,
+                    QueuedKind::PromptCompleted,
+                    ControlBody::PromptCompleted {
+                        prompt_req_id: 7,
+                        outcome: PromptOutcome::Error {
+                            code: -32603,
+                            message: "cached request failed".into(),
+                            data: Some(
+                                serde_json::json!({"privateTokenMarker":"x".repeat(64 * 1024)})
+                            ),
+                        },
+                    },
+                )
+                .await
+        );
+        while let Some((id, _)) = shared.next_outbound(first).await {
+            shared.commit_outbound(first, id).await;
+        }
+        let retained = shared.cached_prompt_completion().await.unwrap();
+        assert!(retained.len() > 16 * 1024);
+
+        let notification = |bytes: usize| {
+            let mut body = ControlBody::Notify {
+                method: "session/update".into(),
+                params: serde_json::json!({"sessionId":"same-native","update":{
+                    "sessionUpdate":"tool_call","toolCallId":"later","title":"later update"
+                },"_meta":{"pad":""}}),
+            };
+            let overhead = control_protocol::encode_frame(&body).unwrap().len();
+            if let ControlBody::Notify { params, .. } = &mut body {
+                params["_meta"]["pad"] = serde_json::Value::String("x".repeat(bytes - overhead));
+            }
+            Arc::<[u8]>::from(control_protocol::encode_frame(&body).unwrap())
+        };
+        let wire = notification(1024 * 1024);
+        let expected_updates = {
+            let mut channel = shared.control.lock().await;
+            for _ in 0..127 {
+                assert!(channel.make_room(wire.len()));
+                channel.push(
+                    DeliveryScope::Persistent,
+                    QueuedKind::Notify,
+                    Arc::clone(&wire),
+                );
+            }
+            // Traffic that fit the former fixed 16KiB reservation exceeds the
+            // contract once this genuinely larger retained completion is counted.
+            let tail_bytes = control_protocol::MAX_CONTROL_QUEUE_BYTES
+                - control_protocol::MAX_NATIVE_LOSS_FRAME_BYTES
+                - 16 * 1024
+                - channel.queued_bytes;
+            let tail = notification(tail_bytes);
+            assert!(channel.make_room(tail.len()));
+            channel.push(DeliveryScope::Persistent, QueuedKind::Notify, tail);
+            assert!(
+                channel.queued_bytes
+                    + retained.len()
+                    + control_protocol::MAX_NATIVE_LOSS_FRAME_BYTES
+                    <= control_protocol::MAX_CONTROL_QUEUE_BYTES
+            );
+            assert_eq!(
+                channel.queue.len(),
+                127,
+                "later traffic sheds a notification, never the completion"
+            );
+            channel.queue.len()
+        };
+        let runner_shared = Arc::clone(&shared);
+        let runner = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            super::super::connection::handle_control_connection(
+                stream,
+                runner_shared,
+                Arc::new(stdin),
+                "retained-bytes".into(),
+            )
+            .await;
+        };
+        let daemon = async {
+            let mut client = AcpClient::attach(
+                socket,
+                temp.path().into(),
+                vec![],
+                "same-native".into(),
+                true,
+                AcpSessionId("retained-bytes".into()),
+                None,
+                "codex".into(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("the producer's own retained replay must be accepted");
+            let mut updates = 0;
+            let mut diagnostics = 0;
+            let mut stopped = 0;
+            while updates < expected_updates || diagnostics == 0 || stopped == 0 {
+                let event = client
+                    .next_event()
+                    .await
+                    .expect("retained runner remains attached");
+                assert!(!serde_json::to_string(&event)
+                    .unwrap()
+                    .contains("privateTokenMarker"));
+                match event {
+                    Event::ToolCallStarted { .. } => updates += 1,
+                    Event::PromptRuntimeError { .. } => diagnostics += 1,
+                    Event::Stopped { reason } => {
+                        assert_eq!(reason, "prompt_failed");
+                        stopped += 1;
+                    }
+                    Event::AgentStartupError { message, .. } => panic!("{message}"),
+                    Event::AcpConnectionUnavailable { .. } => {
+                        panic!("bounded replay lost the native channel")
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!((diagnostics, stopped), (1, 1));
+            client.shutdown().await.unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(120), async {
+            tokio::join!(runner, daemon);
+        })
+        .await
+        .expect("retained replay consumer completes");
     }
 
     /// The replay barrier follows the updates an agent sent before its session reply,
@@ -1515,9 +2013,10 @@ mod tests {
         let ready = ControlBody::SessionReady {
             acp_session_id: "s".into(),
             result: serde_json::json!({}),
+            native_channel: crate::acp::control_protocol::NativeChannelAvailability::Available,
         };
         shared
-            .enqueue_handshake(attachment, ready.clone(), true)
+            .enqueue_handshake(attachment, ready.clone(), true, false)
             .await;
 
         let mut sent = Vec::new();

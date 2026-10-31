@@ -2,6 +2,7 @@
 //! stop/start/snooze/unread endpoints.
 
 use super::*;
+use crate::session::SessionStore;
 
 pub async fn update_session_pin(
     State(state): State<Arc<AppState>>,
@@ -547,6 +548,101 @@ pub async fn touch_session_access(
     {
         return response;
     }
+    drop(guard);
+    drop(submission);
+    drop(namespace);
+    crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
+}
+
+/// Completion bookkeeping is not another explicit Access/wake gesture.
+pub async fn touch_session_input_recency(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<crate::daemon::InputRecencyBody>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return crate::server::api::read_only_response();
+    }
+    let namespace = state.profile_namespace.read().await;
+    if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let Some(submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return crate::server::api::session_not_found();
+    };
+    let lock = state.instance_lock(&id).await;
+    let guard = lock.lock().await;
+    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
+        return response;
+    }
+    let current = {
+        let rows = state.instances.read().await;
+        let Some(row) = rows.iter().find(|row| row.id == id) else {
+            return crate::server::api::session_not_found();
+        };
+        row.created_at == body.created_at
+            && row.lifecycle_generation == body.lifecycle_generation
+            && row.source_profile == body.profile
+    };
+    if current {
+        let persist_id = id.clone();
+        let worker_state = state.clone();
+        let persisted = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            use crate::session::SessionStore;
+            let native = crate::server::session_store::NativeSessionStore::open(
+                worker_state,
+                &body.profile,
+                None,
+            )?;
+            if body.profile_identity.is_none()
+                || body.profile_identity != Some(native.storage().bound_profile_identity()?)
+            {
+                return Ok(());
+            }
+            (&native as &dyn SessionStore).update(|rows, _| {
+                let row = rows
+                    .iter_mut()
+                    .find(|row| {
+                        row.id == persist_id
+                            && row.created_at == body.created_at
+                            && row.lifecycle_generation == body.lifecycle_generation
+                    })
+                    .ok_or(crate::session::LifecycleReservationError::Superseded)?;
+                row.last_accessed_at = Some(chrono::Utc::now());
+                Ok(())
+            })
+        })
+        .await;
+        match persisted {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if error.is::<crate::session::SessionCommitApplied>() => {
+                return api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "outcome_unconfirmed",
+                    "The recency update committed, but runtime publication is unconfirmed.",
+                );
+            }
+            Ok(Err(error))
+                if error.downcast_ref::<crate::session::LifecycleReservationError>()
+                    == Some(&crate::session::LifecycleReservationError::Superseded) => {}
+            Ok(Err(error)) if error.is::<crate::session::NativeStoreUnavailable>() => {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(target: "session.store", %error, "native input recency commit failed");
+                return persist_failed_response();
+            }
+            Err(error) => {
+                tracing::warn!(target: "session.store", %error, "native input recency worker failed");
+                return persist_failed_response();
+            }
+        }
+    }
+    // Superseded completion is a deliberate no-op, not permission to wake the replacement.
     drop(guard);
     drop(submission);
     drop(namespace);
@@ -1137,6 +1233,9 @@ pub(crate) fn lifecycle_rejection(
     state: &AppState,
     error: &anyhow::Error,
 ) -> Option<axum::response::Response> {
+    if let Some(cause) = error.downcast_ref::<crate::session::LaunchIndeterminateCause>() {
+        return Some(super::ensure::indeterminate_launch_response(*cause));
+    }
     match error.downcast_ref::<LifecycleTargetError>() {
         Some(LifecycleTargetError::Missing) => {
             return Some(if state.cityhall_mode {
@@ -1317,12 +1416,46 @@ fn commit_structured_user_stop(
     let _lifecycle = native.storage().acquire_instance_lifecycle_lock(id)?;
     // Capture after the birth flock: a child born before this fence is ours to settle.
     let target = state.acp_supervisor.capture_retirement(id)?;
+    // The original producer can have persisted its binding before the async
+    // listener obtains instance exclusion. Preserve that qualified observation
+    // while we still own its native incarnation, before Stop supersedes it.
+    let through = state.acp_event_store.highest_seq_checked(id)?;
+    let observed = state
+        .acp_event_store
+        .handoff_context_event(id, 0, through)?;
     let mut generation = None;
     let publication = match (&native as &dyn SessionStore).update(|rows, _| {
         let row = rows
             .iter_mut()
             .find(|row| row.id == id)
             .ok_or(crate::session::SessionGone)?;
+        if let Some((_, event @ crate::acp::Event::AcpSessionAssigned { .. })) = &observed {
+            let context = crate::acp::state::NativeEventContext::capture(row, native.storage())?;
+            let captured_scope = target
+                .lease
+                .as_ref()
+                .and_then(|lease| lease.native_scope().ok().flatten());
+            if event.native_subject().is_some_and(|subject| {
+                subject.context == context
+                    && subject.owner == target.identity
+                    && captured_scope
+                        .as_ref()
+                        .is_some_and(|scope| scope.context == context)
+                    && matches!(
+                        subject.kind,
+                        crate::acp::state::NativeSubjectEvent::BindingObserved
+                            | crate::acp::state::NativeSubjectEvent::ChannelReady
+                    )
+            }) {
+                let change = crate::server::acp_events::derive_acp_session_change(event);
+                crate::server::acp_events::apply_acp_session_change(
+                    row,
+                    id,
+                    change.as_ref(),
+                    false,
+                );
+            }
+        }
         generation = Some(reserve_structured_user_stop(row)?);
         Ok(())
     }) {
@@ -2017,6 +2150,7 @@ fn admit_restart(
     row.idle_dormant_since = None;
     row.idle_entered_at = None;
     row.last_error = None;
+    row.last_error_evidence = None;
     row.last_error_check = None;
     row.status = Status::Starting;
     Ok(())
@@ -2230,11 +2364,7 @@ async fn finish_structured_restart(
             agent,
             started.sandbox_info.clone(),
         );
-        request.launch_admission = Some(crate::acp::supervisor::LaunchAdmission {
-            store: native.clone(),
-            generation,
-            namespace: Some(state.profile_namespace.clone()),
-        });
+        request.launch_admission = Some(crate::acp::supervisor::LaunchAdmission { store: native.clone(), generation, namespace: Some(state.profile_namespace.clone()), native_scope: None });
         let profile = started.source_profile.clone();
         drop(guard);
         drop(submission);
@@ -2270,10 +2400,9 @@ async fn finish_structured_restart(
                         .prompt_dispatch_under_submission(&id, &wake, false, true)
                         .await;
                     if matches
-                        && !matches!(
-                            dispatch,
-                            crate::acp::dispatch::PromptDispatch::Queued { .. }
-                        )
+                        && matches!(dispatch,
+                            crate::acp::dispatch::PromptDispatch::Sent
+                                | crate::acp::dispatch::PromptDispatch::Steered)
                     {
                         let result = state
                             .session_service
@@ -2582,6 +2711,26 @@ async fn prepare_agent_session_inner(
         .then_some(instance.lifecycle_generation)
         .or(expected_generation);
     let worker_restart = restart.clone();
+    // This is an owned reference, not a lock; keep its directory pinned through hooks/waits.
+    let (_preparation_source, preparation_identity) = match (|| -> anyhow::Result<_> {
+        if preparation == AgentPreparation::Ensure && body.expected.is_none() {
+            let source = crate::session::Storage::open_reference(&instance.source_profile)?;
+            let expected = crate::daemon::NativePreparationIdentity::from_instance(
+                &instance,
+                source.bound_profile_identity()?,
+            );
+            Ok((Some(source), Some(expected)))
+        } else {
+            Ok((None, body.expected))
+        }
+    })() {
+        Ok(captured) => captured,
+        Err(error) => {
+            tracing::warn!(target: "http.api.sessions", session = %id, %error,
+                "native preparation profile scope unavailable");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
     let worker_state = state.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         use crate::session::SessionStore;
@@ -2589,9 +2738,15 @@ async fn prepare_agent_session_inner(
         let mut native = crate::server::session_store::NativeSessionStore::open(
             worker_state.clone(),
             &profile,
-            Some(instance.id.clone()),
+            (preparation != AgentPreparation::Ensure).then(|| instance.id.clone()),
         )?;
         native.configuration(Some(&profile))?;
+        anyhow::ensure!(
+            preparation_identity
+                .as_ref()
+                .is_none_or(|expected| expected.matches_source(native.storage())),
+            crate::session::LifecycleReservationError::Superseded
+        );
         let identity = worker_restart
             .as_ref()
             .map(|_| crate::session::acquire_session_identity_lock())
@@ -2676,6 +2831,8 @@ async fn prepare_agent_session_inner(
                 outgoing.capture_before_restart_in(&native)?;
             }
         }
+        let mut start_admission = None;
+        let mut ready_target = None;
         let mut started = if let (Some(body), Some(target_native)) =
             (&worker_restart, target_native)
         {
@@ -2714,6 +2871,12 @@ async fn prepare_agent_session_inner(
                     .iter_mut()
                     .find(|row| row.id == instance.id)
                     .ok_or(LifecycleTargetError::Missing)?;
+                anyhow::ensure!(
+                    preparation_identity
+                        .as_ref()
+                        .is_none_or(|expected| expected.matches(row)),
+                    crate::session::LifecycleReservationError::Superseded
+                );
                 if worker_state.cityhall_mode && !row.is_structured() {
                     return Err(LifecycleTargetError::CityHall.into());
                 }
@@ -2740,16 +2903,40 @@ async fn prepare_agent_session_inner(
                 {
                     return Err(LifecycleTargetError::Busy.into());
                 }
-                if preparation == AgentPreparation::Ensure {
+                if row.is_structured() {
                     anyhow::ensure!(
-                        !row.is_structured(),
+                        preparation != AgentPreparation::Ensure,
                         "Structured sessions have no agent pane"
                     );
-                    if super::ensure::ready_agent_session(row)?.is_some() {
+                    if row.status != Status::Stopped {
                         return Ok(None);
                     }
-                } else if row.status != Status::Stopped {
-                    return Ok(None);
+                } else {
+                    let Some(admission) = row.admit_native_start()? else {
+                        if preparation == AgentPreparation::Ensure {
+                            let (name, physical) = super::ensure::physical_agent_target(row)?
+                                .ok_or(crate::session::NativeInputError::Ownership)?;
+                            ready_target = Some((
+                                row.created_at,
+                                row.title.clone(),
+                                crate::daemon::TerminalTarget {
+                                    tmux_session: name,
+                                    physical: Some(physical),
+                                    lifecycle_generation: row.lifecycle_generation,
+                                    profile: row.source_profile.clone(),
+                                    status: crate::daemon::TerminalTargetStatus::Alive,
+                                },
+                            ));
+                        }
+                        return Ok(None);
+                    };
+                    anyhow::ensure!(
+                        preparation_identity.as_ref().is_none_or(|expected| {
+                            expected.selection.as_ref() == Some(admission.selection())
+                        }),
+                        crate::session::LifecycleReservationError::Superseded
+                    );
+                    start_admission = Some(admission);
                 }
                 let generation = row.try_acquire_lifecycle_reservation(
                     LifecycleOperation::Launch,
@@ -2758,8 +2945,9 @@ async fn prepare_agent_session_inner(
                 )?;
                 row.idle_dormant_since = None;
                 row.idle_entered_at = None;
-                row.last_error = None;
                 if row.is_structured() {
+                    row.last_error = None;
+                    row.last_error_evidence = None;
                     row.status = Status::Idle;
                     row.release_lifecycle_reservation_if_owned(
                         LifecycleOperation::Launch,
@@ -2772,7 +2960,29 @@ async fn prepare_agent_session_inner(
             })?
         };
         let Some(mut started) = started.take() else {
-            return Ok(None);
+            let prepared = if let Some((created_at, title, target)) = ready_target {
+                // A fresh live observation is not yet in the runtime-only projection.
+                // Adopt that exact observation before publishing its receipt.
+                let mut owner = instance;
+                owner.title = title;
+                native.adopt_agent_observation(
+                    &owner,
+                    crate::session::PaneObservation {
+                        state: crate::session::PanePresence::Alive,
+                        tmux_session: Some(target.tmux_session.clone()),
+                        physical: target.physical.clone(),
+                        legacy_tool: None,
+                    },
+                )?;
+                Some(super::ensure::PreparedAgentTarget {
+                    created_at,
+                    target,
+                    native,
+                })
+            } else {
+                None
+            };
+            return Ok((None, prepared));
         };
         started.source_profile = native.storage().profile().to_owned();
         started.file_watch = Some(worker_state.file_watch.clone());
@@ -2789,7 +2999,7 @@ async fn prepare_agent_session_inner(
         }
         let generation = started.prepare_reserved_launch_hooks(
             store,
-            worker_restart.is_none(),
+            preparation == AgentPreparation::Restart && worker_restart.is_none(),
             crate::session::LaunchReservation {
                 generation: started.lifecycle_generation,
                 title_lock,
@@ -2797,16 +3007,32 @@ async fn prepare_agent_session_inner(
             },
         )?;
         drop(identity);
-        Ok(Some((generation, started, native, conversation_carry)))
+        Ok((
+            Some((
+                generation,
+                started,
+                native,
+                conversation_carry,
+                start_admission,
+            )),
+            None,
+        ))
     })
     .await;
+    let mut prepared_target = None;
+    let result = result.map(|result| {
+        result.map(|(started, target)| {
+            prepared_target = target;
+            started
+        })
+    });
     drop(guard);
     drop(submission);
     drop(namespace);
     let reason = restart_reason(restart_origin, restart.as_deref());
     let requested_wake_message = restart.as_ref().and_then(|body| body.wake_message.clone());
     let hooked = match result {
-        Ok(Ok(Some((generation, mut started, native, conversation_carry)))) => {
+        Ok(Ok(Some((generation, mut started, native, conversation_carry, start_admission)))) => {
             tokio::task::spawn_blocking(move || {
                 let _timeout = restart.as_ref().filter(|body| body.bound_hooks).map(|_| {
                     crate::session::recovery::HookTimeoutScope::new(
@@ -2824,6 +3050,7 @@ async fn prepare_agent_session_inner(
                     native,
                     hooks,
                     conversation_carry,
+                    start_admission,
                 )))
             })
             .await
@@ -2833,7 +3060,7 @@ async fn prepare_agent_session_inner(
         Err(error) => Err(error),
     };
     let hooked = match hooked {
-        Ok(Ok(Some((generation, started, native, hooks, carry)))) if started.is_structured() => {
+        Ok(Ok(Some((generation, started, native, hooks, carry, _)))) if started.is_structured() => {
             return finish_structured_restart(
                 &state,
                 &id,
@@ -2858,8 +3085,16 @@ async fn prepare_agent_session_inner(
         .await;
     let guard = lock.lock().await;
     let mut restart_identity = None;
+    let adoption_state = state.clone();
     let result = match hooked {
-        Ok(Ok(Some((generation, mut started, native, hooks, conversation_carry)))) => {
+        Ok(Ok(Some((
+            generation,
+            mut started,
+            native,
+            hooks,
+            conversation_carry,
+            start_admission,
+        )))) => {
             tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                 use crate::session::SessionStore;
                 let outcome = started.finish_reserved_launch(
@@ -2871,14 +3106,34 @@ async fn prepare_agent_session_inner(
                         } else {
                             crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting
                         },
-                        restart: true,
+                        restart: preparation == AgentPreparation::Restart,
                         conversation_carry,
+                        start_admission,
                     },
                     generation,
                     hooks,
                 );
-                let title = crate::session::acquire_session_title_lock(&started.id)?;
-                let lifecycle = native.storage().acquire_instance_lifecycle_lock(&started.id)?;
+                let born_at = started.created_at;
+                let born_pane = std::mem::take(&mut started.agent_pane);
+                #[cfg(test)]
+                tokio::runtime::Handle::current().block_on(
+                    super::tests::terminal_custody::pause(
+                        &started.id, super::tests::terminal_custody::Boundary::LaunchFinished,
+                    ),
+                );
+                let _title = crate::session::acquire_session_title_lock(&started.id)?;
+                let _lifecycle = native.storage().acquire_instance_lifecycle_lock(&started.id)?;
+                // The launch released its exclusions on return. A CLI peer may
+                // have replaced it without the daemon cache observing that write.
+                let durable = native.load()?.into_iter()
+                    .find(|row| row.id == started.id)
+                    .ok_or(crate::session::LifecycleReservationError::Superseded)?;
+                anyhow::ensure!(
+                    durable.created_at == born_at
+                        && durable.lifecycle_generation == generation
+                        && durable.source_profile == started.source_profile,
+                    crate::session::LifecycleReservationError::Superseded
+                );
                 let panes = match crate::tmux::batch_pane_metadata() {
                     Ok(panes) => Some(panes),
                     Err(error) => {
@@ -2886,7 +3141,42 @@ async fn prepare_agent_session_inner(
                         None
                     }
                 };
-                Ok(Some((generation, started, outcome, (title, lifecycle), panes)))
+                native.check_available()?;
+                let _publication = adoption_state.publication.blocking_write();
+                let metadata = adoption_state.canonical_metadata.blocking_read();
+                let mut instances = adoption_state.instances.blocking_write();
+                let legacy_scope = crate::server::pane::legacy_tool_scope_for_panes(
+                    &instances, &metadata.raw_tool_names, panes.as_ref(),
+                );
+                let row = instances.iter_mut().find(|row| {
+                    row.id == started.id
+                        && row.lifecycle_generation == generation
+                        && started.lifecycle_generation == generation
+                        && row.created_at == started.created_at
+                        && row.source_profile == started.source_profile
+                        && row.title == started.title
+                }).ok_or(crate::session::LifecycleReservationError::Superseded)?;
+                row.inherit_process_runtime(started);
+                let profile = row.source_profile.clone();
+                let tools = metadata.auxiliary_tools.get(&profile)
+                    .map(Vec::as_slice).unwrap_or_default();
+                crate::server::pane::sample_panes(
+                    row, tools, panes.as_ref(), legacy_scope.as_ref(), None,
+                );
+                // Current observations may update the view, but cannot mint an
+                // old operation's Created receipt for a different physical owner.
+                let prepared = super::ensure::PreparedAgentTarget::captured(
+                    born_at, generation, profile.clone(), born_pane,
+                    if preparation == AgentPreparation::Restart {
+                        crate::daemon::TerminalTargetStatus::Restarted
+                    } else {
+                        crate::daemon::TerminalTargetStatus::Created
+                    },
+                    native,
+                );
+                adoption_state.mutation_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                adoption_state.runtime.request_publish();
+                Ok(Some((generation, profile, outcome, prepared)))
             })
             .await
         }
@@ -2895,53 +3185,10 @@ async fn prepare_agent_session_inner(
         Err(error) => Err(error),
     };
     let outcome = match result {
-        Ok(Ok(Some((generation, started, outcome, ownership, panes)))) => {
-            let adopted = {
-                let _publication = state.publication.write().await;
-                let metadata = state.canonical_metadata.read().await;
-                let mut instances = state.instances.write().await;
-                let legacy_scope = crate::server::pane::legacy_tool_scope_for_panes(
-                    &instances,
-                    &metadata.raw_tool_names,
-                    panes.as_ref(),
-                );
-                match instances.iter_mut().find(|row| row.id == id) {
-                    Some(row)
-                        if row.lifecycle_generation == generation
-                            && started.lifecycle_generation == generation
-                            && row.source_profile == started.source_profile
-                            && row.title == started.title =>
-                    {
-                        row.inherit_process_runtime(started);
-                        restart_identity =
-                            Some((row.lifecycle_generation, row.source_profile.clone()));
-                        let tools = metadata
-                            .auxiliary_tools
-                            .get(&row.source_profile)
-                            .map(Vec::as_slice)
-                            .unwrap_or_default();
-                        crate::server::pane::sample_panes(
-                            row,
-                            tools,
-                            panes.as_ref(),
-                            legacy_scope.as_ref(),
-                            None,
-                        );
-                        state
-                            .mutation_epoch
-                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        state.runtime.request_publish();
-                        true
-                    }
-                    _ => false,
-                }
-            };
-            drop(ownership);
-            if adopted {
-                outcome.map(Some)
-            } else {
-                Err(crate::session::LifecycleReservationError::Superseded.into())
-            }
+        Ok(Ok(Some((generation, profile, outcome, prepared)))) => {
+            restart_identity = Some((generation, profile));
+            prepared_target = prepared;
+            outcome.map(Some)
         }
         Ok(Ok(None)) => Ok(None),
         Ok(Err(error)) => Err(error),
@@ -2986,6 +3233,18 @@ async fn prepare_agent_session_inner(
             }
             return response;
         }
+        Ok(Some(crate::session::StartOutcome::Indeterminate { cause })) => {
+            let response = super::ensure::indeterminate_launch_response(cause);
+            drop(guard);
+            drop(submission);
+            drop(namespace);
+            return match state.runtime.publish(&state).await {
+                Ok(snapshot) => {
+                    crate::server::runtime::mutation_response(&snapshot.value.cursor, response)
+                }
+                Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
+        }
         Ok(Some(crate::session::StartOutcome::ResumeFailed { sid })) => {
             let response = (StatusCode::CONFLICT, crate::daemon::ApiErrorCode::ResumeFailed.header(), Json(serde_json::json!({
                 "error": "resume_failed", "message": "Resume failed; preserved for explicit retry", "resume_session_id": sid,
@@ -3015,23 +3274,22 @@ async fn prepare_agent_session_inner(
         }) else {
             return StatusCode::CONFLICT.into_response();
         };
+        let mut wake_source = None;
         let target = if row.is_structured() {
             None
         } else {
-            let Some(name) = row
-                .agent_pane
-                .tmux_session
-                .as_ref()
-                .filter(|_| row.agent_pane.state == crate::session::PanePresence::Alive)
-            else {
+            let Some(prepared) = prepared_target.take().filter(|prepared| {
+                prepared.created_at == row.created_at
+                    && prepared.target.lifecycle_generation == generation
+                    && prepared.target.profile == profile
+                    && prepared.target.physical == row.agent_pane.physical
+                    && row.agent_pane.tmux_session.as_deref()
+                        == Some(prepared.target.tmux_session.as_str())
+            }) else {
                 return StatusCode::CONFLICT.into_response();
             };
-            Some(crate::daemon::TerminalTarget {
-                tmux_session: name.clone(),
-                status: crate::daemon::TerminalTargetStatus::Restarted,
-                lifecycle_generation: generation,
-                profile: profile.clone(),
-            })
+            wake_source = Some(prepared.native);
+            Some(prepared.target)
         };
         if matches!(
             outcome,
@@ -3044,13 +3302,10 @@ async fn prepare_agent_session_inner(
             let wake_message =
                 select_restart_wake_message(restart_origin, requested_wake_message, &profile);
             if !wake_message.is_empty() {
-                crate::session::restart::spawn_wake_worker(
-                    id.clone(),
-                    row.title.clone(),
-                    row.tool.clone(),
-                    wake_message,
-                    Some((profile.clone(), generation)),
-                );
+                let profile_identity = wake_source
+                    .as_ref()
+                    .and_then(|native| native.storage().bound_profile_identity().ok());
+                crate::session::restart::spawn_wake_worker(row, wake_message, profile_identity);
             }
         }
         drop(rows);
@@ -3067,7 +3322,15 @@ async fn prepare_agent_session_inner(
         .await;
     }
     if preparation == AgentPreparation::Ensure {
-        let response = super::ensure::agent_target_response(&state, &id, outcome).await;
+        #[cfg(test)]
+        super::tests::terminal_custody::pause(
+            &id,
+            super::tests::terminal_custody::Boundary::EnsureReceipt,
+        )
+        .await;
+        let response =
+            super::ensure::prepared_agent_target_response(&state, &id, outcome, prepared_target)
+                .await;
         if !response.status().is_success() && restart_identity.is_some() {
             match state.runtime.publish(&state).await {
                 Ok(snapshot) => {
@@ -3681,6 +3944,7 @@ mod durable_stop_tests {
                 store: Arc::new(Storage::open_unwatched("default").unwrap()),
                 generation: stored.lifecycle_generation,
                 namespace: None,
+                native_scope: None,
             };
             let mut child = crate::acp::supervisor::with_durable_launch(
                 Some(admission),

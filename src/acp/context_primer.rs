@@ -81,8 +81,8 @@ pub struct ContextPrimer {
     /// Older turns were dropped or the newest turn was cut to fit.
     pub truncated: bool,
     pub max_chars: usize,
-    /// The last prompt, when the session ended rate-limited or failed to
-    /// start before the agent processed it; it is left out of the transcript.
+    /// Retained last prompt when failure ended without an observed response.
+    /// This does not prove the native agent never received or processed it.
     pub unprocessed_prompt: Option<String>,
 }
 
@@ -198,10 +198,11 @@ fn fold_turns(events: &[(u64, Event)], before_seq: Option<u64>) -> Folded {
             }
             Event::Stopped { reason } => {
                 turns.extend(current.take());
-                ended_non_success =
-                    reason == "rate_limited" || reason == RATE_LIMIT_EXHAUSTED_RETRIES_REASON;
+                ended_non_success = reason == "rate_limited"
+                    || reason == RATE_LIMIT_EXHAUSTED_RETRIES_REASON
+                    || reason == "prompt_failed";
             }
-            Event::AgentStartupError { .. } => {
+            Event::AgentStartupError { .. } | Event::AcpConnectionUnavailable { .. } => {
                 turns.extend(current.take());
                 ended_non_success = true;
             }
@@ -225,7 +226,7 @@ pub fn build_context_primer(events: &[(u64, Event)], opts: PrimerOptions) -> Con
         ended_non_success,
     } = fold_turns(events, opts.before_seq);
 
-    // A prompt the agent never processed must not read as answered history.
+    // No observed response does not prove the agent never received the prompt.
     let unprocessed = ended_non_success
         && turns.last().is_some_and(|last| {
             last.assistant_text.is_empty()
@@ -600,6 +601,7 @@ mod tests {
         // An unprocessed prompt is split out only when the agent never answered.
         let startup_error = Event::AgentStartupError {
             message: "ACP connection failed".into(),
+            native_subject: None,
         };
         // (events, unprocessed prompt, rendered turns)
         let cases = [
@@ -629,6 +631,11 @@ mod tests {
             (
                 vec![user("Refactor it."), startup_error],
                 Some("Refactor it."),
+                0,
+            ),
+            (
+                vec![user("explicit request failed"), stopped("prompt_failed")],
+                Some("explicit request failed"),
                 0,
             ),
             (

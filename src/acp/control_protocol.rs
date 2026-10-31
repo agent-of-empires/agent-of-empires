@@ -1,4 +1,4 @@
-//! Control protocol v3 between `aoe serve` and `aoe __acp-runner`, carried
+//! Control protocol v4 between `aoe serve` and `aoe __acp-runner`, carried
 //! over `<id>.control.sock`.
 
 use anyhow::{bail, Result};
@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current wire generation.
-pub const CONTROL_PROTOCOL_VERSION: u32 = 3;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 4;
 
 /// Maximum NDJSON frame accepted from the ACP agent.
 pub const MAX_AGENT_FRAME_BYTES: usize = 64 * 1024 * 1024;
@@ -23,6 +23,39 @@ pub const MAX_CONTROL_FRAME_BYTES: u32 = MAX_AGENT_FRAME_BYTES as u32 + 64 * 102
 pub const MAX_CONTROL_QUEUE_FRAMES: usize = 4096;
 pub const MAX_CONTROL_QUEUE_BYTES: usize = 128 * 1024 * 1024;
 
+/// Retained completion and sticky loss each add one replay item outside the
+/// ordinary queue. Completion bytes use the actual cached wire length; only
+/// the fixed-size native-loss receipt has a constant byte reservation.
+pub(crate) const CONTROL_REPLAY_RESERVED_FRAMES: usize = 2;
+pub(super) const MAX_COMPLETION_MARKER_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_NATIVE_LOSS_FRAME_BYTES: usize = 256;
+
+/// A local observation by the runner that owns native stdin/stdout.
+/// These causes say nothing about whether the native process is still alive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeChannelLossCause {
+    StdoutEof,
+    ReadFailed,
+    WriteFailed,
+    ProtocolEnded,
+}
+
+/// This receipt is produced from the runner's genuine in-memory native
+/// establishment and channel state, never from a registry session ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum NativeChannelAvailability {
+    Available,
+    Unavailable { cause: NativeChannelLossCause },
+}
+
+#[derive(
+    Debug, Clone, Default, Serialize, Deserialize, agent_client_protocol::JsonRpcNotification,
+)]
+#[notification(method = "_aoe/native_channel_lost")]
+pub(crate) struct NativeChannelLostMarker {}
+
 /// Runner-minted [`ControlBody::Notify`] queued right after an established
 /// session's [`ControlBody::SessionReady`]. Frames go out handshake first, so
 /// it follows the updates the agent sent before its reply; the daemon handles
@@ -33,15 +66,51 @@ pub const MAX_CONTROL_QUEUE_BYTES: usize = 128 * 1024 * 1024;
 #[notification(method = "_aoe/session_replayed")]
 pub struct SessionReplayed {}
 
-/// Daemon-minted notification written after a local prompt's completion.
-///
-/// The crate handles notifications in order, so the waiter resolves only after
-/// the updates the agent sent before its reply have been applied.
+/// Daemon-minted completion barrier, ordered behind preceding SDK notifications.
+/// Adopted payloads contain the bounded public diagnostic, never raw error envelopes.
 #[derive(
     Debug, Clone, Default, Serialize, Deserialize, agent_client_protocol::JsonRpcNotification,
 )]
 #[notification(method = "_aoe/prompt_completed")]
-pub(crate) struct PromptCompletedMarker {}
+pub(crate) struct PromptCompletedMarker {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopted: Option<Box<AdoptedPromptCompletion>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct AdoptedPromptCompletion {
+    pub turn: u64,
+    pub diagnostic: Option<AdoptedPromptDiagnostic>,
+    pub reason: String,
+}
+
+/// Private ingress markers admit only prompt diagnostics, never arbitrary
+/// events with private native-subject qualifications.
+#[derive(Debug, Clone, Serialize)]
+#[serde(transparent)]
+pub(crate) struct AdoptedPromptDiagnostic(crate::acp::state::Event);
+
+impl AdoptedPromptDiagnostic {
+    pub(crate) fn new(event: crate::acp::state::Event) -> Option<Self> {
+        matches!(
+            event,
+            crate::acp::state::Event::PromptRuntimeError { .. }
+                | crate::acp::state::Event::RateLimit { .. }
+        )
+        .then_some(Self(event))
+    }
+
+    pub(crate) fn into_event(self) -> crate::acp::state::Event {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for AdoptedPromptDiagnostic {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let event = crate::acp::state::Event::deserialize(deserializer)?;
+        Self::new(event).ok_or_else(|| serde::de::Error::custom("not a prompt diagnostic"))
+    }
+}
 
 /// A single control frame.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -59,6 +128,7 @@ pub enum ControlBody {
     SessionReady {
         acp_session_id: String,
         result: serde_json::Value,
+        native_channel: NativeChannelAvailability,
     },
     /// The runner-owned handshake failed (agent incompatible, `session/new`
     /// error, transport failure).
@@ -71,6 +141,14 @@ pub enum ControlBody {
     PromptCompleted {
         prompt_req_id: i64,
         outcome: PromptOutcome,
+    },
+    /// Sticky runner-owned native I/O loss. Management and process ownership
+    /// survive; this is neither a peer JSON-RPC error nor a prompt outcome.
+    NativeChannelLost {
+        cause: NativeChannelLossCause,
+        /// Genuine completed native cache exists; routing only, not usability
+        /// or permission to issue another native request.
+        cached_session: bool,
     },
     /// An agent-to-client request the daemon must service (permission,
     /// elicitation, fs, terminal).
@@ -285,6 +363,7 @@ mod tests {
             ControlBody::SessionReady {
                 acp_session_id: "sess-1".into(),
                 result: serde_json::json!({"sessionId": "sess-1"}),
+                native_channel: crate::acp::control_protocol::NativeChannelAvailability::Available,
             },
             ControlBody::ResumeSession,
             ControlBody::HandshakeFailed {

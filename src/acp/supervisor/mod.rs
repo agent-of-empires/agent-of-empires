@@ -37,6 +37,16 @@ pub(crate) use agents::apply_agent_command_override;
 pub(crate) use launch::{host_spawn_environment, with_durable_launch};
 pub use sink::{BroadcastSink, ChannelSink};
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_WORKER_STATES_SNAPSHOT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn before_worker_states_snapshot_for_test(hook: impl FnOnce() + 'static) {
+    BEFORE_WORKER_STATES_SNAPSHOT.set(Some(Box::new(hook)));
+}
+
 /// Post-startup respawns allowed within `RESTART_WINDOW` before the session is parked.
 const MAX_RESPAWNS_IN_WINDOW: u32 = 3;
 const RESTART_WINDOW: Duration = Duration::from_secs(60);
@@ -165,6 +175,10 @@ pub(crate) enum ResumeReservationOutcome {
     AlreadyPresent,
 }
 
+#[derive(Debug, Error)]
+#[error("native observation epoch is busy")]
+pub(crate) struct NativeObservationBusy;
+
 pub struct Supervisor<S: BroadcastSink> {
     sink: Arc<S>,
     registry: Arc<Mutex<AgentRegistry>>,
@@ -206,16 +220,25 @@ pub(crate) struct ResumeReservation {
     attach_record: Option<Box<crate::process::worker_registry::WorkerRecord>>,
     lifecycle: Arc<std::sync::Mutex<LifecycleTable>>,
     notify: Arc<tokio::sync::Notify>,
+    preserve_owner: bool,
 }
 
 impl ResumeReservation {
     pub(crate) fn lease(&self) -> &Lease {
         &self.lease
     }
+
+    fn preserve_refused_owner(&mut self) {
+        self.preserve_owner =
+            !self.lease.is_borrowed_attach() && self.lease.spawned_runner().is_some();
+    }
 }
 
 impl Drop for ResumeReservation {
     fn drop(&mut self) {
+        if self.preserve_owner {
+            return;
+        }
         let mut lifecycle = lock_recover(&self.lifecycle);
         if !lifecycle.construction_is_pending(&self.lease) {
             return;
@@ -299,6 +322,7 @@ pub(crate) struct LaunchAdmission {
     pub store: Arc<dyn crate::session::SessionStore>,
     pub generation: u64,
     pub namespace: Option<Arc<tokio::sync::RwLock<()>>>,
+    pub native_scope: Option<crate::acp::state::NativeObservationScope>,
 }
 
 impl std::fmt::Debug for LaunchAdmission {
@@ -412,6 +436,13 @@ impl<S: BroadcastSink> Supervisor<S> {
     pub async fn worker_states_snapshot(
         &self,
     ) -> HashMap<String, (AcpWorkerState, Option<AcpWorkerStart>)> {
+        #[cfg(test)]
+        {
+            let hook = BEFORE_WORKER_STATES_SNAPSHOT.with(|hook| hook.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         lock_recover(&self.lifecycle)
             .snapshot()
             .into_iter()
@@ -443,6 +474,35 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
     }
 
+    pub(crate) fn current_lease(&self, session_id: &str) -> Option<Lease> {
+        lock_recover(&self.lifecycle).current_lease(session_id)
+    }
+
+    /// Recheck the worker epoch at canonical mutation, without reversing the
+    /// producer's lifecycle -> native lock order. The caller releases its
+    /// native lock before reacquiring after contention.
+    pub(crate) fn commit_native_observation<T>(
+        &self,
+        session_id: &str,
+        epoch: Option<u64>,
+        mutation: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let lifecycle = self
+            .lifecycle
+            .try_lock()
+            .map_err(|_| anyhow::Error::new(NativeObservationBusy))?;
+        anyhow::ensure!(
+            match epoch {
+                Some(epoch) => lifecycle
+                    .current_lease(session_id)
+                    .is_some_and(|lease| lease.epoch() == epoch),
+                None => lifecycle.phase(session_id) == WorkerPhase::Absent,
+            },
+            crate::session::LifecycleReservationError::Superseded
+        );
+        mutation()
+    }
+
     /// The running epoch, for a caller that must stop only that epoch.
     pub(crate) fn running_lease(&self, session_id: &str) -> Option<Lease> {
         lock_recover(&self.lifecycle)
@@ -453,19 +513,6 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// Whether this session has a worker up or coming up.
     pub async fn is_running(&self, session_id: &str) -> bool {
         lock_recover(&self.lifecycle).is_running(session_id)
-    }
-
-    /// Whether a live frame's generation is the worker currently installed.
-    pub(crate) async fn is_current_worker_generation(
-        &self,
-        session_id: &str,
-        generation: u64,
-    ) -> bool {
-        self.workers
-            .lock()
-            .await
-            .get(session_id)
-            .is_some_and(|worker| worker.lease.epoch() == generation)
     }
 
     /// Automatic respawns retain the originating launch; a new launch supersedes it.
@@ -525,23 +572,6 @@ fn lock_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::test_support::*;
     use super::*;
-
-    #[tokio::test]
-    async fn respawned_worker_rejects_the_prior_generation() {
-        let sup = Supervisor::new(VecSink::new());
-        let first = sup.test_insert_worker("s-generation").await;
-        let second = sup.test_respawn_worker("s-generation").await;
-
-        assert_ne!(first, second);
-        assert!(
-            !sup.is_current_worker_generation("s-generation", first)
-                .await
-        );
-        assert!(
-            sup.is_current_worker_generation("s-generation", second)
-                .await
-        );
-    }
 
     #[tokio::test]
     async fn bookkeeping_sets_track_and_drain() {

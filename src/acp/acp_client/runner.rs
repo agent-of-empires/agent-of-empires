@@ -171,7 +171,13 @@ pub(super) async fn spawn_runner_detached(
     socket_path: &std::path::Path,
     session_id: String,
     session_sandbox: Option<&SessionSandbox>,
-) -> Result<(u32, Option<crate::session::ExecutionBinding>), AcpError> {
+) -> Result<
+    (
+        crate::acp::runner_lifecycle::RunnerIdentity,
+        Option<crate::session::ExecutionBinding>,
+    ),
+    AcpError,
+> {
     let current_exe =
         std::env::current_exe().map_err(|e| AcpError::Spawn(format!("current_exe: {e}")))?;
     ensure_runner_exe(&current_exe)?;
@@ -484,7 +490,7 @@ pub(super) async fn spawn_runner_detached(
     let lease = config.launch_lease.clone();
     let admission = lease.as_ref().and_then(|lease| lease.admission());
     let generation = config.generation;
-    let pid = crate::acp::supervisor::with_durable_launch(admission, session_id, move || {
+    let identity = crate::acp::supervisor::with_durable_launch(admission, session_id, move || {
         let mut birth = lease.as_ref().map(|lease| lease.lock_birth());
         if lease
             .as_ref()
@@ -508,29 +514,27 @@ pub(super) async fn spawn_runner_detached(
         let pid = child
             .id()
             .ok_or_else(|| AcpError::Spawn("runner exited before it could be identified".into()))?;
+        let identity = crate::acp::runner_lifecycle::RunnerIdentity {
+            pid,
+            generation,
+            birth_fingerprint: crate::process::process_birth_identity(pid)
+                .ok()
+                .flatten()
+                .map(|identity| identity.fingerprint()),
+        };
         // Transfer reaping before the blocking result can be dropped.
         if let Some(lease) = &lease {
-            lease.record_spawned_child(
-                child,
-                crate::acp::runner_lifecycle::RunnerIdentity {
-                    pid,
-                    generation,
-                    birth_fingerprint: crate::process::process_birth_identity(pid)
-                        .ok()
-                        .flatten()
-                        .map(|identity| identity.fingerprint()),
-                },
-            );
+            lease.record_spawned_child(child, identity);
         } else {
             tokio::spawn(async move {
                 let _ = child.wait().await;
             });
         }
-        Ok(pid)
+        Ok(identity)
     })
     .await
     .map_err(|error| AcpError::Spawn(error.to_string()))?;
-    Ok((pid, native_store))
+    Ok((identity, native_store))
 }
 
 #[cfg(test)]

@@ -327,11 +327,21 @@ impl TranscriptModel {
                 deltas
             }
             // The failure itself is the turn's visible product, so no empty-output notice.
-            Event::AgentStartupError { message } => {
+            Event::AgentStartupError { message, .. } => {
                 let mut deltas = self.sweep_open_tools(seq);
                 self.turn_active = false;
                 self.turn_has_output = true;
                 deltas.push(self.notice(seq, format!("agent startup failed: {message}")));
+                deltas
+            }
+            Event::AcpConnectionUnavailable { source, cause, .. } => {
+                let mut deltas = self.sweep_open_tools(seq);
+                self.turn_active = false;
+                self.turn_has_output = true;
+                deltas.push(self.notice(
+                    seq,
+                    format!("ACP connection unavailable ({source:?}, {cause:?})"),
+                ));
                 deltas
             }
             // A dedicated remediation screen renders this, so the timeline stays quiet.
@@ -404,7 +414,7 @@ impl TranscriptModel {
                     text,
                 )]
             }
-            Event::PromptRuntimeError { message } => {
+            Event::PromptRuntimeError { message, .. } => {
                 self.turn_has_output = true;
                 vec![self.notice(seq, format!("prompt failed: {message}"))]
             }
@@ -894,17 +904,13 @@ mod tests {
         // (event, row id, kind, text)
         let cases = [
             (
-                Event::AgentStartupError {
-                    message: "node missing".into(),
-                },
+                Event::AgentStartupError { message: "node missing".into(), native_subject: None },
                 "notice-1",
                 TranscriptRowKind::Notice,
                 "agent startup failed: node missing".to_string(),
             ),
             (
-                Event::PromptRuntimeError {
-                    message: "stream died".into(),
-                },
+                Event::PromptRuntimeError { message: "stream died".into(), evidence: None, native_subject: None },
                 "notice-1",
                 TranscriptRowKind::Notice,
                 "prompt failed: stream died".to_string(),
@@ -1612,6 +1618,7 @@ mod tests {
             stopped("cancelled"),
             Event::AgentStartupError {
                 message: "boom".into(),
+                native_subject: None,
             },
             Event::IncompatibleAgent {
                 detail: crate::acp::state::StartupErrorDetail::UnsupportedProtocolVersion {
@@ -1643,6 +1650,8 @@ mod tests {
         };
         let runtime_error = Event::PromptRuntimeError {
             message: "boom".into(),
+            evidence: None,
+            native_subject: None,
         };
         // (events between the prompt and its stop, notice expected)
         let cases = [

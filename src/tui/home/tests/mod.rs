@@ -50,6 +50,16 @@ pub(super) async fn request_with_headers(
     body: serde_json::Value,
 ) -> (StatusCode, axum::http::HeaderMap, serde_json::Value) {
     let before = state.runtime.publish(state).await.unwrap();
+    request_with_headers_at_epoch(state, method, path, body, &before.value.cursor.epoch).await
+}
+
+pub(super) async fn request_with_headers_at_epoch(
+    state: &Arc<AppState>,
+    method: &str,
+    path: &str,
+    body: serde_json::Value,
+    epoch: &str,
+) -> (StatusCode, axum::http::HeaderMap, serde_json::Value) {
     let response = test_support::build_router_for_test(state.clone())
         .oneshot(
             Request::builder()
@@ -57,10 +67,7 @@ pub(super) async fn request_with_headers(
                 .uri(path)
                 .header("host", "localhost")
                 .header("content-type", "application/json")
-                .header(
-                    crate::daemon::RUNTIME_EPOCH_HEADER,
-                    &before.value.cursor.epoch,
-                )
+                .header(crate::daemon::RUNTIME_EPOCH_HEADER, epoch)
                 .extension(axum::extract::ConnectInfo(
                     crate::server::peer::ConnectionPeer::UnixOwner {
                         uid: nix::unistd::geteuid().as_raw(),

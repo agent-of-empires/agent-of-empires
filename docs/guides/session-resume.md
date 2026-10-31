@@ -102,6 +102,12 @@ This records an assertion about the intended native target, separately from any 
 
 When a launch requests resume, AoE preserves an unknown stored ID and attempts it only when native execution resolves. A qualified capture can establish its binding. If the native resume probe fails, AoE preserves the ID, records a durable failure marker, and returns `resume_failed` without starting fresh in that call.
 
+If a resume or fresh-pinned readiness probe cannot observe the exact owned pane, AoE returns `launch_indeterminate`, not `resume_failed` or ready success. Command timeouts, failed or malformed tmux observations, and changed ownership do not prove that the Agent exited. Expiry of the stabilization window is a separate outcome and proves neither death nor loaded history.
+
+AoE preserves the pane, process, conversation association, capture poller and scope ownership on this outcome. It releases only its own launch reservation when storage permits, without teardown even if release fails. Sends, attach preparation and restart wake messages stop at this refusal. Inspect the existing pane and restore tmux access before retrying; do not assume that the Agent needs a replacement. This does not restrict an explicit owned Stop.
+
+A renamed pane is not confirmed absence: AoE checks its captured session and pane IDs on the original tmux server. Cleanup also rechecks death and ownership. If that recheck becomes inconclusive, AoE returns `launch_indeterminate` without changing the current Status or recording a new failed-resume marker. A marker already justified by confirmed death remains intact if later removal becomes indeterminate.
+
 Same-ID observations, including binding qualification and OMP launch confirmation, preserve the durable failure marker. Capturing a different ID clears it; an explicit `set-session-id` assertion or a successful launch can also clear it.
 
 On the next orchestrated restart or send-driven revival under `Default`, a resume-capable conversation with that marker starts fresh instead of repeating the probe. This applies to both restart policies, including when `auto_resume_on_restart = false`. The fresh launch abandons the AoE association with the old conversation, not its native transcript. CLI restart reports the fresh result; sends and restart wake messages may then reach the new conversation.

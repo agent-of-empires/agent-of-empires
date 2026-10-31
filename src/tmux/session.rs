@@ -1,6 +1,6 @@
 //! tmux session management
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::io::Write;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,6 +20,208 @@ use crate::util::now_ms;
 
 pub struct Session {
     name: String,
+    physical: Option<std::sync::Arc<crate::session::LegacyToolObservation>>,
+    agent_command: Option<String>,
+    input_fence: Option<std::sync::Arc<crate::session::NativeInputFence>>,
+    #[cfg(unix)]
+    input_channel: Option<std::sync::Arc<super::vt::VtChannel>>,
+}
+
+#[derive(Default)]
+struct InputAcknowledgement {
+    current: Option<(u64, u64, u8)>,
+    outer: Option<(u64, u64, u8)>,
+    completed: u8,
+    refused: bool,
+}
+
+impl InputAcknowledgement {
+    fn line(&mut self, bytes: &[u8]) -> Result<()> {
+        let line = std::str::from_utf8(bytes)?;
+        if line == "AOE_INPUT_REFUSED" {
+            self.refused = true;
+            return Ok(());
+        }
+        let mut fields = line.split_ascii_whitespace();
+        let Some(kind @ ("%begin" | "%end" | "%error")) = fields.next() else {
+            anyhow::ensure!(
+                line != "%exit" || self.completed == 2,
+                crate::session::NativeInputError::Ownership
+            );
+            return Ok(());
+        };
+        let timestamp = fields
+            .next()
+            .context("missing tmux guard timestamp")?
+            .parse()?;
+        let number = fields
+            .next()
+            .context("missing tmux guard number")?
+            .parse()?;
+        let flags = fields.next().context("missing tmux guard flags")?.parse()?;
+        anyhow::ensure!(
+            fields.next().is_none() && flags == 0,
+            crate::session::NativeInputError::Ownership
+        );
+        let key = (timestamp, number, flags);
+        if kind == "%begin" {
+            anyhow::ensure!(
+                self.current.is_none() && self.completed < 2,
+                crate::session::NativeInputError::Ownership
+            );
+            if self.completed == 0 {
+                self.outer = Some(key);
+            } else {
+                anyhow::ensure!(
+                    self.outer != Some(key),
+                    crate::session::NativeInputError::Ownership
+                );
+            }
+            self.current = Some(key);
+        } else {
+            anyhow::ensure!(
+                self.current.take() == Some(key) && kind == "%end",
+                crate::session::NativeInputError::Ownership
+            );
+            self.completed += 1;
+            anyhow::ensure!(!self.refused, crate::session::NativeInputError::Ownership);
+        }
+        Ok(())
+    }
+}
+
+/// Own only the short-lived tmux command client, never the server or pane.
+struct InputCommandProcess(std::process::Child);
+
+impl Drop for InputCommandProcess {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            let _ = self.0.kill();
+        }
+        let _ = self.0.wait();
+    }
+}
+
+/// -C on a one-shot argv command emits flags=0 guards without attaching a client.
+/// The outer if-shell guard is NOT delivery: its selected synchronous send/paste
+/// must finish too. tmux emits that guard before running after-send hooks.
+fn run_input_effect(
+    command: &mut std::process::Command,
+    native: Option<crate::session::StorageFlock>,
+) -> Result<()> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    let mut native = native;
+    let mut child = InputCommandProcess(
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    let result = (|| -> Result<()> {
+        let mut stdout = child
+            .0
+            .stdout
+            .take()
+            .context("tmux control stdout missing")?;
+        let fd = stdout.as_raw_fd();
+        // This is our command's pipe; no other reader shares its descriptor flags.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        anyhow::ensure!(
+            flags >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0,
+            std::io::Error::last_os_error()
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut ack = InputAcknowledgement::default();
+        let mut line = [0u8; 4096];
+        let mut line_len = 0;
+        let mut buffer = [0u8; 4096];
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                anyhow::ensure!(
+                    ack.completed == 2,
+                    crate::session::NativeInputError::Ownership
+                );
+                break;
+            }
+            let mut poll = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe {
+                libc::poll(
+                    &mut poll,
+                    1,
+                    remaining.as_millis().clamp(1, i32::MAX as u128) as i32,
+                )
+            };
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if ack.completed == 2 {
+                    break;
+                }
+                return Err(error.into());
+            }
+            if ready == 0 {
+                continue;
+            }
+            let count = match stdout.read(&mut buffer) {
+                Ok(0) => {
+                    anyhow::ensure!(
+                        ack.completed == 2,
+                        crate::session::NativeInputError::Ownership
+                    );
+                    break;
+                }
+                Ok(count) => count,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue
+                }
+                Err(_) if ack.completed == 2 => break,
+                Err(error) => return Err(error.into()),
+            };
+            if ack.completed == 2 {
+                continue;
+            }
+            for &byte in &buffer[..count] {
+                if byte == b'\n' {
+                    ack.line(&line[..line_len])
+                        .context(crate::session::NativeInputError::Ownership)?;
+                    line_len = 0;
+                    if ack.completed == 2 {
+                        // User hooks may re-enter AoE. Release before draining/reaping
+                        // their command client, and independently fence a later Enter.
+                        drop(native.take());
+                        #[cfg(test)]
+                        tests::observe_selected_input_ack();
+                        break;
+                    }
+                } else {
+                    anyhow::ensure!(
+                        line_len < line.len(),
+                        crate::session::NativeInputError::Ownership
+                    );
+                    line[line_len] = byte;
+                    line_len += 1;
+                }
+            }
+        }
+        Ok(())
+    })();
+    drop(native.take());
+    // A selected native ACK, not process exit after user hooks, establishes delivery.
+    result
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -320,6 +522,11 @@ impl Session {
     pub fn new(id: &str, title: &str) -> Result<Self> {
         Ok(Self {
             name: Self::resolve_name(id, title),
+            physical: None,
+            agent_command: None,
+            input_fence: None,
+            #[cfg(unix)]
+            input_channel: None,
         })
     }
 
@@ -327,7 +534,255 @@ impl Session {
     pub fn from_name(name: &str) -> Self {
         Self {
             name: name.to_string(),
+            physical: None,
+            agent_command: None,
+            input_fence: None,
+            #[cfg(unix)]
+            input_channel: None,
         }
+    }
+
+    pub(crate) fn from_observation(
+        name: &str,
+        physical: std::sync::Arc<crate::session::LegacyToolObservation>,
+    ) -> Self {
+        Self {
+            name: name.to_owned(),
+            physical: Some(physical),
+            agent_command: None,
+            input_fence: None,
+            #[cfg(unix)]
+            input_channel: None,
+        }
+    }
+
+    pub(crate) fn with_native_input_fence(
+        mut self,
+        fence: std::sync::Arc<crate::session::NativeInputFence>,
+    ) -> Self {
+        self.input_fence = Some(fence);
+        self
+    }
+
+    /// Bind at admission, never look up another channel while executing old input.
+    pub(crate) fn capture_input_channel(mut self) -> Self {
+        #[cfg(unix)]
+        {
+            self.input_channel = super::vt::lookup(&self.name)
+                .filter(|channel| channel.belongs_to(self.physical.as_deref()));
+        }
+        self
+    }
+
+    pub(crate) fn live_input_mode(&self) -> Option<bool> {
+        #[cfg(unix)]
+        {
+            self.input_channel
+                .as_ref()
+                .and_then(|channel| channel.input_mode())
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
+    pub(crate) fn live_cursor_mode(&self) -> Option<bool> {
+        #[cfg(unix)]
+        {
+            self.input_channel
+                .as_ref()
+                .and_then(|channel| channel.cursor_mode())
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
+    pub(crate) fn send_live_raw_bytes(&self, bytes: &[u8]) -> Result<()> {
+        #[cfg(unix)]
+        if let Some(channel) = self
+            .input_channel
+            .as_ref()
+            .filter(|channel| channel.input_mode().is_some())
+        {
+            let _native = self.lock_input_effect()?;
+            anyhow::ensure!(
+                channel.write_input(bytes),
+                crate::session::NativeInputError::Ownership
+            );
+            return Ok(());
+        }
+        self.send_raw_bytes(bytes)
+    }
+
+    pub(crate) fn paste_live_text(&self, text: &str) -> Result<()> {
+        #[cfg(unix)]
+        if let Some(channel) = self
+            .input_channel
+            .as_ref()
+            .filter(|channel| channel.input_mode().is_some())
+        {
+            let _native = self.lock_input_effect()?;
+            anyhow::ensure!(
+                channel.paste_text(text),
+                crate::session::NativeInputError::Ownership
+            );
+            return Ok(());
+        }
+        self.paste_text(text)
+    }
+
+    pub(crate) fn send_named_key(&self, key: &str) -> Result<()> {
+        self.send_named_key_repeat(key, 1)
+    }
+
+    pub(crate) fn send_named_key_repeat(&self, key: &str, count: usize) -> Result<()> {
+        let target =
+            self.live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?;
+        self.tmux_input("send-keys", &target, ["-N", &count.to_string(), key])
+    }
+
+    /// Readiness is sampled after caller waits, then checked again by tmux in
+    /// each input effect, including the Enter following a delayed paste.
+    pub(crate) fn admit_agent_input(&mut self, expects_shell: bool) -> Result<()> {
+        let physical = self
+            .physical
+            .as_ref()
+            .ok_or(crate::session::NativeInputError::Ownership)?;
+        let observation = super::utils::probe_owned_pane_readiness(
+            physical,
+            &crate::tmux::TmuxCommandDeadline::new(),
+        )
+        .context(crate::session::NativeInputError::Ownership)?;
+        let Some((super::utils::PaneProbe::Alive, shell, command)) = observation else {
+            return Err(crate::session::NativeInputError::Ownership.into());
+        };
+        anyhow::ensure!(
+            !command.is_empty() && (!shell || expects_shell),
+            crate::session::NativeInputError::AgentNotReady
+        );
+        self.agent_command = Some(command);
+        Ok(())
+    }
+
+    fn input_command(&self) -> Result<std::process::Command> {
+        if let Some(physical) = &self.physical {
+            anyhow::ensure!(
+                crate::process::process_birth_is_live(physical.server.pid, &physical.server.birth,)
+                    .context(crate::session::NativeInputError::Ownership)?,
+                crate::session::NativeInputError::Ownership,
+            );
+            Ok(crate::tmux::tmux_query_command_for_socket(
+                &physical.server.socket,
+            ))
+        } else {
+            Ok(crate::tmux::tmux_command())
+        }
+    }
+
+    fn lock_input_effect(&self) -> Result<Option<crate::session::StorageFlock>> {
+        let native = self
+            .input_fence
+            .as_ref()
+            .map(|fence| fence.lock())
+            .transpose()?;
+        if let Some(physical) = &self.physical {
+            anyhow::ensure!(
+                crate::process::process_birth_is_live(physical.server.pid, &physical.server.birth,)
+                    .context(crate::session::NativeInputError::Ownership)?,
+                crate::session::NativeInputError::Ownership
+            );
+        }
+        Ok(native)
+    }
+
+    fn physical_input_condition(&self) -> Result<String> {
+        use std::fmt::Write as _;
+        let physical = self
+            .physical
+            .as_ref()
+            .ok_or(crate::session::NativeInputError::Ownership)?;
+        let pane_pid = physical
+            .identity
+            .pane_pid
+            .ok_or(crate::session::NativeInputError::Ownership)?;
+        let mut condition = String::with_capacity(256);
+        for _ in 0..5 + usize::from(self.agent_command.is_some()) {
+            condition.push_str("#{&&:");
+        }
+        write!(
+            condition,
+            "#{{==:#{{session_id}},{}}}",
+            physical.identity.session_id
+        )?;
+        write!(
+            condition,
+            ",#{{==:#{{pane_id}},{}}}}}",
+            physical.identity.pane_id
+        )?;
+        write!(condition, ",#{{==:#{{pane_pid}},{pane_pid}}}}}")?;
+        write!(condition, ",#{{==:#{{pid}},{}}}}}", physical.server.pid)?;
+        write!(
+            condition,
+            ",#{{==:#{{socket_path}},{}}}}}",
+            Self::tmux_format_literal(&physical.server.socket)
+        )?;
+        condition.push_str(",#{==:#{pane_dead},0}}");
+        if let Some(command) = &self.agent_command {
+            write!(
+                condition,
+                ",#{{==:#{{pane_current_command}},{}}}}}",
+                Self::tmux_format_literal(command)
+            )?;
+        }
+        Ok(condition)
+    }
+
+    fn tmux_input<'a>(
+        &self,
+        verb: &str,
+        target: &str,
+        args: impl IntoIterator<Item = &'a str>,
+    ) -> Result<()> {
+        let mut command = self.input_command()?;
+        if let Some(physical) = &self.physical {
+            anyhow::ensure!(
+                target == physical.identity.pane_id,
+                crate::session::NativeInputError::Ownership
+            );
+            let mut effect = format!("{verb} -t {}", Self::tmux_command_string_literal(target));
+            for arg in args {
+                effect.push(' ');
+                effect.push_str(&Self::tmux_command_string_literal(arg));
+            }
+            let native = if matches!(verb, "send-keys" | "paste-buffer") {
+                self.lock_input_effect()?
+            } else {
+                None
+            };
+            command.args([
+                "-C",
+                "if-shell",
+                "-t",
+                target,
+                "-F",
+                &self.physical_input_condition()?,
+                &effect,
+                "display-message -p AOE_INPUT_REFUSED",
+            ]);
+            run_input_effect(&mut command, native)
+                .context(crate::session::NativeInputError::Ownership)?;
+        } else {
+            let output = command.arg(verb).args(["-t", target]).args(args).output()?;
+            anyhow::ensure!(
+                output.status.success(),
+                "tmux input failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
     }
 
     /// The name of the tmux session to ACT on for this session id: the
@@ -429,6 +884,7 @@ impl Session {
         extra_env: &[PaneEnvMutation],
     ) -> Result<()> {
         self.create_with_size_env_inner(working_dir, command, size, profile, extra_env, &[], None)
+            .map(|_| ())
     }
 
     /// Create a pane whose container runtime reads target environment values
@@ -444,7 +900,7 @@ impl Session {
         extra_env: &[PaneEnvMutation],
         container_env: &[(String, String)],
         scope: Option<&crate::process::systemd::ScopePrefix>,
-    ) -> Result<()> {
+    ) -> Result<Option<crate::session::LegacyToolObservation>> {
         self.create_with_size_env_inner(
             working_dir,
             command,
@@ -467,9 +923,9 @@ impl Session {
         extra_env: &[PaneEnvMutation],
         container_env: &[(String, String)],
         scope: Option<&crate::process::systemd::ScopePrefix>,
-    ) -> Result<()> {
+    ) -> Result<Option<crate::session::LegacyToolObservation>> {
         if self.exists_live() {
-            return Ok(());
+            return Ok(None);
         }
 
         // tmux silently falls back to $HOME for a missing `-c` directory.
@@ -539,6 +995,14 @@ impl Session {
             Some(&wrapped_command),
             size,
         );
+        args.splice(
+            1..1,
+            [
+                "-P".to_owned(),
+                "-F".to_owned(),
+                "#{session_id}|#{pane_id}|#{pane_pid}|#{socket_path}|#{pid}".to_owned(),
+            ],
+        );
         let target = format!("={}:", self.name);
         append_session_setup_args(&mut args, &target, &config, None);
         crate::tmux::append_session_kind_args(&mut args, &target, crate::tmux::SessionKind::Agent);
@@ -567,7 +1031,15 @@ impl Session {
         env_file.disarm();
         super::refresh_session_cache();
 
-        Ok(())
+        Ok(
+            match super::utils::created_pane_observation(&output.stdout) {
+                Ok(pane) => Some(pane),
+                Err(error) => {
+                    tracing::warn!(target: "tmux.command", session = %self.name, error = %format_args!("{error:#}"), "created pane identity is unproven");
+                    None
+                }
+            },
+        )
     }
 
     pub fn is_pane_dead(&self) -> bool {
@@ -578,56 +1050,8 @@ impl Session {
         is_pane_running_shell(&self.name)
     }
 
-    /// Revive a dead pane in place via `tmux respawn-pane -k` without
-    /// tearing down the surrounding tmux session.
-    ///
-    /// When `remain-on-exit on` is set, a pane whose process has exited
-    /// stays around as a dead pane and the tmux session remains. The
-    /// normal restart flow (kill-session + new-session) is correct for
-    /// that case, but kill-session can race against the session cache:
-    /// process-tree kill of a defunct pid stalls on macOS, and the
-    /// subsequent kill can run while exists() still sees the cached
-    /// entry, leaving the dead pane in place. Respawning first puts the
-    /// pane back into a live state so the kill path proceeds cleanly.
-    ///
-    /// Returns `Ok(true)` if the first window's pane was dead and was
-    /// respawned with `command` (using `working_dir` as the cwd). Returns
-    /// `Ok(false)` if the pane is alive (no action taken) or the session
-    /// does not exist. Returns `Err` if tmux respawn-pane fails.
-    pub fn respawn_dead_pane(&self, working_dir: &str, command: Option<&str>) -> Result<bool> {
-        if !self.exists() {
-            return Ok(false);
-        }
-        if !self.is_pane_dead() {
-            return Ok(false);
-        }
-
-        // `^` is the window's active pane; `.0` would be base-index
-        // sensitive. See #435, #488. The `-k` flag forces respawn past the
-        // remembered exit status; without it tmux refuses to respawn.
-        let target = format!("={}:^", self.name);
-        let mut args: Vec<String> = vec![
-            "respawn-pane".to_string(),
-            "-k".to_string(),
-            "-t".to_string(),
-            target,
-            "-c".to_string(),
-            working_dir.to_string(),
-        ];
-        if let Some(cmd) = command {
-            args.push(cmd.to_string());
-        }
-
-        let output = crate::tmux::tmux_command().args(&args).output()?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("Failed to respawn dead pane: {}", stderr);
-        }
-
-        super::refresh_session_cache();
-        Ok(true)
-    }
+    // Dead panes are removed by utils::remove_owned_dead_pane using exact corpse
+    // custody, never respawned into a transient shell before teardown.
 
     pub fn kill(&self) -> Result<()> {
         // Retain the exact agent pane until kill-session removes it. Otherwise process-tree
@@ -678,10 +1102,13 @@ impl Session {
     }
 
     pub fn attach(&self) -> Result<()> {
-        if !self.exists() {
+        if self.physical.is_none() && !self.exists() {
             bail!("Session does not exist: {}", self.name);
         }
-        let target = format!("={}:", self.name);
+        let target = match &self.physical {
+            Some(physical) => format!("{}:", physical.identity.session_id),
+            None => format!("={}:", self.name),
+        };
 
         let switch_existing = if crate::tmux::utils::inside_tmux() {
             match crate::tmux::current_session_for_current_pane()? {
@@ -693,15 +1120,37 @@ impl Session {
         } else {
             false
         };
-        let mut command = crate::tmux::tmux_command();
-        if switch_existing {
-            command.args(["switch-client", "-t", &target]);
+        let mut command = self.input_command()?;
+        if let Some(physical) = &self.physical {
+            let verb = if switch_existing {
+                "switch-client"
+            } else {
+                "attach-session"
+            };
+            let effect = format!("{verb} -t {}", Self::tmux_command_string_literal(&target));
+            command.args([
+                "if-shell",
+                "-t",
+                &physical.identity.pane_id,
+                "-F",
+                &self.physical_input_condition()?,
+                &effect,
+                "",
+            ]);
         } else {
+            command.args([
+                if switch_existing {
+                    "switch-client"
+                } else {
+                    "attach-session"
+                },
+                "-t",
+                &target,
+            ]);
+        }
+        if !switch_existing {
             // An inherited TMUX without a caller client must not block a fresh client.
-            command
-                .args(["attach-session", "-t", &target])
-                .env_remove("TMUX")
-                .env_remove("TMUX_PANE");
+            command.env_remove("TMUX").env_remove("TMUX_PANE");
         }
         let status = command.status()?;
         if !status.success() {
@@ -711,6 +1160,19 @@ impl Session {
                 self.name,
                 status.code().unwrap_or(-1),
                 diag
+            );
+        }
+        if let Some(physical) = &self.physical {
+            anyhow::ensure!(
+                matches!(
+                    super::utils::probe_owned_pane(
+                        &self.name,
+                        physical,
+                        &crate::tmux::TmuxCommandDeadline::new(),
+                    )?,
+                    Some((super::utils::PaneProbe::Alive, _, _))
+                ),
+                "Native attachment target is no longer physically available"
             );
         }
 
@@ -807,13 +1269,14 @@ impl Session {
     }
 
     pub fn capture_pane(&self, lines: usize) -> Result<String> {
-        if !self.exists() {
+        if self.physical.is_none() && !self.exists() {
             return Ok(String::new());
         }
 
         let target =
             self.live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?;
-        let output = crate::tmux::tmux_command()
+        let output = self
+            .input_command()?
             .args([
                 "capture-pane",
                 "-t",
@@ -1257,6 +1720,9 @@ impl Session {
         &self,
         deadline: &crate::tmux::TmuxCommandDeadline,
     ) -> Result<String> {
+        if let Some(physical) = &self.physical {
+            return Ok(physical.identity.pane_id.clone());
+        }
         #[cfg(unix)]
         if let Some(id) = crate::tmux::vt::channel_pane_id(&self.name) {
             return Ok(id);
@@ -1273,7 +1739,7 @@ impl Session {
         let target = self.live_pane_target_with_deadline(deadline)?;
         let start = format!("-{}", lines);
         const HEADER_FMT: &str = CURSOR_FMT;
-        let mut command = crate::tmux::tmux_command();
+        let mut command = self.input_command()?;
         command.args([
             "display-message",
             "-p",
@@ -1344,16 +1810,11 @@ impl Session {
         let target =
             self.live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?;
         for batch in raw_byte_batches(bytes) {
-            let output = crate::tmux::tmux_command()
-                .args(["send-keys", "-t", &target, "-H"])
-                .args(&batch)
-                .output()?;
-            if !output.status.success() {
-                anyhow::bail!(
-                    "tmux send-keys -H exited non-zero for {} bytes",
-                    bytes.len()
-                );
-            }
+            self.tmux_input(
+                "send-keys",
+                &target,
+                std::iter::once("-H").chain(batch.iter().map(String::as_str)),
+            )?;
         }
         Ok(())
     }
@@ -1371,7 +1832,7 @@ impl Session {
     pub fn paste_text(&self, text: &str) -> Result<()> {
         let target =
             self.live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?;
-        Self::send_via_paste_buffer(&target, text)
+        self.send_via_paste_buffer(&target, text)
     }
 
     pub fn get_pane_pid(&self) -> Option<u32> {
@@ -1406,7 +1867,7 @@ impl Session {
     /// treating them as newlines instead of submit. The delay lets the
     /// suppression window expire before Enter is sent.
     pub fn send_keys_with_delay(&self, text: &str, enter_delay_ms: u64) -> Result<()> {
-        if !self.exists() {
+        if self.physical.is_none() && !self.exists() {
             bail!("Session does not exist: {}", self.name);
         }
 
@@ -1422,12 +1883,12 @@ impl Session {
         );
 
         match delivery {
-            SubmitText::Paste(text) => Self::send_via_paste_buffer(&target, text)?,
+            SubmitText::Paste(text) => self.send_via_paste_buffer(&target, text)?,
             SubmitText::Literal(payload) => {
                 let (head, semis) = peel_trailing_semicolons(&payload);
                 if !head.is_empty() {
                     // `--` so lines starting with `-` are not read as tmux flags.
-                    Self::tmux_send(&target, &["-l", "--", head])?;
+                    self.tmux_input("send-keys", &target, ["-l", "--", head])?;
                 }
                 if semis > 0 {
                     self.send_raw_bytes(&vec![b';'; semis])?;
@@ -1440,7 +1901,7 @@ impl Session {
         }
 
         // Enter to submit
-        Self::tmux_send(&target, &["Enter"])?;
+        self.tmux_input("send-keys", &target, ["Enter"])?;
 
         Ok(())
     }
@@ -1454,7 +1915,7 @@ impl Session {
     /// own interactive permission prompt; see
     /// [`crate::agents::PermissionResponse`].
     pub fn send_key_tokens(&self, tokens: &[crate::agents::KeyToken]) -> Result<()> {
-        if !self.exists() {
+        if self.physical.is_none() && !self.exists() {
             bail!("Session does not exist: {}", self.name);
         }
 
@@ -1463,10 +1924,10 @@ impl Session {
         for token in tokens {
             match token {
                 crate::agents::KeyToken::Literal(text) => {
-                    Self::tmux_send(&target, &["-l", "--", text])?;
+                    self.tmux_input("send-keys", &target, ["-l", "--", *text])?;
                 }
                 crate::agents::KeyToken::Named(name) => {
-                    Self::tmux_send(&target, &[name])?;
+                    self.tmux_input("send-keys", &target, [*name])?;
                 }
             }
         }
@@ -1484,6 +1945,14 @@ impl Session {
     /// Best-effort: failures (session gone, tmux ENOENT) are swallowed
     /// so a stuck pane never blocks the user's exit from live mode.
     pub fn reset_size_to_latest_client(&self) {
+        if let Some(physical) = &self.physical {
+            let _ = self.tmux_input(
+                "set-option",
+                &physical.identity.pane_id,
+                ["window-size", "latest"],
+            );
+            return;
+        }
         if !self.exists() {
             return;
         }
@@ -2316,12 +2785,13 @@ impl Session {
     /// integration hits this, the fallback is to short-circuit
     /// [`SubmitText::Paste`] for that agent and keep the per-line
     /// Shift+Enter path.
-    fn send_via_paste_buffer(target: &str, text: &str) -> Result<()> {
+    fn send_via_paste_buffer(&self, target: &str, text: &str) -> Result<()> {
         static SEND_COUNTER: AtomicU64 = AtomicU64::new(0);
         let seq = SEND_COUNTER.fetch_add(1, Ordering::Relaxed);
         let buf_name = format!("aoe-send-{}-{}", std::process::id(), seq);
 
-        let mut child = crate::tmux::tmux_command()
+        let mut child = self
+            .input_command()?
             .args(["load-buffer", "-b", &buf_name, "-"])
             .stdin(Stdio::piped())
             .stderr(Stdio::piped())
@@ -2334,31 +2804,16 @@ impl Session {
             bail!("tmux load-buffer failed (status={:?})", status.code());
         }
 
-        let output = crate::tmux::tmux_command()
-            .args(["paste-buffer", "-d", "-p", "-b", &buf_name, "-t", target])
-            .output()?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // `-d` only deletes on success.
-            let _ = crate::tmux::tmux_command()
-                .args(["delete-buffer", "-b", &buf_name])
-                .output();
-            bail!("tmux paste-buffer failed: {}", stderr);
-        }
-
-        Ok(())
-    }
-
-    fn tmux_send(target: &str, args: &[&str]) -> Result<()> {
-        let output = crate::tmux::tmux_command()
-            .arg("send-keys")
-            .args(["-t", target])
-            .args(args)
-            .output()?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("Failed to send keys: {}", stderr);
+        if let Err(error) = self.tmux_input(
+            "paste-buffer",
+            target,
+            ["-d", "-p", "-b", buf_name.as_str()],
+        ) {
+            // `-d` only deletes on success. Cleanup stays on the captured server.
+            if let Ok(mut command) = self.input_command() {
+                let _ = command.args(["delete-buffer", "-b", &buf_name]).output();
+            }
+            return Err(error);
         }
 
         Ok(())
@@ -2645,6 +3100,163 @@ mod tests {
         only_pane_id, pane_field, wait_for_pane_command, wait_for_pane_dead, TmuxTestSession,
     };
     use super::*;
+
+    #[test]
+    fn input_ack_requires_the_selected_effect_and_rejects_a_false_guard() {
+        let mut ack = InputAcknowledgement::default();
+        ack.line(b"%begin 10 50 0").unwrap();
+        ack.line(b"%end 10 50 0").unwrap();
+        assert_eq!(
+            ack.completed, 1,
+            "outer if-shell completion is not delivery"
+        );
+        ack.line(b"%begin 10 73 0").unwrap();
+        ack.line(b"%end 10 73 0").unwrap();
+        assert_eq!(
+            ack.completed, 2,
+            "selected item numbers need not be adjacent"
+        );
+
+        let mut refused = InputAcknowledgement::default();
+        for line in [
+            b"%begin 20 80 0".as_slice(),
+            b"%end 20 80 0",
+            b"%begin 20 92 0",
+            b"AOE_INPUT_REFUSED",
+        ] {
+            refused.line(line).unwrap();
+        }
+        assert!(
+            refused.line(b"%end 20 92 0").is_err(),
+            "a successful refusal command must not acknowledge delivery"
+        );
+    }
+
+    #[test]
+    fn input_ack_rejects_unmatched_and_failed_effects() {
+        for last in [b"%end 30 101 0".as_slice(), b"%error 30 100 0"] {
+            let mut ack = InputAcknowledgement::default();
+            ack.line(b"%begin 30 100 0").unwrap();
+            assert!(ack.line(last).is_err());
+        }
+        let mut ack = InputAcknowledgement::default();
+        ack.line(b"%begin 40 110 0").unwrap();
+        ack.line(b"%end 40 110 0").unwrap();
+        assert!(
+            ack.line(b"%exit").is_err(),
+            "loss after outer ACK is not effect ACK"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn selected_input_ack_releases_native_exclusion_before_client_completion() {
+        use std::os::unix::ffi::OsStrExt;
+        let temp = tempfile::tempdir().unwrap();
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let storage = crate::session::Storage::new_unwatched("default").unwrap();
+        let native = storage
+            .acquire_instance_lifecycle_lock("control-ack")
+            .unwrap();
+        let fifo = temp.path().join("release");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        // Retain both ends until cleanup so an early write survives a late reader.
+        let mut release_fifo = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo)
+            .unwrap();
+        // A declared control peer leaves its client alive after the selected ACK,
+        // as a synchronous input followed by a waiting user hook does in tmux.
+        let script = format!(
+            "printf '%s\\n' '%begin 1 10 0' '%end 1 10 0' '%begin 1 23 0' '%end 1 23 0'; \
+             read -r released < {}",
+            shell_escape_script_word(fifo.to_str().unwrap()),
+        );
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let (ack_tx, ack) = std::sync::mpsc::channel();
+        let (resume_tx, resume) = std::sync::mpsc::channel();
+        let input = std::thread::spawn(move || {
+            let _ack = SelectedInputAckGuard::install(SelectedInputAckProbe {
+                acknowledged: ack_tx,
+                resume,
+            });
+            let result = run_input_effect(
+                std::process::Command::new("sh").args(["-c", &script]),
+                Some(native),
+            );
+            done_tx.send(result).unwrap();
+        });
+        let acknowledged = ack.recv_timeout(Duration::from_secs(5));
+        let (released_tx, released) = std::sync::mpsc::channel();
+        let probe = std::thread::spawn(move || {
+            let result = storage
+                .acquire_instance_lifecycle_lock("control-ack")
+                .map(drop);
+            released_tx.send(result).unwrap();
+        });
+        let unlocked = released.recv_timeout(Duration::from_secs(5));
+        let early = done.try_recv().ok();
+        let completed_early = early.is_some();
+        // Release both barriers before assertions, even if an observation failed.
+        let peer_released = release_fifo.write_all(b"released\n");
+        let checkpoint_released = resume_tx.send(());
+        drop(resume_tx);
+        let result = early
+            .map(Ok)
+            .unwrap_or_else(|| done.recv_timeout(Duration::from_secs(5)));
+        let input_joined = input.join();
+        let probe_joined = probe.join();
+        drop(release_fifo);
+        acknowledged.expect("input worker reached the selected-ACK checkpoint");
+        unlocked
+            .expect("native lock must be released while the ACK worker remains parked")
+            .expect("native lock probe succeeded");
+        assert!(
+            !completed_early,
+            "client completion must not stand in for the effect ACK"
+        );
+        peer_released.unwrap();
+        checkpoint_released.unwrap();
+        input_joined.unwrap();
+        probe_joined.unwrap();
+        result.unwrap().unwrap();
+    }
+
+    struct SelectedInputAckProbe {
+        acknowledged: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    }
+
+    thread_local! {
+        static SELECTED_INPUT_ACK: std::cell::RefCell<Option<SelectedInputAckProbe>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn observe_selected_input_ack() {
+        SELECTED_INPUT_ACK.with(|slot| {
+            if let Some(probe) = slot.borrow().as_ref() {
+                if probe.acknowledged.send(()).is_ok() {
+                    let _ = probe.resume.recv();
+                }
+            }
+        });
+    }
+
+    struct SelectedInputAckGuard(Option<SelectedInputAckProbe>);
+
+    impl SelectedInputAckGuard {
+        fn install(probe: SelectedInputAckProbe) -> Self {
+            Self(SELECTED_INPUT_ACK.with(|slot| slot.replace(Some(probe))))
+        }
+    }
+
+    impl Drop for SelectedInputAckGuard {
+        fn drop(&mut self) {
+            SELECTED_INPUT_ACK.with(|slot| slot.replace(self.0.take()));
+        }
+    }
+
     struct ReadyCaptureProbe {
         captured: std::sync::mpsc::Sender<String>,
         resume: std::sync::mpsc::Receiver<()>,
@@ -4398,9 +5010,7 @@ mod tests {
 
         wait_for_pane_command(&agent_pane, "sleep");
 
-        let session = Session {
-            name: session_name.clone(),
-        };
+        let session = Session::from_name(&session_name);
 
         // With no window 0, a `:0.0` target resolves to the active window --
         // the shell opened above -- so `capture_pane` reads the wrong pane or,
@@ -5910,87 +6520,6 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
-    /// A retained dead pane is revivable without exposing its stale process PID.
-    fn test_respawn_dead_pane_revives_dead_pane() {
-        if !tmux_available() {
-            eprintln!("Skipping test: tmux not available");
-            return;
-        }
-
-        let guard = TmuxTestSession::new("aoe_test_respawn");
-        let session_name = guard.name().to_string();
-
-        // Pin pane zero independently of user tmux configuration.
-        let output = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &session_name,
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "true",
-                ";",
-                "set-option",
-                "-p",
-                "-t",
-                &session_name,
-                "remain-on-exit",
-                "on",
-                ";",
-                "set-option",
-                "-t",
-                &session_name,
-                "pane-base-index",
-                "0",
-            ])
-            .output()
-            .expect("tmux new-session");
-        assert!(output.status.success());
-
-        let pane_id = only_pane_id(&session_name);
-        wait_for_pane_dead(&pane_id);
-
-        let session = Session::from_name(&session_name);
-        super::refresh_session_cache();
-
-        assert!(session.exists(), "Session should exist via remain-on-exit");
-        assert!(session.is_pane_dead(), "Pane should be dead after `true`");
-        assert_eq!(
-            session.get_pane_pid(),
-            None,
-            "a dead pane is not a live process owner"
-        );
-
-        let respawned = session
-            .respawn_dead_pane("/tmp", Some("sleep 30"))
-            .expect("respawn_dead_pane should succeed");
-        assert!(respawned, "respawn_dead_pane should report it acted");
-
-        wait_for_pane_command(&pane_id, "sleep");
-        assert!(session.exists(), "Session should still exist after respawn");
-        assert!(
-            !session.is_pane_dead(),
-            "Pane should be alive after respawn"
-        );
-        assert!(
-            session.get_pane_pid().is_some(),
-            "the respawned pane owns a live process"
-        );
-
-        let respawned_again = session
-            .respawn_dead_pane("/tmp", Some("sleep 30"))
-            .expect("respawn_dead_pane on live pane should not error");
-        assert!(
-            !respawned_again,
-            "respawn_dead_pane should report no-op on live pane"
-        );
-    }
-
-    #[test]
     fn kill_retains_the_last_pane_until_exact_session_removal() {
         if std::env::var_os("AOE_TEST_KILL_LAST_PANE_CHILD").is_some() {
             let name = "aoe_test_last_pane_teardown";
@@ -6052,20 +6581,6 @@ mod tests {
             "{}{}",
             String::from_utf8_lossy(&child.stdout),
             String::from_utf8_lossy(&child.stderr)
-        );
-    }
-
-    /// respawn_dead_pane on a non-existent session is a safe no-op.
-    #[test]
-    #[serial_test::serial]
-    fn test_respawn_dead_pane_no_session() {
-        let session = Session::from_name("aoe_test_nonexistent_session_xyz");
-        let result = session
-            .respawn_dead_pane("/tmp", Some("zsh"))
-            .expect("respawn_dead_pane should not error on missing session");
-        assert!(
-            !result,
-            "respawn_dead_pane should return false for missing session"
         );
     }
 }

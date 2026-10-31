@@ -245,6 +245,7 @@ async fn commit_structured_view(
             slot.idle_dormant_since = None;
             slot.idle_entered_at = None;
             slot.last_error = None;
+            slot.last_error_evidence = None;
             slot.lifecycle_generation = generation;
             slot.acp_load_session_capable = None;
             Ok(slot.lifecycle_generation)
@@ -419,6 +420,7 @@ async fn deferred_enable_request(
                 store: native,
                 generation: expected.lifecycle_generation,
                 namespace: Some(state.profile_namespace.clone()),
+                native_scope: None,
             }),
             stored_acp_session_id: seed.stored_acp_session_id,
             seed_history_replay: seed.seed_history_replay,
@@ -650,6 +652,7 @@ fn handoff_key(row: &Instance) -> anyhow::Result<HandoffKey> {
 fn claim_handoff_in(
     mut owner: TerminalHandoff,
     expected: HandoffKey,
+    state: &AppState,
 ) -> anyhow::Result<TerminalHandoff> {
     use crate::session::{LifecycleOperation, LifecycleReservation, LifecycleReservationError};
     let profile = owner.store().storage().profile().to_owned();
@@ -664,7 +667,14 @@ fn claim_handoff_in(
         .store()
         .storage()
         .acquire_instance_lifecycle_lock(&id)?;
-    owner.update_owned(|rows| {
+    let target = state.acp_supervisor.capture_retirement(&id)?;
+    let observation_storage = crate::session::Storage::open_reference(&profile)?;
+    anyhow::ensure!(
+        observation_storage.bound_profile_identity()? == identity,
+        LifecycleReservationError::Superseded
+    );
+    let mut prepared_scope = None;
+    let claimed = owner.update_owned(|rows| {
         let row = rows
             .iter_mut()
             .find(|row| row.id == id)
@@ -684,11 +694,38 @@ fn claim_handoff_in(
             .as_mut()
             .expect("validated handoff")
             .generation = generation;
+        if target.lease.as_ref().is_some_and(|lease| {
+            lease
+                .retirement()
+                .has_handoff_identity_scope(expected, target.identity)
+        }) && row.terminal_handoff.as_ref().is_some_and(|intent| {
+            intent.stage == HandoffStage::RetirementPending
+                && intent.source_conversation.matches(row)
+                && matches!((&intent.runner, target.identity),
+                    (crate::session::purge_owners::RunnerCapture::Captured {
+                        pid, generation, birth_fingerprint, ..
+                    }, Some(actor)) if *pid == actor.pid && *generation == actor.generation
+                        && *birth_fingerprint == actor.birth_fingerprint)
+        }) {
+            if let (Some(lease), Some(actor)) = (&target.lease, target.identity) {
+                prepared_scope = Some(lease.retirement().prepare_handoff_identity_scope(
+                    row,
+                    &observation_storage,
+                    actor,
+                )?);
+            }
+        }
         Ok(HandoffKey {
             id: expected.id,
             generation,
         })
-    })?;
+    });
+    if owner.key.is_some() {
+        if let (Some(lease), Some(scope)) = (&target.lease, prepared_scope) {
+            lease.retirement().record_handoff_identity_scope(scope);
+        }
+    }
+    claimed?;
     Ok(owner)
 }
 
@@ -755,7 +792,13 @@ fn reserve_handoff_in(
         _ => None,
     };
     let intent_id = uuid::Uuid::new_v4();
-    owner.update_owned(|rows| {
+    let observation_storage = crate::session::Storage::open_reference(&profile)?;
+    anyhow::ensure!(
+        observation_storage.bound_profile_identity()? == identity,
+        LifecycleReservationError::Superseded
+    );
+    let mut prepared_scope = None;
+    let reserved = owner.update_owned(|rows| {
         let row = rows
             .iter_mut()
             .find(|row| row.id == expected.id)
@@ -801,11 +844,24 @@ fn reserve_handoff_in(
             launch_started: false,
             launch: None,
         }));
+        if let (Some(lease), Some(identity)) = (&target.lease, target.identity) {
+            prepared_scope = Some(lease.retirement().prepare_handoff_identity_scope(
+                row,
+                &observation_storage,
+                identity,
+            )?);
+        }
         Ok(HandoffKey {
             id: intent_id,
             generation,
         })
-    })?;
+    });
+    if owner.key.is_some() {
+        if let (Some(lease), Some(scope)) = (&target.lease, prepared_scope) {
+            lease.retirement().record_handoff_identity_scope(scope);
+        }
+    }
+    reserved?;
     Ok(owner)
 }
 
@@ -838,7 +894,13 @@ fn record_retired_handoff_in(
         );
         if let Some(event) = final_context_event.as_ref() {
             let change = crate::server::acp_events::derive_acp_session_change(event);
-            crate::server::acp_events::apply_acp_session_change(row, session_id, change.as_ref());
+            // The matched handoff owns this final context from the original retired worker.
+            crate::server::acp_events::apply_acp_session_change(
+                row,
+                session_id,
+                change.as_ref(),
+                true,
+            );
         }
         let terminal = match &intent.context {
             TerminalHandoffContext::Keep { native_store } => {
@@ -1075,7 +1137,7 @@ async fn terminal_handoff_request(state: Arc<AppState>, id: String) -> Response 
                 .acp_event_store
                 .handoff_context_event(&id, 0, source_event_seq)
             {
-                Ok(Some((_, crate::acp::Event::AcpSessionAssigned { acp_session_id })))
+                Ok(Some((_, crate::acp::Event::AcpSessionAssigned { acp_session_id, .. })))
                     if instance.acp_session_id.as_deref() == Some(acp_session_id.as_str()) => {}
                 Ok(Some(_)) => {
                     return handoff_unavailable(&anyhow::anyhow!(
@@ -1205,9 +1267,12 @@ fn drive_terminal_handoff(
             match intent.stage {
                 _ if !claimed => {
                     let unclaimed = TerminalHandoff::new(native, id.clone(), driver.clone());
+                    let claim_state = state.clone();
                     owner = Some(
-                        tokio::task::spawn_blocking(move || claim_handoff_in(unclaimed, key))
-                            .await??,
+                        tokio::task::spawn_blocking(move || {
+                            claim_handoff_in(unclaimed, key, &claim_state)
+                        })
+                        .await??,
                     );
                     claimed = true;
                 }
@@ -1574,10 +1639,15 @@ mod tests {
         let mut request = spawn_request(&row.id);
         request.source_profile = Some(row.source_profile.clone());
         request.expected_lifecycle_generation = row.lifecycle_generation;
+        let storage =
+            Arc::new(crate::session::Storage::open_unwatched(&row.source_profile).unwrap());
+        let native_scope =
+            Some(crate::acp::state::NativeObservationScope::capture(row, &storage).unwrap());
         request.launch_admission = Some(crate::acp::supervisor::LaunchAdmission {
-            store: Arc::new(crate::session::Storage::open_unwatched(&row.source_profile).unwrap()),
+            store: storage,
             generation: row.lifecycle_generation,
             namespace: Some(state.profile_namespace.clone()),
+            native_scope,
         });
         lease.set_admission(request.launch_admission.clone());
         let supervisor = state.acp_supervisor.clone();
@@ -1694,12 +1764,17 @@ mod tests {
             )
             .await?;
         let lease = producer.lease().clone();
+        let storage = Arc::new(crate::session::Storage::open_unwatched(
+            &row.source_profile,
+        )?);
+        let native_scope = Some(crate::acp::state::NativeObservationScope::capture(
+            &row, &storage,
+        )?);
         lease.set_admission(Some(crate::acp::supervisor::LaunchAdmission {
-            store: Arc::new(crate::session::Storage::open_unwatched(
-                &row.source_profile,
-            )?),
+            store: storage,
             generation: row.lifecycle_generation,
             namespace: Some(state.profile_namespace.clone()),
+            native_scope,
         }));
         let cancellation = lease.cancellation().clone();
         let disabling = acp_disable(State(state.clone()), Path(row.id.clone()));
@@ -2455,12 +2530,14 @@ mod tests {
         producer_events
             .send(Event::AcpSessionAssigned {
                 acp_session_id: initial_sid.into(),
+                connection_ready: false,
+                native_subject: None,
             })
             .await?;
         let initial_frame = tokio::time::timeout(Duration::from_secs(5), frames.recv()).await??;
         assert_eq!(initial_frame.worker_generation, Some(lease.epoch()));
         assert!(
-            matches!(initial_frame.event.as_ref(), Event::AcpSessionAssigned { acp_session_id } if acp_session_id == initial_sid)
+            matches!(initial_frame.event.as_ref(), Event::AcpSessionAssigned { acp_session_id, .. } if acp_session_id == initial_sid)
         );
         assert_eq!(
             state
@@ -2523,34 +2600,50 @@ mod tests {
         std::fs::write(&final_transcript, &final_bytes)?;
         worker_registry::update_stored_acp_session_id(&row.id, pid, final_sid)?;
         producer_events
+            .send(Event::AgentMessageChunk {
+                text: "old producer traffic is not new-root turn authority".into(),
+                message_id: None,
+            })
+            .await?;
+        producer_events
+            .send(Event::Stopped {
+                reason: "prompt_complete".into(),
+            })
+            .await?;
+        producer_events
             .send(Event::AcpSessionAssigned {
                 acp_session_id: final_sid.into(),
+                connection_ready: true,
+                native_subject: None,
             })
             .await?;
         let final_frame = tokio::time::timeout(Duration::from_secs(5), frames.recv()).await??;
         assert_eq!(final_frame.worker_generation, Some(lease.epoch()));
         assert!(
-            matches!(final_frame.event.as_ref(), Event::AcpSessionAssigned { acp_session_id } if acp_session_id == final_sid)
+            matches!(final_frame.event.as_ref(), Event::AcpSessionAssigned {
+                acp_session_id, connection_ready: false, ..
+            } if acp_session_id == final_sid)
         );
-        assert!(final_frame.seq > intent.source_event_seq);
-        producer_events
-            .send(Event::AgentMessageChunk {
-                text: "original producer finished materializing its native context".into(),
-                message_id: None,
-            })
-            .await?;
-        let tail_frame = tokio::time::timeout(Duration::from_secs(5), frames.recv()).await??;
-        assert_eq!(tail_frame.worker_generation, Some(lease.epoch()));
-        assert!(tail_frame.seq > final_frame.seq);
-        assert!(matches!(
-            tail_frame.event.as_ref(),
-            Event::AgentMessageChunk { .. }
-        ));
+        assert_eq!(
+            final_frame.seq,
+            initial_frame.seq + 1,
+            "old-root turn/status traffic must not allocate or persist new-root events"
+        );
+        assert!(
+            lease
+                .native_scope()
+                .unwrap()
+                .unwrap()
+                .fence
+                .lock_observation()
+                .is_err(),
+            "metadata custody must never heal the native-control fence"
+        );
         assert!(matches!(
             state.acp_event_store.handoff_context_event(
-                &row.id, intent.source_event_seq, tail_frame.seq,
+                &row.id, intent.source_event_seq, final_frame.seq,
             )?,
-            Some((seq, Event::AcpSessionAssigned { acp_session_id }))
+            Some((seq, Event::AcpSessionAssigned { acp_session_id, .. }))
                 if seq == final_frame.seq && acp_session_id == final_sid
         ));
         let record =

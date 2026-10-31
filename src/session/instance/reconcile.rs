@@ -25,27 +25,27 @@ impl Instance {
         &mut self,
         storage: &dyn crate::session::SessionStore,
     ) -> Result<()> {
-        let mut disk = storage
+        let disk = storage
             .load()?
             .into_iter()
             .find(|row| row.id == self.id)
             .ok_or(LifecycleReservationError::Superseded)?;
+        self.reconcile_loaded(disk, storage.storage().profile());
+        Ok(())
+    }
+
+    pub(super) fn reconcile_loaded(&mut self, mut disk: Self, profile: &str) {
         let preserve_errors = disk.lifecycle_generation <= self.lifecycle_generation;
-        disk.source_profile = if self.source_profile == storage.storage().profile() {
+        disk.source_profile = if self.source_profile == profile {
             std::mem::take(&mut self.source_profile)
         } else {
-            storage.storage().profile().to_owned()
+            profile.to_owned()
         };
-        // The poller and the repair window both describe the launch this row was
-        // holding. A row the store now describes can run another one, so neither
-        // crosses over: a poller for the launch the row gives up keeps reading
-        // files this row no longer owns, and a window armed for it paces an
-        // attempt this row never made.
+        // Runtime custody follows the same held conversation rules as a disk reload.
         let prior = std::mem::replace(self, disk);
         let handoff = Handoff::decide(&prior.capture_poller, prior.held(), self.held());
         self.inherit_runtime(prior, preserve_errors);
         handoff.settle(&mut self.capture_poller);
-        Ok(())
     }
 
     /// Flush the previous pane's publication before its source is retired.

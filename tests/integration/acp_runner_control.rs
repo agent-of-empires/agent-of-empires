@@ -1,4 +1,4 @@
-//! Integration tests for the runner's control-only v3 transport.
+//! Integration tests for the runner's control-only v4 transport.
 //!
 //! The scenarios spawn real `aoe __acp-runner` processes with deterministic
 //! stand-in agents and exercise framed handshake, forward-lane, reverse-lane,
@@ -11,6 +11,7 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use agent_of_empires::acp::acp_client::AcpClient;
+use agent_of_empires::acp::control_protocol::CONTROL_PROTOCOL_VERSION;
 use agent_of_empires::acp::state::AcpSessionId;
 
 /// App data dir for the debug binary under this test's env, mirroring the
@@ -124,7 +125,7 @@ fn read_frame(stream: &mut UnixStream) -> serde_json::Value {
     serde_json::from_slice(&body).expect("parse frame json")
 }
 
-/// The v3 core loop over real sockets and framing: an
+/// The current control loop over real sockets and framing: an
 /// agent-issued request reaches the daemon as a `ServerCall`, and the
 /// daemon's `ServerResult` reaches the agent as a JSON-RPC response echoing
 /// the agent's own id.
@@ -180,7 +181,7 @@ fn runner_proxies_agent_requests_over_the_control_channel() {
     // #2977: the relay socket is retired, so the runner must NOT create it.
     assert!(
         !socket.exists(),
-        "a v3 runner must not bind the retired raw socket at {}",
+        "a current runner must not bind the retired raw socket at {}",
         socket.display()
     );
 
@@ -189,11 +190,11 @@ fn runner_proxies_agent_requests_over_the_control_channel() {
     let hello = read_frame(&mut ctl);
     assert_eq!(hello["kind"], "hello", "first control frame is Hello");
     assert_eq!(hello["session_id"], session_id);
-    assert_eq!(hello["control_protocol_version"], 3);
+    assert_eq!(hello["control_protocol_version"], CONTROL_PROTOCOL_VERSION);
 
     write_frame(
         &mut ctl,
-        &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
+        &serde_json::json!({"kind": "attach", "control_protocol_version": CONTROL_PROTOCOL_VERSION}),
     );
 
     // Drive an agent-to-client request through cat. `fs/read_text_file` goes
@@ -390,7 +391,7 @@ for line in sys.stdin:
         assert_eq!(read_frame(stream)["kind"], "hello");
         write_frame(
             stream,
-            &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
+            &serde_json::json!({"kind": "attach", "control_protocol_version": CONTROL_PROTOCOL_VERSION}),
         );
     };
     let initialize = |stream: &mut UnixStream| {
@@ -544,7 +545,7 @@ for line in sys.stdin:
     assert_eq!(read_frame(&mut ctl)["kind"], "hello");
     write_frame(
         &mut ctl,
-        &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
+        &serde_json::json!({"kind": "attach", "control_protocol_version": CONTROL_PROTOCOL_VERSION}),
     );
     write_frame(
         &mut ctl,
@@ -608,7 +609,7 @@ for line in sys.stdin:
     assert_eq!(read_frame(&mut resumed)["kind"], "hello");
     write_frame(
         &mut resumed,
-        &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
+        &serde_json::json!({"kind": "attach", "control_protocol_version": CONTROL_PROTOCOL_VERSION}),
     );
     assert_eq!(
         read_typed_frame(&mut resumed),
@@ -633,7 +634,7 @@ fn find_python3() -> Option<PathBuf> {
 }
 
 #[tokio::test]
-#[serial_test::parallel]
+#[serial_test::serial]
 async fn cancelled_attach_reaps_runner_before_replacement_load_fallback() {
     if cfg!(not(unix)) {
         return;
@@ -643,11 +644,13 @@ async fn cancelled_attach_reaps_runner_before_replacement_load_fallback() {
         return;
     };
 
+    let mut env = agent_of_empires::server::test_support::RuntimeEnvGuard::read_lock();
     let scratch = Scratch::new("latehs");
     let home = scratch.0.join("home");
     let xdg = scratch.0.join("xdg");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&xdg).unwrap();
+    env.bind(&xdg);
 
     let agent_log = scratch.0.join("agent-methods.log");
     let agent_pid_file = scratch.0.join("agent.pid");
@@ -727,7 +730,7 @@ for line in sys.stdin:
     wait_for(&control, "old control socket");
     assert!(
         !socket.exists(),
-        "a v3 runner must not bind the retired raw socket at {}",
+        "a current runner must not bind the retired raw socket at {}",
         socket.display()
     );
     let old_agent_pid = wait_for_u32(&agent_pid_file, "old agent pid");
@@ -797,7 +800,7 @@ for line in sys.stdin:
     assert_eq!(read_frame(&mut ctl)["kind"], "hello");
     write_frame(
         &mut ctl,
-        &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
+        &serde_json::json!({"kind": "attach", "control_protocol_version": CONTROL_PROTOCOL_VERSION}),
     );
     write_frame(
         &mut ctl,
@@ -856,7 +859,7 @@ for line in sys.stdin:
     drop(replacement);
 }
 
-/// The runner owns the ACP handshake. Drive it as a v3
+/// The runner owns the ACP handshake. Drive it as a current
 /// daemon over the control channel across two attaches and assert the
 /// agent is handshaken (initialize + session/new) exactly once, that the
 /// second attach replays the cache without touching the agent, and that a
@@ -950,19 +953,17 @@ for line in sys.stdin:
     wait_for(&record, "registry record");
     wait_for(&control, "control socket");
 
-    let v3 = serde_json::json!(3);
-
     // --- First attach: the runner runs the handshake against the agent. ---
     {
         let mut ctl = UnixStream::connect(&control).expect("connect control socket");
         ctl.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         let hello = read_frame(&mut ctl);
         assert_eq!(hello["kind"], "hello");
-        assert_eq!(hello["control_protocol_version"], v3);
+        assert_eq!(hello["control_protocol_version"], CONTROL_PROTOCOL_VERSION);
 
         write_frame(
             &mut ctl,
-            &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
+            &serde_json::json!({"kind": "attach", "control_protocol_version": CONTROL_PROTOCOL_VERSION}),
         );
         write_frame(
             &mut ctl,
@@ -1002,7 +1003,7 @@ for line in sys.stdin:
 
         write_frame(
             &mut ctl,
-            &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
+            &serde_json::json!({"kind": "attach", "control_protocol_version": CONTROL_PROTOCOL_VERSION}),
         );
         let replayed = read_typed_frame(&mut ctl);
         assert_eq!(replayed["kind"], "prompt_completed");
@@ -1113,7 +1114,7 @@ fn runner_load_uses_requested_id_and_caches_response() {
         assert_eq!(read_frame(&mut ctl)["kind"], "hello");
         write_frame(
             &mut ctl,
-            &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
+            &serde_json::json!({"kind": "attach", "control_protocol_version": CONTROL_PROTOCOL_VERSION}),
         );
         write_frame(
             &mut ctl,
@@ -1157,7 +1158,7 @@ fn runner_load_uses_requested_id_and_caches_response() {
         assert_eq!(read_frame(&mut ctl)["kind"], "hello");
         write_frame(
             &mut ctl,
-            &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
+            &serde_json::json!({"kind": "attach", "control_protocol_version": CONTROL_PROTOCOL_VERSION}),
         );
         write_frame(
             &mut ctl,
@@ -1282,7 +1283,7 @@ for line in sys.stdin:
 
     write_frame(
         &mut ctl,
-        &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
+        &serde_json::json!({"kind": "attach", "control_protocol_version": CONTROL_PROTOCOL_VERSION}),
     );
     write_frame(
         &mut ctl,
@@ -1308,7 +1309,7 @@ for line in sys.stdin:
 /// The replacement daemon must wait for an already-sent reset and use its
 /// committed identity, without loading or creating another agent session.
 #[tokio::test]
-#[serial_test::parallel]
+#[serial_test::serial]
 async fn resumed_client_uses_reset_committed_after_reattach() {
     use agent_of_empires::acp::control_protocol::{self, ControlBody};
     use agent_of_empires::acp::state::Event;
@@ -1316,11 +1317,13 @@ async fn resumed_client_uses_reset_committed_after_reattach() {
     let Some(python3) = find_python3() else {
         return;
     };
+    let mut env = agent_of_empires::server::test_support::RuntimeEnvGuard::read_lock();
     let scratch = Scratch::new("reset-resume");
     let home = scratch.0.join("home");
     let xdg = scratch.0.join("xdg");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&xdg).unwrap();
+    env.bind(&xdg);
     let received = scratch.0.join("reset-received");
     let release = scratch.0.join("release-reset");
     let agent = scratch.0.join("agent.py");
@@ -1457,7 +1460,7 @@ for line in sys.stdin:
             .unwrap()
             .unwrap()
         {
-            Event::AcpSessionAssigned { acp_session_id } => assigned = Some(acp_session_id),
+            Event::AcpSessionAssigned { acp_session_id, .. } => assigned = Some(acp_session_id),
             Event::AgentMessageChunk { text, .. } => addressed = Some(text),
             _ => {}
         }
@@ -1475,7 +1478,7 @@ for line in sys.stdin:
 /// replay bound ("pending native session updates exceed replay capacity") and
 /// the reconciler terminated the worker. See #3937.
 #[tokio::test]
-#[serial_test::parallel]
+#[serial_test::serial]
 async fn streaming_during_reattach_does_not_overflow_pending_replay() {
     use agent_of_empires::acp::control_protocol::{self, ControlBody};
     use agent_of_empires::acp::state::Event;
@@ -1483,11 +1486,13 @@ async fn streaming_during_reattach_does_not_overflow_pending_replay() {
     let Some(python3) = find_python3() else {
         return;
     };
+    let mut env = agent_of_empires::server::test_support::RuntimeEnvGuard::read_lock();
     let scratch = Scratch::new("stream-reattach");
     let home = scratch.0.join("home");
     let xdg = scratch.0.join("xdg");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&xdg).unwrap();
+    env.bind(&xdg);
     let trigger = scratch.0.join("flood-trigger");
     let flooded = scratch.0.join("flooded");
     let agent = scratch.0.join("agent.py");
@@ -1625,7 +1630,7 @@ for line in sys.stdin:
             .unwrap()
             .unwrap()
         {
-            Event::AcpSessionAssigned { acp_session_id } => assigned = Some(acp_session_id),
+            Event::AcpSessionAssigned { acp_session_id, .. } => assigned = Some(acp_session_id),
             Event::AgentMessageChunk { .. } => chunks += 1,
             Event::AgentStartupError { .. } => {
                 panic!("reattach overflowed pending replay and the worker was killed")
@@ -1638,13 +1643,14 @@ for line in sys.stdin:
 }
 
 #[tokio::test]
-#[serial_test::parallel]
+#[serial_test::serial]
 async fn resumed_prompt_completes_only_for_its_own_runner_request() {
     use agent_of_empires::acp::state::Event;
 
     let Some(python3) = find_python3() else {
         return;
     };
+    let mut env = agent_of_empires::server::test_support::RuntimeEnvGuard::read_lock();
     for old_first in [true, false] {
         let scratch = Scratch::new(if old_first {
             "prompt-old-first"
@@ -1655,6 +1661,7 @@ async fn resumed_prompt_completes_only_for_its_own_runner_request() {
         let xdg = scratch.0.join("xdg");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&xdg).unwrap();
+        env.bind(&xdg);
         let received = scratch.0.join("old-received");
         let agent = scratch.0.join("agent.py");
         std::fs::write(
@@ -1727,7 +1734,7 @@ for line in sys.stdin:
         assert_eq!(read_frame(&mut first)["kind"], "hello");
         write_frame(
             &mut first,
-            &serde_json::json!({"kind":"attach","control_protocol_version":3}),
+            &serde_json::json!({"kind":"attach","control_protocol_version":CONTROL_PROTOCOL_VERSION}),
         );
         write_frame(
             &mut first,
@@ -1857,7 +1864,7 @@ for line in sys.stdin:
         assert_eq!(read_frame(&mut stream)["kind"], "hello");
         write_frame(
             &mut stream,
-            &serde_json::json!({"kind":"attach","control_protocol_version":3}),
+            &serde_json::json!({"kind":"attach","control_protocol_version":CONTROL_PROTOCOL_VERSION}),
         );
         stream
     };
@@ -1992,8 +1999,8 @@ for line in sys.stdin:
     }
 }
 
-/// The real runner owns a busy native turn. A proxy withholds only a cached
-/// initialize response, so the daemon deadline cannot be confused with agent death.
+/// Pause the actual runner while its native agent owns a busy turn. The bounded
+/// Hello wait must preserve that original turn, with no proxy/peer-proof bypass.
 #[tokio::test]
 #[serial_test::serial]
 async fn borrowed_attach_timeout_preserves_real_runner_and_native_turn() {
@@ -2158,74 +2165,37 @@ for line in sys.stdin:
     assert_eq!(line, "prompt_started\n");
     drop(initial);
 
-    // Keep the registry's exact producer identity, but route daemon observation
-    // through a gate in front of the real runner's existing control socket.
-    let proxy_socket = scratch.0.join("attempt.sock");
-    let proxy_control = agent_of_empires::process::worker::control_socket_sibling(&proxy_socket);
-    let listener = tokio::net::UnixListener::bind(proxy_control).unwrap();
-    let mut original = worker_registry::load(id).unwrap().unwrap();
+    let original = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(record) = worker_registry::load(id).unwrap() {
+                if record.detached_at.is_some() {
+                    // Detach may become readable before its writer unlocks.
+                    // Re-saving this complete unchanged record acquires/releases
+                    // that same registry flock before freezing the real owner.
+                    // With its prompt held and no control peer, no later writer
+                    // can run until this test resumes or reattaches the runner.
+                    worker_registry::save(&record).unwrap();
+                    break record;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("original runner completes and unlocks its detach record");
     assert_eq!(original.pid, runner.0.id());
     assert_eq!(
         original.stored_acp_session_id.as_deref(),
         Some("owned-native-session")
     );
-    original.socket_path = proxy_socket;
-    worker_registry::save(&original).unwrap();
     let identity = RunnerIdentity::from_record(&original);
     assert!(identity.birth_fingerprint.is_some());
-    let (held_tx, held_rx) = tokio::sync::oneshot::channel();
-    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
-    let mut proxy = tokio::task::JoinSet::new();
-    proxy.spawn(async move {
-        let mut held_tx = Some(held_tx);
-        let mut closed_tx = Some(closed_tx);
-        for attempt in 0..2 {
-            let (mut daemon, _) = listener.accept().await.unwrap();
-            let mut producer = tokio::net::UnixStream::connect(&real_control)
-                .await
-                .unwrap();
-            if attempt == 1 {
-                tokio::io::copy_bidirectional(&mut daemon, &mut producer)
-                    .await
-                    .unwrap();
-                continue;
-            }
-            let hello = control_protocol::read_frame(&mut producer)
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(matches!(hello, ControlBody::Hello { .. }));
-            control_protocol::write_frame(&mut daemon, &hello)
-                .await
-                .unwrap();
-            for initialize in [false, true] {
-                let command = control_protocol::read_frame(&mut daemon)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert!(matches!(
-                    (&command, initialize),
-                    (ControlBody::Attach { .. }, false) | (ControlBody::Initialize { .. }, true)
-                ));
-                control_protocol::write_frame(&mut producer, &command)
-                    .await
-                    .unwrap();
-            }
-            let initialized = control_protocol::read_frame(&mut producer)
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(matches!(initialized, ControlBody::Initialized { .. }));
-            held_tx.take().unwrap().send(()).unwrap();
-            assert_eq!(
-                control_protocol::read_frame(&mut daemon).await.unwrap(),
-                None,
-                "a timed-out observer must send no cancel, close, or delete"
-            );
-            drop(producer);
-            closed_tx.take().unwrap().send(()).unwrap();
-        }
-    });
+    let runner_pid = nix::unistd::Pid::from_raw(original.pid as i32);
+    nix::sys::signal::kill(runner_pid, nix::sys::signal::Signal::SIGSTOP).unwrap();
+    assert!(matches!(
+        nix::sys::wait::waitpid(runner_pid, Some(nix::sys::wait::WaitPidFlag::WUNTRACED)).unwrap(),
+        nix::sys::wait::WaitStatus::Stopped(pid, nix::sys::signal::Signal::SIGSTOP) if pid == runner_pid
+    ));
     let store = Arc::new(EventStore::open(&scratch.0.join("consumer.db"), 1000).unwrap());
     let (tx, mut rx) = tokio::sync::broadcast::channel(64);
     let sink = Arc::new(ChannelSink {
@@ -2246,22 +2216,21 @@ for line in sys.stdin:
     );
     let supervisor = Arc::new(Supervisor::new(sink));
     supervisor.hydrate_seqs(store.all_session_seqs());
-    let attaching = tokio::spawn({
-        let supervisor = supervisor.clone();
-        let home = home.clone();
-        async move { supervisor.attach(id.into(), home, vec![], true, None).await }
-    });
-    held_rx.await.unwrap();
-    tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(3)).await;
-    tokio::time::resume();
-    assert!(matches!(
-        attaching.await.unwrap(),
-        Err(SupervisorError::Acp(
-            agent_of_empires::acp::acp_client::AcpError::AttachTimedOut
-        ))
-    ));
-    closed_rx.await.unwrap();
+    let attaching = tokio::time::timeout(
+        Duration::from_secs(10),
+        supervisor.attach(id.into(), home.clone(), vec![], true, None),
+    )
+    .await;
+    nix::sys::signal::kill(runner_pid, nix::sys::signal::Signal::SIGCONT).unwrap();
+    assert!(
+        matches!(
+            attaching,
+            Ok(Err(SupervisorError::Acp(
+                agent_of_empires::acp::acp_client::AcpError::AttachTimedOut
+            )))
+        ),
+        "{attaching:?}"
+    );
     assert!(runner.0.try_wait().unwrap().is_none());
     assert!(worker_registry::is_pid_alive(agent_pid));
     let retained = worker_registry::load(id).unwrap().unwrap();
@@ -2278,10 +2247,13 @@ for line in sys.stdin:
         .iter()
         .any(|(_, event)| matches!(event, Event::Stopped { .. })));
 
-    supervisor
-        .attach(id.into(), home, vec![], true, None)
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        supervisor.attach(id.into(), home, vec![], true, None),
+    )
+    .await
+    .expect("resumed original runner completes bounded reattachment")
+    .unwrap();
     assert_eq!(supervisor.running_identity(id), Some(identity));
     gate.get_mut().write_all(b"c").await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -2293,7 +2265,7 @@ for line in sys.stdin:
     .unwrap();
     let events = store.replay_from(id, 0);
     assert!(events.iter().any(|(_, event)| matches!(event,
-        Event::AcpSessionAssigned { acp_session_id } if acp_session_id == "owned-native-session")));
+        Event::AcpSessionAssigned { acp_session_id, .. } if acp_session_id == "owned-native-session")));
     assert!(events.iter().any(|(_, event)| matches!(event,
         Event::AgentMessageChunk { text, .. } if text == "real original turn completed")));
     let stops: Vec<_> = events
@@ -2332,5 +2304,4 @@ for line in sys.stdin:
     assert!(runner.0.try_wait().unwrap().is_none());
     assert!(worker_registry::is_pid_alive(agent_pid));
     supervisor.detach_all().await;
-    proxy.join_next().await.unwrap().unwrap();
 }

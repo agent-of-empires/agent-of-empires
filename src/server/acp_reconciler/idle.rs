@@ -473,6 +473,8 @@ mod tests {
                     vec![],
                     vec![Event::AcpSessionAssigned {
                         acp_session_id: "acp-1".to_string(),
+                        connection_ready: false,
+                        native_subject: None,
                     }],
                 ),
                 Running,
