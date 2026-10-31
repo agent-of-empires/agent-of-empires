@@ -150,6 +150,44 @@ Non-ACP tools always run in the terminal view, with no toggle.
 
 See the [local Daemon workflow](quick-start.md#launch-the-tui) for startup, shutdown, and recovery. Structured sidebar statuses arrive through the runtime WebSocket. Reconnecting restores live state.
 
+### Inspecting Trash in the TUI
+
+Select a session in the expanded **Trash** section to read its retained ACP
+transcript. Inspection never starts an agent or prepares a terminal or tool pane,
+regardless of the session's current view or click preference.
+
+![Read-only Trash inspection with retained ACP history and a text selection](assets/structured-view/trash-readonly.png)
+
+Scroll with the mouse wheel. Without reader focus, use **Earlier/Later** in the
+footer or **Shift+PageUp/PageDown**. Press **Enter** to focus the reader and use
+**Up/Down**, **PageUp/PageDown**, and **Home/End**. Drag over text to copy it.
+**Esc** returns to the session list. Restore and permanent deletion remain
+separate management actions shown in the footer.
+
+Opening **System Health** releases reader keyboard focus. Press **Enter** to
+return to the selected Trash transcript.
+
+Tool arguments, structured changes, and retained text output are shown without
+the active view's preview limits, including successful calls. Scroll and drag to
+copy their full retained text. Media stays represented by descriptive placeholders.
+Text retained before a media-only completion remains readable beside those
+placeholders.
+Unfinished text snapshots remain readable even when their start or completion
+event is unavailable. They are labeled **completion unavailable**, not marked
+successful or stopped. Wrapping and copy preserve painted Unicode graphemes.
+
+Rename and workdir dialogs, quick permission replies, and pending Trash
+confirmations close if their session changes lifecycle or disappears. A pending
+dialog cannot retarget another session when the list updates.
+
+The reader folds persisted ACP events across all retained pages, including events
+recorded before a switch to terminal view. Missing or unreadable event ranges are
+marked explicitly, even when no readable transcript rows remain. It does not
+import native agent history files: their formats and availability vary by agent
+and execution environment.
+Missing content and read failures are shown without restarting the agent.
+Destroyed tmux scrollback cannot be recovered by this reader.
+
 ### Launch command and session naming
 
 `--cmd <tool>` uses `session.agent_command_override`, preserving required ACP arguments, such as `opencode acp`. Adapter-backed agents use `session.agent_acp_cmd` for a full command swap. The wizard displays the resolved command read-only.

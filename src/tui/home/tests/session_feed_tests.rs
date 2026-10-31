@@ -153,6 +153,90 @@ fn snapshot_of(sessions: Vec<crate::daemon::SessionResponse>) -> SessionFeedResu
 
 #[test]
 #[serial]
+fn session_dialogs_follow_their_original_identity_across_snapshots() {
+    use crate::tui::home::bindings::{self, ActionId};
+    for action in [
+        ActionId::Rename,
+        ActionId::SetWorktreeName,
+        ActionId::RespondToPermission,
+    ] {
+        let permission = action == ActionId::RespondToPermission;
+        for change in ["trash", "purge", "generation", "status"] {
+            let mut env = create_test_env_with_sessions(2);
+            for instance in env.view.cloned_instances() {
+                env.view.mutate_instance(&instance.id, |row| {
+                    row.view = crate::session::View::Terminal;
+                    row.tool = "claude".into();
+                    row.worktree_info = Some(crate::session::WorktreeInfo {
+                        branch: "fixture".into(),
+                        main_repo_path: "/tmp".into(),
+                        managed_by_aoe: true,
+                        created_at: chrono::Utc::now(),
+                        base_branch: None,
+                    });
+                });
+            }
+            env.view.cursor = 1;
+            env.view.update_selected();
+            let id = env.view.selected_session.clone().unwrap();
+            env.view
+                .session_feed
+                .publish_for_test(daemon_snapshot(&env.view, &id, "Stopped"));
+            env.view.apply_session_feed();
+            env.view
+                .handle_key(bindings::key_event(action, false).unwrap(), None);
+            assert_eq!(env.view.permission_response_dialog.is_some(), permission);
+            assert_eq!(
+                env.view.rename_dialog.is_some() || env.view.worktree_name_dialog.is_some(),
+                !permission,
+            );
+
+            let SessionFeedResult::Snapshot(mut snapshot) = daemon_snapshot(&env.view, &id, "Idle")
+            else {
+                unreachable!()
+            };
+            let next = Arc::make_mut(&mut snapshot);
+            match change {
+                "trash" => {
+                    next.contents.sessions[0].trashed_at = Some(chrono::Utc::now().to_rfc3339());
+                    next.contents.sessions[0].lifecycle_generation += 1;
+                }
+                "purge" => next.contents.sessions.retain(|row| row.id != id),
+                "generation" => next.contents.sessions[0].lifecycle_generation += 1,
+                "status" => {}
+                _ => unreachable!(),
+            }
+            env.view
+                .session_feed
+                .publish_for_test(SessionFeedResult::Snapshot(snapshot));
+            env.view.apply_session_feed();
+            env.view.enforce_trash_read_only();
+            let retained = change == "status";
+            assert_eq!(
+                env.view.permission_response_dialog.is_some(),
+                permission && retained,
+                "action={action:?}, change={change}",
+            );
+            assert_eq!(
+                env.view.rename_dialog.is_some() || env.view.worktree_name_dialog.is_some(),
+                !permission && retained,
+                "action={action:?}, change={change}",
+            );
+            if !retained {
+                assert!(env.view.pending_permission_response.is_none());
+                assert!(
+                    env.view
+                        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), None)
+                        .is_none(),
+                    "a stale dialog submit must not activate the replacement selection",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[serial]
 fn native_attachment_never_survives_a_cancelled_context() {
     use crate::daemon::{MutationReceipt, RuntimeCursor, TerminalTarget, TerminalTargetStatus};
     use crate::session::{AuxiliaryObservation, AuxiliaryTarget, PanePresence};
@@ -2733,6 +2817,130 @@ fn diff_keyboard_and_mouse_refusal_are_visible_dismissible_and_keep_comparison()
         assert_eq!(payload_bytes("test"), bytes);
         assert!(respond(Err("original pending stop".into())).is_some());
         assert!(respond(Err("must not have submitted diff".into())).is_none());
+    }
+}
+
+#[test]
+#[serial]
+fn trash_transition_discards_diff_and_delayed_base_save() {
+    let (mut env, id, _repo) = diff_admission_fixture();
+    let mut commands = env.view.session_feed.command_driver_for_test();
+    env.view
+        .diff_view
+        .as_mut()
+        .unwrap()
+        .select_branch("review".into());
+    env.view
+        .mutate_instance(&id, |inst| inst.trashed_at = Some(chrono::Utc::now()));
+    env.view.drain_pending_diff_override();
+    assert!(commands(Err("unexpected diff save".into())).is_none());
+    env.view.enforce_trash_read_only();
+    assert!(env.view.diff_view.is_none());
+}
+
+#[test]
+#[serial]
+fn trash_transition_cancels_auxiliary_stop_confirmation_and_late_submit() {
+    for late_submit in [false, true] {
+        let mut env = create_test_env_with_sessions(1);
+        let id = env.view.instance_at(0).id.clone();
+        let snapshot = daemon_snapshot(&env.view, &id, "Stopped");
+        env.view.session_feed.publish_for_test(snapshot);
+        env.view.apply_session_feed();
+        let mut commands = env.view.session_feed.command_driver_for_test();
+        env.view.select_session_by_id(&id);
+        assert!(env.view.session_feed.can_submit(&id));
+        env.view.pending_stop_auxiliary = Some((
+            id.clone(),
+            crate::daemon::StopAuxiliaryBody {
+                target: crate::session::AuxiliaryTarget::Host { index: 0 },
+                adoption: None,
+            },
+        ));
+        env.view.confirm_dialog = Some(crate::tui::dialogs::ConfirmDialog::new(
+            "Kill Terminal",
+            "fixture",
+            "stop_auxiliary",
+        ));
+        env.view
+            .mutate_instance(&id, |inst| inst.trashed_at = Some(chrono::Utc::now()));
+        if late_submit {
+            env.view.dispatch_confirm_submit("stop_auxiliary");
+        } else {
+            env.view.enforce_trash_read_only();
+            assert!(env.view.confirm_dialog.is_none());
+        }
+        assert!(env.view.pending_stop_auxiliary.is_none());
+        assert!(commands(Err("unexpected stop".into())).is_none());
+    }
+}
+
+#[test]
+#[serial]
+fn trash_confirmation_rejects_a_changed_original_target() {
+    for change in ["trash", "generation", "purge", "selection"] {
+        for late_submit in [false, true] {
+            let mut env = create_test_env_with_sessions(2);
+            let id = env.view.selected_session.clone().unwrap();
+            env.view
+                .session_feed
+                .publish_for_test(daemon_snapshot(&env.view, &id, "Stopped"));
+            env.view.apply_session_feed();
+            let mut requests = env.view.session_feed.request_driver_for_test();
+            env.view
+                .handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE), None);
+            assert!(env.view.pending_trash_session.is_some());
+            let SessionFeedResult::Snapshot(mut snapshot) =
+                daemon_snapshot(&env.view, &id, "Stopped")
+            else {
+                unreachable!()
+            };
+            let next = Arc::make_mut(&mut snapshot);
+            match change {
+                "trash" => {
+                    next.contents.sessions[0].trashed_at = Some(chrono::Utc::now().to_rfc3339());
+                    next.contents.sessions[0].lifecycle_generation += 1;
+                }
+                "generation" => next.contents.sessions[0].lifecycle_generation += 1,
+                "purge" => next.contents.sessions.retain(|row| row.id != id),
+                "selection" => {}
+                _ => unreachable!(),
+            }
+            env.view
+                .session_feed
+                .publish_for_test(SessionFeedResult::Snapshot(snapshot));
+            env.view.apply_session_feed();
+            let other = env
+                .view
+                .instances()
+                .find(|row| row.id != id)
+                .unwrap()
+                .id
+                .clone();
+            env.view.select_session_by_id(&other);
+            if late_submit {
+                env.view.dispatch_confirm_submit("trash_session");
+            } else {
+                env.view.enforce_trash_read_only();
+                assert_eq!(
+                    env.view.confirm_dialog.is_some(),
+                    change == "selection",
+                    "{change}"
+                );
+                if change == "selection" {
+                    env.view.dispatch_confirm_submit("trash_session");
+                }
+            }
+            assert!(env.view.pending_trash_session.is_none(), "{change}");
+            let request = requests(Err("trash request observed".into()));
+            if change == "selection" {
+                assert!(
+                    matches!(request, Some((target, crate::tui::session_feed::SessionRequest::Trash(_))) if target == id)
+                );
+            } else {
+                assert!(request.is_none(), "{change}");
+            }
+        }
     }
 }
 

@@ -612,6 +612,7 @@ impl HomeView {
         new_name: &str,
         rename_branch: bool,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.selected_is_trashed(), "Trash sessions are read-only");
         let Some(id) = self.selected_session.clone() else {
             return Ok(());
         };
@@ -667,6 +668,7 @@ impl HomeView {
         new_profile: Option<&str>,
         rename_branch: bool,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.selected_is_trashed(), "Trash sessions are read-only");
         let Some(id) = self.selected_session.clone() else {
             return Ok(());
         };
@@ -860,10 +862,18 @@ impl HomeView {
     ///
     /// The daemon commits the trash reservation, teardown and relocation; UI follows its receipt fence.
     pub(super) fn trash_session_by_id(&mut self, id: &str) {
+        let Some(instance) = self
+            .get_instance(id)
+            .filter(|instance| !instance.is_trashed())
+        else {
+            return;
+        };
+        let generation = instance.lifecycle_generation;
         if let Err(error) = self.session_feed.submit_request(
             id.to_owned(),
             crate::tui::session_feed::SessionRequest::Trash(crate::daemon::TrashSessionBody {
                 kill_pane: true,
+                expected_generation: Some(generation),
             }),
         ) {
             self.info_dialog = Some(InfoDialog::new(

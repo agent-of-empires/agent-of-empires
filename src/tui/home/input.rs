@@ -427,6 +427,169 @@ fn slice_line_columns(line: &ratatui::text::Line, from: u16, to_excl: u16, width
 const PAGE_STEP: u16 = 10;
 
 impl HomeView {
+    pub(in crate::tui) fn selected_is_trashed(&self) -> bool {
+        self.selected_session
+            .as_deref()
+            .and_then(|id| self.get_instance(id))
+            .is_some_and(|inst| inst.is_trashed())
+    }
+
+    pub(in crate::tui) fn retained_reader_focused(&self) -> bool {
+        self.selected_session
+            .as_deref()
+            .and_then(|id| self.get_instance(id))
+            .is_some_and(|inst| {
+                inst.is_trashed()
+                    && self
+                        .retained_focus
+                        .as_ref()
+                        .is_some_and(|(id, generation)| {
+                            id == &inst.id && *generation == inst.lifecycle_generation
+                        })
+            })
+    }
+
+    fn selected_dialog_target(&self) -> Option<super::SessionDialogTarget> {
+        let instance = self.get_instance(self.selected_session.as_deref()?)?;
+        Some(super::SessionDialogTarget {
+            session_id: instance.id.clone(),
+            source_profile: instance.source_profile.clone(),
+            lifecycle_generation: instance.lifecycle_generation,
+        })
+    }
+
+    fn reconcile_session_dialog(&mut self) {
+        let Some(target) = self.session_dialog_target.as_ref() else {
+            return;
+        };
+        let session_rename = self
+            .rename_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.mode() == RenameMode::Session);
+        if !session_rename
+            && self.worktree_name_dialog.is_none()
+            && self.restart_dialog.is_none()
+            && self.tool_picker_dialog.is_none()
+            && self.permission_response_dialog.is_none()
+        {
+            self.session_dialog_target = None;
+            return;
+        }
+        let valid = self.selected_session.as_deref() == Some(target.session_id.as_str())
+            && self
+                .get_instance(&target.session_id)
+                .is_some_and(|instance| {
+                    instance.source_profile == target.source_profile
+                        && instance.lifecycle_generation == target.lifecycle_generation
+                        && !instance.is_trashed()
+                        && (self.permission_response_dialog.is_none() || !instance.is_archived())
+                });
+        if valid {
+            return;
+        }
+        if session_rename {
+            self.rename_dialog = None;
+        }
+        self.worktree_name_dialog = None;
+        self.restart_dialog = None;
+        self.tool_picker_dialog = None;
+        self.permission_response_dialog = None;
+        self.pending_permission_response = None;
+        self.session_dialog_target = None;
+        self.info_dialog = Some(InfoDialog::new(
+            "Session Changed",
+            "The session changed or is no longer selected. The pending edit or response was cancelled.",
+        ));
+    }
+
+    fn trash_confirmation_is_current(&self, target: &super::SessionDialogTarget) -> bool {
+        self.get_instance(&target.session_id)
+            .is_some_and(|instance| {
+                instance.source_profile == target.source_profile
+                    && instance.lifecycle_generation == target.lifecycle_generation
+                    && !instance.is_trashed()
+            })
+            && self
+                .session_feed
+                .applied_session(&target.session_id)
+                .is_some_and(|row| {
+                    row.profile == target.source_profile
+                        && row.lifecycle_generation == target.lifecycle_generation
+                        && row.trashed_at.is_none()
+                })
+    }
+
+    fn reconcile_trash_confirmation(&mut self) {
+        if self
+            .pending_trash_session
+            .as_ref()
+            .is_none_or(|target| self.trash_confirmation_is_current(target))
+        {
+            return;
+        }
+        self.pending_trash_session = None;
+        if self
+            .confirm_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.action() == "trash_session")
+        {
+            self.confirm_dialog = None;
+            self.info_dialog = Some(InfoDialog::new(
+                "Session Changed",
+                "The session changed. The pending trash operation was cancelled.",
+            ));
+        }
+    }
+
+    pub(in crate::tui) fn enforce_trash_read_only(&mut self) {
+        self.reconcile_trash_confirmation();
+        self.reconcile_session_dialog();
+        if !self.selected_is_trashed() {
+            return;
+        }
+        self.exit_live_send_if_active();
+        self.cancel_native_attachment();
+        if self.preview_capture_target.is_some() {
+            self.sync_preview_capture_worker(None);
+        }
+        self.mouse_forward_btn = None;
+        self.hover_forward_cell = None;
+        self.send_message_dialog = None;
+        self.pending_send_session = None;
+        self.permission_response_dialog = None;
+        self.pending_permission_response = None;
+        self.restart_dialog = None;
+        self.tool_picker_dialog = None;
+        if self
+            .rename_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.mode() == RenameMode::Session)
+        {
+            self.rename_dialog = None;
+        }
+        self.worktree_name_dialog = None;
+        self.attach_project_dialog = None;
+        self.snooze_duration_dialog = None;
+        self.pending_snooze_session = None;
+        self.diff_view = None;
+        self.pending_stop_session = None;
+        self.pending_stop_auxiliary = None;
+        if self
+            .confirm_dialog
+            .as_ref()
+            .is_some_and(|dialog| matches!(dialog.action(), "stop_auxiliary" | "stop_session"))
+        {
+            self.confirm_dialog = None;
+        }
+        if self
+            .context_menu
+            .as_ref()
+            .is_some_and(|menu| !menu.is_read_only_session_menu())
+        {
+            self.context_menu = None;
+        }
+    }
+
     pub fn is_diff_open(&self) -> bool {
         self.diff_view.is_some()
     }
@@ -484,6 +647,7 @@ impl HomeView {
     }
 
     fn open_tool_picker(&mut self) {
+        self.session_dialog_target = self.selected_dialog_target();
         let observed = self
             .selected_session
             .as_ref()
@@ -501,6 +665,9 @@ impl HomeView {
     }
 
     fn activate_tool(&mut self, tool_name: String, toggle_current: bool) -> Option<Action> {
+        if self.selected_is_trashed() {
+            return None;
+        }
         let observed = self.selected_session.as_ref()
             .and_then(|id| self.get_instance(id))
             .is_some_and(|row| row.auxiliary.iter().any(|observation| {
@@ -897,7 +1064,11 @@ impl HomeView {
                 // lines up from the newest, the top `offset + height - 1`. Deriving it
                 // from the offset rather than the stale `total_lines` keeps it correct
                 // before the next capture.
-                let offset = self.preview_scroll_offset as usize;
+                let offset = if self.selected_is_trashed() {
+                    self.retained_scroll_offset
+                } else {
+                    self.preview_scroll_offset as usize
+                };
                 let from_bottom = if at_top {
                     offset + (pane.height as usize).saturating_sub(1)
                 } else {
@@ -925,6 +1096,19 @@ impl HomeView {
     /// of the wheel handlers so the edge auto-scroll can move the pane without dragging
     /// the `handle_scroll_*` routing along.
     fn scroll_preview_offset(&mut self, delta: i32) -> bool {
+        if self.selected_is_trashed() {
+            let max = self
+                .preview_text_view
+                .total_lines
+                .saturating_sub(self.preview_visible_rows);
+            let new = self
+                .retained_scroll_offset
+                .saturating_add_signed(delta as isize)
+                .min(max);
+            let changed = new != self.retained_scroll_offset;
+            self.retained_scroll_offset = new;
+            return changed;
+        }
         // Use the rendered output-body height the per-frame clamp uses
         // (`clamp_scroll_to_capture`), not `dimensions.1 - 1`, which over-counts the max
         // offset by a row: on an alternate-screen agent that phantom row oscillates
@@ -1007,11 +1191,24 @@ impl HomeView {
         // The structured preview's transcript is its own line source: the view re-derives
         // the pre-wrapped rows the renderer painted (`wrapped_transcript`), so slicing
         // maps one-to-one onto the on-screen cells. Terminal previews read the tmux cache.
-        let structured_lines = self
-            .structured_preview
-            .as_ref()
-            .filter(|_| self.structured_transcript_painted)
-            .map(|v| v.selection_text(width));
+        let retained = self
+            .selected_session
+            .as_deref()
+            .and_then(|id| self.get_instance(id))
+            .filter(|inst| inst.is_trashed());
+        let structured_lines = if let Some(inst) = retained {
+            Some(
+                self.retained_preview
+                    .as_ref()
+                    .filter(|view| view.matches(inst))
+                    .map_or_else(Default::default, |view| view.selection_text(width)),
+            )
+        } else {
+            self.structured_preview
+                .as_ref()
+                .filter(|_| self.structured_transcript_painted)
+                .map(|v| v.selection_text(width))
+        };
         let lines = match structured_lines.as_ref() {
             Some(text) => text,
             None => self.active_preview_cache().parsed_text.as_ref()?,
@@ -1159,6 +1356,16 @@ impl HomeView {
                 // goes through the runtime like every other one; this process
                 // does not kill it itself.
                 if let Some((session_id, target)) = self.pending_stop_auxiliary.take() {
+                    if self
+                        .get_instance(&session_id)
+                        .is_none_or(|inst| inst.is_trashed())
+                        || self
+                            .session_feed
+                            .applied_session(&session_id)
+                            .is_some_and(|row| row.trashed_at.is_some())
+                    {
+                        return None;
+                    }
                     if let Err(error) = self.session_feed.submit(
                         session_id,
                         crate::daemon::SessionMutation::StopAuxiliary(target),
@@ -1180,8 +1387,11 @@ impl HomeView {
                 None
             }
             "trash_session" => {
-                if let Some(session_id) = self.pending_trash_session.take() {
-                    self.trash_session_by_id(&session_id);
+                self.reconcile_trash_confirmation();
+                if let Some(target) = self.pending_trash_session.take() {
+                    if self.trash_confirmation_is_current(&target) {
+                        self.trash_session_by_id(&target.session_id);
+                    }
                 }
                 None
             }
@@ -1885,6 +2095,33 @@ impl HomeView {
         // coords, so once the user does anything else the cells underneath can change and
         // it would point at unrelated content. Covers the live-send branch below too.
         self.clear_preview_selection();
+        self.enforce_trash_read_only();
+        if self.retained_reader_focused() && !self.has_non_live_send_overlay() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.retained_focus = None;
+                }
+                KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.retained_focus = None;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.scroll_preview_offset(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.scroll_preview_offset(-1);
+                }
+                KeyCode::PageUp => {
+                    self.scroll_preview_offset(i32::from(PAGE_STEP));
+                }
+                KeyCode::PageDown => {
+                    self.scroll_preview_offset(-i32::from(PAGE_STEP));
+                }
+                KeyCode::Home => self.retained_scroll_offset = usize::MAX,
+                KeyCode::End => self.retained_scroll_offset = 0,
+                _ => {}
+            }
+            return None;
+        }
 
         // Handle serve view (full-screen takeover)
         if let Some(ref mut serve) = self.serve_view {
@@ -2808,6 +3045,9 @@ impl HomeView {
             // Tab is the activation key's complement: whichever of live-send and tmux
             // attach `Enter` doesn't do. Only fires when `live_send` is None.
             KeyCode::Tab => {
+                if self.selected_is_trashed() {
+                    return None;
+                }
                 // A structured session has no tmux pane to attach or live-send into, so
                 // both Tab meanings are vacuous; say so instead of ignoring the press.
                 if let Some(id) = self.selected_session.as_deref() {
@@ -2883,6 +3123,15 @@ impl HomeView {
         else {
             return;
         };
+        if self.get_instance(&id).is_some_and(|inst| inst.is_trashed())
+            || self
+                .session_feed
+                .applied_session(&id)
+                .is_some_and(|row| row.trashed_at.is_some())
+        {
+            self.diff_view = None;
+            return;
+        }
         let Some(diff) = self.diff_view.as_ref() else {
             return;
         };
@@ -2946,6 +3195,44 @@ impl HomeView {
         // cannot diverge on what an action does.
         if id.needs_canonical_session() && self.is_creating_stub_selected() {
             self.flash_status("Still creating this session; it has no runtime yet");
+            return None;
+        }
+        if self.selected_is_trashed()
+            && !matches!(
+                id,
+                ActionId::Quit
+                    | ActionId::Help
+                    | ActionId::ResolveIndeterminate
+                    | ActionId::SearchStart
+                    | ActionId::SearchNext
+                    | ActionId::NewSession
+                    | ActionId::NewFromProject
+                    | ActionId::Serve
+                    | ActionId::Settings
+                    | ActionId::Profiles
+                    | ActionId::Projects
+                    | ActionId::Plugins
+                    | ActionId::Skills
+                    | ActionId::Update
+                    | ActionId::ToggleArchive
+                    | ActionId::Delete
+                    | ActionId::JumpPrevFinished
+                    | ActionId::JumpNextFinished
+                    | ActionId::TogglePreviewInfo
+                    | ActionId::ToggleHideStopped
+                    | ActionId::ToggleDiagnostics
+                    | ActionId::OpenSystemHealth
+                    | ActionId::SortPicker
+                    | ActionId::GroupBy
+                    | ActionId::NextWaiting
+                    | ActionId::Tips
+                    | ActionId::EmptyTrash
+                    | ActionId::OpenCommandPalette
+                    | ActionId::PreviewScrollUp
+                    | ActionId::PreviewScrollDown
+                    | ActionId::DismissUpdateBanner
+            )
+        {
             return None;
         }
         match id {
@@ -3099,10 +3386,20 @@ impl HomeView {
             ActionId::AutoName => return self.auto_name_selected(),
             ActionId::OpenCommandPalette => self.open_command_palette(),
             ActionId::PreviewScrollUp => {
-                self.preview_scroll_offset = self.preview_scroll_offset.saturating_add(PAGE_STEP)
+                if self.selected_is_trashed() {
+                    self.scroll_preview_offset(i32::from(PAGE_STEP));
+                } else {
+                    self.preview_scroll_offset =
+                        self.preview_scroll_offset.saturating_add(PAGE_STEP);
+                }
             }
             ActionId::PreviewScrollDown => {
-                self.preview_scroll_offset = self.preview_scroll_offset.saturating_sub(PAGE_STEP)
+                if self.selected_is_trashed() {
+                    self.scroll_preview_offset(-i32::from(PAGE_STEP));
+                } else {
+                    self.preview_scroll_offset =
+                        self.preview_scroll_offset.saturating_sub(PAGE_STEP);
+                }
             }
             // `App` handles the chord before the home view sees it.
             ActionId::DismissUpdateBanner => {}
@@ -3501,6 +3798,9 @@ impl HomeView {
     }
 
     fn attach_terminal_for_selected(&mut self) -> Option<Action> {
+        if self.selected_is_trashed() {
+            return None;
+        }
         // Quick-attach to paired terminal from any view.
         if let Some(id) = &self.selected_session {
             if let Some(inst) = self.get_instance(id) {
@@ -3863,7 +4163,7 @@ impl HomeView {
             sort_order: self.sort_order,
             has_search: !self.search_matches.is_empty(),
             project_group_selected: self.project_group_at_cursor().is_some(),
-            live_send,
+            preview_scroll: live_send || (self.selected_is_trashed() && !self.system_health_open),
         }
     }
 
@@ -4227,6 +4527,10 @@ impl HomeView {
     pub(super) fn activate_selected_session(&mut self) -> Option<Action> {
         self.system_health_open = false;
         let id = self.selected_session.clone()?;
+        if let Some(inst) = self.get_instance(&id).filter(|inst| inst.is_trashed()) {
+            self.retained_focus = Some((id, inst.lifecycle_generation));
+            return None;
+        }
         if let Some(inst) = self.get_instance(&id) {
             if matches!(inst.status, Status::Deleting | Status::Creating) {
                 return None;
@@ -4299,6 +4603,9 @@ impl HomeView {
     /// in-flight guards from `activate_selected_session`.
     pub(super) fn tab_attach_action(&mut self) -> Option<Action> {
         let id = self.selected_session.clone()?;
+        if self.get_instance(&id).is_some_and(|inst| inst.is_trashed()) {
+            return None;
+        }
         if let Some(inst) = self.get_instance(&id) {
             if matches!(inst.status, Status::Deleting | Status::Creating) {
                 return None;
@@ -4352,6 +4659,9 @@ impl HomeView {
                 }
             }
             if self.selected_session != prev_session {
+                self.retained_preview = None;
+                self.retained_focus = None;
+                self.retained_scroll_offset = 0;
                 self.system_health_open = false;
                 self.preview_scroll_offset = 0;
                 // A finalized preview selection pins to the previous pane's cells, so
@@ -4373,6 +4683,9 @@ impl HomeView {
                 // new one.
                 self.unread_dwell = None;
             }
+        }
+        if self.selected_is_trashed() {
+            self.exit_live_send_if_active();
         }
     }
 
@@ -4534,6 +4847,9 @@ impl HomeView {
     /// rides the ordered `LiveSendWorker` to stay in sequence with typed keystrokes; in
     /// passive preview it goes out as a one-shot fork. True when forwarded.
     fn forward_wheel_to_preview(&self, up: bool, col: u16, row: u16) -> bool {
+        if self.selected_is_trashed() {
+            return false;
+        }
         let cursor = self.active_preview_cursor();
         let Some(cursor) = cursor else { return false };
         let Some(key) = wheel_forward_key(&cursor, up, self.preview_text_view, col, row) else {
@@ -4549,6 +4865,9 @@ impl HomeView {
     /// alternate-screen gate keeps scroll input out of a normal-buffer shell. `up` picks
     /// the direction; `col`/`row` is the held cell. True when something was sent.
     fn forward_scroll_to_preview(&self, up: bool, col: u16, row: u16) -> bool {
+        if self.selected_is_trashed() {
+            return false;
+        }
         let Some(cursor) = self.active_preview_cursor() else {
             return false;
         };
@@ -4558,12 +4877,25 @@ impl HomeView {
         self.send_to_preview_pane(key)
     }
 
-    /// Send a forwarded key or mouse-byte payload to the pane the preview shows
-    /// (`preview_capture_target`), which is what the cursor and mapped coordinates
-    /// describe. Routed through the ordered live-send worker only when that pane is also
-    /// the live-send target, so it stays in sequence with typed keystrokes; otherwise a
-    /// one-shot send is forked. True when something was dispatched.
+    fn preview_accepts_input(&self) -> bool {
+        self.session_feed.native_interaction_available()
+            && self
+                .selected_session
+                .as_deref()
+                .and_then(|id| self.get_instance(id))
+                .is_some_and(|instance| {
+                    !instance.is_trashed()
+                        && self.active_preview_cache().session_id.as_deref()
+                            == Some(instance.id.as_str())
+                        && self.active_preview_cursor().is_some()
+                })
+    }
+
+    /// Keep forwarded input on the current preview owner's pane.
     fn send_to_preview_pane(&self, key: live_send::TmuxKey) -> bool {
+        if !self.preview_accepts_input() {
+            return false;
+        }
         let Some(target) = self.preview_capture_target.as_deref() else {
             return false;
         };
@@ -4573,8 +4905,10 @@ impl HomeView {
                 return true;
             }
         }
-        live_send::send_key_oneshot(target, key);
-        true
+        let Some(lease) = self.session_feed.native_input_lease() else {
+            return false;
+        };
+        live_send::send_key_oneshot(target, key, lease)
     }
 
     /// The previewed agent's cursor when a mouse button event over the preview should go
@@ -4584,6 +4918,9 @@ impl HomeView {
     /// event fall through to aoe's handlers; Shift is the caller's escape hatch. The
     /// cursor comes back so the caller can read `mouse_sgr` for the encoding.
     fn preview_forwards_mouse(&self) -> Option<crate::tmux::PaneCursor> {
+        if self.selected_is_trashed() {
+            return None;
+        }
         let cursor = self.active_preview_cursor()?;
         (cursor.alternate_on && cursor.mouse_tracking).then_some(cursor)
     }
@@ -4604,6 +4941,10 @@ impl HomeView {
         row: u16,
     ) -> bool {
         use crossterm::event::{MouseButton, MouseEventKind};
+        if !self.preview_accepts_input() {
+            self.mouse_forward_btn = None;
+            return false;
+        }
         let base = |b: MouseButton| match b {
             MouseButton::Left => 0u16,
             MouseButton::Middle => 1,
@@ -4646,7 +4987,6 @@ impl HomeView {
             self.mouse_forward_btn = None;
             return false;
         }
-        self.mouse_forward_btn = if release { None } else { Some(base_button) };
         let bytes = mouse_event_bytes(
             base_button,
             release,
@@ -4654,7 +4994,12 @@ impl HomeView {
             cursor.mouse_sgr,
             mouse_pane(&cursor, self.preview_text_view).cell(col, row),
         );
-        self.send_to_preview_pane(live_send::TmuxKey::HexBytes(bytes))
+        if !self.send_to_preview_pane(live_send::TmuxKey::HexBytes(bytes)) {
+            self.mouse_forward_btn = None;
+            return false;
+        }
+        self.mouse_forward_btn = if release { None } else { Some(base_button) };
+        true
     }
 
     /// Forward a bare mouse-motion event to a previewed agent in any-event tracking (DEC
@@ -4664,9 +5009,10 @@ impl HomeView {
     /// terminal delivers. Unlike `forward_mouse_to_preview` it never consumes the event,
     /// so aoe's own hover handling still runs. True when a report was sent.
     pub fn forward_hover_to_preview(&mut self, col: u16, row: u16) -> bool {
-        if self.has_non_live_send_overlay() || !self.hit_preview(col, row) {
-            // Off-preview (or covered by a modal): drop the dedup cell so
-            // re-entering the preview on the same cell reports again.
+        if !self.preview_accepts_input()
+            || self.has_non_live_send_overlay()
+            || !self.hit_preview(col, row)
+        {
             self.hover_forward_cell = None;
             return false;
         }
@@ -4681,8 +5027,12 @@ impl HomeView {
         if self.hover_forward_cell == Some(cell) {
             return false;
         }
+        if !self.send_to_preview_pane(live_send::TmuxKey::HexBytes(bytes)) {
+            self.hover_forward_cell = None;
+            return false;
+        }
         self.hover_forward_cell = Some(cell);
-        self.send_to_preview_pane(live_send::TmuxKey::HexBytes(bytes))
+        true
     }
 
     pub fn handle_scroll_up(&mut self, col: u16, row: u16) -> bool {
@@ -4732,6 +5082,9 @@ impl HomeView {
         }
         if self.selected_session.is_none() {
             return false;
+        }
+        if self.selected_is_trashed() {
+            return self.scroll_preview_offset(i32::from(STEP));
         }
         // Full-screen app: send the wheel to it rather than scrolling the irrelevant
         // normal-buffer capture. Fires in live-send and passive preview.
@@ -5031,6 +5384,18 @@ impl HomeView {
     /// new menu action needs to be wired here once, not at each call
     /// site.
     pub(super) fn dispatch_context_menu_action(&mut self, action: ContextMenuAction) {
+        if self.selected_is_trashed()
+            && !matches!(
+                action,
+                ContextMenuAction::Restore
+                    | ContextMenuAction::Delete
+                    | ContextMenuAction::NewSession
+                    | ContextMenuAction::OpenSortPicker
+                    | ContextMenuAction::OpenGroupPicker
+            )
+        {
+            return;
+        }
         // The creating stub has no actions yet, so opening a menu whose every
         // entry would refuse it is worse than saying why. Same refusal as
         // `run_action`, which the menu is the second dispatcher for.
@@ -5410,6 +5775,8 @@ impl HomeView {
                     dialog = dialog.with_worktree_branch(&branch, upstream);
                 }
             }
+            self.session_dialog_target = self.selected_dialog_target();
+            self.group_rename_context = None;
             self.rename_dialog = Some(dialog);
         } else if let Some(group_path) = &self.selected_group {
             if let Some((title, hint)) = self.automatic_group_hint() {
@@ -5493,6 +5860,7 @@ impl HomeView {
             .and_then(|s| s.to_str())
             .unwrap_or(&project_path)
             .to_string();
+        self.session_dialog_target = self.selected_dialog_target();
         self.worktree_name_dialog = Some(WorktreeNameDialog::new(&current_dir, &wt.branch));
     }
 
@@ -5503,8 +5871,7 @@ impl HomeView {
     /// groups can't be deleted, and the Trash header offers to empty the trash. Shared by
     /// the keys and the context menu.
     pub(super) fn open_delete_for_selected(&mut self) {
-        // Deletion only allowed in Structured View.
-        if self.view_mode == ViewMode::Terminal {
+        if self.view_mode == ViewMode::Terminal && !self.selected_is_trashed() {
             let hint = if self.strict_hotkeys {
                 "Terminals cannot be deleted directly. Switch to Structured View (press Shift+T) and delete the agent session instead."
             } else {
@@ -5559,11 +5926,11 @@ impl HomeView {
                     // trash_session_by_id.
                     if session_cfg.confirm_delete {
                         let message = format!("Move '{}' to the trash?", inst.title);
-                        self.pending_trash_session = Some(sid);
-                        // Offer the same in-dialog opt-out the quit confirm has: the
-                        // guard is on by default, so a user who wants one-keystroke trash
-                        // back shouldn't have to find the setting. Ticking it persists
-                        // confirm_delete = false.
+                        self.pending_trash_session = Some(super::SessionDialogTarget {
+                            session_id: sid,
+                            source_profile: inst.source_profile.clone(),
+                            lifecycle_generation: inst.lifecycle_generation,
+                        });
                         let dialog = self
                             .confirm_by_repeating(
                                 ActionId::Delete,
@@ -5713,33 +6080,19 @@ impl HomeView {
                     self.cursor = abs_idx;
                     self.update_selected();
                 }
-                // An archived row is parked, its pane killed on archive. A single click
-                // is a "let me look at this" gesture, so it must not enter live-send,
-                // which would respawn the pane and auto-unarchive the row through
-                // touch_last_accessed. Stop at the cursor update; bringing it back stays
-                // explicit (`z`, or a deliberate double-click / Enter).
+                // Shelved rows select without preparing a pane.
                 let archived = self
                     .get_instance(&id)
-                    .map(|inst| inst.is_archived())
+                    .map(|inst| inst.is_archived() || inst.is_trashed())
                     .unwrap_or(false);
-                // Single-click behavior is otherwise `SessionConfig::click_action`:
-                // `LiveSend` (the default) enters live-send for the clicked row or
-                // switches the live target, while `SelectOnly` stops at the cursor update
-                // so the user can browse previews, exiting live mode if a different row
-                // was live. Double-click still activates via `default_attach_mode`.
-                // `click_action` returns `None` for structured sessions, where
-                // `start_live_send` already short-circuits.
+                // SelectOnly also leaves any existing live-send target.
                 if archived
                     || matches!(
                         self.click_action(&id),
                         Some(crate::session::ClickAction::SelectOnly)
                     )
                 {
-                    // The click only moves the cursor and, if live-sending, leaves live
-                    // mode. That holds for a different row (keystrokes were aimed at the
-                    // old session) and for the row already live: a single click is a "stop
-                    // touching that" gesture. In `LiveSend` mode the `start_live_send`
-                    // branch below retargets instead.
+                    // Do not leave keystrokes aimed at the previously live row.
                     if let Some(state) = self.live_send.clone() {
                         self.exit_live_send_and_restore_sizing(&state);
                     }
@@ -5807,7 +6160,7 @@ impl HomeView {
         // `active_preview_cache` is the tmux capture while `preview_text_view` may come from
         // the transcript's geometry; resolving one against the other opens a URL from
         // another session's output. `paint_preview_links` skips the same case.
-        if self.structured_transcript_painted {
+        if self.selected_is_trashed() || self.structured_transcript_painted {
             return None;
         }
         let view = self.preview_text_view;
@@ -6067,6 +6420,9 @@ impl HomeView {
         if self.selected_session.is_none() {
             return false;
         }
+        if self.selected_is_trashed() {
+            return self.scroll_preview_offset(-i32::from(STEP));
+        }
         // Mirror handle_scroll_up: a full-screen app gets the wheel
         // forwarded rather than moving the preview's capture window.
         if self.forward_wheel_to_preview(false, col, row) {
@@ -6094,6 +6450,12 @@ impl HomeView {
         // underneath can change. Doing it here covers the drag-select -> right-click ->
         // paste-into-dialog sequence, which never goes through `handle_key`.
         self.clear_preview_selection();
+        if self.selected_is_trashed() {
+            self.exit_live_send_if_active();
+            if !self.has_non_live_send_overlay() || self.send_message_dialog.is_some() {
+                return;
+            }
+        }
         if !self.has_non_live_send_overlay() {
             if let Some(state) = self.live_send.clone() {
                 if let Some(worker) = &self.live_send_worker {
@@ -6130,6 +6492,9 @@ impl HomeView {
         }
         if let Some(ref mut settings) = self.settings_view {
             settings.handle_paste(text);
+            return;
+        }
+        if self.selected_is_trashed() {
             return;
         }
 
@@ -6187,6 +6552,7 @@ impl HomeView {
         let profiles =
             list_profiles_for_display().unwrap_or_else(|_| vec![current_profile.clone()]);
         let tools: Vec<String> = self.available_tools.available_list().to_vec();
+        self.session_dialog_target = self.selected_dialog_target();
         self.restart_dialog = Some(RestartDialog::new(
             &current_title,
             &current_profile,
@@ -6212,6 +6578,9 @@ impl HomeView {
             return None;
         }
         let inst = self.get_instance(&id)?;
+        if inst.is_trashed() {
+            return None;
+        }
         if matches!(inst.status, Status::Creating | Status::Deleting) {
             return None;
         }
@@ -6245,6 +6614,9 @@ impl HomeView {
     /// same revive path as a fresh entry; the view follows only once that succeeds.
     fn swap_live_send_target(&mut self, state: &live_send::LiveSendState) -> Option<Action> {
         let inst = self.get_instance(&state.session_id)?;
+        if inst.is_trashed() {
+            return None;
+        }
         let target = match state.target {
             live_send::LiveSendTarget::Terminal | live_send::LiveSendTarget::ContainerTerminal => {
                 live_send::LiveSendTarget::Agent
@@ -6284,6 +6656,13 @@ impl HomeView {
     /// runtime that owns the pane is gone, so the keystroke has nowhere to go.
     fn handle_live_send_key(&mut self, key: KeyEvent) -> Option<Action> {
         let state = self.live_send.clone()?;
+        if self
+            .get_instance(&state.session_id)
+            .is_some_and(|inst| inst.is_trashed())
+        {
+            self.teardown_live_send();
+            return None;
+        }
         if !self.session_feed.native_interaction_available() {
             self.teardown_live_send();
             return None;
@@ -6659,6 +7038,7 @@ impl HomeView {
                 ));
                 return;
             }
+            self.session_dialog_target = self.selected_dialog_target();
             self.permission_response_dialog =
                 Some(crate::tui::dialogs::PermissionResponseDialog::structured(
                     &title,
@@ -6680,6 +7060,7 @@ impl HomeView {
             ));
             return;
         };
+        self.session_dialog_target = self.selected_dialog_target();
         self.pending_permission_response = Some(PermissionResponseTarget::Terminal(id));
         self.permission_response_dialog = Some(crate::tui::dialogs::PermissionResponseDialog::new(
             &title,
@@ -6739,6 +7120,9 @@ impl HomeView {
         if matches!(inst.status, Status::Creating | Status::Deleting) {
             return None;
         }
+        if inst.is_trashed() {
+            return None;
+        }
         let target = self.current_send_target();
         let ready = match &target {
             live_send::LiveSendTarget::Agent => crate::tmux::Session::new(&inst.id, &inst.title)
@@ -6759,6 +7143,9 @@ impl HomeView {
     /// inadvertent typing and opens the compose dialog pre-filled with it. Mirrors
     /// handle_paste's delegation and fallback.
     fn capture_letter_to_compose(&mut self, c: char) {
+        if self.selected_is_trashed() {
+            return;
+        }
         let s = c.to_string();
         if let Some(ref mut dialog) = self.send_message_dialog {
             dialog.handle_paste(&s);

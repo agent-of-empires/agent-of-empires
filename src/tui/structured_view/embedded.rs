@@ -37,6 +37,187 @@ pub enum EmbeddedEvent {
     SessionInfo(super::ViewSideInfo),
 }
 
+/// Retained transcript reader. No WebSocket, composer dispatcher, or worker setup.
+pub struct RetainedView {
+    session_id: String,
+    source_profile: String,
+    generation: u64,
+    state: Option<StructuredViewState>,
+    unfinished_outputs: Vec<crate::acp::transcript::UnfinishedToolOutput>,
+    load: Option<tokio::task::JoinHandle<()>>,
+    result: tokio::sync::oneshot::Receiver<
+        Result<(crate::acp::transcript::RetainedTranscript, bool), String>,
+    >,
+    message: String,
+}
+
+impl RetainedView {
+    pub fn new(endpoint: Option<DaemonEndpoint>, inst: &crate::session::Instance) -> Self {
+        let (tx, result) = tokio::sync::oneshot::channel();
+        let mut view = Self {
+            session_id: inst.id.clone(),
+            source_profile: inst.source_profile.clone(),
+            generation: inst.lifecycle_generation,
+            state: None,
+            unfinished_outputs: Vec::new(),
+            load: None,
+            result,
+            message: "Daemon unavailable; retained transcript could not be read.".into(),
+        };
+        let Some(endpoint) = endpoint else {
+            return view;
+        };
+        let http = match crate::acp::client::HttpClient::new(endpoint.clone()) {
+            Ok(http) => http,
+            Err(error) => {
+                view.message = format!("Transcript read failed: {error}");
+                return view;
+            }
+        };
+        let mut state = StructuredViewState::new(inst.id.clone(), endpoint, http.clone(), None);
+        state.transcript.session_title = Some(inst.title.clone());
+        view.state = Some(state);
+        view.message = "Loading retained ACP transcript…".into();
+        let id = inst.id.clone();
+        view.load = Some(tokio::spawn(async move {
+            let rows = http
+                .replay_retained_paged(&id, 0, 1000)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(rows);
+        }));
+        view
+    }
+
+    pub fn matches(&self, inst: &crate::session::Instance) -> bool {
+        inst.is_trashed()
+            && self.session_id == inst.id
+            && self.source_profile == inst.source_profile
+            && self.generation == inst.lifecycle_generation
+    }
+
+    pub fn tick(&mut self) -> bool {
+        if self.load.is_none() {
+            return false;
+        }
+        let result = match self.result.try_recv() {
+            Ok(result) => result,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return false,
+            Err(error) => Err(error.to_string()),
+        };
+        self.load = None;
+        match result {
+            Ok((snapshot, lost)) => {
+                self.message = if snapshot.rows.is_empty() && snapshot.unfinished_outputs.is_empty()
+                {
+                    "No readable retained ACP content. Native history is not available through this reader; destroyed tmux scrollback cannot be recovered.".into()
+                } else {
+                    "Retained ACP transcript · scroll to read · drag to copy".into()
+                };
+                if lost {
+                    self.message = format!(
+                        "Retained ACP history is incomplete; some events are unavailable. {}",
+                        self.message,
+                    );
+                }
+                if let Some(state) = self.state.as_mut() {
+                    state.transcript.server_rows = snapshot.rows;
+                }
+                self.unfinished_outputs = snapshot.unfinished_outputs;
+            }
+            Err(error) => self.message = format!("Transcript read failed: {error}"),
+        }
+        true
+    }
+
+    pub fn selection_text(&self, width: u16) -> ratatui::text::Text<'static> {
+        self.state
+            .as_ref()
+            .filter(|state| {
+                !state.transcript.server_rows.is_empty() || !self.unfinished_outputs.is_empty()
+            })
+            .map_or_else(Default::default, |state| {
+                render::wrapped_transcript(
+                    state,
+                    &Theme::default(),
+                    width,
+                    render::ToolOutputMode::Retained(&self.unfinished_outputs),
+                )
+            })
+    }
+
+    pub fn render(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        theme: &Theme,
+        offset: usize,
+        focused: bool,
+    ) -> render::TranscriptGeometry {
+        use ratatui::{style::Style, widgets::Paragraph};
+        let mut status = Vec::new();
+        render::wrap_line_into(
+            ratatui::text::Line::from(self.message.clone()),
+            area.width,
+            &mut status,
+        );
+        let status_rows = status.len().min(u16::MAX as usize) as u16;
+        let chunks = ratatui::layout::Layout::vertical([
+            ratatui::layout::Constraint::Length(1),
+            ratatui::layout::Constraint::Length(status_rows),
+            ratatui::layout::Constraint::Min(0),
+        ])
+        .split(area);
+        frame.render_widget(
+            Paragraph::new(if focused {
+                "Trash · read-only · Esc: sessions"
+            } else {
+                "Trash · read-only · Enter: read"
+            })
+            .style(Style::default().fg(theme.hint)),
+            chunks[0],
+        );
+        frame.render_widget(
+            Paragraph::new(status).style(Style::default().fg(theme.text)),
+            chunks[1],
+        );
+        let text_area = chunks[2];
+        let mut text = self
+            .state
+            .as_ref()
+            .filter(|state| {
+                !state.transcript.server_rows.is_empty() || !self.unfinished_outputs.is_empty()
+            })
+            .map_or_else(Default::default, |state| {
+                render::wrapped_transcript(
+                    state,
+                    theme,
+                    text_area.width,
+                    render::ToolOutputMode::Retained(&self.unfinished_outputs),
+                )
+            });
+        let total = text.lines.len();
+        let max = total.saturating_sub(text_area.height as usize);
+        let first = max.saturating_sub(offset);
+        text.lines.drain(..first);
+        text.lines.truncate(text_area.height as usize);
+        frame.render_widget(Paragraph::new(text), text_area);
+        render::TranscriptGeometry {
+            text_area,
+            first_line: first,
+            total_lines: total,
+        }
+    }
+}
+
+impl Drop for RetainedView {
+    fn drop(&mut self) {
+        if let Some(load) = self.load.take() {
+            load.abort();
+        }
+    }
+}
+
 pub struct EmbeddedView {
     state: StructuredViewState,
     toast_deadline: Option<Instant>,
@@ -243,7 +424,12 @@ impl EmbeddedView {
     /// `width` columns, so the home view's selection extraction slices match the
     /// on-screen geometry. Styles are irrelevant to extraction.
     pub fn selection_text(&self, width: u16) -> ratatui::text::Text<'static> {
-        render::wrapped_transcript(&self.state, &crate::tui::styles::Theme::default(), width)
+        render::wrapped_transcript(
+            &self.state,
+            &crate::tui::styles::Theme::default(),
+            width,
+            render::ToolOutputMode::Compact,
+        )
     }
 
     /// Paste text into the composer, focusing it if needed, then load the file
@@ -252,5 +438,507 @@ impl EmbeddedView {
     pub async fn paste_text_with_file_load(&mut self, text: &str) {
         super::paste_into_composer(&mut self.state, text);
         super::ensure_files_loaded(&mut self.state, &mut self.toast_deadline).await;
+    }
+}
+
+#[cfg(test)]
+mod retained_tests {
+    use super::*;
+    use axum::{
+        extract::{Path, State},
+        http::StatusCode,
+        routing::get,
+        Router,
+    };
+    use std::{sync::Arc, time::Duration};
+
+    #[test]
+    fn trash_home_reaches_history_beyond_u16_lines() {
+        let inst = crate::session::Instance::new("large retained", "/tmp");
+        let endpoint = DaemonEndpoint::new(
+            "http://127.0.0.1:1".into(),
+            None,
+            crate::acp::client::discovery::Source::Env,
+        );
+        let http = crate::acp::client::HttpClient::new(endpoint.clone()).unwrap();
+        let mut state = StructuredViewState::new(inst.id.clone(), endpoint, http, None);
+        let mut model = crate::acp::transcript::TranscriptModel::new();
+        model.apply_event(
+            1,
+            &crate::acp::state::Event::AgentMessageChunk {
+                text: format!(
+                    "oldest retained text\n\n{}newest retained text",
+                    "line\n\n".repeat(70_000)
+                ),
+                message_id: None,
+            },
+        );
+        state.transcript.merge_server_rows(model.rows().to_vec());
+        let mut view = RetainedView::new(None, &inst);
+        view.state = Some(state);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 10)).unwrap();
+        let mut first = usize::MAX;
+        terminal
+            .draw(|frame| {
+                first = view
+                    .render(frame, frame.area(), &Theme::default(), usize::MAX, false)
+                    .first_line;
+            })
+            .unwrap();
+        assert_eq!(first, 0, "Home must reach the oldest retained line");
+    }
+
+    #[test]
+    fn retained_tool_output_is_readable_and_copyable_without_preview_limits() {
+        use crate::acp::state::{Event, ToolCall};
+        for kind in ["execute", "read", "edit", "delete", "unknown"] {
+            for failed in [false, true] {
+                let inst = crate::session::Instance::new("retained output", "/tmp");
+                let endpoint = DaemonEndpoint::new(
+                    "http://127.0.0.1:1".into(),
+                    None,
+                    crate::acp::client::discovery::Source::Env,
+                );
+                let http = crate::acp::client::HttpClient::new(endpoint.clone()).unwrap();
+                let mut state = StructuredViewState::new(inst.id.clone(), endpoint, http, None);
+                let mut model = crate::acp::transcript::TranscriptModel::new();
+                let at = chrono::DateTime::from_timestamp(100, 0).unwrap();
+                model.apply_event(
+                    1,
+                    &Event::ToolCallStarted {
+                        tool_call: ToolCall {
+                            id: "tool".into(),
+                            name: "RetainedTool".into(),
+                            kind: kind.into(),
+                            args_preview: format!("{}\nARGUMENT-END", "argument ".repeat(40)),
+                            started_at: at,
+                            parent_tool_call_id: None,
+                            memory_recall: None,
+                            diffs: if kind == "edit" {
+                                vec![crate::acp::state::DiffPreview {
+                                    path: "/tmp/retained.txt".into(),
+                                    old_text: Some("before".into()),
+                                    new_text: Some("changed\n".repeat(30) + "DIFF-END"),
+                                    created_at: at,
+                                }]
+                            } else {
+                                Vec::new()
+                            },
+                        },
+                    },
+                );
+                let output = (0..40)
+                    .map(|i| format!("output-{i:02}\n"))
+                    .collect::<String>()
+                    + "OUTPUT-END";
+                let blocks = if kind == "unknown" {
+                    vec![
+                        crate::acp::state::ToolOutputBlock::Text {
+                            text: output.clone(),
+                        },
+                        crate::acp::state::ToolOutputBlock::Image {
+                            mime_type: "image/png".into(),
+                            data: Some("BINARY-NOT-TEXT".into()),
+                            uri: None,
+                        },
+                    ]
+                } else {
+                    Vec::new()
+                };
+                model.apply_event(
+                    2,
+                    &Event::ToolCallCompleted {
+                        tool_call_id: "tool".into(),
+                        is_error: failed,
+                        content: if kind == "unknown" {
+                            "FALLBACK-NOT-DISPLAYED".into()
+                        } else {
+                            output
+                        },
+                        output: blocks,
+                        completed_at: at,
+                        async_subagent: false,
+                    },
+                );
+                state.transcript.server_rows = model.into_rows();
+                let mut view = RetainedView::new(None, &inst);
+                view.state = Some(state);
+                for width in [32, 80] {
+                    let copied = view
+                        .selection_text(width)
+                        .lines
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    assert!(
+                        copied.contains("ARGUMENT-END"),
+                        "{kind}, failed={failed}: {copied}"
+                    );
+                    for i in 0..40 {
+                        assert!(
+                            copied.contains(&format!("output-{i:02}")),
+                            "{kind}, failed={failed}: missing output-{i:02}"
+                        );
+                    }
+                    assert!(copied.contains("OUTPUT-END"));
+                    assert!(!copied.contains("press `o`"));
+                    if kind == "edit" {
+                        assert!(copied.contains("DIFF-END"));
+                    }
+                    if kind == "unknown" {
+                        assert!(copied.contains("[image image/png]"));
+                        assert!(!copied.contains("BINARY-NOT-TEXT"));
+                        assert!(!copied.contains("FALLBACK-NOT-DISPLAYED"));
+                    }
+                    let mut terminal =
+                        ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 12))
+                            .unwrap();
+                    terminal
+                        .draw(|frame| {
+                            view.render(frame, frame.area(), &Theme::default(), 0, true);
+                        })
+                        .unwrap();
+                    let painted: String = terminal
+                        .backend()
+                        .buffer()
+                        .content()
+                        .iter()
+                        .map(|cell| cell.symbol())
+                        .collect();
+                    assert!(
+                        painted.contains("OUTPUT-END"),
+                        "{kind}, failed={failed}: {painted}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn retained_media_completion_preserves_text_fallback() {
+        use crate::acp::state::{Event, ToolOutputBlock};
+        let image = ToolOutputBlock::Image {
+            mime_type: "image/png".into(),
+            data: Some("BINARY-HIDDEN".into()),
+            uri: None,
+        };
+        let resource = |text: Option<&str>| ToolOutputBlock::Resource {
+            uri: "fixture-resource".into(),
+            mime_type: None,
+            text: text.map(str::to_owned),
+            data: Some("BINARY-HIDDEN".into()),
+        };
+        let cases = [
+            (vec![image.clone()], "", "BUFFER-TEXT"),
+            (
+                vec![
+                    image.clone(),
+                    ToolOutputBlock::Text {
+                        text: String::new(),
+                    },
+                ],
+                "",
+                "BUFFER-TEXT",
+            ),
+            (vec![resource(Some(""))], "", "BUFFER-TEXT"),
+            (
+                vec![
+                    resource(None),
+                    ToolOutputBlock::Audio {
+                        mime_type: "audio/wav".into(),
+                        data: Some("BINARY-HIDDEN".into()),
+                    },
+                    ToolOutputBlock::ResourceLink {
+                        uri: "fixture-link".into(),
+                        name: "link".into(),
+                        mime_type: None,
+                    },
+                ],
+                "",
+                "BUFFER-TEXT",
+            ),
+            (vec![image.clone()], "EXPLICIT-TEXT", "EXPLICIT-TEXT"),
+            (
+                vec![
+                    image,
+                    ToolOutputBlock::Text {
+                        text: "FINAL-TEXT".into(),
+                    },
+                ],
+                "FINAL-TEXT",
+                "FINAL-TEXT",
+            ),
+            (vec![resource(Some("RESOURCE-TEXT"))], "", "RESOURCE-TEXT"),
+        ];
+        for (blocks, final_text, expected) in cases {
+            for failed in [false, true] {
+                let inst = crate::session::Instance::new("retained media", "/tmp");
+                let endpoint = DaemonEndpoint::new(
+                    "http://127.0.0.1:1".into(),
+                    None,
+                    crate::acp::client::discovery::Source::Env,
+                );
+                let http = crate::acp::client::HttpClient::new(endpoint.clone()).unwrap();
+                let mut state = StructuredViewState::new(inst.id.clone(), endpoint, http, None);
+                let mut model = crate::acp::transcript::TranscriptModel::new();
+                model.apply_event(
+                    1,
+                    &Event::ToolCallContent {
+                        tool_call_id: "media".into(),
+                        content: "BUFFER-TEXT".into(),
+                    },
+                );
+                model.apply_event(
+                    2,
+                    &Event::ToolCallCompleted {
+                        tool_call_id: "media".into(),
+                        is_error: failed,
+                        content: final_text.into(),
+                        output: blocks.clone(),
+                        completed_at: chrono::Utc::now(),
+                        async_subagent: false,
+                    },
+                );
+                state.transcript.server_rows = model.into_rows();
+                let mut view = RetainedView::new(None, &inst);
+                view.state = Some(state);
+                for width in [32, 80] {
+                    let copied = view.selection_text(width).to_string();
+                    let mut terminal =
+                        ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 20))
+                            .unwrap();
+                    terminal
+                        .draw(|frame| {
+                            view.render(frame, frame.area(), &Theme::default(), 0, true);
+                        })
+                        .unwrap();
+                    let painted: String = terminal
+                        .backend()
+                        .buffer()
+                        .content()
+                        .iter()
+                        .map(|cell| cell.symbol())
+                        .collect();
+                    for text in [&copied, &painted] {
+                        assert_eq!(
+                            text.matches(expected).count(),
+                            1,
+                            "failed={failed}, width={width}: {text}"
+                        );
+                        if expected != "BUFFER-TEXT" {
+                            assert!(!text.contains("BUFFER-TEXT"));
+                        }
+                        assert!(!text.contains("BINARY-HIDDEN"));
+                        if blocks
+                            .iter()
+                            .any(|block| matches!(block, ToolOutputBlock::Image { .. }))
+                        {
+                            assert_eq!(text.matches("[image image/png]").count(), 1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_empty_history_does_not_hide_known_loss() {
+        for empty in [false, true] {
+            for incomplete in [false, true] {
+                let inst = crate::session::Instance::new("retained state", "/tmp");
+                let mut model = crate::acp::transcript::TranscriptModel::new();
+                if !empty {
+                    model.apply_event(
+                        1,
+                        &crate::acp::state::Event::AgentMessageChunk {
+                            text: "retained message".into(),
+                            message_id: None,
+                        },
+                    );
+                }
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let mut view = RetainedView::new(None, &inst);
+                view.result = rx;
+                view.load = Some(tokio::spawn(async {}));
+                tx.send(Ok((model.into_retained(), incomplete))).unwrap();
+                assert!(view.tick());
+                for width in [32, 100] {
+                    let mut terminal =
+                        ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30))
+                            .unwrap();
+                    terminal
+                        .draw(|frame| {
+                            view.render(frame, frame.area(), &Theme::default(), 0, false);
+                        })
+                        .unwrap();
+                    let painted: String = terminal
+                        .backend()
+                        .buffer()
+                        .content()
+                        .iter()
+                        .map(|cell| cell.symbol())
+                        .collect();
+                    assert_eq!(
+                        painted.contains("incomplete"),
+                        incomplete,
+                        "empty={empty}, width={width}: {painted}"
+                    );
+                    assert_eq!(
+                        painted.contains("No readable"),
+                        empty,
+                        "incomplete={incomplete}, width={width}: {painted}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_snapshot_exposes_unfinished_and_orphan_output() {
+        use crate::acp::state::{Event, ToolCall};
+        for started in [false, true] {
+            let inst = crate::session::Instance::new("unfinished", "/tmp");
+            let id = inst.id.clone();
+            let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+            if started {
+                state
+                    .acp_event_store
+                    .record(
+                        &id,
+                        1,
+                        &Event::ToolCallStarted {
+                            tool_call: ToolCall {
+                                id: "unfinished".into(),
+                                name: "RetainedTool".into(),
+                                kind: "execute".into(),
+                                args_preview: "{}".into(),
+                                started_at: chrono::Utc::now(),
+                                parent_tool_call_id: None,
+                                memory_recall: None,
+                                diffs: Vec::new(),
+                            },
+                        },
+                    )
+                    .unwrap();
+            }
+            for (seq, text) in [
+                (2, "superseded output"),
+                (3, "unfinished output\nUNFINISHED-TAIL"),
+            ] {
+                state
+                    .acp_event_store
+                    .record(
+                        &id,
+                        seq,
+                        &Event::ToolCallContent {
+                            tool_call_id: "unfinished".into(),
+                            content: text.into(),
+                        },
+                    )
+                    .unwrap();
+            }
+            let app = Router::new()
+                .route(
+                    "/api/sessions/{id}/acp/replay",
+                    get(crate::server::api::acp_replay),
+                )
+                .with_state(state);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = DaemonEndpoint::new(
+                format!("http://{}", listener.local_addr().unwrap()),
+                None,
+                crate::acp::client::discovery::Source::Env,
+            );
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let mut view = RetainedView::new(Some(endpoint), &inst);
+            tokio::time::timeout(Duration::from_secs(5), view.load.as_mut().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(view.tick());
+            let copied = view.selection_text(80).to_string();
+            assert!(
+                copied.contains("UNFINISHED-TAIL"),
+                "started={started}: {copied}"
+            );
+            assert!(!copied.contains("superseded output"));
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+            terminal
+                .draw(|frame| {
+                    view.render(frame, frame.area(), &Theme::default(), 0, true);
+                })
+                .unwrap();
+            let painted: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(painted.contains("UNFINISHED-TAIL"));
+            for marker in ['✓', '✗', '◼'] {
+                assert!(!painted.contains(marker));
+            }
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn obsolete_read_is_cancelled_and_failure_does_not_become_empty_history() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let app =
+            Router::new()
+                .route(
+                    "/api/sessions/{id}/acp/replay",
+                    get(
+                        |Path(id): Path<String>,
+                         State(started): State<Arc<tokio::sync::Notify>>| async move {
+                            if id == "obsolete" {
+                                started.notify_one();
+                                std::future::pending::<()>().await;
+                            }
+                            StatusCode::SERVICE_UNAVAILABLE
+                        },
+                    ),
+                )
+                .with_state(started.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = DaemonEndpoint::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            None,
+            crate::acp::client::discovery::Source::Env,
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut inst = crate::session::Instance::new("retained", "/tmp");
+        inst.id = "obsolete".into();
+        inst.trashed_at = Some(chrono::Utc::now());
+        let obsolete = RetainedView::new(Some(endpoint.clone()), &inst);
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        let task = obsolete.load.as_ref().unwrap().abort_handle();
+        drop(obsolete);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        inst.id = "failed".into();
+        let mut failed = RetainedView::new(Some(endpoint), &inst);
+        tokio::time::timeout(Duration::from_secs(5), failed.load.as_mut().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(failed.tick());
+        assert!(failed.message.contains("503"), "{}", failed.message);
+        assert!(failed.selection_text(60).lines.is_empty());
+        server.abort();
+        let _ = server.await;
     }
 }

@@ -152,6 +152,19 @@ impl ContextMenuDialog {
         )
     }
 
+    pub fn is_read_only_session_menu(&self) -> bool {
+        self.items.iter().all(|(action, _)| {
+            matches!(
+                action,
+                ContextMenuAction::Restore
+                    | ContextMenuAction::Delete
+                    | ContextMenuAction::NewSession
+                    | ContextMenuAction::OpenSortPicker
+                    | ContextMenuAction::OpenGroupPicker
+            )
+        })
+    }
+
     pub fn for_group(anchor: (u16, u16)) -> Self {
         Self::new(
             anchor,

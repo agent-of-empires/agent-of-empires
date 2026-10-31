@@ -497,6 +497,9 @@ pub struct TrashSessionBody {
     /// False preserves tmux panes, not structured workers.
     #[serde(default = "default_kill_pane")]
     pub kill_pane: bool,
+    /// Reject a lifecycle change after the caller captured its target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_generation: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -530,6 +533,7 @@ impl Default for TrashSessionBody {
     fn default() -> Self {
         Self {
             kill_pane: default_kill_pane(),
+            expected_generation: None,
         }
     }
 }

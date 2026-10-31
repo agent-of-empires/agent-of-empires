@@ -85,6 +85,12 @@ pub(super) struct GroupRenameContext {
     pub(super) old_profile: String,
 }
 
+pub(super) struct SessionDialogTarget {
+    session_id: String,
+    source_profile: String,
+    lifecycle_generation: u64,
+}
+
 pub(super) enum PermissionResponseTarget {
     Terminal(String),
     Structured { session_id: String, nonce: String },
@@ -255,6 +261,7 @@ pub struct HomeView {
     pub(super) restart_dialog: Option<RestartDialog>,
     pub(super) context_menu: Option<ContextMenuDialog>,
     pub(super) group_rename_context: Option<GroupRenameContext>,
+    pub(super) session_dialog_target: Option<SessionDialogTarget>,
     pub(super) repo_trust_dialog: Option<RepoTrustDialog>,
     pub(super) pending_repo_trust_data: Option<NewSessionData>,
     /// Canonical daemon-reviewed configuration fingerprint for the pending
@@ -341,12 +348,16 @@ pub struct HomeView {
     pub(in crate::tui) structured_preview:
         Option<crate::tui::structured_view::embedded::EmbeddedView>,
     pub(in crate::tui) structured_preview_pending: bool,
+    pub(in crate::tui) retained_preview:
+        Option<crate::tui::structured_view::embedded::RetainedView>,
+    pub(in crate::tui) retained_focus: Option<(String, u64)>,
+    pub(in crate::tui) retained_scroll_offset: usize,
     /// The last frame painted the mounted structured transcript into the preview, so
     /// `preview_text_view` maps transcript rows rather than the tmux capture.
     pub(super) structured_transcript_painted: bool,
     /// Exact canonical purge owner captured when Force Remove confirmation opens.
     pub(super) pending_force_remove_session: Option<(String, std::num::NonZeroU64)>,
-    pub(super) pending_trash_session: Option<String>,
+    pub(super) pending_trash_session: Option<SessionDialogTarget>,
     pub(super) pending_dialog_click_action: Option<crate::tui::app::Action>,
     pub(super) search_active: bool,
     pub(super) search_query: Input,

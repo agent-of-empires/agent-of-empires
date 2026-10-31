@@ -94,6 +94,8 @@ impl HomeView {
         self.system_health_scroll = 0;
         self.diff_view = None;
         self.live_send = None;
+        self.retained_focus = None;
+        self.clear_preview_selection();
         self.request_metrics_refresh();
     }
 
@@ -923,6 +925,9 @@ impl HomeView {
         nonce: String,
         choice: crate::tui::dialogs::PermissionResponseChoice,
     ) {
+        if self.get_instance(&session_id).is_none() || self.start_blocked(&session_id).is_some() {
+            return;
+        }
         let decision = Self::approval_decision_wire(choice);
         self.remove_structured_pending_approval(&session_id, &nonce);
         self.structured_approval_poller.request_resolve(
