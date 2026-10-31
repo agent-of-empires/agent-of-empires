@@ -83,8 +83,13 @@ pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservati
 pub(crate) use identity_sidecar::FAIL_PI_PATH_WRITES;
 pub use polling::PollerStart;
 pub use ready::{EnsureReadyError, EnsureReadyOutcome, SessionGone};
-pub(crate) use resume::{LaunchReservation, ResumeAttemptPolicy, ResumeLaunchOptions};
-pub(crate) use sid_persist::{persist_session_to_storage, SidPersistOutcome, SidWrite};
+pub use resume::ManagedResumeCause;
+pub(crate) use resume::{
+    LaunchReservation, ManagedResumeRefused, ResumeAttemptPolicy, ResumeLaunchOptions,
+};
+pub(crate) use sid_persist::{
+    persist_session_to_storage, CaptureCommit, SidPersistOutcome, SidWrite,
+};
 pub use start::{LaunchSidOutcome, StartOutcome};
 pub(crate) use status::PassiveStatusPatch;
 pub use status::{Status, TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR};
@@ -124,7 +129,7 @@ pub use types::{
     WorktreeInfo,
 };
 pub(crate) use types::{
-    PrimeAgentCapturePlan, PriorToolSession, ResumeIntent, SandboxStoreTransitionPath,
+    PrimeAgentCapturePlan, PriorToolSession, ResumeIntent, SandboxPin, SandboxStoreTransitionPath,
     SessionSidecarSource,
 };
 
@@ -665,6 +670,9 @@ pub struct Instance {
     // Docker sandbox integration
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_info: Option<SandboxInfo>,
+    /// Target of the last container this row built or adopted; absent on older rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) sandbox_pin: Option<SandboxPin>,
     /// Filesystem generation used by this container's private agent stores.
     #[serde(default, skip_serializing_if = "is_zero_u8")]
     pub(crate) sandbox_store_generation: u8,
@@ -711,17 +719,15 @@ pub struct Instance {
     /// agent's ids and consumes the incoming agent's entry, so the map holds at
     /// most one entry per tool the row has ever run under.
     ///
-    /// `resume_probe_failed_sid` is deliberately not parked with them: a
-    /// restored sid is worth one fresh probe (the conversation may well still
-    /// be there), and if it is gone the resume-fallback cascade already starts
-    /// a new session instead. Additive: absent in older rows, no migration.
+    /// `resume_probe_failed_sid` is not parked: restoring a conversation after
+    /// an engine swap permits one new resume probe.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub(crate) prior_tool_session_ids: HashMap<String, PriorToolSession>,
 
     /// Durable loop-breaker for ambiguous resume-probe failures. When this
-    /// equals `agent_session_id`, startup recovery skips automatic resume so a
-    /// transient pane crash does not repeatedly re-run the same failed probe.
-    /// Explicit user actions can still retry the preserved sid.
+    /// equals `agent_session_id`, the next default resume cascade starts fresh
+    /// instead of repeating the failed probe. Explicit pins and direct starts
+    /// may retry after shared native-context validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) resume_probe_failed_sid: Option<String>,
 

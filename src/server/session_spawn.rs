@@ -670,6 +670,16 @@ pub(crate) async fn spawn_structured_session(
         }
 
         crate::tips::record_session_creations(1);
+        tracing::info!(
+            target: "session.create",
+            session = %instance.id,
+            title = %instance.title,
+            tool = %instance.tool,
+            view = if instance.is_structured() { "structured" } else { "terminal" },
+            project_path = %instance.project_path,
+            branch = ?instance.worktree_info.as_ref().map(|w| &w.branch),
+            "session created"
+        );
         Ok::<_, anyhow::Error>((
             instance,
             build_warnings,

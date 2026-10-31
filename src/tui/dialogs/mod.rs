@@ -68,7 +68,7 @@ pub use rename::{RenameData, RenameDialog, RenameMode};
 pub use repo_trust::{RepoTrustAction, RepoTrustDialog};
 pub use restart::{RestartData, RestartDialog};
 pub use send_message::SendMessageDialog;
-pub use serve::{served_via, ServeAction, ServeLaunchRequest, ServeView};
+pub use serve::{served_via, DashboardLaunch, ServeAction, ServeLaunchRequest, ServeView};
 pub use skills_manager::SkillsManagerDialog;
 pub use snooze_duration::SnoozeDurationDialog;
 pub use telemetry_consent::TelemetryConsentDialog;
@@ -269,6 +269,19 @@ pub(crate) mod test_render {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|f| render(f, &theme)).unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    /// The drawn rows joined by newlines, for matching text a fixed needle can't.
+    pub fn text(buf: &Buffer) -> String {
+        let area = buf.area;
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Cell of the first occurrence of `needle`, for clicking what was drawn.

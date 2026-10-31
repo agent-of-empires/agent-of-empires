@@ -742,14 +742,8 @@ impl App {
                                     e2e_render_ack(false)?;
                                     continue;
                                 }
-                                match (key.code, key.modifiers) {
-                                    (KeyCode::Char('q'), KeyModifiers::NONE)
-                                    | (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
-                                    (KeyCode::Char('r'), KeyModifiers::NONE)
-                                        if self.home.sidebar_source == crate::tui::session_feed::SidebarSource::Disconnected => {
-                                        self.home.connect_runtime();
-                                    }
-                                    _ => {}
+                                if self.handle_runtime_gate_key(key) {
+                                    break;
                                 }
                             }
                             Some(Ok(Event::Resize(_, _))) => {}
@@ -1322,6 +1316,8 @@ impl App {
                 needs_full_refresh = true;
             }
 
+            self.home.request_plugin_ui_refresh();
+
             if last_metrics_sample.elapsed() >= METRICS_SAMPLE_INTERVAL {
                 self.home.request_metrics_refresh();
                 last_metrics_sample = std::time::Instant::now();
@@ -1329,6 +1325,10 @@ impl App {
 
             if self.home.apply_metrics_updates() {
                 refresh_needed = true;
+            }
+
+            if self.home.apply_plugin_ui_updates() {
+                needs_full_refresh = true;
             }
 
             needs_full_refresh |= self.home.apply_session_feed();
@@ -2581,6 +2581,10 @@ impl App {
         self.home.session_feed.suspend_for_dashboard();
         self.home
             .set_sidebar_source(crate::tui::session_feed::SidebarSource::Connecting, None);
+        self.home.dashboard_launch = Some(crate::tui::dialogs::DashboardLaunch::Running {
+            target: request.target(),
+            started_at: std::time::Instant::now(),
+        });
         let (result, receiver) = tokio::sync::oneshot::channel();
         self.dashboard_launch = Some(receiver);
         tokio::spawn(async move {
@@ -2598,6 +2602,7 @@ impl App {
             Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Err("Dashboard startup was interrupted; no reconnect or mutation was replayed. Use aoe serve --status, then reconnect explicitly.".to_owned()),
         };
         self.dashboard_launch = None;
+        let launch = self.home.dashboard_launch.take();
         match result {
             Ok(prepared) if self.dashboard_stop_requested => {
                 drop(prepared);
@@ -2615,6 +2620,18 @@ impl App {
             Err(message) => {
                 if let Some(serve) = &mut self.home.serve_view {
                     serve.finish_launch(Err(message.clone()));
+                } else if let Some(crate::tui::dialogs::DashboardLaunch::Running {
+                    target, ..
+                }) = launch
+                {
+                    // Hidden with Esc: the offline takeover's "Didn't start" row reports it. The log
+                    // tail is read now, so a view opened later shows this failure's lines.
+                    self.home.dashboard_launch =
+                        Some(crate::tui::dialogs::DashboardLaunch::Failed {
+                            target,
+                            message: message.clone(),
+                            log_tail: crate::acp::client::autostart::initial_log_tail(),
+                        });
                 }
                 self.home.set_sidebar_source(
                     crate::tui::session_feed::SidebarSource::Disconnected,
@@ -2624,6 +2641,28 @@ impl App {
         }
         self.start_dashboard_stop_if_ready();
         true
+    }
+
+    /// Keys while the runtime isn't the Daemon and no Web dashboard view is open: the offline
+    /// takeover or the "Connecting" screen. Returns true to quit.
+    fn handle_runtime_gate_key(&mut self, key: KeyEvent) -> bool {
+        use crate::tui::session_feed::SidebarSource;
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('q'), KeyModifiers::NONE)
+            | (KeyCode::Char('c'), KeyModifiers::CONTROL) => return true,
+            (KeyCode::Char('r'), KeyModifiers::NONE)
+                if self.home.sidebar_source == SidebarSource::Disconnected =>
+            {
+                self.home.connect_runtime();
+            }
+            // A dashboard start hidden with Esc keeps the runtime off the Daemon, so this screen is
+            // the only way back to it: still starting, or why it didn't.
+            (KeyCode::Enter, KeyModifiers::NONE) if self.home.dashboard_launch.is_some() => {
+                self.home.open_serve();
+            }
+            _ => {}
+        }
+        false
     }
 
     fn request_dashboard_stop(&mut self) {
@@ -4346,6 +4385,93 @@ mod tests {
         let (paste, enter) = App::split_trailing_enter("hi\n\n", &burst_keys);
         assert_eq!(paste, "hi\n");
         assert!(enter.is_some());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_launch_hidden_with_esc_stays_visible_and_its_failure_is_shown_once() {
+        use crate::tui::dialogs::{test_render, DashboardLaunch};
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let mut app = App::new(
+            "test",
+            AvailableTools::with_tools(&[]),
+            true,
+            false,
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        use crate::tui::session_feed::SidebarSource;
+        let enter = KeyEvent::from(KeyCode::Enter);
+        // The whole home screen as the user sees it, including a takeover.
+        let home = |app: &mut App| {
+            test_render::text(&test_render::draw(110, 40, |frame, theme| {
+                app.home
+                    .render(frame, frame.area(), theme, None, None, None)
+            }))
+        };
+        let screen = |app: &App| {
+            let view = app.home.serve_view.as_ref().expect("serve view open");
+            test_render::text(&test_render::draw(110, 40, |frame, theme| {
+                view.render(frame, frame.area(), theme)
+            }))
+        };
+        // 30s or a little more on a loaded run.
+        let elapsed = regex::Regex::new(r"Elapsed: 3\d+s").unwrap();
+        // Whether a view is open when the launch fails.
+        for view_open in [false, true] {
+            let started = std::time::Instant::now() - Duration::from_secs(30);
+            app.home.dashboard_launch = Some(DashboardLaunch::tunnel_for_test(started));
+            let (settle, launch) = tokio::sync::oneshot::channel();
+            app.dashboard_launch = Some(launch);
+            // As start_dashboard_launch leaves it: off the Daemon, behind the runtime gate.
+            app.home.set_sidebar_source(SidebarSource::Connecting, None);
+            assert!(home(&mut app).contains("Enter: back to the Web dashboard start"));
+
+            // Reopened mid-launch through the gate, it counts from the launch and leaves the bound
+            // to the App.
+            assert!(!app.handle_runtime_gate_key(enter));
+            assert!(elapsed.is_match(&screen(&app)), "{}", screen(&app));
+            assert!(app.home.serve_view.as_mut().is_some_and(|v| !v.tick()));
+            if !view_open {
+                app.home.handle_key(KeyEvent::from(KeyCode::Esc), None);
+                assert!(app.home.serve_view.is_none());
+            }
+
+            let log = crate::cli::serve::stdio_redirect_path().unwrap();
+            std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+            std::fs::write(&log, "[AOE_START_MARKER]\nbind failed on port 8081\n").unwrap();
+            let reason = "Dashboard start failed. Check `aoe logs`.";
+            assert!(settle.send(Err(reason.into())).is_ok());
+            assert!(app.poll_dashboard_launch());
+            if !view_open {
+                // Later Daemon activity mustn't stand in for this failure's log lines.
+                std::fs::write(&log, "[AOE_START_MARKER]\nlater daemon activity\n").unwrap();
+                // A dashboard that came up some other way outranks the stored failure.
+                use crate::tui::dialogs::WebState;
+                assert_eq!(app.home.connections_web_state(None), WebState::Failed);
+                app.home.serve_running = true;
+                assert_ne!(app.home.connections_web_state(None), WebState::Failed);
+                app.home.serve_running = false;
+                // The offline takeover says it didn't start, and Enter, through the gate, shows why.
+                assert_eq!(app.home.sidebar_source, SidebarSource::Disconnected);
+                let takeover = home(&mut app);
+                assert!(
+                    takeover.contains("Didn't start \u{00B7} Enter shows why"),
+                    "{takeover}"
+                );
+                assert!(!app.handle_runtime_gate_key(enter));
+            }
+            let shown = screen(&app);
+            assert!(shown.contains("Dashboard start failed."), "{view_open}");
+            assert!(
+                shown.contains("bind failed on port 8081")
+                    && !shown.contains("later daemon activity"),
+                "{view_open}: {shown}"
+            );
+            app.home.handle_key(KeyEvent::from(KeyCode::Esc), None);
+            assert!(app.home.dashboard_launch.is_none(), "shown once");
+        }
     }
 
     #[tokio::test]

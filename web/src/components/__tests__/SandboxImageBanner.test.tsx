@@ -376,6 +376,106 @@ describe("SandboxImageBanner", () => {
     }
   });
 
+  it("stops standing in for an unseen pull when the Update now reply never comes", async () => {
+    await mount(status());
+    // The reply never settles, and no status ever catches the pull running.
+    pullSandboxImage.mockImplementationOnce(() => new Promise(() => {}));
+    fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+    fetchSandboxImageStatus.mockResolvedValue(status({ state: "current", pull: { state: "done" } } as never));
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await pollAfter(20_000);
+    expect(banner()?.getAttribute("aria-label")).toBe("Downloading sandbox image");
+    // Past the cap, the Daemon's own status is believed: the pull finished.
+    await pollAfter(12_000);
+    expect(banner()?.getAttribute("aria-label")).toBe("Sandbox image updated");
+  });
+
+  it("keeps watching for the pull past the cap while the Update now reply is out", async () => {
+    await mount(status());
+    pullSandboxImage.mockImplementationOnce(() => new Promise(() => {}));
+    fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+    // No status shows it yet, and no visibility or reconnect event comes.
+    await pollAfter(32_000);
+    const calls = fetchSandboxImageStatus.mock.calls.length;
+    await pollAfter(2000);
+    expect(fetchSandboxImageStatus.mock.calls.length).toBe(calls + 1);
+    // A delayed pull starts, and is followed to its outcome.
+    fetchSandboxImageStatus.mockResolvedValue(status({ pull: { state: "running" } }));
+    await pollAfter(2000);
+    expect(banner()?.getAttribute("aria-label")).toBe("Downloading sandbox image");
+    fetchSandboxImageStatus.mockResolvedValue(status({ state: "current", pull: { state: "done" } } as never));
+    await pollAfter(2000);
+    expect(banner()?.getAttribute("aria-label")).toBe("Sandbox image updated");
+  });
+
+  it("shows a refusal that arrives after an older outcome was dismissed", async () => {
+    await mount(status());
+    let reply!: (r: { ok: boolean; message?: string }) => void;
+    pullSandboxImage.mockImplementationOnce(() => new Promise((resolve) => (reply = resolve)));
+    fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+    // Past the cap an older finished pull shows, and the user dismisses it.
+    fetchSandboxImageStatus.mockResolvedValue(status({ state: "current", pull: { state: "done" } } as never));
+    await pollAfter(32_000);
+    expect(banner()?.getAttribute("aria-label")).toBe("Sandbox image updated");
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss sandbox image notice" }));
+    expect(banner()).toBeNull();
+    // Then the Daemon refuses this click.
+    await act(async () => reply({ ok: false, message: "Pulling is off on this server." }));
+    expect(banner()?.getAttribute("aria-label")).toBe("Couldn't download the sandbox image");
+    expect(banner()?.textContent).toContain("Pulling is off on this server.");
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+  });
+
+  it("ties an outcome to this click only once a status or the accepted reply does", async () => {
+    // (reply, outcome status after the cap, banner)
+    const cases: [string, { ok: boolean } | null, Partial<SandboxImageStatus>, string][] = [
+      // No status saw it running and no reply came: an older pull's outcome isn't this click's.
+      ["older done", null, { pull: { state: "done" } }, "Sandbox image update available"],
+      ["older failed", null, { pull: { state: "failed", error: "old" } }, "Sandbox image update available"],
+      // The Daemon claims the pull before it answers, so after an accepted reply it is this click's.
+      ["accepted, then done", { ok: true }, { pull: { state: "done" } }, "Sandbox image updated"],
+    ];
+    for (const [name, reply, after, want] of cases) {
+      const { unmount } = await mount(status());
+      pullSandboxImage.mockImplementationOnce(() => (reply ? Promise.resolve(reply) : new Promise(() => {})));
+      fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+      fetchSandboxImageStatus.mockResolvedValue(status(after));
+      await pollAfter(32_000);
+      expect(banner()?.getAttribute("aria-label"), name).toBe(want);
+      unmount();
+    }
+  });
+
+  it("shows progress, not an older state already on screen, once the reply is accepted", async () => {
+    const older: SandboxImageStatus["pull"][] = [
+      { state: "done" },
+      { state: "failed", error: "old" },
+      { state: "idle" },
+    ];
+    for (const pull of older) {
+      const { unmount } = await mount(status());
+      let reply!: (r: { ok: boolean }) => void;
+      pullSandboxImage.mockImplementationOnce(() => new Promise((resolve) => (reply = resolve)));
+      fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+      // Past the cap the state the Daemon still reports shows as the offer.
+      fetchSandboxImageStatus.mockResolvedValue(status({ pull }));
+      await pollAfter(32_000);
+      expect(banner()?.getAttribute("aria-label"), pull.state).toBe("Sandbox image update available");
+      // The Daemon accepts this click; the status fetched after that is still out.
+      let fresh!: (s: SandboxImageStatus) => void;
+      fetchSandboxImageStatus.mockImplementation(() => new Promise((resolve) => (fresh = resolve)));
+      await act(async () => reply({ ok: true }));
+      expect(banner()?.getAttribute("aria-label"), pull.state).toBe("Downloading sandbox image");
+      // The fresh status shows this pull's outcome.
+      await act(async () => fresh(status({ state: "current", pull: { state: "done" } } as never)));
+      expect(banner()?.getAttribute("aria-label"), pull.state).toBe("Sandbox image updated");
+      unmount();
+    }
+  });
+
   it("hides an earlier available update once a check fails", async () => {
     await mount(status());
     expect(banner()).not.toBeNull();

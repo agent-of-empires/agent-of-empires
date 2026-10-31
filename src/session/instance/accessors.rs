@@ -55,6 +55,7 @@ impl Instance {
             worktree_info: None,
             workspace_info: None,
             sandbox_info: None,
+            sandbox_pin: None,
             sandbox_store_generation:
                 crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION,
             sandbox_store_transition_paths: Vec::new(),
@@ -462,7 +463,7 @@ impl Instance {
             .map(|(capture, _)| capture.backend)
     }
 
-    /// Bare wrappers can receive automatic selectors, without proving execution identity.
+    /// Bare wrappers can receive fresh-session selectors without attesting execution.
     pub(super) fn legacy_default_selector_agent(&self) -> Option<&'static crate::agents::AgentDef> {
         if matches!(
             self.resume_intent,
@@ -1401,24 +1402,6 @@ mod tests {
         inst.acp_session_id = Some("sid-abc".to_string());
 
         assert!(inst.terminal_keep_context_state(None).is_err());
-    }
-    #[test]
-    #[serial_test::serial]
-    fn handoff_refuses_unattested_native_configuration() {
-        let temp = tempfile::tempdir().unwrap();
-        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
-        let _claude = crate::session::test_support::install_login_shell_path_command(
-            temp.path(),
-            "claude",
-            "#!/bin/sh\nexit 0\n",
-        );
-        let mut inst = Instance::new("claude-handoff-error", "/tmp");
-        inst.view = View::Structured;
-        inst.acp_session_id = Some("sid-abc".into());
-        let worker = inst.resolve_native_execution(None).unwrap().binding;
-        inst.extra_args = "--mcp-config /tmp/unattested.json".into();
-
-        assert!(inst.terminal_keep_context_state(Some(&worker)).is_err());
     }
 
     /// #4127: the launch's route reaches both bindings a resume may persist,

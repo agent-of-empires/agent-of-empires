@@ -73,6 +73,24 @@ pub(crate) enum SidWrite {
     PinnedForeign,
 }
 
+/// Result of a capture transaction, including its committed loop breaker.
+#[must_use]
+#[derive(Debug)]
+pub(crate) struct CaptureCommit {
+    pub(crate) outcome: SidWrite,
+    /// Meaningful only when `outcome` is `Applied`; otherwise do not adopt it.
+    pub(crate) failed_sid: Option<String>,
+}
+
+impl CaptureCommit {
+    pub(crate) fn unapplied(outcome: SidWrite) -> Self {
+        Self {
+            outcome,
+            failed_sid: None,
+        }
+    }
+}
+
 /// Caller contract for `persist_session_id`: whether to publish the
 /// post-CAS `agent_session_id` to the tmux hidden env.
 ///
@@ -94,12 +112,12 @@ pub(crate) fn persist_session_to_storage(
     observation: &crate::session::poller::SessionIdObservation,
     expected: &ConversationState,
     file_watch: &std::sync::Arc<crate::file_watch::FileWatchService>,
-) -> SidWrite {
+) -> CaptureCommit {
     let storage = match crate::session::storage::Storage::new(profile, file_watch.clone()) {
         Ok(storage) => storage,
         Err(error) => {
             tracing::warn!(target: "session.store", "Cannot open capture storage: {error}");
-            return SidWrite::Failed;
+            return CaptureCommit::unapplied(SidWrite::Failed);
         }
     };
     persist_session_with_storage(&storage, instance_id, observation, expected)
@@ -114,9 +132,9 @@ impl Instance {
         instance_id: &str,
         session_id: &str,
         generation: &str,
-    ) -> Result<SidWrite> {
+    ) -> Result<CaptureCommit> {
         if !is_valid_session_id(session_id) {
-            return Ok(SidWrite::Failed);
+            return Ok(CaptureCommit::unapplied(SidWrite::Failed));
         }
         storage.update(|instances, _groups| {
             let Some(instance) = instances
@@ -142,10 +160,13 @@ impl Instance {
                     disk_generation = ?instance.omp_capture_generation,
                     "OMP pin confirmation CAS mismatch"
                 );
-                return Ok(SidWrite::Skipped);
+                return Ok(CaptureCommit::unapplied(SidWrite::Skipped));
             }
             instance.resume_intent = ResumeIntent::Default;
-            Ok(SidWrite::Applied)
+            Ok(CaptureCommit {
+                outcome: SidWrite::Applied,
+                failed_sid: instance.resume_probe_failed_sid.clone(),
+            })
         })
     }
 
@@ -468,14 +489,14 @@ pub(super) fn persist_session_with_storage(
     instance_id: &str,
     observation: &crate::session::poller::SessionIdObservation,
     expected: &ConversationState,
-) -> SidWrite {
+) -> CaptureCommit {
     use crate::session::poller::SessionIdGuard;
     let session_id = observation.sid.as_str();
     if !is_valid_session_id(session_id) {
-        return SidWrite::Failed;
+        return CaptureCommit::unapplied(SidWrite::Failed);
     }
     if observation.execution != expected.active {
-        return SidWrite::Skipped;
+        return CaptureCommit::unapplied(SidWrite::Skipped);
     }
     let binding = observation.conversation_binding();
     let result = storage.update(|instances, _groups| {
@@ -483,22 +504,22 @@ pub(super) fn persist_session_with_storage(
             .iter()
             .position(|instance| instance.id == instance_id)
         else {
-            return Ok(SidWrite::Failed);
+            return Ok(CaptureCommit::unapplied(SidWrite::Failed));
         };
         let instance = &instances[index];
         if !expected.matches(instance)
             || matches!(instance.resume_intent, ResumeIntent::Fork { .. })
         {
-            return Ok(SidWrite::Skipped);
+            return Ok(CaptureCommit::unapplied(SidWrite::Skipped));
         }
         match &observation.guard {
             SessionIdGuard::OmpGeneration(generation)
                 if instance.omp_capture_generation.as_ref() != Some(generation) =>
             {
-                return Ok(SidWrite::Skipped)
+                return Ok(CaptureCommit::unapplied(SidWrite::Skipped))
             }
             SessionIdGuard::OmpLegacy if instance.omp_capture_generation.is_some() => {
-                return Ok(SidWrite::Skipped)
+                return Ok(CaptureCommit::unapplied(SidWrite::Skipped))
             }
             _ => {}
         }
@@ -508,7 +529,7 @@ pub(super) fn persist_session_with_storage(
         // for the pinned sid stays a namespace doubt (`Skipped`).
         if let ResumeIntent::Use(pinned) = &instance.resume_intent {
             if pinned != session_id {
-                return Ok(SidWrite::PinnedForeign);
+                return Ok(CaptureCommit::unapplied(SidWrite::PinnedForeign));
             }
             if instance.resume_binding.as_ref().is_some_and(|target| {
                 target.execution.as_ref()
@@ -516,11 +537,11 @@ pub(super) fn persist_session_with_storage(
                         .as_ref()
                         .and_then(|binding| binding.execution.as_ref())
             }) {
-                return Ok(SidWrite::Skipped);
+                return Ok(CaptureCommit::unapplied(SidWrite::Skipped));
             }
         }
         if instance.is_capture_excluded(session_id, observation.source()) {
-            return Ok(SidWrite::Skipped);
+            return Ok(CaptureCommit::unapplied(SidWrite::Skipped));
         }
         let owns = |sid: Option<&str>, owner: Option<&ConversationBinding>| {
             sid == Some(session_id)
@@ -545,35 +566,36 @@ pub(super) fn persist_session_with_storage(
             // A peer durably owns this sid, so the publication is a conflict to
             // retry rather than a divergence to abandon. A pin confirmation is
             // exempt: the row armed the pin and must be able to re-prove it.
-            return Ok(if confirms_pin {
+            return Ok(CaptureCommit::unapplied(if confirms_pin {
                 SidWrite::Skipped
             } else {
                 SidWrite::OwnershipConflict
-            });
+            }));
         }
         let pi_session_path = instance.observed_pi_session_path(observation);
         let instance = &mut instances[index];
-        // A source-less observation of the id the row already holds is not
-        // evidence that a conversation qualified, nor that a failed resume now
-        // works; keep the binding and the loop breaker.
-        let establishes = binding.is_some();
+        // Qualification of the same durable sid does not prove that a failed
+        // resume now works. Only a different sid resets the loop breaker.
         let new_conversation = instance.agent_session_id.as_deref() != Some(session_id);
         let binding = binding.or_else(|| instance.observed_binding(observation));
         instance.set_agent_conversation(Some(session_id.into()), binding, pi_session_path);
-        if establishes || new_conversation {
+        if new_conversation {
             instance.resume_probe_failed_sid = None;
         }
         if confirms_pin {
             instance.resume_intent = ResumeIntent::Default;
             instance.resume_binding = None;
         }
-        Ok(SidWrite::Applied)
+        Ok(CaptureCommit {
+            outcome: SidWrite::Applied,
+            failed_sid: instance.resume_probe_failed_sid.clone(),
+        })
     });
     match result {
         Ok(outcome) => outcome,
         Err(error) => {
             tracing::warn!(target: "session.store", "Cannot persist captured conversation: {error}");
-            SidWrite::Failed
+            CaptureCommit::unapplied(SidWrite::Failed)
         }
     }
 }
@@ -750,7 +772,7 @@ mod tests {
         let observed =
             crate::session::poller::SessionIdObservation::instance_sidecar(VALID_SID.into(), None);
         assert_eq!(
-            persist_session_with_storage(&storage, &snapshot.id, &observed, &expected),
+            persist_session_with_storage(&storage, &snapshot.id, &observed, &expected).outcome,
             SidWrite::Skipped
         );
         assert!(storage.load().unwrap()[0].agent_session_id.is_none());
@@ -774,8 +796,81 @@ mod tests {
                 &expected_state(&inst.tool, prior, ResumeIntent::Default),
                 &FileWatchService::noop(),
             );
-            assert_eq!(write, expected);
+            assert_eq!(write.outcome, expected);
             assert_eq!(disk_sid(profile, &inst.id).as_deref(), Some(disk));
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn captured_observation_clears_failed_marker_only_for_a_different_sid() {
+        use crate::session::instance::ActiveExecution;
+        use crate::session::{ConversationBinding, ExecutionBinding};
+
+        const OTHER_SID: &str = "019342aa-2222-7eee-8fff-aaaabbbbcccc";
+        for (case, qualified, prior_binding, captured_sid) in [
+            ("qualified-replay", true, true, VALID_SID),
+            ("binding-enrichment", true, false, VALID_SID),
+            ("source-less-replay", false, true, VALID_SID),
+            ("different-sid", true, true, OTHER_SID),
+        ] {
+            let profile = "capture-failed-marker";
+            let mut inst = make_inst(profile, case);
+            let source = ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec!["/tmp/sessions/bucket".into()],
+                configuration: Vec::new(),
+                cwd: "/tmp/x".into(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: None,
+            };
+            inst.active_execution = Some(ActiveExecution {
+                launch_id: "failed-generation".into(),
+                binding: source.clone(),
+                capture: None,
+                container: None,
+            });
+            let mut observed = observation(captured_sid);
+            observed.execution = inst.active_execution.clone();
+            if qualified {
+                observed.scope_to(source);
+            }
+            inst.agent_session_id = Some(VALID_SID.into());
+            inst.agent_session_binding = prior_binding.then(|| ConversationBinding {
+                session_id: VALID_SID.into(),
+                ..observed
+                    .conversation_binding()
+                    .unwrap_or_else(|| ConversationBinding::unknown(VALID_SID))
+            });
+            inst.resume_probe_failed_sid = Some(VALID_SID.into());
+            let (_temp, _home, storage) = seeded(profile, &[&inst]);
+            let expected = inst.conversation_state();
+
+            assert_eq!(
+                persist_session_with_storage(&storage, &inst.id, &observed, &expected).outcome,
+                SidWrite::Applied,
+                "{case}"
+            );
+            let rows = storage.load().unwrap();
+            let row = &rows[0];
+            assert_eq!(
+                row.agent_session_id.as_deref(),
+                Some(captured_sid),
+                "{case}"
+            );
+            if qualified {
+                assert_eq!(
+                    row.agent_session_binding,
+                    observed.conversation_binding(),
+                    "{case}"
+                );
+            }
+            assert_eq!(
+                row.resume_probe_failed_sid.as_deref(),
+                (captured_sid == VALID_SID).then_some(VALID_SID),
+                "{case}"
+            );
         }
     }
 
@@ -791,7 +886,8 @@ mod tests {
         let expected = inst.conversation_state();
 
         assert_eq!(
-            persist_session_with_storage(&storage, &inst.id, &observation(OTHER_SID), &expected),
+            persist_session_with_storage(&storage, &inst.id, &observation(OTHER_SID), &expected)
+                .outcome,
             SidWrite::PinnedForeign
         );
         let disk = storage.load().unwrap();
@@ -799,7 +895,8 @@ mod tests {
         assert_eq!(disk[0].resume_intent, ResumeIntent::Use(VALID_SID.into()));
 
         assert_eq!(
-            persist_session_with_storage(&storage, &inst.id, &observation(VALID_SID), &expected),
+            persist_session_with_storage(&storage, &inst.id, &observation(VALID_SID), &expected)
+                .outcome,
             SidWrite::Applied,
             "the pin must still accept its own conversation"
         );
@@ -856,7 +953,8 @@ mod tests {
                 &claimant.id,
                 &observed,
                 &claimant.conversation_state(),
-            ),
+            )
+            .outcome,
             SidWrite::Skipped,
             "an unproven pin must remain retryable"
         );
@@ -926,7 +1024,8 @@ mod tests {
                     &observed,
                     &claimant.conversation_state(),
                     &FileWatchService::noop()
-                ),
+                )
+                .outcome,
                 expected,
                 "{namespace}"
             );
@@ -953,7 +1052,8 @@ mod tests {
                 &claimant.id,
                 &observation(sid),
                 &claimant.conversation_state(),
-            ),
+            )
+            .outcome,
             SidWrite::OwnershipConflict
         );
         assert_eq!(disk_sid(profile, &claimant.id), None);
@@ -1050,7 +1150,8 @@ mod tests {
                     &claimant.id,
                     &observed,
                     &claimant.conversation_state(),
-                ),
+                )
+                .outcome,
                 SidWrite::OwnershipConflict,
                 "{case} must not change the one-owner decision"
             );
@@ -1097,7 +1198,8 @@ mod tests {
                 &claimant.id,
                 &observed,
                 &claimant.conversation_state(),
-            ),
+            )
+            .outcome,
             SidWrite::Applied,
             "an unclaimed ID remains capturable before publication"
         );
@@ -1254,7 +1356,7 @@ mod tests {
             &expected_state(&inst.tool, Some("old"), ResumeIntent::Default),
             &svc,
         );
-        assert_eq!(write, SidWrite::Applied);
+        assert_eq!(write.outcome, SidWrite::Applied);
         let evt = tokio::time::timeout(Duration::from_millis(2_500), rx.recv())
             .await
             .expect("delivery within budget")
@@ -1375,7 +1477,8 @@ mod tests {
                 &inst.id,
                 &observation,
                 &inst.conversation_state()
-            ),
+            )
+            .outcome,
             SidWrite::Applied
         );
     }
@@ -1408,7 +1511,8 @@ mod tests {
         let next_sid = "019342aa-2222-7eee-8fff-aaaabbbbcccc";
         let expected = storage.load().unwrap()[0].conversation_state();
         assert_eq!(
-            persist_session_with_storage(&storage, &inst.id, &observation(next_sid), &expected),
+            persist_session_with_storage(&storage, &inst.id, &observation(next_sid), &expected)
+                .outcome,
             SidWrite::Applied
         );
         assert_eq!(disk_sid(profile, &inst.id).as_deref(), Some(next_sid));
@@ -1524,7 +1628,8 @@ mod tests {
                     ),
                     &inst.conversation_state(),
                     &FileWatchService::noop(),
-                ),
+                )
+                .outcome,
                 SidWrite::Skipped
             );
         }

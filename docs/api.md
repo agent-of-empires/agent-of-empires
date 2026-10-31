@@ -568,10 +568,12 @@ Before delivery, the HTTP endpoint removes bracketed-paste delimiters and remain
 | `403` | `{"error": "read_only"}` | Server is in read-only mode |
 | `404` | `{"error": "not_found"}` | No session with that id |
 | `409` | `{"error": "session_not_running"}` | Session exists but the tmux pane is gone |
-| `409` | `{"error": "resume_failed", "message": "...", "resume_session_id": "..."}` | Auto-revive tried to resume a stored conversation, but the pane exited before AoE could prove the ID invalid. The ID is preserved for explicit retry or replacement. |
+| `409` | `{"error": "resume_failed", "message": "...", "resume_session_id": "..."}` | Auto-revive tried to resume a stored conversation, but the pane exited during the probe. The ID and failure marker are preserved in this call; the next default revival can start fresh. |
 | `409` | `{"error": "session_transient", "status": "..."}` | Session is mid-lifecycle and cannot accept input yet |
 | `409` | `{"error": "session_archived" \| "session_trashed", "message": "..."}` | Session is archived or trashed, even with a live pane or `revive: false`; unarchive or restore it first. `/start`, `/ensure`, `/container-terminal` and structured-view prompts refuse the same way. |
 | `500` | `{"error": "tmux_error"}` or `{"error": "internal"}` | Unexpected failure (logged server-side) |
+
+After a prior failed resume probe, a default restart or send-driven revival can start a new conversation and deliver input there. The old native transcript is not deleted, but its AoE association is abandoned. `/ensure` reports this as `resume_outcome: "fresh_after_failed_resume"` with `prior_session_id` and a message, rather than claiming a successful resume. See [session recovery policy](guides/session-resume.md#pinning-or-resetting-a-conversation) for explicit retry and direct CLI start behavior.
 
 Concurrent POSTs to the same `id` are serialized server-side, so two
 orchestrators racing on the same session won't interleave keystrokes
@@ -660,12 +662,19 @@ attachment is delivered. Genuine authority loss or an unknown outcome remains
 blocked until reconciled.
 
 A failed launch can still commit a lifecycle generation. The finite
-`aoe-error-code` values `start_failed` and `resume_failed`, with valid same-epoch
-runtime receipt headers, acknowledge that preparation commit, not a successful
+`aoe-error-code` values `start_failed`, `resume_failed`, and
+`managed_resume_refused`, with valid same-epoch runtime receipt headers,
+acknowledge that preparation commit, not a successful
 launch. Clients must apply its snapshot before retrying. A later send or target
 probe failure can likewise retain a preparation cursor; it does not acknowledge
 message delivery. Transport loss or malformed mutation receipts remain unknown;
 effect-free daemon refusals do not acknowledge a commit.
+
+`409 managed_resume_refused` preserves the managed conversation. Its finite
+`aoe-managed-resume-cause` header supplies an application-owned recovery reason.
+Missing, unknown, or ambiguous cause metadata keeps the refusal generic; native
+clients do not read response bodies to derive that reason. See
+[managed resume recovery](guides/session-resume.md#common-managed-resume-and-fork-refusals).
 
 A failed purge can commit a retained-row failure marker. `409 purge_failed`
 includes the finite code header and its canonical receipt; clients wait for that

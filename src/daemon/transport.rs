@@ -49,50 +49,13 @@ pub(crate) fn prepare_runtime_directory(parent: &Path) -> anyhow::Result<()> {
     }
     let owner = nix::unistd::geteuid().as_raw();
     if let Some(app_dir) = parent.parent() {
+        for ancestor in app_dir.ancestors().skip(1) {
+            check_ancestor(ancestor, parent, owner)?;
+        }
         drop_group_other_write(app_dir, owner)?;
     }
     for ancestor in parent.ancestors() {
-        let meta = std::fs::symlink_metadata(ancestor)?;
-        if meta.is_dir()
-            && meta.uid() == owner
-            && meta.mode() & 0o022 != 0
-            && !trusted_ancestor(meta.uid(), meta.mode(), owner)
-        {
-            if ancestor == parent {
-                return Err(anyhow::anyhow!(runtime_path_refusal(
-                    ancestor,
-                    meta.mode(),
-                    "not private to its owner",
-                    RuntimePathRemedy::Command {
-                        template: "chmod -- 0700 {path}",
-                        manual: "Set this directory to mode 0700",
-                    },
-                )));
-            }
-            return Err(anyhow::anyhow!(runtime_path_refusal(
-                ancestor,
-                meta.mode(),
-                "writable by its group or by others",
-                RuntimePathRemedy::Command {
-                    template: "chmod -- go-w {path}",
-                    manual: "Remove group/other write permission from this directory",
-                },
-            )));
-        }
-        anyhow::ensure!(
-            meta.is_dir()
-                && !meta.file_type().is_symlink()
-                && trusted_ancestor(meta.uid(), meta.mode(), owner),
-            "{}",
-            runtime_path_refusal(
-                ancestor,
-                meta.mode(),
-                "not a trusted real directory",
-                RuntimePathRemedy::Advice(
-                    "Inspect ownership and symlinks; select a real directory owned by this user or root.",
-                ),
-            )
-        );
+        check_ancestor(ancestor, parent, owner)?;
     }
     let directory = std::fs::symlink_metadata(parent)?;
     anyhow::ensure!(
@@ -119,13 +82,83 @@ pub(crate) fn prepare_runtime_directory(parent: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn check_ancestor(ancestor: &Path, parent: &Path, owner: u32) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(ancestor)?;
+    if meta.is_dir()
+        && meta.uid() == owner
+        && meta.mode() & 0o022 != 0
+        && !trusted_ancestor(meta.uid(), meta.mode(), owner)
+    {
+        if ancestor == parent {
+            return Err(anyhow::anyhow!(runtime_path_refusal(
+                ancestor,
+                meta.mode(),
+                "not private to its owner",
+                RuntimePathRemedy::Command {
+                    template: "chmod -- 0700 {path}",
+                    manual: "Set this directory to mode 0700",
+                },
+            )));
+        }
+        return Err(anyhow::anyhow!(runtime_path_refusal(
+            ancestor,
+            meta.mode(),
+            "writable by its group or by others",
+            RuntimePathRemedy::Command {
+                template: "chmod -- go-w {path}",
+                manual: "Remove group/other write permission from this directory",
+            },
+        )));
+    }
+    anyhow::ensure!(
+        meta.is_dir()
+            && !meta.file_type().is_symlink()
+            && trusted_ancestor(meta.uid(), meta.mode(), owner),
+        "{}",
+        runtime_path_refusal(
+            ancestor,
+            meta.mode(),
+            "not a trusted real directory",
+            RuntimePathRemedy::Advice(
+                "Inspect ownership and symlinks; select a real directory owned by this user or root.",
+            ),
+        )
+    );
+    Ok(())
+}
+
 /// The app dir belongs to aoe, but a umask of 002 creates it group-writable.
+/// Callers validate its ancestors first; the open pins the inode so a swapped
+/// entry cannot be chmodded.
 fn drop_group_other_write(dir: &Path, owner: u32) -> anyhow::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_DIRECTORY | nix::libc::O_CLOEXEC)
+        .open(dir)
+    {
+        Ok(file) => file,
+        // A symlink or non-directory is refused with a diagnostic by the ancestor check.
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(nix::libc::ELOOP | nix::libc::ENOTDIR)
+            ) =>
+        {
+            return Ok(())
+        }
+        Err(error) => return Err(error.into()),
+    };
+    drop_write_through_fd(&file, owner)
+}
+
+fn drop_write_through_fd(file: &std::fs::File, owner: u32) -> anyhow::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let meta = std::fs::symlink_metadata(dir)?;
-    if meta.is_dir() && meta.uid() == owner && meta.mode() & 0o022 != 0 {
+    let meta = file.metadata()?;
+    if meta.uid() == owner && meta.mode() & 0o022 != 0 {
         let mode = meta.mode() & 0o7777 & !0o022;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))?;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
     }
     Ok(())
 }
@@ -257,6 +290,7 @@ pub(crate) fn response_deadline(response: &reqwest::Response) -> tokio::time::In
 }
 
 pub(crate) fn request_error(error: reqwest::Error) -> DaemonClientError {
+    tracing::debug!(target: "daemon.client", %error, "daemon request failed");
     if error.is_timeout() {
         DaemonClientError::Timeout
     } else {
@@ -437,6 +471,69 @@ mod tests {
         prepare_runtime_directory(&app.join("daemon")).unwrap();
 
         assert_eq!(std::fs::metadata(&app).unwrap().mode() & 0o777, 0o755);
+    }
+
+    #[test]
+    fn app_dir_tightening_follows_the_opened_inode_not_the_path() {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().canonicalize().unwrap();
+        let app = base.join("app");
+        let moved = base.join("moved");
+        let sentinel = base.join("sentinel");
+        std::fs::create_dir(&app).unwrap();
+        std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o775)).unwrap();
+        std::fs::write(&sentinel, b"secret").unwrap();
+        std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let pinned = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_DIRECTORY)
+            .open(&app)
+            .unwrap();
+        std::fs::rename(&app, &moved).unwrap();
+        std::os::unix::fs::symlink(&sentinel, &app).unwrap();
+
+        drop_write_through_fd(&pinned, nix::unistd::geteuid().as_raw()).unwrap();
+
+        assert_eq!(std::fs::metadata(&sentinel).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(&moved).unwrap().mode() & 0o777, 0o755);
+    }
+
+    #[test]
+    fn symlinked_app_dir_is_refused_and_its_target_left_alone() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().canonicalize().unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let target = base.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o775)).unwrap();
+        std::os::unix::fs::symlink(&target, base.join("app")).unwrap();
+
+        prepare_runtime_directory(&base.join("app/daemon")).unwrap_err();
+
+        assert_eq!(std::fs::metadata(&target).unwrap().mode() & 0o777, 0o775);
+    }
+
+    #[test]
+    fn untrusted_upper_parent_is_refused_before_the_app_dir_is_tightened() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().canonicalize().unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let upper = base.join("upper");
+        let app = upper.join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o775)).unwrap();
+        std::fs::set_permissions(&upper, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let error = prepare_runtime_directory(&app.join("daemon")).unwrap_err();
+
+        assert!(
+            error.to_string().contains(upper.to_str().unwrap()),
+            "{error}"
+        );
+        assert_eq!(std::fs::metadata(&app).unwrap().mode() & 0o777, 0o775);
     }
 
     fn run_directory_recovery(error: &anyhow::Error) {

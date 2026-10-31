@@ -5,6 +5,9 @@ import { onServerDownChange } from "../lib/connectionState";
 const POLL_MINUTES = 60;
 // Often enough that "updated" follows a pull closely; the Daemon answers from memory.
 const PULL_POLL_MS = 2000;
+// How long "Downloading" stands in for a pull no status has shown. The Daemon answers Update now as
+// soon as it starts the pull, so a reply still missing after this is lost, and statuses are believed.
+const UNCONFIRMED_PULL_MS = 30_000;
 
 export type SandboxImageBannerView =
   | { kind: "available"; image: string; onUpdate: () => void; onDismiss: () => void }
@@ -30,14 +33,17 @@ export function useSandboxImageBanner(): SandboxImageBannerView | null {
   // Set once a status shows the pull this page asked for running; a failed reply arriving after
   // that can't undo it, since the Daemon starts the pull before it answers.
   const pullConfirmed = useRef(false);
-  // True from "Update now" until its reply lands.
-  const replyPending = useRef(false);
+  // When "Update now" was pressed, while its reply is still out; null once it lands.
+  const replyPendingSince = useRef<number | null>(null);
   // Each "Update now" or Retry is a new attempt; a reply to an older one changes nothing.
   const attempt = useRef(0);
   // The digest the latest status offered, and the one the current attempt pulled, so a finished
   // pull can tell a newer image published since from the one it just pulled.
   const offeredDigest = useRef<string | null>(null);
   const [pulledDigest, setPulledDigest] = useState<string | null>(null);
+  // A status showed the current attempt's pull running, or the Daemon accepted it (it claims the
+  // pull before it answers), so the outcome a status shows from then on is this attempt's.
+  const [sawRunning, setSawRunning] = useState(false);
   // The Daemon refuses checks and pulls while it can't read its configuration.
   const [configUnreadable, setConfigUnreadable] = useState(false);
   const [configNoticeDismissed, setConfigNoticeDismissed] = useState(false);
@@ -60,19 +66,27 @@ export function useSandboxImageBanner(): SandboxImageBannerView | null {
       const refused = s && !("state" in s) ? s.error : null;
       setConfigUnreadable(refused === "config_unreadable");
       // Until the reply lands or a status shows the pull, any other pull state predates it: keep
-      // showing "Downloading" and polling fast rather than flashing the old state back.
+      // showing "Downloading" and polling fast rather than flashing the old state back. Only for a
+      // while: a reply that never comes can't hide a pull that finished unseen.
+      const since = replyPendingSince.current;
       const predatesPull =
-        !!answer && replyPending.current && !pullConfirmed.current && answer.pull.state !== "running";
+        !!answer &&
+        since !== null &&
+        Date.now() - since < UNCONFIRMED_PULL_MS &&
+        !pullConfirmed.current &&
+        answer.pull.state !== "running";
       if (answer) {
         offeredDigest.current = answer.state === "available" ? answer.remote_digest : null;
         setStatus(predatesPull ? { ...answer, pull: { state: "running" } } : answer);
         if (answer.pull.state === "running") {
           pullConfirmed.current = true;
+          setSawRunning(true);
           setWatchedPull(true);
           // The Daemon is pulling after all, e.g. the "Update now" reply was lost on the way.
           setRefusal(null);
         }
-        expectingPull.current = predatesPull || answer.pull.state === "running";
+        // The cap only limits what's shown: while the reply is out, keep watching for the pull.
+        expectingPull.current = predatesPull || answer.pull.state === "running" || since !== null;
       }
       if (timer) clearTimeout(timer);
       const pulling = expectingPull.current;
@@ -104,16 +118,23 @@ export function useSandboxImageBanner(): SandboxImageBannerView | null {
   const update = useCallback(() => {
     const mine = ++attempt.current;
     setPulledDigest(offeredDigest.current);
+    setSawRunning(false);
     setWatchedPull(true);
     setNoticeDismissed(false);
     setRefusal(null);
     expectingPull.current = true;
     pullConfirmed.current = false;
-    replyPending.current = true;
+    replyPendingSince.current = Date.now();
     setStatus((s) => s && { ...s, pull: { state: "running" } });
     void pullSandboxImage().then((reply) => {
       if (mine !== attempt.current) return;
-      replyPending.current = false;
+      replyPendingSince.current = null;
+      if (reply.ok) {
+        setSawRunning(true);
+        // Acceptance ties what comes next to this click, not a state already on screen: until a
+        // status fetched after it lands, show the pull as running.
+        if (!pullConfirmed.current) setStatus((s) => s && { ...s, pull: { state: "running" } });
+      }
       if (!reply.ok && !pullConfirmed.current) {
         // Nothing was pulled, and the Daemon may still hold an older pull's outcome. No status has
         // shown a pull since the click, so the "running" in `status` is this page's own guess.
@@ -121,6 +142,8 @@ export function useSandboxImageBanner(): SandboxImageBannerView | null {
         setWatchedPull(false);
         setStatus((s) => s && (s.pull.state === "running" ? { ...s, pull: { state: "idle" } } : s));
         setRefusal(reply.message ?? "Couldn't reach the Daemon.");
+        // The user may have dismissed an older outcome shown meanwhile; this refusal is new.
+        setNoticeDismissed(false);
       }
       pollNow.current();
     });
@@ -145,8 +168,13 @@ export function useSandboxImageBanner(): SandboxImageBannerView | null {
     const onDismiss = () => setNoticeDismissed(true);
     // An image published since this pull is news again; the one it pulled isn't.
     const newer = status.state === "available" && status.remote_digest !== pulledDigest;
-    if (pull.state === "done" && !newer) return { kind: "done", onDismiss };
-    if (pull.state === "failed") return { kind: "failed", error: pull.error, onRetry: update, onDismiss };
+    // A `done` no status tied to this attempt, while an image is still on offer, may be an older
+    // pull's: show the offer rather than success.
+    const unconfirmed = !sawRunning && status.state === "available";
+    if (pull.state === "done" && !newer && !unconfirmed) return { kind: "done", onDismiss };
+    if (pull.state === "failed" && !unconfirmed) {
+      return { kind: "failed", error: pull.error, onRetry: update, onDismiss };
+    }
   }
 
   if (status.state !== "available" || status.dismissed || dismissedDigest === status.remote_digest) return null;

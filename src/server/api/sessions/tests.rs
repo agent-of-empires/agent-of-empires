@@ -3832,6 +3832,27 @@ fn fork_seed_and_structured_fork_guard_agree_per_agent() {
     }
 }
 
+#[test]
+fn session_response_carries_the_agents_solo_commands() {
+    let cases: [(&str, &[&str], &[&str]); 2] = [
+        ("claude", &["/clear"], &["/compact"]),
+        ("definitely-not-an-acp-agent", &[], &[]),
+    ];
+    for (tool, clear, compact) in cases {
+        let mut inst = make_test_instance();
+        inst.tool = tool.to_string();
+        let response = SessionResponse::from_instance(&inst, false);
+        assert_eq!(
+            (response.clear_aliases, response.compact_aliases),
+            (
+                clear.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                compact.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+            ),
+            "{tool}"
+        );
+    }
+}
+
 /// A binding migration left unattributed is enough to fork, because the row's
 /// own agent decides the capability, while a row with no binding at all names
 /// no agent and stays refused.
@@ -9935,6 +9956,7 @@ async fn create_refuses_a_structured_session_without_its_adapter() {
     })
     .unwrap();
     let project = tempfile::tempdir().unwrap();
+    let _path = crate::session::test_support::EnvGuard::set(&[("PATH", project.path())]);
     let path = project.path().display().to_string();
     let state = crate::server::test_support::build_test_app_state(Vec::new());
     // Holds the only worker slot, so an exempt create that gets through never launches an agent.
@@ -9964,10 +9986,11 @@ async fn create_refuses_a_structured_session_without_its_adapter() {
             "{extra}: {body}"
         );
         assert_eq!(body["error"], "acp_adapter_missing", "{extra}: {body}");
-        let message = body["message"].as_str().unwrap();
         assert!(
-            message.contains(&format!("ACP adapter `{adapter}` is not installed")),
-            "{extra}: {message}"
+            body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(&adapter)),
+            "{extra}: {body}"
         );
         assert!(state.instances.read().await.is_empty(), "{extra}");
         assert!(

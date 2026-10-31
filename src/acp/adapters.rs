@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::acp::node::{NodeSource, ResolvedNode};
 
@@ -347,7 +347,9 @@ fn publish(tmp: &Path, final_dir: &Path) -> std::io::Result<()> {
             Ok(())
         }
         Err(e) => {
-            let _ = std::fs::rename(&backup, final_dir);
+            if let Err(error) = std::fs::rename(&backup, final_dir) {
+                error!(target: "acp.adapters", %error, backup = %backup.display(), "failed to restore adapter backup");
+            }
             let _ = std::fs::remove_dir_all(tmp);
             Err(e)
         }

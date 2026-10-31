@@ -70,6 +70,7 @@ pub fn set_enabled(plugin_id: &str, enabled: bool) -> Result<()> {
     }
     enable_in_config(plugin_id, enabled)?;
     super::reload_registry();
+    tracing::info!(target: "plugin.host", plugin = %plugin_id, enabled, "plugin toggled");
     Ok(())
 }
 
@@ -316,8 +317,22 @@ fn apply_prepared_install(p: &PreparedInstall, log: &OperationLog) -> Result<Ins
         write_lock(&p.id, &p.fetched, &p.manifest_hash, p.featured_verified)
     })();
     if let Err(e) = persisted {
-        let _ = uninstall(&p.id);
-        let _ = std::fs::remove_dir_all(&final_dir);
+        // Not `uninstall`: nothing finished installing, so nothing is announced as uninstalled.
+        let rollback = match is_installed_external(&p.id) {
+            Ok(true) => remove_external(&p.id),
+            Ok(false) => std::fs::remove_dir_all(&final_dir)
+                .with_context(|| format!("removing {}", final_dir.display())),
+            // An unreadable config must not strand the staged tree, or the next
+            // install of the same plugin is refused as already installed.
+            Err(error) => {
+                tracing::warn!(target: "plugin.install", plugin = %p.id, %error, "install rollback: config check failed; removing staged tree");
+                std::fs::remove_dir_all(&final_dir)
+                    .with_context(|| format!("removing {}", final_dir.display()))
+            }
+        };
+        if let Err(error) = rollback {
+            tracing::warn!(target: "plugin.install", plugin = %p.id, %error, "install rollback failed");
+        }
         return Err(e);
     }
     super::reload_registry();
@@ -325,6 +340,7 @@ fn apply_prepared_install(p: &PreparedInstall, log: &OperationLog) -> Result<Ins
         "installed {} {}",
         p.id, p.fetched.manifest.version
     ));
+    tracing::info!(target: "plugin.install", plugin = %p.id, version = %p.fetched.manifest.version, "plugin installed");
 
     Ok(InstallReport {
         id: p.id.clone(),
@@ -611,6 +627,7 @@ fn apply_prepared(
         forget_suggestion_publication(id);
     }
     super::reload_registry();
+    tracing::info!(target: "plugin.install", plugin = %id, version = %prepared.fetched.manifest.version, "plugin updated");
 
     if prepared.caps_changed && !granted {
         eprintln!(
@@ -931,16 +948,28 @@ fn skip_reason(prepared: &Prepared) -> String {
 
 pub fn uninstall(id: &str) -> Result<()> {
     PluginId::new(id.to_string()).map_err(|e| anyhow!("{e}"))?;
+    if !is_installed_external(id)? {
+        bail!("{id} is not an installed external plugin");
+    }
+    let version = super::registry()
+        .get(id)
+        .map(|p| p.manifest.version.clone());
+    remove_external(id)?;
+    tracing::info!(target: "plugin.install", plugin = %id, ?version, "plugin uninstalled");
+    Ok(())
+}
+
+fn is_installed_external(id: &str) -> Result<bool> {
     let config = Config::load()?;
-    let is_external = config
+    Ok(config
         .plugins
         .get(id)
         .and_then(|p| p.source.as_ref())
-        .is_some();
-    if !is_external {
-        bail!("{id} is not an installed external plugin");
-    }
+        .is_some())
+}
 
+/// Drop the plugin's directory, config entry and lock entry.
+fn remove_external(id: &str) -> Result<()> {
     let dir = super::plugins_dir()?.join(id);
     if dir.exists() {
         std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
@@ -1303,14 +1332,20 @@ fn replace_and_build(
     match place_and_build {
         Ok(()) => {
             if had_prior {
-                let _ = std::fs::remove_dir_all(&backup_dir);
+                if let Err(error) = std::fs::remove_dir_all(&backup_dir) {
+                    tracing::warn!(target: "plugin.install", plugin = %plugin_id, %error, "could not remove update backup");
+                }
             }
             Ok(())
         }
         Err(e) => {
-            let _ = std::fs::remove_dir_all(final_dir);
+            if let Err(error) = std::fs::remove_dir_all(final_dir) {
+                tracing::warn!(target: "plugin.install", plugin = %plugin_id, %error, "could not remove failed update tree");
+            }
             if had_prior {
-                let _ = std::fs::rename(&backup_dir, final_dir);
+                if let Err(error) = std::fs::rename(&backup_dir, final_dir) {
+                    tracing::error!(target: "plugin.install", plugin = %plugin_id, %error, "failed to restore previous plugin from backup");
+                }
             }
             Err(e)
         }
