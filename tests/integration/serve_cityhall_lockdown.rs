@@ -398,6 +398,36 @@ async fn allowlisted_route_stays_reachable() {
     );
 }
 
+// The suggestions reads stay open in CityHall mode, like `GET /api/projects`;
+// only the mutations are denied.
+#[tokio::test]
+#[serial_test::parallel]
+async fn suggestion_reads_stay_reachable_in_cityhall() {
+    let state = build_test_app_state_cityhall(Vec::new());
+    let app = build_router_for_test(state);
+    for uri in [
+        "/api/suggestions",
+        "/api/suggestions/templates",
+        "/api/suggestions/mappings",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(request(Method::GET, uri, Body::empty()))
+            .await
+            .unwrap();
+        let status = resp.status();
+        assert_ne!(status, StatusCode::FORBIDDEN, "{uri}");
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains("cityhall_mode"),
+            "{uri} must not be refused by the CityHall gate (got: {status} {text})"
+        );
+    }
+}
+
 // paste_image stays allowlisted for the CityHall composer, but only against a
 // structured target: a plain/terminal session's worktree is foreign state a
 // locked-down client must not write into.
