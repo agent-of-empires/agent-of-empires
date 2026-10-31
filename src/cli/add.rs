@@ -1811,7 +1811,15 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn a_structured_add_stores_the_prompt_verbatim_as_the_pending_turn() {
-        let _app = crate::session::test_support::isolate_app_dir();
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        // `--tool claude` is checked against the process PATH, which the adapter
+        // stub's configured PATH does not touch.
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "claude",
+            "#!/bin/sh\nexit 1\n",
+        );
         let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
         let work = tempfile::tempdir().unwrap();
         let file = work.path().join("prompt.md");
