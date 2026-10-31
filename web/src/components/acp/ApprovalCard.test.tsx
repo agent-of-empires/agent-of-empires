@@ -388,6 +388,33 @@ describe("ApprovalCard plan viewer", () => {
     }
     expect(screen.queryByRole("dialog", { hidden: true })).not.toBeNull();
   });
+  it("binds each plan modal's trap to its own dialog when a covered session keeps one open", () => {
+    const covered = makeApproval({ plan: PLAN, nonce: "n-a" }, "{}", "Ready to code?");
+    const active = makeApproval({ plan: PLAN, nonce: "n-b" }, "{}", "Ready to code?");
+    const { container } = render(
+      <>
+        <div data-testid="covered" inert>
+          <ApprovalCard approval={covered} onResolve={vi.fn()} />
+        </div>
+        <div data-testid="active">
+          <ApprovalCard approval={active} onResolve={vi.fn()} />
+        </div>
+      </>,
+    );
+    for (const id of ["covered", "active"]) {
+      fireEvent.click(within(within(container).getByTestId(id)).getByText("View plan"));
+    }
+    expect(screen.getAllByRole("dialog", { hidden: true })).toHaveLength(2);
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    const left = screen.getAllByRole("dialog", { hidden: true });
+    expect(left).toHaveLength(1);
+    expect(
+      within(container)
+        .getByTestId("covered")
+        .contains(left[0] ?? null),
+    ).toBe(true);
+  });
   it("moves between the view tabs with the arrow keys and labels the panel", () => {
     mount(withPlan());
     fireEvent.click(screen.getByText("View plan"));

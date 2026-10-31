@@ -5,6 +5,7 @@
 import type { Page } from "@playwright/test";
 import { test, expect, pressShortcut, observeFor } from "./helpers/mockedTest";
 import { mockAcpSession, openStructuredSession } from "./helpers/acpMock";
+import { mockSessionsList } from "./helpers/sessions";
 import { mockTerminalApis } from "./helpers/terminal-mocks";
 
 const TITLE = "plan-modal";
@@ -98,6 +99,43 @@ test("the terminal-focus shortcut cannot strand focus behind the plan modal", as
   await page.keyboard.press("Escape");
   await expect(page.getByTestId("plan-modal")).toHaveCount(0);
   await observeFor(page, 300, async () => expect(sentToTerminal()).toBe(sentAfterRefocus));
+});
+
+test("a retained plan modal in a covered session ignores Escape meant for the active one", async ({ page }) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem("aoe-web-settings", JSON.stringify({ persistentStructuredViews: true }));
+  });
+  const mock = await mockAcpSession(page, {
+    sessionId: "sess-a",
+    title: "plan-a",
+    reducedState: { pending_approvals: [approval] },
+  });
+  // Registered after the ACP mock so this two-session list wins; both sessions share its approval.
+  await mockSessionsList(page, () =>
+    ["sess-a", "sess-b"].map((id) => ({
+      id,
+      title: id === "sess-a" ? "plan-a" : "plan-b",
+      project_path: `/tmp/${id}`,
+      group_path: "/tmp",
+      status: "Waiting",
+      view: "structured",
+      acp_worker_state: "running",
+      claude_fullscreen: false,
+    })),
+  );
+  await openStructuredSession(page, mock);
+  await page.getByRole("button", { name: "View plan" }).click();
+  await expect(page.getByTestId("plan-modal")).toHaveCount(1);
+
+  await pressShortcut(page, "a");
+  await expect(page).toHaveURL(/\/session\/sess-b$/);
+  await expect(page.getByTestId("plan-modal")).toBeHidden();
+  await page.getByRole("button", { name: "View plan" }).click();
+  await expect(page.getByTestId("plan-modal")).toHaveCount(2);
+
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("plan-modal")).toHaveCount(1);
+  await expect(page.locator('[inert] [data-testid="plan-modal"]')).toHaveCount(1);
 });
 
 test("a plan file link closes the modal and leaves Tab alone while the approval stays pending", async ({ page }) => {

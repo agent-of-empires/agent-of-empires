@@ -26,15 +26,18 @@ interface Props {
 const FOCUSABLE = 'button:not([disabled]):not([tabindex="-1"])';
 
 // Dialog contains no focus itself, so the plan modal moves focus in, cycles Tab
-// inside the panel, closes on Escape and hands focus back to the opener.
+// inside the panel, closes on Escape and hands focus back to the opener. The
+// root is found through a marker in this instance's own body, so retained
+// plan modals in other sessions never act on each other's dialog.
 function useModalFocus(onClose: () => void) {
+  const marker = useRef<HTMLSpanElement>(null);
   const onCloseRef = useRef(onClose);
   useEffect(() => {
     onCloseRef.current = onClose;
   });
   useEffect(() => {
     const opener = document.activeElement as HTMLElement | null;
-    const root = () => document.querySelector<HTMLElement>('[data-testid="plan-modal"]');
+    const root = () => marker.current?.closest<HTMLElement>('[role="dialog"]') ?? null;
     root()?.querySelector<HTMLElement>(FOCUSABLE)?.focus();
     const onKey = (e: KeyboardEvent) => {
       // A covered session (inert) or a higher overlay such as the command
@@ -75,6 +78,7 @@ function useModalFocus(onClose: () => void) {
       opener?.focus();
     };
   }, []);
+  return marker;
 }
 
 const SECONDARY_BUTTON = "border border-surface-700 text-text-secondary hover:bg-surface-700";
@@ -85,7 +89,7 @@ type View = (typeof VIEWS)[number];
 
 export function PlanModal({ plan, submitting, offline, options, onDecide, onClose }: Props) {
   const [view, setView] = useState<View>("rendered");
-  useModalFocus(onClose);
+  const marker = useModalFocus(onClose);
   // A plan link opens the file viewer behind the dialog, so the modal closes
   // first rather than leaving its Tab trap active over the viewer.
   const fileRefs = useAcpFileRef();
@@ -164,6 +168,7 @@ export function PlanModal({ plan, submitting, offline, options, onDecide, onClos
         </>
       }
     >
+      <span ref={marker} hidden />
       <div className="mb-3 flex items-center gap-1" role="tablist" aria-label="Plan view">
         {VIEWS.map((v) => (
           <button
