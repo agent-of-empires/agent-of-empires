@@ -163,6 +163,9 @@ separate management actions shown in the footer.
 Tool arguments, structured changes, and retained text output are shown without
 the active view's preview limits, including successful calls. Scroll and drag to
 copy their full retained text. Media stays represented by descriptive placeholders.
+Unfinished text snapshots remain readable even when their start or completion
+event is unavailable. They are labeled **completion unavailable**, not marked
+successful or stopped. Wrapping and copy preserve painted Unicode graphemes.
 
 Rename and workdir dialogs, quick permission replies, and pending Trash
 confirmations close if their session changes lifecycle or disappears. A pending

@@ -766,6 +766,21 @@ fn trash_retained_transcript_is_read_only() {
             },
         )
         .unwrap();
+    for (seq, content) in [
+        (1018, "superseded unfinished output".to_string()),
+        (1019, "a".repeat(62) + "♥️x\nUNFINISHED-OUTPUT-END"),
+    ] {
+        store
+            .record(
+                &id,
+                seq,
+                &Event::ToolCallContent {
+                    tool_call_id: "unfinished-tool".into(),
+                    content,
+                },
+            )
+            .unwrap();
+    }
     for seq in [1, 3] {
         store
             .record(
@@ -818,11 +833,48 @@ fn trash_retained_transcript_is_read_only() {
     h.wait_for("ERROR-OUTPUT-END");
     h.assert_screen_contains("history is incomplete");
     h.assert_screen_contains("Trash · read-only");
+    h.wait_for("UNFINISHED-OUTPUT-END");
+    h.wait_for("♥️x");
+    h.assert_screen_contains("completion unavailable");
+    h.assert_screen_not_contains("superseded unfinished output");
+    let screen = h.capture_screen();
+    let (y, line) = screen
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains("♥️x"))
+        .unwrap();
+    let byte = line.find("♥️x").unwrap();
+    let x = unicode_width::UnicodeWidthStr::width(&line[..byte]) as u16 + 1;
+    h.send_mouse_drag((x, y as u16 + 1), (x + 3, y as u16 + 1));
+    wait_until(Duration::from_secs(5), Duration::from_millis(10), || {
+        let copied = std::fs::read_to_string(&clipboard).unwrap_or_default();
+        (copied == "♥️x")
+            .then_some(())
+            .ok_or_else(|| format!("expected complete grapheme in clipboard, got {copied:?}"))
+    });
+    if std::env::var_os("RECORD_E2E").is_some() {
+        let directory = std::path::Path::new("target/e2e-recordings");
+        std::fs::create_dir_all(directory).unwrap();
+        std::fs::write(
+            directory.join("trash-unfinished.ansi"),
+            h.capture_screen_styled(),
+        )
+        .unwrap();
+        std::fs::write(directory.join("trash-unfinished.txt"), h.capture_screen()).unwrap();
+    }
     let before = h.read_sessions();
-    h.send_keys("PageUp");
-    h.send_keys("PageUp");
-    h.send_keys("PageUp");
-    h.send_keys("PageUp");
+    for _ in 0..10 {
+        let previous = h.capture_screen();
+        if previous.contains("SUCCESS-OUTPUT-END") {
+            break;
+        }
+        h.send_keys("PageUp");
+        wait_until(Duration::from_secs(5), Duration::from_millis(10), || {
+            (h.capture_screen() != previous)
+                .then_some(())
+                .ok_or_else(|| "waiting for retained scroll".to_string())
+        });
+    }
     h.wait_for("SUCCESS-OUTPUT-END");
     let screen = h.capture_screen();
     let (y, line) = screen
@@ -923,10 +975,10 @@ fn trash_retained_transcript_is_read_only() {
         .unwrap() as u16
         + 1;
     h.send_mouse_click(0, 7, row);
-    h.wait_for("ERROR-OUTPUT-END");
+    h.wait_for("UNFINISHED-OUTPUT-END");
     h.run_cli_ok(&["rm", &id, "--purge"]);
     h.wait_for_absent("TrashRetained", Duration::from_secs(5));
-    h.wait_for_absent("ERROR-OUTPUT-END", Duration::from_secs(5));
+    h.wait_for_absent("UNFINISHED-OUTPUT-END", Duration::from_secs(5));
     assert!(
         !launch_marker.exists(),
         "restore or purge restarted an agent"

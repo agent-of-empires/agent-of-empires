@@ -281,12 +281,12 @@ impl HttpClient {
     }
 
     /// Fold retained raw events once, preserving reducer state across pages.
-    pub async fn replay_retained_paged(
+    pub(crate) async fn replay_retained_paged(
         &self,
         session_id: &str,
         since: u64,
         page_size: u64,
-    ) -> Result<(Vec<crate::acp::transcript::TranscriptRow>, bool), HttpError> {
+    ) -> Result<(crate::acp::transcript::RetainedTranscript, bool), HttpError> {
         let mut model = crate::acp::transcript::TranscriptModel::new();
         let mut last_seen = since;
         let mut snapshot_highest = since;
@@ -311,7 +311,7 @@ impl HttpClient {
             )
             .await?;
         incomplete |= reported_lost || last_seen < snapshot_highest;
-        Ok((model.into_rows(), incomplete))
+        Ok((model.into_retained(), incomplete))
     }
 
     /// `GET /api/sessions/{id}/acp/files`. Workspace file list for
@@ -1383,6 +1383,14 @@ mod tests {
                 },
             },
             completed("question"),
+            Event::ToolCallContent {
+                tool_call_id: "orphan".into(),
+                content: "old orphan output".into(),
+            },
+            Event::ToolCallContent {
+                tool_call_id: "orphan".into(),
+                content: "latest orphan output".into(),
+            },
         ];
         for (index, event) in events.iter().enumerate() {
             state
@@ -1404,7 +1412,8 @@ mod tests {
         .unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         for size in [1, 2, 8] {
-            let (rows, incomplete) = client.replay_retained_paged(&id, 0, size).await.unwrap();
+            let (snapshot, incomplete) = client.replay_retained_paged(&id, 0, size).await.unwrap();
+            let rows = snapshot.rows;
             assert!(!incomplete);
             let messages: Vec<_> = rows
                 .iter()
@@ -1430,6 +1439,14 @@ mod tests {
             assert!(!rows
                 .iter()
                 .any(|row| row.tool_call_id.as_deref() == Some("question")));
+            assert_eq!(
+                snapshot
+                    .unfinished_outputs
+                    .iter()
+                    .map(|output| (output.tool_call_id.as_str(), output.text.as_str()))
+                    .collect::<Vec<_>>(),
+                [("orphan", "latest orphan output")]
+            );
         }
         server.abort();
         let _ = server.await;
@@ -1497,6 +1514,7 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         for size in [1, 2, 10] {
             let (rows, incomplete) = client.replay_retained_paged(&id, 0, size).await.unwrap();
+            let rows = rows.rows;
             assert!(incomplete, "page size {size}");
             assert_eq!(
                 rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(),

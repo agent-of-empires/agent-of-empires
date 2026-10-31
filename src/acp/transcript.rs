@@ -107,6 +107,25 @@ fn session_notice_text(severity: &str, title: &str, description: &Option<String>
     }
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct RetainedTranscript {
+    pub rows: Vec<TranscriptRow>,
+    pub unfinished_outputs: Vec<UnfinishedToolOutput>,
+}
+
+#[derive(Debug)]
+pub(crate) struct UnfinishedToolOutput {
+    pub tool_call_id: String,
+    pub text: String,
+    first_seq: u64,
+}
+
+#[derive(Debug, Clone)]
+struct BufferedToolOutput {
+    first_seq: u64,
+    text: String,
+}
+
 /// Folds the ACP `Event` stream into an ordered [`TranscriptRow`] list.
 #[derive(Debug, Clone, Default)]
 pub struct TranscriptModel {
@@ -115,7 +134,7 @@ pub struct TranscriptModel {
     /// Tool calls that reached a terminal row, so nothing closes them twice.
     terminal_tools: HashSet<String>,
     /// Streamed `ToolCallContent`, keyed by tool call id.
-    tool_outputs: HashMap<String, String>,
+    tool_outputs: HashMap<String, BufferedToolOutput>,
     /// Tool calls surfaced as an elicitation (AskUserQuestion); their cards are suppressed.
     elicitation_tool_ids: HashSet<String>,
     /// Group of the still-open run of consecutive message chunks.
@@ -143,6 +162,26 @@ impl TranscriptModel {
 
     pub fn into_rows(self) -> Vec<TranscriptRow> {
         self.rows
+    }
+
+    pub(crate) fn into_retained(self) -> RetainedTranscript {
+        let mut unfinished_outputs: Vec<_> = self
+            .tool_outputs
+            .into_iter()
+            .filter(|(id, output)| {
+                !self.elicitation_tool_ids.contains(id) && !output.text.is_empty()
+            })
+            .map(|(tool_call_id, output)| UnfinishedToolOutput {
+                tool_call_id,
+                text: output.text,
+                first_seq: output.first_seq,
+            })
+            .collect();
+        unfinished_outputs.sort_unstable_by_key(|output| output.first_seq);
+        RetainedTranscript {
+            rows: self.rows,
+            unfinished_outputs,
+        }
     }
 
     pub fn last_seq(&self) -> u64 {
@@ -262,6 +301,7 @@ impl TranscriptModel {
                 async_subagent,
             } => {
                 if self.elicitation_tool_ids.remove(tool_call_id) {
+                    self.tool_outputs.remove(tool_call_id);
                     return Vec::new();
                 }
                 let mut deltas =
@@ -277,9 +317,20 @@ impl TranscriptModel {
                 tool_call_id,
                 content,
             } => {
-                // Each content frame replaces the previous snapshot.
-                self.tool_outputs
-                    .insert(tool_call_id.clone(), content.clone());
+                if self.elicitation_tool_ids.contains(tool_call_id) {
+                    return Vec::new();
+                }
+                if let Some(output) = self.tool_outputs.get_mut(tool_call_id) {
+                    output.text.clone_from(content);
+                } else {
+                    self.tool_outputs.insert(
+                        tool_call_id.clone(),
+                        BufferedToolOutput {
+                            first_seq: seq,
+                            text: content.clone(),
+                        },
+                    );
+                }
                 Vec::new()
             }
             Event::ToolCallUpdated {
@@ -300,6 +351,7 @@ impl TranscriptModel {
                     return Vec::new();
                 };
                 self.elicitation_tool_ids.insert(tool_call_id.clone());
+                self.tool_outputs.remove(tool_call_id);
                 self.remove_rows_for_tool(tool_call_id)
             }
             Event::ElicitationResolved { nonce, answers, .. } => {
@@ -552,7 +604,11 @@ impl TranscriptModel {
         content: &str,
     ) -> TranscriptRow {
         // Completion content wins, then streamed output, then a status word.
-        let buffered = self.tool_outputs.remove(tool_call_id).unwrap_or_default();
+        let buffered = self
+            .tool_outputs
+            .remove(tool_call_id)
+            .map(|output| output.text)
+            .unwrap_or_default();
         let text = if !content.is_empty() {
             content.to_string()
         } else if !buffered.is_empty() {
@@ -595,7 +651,11 @@ impl TranscriptModel {
         open.into_iter()
             .map(|id| {
                 self.terminal_tools.insert(id.clone());
-                let buffered = self.tool_outputs.remove(&id).unwrap_or_default();
+                let buffered = self
+                    .tool_outputs
+                    .remove(&id)
+                    .map(|output| output.text)
+                    .unwrap_or_default();
                 let mut row = TranscriptRow::new(
                     format!("stopped-{id}-{seq}"),
                     format!("tool-{id}"),
@@ -866,6 +926,68 @@ mod tests {
             m.apply_event(i as u64 + 1, &e);
         }
         m
+    }
+
+    #[test]
+    fn retained_snapshot_keeps_latest_unfinished_output_without_inventing_rows() {
+        let cases = [
+            (
+                vec![
+                    content("a", "old"),
+                    content("b", "second"),
+                    content("a", "latest"),
+                ],
+                vec![("a", "latest"), ("b", "second")],
+            ),
+            (vec![content("a", "old"), content("a", "")], vec![]),
+            (
+                vec![
+                    content("a", "old"),
+                    completed("a", false, "done"),
+                    content("a", "new invocation"),
+                ],
+                vec![("a", "new invocation")],
+            ),
+            (
+                vec![
+                    content("q", "hidden"),
+                    elicitation_requested("q"),
+                    content("q", "still hidden"),
+                    completed("q", false, ""),
+                    content("q", "ordinary reuse"),
+                ],
+                vec![("q", "ordinary reuse")],
+            ),
+            (
+                vec![
+                    content("q", "hidden"),
+                    elicitation_requested("q"),
+                    content("q", "still hidden"),
+                ],
+                vec![],
+            ),
+            (
+                vec![content("a", "old"), completed("a", false, "final")],
+                vec![],
+            ),
+        ];
+        for (events, expected) in cases {
+            let model = fold(events);
+            let original_rows = model.rows().to_vec();
+            let snapshot = model.into_retained();
+            assert_eq!(
+                snapshot.rows, original_rows,
+                "snapshot must not fabricate lifecycle rows"
+            );
+            assert_eq!(
+                snapshot
+                    .unfinished_outputs
+                    .iter()
+                    .map(|output| (output.tool_call_id.as_str(), output.text.as_str()))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
     }
 
     fn kinds(m: &TranscriptModel) -> Vec<TranscriptRowKind> {

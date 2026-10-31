@@ -43,9 +43,10 @@ pub struct RetainedView {
     source_profile: String,
     generation: u64,
     state: Option<StructuredViewState>,
+    unfinished_outputs: Vec<crate::acp::transcript::UnfinishedToolOutput>,
     load: Option<tokio::task::JoinHandle<()>>,
     result: tokio::sync::oneshot::Receiver<
-        Result<(Vec<crate::acp::transcript::TranscriptRow>, bool), String>,
+        Result<(crate::acp::transcript::RetainedTranscript, bool), String>,
     >,
     message: String,
 }
@@ -58,6 +59,7 @@ impl RetainedView {
             source_profile: inst.source_profile.clone(),
             generation: inst.lifecycle_generation,
             state: None,
+            unfinished_outputs: Vec::new(),
             load: None,
             result,
             message: "Daemon unavailable; retained transcript could not be read.".into(),
@@ -105,8 +107,9 @@ impl RetainedView {
         };
         self.load = None;
         match result {
-            Ok((rows, lost)) => {
-                self.message = if rows.is_empty() {
+            Ok((snapshot, lost)) => {
+                self.message = if snapshot.rows.is_empty() && snapshot.unfinished_outputs.is_empty()
+                {
                     "No readable retained ACP content. Native history is not available through this reader; destroyed tmux scrollback cannot be recovered.".into()
                 } else {
                     "Retained ACP transcript · scroll to read · drag to copy".into()
@@ -118,8 +121,9 @@ impl RetainedView {
                     );
                 }
                 if let Some(state) = self.state.as_mut() {
-                    state.transcript.server_rows = rows;
+                    state.transcript.server_rows = snapshot.rows;
                 }
+                self.unfinished_outputs = snapshot.unfinished_outputs;
             }
             Err(error) => self.message = format!("Transcript read failed: {error}"),
         }
@@ -129,13 +133,15 @@ impl RetainedView {
     pub fn selection_text(&self, width: u16) -> ratatui::text::Text<'static> {
         self.state
             .as_ref()
-            .filter(|state| !state.transcript.server_rows.is_empty())
+            .filter(|state| {
+                !state.transcript.server_rows.is_empty() || !self.unfinished_outputs.is_empty()
+            })
             .map_or_else(Default::default, |state| {
                 render::wrapped_transcript(
                     state,
                     &Theme::default(),
                     width,
-                    render::ToolOutputMode::Retained,
+                    render::ToolOutputMode::Retained(&self.unfinished_outputs),
                 )
             })
     }
@@ -179,13 +185,15 @@ impl RetainedView {
         let mut text = self
             .state
             .as_ref()
-            .filter(|state| !state.transcript.server_rows.is_empty())
+            .filter(|state| {
+                !state.transcript.server_rows.is_empty() || !self.unfinished_outputs.is_empty()
+            })
             .map_or_else(Default::default, |state| {
                 render::wrapped_transcript(
                     state,
                     theme,
                     text_area.width,
-                    render::ToolOutputMode::Retained,
+                    render::ToolOutputMode::Retained(&self.unfinished_outputs),
                 )
             });
         let total = text.lines.len();
@@ -627,7 +635,7 @@ mod retained_tests {
                 let mut view = RetainedView::new(None, &inst);
                 view.result = rx;
                 view.load = Some(tokio::spawn(async {}));
-                tx.send(Ok((model.into_rows(), incomplete))).unwrap();
+                tx.send(Ok((model.into_retained(), incomplete))).unwrap();
                 assert!(view.tick());
                 for width in [32, 100] {
                     let mut terminal =
@@ -657,6 +665,98 @@ mod retained_tests {
                     );
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_snapshot_exposes_unfinished_and_orphan_output() {
+        use crate::acp::state::{Event, ToolCall};
+        for started in [false, true] {
+            let inst = crate::session::Instance::new("unfinished", "/tmp");
+            let id = inst.id.clone();
+            let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+            if started {
+                state
+                    .acp_event_store
+                    .record(
+                        &id,
+                        1,
+                        &Event::ToolCallStarted {
+                            tool_call: ToolCall {
+                                id: "unfinished".into(),
+                                name: "RetainedTool".into(),
+                                kind: "execute".into(),
+                                args_preview: "{}".into(),
+                                started_at: chrono::Utc::now(),
+                                parent_tool_call_id: None,
+                                memory_recall: None,
+                                diffs: Vec::new(),
+                            },
+                        },
+                    )
+                    .unwrap();
+            }
+            for (seq, text) in [
+                (2, "superseded output"),
+                (3, "unfinished output\nUNFINISHED-TAIL"),
+            ] {
+                state
+                    .acp_event_store
+                    .record(
+                        &id,
+                        seq,
+                        &Event::ToolCallContent {
+                            tool_call_id: "unfinished".into(),
+                            content: text.into(),
+                        },
+                    )
+                    .unwrap();
+            }
+            let app = Router::new()
+                .route(
+                    "/api/sessions/{id}/acp/replay",
+                    get(crate::server::api::acp_replay),
+                )
+                .with_state(state);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = DaemonEndpoint::new(
+                format!("http://{}", listener.local_addr().unwrap()),
+                None,
+                crate::acp::client::discovery::Source::Env,
+            );
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let mut view = RetainedView::new(Some(endpoint), &inst);
+            tokio::time::timeout(Duration::from_secs(5), view.load.as_mut().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(view.tick());
+            let copied = view.selection_text(80).to_string();
+            assert!(
+                copied.contains("UNFINISHED-TAIL"),
+                "started={started}: {copied}"
+            );
+            assert!(!copied.contains("superseded output"));
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+            terminal
+                .draw(|frame| {
+                    view.render(frame, frame.area(), &Theme::default(), 0, true);
+                })
+                .unwrap();
+            let painted: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(painted.contains("UNFINISHED-TAIL"));
+            for marker in ['✓', '✗', '◼'] {
+                assert!(!painted.contains(marker));
+            }
+            server.abort();
+            let _ = server.await;
         }
     }
 
