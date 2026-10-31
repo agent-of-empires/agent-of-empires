@@ -90,21 +90,11 @@ pub(crate) enum ContinuationOutcome {
     SupersededByQueue,
 }
 
-/// Installs the rate-limit-interrupted prompt as the next turn so a resume
-/// continues the work (#3028).
-///
-/// Takes the session's submission authority by value: a second claim by the
-/// same task would deadlock on the mutex the caller already holds, and holding
-/// it across the checks is what stops a turn-accepting surface from slipping
-/// between them and the install (#4092).
-///
-/// Park liveness is not a supersession oracle here
-/// ([`crate::acp::event_store::EventStore::rate_limit_park`]): a fresh worker
-/// publishes `AcpSessionAssigned`, which retires its own park.
+/// Select interrupted work under the caller's submission ownership.
 pub(crate) async fn install_rate_limit_continuation(
     state: &Arc<AppState>,
     id: &str,
-    _submission: tokio::sync::OwnedMutexGuard<()>,
+    _submission: &tokio::sync::OwnedMutexGuard<()>,
 ) -> ContinuationOutcome {
     if state
         .instances
@@ -174,11 +164,7 @@ pub(crate) async fn install_rate_limit_continuation(
         .await
         .flatten();
         if queue_supersedes(&minted_at_ms, limit_at_ms) {
-            // A continuation an earlier cadence installed is no longer next.
-            // `/queue` never clears the slot the way `acp_prompt` does, so this
-            // is where a newer word takes it back. Only while the resume pass
-            // runs: it skips a session whose worker is already live, and that
-            // one drains the continuation ahead of the queue.
+            // `/queue` does not clear the interrupted-turn slot.
             state.session_service.clear_pending_initial_turn(id).await;
             return ContinuationOutcome::SupersededByQueue;
         }
@@ -190,22 +176,237 @@ pub(crate) async fn install_rate_limit_continuation(
     ContinuationOutcome::Stands
 }
 
-/// Releases rate-limit parks whose window elapsed: install the interrupted
-/// prompt unless a queued one took the session, publish the breadcrumb for a
-/// delivered continuation, and free the `attempted` slot so this tick
-/// respawns. The park and its times come from the durable event store (#3514).
-/// Returns the released ids so the resume loop does not re-hold them.
+pub(crate) struct QuotaDelivery {
+    park_seq: u64,
+}
+
+impl QuotaDelivery {
+    pub(crate) fn park_seq(&self) -> u64 {
+        self.park_seq
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum QuotaResume {
+    Manual,
+    Automatic { park_seq: u64 },
+    QueuedAtCap { park_seq: u64 },
+}
+
+pub(crate) async fn resume_rate_limited(
+    state: &Arc<AppState>,
+    id: &str,
+    submission: tokio::sync::OwnedMutexGuard<()>,
+    kind: QuotaResume,
+) -> Result<(), crate::acp::supervisor::SupervisorError> {
+    use crate::acp::supervisor::SupervisorError;
+    let Some(park) = query_store(&state.acp_event_store, id, "quota release", |store, id| {
+        store.rate_limit_park(id)
+    })
+    .await
+    .ok_or(SupervisorError::NativeStoreUnavailable)?
+    else {
+        return Ok(());
+    };
+    match kind {
+        QuotaResume::Automatic { park_seq } if park.seq != park_seq || park.cap_reached => {
+            return Ok(())
+        }
+        QuotaResume::QueuedAtCap { park_seq } if park.seq != park_seq || !park.cap_reached => {
+            return Ok(())
+        }
+        _ => {}
+    }
+    let profile = {
+        let rows = state.instances.read().await;
+        rows.iter()
+            .find(|row| row.id == id && is_resumable(row))
+            .map(|row| row.source_profile.clone())
+            .ok_or_else(|| SupervisorError::SpawnCancelled(id.to_owned()))?
+    };
+    if let Some(unavailable) = state.session_service.prompt_native_unavailability(id).await {
+        return Err(crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailable).into());
+    }
+    let mut resume_at = park
+        .info
+        .as_ref()
+        .and_then(|info| info.resets_at)
+        .unwrap_or_else(Utc::now);
+    if matches!(kind, QuotaResume::Automatic { .. }) {
+        let enabled = resolve_per_profile([profile.clone()].into_iter(), |config| {
+            config.acp.rate_limit_auto_resume
+        })
+        .await;
+        if !enabled.get(&profile).copied().unwrap_or(false) {
+            return Ok(());
+        }
+        let streak = query_store(
+            &state.acp_event_store,
+            id,
+            "quota release budget",
+            |store, id| store.rate_limit_redelivery_streak(id),
+        )
+        .await
+        .ok_or(SupervisorError::NativeStoreUnavailable)?;
+        resume_at = match park.info.as_ref().and_then(|info| info.resets_at) {
+            Some(reset) => rate_limit_resume_at(
+                reset,
+                park.recorded_at_ms,
+                RATE_LIMIT_AUTO_RESUME_GRACE_SECS,
+            ),
+            None => rate_limit_unknown_reset_retry_at(park.recorded_at_ms, streak),
+        };
+        if let Some(attempt) = park
+            .last_resume_attempt_ms
+            .and_then(DateTime::from_timestamp_millis)
+        {
+            resume_at =
+                resume_at.max(attempt + chrono::Duration::seconds(RATE_LIMIT_MIN_PARK_SECS));
+        }
+        if Utc::now() < resume_at {
+            return Ok(());
+        }
+        if streak >= RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES {
+            let latest = query_store(
+                &state.acp_event_store,
+                id,
+                "quota release frontier",
+                |store, id| store.highest_seq(id),
+            )
+            .await
+            .ok_or(SupervisorError::NativeStoreUnavailable)?;
+            if state.acp_supervisor.publish_stopped_if_seq(
+                id,
+                RATE_LIMIT_EXHAUSTED_RETRIES_REASON,
+                latest,
+            ) {
+                state.session_service.clear_pending_initial_turn(id).await;
+            }
+            return Ok(());
+        }
+    }
+    let authority = if matches!(kind, QuotaResume::Manual) {
+        crate::process::worker_registry::ResumeAuthority::Explicit
+    } else {
+        crate::process::worker_registry::ResumeAuthority::Automatic
+    };
+    super::resume::ensure_rate_limit_worker(state, id, authority).await?;
+    let control = state.session_service.fold_control_state(id).await;
+    if !control.connection_ready || control.connection_unavailable.is_some() || control.turn_active
+    {
+        return Err(SupervisorError::SpawnCancelled(id.to_owned()));
+    }
+    if matches!(kind, QuotaResume::Automatic { .. }) {
+        let enabled = resolve_per_profile([profile.clone()].into_iter(), |config| {
+            config.acp.rate_limit_auto_resume
+        })
+        .await;
+        if !enabled.get(&profile).copied().unwrap_or(false) {
+            return Ok(());
+        }
+    }
+    let current = query_store(
+        &state.acp_event_store,
+        id,
+        "quota release recheck",
+        |store, id| store.rate_limit_park(id),
+    )
+    .await
+    .ok_or(SupervisorError::NativeStoreUnavailable)?;
+    if !current.is_some_and(|current| current.seq == park.seq) {
+        return Ok(());
+    }
+    let delivery = QuotaDelivery { park_seq: park.seq };
+    let outcome = if matches!(kind, QuotaResume::QueuedAtCap { .. }) {
+        if state
+            .session_service
+            .queued_prompts_snapshot(id)
+            .await
+            .is_empty()
+        {
+            return Ok(());
+        }
+        state.session_service.clear_pending_initial_turn(id).await;
+        ContinuationOutcome::SupersededByQueue
+    } else {
+        install_rate_limit_continuation(state, id, &submission).await
+    };
+    let manual = matches!(kind, QuotaResume::Manual);
+    if manual || matches!(outcome, ContinuationOutcome::Stands) {
+        if manual && park.cap_reached {
+            resume_at = Utc::now();
+        }
+        state
+            .acp_supervisor
+            .publish_rate_limit_auto_resumed(id, resume_at, manual)?;
+    }
+    let handled = match outcome {
+        ContinuationOutcome::Stands => {
+            state
+                .session_service
+                .drain_pending_initial_turn_with_submission(id, &submission, Some(&delivery))
+                .await
+        }
+        ContinuationOutcome::SupersededByQueue => {
+            state
+                .session_service
+                .drain_queued_prompts_with_submission(id, &submission, Some(&delivery))
+                .await
+        }
+    };
+    if !handled {
+        if let Some(unavailable) = state.session_service.prompt_native_unavailability(id).await {
+            return Err(
+                crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailable).into(),
+            );
+        }
+        return Err(SupervisorError::SpawnCancelled(id.to_owned()));
+    }
+    Ok(())
+}
+
+pub(super) async fn schedule_capped_queue(state: &Arc<AppState>, id: &str, park_seq: u64) -> bool {
+    let Some(submission) = state.session_service.try_prompt_submission(id).await else {
+        return false;
+    };
+    schedule_quota_release(
+        state.clone(),
+        id.to_owned(),
+        submission,
+        QuotaResume::QueuedAtCap { park_seq },
+    );
+    true
+}
+
+fn schedule_quota_release(
+    state: Arc<AppState>,
+    id: String,
+    submission: tokio::sync::OwnedMutexGuard<()>,
+    kind: QuotaResume,
+) {
+    crate::task_util::spawn_supervised(
+        "acp.quota_release",
+        crate::task_util::PanicPolicy::Log,
+        async move {
+            if let Err(error) = resume_rate_limited(&state, &id, submission, kind).await {
+                tracing::warn!(target: "acp.supervisor", session = %id, %error,
+                    "quota continuation remains held");
+            }
+        },
+    );
+}
+
+/// Schedule due quota work without waiting for readiness on the global tick.
 pub(super) async fn reap_rate_limit_resumes(
     state: &Arc<AppState>,
     attempted: &mut HashSet<String>,
     parked: &HashSet<String>,
-) -> HashSet<String> {
-    let mut released = HashSet::new();
+) {
     let candidates: Vec<(String, String, bool)> = {
         let instances = state.instances.read().await;
         instances
             .iter()
-            .filter(|i| is_resumable(i) && attempted.contains(&i.id))
+            .filter(|i| is_resumable(i))
             .map(|i| {
                 (
                     i.id.clone(),
@@ -215,41 +416,27 @@ pub(super) async fn reap_rate_limit_resumes(
             })
             .collect()
     };
-    // Only a workerless session is parked; a crash-loop park waits for a manual retry.
-    let mut workerless = Vec::new();
+    let mut eligible = Vec::new();
     for candidate in candidates {
         if parked.contains(&candidate.0) {
             tracing::trace!(target: "acp.supervisor", session = %candidate.0, "rate-limit auto-resume: skipped, session is crash-loop parked");
-        } else if !state.acp_supervisor.is_running(&candidate.0).await {
-            workerless.push(candidate);
+        } else {
+            eligible.push(candidate);
         }
     }
-    if workerless.is_empty() {
-        return released;
+    if eligible.is_empty() {
+        return;
     }
-    let enabled_by_profile = resolve_per_profile(workerless.iter().map(|c| c.1.clone()), |c| {
+    let enabled_by_profile = resolve_per_profile(eligible.iter().map(|c| c.1.clone()), |c| {
         c.acp.rate_limit_auto_resume
     })
     .await;
 
     let now = Utc::now();
-    for (id, profile, has_queued_prompts) in workerless {
+    for (id, profile, has_queued_prompts) in eligible {
         let skip = |reason: &str| {
             tracing::trace!(target: "acp.supervisor", session = %id, "rate-limit auto-resume: skipped, {reason}");
         };
-        if !enabled_by_profile.get(&profile).copied().unwrap_or(false) {
-            skip("not enabled for this profile");
-            continue;
-        }
-        if state
-            .session_service
-            .prompt_native_unavailability(&id)
-            .await
-            .is_some()
-        {
-            skip("current native control admission is unavailable");
-            continue;
-        }
         let Some(park) = query_store(
             &state.acp_event_store,
             &id,
@@ -267,19 +454,20 @@ pub(super) async fn reap_rate_limit_resumes(
         if park.cap_reached {
             // The held slot keeps the resume pass off; a queued prompt has no other route to a worker.
             if has_queued_prompts {
-                tracing::info!(target: "acp.supervisor", session = %id, "rate-limit auto-resume: releasing the redelivery-cap park for a queued prompt");
-                attempted.remove(&id);
-                released.insert(id.clone());
+                if schedule_capped_queue(state, &id, park.seq).await {
+                    attempted.remove(&id);
+                }
             } else {
                 skip("redelivery cap reached and no prompt queued");
             }
             continue;
         }
+        if !enabled_by_profile.get(&profile).copied().unwrap_or(false) {
+            skip("not enabled for this profile");
+            continue;
+        }
         // A pruned `RateLimit` row has no reset time and follows the unknown-reset schedule.
-        let info = park
-            .info
-            .clone()
-            .unwrap_or_else(crate::acp::state::RateLimitInfo::undated);
+        let reset = park.info.as_ref().and_then(|info| info.resets_at);
         let Some(streak) = query_store(
             &state.acp_event_store,
             &id,
@@ -290,7 +478,7 @@ pub(super) async fn reap_rate_limit_resumes(
         else {
             continue;
         };
-        let mut resume_at = match info.resets_at {
+        let mut resume_at = match reset {
             Some(resets_at) => rate_limit_resume_at(
                 resets_at,
                 park.recorded_at_ms,
@@ -310,85 +498,20 @@ pub(super) async fn reap_rate_limit_resumes(
             skip("park window has not elapsed");
             continue;
         }
-        if state.acp_supervisor.is_running(&id).await {
-            skip("worker is already live");
-            continue;
-        }
-        let Some(latest_seq) = query_store(
-            &state.acp_event_store,
-            &id,
-            "rate-limit latest-seq",
-            |s, id| s.highest_seq(id),
-        )
-        .await
-        else {
-            continue;
-        };
-        if streak >= RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES {
-            // `/acp/spawn` holds this lock through its continuation install, so
-            // the CAS plus clear cannot interleave with it. `try_lock` because
-            // blocking would stall the tick; contention is a refusal.
-            let instance_lock = state.instance_lock(&id).await;
-            let Ok(_guard) = instance_lock.try_lock() else {
-                continue;
-            };
-            if state.acp_supervisor.publish_stopped_if_seq(
-                &id,
-                RATE_LIMIT_EXHAUSTED_RETRIES_REASON,
-                latest_seq,
-            ) {
-                state.session_service.clear_pending_initial_turn(&id).await;
-                tracing::warn!(
-                    target: "acp.supervisor",
-                    session = %id,
-                    redeliveries = streak,
-                    max = RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES,
-                    "rate-limit auto-resume: redelivery cap reached; parking session with a terminal stop"
-                );
-            }
-            continue;
-        }
         // Contention is a refusal, not a queue: this is one sequential pass over
         // every session and must not stall behind a submission.
         let Some(submission) = state.session_service.try_prompt_submission(&id).await else {
             skip("a prompt submission owns the session");
             continue;
         };
-        if state
-            .session_service
-            .prompt_native_unavailability(&id)
-            .await
-            .is_some()
-        {
-            skip("native control admission changed before continuation installation");
-            continue;
-        }
-        let outcome = install_rate_limit_continuation(state, &id, submission).await;
-        match outcome {
-            ContinuationOutcome::Stands => {
-                state
-                    .acp_supervisor
-                    .publish_rate_limit_auto_resumed(&id, resume_at, false);
-                tracing::info!(
-                    target: "acp.supervisor",
-                    session = %id,
-                    resets_at = ?info.resets_at,
-                    resume_at = %resume_at,
-                    "rate-limit auto-resume: park window elapsed; respawning worker"
-                );
-            }
-            ContinuationOutcome::SupersededByQueue => {
-                tracing::info!(
-                    target: "acp.supervisor",
-                    session = %id,
-                    "rate-limit auto-resume: a queued prompt superseded the interrupted prompt; respawning for the queue"
-                );
-            }
-        }
         attempted.remove(&id);
-        released.insert(id.clone());
+        schedule_quota_release(
+            state.clone(),
+            id,
+            submission,
+            QuotaResume::Automatic { park_seq: park.seq },
+        );
     }
-    released
 }
 
 #[cfg(test)]
@@ -523,6 +646,71 @@ mod tests {
             .map(|t| t.synthesized)
     }
 
+    async fn ready_worker(
+        state: &Arc<AppState>,
+        id: &str,
+    ) -> Arc<std::sync::Mutex<Vec<&'static str>>> {
+        let row = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == id)
+            .unwrap()
+            .clone();
+        let storage =
+            Arc::new(crate::session::Storage::open_reference(&row.source_profile).unwrap());
+        storage
+            .update(|rows, _| {
+                *rows.iter_mut().find(|stored| stored.id == id).unwrap() = row.clone();
+                Ok(())
+            })
+            .unwrap();
+        crate::server::test_support::refresh_canonical_metadata_for_test(state).await;
+        let commands = state
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(id)
+            .await;
+        let scope = crate::acp::state::NativeObservationScope::capture(&row, &storage).unwrap();
+        state
+            .acp_supervisor
+            .current_lease(id)
+            .unwrap()
+            .set_admission(Some(crate::acp::supervisor::LaunchAdmission {
+                store: storage,
+                generation: row.lifecycle_generation,
+                namespace: Some(state.profile_namespace.clone()),
+                native_scope: Some(scope),
+            }));
+        state.acp_supervisor.test_observe_native_ready(id).await;
+        commands
+    }
+
+    async fn settle_delivery(state: &Arc<AppState>, id: &str) {
+        drop(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                state.session_service.prompt_submission(id),
+            )
+            .await
+            .expect("the supervised quota delivery must release submission ownership"),
+        );
+    }
+
+    fn delivered_prompts(state: &AppState, id: &str, frontier: u64) -> Vec<(String, bool)> {
+        state
+            .acp_event_store
+            .replay_from(id, frontier)
+            .into_iter()
+            .filter_map(|(_, event)| match event {
+                Event::UserPromptSent {
+                    text, synthesized, ..
+                } => Some((text, synthesized)),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn latest_stop_reason(state: &AppState, id: &str) -> Option<String> {
         state
             .acp_event_store
@@ -542,15 +730,17 @@ mod tests {
         let (_home, state, _project) = parked_with_continuation(id, 0).await;
         state
             .acp_supervisor
-            .publish_rate_limit_auto_resumed(id, Utc::now(), false);
+            .publish_rate_limit_auto_resumed(id, Utc::now(), false)
+            .unwrap();
         state
             .acp_supervisor
             .publish_startup_error(id, "spawn failed".into());
         let mut attempted: HashSet<String> = [id.to_string()].into();
 
-        let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
-
-        assert!(released.is_empty() && attempted.contains(id));
+        let frontier = state.acp_event_store.highest_seq(id);
+        reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+        assert!(attempted.contains(id));
+        assert_eq!(state.acp_event_store.highest_seq(id), frontier);
     }
 
     /// The resume loop holds a park even behind a newer startup error, so it
@@ -577,15 +767,14 @@ mod tests {
         );
     }
 
-    /// #3688: a cap park must release its `attempted` slot for an already
-    /// queued prompt (nothing else would deliver it) and hold it otherwise.
+    /// A cap releases only already queued user work, even with auto-resume off.
     #[tokio::test]
     #[serial_test::serial]
     async fn cap_park_releases_attempted_for_a_prompt_already_on_the_queue() {
         for has_queue in [true, false] {
             let id = "sess-3688-cap-queue";
             let (_home, state, _project) = test_state(id);
-            enable_auto_resume(true);
+            enable_auto_resume(false);
             assert!(state.acp_supervisor.publish_stopped_if_seq(
                 id,
                 RATE_LIMIT_EXHAUSTED_RETRIES_REASON,
@@ -596,6 +785,8 @@ mod tests {
                     .queued_prompts
                     .push(queued_prompt());
             }
+            ready_worker(&state, id).await;
+            let frontier = state.acp_event_store.highest_seq(id);
 
             let mut tick = Tick::default();
             tick.attempted.insert(id.to_string());
@@ -605,49 +796,54 @@ mod tests {
                 has_queue,
                 "has_queue={has_queue}"
             );
+            settle_delivery(&state, id).await;
 
             tick.run(&state).await;
+            settle_delivery(&state, id).await;
+            assert_eq!(startup_errors(&state, id), 0, "has_queue={has_queue}");
             assert_eq!(
-                startup_errors(&state, id) > 0,
-                has_queue,
-                "has_queue={has_queue}"
+                delivered_prompts(&state, id, frontier).len(),
+                usize::from(has_queue)
             );
+            assert_eq!(auto_resumed_breadcrumbs(&state, id), 0);
         }
     }
 
     enum Setup {
         None,
-        /// A publish landed between the probe and the CAS.
         CasAhead,
-        /// A manual `/acp/spawn` holds the instance lock.
-        LockHeld,
+        SubmissionHeld,
     }
 
-    /// Below the cap the pass resumes; at the cap it publishes the terminal park
-    /// and drops the continuation, unless the CAS refuses or the lock is contended.
+    /// The supervised decision delivers below cap, caps without delivery at
+    /// budget, and preserves work when the frontier or submission is refused.
     #[tokio::test]
     #[serial_test::serial]
     async fn rate_limit_reap_resumes_below_the_cap_and_parks_at_it() {
         let max = RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES as usize;
-        // (streak, setup, released, latest stop reason, queued continuation).
-        // A kept continuation is daemon-queued, not user-typed, so it carries
-        // `synthesized` and the transcript model skips a duplicate row (#4041).
+        // (streak, setup, scheduled, latest stop reason, remaining initial turn).
         let cases = [
-            (max - 1, Setup::None, true, "rate_limited", Some(true)),
+            (max - 1, Setup::None, true, "rate_limited", None),
             (
                 max,
                 Setup::None,
-                false,
+                true,
                 RATE_LIMIT_EXHAUSTED_RETRIES_REASON,
                 None,
             ),
-            (max, Setup::CasAhead, false, "rate_limited", Some(true)),
-            (max, Setup::LockHeld, false, "rate_limited", Some(true)),
+            (max, Setup::CasAhead, true, "rate_limited", Some(true)),
+            (
+                max,
+                Setup::SubmissionHeld,
+                false,
+                "rate_limited",
+                Some(true),
+            ),
         ];
-        for (streak, setup, released, reason, kept) in cases {
+        for (streak, setup, scheduled, reason, kept) in cases {
             let id = "sess-3688";
             let (_home, state, _project) = parked_with_continuation(id, streak).await;
-            let lock = state.instance_lock(id).await;
+            ready_worker(&state, id).await;
             let _guard = match setup {
                 Setup::None => None,
                 Setup::CasAhead => {
@@ -655,7 +851,7 @@ mod tests {
                     state.acp_supervisor.hydrate_seqs([(id.to_string(), ahead)]);
                     None
                 }
-                Setup::LockHeld => Some(lock.lock().await),
+                Setup::SubmissionHeld => Some(state.session_service.prompt_submission(id).await),
             };
             let mut attempted: HashSet<String> = [id.to_string()].into();
 
@@ -664,10 +860,13 @@ mod tests {
                 reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()),
             )
             .await
-            .expect("a contended instance_lock must not block the tick");
+            .expect("a contended submission must not block the tick");
+            if !matches!(setup, Setup::SubmissionHeld) {
+                settle_delivery(&state, id).await;
+            }
 
             let case = format!("streak={streak}");
-            assert_eq!(!attempted.contains(id), released, "{case}");
+            assert_eq!(!attempted.contains(id), scheduled, "{case}");
             assert_eq!(
                 latest_stop_reason(&state, id).as_deref(),
                 Some(reason),
@@ -677,8 +876,8 @@ mod tests {
         }
     }
 
-    /// A limit that ended an agent-initiated turn has no prompt to redeliver, so
-    /// the park resumes with a bare `continue` once its worker is gone (#4373).
+    /// An elapsed agent-initiated hold continues on its current qualified actor,
+    /// without mistaking observational attachment for replay consent.
     #[tokio::test]
     #[serial_test::serial]
     async fn agent_initiated_park_installs_a_continue_prompt() {
@@ -714,22 +913,485 @@ mod tests {
 
         let mut attempted: HashSet<String> = [id.to_string()].into();
 
-        // A live worker keeps the park: the reaper must not resume over it.
-        state.acp_supervisor.test_insert_worker(id).await;
-        let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
-        assert!(released.is_empty() && attempted.contains(id));
+        ready_worker(&state, id).await;
+        let frontier = state.acp_event_store.highest_seq(id);
+        reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+        assert!(!attempted.contains(id));
+        settle_delivery(&state, id).await;
         assert_eq!(pending_turn(&state, id).await, None);
-        assert_eq!(auto_resumed_breadcrumbs(&state, id), 0);
-
-        state.acp_supervisor.test_remove_worker(id).await;
-        let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
-        assert!(released.contains(id) && !attempted.contains(id));
-        let queued = state.instances.read().await[0]
-            .pending_initial_turn
-            .as_ref()
-            .map(|t| (t.text.clone(), t.synthesized));
-        assert_eq!(queued, Some((AGENT_TURN_CONTINUATION.to_string(), true)));
+        assert_eq!(
+            delivered_prompts(&state, id, frontier),
+            vec![(AGENT_TURN_CONTINUATION.to_string(), true)]
+        );
         assert_eq!(auto_resumed_breadcrumbs(&state, id), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn automatic_quota_delivery_obeys_reported_reset_floor_and_unknown_backoff() {
+        let now = Utc::now();
+        let cases = [
+            (
+                Some(now + chrono::Duration::hours(1)),
+                now - chrono::Duration::days(1),
+                false,
+            ),
+            // A recorded clock ahead of now still imposes the minimum park floor.
+            (
+                Some(now - chrono::Duration::hours(1)),
+                now + chrono::Duration::hours(1),
+                false,
+            ),
+            (None, now - chrono::Duration::minutes(30), false),
+            (
+                Some(now - chrono::Duration::hours(1)),
+                now - chrono::Duration::days(1),
+                true,
+            ),
+            (None, now - chrono::Duration::days(1), true),
+        ];
+        for (reset, recorded, due) in cases {
+            let id = "quota-policy-clock";
+            let (_home, state, _project) = test_state(id);
+            enable_auto_resume(true);
+            for (seq, event) in [
+                crate::acp::state::test_support::prompt("original interrupted work"),
+                Event::RateLimit {
+                    info: crate::acp::state::RateLimitInfo {
+                        status: "limited".into(),
+                        resets_at: reset,
+                        kind: "usage".into(),
+                    },
+                },
+                Event::Stopped {
+                    reason: "rate_limited".into(),
+                },
+            ]
+            .iter()
+            .enumerate()
+            {
+                state
+                    .acp_event_store
+                    .record_at(id, seq as u64 + 1, event, recorded.timestamp_millis())
+                    .unwrap();
+            }
+            state
+                .acp_supervisor
+                .hydrate_seqs([(id.into(), state.acp_event_store.highest_seq(id))]);
+            state
+                .session_service
+                .set_pending_initial_turn(id, "original interrupted work".into(), Vec::new())
+                .await;
+            let commands = ready_worker(&state, id).await;
+            let lease = state.acp_supervisor.current_lease(id).unwrap();
+            let park = state.acp_event_store.rate_limit_park(id).unwrap();
+            let frontier = state.acp_event_store.highest_seq(id);
+            let submission = state.session_service.prompt_submission(id).await;
+            resume_rate_limited(
+                &state,
+                id,
+                submission,
+                QuotaResume::Automatic { park_seq: park.seq },
+            )
+            .await
+            .unwrap();
+            state.acp_supervisor.test_flush_worker_commands(id).await;
+            assert_eq!(
+                commands
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|name| **name == "prompt")
+                    .count(),
+                usize::from(due)
+            );
+            assert_eq!(
+                delivered_prompts(&state, id, frontier).len(),
+                usize::from(due)
+            );
+            assert_eq!(auto_resumed_breadcrumbs(&state, id), usize::from(due));
+            assert_eq!(
+                pending_turn(&state, id).await,
+                if due { None } else { Some(true) }
+            );
+            assert_eq!(
+                state.acp_event_store.rate_limit_redelivery_streak(id),
+                i64::from(due)
+            );
+            assert!(state.acp_supervisor.current_lease(id) == Some(lease));
+            assert_eq!(startup_errors(&state, id), 0);
+            state.shutdown.cancel();
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn qualified_native_loss_preserves_quota_pending_queue_and_budget_before_delivery() {
+        use futures_util::FutureExt as _;
+        for automatic in [false, true] {
+            let id = "quota-native-refusal";
+            let (_home, state, _project) = parked_with_continuation(id, 2).await;
+            state.instances.write().await[0]
+                .queued_prompts
+                .push(queued_prompt());
+            let commands = ready_worker(&state, id).await;
+            let original = state
+                .acp_supervisor
+                .current_native_availability(id)
+                .await
+                .unwrap();
+            let before = state.instances.read().await[0].clone();
+            let frontier = state.acp_event_store.highest_seq(id);
+            let budget = state.acp_event_store.rate_limit_redelivery_streak(id);
+            let park = state.acp_event_store.rate_limit_park(id).unwrap();
+            let checked = std::panic::AssertUnwindSafe(async {
+                original.client.test_observe_native_loss();
+                let submission = state.session_service.prompt_submission(id).await;
+                let kind = if automatic {
+                    QuotaResume::Automatic { park_seq: park.seq }
+                } else {
+                    QuotaResume::Manual
+                };
+                let error = resume_rate_limited(&state, id, submission, kind)
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    error,
+                    crate::acp::supervisor::SupervisorError::Acp(
+                        crate::acp::acp_client::AcpError::ConnectionUnavailable(_)
+                    )
+                ));
+                original.client.test_flush_commands().await;
+                let lost = state
+                    .acp_supervisor
+                    .current_native_availability(id)
+                    .await
+                    .unwrap();
+                assert!(
+                    !lost.ready && lost.unavailable.is_some(),
+                    "FIFO observation cannot restore native authority"
+                );
+                assert!(commands.lock().unwrap().is_empty());
+                assert_eq!(state.acp_event_store.highest_seq(id), frontier);
+                assert_eq!(
+                    state.acp_event_store.rate_limit_redelivery_streak(id),
+                    budget
+                );
+                let after = state.instances.read().await[0].clone();
+                assert_eq!(
+                    serde_json::to_value(after.pending_initial_turn).unwrap(),
+                    serde_json::to_value(before.pending_initial_turn).unwrap()
+                );
+                assert_eq!(
+                    serde_json::to_value(after.queued_prompts).unwrap(),
+                    serde_json::to_value(before.queued_prompts).unwrap()
+                );
+                assert_eq!(after.acp_session_id, before.acp_session_id);
+                assert!(state.acp_supervisor.current_lease(id) == Some(original.lease.clone()));
+                assert_eq!(startup_errors(&state, id), 0);
+            })
+            .catch_unwind()
+            .await;
+            state.acp_supervisor.test_remove_worker(id).await;
+            original.client.shutdown().await.unwrap();
+            state.shutdown.cancel();
+            if let Err(panic) = checked {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_aged_quota_hold_prevents_idle_reaping_without_spending_retry_budget() {
+        let id = "quota-idle-hold";
+        let (_home, state, _project) = parked_with_continuation(id, 1).await;
+        std::fs::write(
+            crate::session::get_app_dir().unwrap().join("config.toml"),
+            "[acp]\nrate_limit_auto_resume = true\nauto_stop_idle_secs = 1\n",
+        )
+        .unwrap();
+        let commands = ready_worker(&state, id).await;
+        let lease = state.acp_supervisor.current_lease(id).unwrap();
+        lease.test_backdate_idle_baseline(
+            (Utc::now() - chrono::Duration::days(1)).timestamp_millis(),
+        );
+        let frontier = state.acp_event_store.highest_seq(id);
+        super::super::idle::reap_idle_workers(&state).await;
+        state.acp_supervisor.test_flush_worker_commands(id).await;
+        assert!(state.acp_supervisor.current_lease(id) == Some(lease));
+        assert!(commands.lock().unwrap().is_empty());
+        assert_eq!(state.acp_event_store.highest_seq(id), frontier);
+        assert_eq!(state.acp_event_store.rate_limit_redelivery_streak(id), 1);
+        assert!(!state.instances.read().await[0].is_idle_dormant());
+        assert_eq!(pending_turn(&state, id).await, Some(true));
+        state.shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn selected_quota_queue_delivers_mixed_age_rows_and_stored_bytes_to_the_same_native_actor(
+    ) {
+        use crate::acp::supervisor::test_support::HeldAttachRunner;
+        use base64::Engine as _;
+        let id = "quota-native-queue-payload";
+        let (_home, state, project) = parked_with_continuation(id, 0).await;
+        enable_auto_resume(false);
+        let park = state.acp_event_store.rate_limit_park(id).unwrap();
+        let bytes = [
+            b"original-old-image".to_vec(),
+            b"original-new-image".to_vec(),
+        ];
+        {
+            let mut rows = state.instances.write().await;
+            rows[0].acp_session_id = Some("same-native".into());
+            for (index, data) in bytes.iter().enumerate() {
+                let mut queued = queued_prompt();
+                queued.id = format!("queued-{index}");
+                queued.seq = index as u64 + 1;
+                queued.text = if index == 0 {
+                    "older queued intent"
+                } else {
+                    "newer queued intent"
+                }
+                .into();
+                queued.created_at = DateTime::from_timestamp_millis(
+                    park.recorded_at_ms + if index == 0 { -1000 } else { 1000 },
+                )
+                .unwrap()
+                .to_rfc3339();
+                queued.attachments = vec![crate::daemon::PromptAttachmentRef {
+                    id: format!("image-{index}"),
+                    kind: crate::daemon::PromptAttachmentKind::Image,
+                    mime_type: "image/png".into(),
+                    name: Some(format!("original-{index}.png")),
+                    size: data.len() as u64,
+                }];
+                assert!(state.acp_event_store.record_pending_attachment(
+                    id,
+                    &queued.id,
+                    &crate::acp::event_store::AttachmentBlob {
+                        id: format!("image-{index}"),
+                        kind: crate::daemon::PromptAttachmentKind::Image,
+                        mime_type: "image/png".into(),
+                        name: Some(format!("original-{index}.png")),
+                        data: data.clone(),
+                    }
+                ));
+                rows[0].queued_prompts.push(queued);
+            }
+        }
+        let row = state.instances.read().await[0].clone();
+        crate::session::Storage::open_reference("default")
+            .unwrap()
+            .update(|rows, _| {
+                *rows.iter_mut().find(|value| value.id == id).unwrap() = row.clone();
+                Ok(())
+            })
+            .unwrap();
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let mut runner = HeldAttachRunner::recording_prompt(
+            id,
+            project.path(),
+            17,
+            Some("default"),
+            "same-native",
+        )
+        .await;
+        let mut events = state.acp_events_tx.subscribe();
+        state
+            .acp_supervisor
+            .attach(id.into(), project.path().into(), Vec::new(), false, None)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let frame = events.recv().await.unwrap();
+                if matches!(frame.event.as_ref(), Event::AcpSessionAssigned { .. }) {
+                    break;
+                }
+                assert!(!matches!(
+                    frame.event.as_ref(),
+                    Event::AgentStartupError { .. }
+                ));
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(runner.resumed_session().await, "same-native");
+        let original = state
+            .acp_supervisor
+            .current_native_availability(id)
+            .await
+            .unwrap();
+        assert_eq!(original.owner, Some(runner.identity));
+        assert_eq!(
+            state.acp_event_store.rate_limit_park(id).unwrap().seq,
+            park.seq,
+            "read-only attachment cannot release quota"
+        );
+        assert_eq!(pending_turn(&state, id).await, Some(true));
+        assert_eq!(auto_resumed_breadcrumbs(&state, id), 0);
+        let frontier = state.acp_event_store.highest_seq(id);
+        let submission = state.session_service.prompt_submission(id).await;
+        resume_rate_limited(&state, id, submission, QuotaResume::Manual)
+            .await
+            .unwrap();
+        let request = tokio::time::timeout(Duration::from_secs(10), runner.next_prompt())
+            .await
+            .unwrap();
+        assert_eq!(request["sessionId"], "same-native");
+        let blocks = request["prompt"].as_array().unwrap();
+        let text = blocks
+            .iter()
+            .filter(|block| block["type"] == "text")
+            .map(|block| block["text"].as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(text, "older queued intent\n\nnewer queued intent");
+        let images = blocks
+            .iter()
+            .filter(|block| block["type"] == "image")
+            .map(|block| {
+                assert_eq!(block["mimeType"], "image/png");
+                base64::engine::general_purpose::STANDARD
+                    .decode(block["data"].as_str().unwrap())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(images, bytes);
+        assert_eq!(delivered_prompts(&state, id, frontier), vec![(text, false)]);
+        assert_eq!(auto_resumed_breadcrumbs(&state, id), 1);
+        assert_eq!(pending_turn(&state, id).await, None);
+        assert!(state.instances.read().await[0].queued_prompts.is_empty());
+        assert!(state.acp_supervisor.current_lease(id) == Some(original.lease.clone()));
+        assert!(crate::process::worker_registry::is_record_live(
+            &runner.record
+        ));
+        runner.complete_turn();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let frame = events.recv().await.unwrap();
+                if matches!(frame.event.as_ref(), Event::Stopped { reason } if reason == "prompt_complete") { break; }
+            }
+        }).await.unwrap();
+        assert_eq!(
+            state.instances.read().await[0].acp_session_id.as_deref(),
+            Some("same-native")
+        );
+        state.acp_supervisor.test_remove_worker(id).await;
+        original.client.shutdown().await.unwrap();
+        state.shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn authorized_quota_queue_preserves_background_work_and_same_actor() {
+        for automatic in [false, true] {
+            let id = "quota-background-queue";
+            let (_home, state, _project) = parked_with_continuation(id, 0).await;
+            enable_auto_resume(automatic);
+            let launched = Event::BackgroundAgentLaunched {
+                agent_id: "retained-background".into(),
+                tool_call_id: "retained-tool".into(),
+                description: "retained background work".into(),
+                prompt: "finish background work".into(),
+                model: "test".into(),
+                output_file: String::new(),
+                workflow: None,
+                started_at: Utc::now(),
+            };
+            let progress = Event::BackgroundAgentProgress {
+                agent_id: "retained-background".into(),
+                status: crate::acp::state::BackgroundAgentStatus::Running,
+                tool_count: 1,
+                tools: Vec::new(),
+                last_tool: None,
+                last_text: None,
+                at: Utc::now(),
+            };
+            for event in [launched, progress] {
+                state
+                    .acp_event_store
+                    .record(id, state.acp_event_store.highest_seq(id) + 1, &event)
+                    .unwrap();
+            }
+            state
+                .acp_supervisor
+                .hydrate_seqs([(id.to_string(), state.acp_event_store.highest_seq(id))]);
+            {
+                let mut rows = state.instances.write().await;
+                rows[0].status = crate::session::Status::Running;
+                let mut queued = queued_prompt();
+                queued.text = "newer queued intent".into();
+                rows[0].queued_prompts.push(queued);
+            }
+            let commands = ready_worker(&state, id).await;
+            let original = state
+                .acp_supervisor
+                .current_native_availability(id)
+                .await
+                .unwrap();
+            let owner = original.lease.clone();
+            let control = state.session_service.fold_control_state(id).await;
+            assert!(
+                control.connection_ready
+                    && !control.turn_active
+                    && control.has_active_background_agent()
+            );
+            assert_eq!(control.sidebar_status(), crate::session::Status::Running);
+            assert!(state.acp_event_store.has_in_flight_turn(id));
+            assert!(!state.acp_event_store.has_in_flight_main_turn(id));
+            let park_seq = state.acp_event_store.rate_limit_park(id).unwrap().seq;
+            let frontier = state.acp_event_store.highest_seq(id);
+            state.session_service.drain_queued_prompts_once(id).await;
+            assert_eq!(
+                state.acp_event_store.highest_seq(id),
+                frontier,
+                "ordinary drain cannot release a quota hold"
+            );
+            assert_eq!(pending_turn(&state, id).await, Some(true));
+            let submission = state.session_service.prompt_submission(id).await;
+            let kind = if automatic {
+                QuotaResume::Automatic { park_seq }
+            } else {
+                QuotaResume::Manual
+            };
+            resume_rate_limited(&state, id, submission, kind)
+                .await
+                .unwrap();
+            original.client.test_flush_commands().await;
+            assert_eq!(
+                commands
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|name| **name == "prompt")
+                    .count(),
+                1
+            );
+            assert!(state.acp_event_store.rate_limit_park(id).is_none());
+            assert_eq!(
+                delivered_prompts(&state, id, frontier),
+                vec![("newer queued intent".into(), false)]
+            );
+            assert_eq!(
+                auto_resumed_breadcrumbs(&state, id),
+                usize::from(!automatic)
+            );
+            assert_eq!(pending_turn(&state, id).await, None);
+            assert!(state.instances.read().await[0].queued_prompts.is_empty());
+            assert!(state.acp_supervisor.current_lease(id) == Some(owner));
+            assert!(state
+                .session_service
+                .fold_control_state(id)
+                .await
+                .has_active_background_agent());
+            assert_eq!(startup_errors(&state, id), 0);
+            state.acp_supervisor.test_remove_worker(id).await;
+            original.client.shutdown().await.unwrap();
+            state.shutdown.cancel();
+        }
     }
 
     fn auto_resumed_breadcrumbs(state: &AppState, id: &str) -> usize {
@@ -806,7 +1468,7 @@ mod tests {
         // The `parked` fixture backdates the limit an hour, so these straddle it.
         let after = Utc::now();
         let before = Utc::now() - chrono::Duration::hours(2);
-        // (label, continuation installed, queued at, turn kept, breadcrumbs)
+        // (label, initial continuation installed, queued at, continuation chosen, breadcrumbs)
         let cases = [
             ("queued-after", false, after.to_rfc3339(), None, 0),
             (
@@ -851,26 +1513,38 @@ mod tests {
                 state.acp_event_store.rate_limit_park(&id).is_some(),
                 "{label}: a queued prompt must leave the park standing"
             );
+            ready_worker(&state, &id).await;
+            let frontier = state.acp_event_store.highest_seq(&id);
             let mut attempted: HashSet<String> = [id.clone()].into();
 
-            let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+            reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+            settle_delivery(&state, &id).await;
 
-            assert_eq!(pending_turn(&state, &id).await, kept, "{label}");
+            assert_eq!(pending_turn(&state, &id).await, None, "{label}");
+            let expected = if kept.is_some() {
+                ("run the nightly task", true)
+            } else {
+                ("manual prompt B", false)
+            };
+            assert_eq!(
+                delivered_prompts(&state, &id, frontier),
+                vec![(expected.0.into(), expected.1)],
+                "{label}"
+            );
             assert_eq!(
                 auto_resumed_breadcrumbs(&state, &id),
                 breadcrumbs,
                 "{label}: a refused continuation must not spend a redelivery"
             );
             assert!(
-                !attempted.contains(&id) && released.contains(&id),
+                !attempted.contains(&id),
                 "{label}: the queued prompt has no other route to a worker"
             );
         }
     }
 
-    /// #4092: a spawn's own worker publishes `AcpSessionAssigned`, which
-    /// retires the park without any prompt having superseded anything, so the
-    /// install must key on the interrupted prompt rather than on park liveness.
+    /// Attaching to the same actor is observational: it neither releases the
+    /// quota hold nor supersedes the interrupted prompt selected for replay.
     #[tokio::test]
     #[serial_test::serial]
     async fn a_manual_install_lands_after_its_own_worker_assigns_the_session() {
@@ -891,14 +1565,14 @@ mod tests {
             )
             .unwrap();
         assert!(
-            state.acp_event_store.rate_limit_park(id).is_none(),
-            "the assignment must retire the park, or the case asserts nothing"
+            state.acp_event_store.rate_limit_park(id).is_some(),
+            "an observed assignment must not release the quota hold"
         );
 
         let _outcome = install_rate_limit_continuation(
             &state,
             id,
-            state.session_service.prompt_submission(id).await,
+            &state.session_service.prompt_submission(id).await,
         )
         .await;
 
@@ -925,7 +1599,7 @@ mod tests {
         let _submission = state.session_service.prompt_submission(id).await;
         let mut attempted: HashSet<String> = [id.to_string()].into();
 
-        let released = tokio::time::timeout(
+        tokio::time::timeout(
             Duration::from_secs(5),
             reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()),
         )
@@ -935,10 +1609,6 @@ mod tests {
         assert!(
             attempted.contains(id),
             "the session stays held until the next cadence"
-        );
-        assert!(
-            !released.contains(id),
-            "nothing was resumed, so nothing is released"
         );
         assert_eq!(pending_turn(&state, id).await, None);
         assert_eq!(auto_resumed_breadcrumbs(&state, id), 0);

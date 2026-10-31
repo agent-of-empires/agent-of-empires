@@ -900,12 +900,66 @@ pub(crate) fn observe_lock_contention_for_test(
 }
 
 #[cfg(test)]
-fn report_lock_contention_for_test(path: &Path) {
+struct SharedLockContentionObserver {
+    path: PathBuf,
+    sender: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+#[cfg(test)]
+static SHARED_LOCK_CONTENTION_OBSERVER: std::sync::Mutex<Option<SharedLockContentionObserver>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) struct SharedLockContentionGuard;
+
+#[cfg(test)]
+impl Drop for SharedLockContentionGuard {
+    fn drop(&mut self) {
+        let observer = SHARED_LOCK_CONTENTION_OBSERVER.lock().unwrap().take();
+        drop(observer);
+    }
+}
+
+#[cfg(test)]
+impl Storage {
+    pub(crate) fn observe_shared_lock_contention_for_test(
+        &self,
+        sender: tokio::sync::oneshot::Sender<()>,
+    ) -> SharedLockContentionGuard {
+        let path = self
+            .sessions_path
+            .parent()
+            .unwrap()
+            .join(STORAGE_LOCK_FILENAME);
+        let mut slot = SHARED_LOCK_CONTENTION_OBSERVER.lock().unwrap();
+        assert!(slot.is_none(), "one scoped shared-flock observer");
+        *slot = Some(SharedLockContentionObserver {
+            path,
+            sender: Some(sender),
+        });
+        SharedLockContentionGuard
+    }
+}
+
+#[cfg(test)]
+fn report_lock_contention_for_test(path: &Path, shared_flock: bool) {
     LOCK_CONTENTION_OBSERVER.with(|slot| {
         if let Some(sender) = slot.borrow_mut().take() {
             let _ = sender.send(path.to_path_buf());
         }
     });
+    if shared_flock {
+        let sender = {
+            let mut slot = SHARED_LOCK_CONTENTION_OBSERVER.lock().unwrap();
+            // Keep the registration until Drop so an old guard cannot clear a newer one.
+            slot.as_mut()
+                .filter(|observer| observer.path == path)
+                .and_then(|observer| observer.sender.take())
+        };
+        if let Some(sender) = sender {
+            let _ = sender.send(());
+        }
+    }
 }
 
 pub(crate) fn acquire_open_storage_flock(file: fs::File, path: &Path) -> Result<StorageFlock> {
@@ -918,7 +972,7 @@ pub(crate) fn acquire_open_storage_flock(file: fs::File, path: &Path) -> Result<
             fs::write(marker, path.as_os_str().as_encoded_bytes())?;
         }
         #[cfg(test)]
-        report_lock_contention_for_test(path);
+        report_lock_contention_for_test(path, false);
         let started = Instant::now();
         let mut warned = false;
         loop {
@@ -967,7 +1021,7 @@ fn acquire_open_storage_shared_flock(file: fs::File, path: &Path) -> Result<Stor
             return Err(e.into());
         }
         #[cfg(test)]
-        report_lock_contention_for_test(path);
+        report_lock_contention_for_test(path, true);
         let started = Instant::now();
         let mut warned = false;
         loop {
@@ -1371,6 +1425,12 @@ pub(crate) trait SessionStore: Send + Sync {
     /// Runs synchronously, at most once and exactly once on success.
     /// Mutation errors must prevent the write.
     fn commit(&self, mutation: &mut SessionMutation<'_>) -> Result<()>;
+    /// Canonical post-launch metadata checkpoint on this already bound store.
+    /// The mutation must fence its original physical context, producer and full
+    /// selection. Launch-only presentation fields are not metadata authority.
+    fn commit_metadata_checkpoint(&self, mutation: &mut SessionMutation<'_>) -> Result<()> {
+        self.commit(mutation)
+    }
     fn release_lifecycle_reservation(
         &self,
         id: &str,
@@ -2543,7 +2603,7 @@ impl Storage {
     {
         #[cfg(test)]
         let _mu = crate::session::test_support::lock_reporting_contention(&self.save_lock, || {
-            report_lock_contention_for_test(&self.sessions_path)
+            report_lock_contention_for_test(&self.sessions_path, false)
         })
         .unwrap_or_else(|error| error.into_inner());
         #[cfg(not(test))]

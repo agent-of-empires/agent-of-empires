@@ -217,6 +217,7 @@ async fn auth_status_is_cleared_per_adapter_process() {
     let reattach = ConnectMode::Resume {
         acp_session_id: "s-auth".into(),
         in_flight_turn: false,
+        unsuccessful_main: false,
     };
     let cases = [
         ("silent replacement", fresh(), false, vec![false]),
@@ -249,6 +250,7 @@ async fn auth_bootstrap_exceeding_public_and_shim_capacity_reaches_ready_before_
         ConnectMode::Resume {
             acp_session_id: "s-auth".into(),
             in_flight_turn: false,
+            unsuccessful_main: false,
         },
     ] {
         let fresh = matches!(&mode, ConnectMode::Fresh { .. });
@@ -564,12 +566,15 @@ async fn correlated_config_result_survives_eof_while_public_queue_is_full() {
     fake.agent.abort();
 }
 
-/// A limit that ends an agent-initiated turn must end the connection, or the
-/// drain loop never drops the worker and the reaper skips it as still running
-/// (#4373).
 #[tokio::test]
-async fn rate_limit_on_an_agent_initiated_turn_ends_the_connection() {
-    let mut fake = spawn_fake_connection("s-limit", None, false, |_| Vec::new()).await;
+async fn rate_limit_on_an_agent_initiated_turn_preserves_the_connection() {
+    let mut fake = spawn_fake_connection("s-limit", None, false, |id| {
+        vec![
+            serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"stopReason":"end_turn"}})
+                .to_string(),
+        ]
+    })
+    .await;
 
     tokio::time::timeout(Duration::from_secs(10), async {
         while !matches!(
@@ -594,15 +599,15 @@ async fn rate_limit_on_an_agent_initiated_turn_ends_the_connection() {
     let mut seen = Vec::new();
     tokio::time::timeout(Duration::from_secs(30), async {
         while let Some(event) = fake.event_rx.recv().await {
+            let stopped = matches!(&event, Event::Stopped { reason } if reason == "rate_limited");
             seen.push(event);
+            if stopped {
+                break;
+            }
         }
     })
     .await
-    .expect("the connection must end after parking, closing the event channel");
-    tokio::time::timeout(Duration::from_secs(10), fake.connection)
-        .await
-        .expect("connection task ends")
-        .expect("connection task does not panic");
+    .expect("the agent-initiated quota turn must end");
 
     let limit = seen.iter().position(|e| {
         matches!(e, Event::RateLimit { info } if info.resets_at.map(|t| t.timestamp()) == Some(resets_at))
@@ -614,6 +619,27 @@ async fn rate_limit_on_an_agent_initiated_turn_ends_the_connection() {
         limit.is_some() && limit < stopped,
         "RateLimit then Stopped(rate_limited) expected: {seen:?}"
     );
+    fake.cmd_tx.send(ClientCmd::Cancel).await.unwrap();
+    fake.cmd_tx
+        .send(ClientCmd::Prompt(Vec::new()))
+        .await
+        .unwrap();
+    let next = collect_terminal(&mut fake).await;
+    assert!(matches!(next.last(), Some(Event::Stopped { reason }) if reason == "prompt_complete"));
+    assert_eq!(
+        next.iter()
+            .filter(|event| matches!(event, Event::Stopped { .. }))
+            .count(),
+        1
+    );
+    assert!(!next
+        .iter()
+        .any(|event| matches!(event, Event::AcpSessionAssigned { .. })));
+    fake.cmd_tx.send(ClientCmd::Shutdown).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), fake.connection)
+        .await
+        .unwrap()
+        .unwrap();
     fake.agent.abort();
     let _ = fake.agent.await;
 }
@@ -644,13 +670,22 @@ async fn prompted_turn_ending_on_a_rejected_window_parks() {
         let update = format!(
             r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s-prompted","update":{{"sessionUpdate":"usage_update","used":10,"size":100,"_meta":{{"_claude/rateLimit":{{"status":"rejected","rateLimitType":"five_hour","resetsAt":{resets_at}{overage}}}}}}}}}}}"#
         );
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let native_calls = calls.clone();
         let mut fake = spawn_fake_connection("s-prompted", None, false, move |id| {
-            vec![
-                update.clone(),
-                format!(
-                    r#"{{"jsonrpc":"2.0","id":{id},"result":{{"stopReason":"{stop_reason}"}}}}"#
-                ),
-            ]
+            if native_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                vec![
+                    update.clone(),
+                    format!(
+                        r#"{{"jsonrpc":"2.0","id":{id},"result":{{"stopReason":"{stop_reason}"}}}}"#
+                    ),
+                ]
+            } else {
+                vec![
+                    serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"stopReason":"end_turn"}})
+                        .to_string(),
+                ]
+            }
         })
         .await;
         fake.cmd_tx
@@ -685,20 +720,32 @@ async fn prompted_turn_ending_on_a_rejected_window_parks() {
                 "{stop_reason}: RateLimit expected: {seen:?}"
             );
             assert_eq!(stopped_reason, "rate_limited", "{seen:?}");
-            // The connection must end so the reaper can resume it.
-            tokio::time::timeout(Duration::from_secs(10), fake.connection)
-                .await
-                .expect("connection task ends after parking")
-                .expect("connection task does not panic");
         } else {
             assert!(
                 limit.is_none(),
                 "{stop_reason}{overage}: must not park: {seen:?}"
             );
             assert_ne!(stopped_reason, "rate_limited", "{seen:?}");
-            fake.connection.abort();
-            let _ = fake.connection.await;
         }
+        fake.cmd_tx.send(ClientCmd::Cancel).await.unwrap();
+        fake.cmd_tx
+            .send(ClientCmd::Prompt(Vec::new()))
+            .await
+            .unwrap();
+        let next = collect_terminal(&mut fake).await;
+        assert!(
+            matches!(next.last(), Some(Event::Stopped { reason }) if reason == "prompt_complete")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(!next.iter().any(|event| matches!(
+            event,
+            Event::RateLimit { .. } | Event::AcpSessionAssigned { .. }
+        )));
+        fake.cmd_tx.send(ClientCmd::Shutdown).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), fake.connection)
+            .await
+            .unwrap()
+            .unwrap();
         fake.agent.abort();
         let _ = fake.agent.await;
     }
@@ -762,10 +809,6 @@ async fn request_errors_fail_the_turn_without_replacing_the_connection() {
             assert!(
                 matches!(events.last(), Some(Event::Stopped { reason }) if reason == "rate_limited")
             );
-            tokio::time::timeout(Duration::from_secs(10), fake.connection)
-                .await
-                .unwrap()
-                .unwrap();
         } else {
             let failures: Vec<_> = events
                 .iter()
@@ -788,44 +831,44 @@ async fn request_errors_fail_the_turn_without_replacing_the_connection() {
             assert!(
                 matches!(events.last(), Some(Event::Stopped { reason }) if reason == "prompt_failed")
             );
-            assert!(!fake.connection.is_finished());
-            fake.cmd_tx.send(ClientCmd::Cancel).await.unwrap();
-            fake.cmd_tx
-                .send(ClientCmd::Prompt(Vec::new()))
-                .await
-                .unwrap();
-            let next = collect_terminal(&mut fake).await;
-            assert!(
-                matches!(next.last(), Some(Event::Stopped { reason }) if reason == "prompt_complete")
-            );
-            events.extend(next);
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| matches!(event, Event::Stopped { .. }))
-                    .count(),
-                2,
-                "late cancel must not add a second terminal to the failed turn"
-            );
-            assert_eq!(
-                calls.load(Ordering::SeqCst),
-                2,
-                "only explicit prompts reach the same connection"
-            );
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| matches!(event, Event::AcpSessionAssigned { .. }))
-                    .count(),
-                1
-            );
-            assert!(!events.iter().any(|event| matches!(
-                event,
-                Event::AgentStartupError { .. } | Event::SessionContextReset { .. }
-            )));
-            fake.connection.abort();
-            let _ = fake.connection.await;
         }
+        assert!(!fake.connection.is_finished());
+        fake.cmd_tx.send(ClientCmd::Cancel).await.unwrap();
+        fake.cmd_tx
+            .send(ClientCmd::Prompt(Vec::new()))
+            .await
+            .unwrap();
+        let next = collect_terminal(&mut fake).await;
+        assert!(
+            matches!(next.last(), Some(Event::Stopped { reason }) if reason == "prompt_complete")
+        );
+        events.extend(next);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::Stopped { .. }))
+                .count(),
+            2,
+            "late cancel must not add a second terminal to the unsuccessful turn"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "only explicit prompts reach the same connection"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::AcpSessionAssigned { .. }))
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            Event::AgentStartupError { .. } | Event::SessionContextReset { .. }
+        )));
+        fake.connection.abort();
+        let _ = fake.connection.await;
         let public = serde_json::to_string(&events).unwrap();
         assert!(!public.contains("privateTokenMarker") && !public.contains("must-not-leak"));
         fake.agent.abort();
@@ -840,6 +883,7 @@ async fn transport_and_protocol_failure_remain_fatal_across_turn_ownership() {
         let resume = (mode == "adopted").then(|| ConnectMode::Resume {
             acp_session_id: "s-eof".into(),
             in_flight_turn: true,
+            unsuccessful_main: false,
         });
         let mut fake = spawn_fake_connection("s-eof", resume, mode == "after_error", move |id| {
             entered.send(()).unwrap();
@@ -934,6 +978,7 @@ async fn unsupported_session_prompt_prose_preserves_identity_and_the_next_explic
         Some(ConnectMode::Resume {
             acp_session_id: "s-rejected".into(),
             in_flight_turn: false,
+            unsuccessful_main: false,
         }),
         false,
         move |id| {

@@ -1,4 +1,4 @@
-//! The v4 runner control socket: connecting, establishing a session, and
+//! The v5 runner control socket: connecting, establishing a session, and
 //! routing ACP frames over it.
 
 use crate::acp::control_protocol::{
@@ -46,7 +46,7 @@ pub(super) struct DaemonControlClient {
     pub(super) ingress: Arc<SessionIngress>,
     pub(super) connection_state: Arc<ConnectionState>,
     write: Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
-    handshake_rx: Mutex<mpsc::Receiver<ControlBody>>,
+    handshake_rx: Mutex<mpsc::Receiver<HandshakeReply>>,
     sessions_established: AtomicU64,
     native_cache: Arc<AtomicBool>,
     native_ready: Arc<AtomicBool>,
@@ -69,6 +69,105 @@ type LocalOutcome = (
 pub(super) enum ControlPromptResult {
     Outcome(control_protocol::PromptOutcome),
     NativeLost,
+}
+
+#[derive(Default)]
+pub(super) enum OriginalForkResponse {
+    #[default]
+    Unused,
+    Requested(String),
+    Finished(Option<Arc<crate::acp::state::NativeForkRejection>>),
+}
+
+impl OriginalForkResponse {
+    fn register(&mut self, parent: Option<&str>) -> bool {
+        if !matches!(self, Self::Unused) {
+            return false;
+        }
+        *self = parent.map_or(Self::Finished(None), |parent| {
+            Self::Requested(parent.to_owned())
+        });
+        parent.is_some()
+    }
+
+    fn receive(&mut self, body: &ControlBody, owner: crate::acp::runner_lifecycle::RunnerIdentity) {
+        match std::mem::take(self) {
+            Self::Requested(parent) => {
+                let rejection = matches!(body, ControlBody::HandshakeFailed {
+                    method, origin: control_protocol::HandshakeFailureOrigin::NativeResponse, ..
+                } if method == "session/fork")
+                .then(|| Arc::new(crate::acp::state::NativeForkRejection { owner, parent }));
+                *self = Self::Finished(rejection);
+            }
+            previous => *self = previous,
+        }
+    }
+
+    pub(super) fn snapshot(&self) -> Option<Arc<crate::acp::state::NativeForkRejection>> {
+        match self {
+            Self::Finished(rejection) => rejection.clone(),
+            Self::Unused | Self::Requested(_) => None,
+        }
+    }
+
+    pub(super) fn seal(&mut self) -> Option<Arc<crate::acp::state::NativeForkRejection>> {
+        if !matches!(self, Self::Finished(_)) {
+            *self = Self::Finished(None);
+        }
+        self.snapshot()
+    }
+}
+
+struct HandshakeReply {
+    body: ControlBody,
+    application: Option<HandshakeApplication>,
+}
+
+struct HandshakeApplication(Arc<ConnectionState>);
+
+impl std::fmt::Debug for HandshakeApplication {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HandshakeApplication")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for HandshakeApplication {
+    fn drop(&mut self) {
+        self.0.finish_completed_outcome();
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct EstablishmentFailure {
+    pub(super) origin: control_protocol::HandshakeFailureOrigin,
+    pub(super) error: agent_client_protocol::Error,
+    pub(super) fork_rejection: Option<Arc<crate::acp::state::NativeForkRejection>>,
+    _application: Option<HandshakeApplication>,
+}
+
+impl From<agent_client_protocol::Error> for EstablishmentFailure {
+    fn from(error: agent_client_protocol::Error) -> Self {
+        Self {
+            origin: control_protocol::HandshakeFailureOrigin::Unknown,
+            error,
+            fork_rejection: None,
+            _application: None,
+        }
+    }
+}
+
+impl From<EstablishmentFailure> for agent_client_protocol::Error {
+    fn from(failure: EstablishmentFailure) -> Self {
+        failure.error
+    }
+}
+
+impl std::fmt::Display for EstablishmentFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, formatter)
+    }
 }
 
 fn observe_native_loss(state: &ConnectionState, cause: NativeChannelLossCause) {
@@ -277,7 +376,7 @@ impl DaemonControlClient {
         }
     }
 
-    async fn receive_handshake(&self) -> Option<ControlBody> {
+    async fn receive_handshake(&self) -> Option<HandshakeReply> {
         let mut replies = self.handshake_rx.lock().await;
         tokio::select! {
             biased;
@@ -303,6 +402,16 @@ impl DaemonControlClient {
         self.peer_identity
     }
 
+    pub(super) fn original_fork_rejection(
+        &self,
+    ) -> Option<Arc<crate::acp::state::NativeForkRejection>> {
+        self.connection_state
+            .fork_response
+            .lock()
+            .expect("fork response custody")
+            .snapshot()
+    }
+
     /// A lost connection does not assert process death or authorize a signal.
     pub(super) async fn wait_peer_exit(&self) {
         loop {
@@ -326,9 +435,11 @@ impl DaemonControlClient {
         self.send(ControlBody::Initialize { request })
             .await
             .map_err(|e| acp_internal_error(format!("control write failed: {e}")))?;
-        match self.receive_handshake().await {
+        match self.receive_handshake().await.map(|reply| reply.body) {
             Some(ControlBody::Initialized { result }) => Ok(result),
-            Some(ControlBody::HandshakeFailed { error }) => Err(acp_error_from_value(error)),
+            Some(ControlBody::HandshakeFailed { method, error, .. }) if method == "initialize" => {
+                Err(acp_error_from_value(error))
+            }
             _ => Err(acp_internal_error(
                 "control channel closed during initialize".into(),
             )),
@@ -339,27 +450,69 @@ impl DaemonControlClient {
         &self,
         method: &str,
         request: serde_json::Value,
-    ) -> Result<(String, serde_json::Value), agent_client_protocol::Error> {
+    ) -> Result<(String, serde_json::Value), EstablishmentFailure> {
+        let original_fork = method == "session/fork"
+            && self
+                .connection_state
+                .fork_response
+                .lock()
+                .expect("fork response custody")
+                .register(request.get("sessionId").and_then(serde_json::Value::as_str));
         self.send(ControlBody::EstablishSession {
             method: method.to_string(),
             request,
         })
         .await
-        .map_err(|e| acp_internal_error(format!("control write failed: {e}")))?;
-        match self.receive_handshake().await {
-            Some(ControlBody::SessionReady {
+        .map_err(|e| EstablishmentFailure {
+            origin: control_protocol::HandshakeFailureOrigin::LocalTransport,
+            error: acp_internal_error(format!("control write failed: {e}")),
+            fork_rejection: None,
+            _application: None,
+        })?;
+        let Some(HandshakeReply { body, application }) = self.receive_handshake().await else {
+            return Err(EstablishmentFailure {
+                origin: control_protocol::HandshakeFailureOrigin::LocalTransport,
+                error: acp_internal_error(
+                    "control channel closed during session establishment".into(),
+                ),
+                fork_rejection: None,
+                _application: None,
+            });
+        };
+        match body {
+            ControlBody::SessionReady {
                 acp_session_id,
                 result,
                 ..
-            }) => {
+            } => {
                 self.sessions_established
                     .fetch_add(1, AtomicOrdering::Relaxed);
                 Ok((acp_session_id, result))
             }
-            Some(ControlBody::HandshakeFailed { error }) => Err(acp_error_from_value(error)),
-            _ => Err(acp_internal_error(
-                "control channel closed during session establishment".into(),
-            )),
+            ControlBody::HandshakeFailed {
+                method: failed,
+                origin,
+                error,
+            } if failed == method => Err(EstablishmentFailure {
+                fork_rejection: if original_fork
+                    && origin == control_protocol::HandshakeFailureOrigin::NativeResponse
+                {
+                    self.original_fork_rejection()
+                } else {
+                    None
+                },
+                origin,
+                error: acp_error_from_value(error),
+                _application: application,
+            }),
+            _ => Err(EstablishmentFailure {
+                origin: control_protocol::HandshakeFailureOrigin::LocalResult,
+                error: acp_internal_error(
+                    "control handshake did not match session establishment".into(),
+                ),
+                fork_rejection: None,
+                _application: None,
+            }),
         }
     }
 
@@ -368,9 +521,13 @@ impl DaemonControlClient {
         self.send(ControlBody::ResumeSession)
             .await
             .map_err(|e| acp_internal_error(format!("control write failed: {e}")))?;
-        match self.receive_handshake().await {
+        match self.receive_handshake().await.map(|reply| reply.body) {
             Some(ControlBody::SessionReady { acp_session_id, .. }) => Ok(acp_session_id),
-            Some(ControlBody::HandshakeFailed { error }) => Err(acp_error_from_value(error)),
+            Some(ControlBody::HandshakeFailed { method, error, .. })
+                if method == "resume_session" =>
+            {
+                Err(acp_error_from_value(error))
+            }
             _ => Err(acp_internal_error(
                 "control channel closed during resume".into(),
             )),
@@ -519,8 +676,8 @@ pub(super) async fn wait_runner_registration(
     }
 }
 
-/// Dial one v4 control socket and bind its actual peer before trusting Hello.
-pub(super) async fn connect_runner_control_v4(
+/// Dial one v5 control socket and bind its actual peer before trusting Hello.
+pub(super) async fn connect_runner_control_v5(
     control_path: &std::path::Path,
     session_label: String,
     terminal_claim: Arc<TerminalClaim>,
@@ -633,7 +790,7 @@ pub(super) async fn connect_runner_control_v4(
     info!(
         target: "acp.protocol",
         session = %session_label,
-        "runner control channel v4 attached; runner owns the ACP protocol"
+        "runner control channel v5 attached; runner owns the ACP protocol"
     );
 
     // 64 KiB matches the stdio pipe size.
@@ -646,7 +803,7 @@ pub(super) async fn connect_runner_control_v4(
     let write_half = Arc::new(Mutex::new(write_half));
 
     let reader_prompt_in_flight = prompt_in_flight.clone();
-    let (hs_tx, hs_rx) = mpsc::channel::<ControlBody>(8);
+    let (hs_tx, hs_rx) = mpsc::channel::<HandshakeReply>(8);
     let completion = Arc::new(std::sync::Mutex::new(PromptCompletion::Adopted));
     let reader_completion = completion.clone();
     let settled = Arc::new(std::sync::Mutex::new(None));
@@ -688,6 +845,8 @@ pub(super) async fn connect_runner_control_v4(
                         | ControlBody::HandshakeFailed { .. }),
                         _,
                     ))) => {
+                        reader_connection_state.fork_response.lock()
+                            .expect("fork response custody").receive(&frame, expected_owner);
                         if let ControlBody::SessionReady {
                             acp_session_id,
                             native_channel,
@@ -709,7 +868,15 @@ pub(super) async fn connect_runner_control_v4(
                             }
                             reader_ingress.resolve(None, acp_session_id.clone().into());
                         }
-                        if hs_tx.send(frame).await.is_err() {
+                        let application = (!reader_connection_state.sdk_is_closing()
+                            && matches!(&frame, ControlBody::HandshakeFailed {
+                                method, origin: control_protocol::HandshakeFailureOrigin::NativeResponse, ..
+                            } if method == "session/fork"))
+                            .then(|| {
+                                reader_connection_state.begin_completed_outcome();
+                                HandshakeApplication(reader_connection_state.clone())
+                            });
+                        if hs_tx.send(HandshakeReply { body: frame, application }).await.is_err() {
                             return;
                         }
                     }
@@ -1254,34 +1421,46 @@ pub(super) async fn publish_adopted_completion(
     let completion = completion.lock().expect("completion mutex poisoned");
     // Recheck after capacity waits, then enqueue both events before local activation.
     if matches!(*completion, PromptCompletion::Adopted) {
-        return terminal.publish_claimed(turn, reason == "prompt_failed", || {
-            if let Some(event) = diagnostic {
+        return terminal.publish_claimed(
+            turn,
+            matches!(reason.as_str(), "prompt_failed" | "rate_limited"),
+            || {
+                if let Some(event) = diagnostic {
+                    permits
+                        .next()
+                        .expect("diagnostic permit")
+                        .send(event.into_event());
+                }
                 permits
                     .next()
-                    .expect("diagnostic permit")
-                    .send(event.into_event());
-            }
-            permits
-                .next()
-                .expect("terminal permit")
-                .send(Event::Stopped { reason });
-            in_flight.store(false, AtomicOrdering::Release);
-        });
+                    .expect("terminal permit")
+                    .send(Event::Stopped { reason });
+                in_flight.store(false, AtomicOrdering::Release);
+            },
+        );
     }
     false
 }
 
 /// Same result shape as the crate `send_request` it replaces.
-pub(super) async fn establish_session_v4<Resp: serde::de::DeserializeOwned>(
+pub(super) async fn establish_session_v5<Resp: serde::de::DeserializeOwned>(
     control: &DaemonControlClient,
     method: &str,
     request: &impl serde::Serialize,
-) -> Result<Resp, agent_client_protocol::Error> {
-    let params = serde_json::to_value(request)
-        .map_err(|e| acp_internal_error(format!("serialize {method} params: {e}")))?;
+) -> Result<Resp, EstablishmentFailure> {
+    let params = serde_json::to_value(request).map_err(|e| EstablishmentFailure {
+        origin: control_protocol::HandshakeFailureOrigin::LocalResult,
+        error: acp_internal_error(format!("serialize {method} params: {e}")),
+        fork_rejection: None,
+        _application: None,
+    })?;
     let (_id, result) = control.establish_session(method, params).await?;
-    serde_json::from_value(result)
-        .map_err(|e| acp_internal_error(format!("deserialize {method} result: {e}")))
+    serde_json::from_value(result).map_err(|e| EstablishmentFailure {
+        origin: control_protocol::HandshakeFailureOrigin::LocalResult,
+        error: acp_internal_error(format!("deserialize {method} result: {e}")),
+        fork_rejection: None,
+        _application: None,
+    })
 }
 
 /// Preserve private error code/data for structured classifiers. An abort is
@@ -1384,7 +1563,7 @@ mod tests {
         in_flight: bool,
     ) -> Result<(Arc<DaemonControlClient>, tokio::io::DuplexStream), AcpError> {
         let in_flight = Arc::new(AtomicBool::new(in_flight));
-        connect_runner_control_v4(
+        connect_runner_control_v5(
             control,
             session.into(),
             terminal,
@@ -1418,7 +1597,7 @@ mod tests {
             let in_flight = Arc::new(AtomicBool::new(true));
             let (event_tx, events) = mpsc::channel(8);
             let (client, peer) = tokio::join!(
-                connect_runner_control_v4(
+                connect_runner_control_v5(
                     &socket,
                     "prompt".into(),
                     terminal.clone(),
@@ -2139,6 +2318,7 @@ mod tests {
                     vec![],
                     "sid-stored".into(),
                     false,
+                    false,
                     AcpSessionId("resume".into()),
                     None,
                     "codex".into(),
@@ -2330,6 +2510,7 @@ mod tests {
                 vec![],
                 "stale".into(),
                 true,
+                false,
                 AcpSessionId("native-resume".into()),
                 None,
                 "codex".into(),
@@ -2418,6 +2599,7 @@ mod tests {
                 vec![],
                 "actual".into(),
                 true,
+                false,
                 AcpSessionId("same-id".into()),
                 None,
                 "codex".into(),
@@ -2540,6 +2722,7 @@ mod tests {
                 vec![],
                 "stale".into(),
                 true,
+                false,
                 AcpSessionId("byte-backlog".into()),
                 None,
                 "codex".into(),
@@ -2568,6 +2751,43 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn retained_quota_latch_discards_cached_completion_and_accepts_next_explicit_prompt() {
+        let mut peer = PromptControlPeer::new().await;
+        // Reattachment restores a completed quota main turn, not the surviving
+        // background activity that caused the broader native-work query to be true.
+        peer.in_flight.store(false, AtomicOrdering::Release);
+        assert!(peer.terminal.claim_failed());
+        peer.send(ControlBody::PromptCompleted {
+            prompt_req_id: 5,
+            outcome: PromptOutcome::Error {
+                code: -32603,
+                message: "usage limit reached".into(),
+                data: Some(serde_json::json!({"errorKind":"rate_limit"})),
+            },
+        })
+        .await;
+        peer.drain().await;
+        assert!(
+            peer.events.try_recv().is_err(),
+            "cached completion must not publish a second quota boundary"
+        );
+        assert!(peer.terminal.claimed() && peer.terminal.failed());
+        assert!(!peer.in_flight.load(AtomicOrdering::Acquire));
+        peer.client.supersede_adopted_turn();
+        peer.terminal.begin_turn();
+        peer.in_flight.store(true, AtomicOrdering::Release);
+        let completion = peer.prompt().await;
+        peer.send(ControlBody::PromptStarted { prompt_req_id: 6 })
+            .await;
+        peer.completed(6, "end_turn").await;
+        peer.drain().await;
+        assert_eq!(
+            completion.await.unwrap(),
+            ControlPromptResult::Outcome(end("end_turn"))
+        );
     }
 
     /// A waiterless completion for an adopted turn publishes its terminal,
@@ -2724,7 +2944,7 @@ mod tests {
             }
         };
         let daemon = async {
-            let (client, crate_side) = connect_runner_control_v4(
+            let (client, crate_side) = connect_runner_control_v5(
                 &control,
                 "replayed".into(),
                 Arc::new(TerminalClaim::new()),
@@ -2920,6 +3140,7 @@ mod tests {
                     mode: ConnectMode::Resume {
                         acp_session_id: "sid-adopted".into(),
                         in_flight_turn: true,
+                        unsuccessful_main: false,
                     },
                     ready_tx,
                     profile: &crate::acp::agent_profiles::GEMINI,
@@ -2948,6 +3169,8 @@ mod tests {
             assert!(matches!(initialize, Some(ControlBody::Initialize { .. })));
             if fail_handshake {
                 peer.send(ControlBody::HandshakeFailed {
+                    method: "initialize".into(),
+                    origin: control_protocol::HandshakeFailureOrigin::NativeResponse,
                     error: serde_json::json!({"code":-32603,"message":"initialize failed","data":{"privateTokenMarker":"must-not-leak"}}),
                 }).await;
                 let error = ready_rx.await.unwrap().unwrap_err();

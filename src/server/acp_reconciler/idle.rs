@@ -158,6 +158,17 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
             let _ = entered.send(());
             let _ = release.await;
         }
+        if query_store(
+            &state.acp_event_store,
+            &id,
+            "idle-reap quota hold",
+            |store, id| store.rate_limit_park(id).is_some(),
+        )
+        .await
+        .unwrap_or(true)
+        {
+            continue;
+        }
         let Some((lease, activity_seq)) = state.acp_supervisor.idle_observation(&id) else {
             continue;
         };
@@ -395,11 +406,12 @@ mod tests {
                     id,
                     1,
                     &Event::Stopped {
-                        reason: "rate_limited".into(),
+                        reason: "prompt_complete".into(),
                     },
                     stale_ms,
                 )
                 .unwrap();
+            assert!(state.acp_event_store.rate_limit_park(id).is_none());
             let sup = &state.acp_supervisor;
             let (_hold, before) = match worker {
                 Worker::Starting => (Some(sup.test_hold_starting(id)), Resuming),

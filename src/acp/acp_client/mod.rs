@@ -76,7 +76,7 @@ use tracing::Instrument;
 
 use self::commands::{ClientCmd, ConnectMode};
 use self::connection::{run_connection_task, ConnectionParams, ConnectionState, RunnerLink};
-use self::control::{connect_runner_control_v4, wait_runner_registration, ShutdownControlOnDrop};
+use self::control::{connect_runner_control_v5, wait_runner_registration, ShutdownControlOnDrop};
 use self::delete::ACP_SESSION_DELETE_TIMEOUT;
 use self::handshake::wait_for_handshake;
 use self::lifecycle::TerminalClaim;
@@ -328,6 +328,16 @@ impl PendingRunnerConnection {
         if let Some(launch) = self.launch.as_ref() {
             let label = launch.session_id.0.clone();
             let terminal_claim = Arc::new(TerminalClaim::new());
+            if matches!(
+                &launch.mode,
+                ConnectMode::Resume {
+                    unsuccessful_main: true,
+                    in_flight_turn: false,
+                    ..
+                }
+            ) {
+                terminal_claim.claim_failed();
+            }
             let prompt_in_flight = Arc::new(AtomicBool::new(matches!(
                 &launch.mode,
                 ConnectMode::Resume {
@@ -342,7 +352,7 @@ impl PendingRunnerConnection {
                     return Err(AcpError::Spawn("runner construction cancelled".into())),
                 result = async {
                     wait_runner_registration(&label, self.owner, self.newborn, deadline).await?;
-                    let connect = connect_runner_control_v4(&control_path, label.clone(),
+                    let connect = connect_runner_control_v5(&control_path, label.clone(),
                         terminal_claim.clone(), prompt_in_flight.clone(), self.owner);
                     match deadline {
                         Some(end) => tokio::time::timeout_at(end, connect).await
@@ -868,6 +878,7 @@ impl AcpClient {
         additional_dirs: Vec<PathBuf>,
         stored_acp_session_id: String,
         in_flight_turn: bool,
+        unsuccessful_main: bool,
         session_id: AcpSessionId,
         sandbox: Option<(SessionSandbox, SandboxPathMap)>,
         agent_key: String,
@@ -904,6 +915,7 @@ impl AcpClient {
             mode: ConnectMode::Resume {
                 acp_session_id: stored_acp_session_id,
                 in_flight_turn,
+                unsuccessful_main,
             },
             cwd,
             additional_dirs,
@@ -937,6 +949,16 @@ impl AcpClient {
 
     pub(crate) fn connected_runner(&self) -> Option<crate::acp::runner_lifecycle::RunnerIdentity> {
         self.connected_runner
+    }
+
+    pub(crate) fn seal_original_fork_rejection(
+        &self,
+    ) -> Option<Arc<crate::acp::state::NativeForkRejection>> {
+        self.connection_state
+            .fork_response
+            .lock()
+            .expect("fork response custody")
+            .seal()
     }
 
     pub(crate) fn ensure_available(&self) -> Result<(), AcpError> {

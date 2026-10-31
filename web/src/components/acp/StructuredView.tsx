@@ -526,6 +526,8 @@ function ComposerDock({
           authStatus={state.authStatus}
           availableCommands={state.availableCommands}
           connected={status === "open" && nativeInputAvailable(state)}
+          canForceEndTurn={ctx.canForceEndTurn}
+          stopTurn={ctx.stopTurn}
           canSubmit={status === "open" && canSubmitPromptIntent(state)}
           turnActive={state.turnActive}
           enqueuePrompt={ctx.sendPrompt}

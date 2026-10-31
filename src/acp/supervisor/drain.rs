@@ -17,8 +17,8 @@ use super::launch::{
 use super::teardown::{settle_sweeping_if_owed, tear_down_runner, wait_for_exit};
 use super::{
     lock_recover, next_seq, BroadcastSink, Launcher, PendingContextReset, ResumeReservation,
-    SeqMap, SharedSet, Supervisor, SupervisorError, WorkerKind, Workers, MAX_RESPAWNS_IN_WINDOW,
-    RESPAWN_BACKOFF, RESTART_WINDOW,
+    SeqMap, SharedSet, StartupFailure, Supervisor, SupervisorError, WorkerKind, Workers,
+    MAX_RESPAWNS_IN_WINDOW, RESPAWN_BACKOFF, RESTART_WINDOW,
 };
 use crate::acp::acp_client::{AcpError, SpawnConfig};
 use crate::acp::runner_lifecycle::{
@@ -118,7 +118,7 @@ struct Drain<S> {
     process_control: Arc<dyn ProcessControl>,
     launcher: Launcher,
     notify: Arc<tokio::sync::Notify>,
-    startup_failures: SharedSet,
+    startup_failures: Arc<std::sync::Mutex<HashMap<String, StartupFailure>>>,
     pending_context_resets: SharedSet,
     context_reset: Option<PendingContextReset>,
     respawned_in_place: SharedSet,
@@ -128,8 +128,9 @@ struct Drain<S> {
 #[derive(Default)]
 struct StreamEnd {
     agent_unresponsive: bool,
-    rate_limited: bool,
+    startup_rate_limited: bool,
     startup_failed: bool,
+    fork_rejection: Option<Arc<super::fork_rejection::QualifiedForkRejection>>,
     superseded: bool,
 }
 
@@ -176,6 +177,18 @@ impl<S: BroadcastSink> Drain<S> {
             {
                 return;
             }
+            if let Some(receipt) = &end.fork_rejection {
+                let cancellation = lease.cancellation();
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return,
+                    _ = receipt.wait() => {}
+                }
+                if !receipt.committed() {
+                    self.drop_handle(&lease).await;
+                    return;
+                }
+            }
             warn!(
                 target: "acp.supervisor",
                 session = %self.session_id,
@@ -189,16 +202,16 @@ impl<S: BroadcastSink> Drain<S> {
                     .and_then(|(_, identity)| identity);
                 kill_wedged_runner(&*self.process_control, &self.session_id, identity).await;
             }
-            if end.rate_limited {
+            if end.startup_rate_limited && end.fork_rejection.is_none() {
                 info!(
                     target: "acp.supervisor",
                     session = %self.session_id,
-                    "rate-limited; dropping worker handle without respawn"
+                    "startup rate-limited; leaving continuation to the quota governor"
                 );
                 self.drop_handle(&lease).await;
                 return;
             }
-            if end.startup_failed {
+            if end.startup_failed || end.fork_rejection.is_some() {
                 info!(
                     target: "acp.supervisor",
                     session = %self.session_id,
@@ -214,7 +227,10 @@ impl<S: BroadcastSink> Drain<S> {
                     {
                         return;
                     }
-                    lock_recover(&self.startup_failures).insert(self.session_id.clone());
+                    let failure = end
+                        .fork_rejection
+                        .map_or(StartupFailure::Retry, StartupFailure::ForkRejected);
+                    lock_recover(&self.startup_failures).insert(self.session_id.clone(), failure);
                 }
                 self.drop_handle(&lease).await;
                 return;
@@ -409,6 +425,48 @@ impl<S: BroadcastSink> Drain<S> {
         let mut end = StreamEnd::default();
         let mut established = false;
         while let Some(mut event) = inbound.recv().await {
+            if let Event::SessionContextReset {
+                fork_rejection: Some(proof),
+                ..
+            } = &event
+            {
+                let receipt = {
+                    let workers = self.workers.lock().await;
+                    let lifecycle = lock_recover(&self.lifecycle);
+                    let original_custody = workers
+                        .get(&self.session_id)
+                        .filter(|handle| handle.lease == *lease)
+                        .is_some_and(|handle| {
+                            handle.client.connected_runner() == Some(proof.owner)
+                        })
+                        || lease.retirement().retains_original_client(proof.owner)
+                        || lease.retirement().fork_rejection().is_some();
+                    // Existing custody accepts only the very same proof Arc.
+                    if original_custody
+                        && lifecycle.current_lease(&self.session_id).as_ref() == Some(lease)
+                    {
+                        lease.retirement().receive_fork_rejection(lease, proof)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(receipt) = receipt {
+                    #[cfg(test)]
+                    if let Some(observed) = receipt.drain_observer.lock().unwrap().take() {
+                        let _ = observed.send(());
+                    }
+                    end.fork_rejection = Some(receipt.clone());
+                    let lifecycle = self.lifecycle.clone();
+                    let original = lease.clone();
+                    crate::task_util::spawn_supervised(
+                        "acp.fork_rejection_checkpoint",
+                        crate::task_util::PanicPolicy::Log,
+                        async move {
+                            super::fork_rejection::checkpoint(&lifecycle, &original, &receipt).await
+                        },
+                    );
+                }
+            }
             let retiring = self.identity_only || lease.retirement().binding_checkpoint().is_some();
             if retiring {
                 self.context_reset = None;
@@ -425,6 +483,7 @@ impl<S: BroadcastSink> Drain<S> {
                 if let Some(pending) = self.context_reset.take() {
                     let mut reset = Event::SessionContextReset {
                         reason: pending.reason,
+                        fork_rejection: None,
                     };
                     match self.publish_owned(lease, &mut reset).await {
                         OwnedPublication::Published => {}
@@ -438,15 +497,15 @@ impl<S: BroadcastSink> Drain<S> {
                     let assigned = acp_session_id.clone();
                     let generation = lease.epoch();
                     let acknowledged = tokio::task::spawn_blocking(move || {
-                        crate::migrations::v033_isolate_sandbox_content::acknowledge_context_reset(
-                            &pending.profile,
-                            &id,
-                            crate::migrations::v033_isolate_sandbox_content::NativeContextView::Structured,
-                            generation,
-                            &pending.transactions,
-                            Some(&assigned),
-                        )
-                    }).await;
+                    crate::migrations::v033_isolate_sandbox_content::acknowledge_context_reset(
+                        &pending.profile,
+                        &id,
+                        crate::migrations::v033_isolate_sandbox_content::NativeContextView::Structured,
+                        generation,
+                        &pending.transactions,
+                        Some(&assigned),
+                    )
+                }).await;
                     let failure = match acknowledged {
                         Ok(Ok(())) => None,
                         Ok(Err(error)) => Some(error.to_string()),
@@ -499,11 +558,14 @@ impl<S: BroadcastSink> Drain<S> {
                     "agent_unresponsive" | "prompt_orphaned" | "user_forced" => {
                         end.agent_unresponsive = true;
                     }
-                    "rate_limited" => end.rate_limited = true,
+                    "rate_limited" if !established => end.startup_rate_limited = true,
                     _ => {}
                 },
                 Event::AgentStartupError { .. } if !established => end.startup_failed = true,
-                Event::AcpSessionAssigned { .. } => established = true,
+                Event::AcpSessionAssigned { .. } => {
+                    established = true;
+                    end.startup_rate_limited = false;
+                }
                 _ => {}
             }
         }
@@ -729,7 +791,8 @@ impl<S: BroadcastSink> Drain<S> {
                 {
                     return None;
                 }
-                lock_recover(&self.startup_failures).insert(session_id.clone());
+                lock_recover(&self.startup_failures)
+                    .insert(session_id.clone(), StartupFailure::Retry);
             }
             RestartDecision::Gone => return None,
             RestartDecision::Fenced => {
@@ -846,6 +909,19 @@ impl<S: BroadcastSink> Drain<S> {
         };
         config.generation = respawn_lease.epoch();
         config.launch_lease = Some(respawn_lease.clone());
+        if let Err(error) =
+            super::fork_rejection::prepare_fork_seed(&respawn_lease, config.fork_from.as_deref())
+                .await
+        {
+            self.fail_launch(
+                &respawn_lease,
+                previous,
+                &config,
+                AcpError::Spawn(error.to_string()),
+            )
+            .await;
+            return None;
+        }
 
         let cancelled = lock_recover(&self.lifecycle).cancel_requested(&respawn_lease);
         if cancelled.is_some() {
@@ -1455,7 +1531,7 @@ mod tests {
         let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
         *DEFERRED_REGISTRY_OBSERVED.lock().unwrap() = Some(observed_tx);
         let registry = worker_registry::try_registry_lock(id).unwrap().unwrap();
-        runner.exit_owner();
+        runner.exit_peer();
         tokio::time::timeout(Duration::from_secs(5), observed_rx)
             .await
             .unwrap()
@@ -2095,9 +2171,9 @@ mod tests {
             assert_eq!(
                 sup.take_startup_failures(),
                 if expect_rearm {
-                    vec![id.to_string()]
+                    vec![(id.to_string(), super::super::StartupFailure::Retry)]
                 } else {
-                    Vec::<String>::new()
+                    Vec::new()
                 },
                 "{id}: only a registry-backed attached crash re-arms"
             );
@@ -2219,8 +2295,8 @@ mod tests {
 
             assert!(!sup.workers.lock().await.contains_key(id), "{id}");
             assert_eq!(sup.worker_state(id).await, AcpWorkerState::Absent, "{id}");
-            let expected_failures: Vec<String> = if startup_failure {
-                vec![id.to_string()]
+            let expected_failures = if startup_failure {
+                vec![(id.to_string(), super::super::StartupFailure::Retry)]
             } else {
                 Vec::new()
             };
@@ -2299,7 +2375,10 @@ mod tests {
                 .iter()
                 .any(|(_, _, event)| matches!(event, Event::AcpSessionAssigned { .. })));
         }
-        assert_eq!(supervisor.take_startup_failures(), vec![id.to_string()]);
+        assert_eq!(
+            supervisor.take_startup_failures(),
+            vec![(id.to_string(), super::super::StartupFailure::Retry)]
+        );
         assert!(!supervisor.workers.lock().await.contains_key(id));
     }
 

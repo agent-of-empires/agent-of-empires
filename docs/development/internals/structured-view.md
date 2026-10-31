@@ -13,7 +13,7 @@ Each runner registers at `<app_dir>/acp-workers/<session_id>.json` (pid, socket 
 Invariants worth knowing before touching this code:
 
 - **One owner per generation.** Every spawn, attach and respawn has a local lease epoch tied to its captured runner generation. Shutdown, the reaper, the drain task and the reconciler refuse stale authority. A spawn completing after a stop tears its own runner down instead of installing it. Stop remains pending until physical runner and scope retirement is proven, holding prompts and refusing resumes while the reconciler retries.
-- **Compatibility is not liveness.** `runner_version` is 7 and the control wire is v4. The optional registry `control_protocol_version` is a prerequisite, not proof of native usability; missing/null stays Unknown without rewriting old records. Unknown, incompatible or unconfirmed live ownership is refused before adoption, replacement, budget or queue effects. The actual connected Unix peer must match the captured PID and kernel birth before Attach. Compatible v4 workers retain the existing build-staleness replacement policy.
+- **Compatibility is not liveness.** `runner_version` is 7 and the control wire is v5. The optional registry `control_protocol_version` is a prerequisite, not proof of native usability; missing/null stays Unknown without rewriting old records. Unknown, incompatible or unconfirmed live ownership is refused before adoption, replacement, budget or queue effects. The actual connected Unix peer must match the captured PID and kernel birth before Attach. Compatible v5 workers retain the existing build-staleness replacement policy.
 - **Process-group termination.** Runners are group leaders via `setsid`, and every termination path signals the group, so the node wrapper and SDK child die with the runner rather than reparenting to PID 1. Prefer the verbs over `kill -9`, which leaves the runner no chance to clean up.
 - **Self-termination watchdog.** A runner polls its own registry record and exits when abandoned: record gone, superseded, or detached from any daemon past a 48h retention window (reset on reattach). This is the backstop for a daemon that dies without killing its runners.
 - **Detach buffer.** Notifications, retained `PromptCompleted` and the non-sheddable FIFO `NativeLost` observation share a 4096-frame / 128 MiB replay ceiling. Admission charges the actual retained completion wire bytes, prefix included, and reserves the loss frame separately; a large error completion cannot overfill the consumer by refilling notifications. Ordinary notification delivery remains best effort. Reverse calls outstanding at detach are cancelled toward the agent and queued replies are dropped; `terminal/release` remains idempotent cleanup.
@@ -24,6 +24,8 @@ Invariants worth knowing before touching this code:
 - **Exact scope retirement.** Scoped runners persist their exact transient unit alongside PID and generation; unscoped and unresolved ownership are distinct. Explicit stop waits for only the captured unit to stop and become empty before settling. Rejected or timed-out scope retirement keeps its lease and retry debt, even after the leader exits. A SID wildcard never authorizes ACP retirement or recovered purge cleanup.
 - **Callback parity and replay accounting.** Session-scoped filesystem, terminal, and permission callbacks wait for that announcement with either named or positional parameters, while request-scoped elicitation stays independent of session authority. Pending replay charges each original control frame, its four-byte prefix included, against the runner's 4096-frame / 128 MiB budget; typed re-serialization can expand native JSON and is not a substitute.
 - **Mid-turn reattach.** `ResumeSession` adopts the runner's committed session identity and never sends ACP `session/new` or `session/load`. A new local prompt supersedes adoption, and only the matching canonical request id may resolve it; a 30-second resume-idle watchdog is the fallback.
+- **Rejected fork custody.** Only an authenticated, correlated native `session/fork` rejection can consume its captured original fork/import seed. The receipt survives the original child's exit, but its checkpoint still requires the original producer, physical store and full selected binding/route. Local, transport and pre-request failures do not consume it. This metadata receipt grants neither readiness nor fresh-conversation permission.
+  The original control reader freezes its single result before callback backpressure. Retirement seals that custody without waiting for an unreceived response. Its checkpoint cannot acknowledge a separate binding or controller-journal obligation.
 - **Background sub-agents across a restart.** The async-Task tailer (see [Stuck-turn watchdogs](#stuck-turn-watchdogs)) is per connection, so a `BackgroundAgentLaunched` can be left with no completion when its worker dies. The next owner reconciles that: `attach` re-tails every unresolved launch that still carries a transcript path, since the runner it adopted is provably alive; `spawn`, the drain task's respawn, and every terminal drain arm detach unconditionally. `output_file` is persisted for that resume and stripped from every client-facing frame.
 
 ## Owned retirement and idle decisions
@@ -163,7 +165,12 @@ response alone does not prove closure; real transport closure remains fatal.
 | Ordinary adopted runner completion | Preserves the same diagnostic and failed terminal, ordered before a new local turn. Aborted completion is not success. |
 | ACP transport or control closure | Remains a connection failure, including idle EOF and closure after a request error. It is not relabelled as a provider response or automatically retryable evidence. |
 | Rate limit / lifecycle load rejection | Retains its existing distinct parking or `SessionContextReset` path. Error ingestion does not authorize a fresh conversation. |
-| State, Status and clients | Failed completion closes the turn and projects Error independently of the running worker. Transcript, usage and pending approvals/elicitations survive. No implicit prompt replay occurs. |
+| State, Status and clients | Failed completion closes the main turn; surviving background work can still project Running. Transcript, usage and pending approvals/elicitations survive. No implicit prompt replay occurs. |
+
+Main adoption follows actual normal and diff-comment input boundaries, not live
+background work. Canonical failed main outcomes keep terminal inference latched
+through retained attachment, accounting and ambient progress until a genuine main
+input or outcome supersedes them. Background restoration cannot reopen a failed main.
 
 `prompt_failed` never replays the failed request. A distinct already-explicit
 queued intent may follow under the existing governor only while the same current
@@ -297,8 +304,10 @@ exclusion. Producers and native-control admission try the native flock/cache
 without blocking under workers/lifecycle guards. On contention, they release both
 global guards, wait outside them and recheck every current lease/actor/native fence
 before effects or sequence allocation. The original pending event is retained
-exactly once. Read-only current-availability projection is nonblocking and returns
-Unknown rather than creating an inverse publication/native-lock dependency.
+exactly once. Read-only current-availability projection initially returns Unknown
+on contention. Identified contention settles outside those guards, then freshly
+requalifies the exact owner, lease and native scope at the same frontier without
+requiring a new ACP event. Stable Unknown, supersession or loss cannot become Ready.
 The existing attach deadline also bounds the control Hello exchange, not just
 socket connection and runner registration.
 A timeout while observing an attested retained runner releases only the borrowed
@@ -322,6 +331,15 @@ snapshot or covered raw frame cannot overwrite newer authority. Socket-open,
 session IDs, cached views and optimistic rows grant no controls. Disconnect and
 view reopen withdraw authority without discarding the previous diagnostic.
 Only actual current Available enables native mode/config/cancel/responders.
+Graceful Stop obeys that native gate. Explicit local force-end remains available
+after server-confirmed cancellation or an accepted graceful cancel for this
+session/turn. A refused gesture never arms escalation or queues cancellation
+across Unknown.
+Web native admission synchronizes its state and socket-status references together
+in layout. The app's Stop receives the current session/turn callback directly,
+independently of the SDK's passive adapter publication. Retained callbacks keep
+their original identity; they cannot redirect an old gesture to a newer turn.
+
 The runtime-only `prompt_wake_eligible` snapshot field separately represents the
 existing explicit WorkerDown queue/wake and initial-start governor, including ordinary known
 absence, dormancy, snooze and rate-limit parks. It is not native health, generic
@@ -372,6 +390,13 @@ Terminal handoff persists intent before retiring the original runner. It retains
 
 A CLI-resumable handoff preserves the final native conversation and its exact execution/store binding, including newer identity from that recorded execution. Missing custody remains pending rather than launching a fresh conversation. Restore the original native store or explicitly bind a verified target with `aoe session set-session-id SESSION ID --store /absolute/store`. Explicitly clearing the ID with `aoe session set-session-id SESSION ""` authorizes a fresh terminal conversation. Target changes require completed original retirement, no active launch and no live pane; they retain handoff identity and invalidate older generation results. A marker-proven owned dead pane may remain for the ordinary start path to remove. A live, unowned or mismatched pane is retained. Retry disable to adopt an already-live matching pane without another launch.
 
+Enabling Structured view commits its eligible selected load target and replay
+intent before starting the adapter, under the same full conversation/store and
+lifecycle comparison as the view change. Stop during the first load preserves
+that choice. The binding keeps its existing provenance: a durable selection does
+not prove native load success, applied replay or readiness, and does not authorize
+accepting superseded callbacks or an implicit new conversation. This selection
+checkpoint is separate from native-result and replay durability.
 
 The ACP load-session capability belongs to structured runtime state: same-view reloads retain it, while terminal handoff and a later enable clear it rather than resurrecting the previous adapter observation.
 
@@ -483,9 +508,21 @@ Client busy indicators include tasks without changing the main-turn rules for se
 
 ## Rate-limit handling
 
-A backend reporting `errorKind: "rate_limit"` is a clean terminal state, not a crash: the daemon emits `RateLimit` plus `Stopped { reason: "rate_limited" }`, drops the worker handle, and does not respawn into the same limit. The park is durable (the latest `RateLimit` with no prompt, agent switch, or unrelated stop after it) and survives a daemon restart, so a failed resume neither clears the banner nor disarms auto-resume. `RateLimitInfo.resets_at` is filled only from a reset the agent attributed to the window it rejected, and stays `None` otherwise, so no fabricated time reaches the UI.
+A backend reporting `errorKind: "rate_limit"` ends the main turn with `RateLimit`
+and `Stopped { reason: "rate_limited" }`, without discarding a healthy native actor
+or its background work. The durable park holds ambient turn inference, pending
+delivery and idle reaping; observing the same actor through Attach or a Ready
+receipt is not replay consent. Canonical park metadata is independent of worker
+liveness. `RateLimitInfo.resets_at` contains only a reset attributed to the
+rejected window, or `None`, never a fabricated time.
 
 With `[acp] rate_limit_auto_resume`, the reconciler resumes the same worker once `resets_at` plus a 15s grace passes, or, with no reported reset, an hour after the park with the wait doubling per redelivery (1h, 2h, 4h, 8h, 16h). Each resume re-delivers the interrupted prompt once, capped at 5 per streak, after which the session parks on `Stopped { reason: "rate_limit_exhausted_retries" }`. The streak is counted from persisted `RateLimitAutoResumed` breadcrumbs since the last organic turn end or agent switch, kept in a per-session row outside the pruned transcript. Nothing un-parks a session on a timer otherwise: dispatch treats the park like idle dormancy, which is what makes "send a new prompt" true.
+
+Manual retry does not require auto-resume opt-in. Both paths serialize selection,
+breadcrumb and chosen delivery under one submission guard. Newer queued intent
+can supersede the interrupted continuation while preserving queue and attachment
+order. An attested retained owner is reobserved through read-only `ResumeSession`,
+never an Attach-to-Spawn fallback.
 
 ## Crash-loop park
 

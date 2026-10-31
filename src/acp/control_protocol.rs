@@ -1,4 +1,4 @@
-//! Control protocol v4 between `aoe serve` and `aoe __acp-runner`, carried
+//! Control protocol v5 between `aoe serve` and `aoe __acp-runner`, carried
 //! over `<id>.control.sock`.
 
 use anyhow::{bail, Result};
@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current wire generation.
-pub const CONTROL_PROTOCOL_VERSION: u32 = 4;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 5;
 
 /// Maximum NDJSON frame accepted from the ACP agent.
 pub const MAX_AGENT_FRAME_BYTES: usize = 64 * 1024 * 1024;
@@ -29,6 +29,36 @@ pub const MAX_CONTROL_QUEUE_BYTES: usize = 128 * 1024 * 1024;
 pub(crate) const CONTROL_REPLAY_RESERVED_FRAMES: usize = 2;
 pub(super) const MAX_COMPLETION_MARKER_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_NATIVE_LOSS_FRAME_BYTES: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandshakeFailureOrigin {
+    NativeResponse,
+    LocalTransport,
+    LocalResult,
+    LocalState,
+    Unknown,
+}
+
+#[derive(Debug)]
+pub(crate) struct HandshakeFailure {
+    pub origin: HandshakeFailureOrigin,
+    pub error: serde_json::Value,
+}
+
+impl HandshakeFailure {
+    pub(crate) fn new(origin: HandshakeFailureOrigin, error: serde_json::Value) -> Self {
+        Self { origin, error }
+    }
+
+    pub(crate) fn into_frame(self, method: &str) -> ControlBody {
+        ControlBody::HandshakeFailed {
+            method: method.to_owned(),
+            origin: self.origin,
+            error: self.error,
+        }
+    }
+}
 
 /// A local observation by the runner that owns native stdin/stdout.
 /// These causes say nothing about whether the native process is still alive.
@@ -132,7 +162,11 @@ pub enum ControlBody {
     },
     /// The runner-owned handshake failed (agent incompatible, `session/new`
     /// error, transport failure).
-    HandshakeFailed { error: serde_json::Value },
+    HandshakeFailed {
+        method: String,
+        origin: HandshakeFailureOrigin,
+        error: serde_json::Value,
+    },
     /// The runner assigned the canonical JSON-RPC id for this attachment's
     /// [`ControlBody::Prompt`].
     PromptStarted { prompt_req_id: i64 },
@@ -367,6 +401,8 @@ mod tests {
             },
             ControlBody::ResumeSession,
             ControlBody::HandshakeFailed {
+                method: "initialize".into(),
+                origin: HandshakeFailureOrigin::NativeResponse,
                 error: serde_json::json!({"code": -32603, "message": "incompatible"}),
             },
             ControlBody::Prompt {

@@ -27,7 +27,7 @@ use crate::acp::acp_client::config_options::{
     apply_config_default, config_option_failure_event, config_options_event, mode_config_id,
     modes_available_event, thought_level_config_id, ConfigOptionDispatchPurpose, SessionChannels,
 };
-use crate::acp::acp_client::control::{establish_session_v4, DaemonControlClient};
+use crate::acp::acp_client::control::{establish_session_v5, DaemonControlClient};
 use crate::acp::acp_client::errors::{
     acp_internal_error, public_error_message, AcpError, IncompatibleAgentError,
 };
@@ -329,7 +329,7 @@ impl Session {
         method: &str,
         req: Req,
         native_id: fn(&Req::Response) -> SessionId,
-    ) -> Result<Req::Response, agent_client_protocol::Error>
+    ) -> Result<Req::Response, super::super::control::EstablishmentFailure>
     where
         Req: JsonRpcRequest + serde::Serialize,
         Req::Response: serde::de::DeserializeOwned + Send + 'static,
@@ -340,18 +340,17 @@ impl Session {
             ingress.begin()
         };
         match self.control.as_ref() {
-            Some(control) => establish_session_v4(control, method, &req).await,
-            None => {
-                ordered_session_request(
-                    &self.connection,
-                    ingress,
-                    &self.shared.connection_state,
-                    generation,
-                    req,
-                    native_id,
-                )
-                .await
-            }
+            Some(control) => establish_session_v5(control, method, &req).await,
+            None => ordered_session_request(
+                &self.connection,
+                ingress,
+                &self.shared.connection_state,
+                generation,
+                req,
+                native_id,
+            )
+            .await
+            .map_err(Into::into),
         }
     }
 
@@ -377,6 +376,7 @@ impl Session {
                     reason:
                         "Conversation context reset; the agent resumed a different conversation."
                             .to_string(),
+                    fork_rejection: None,
                 })
                 .await;
         }
@@ -403,11 +403,11 @@ impl Session {
                 .await
                 .into_result();
         };
-        let result = establish_session_v4(control, "session/load", &req).await;
+        let result = establish_session_v5(control, "session/load", &req).await;
         if result.is_ok() {
             control.session_replayed().await;
         }
-        result
+        result.map_err(Into::into)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -464,27 +464,57 @@ impl Session {
                     }
                     Ok(new_id)
                 }
-                Err(e) => {
-                    if self.shared.connection_state.loss().is_some() {
-                        return Err(e);
-                    }
+                Err(mut e) => {
+                    let rejection = if e.origin
+                        == crate::acp::control_protocol::HandshakeFailureOrigin::NativeResponse
+                    {
+                        e.fork_rejection.take()
+                    } else {
+                        None
+                    };
                     warn!(
                         target: "acp.protocol",
                         session = %label,
                         parent_acp_id = %parent,
                         "session/fork failed; failing spawn (no session/new fallback): {e}"
                     );
-                    // Clears the one-shot fork marker so reattach does not
-                    // retry the failing fork forever.
-                    self.shared
-                        .emit(Event::SessionContextReset {
-                            reason: format!(
-                                "fork_failed: {}",
-                                super::super::errors::public_error_message(&e)
-                            ),
-                        })
-                        .await;
-                    Err(e)
+                    if let Some(rejection) = rejection {
+                        #[cfg(test)]
+                        {
+                            let gate = self
+                                .shared
+                                .connection_state
+                                .fork_emit_gate
+                                .lock()
+                                .unwrap()
+                                .take();
+                            if let Some((entered, release)) = gate {
+                                let _ = entered.send(());
+                                let _ = release.await;
+                            }
+                        }
+                        self.shared
+                            .emit(Event::SessionContextReset {
+                                reason: format!(
+                                    "fork_failed: {}",
+                                    super::super::errors::public_error_message(&e.error)
+                                ),
+                                fork_rejection: Some(rejection),
+                            })
+                            .await;
+                        #[cfg(test)]
+                        if let Some(emitted) = self
+                            .shared
+                            .connection_state
+                            .fork_emitted
+                            .lock()
+                            .unwrap()
+                            .take()
+                        {
+                            let _ = emitted.send(());
+                        }
+                    }
+                    Err(e.into())
                 }
             };
         }
@@ -497,6 +527,7 @@ impl Session {
             self.shared
                 .emit(Event::SessionContextReset {
                     reason: "fork_unsupported_by_agent".to_string(),
+                    fork_rejection: None,
                 })
                 .await;
         }
@@ -593,7 +624,10 @@ impl Session {
         let id = new_session.session_id.clone();
         if let Some(reason) = context_reset_reason {
             self.shared
-                .emit(Event::SessionContextReset { reason })
+                .emit(Event::SessionContextReset {
+                    reason,
+                    fork_rejection: None,
+                })
                 .await;
         }
         self.shared.commit_session(id.clone(), true).await?;

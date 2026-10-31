@@ -77,6 +77,16 @@ pub(super) struct ConnectionState {
     ordered_loss_wake: tokio::sync::Notify,
     completed_outcomes: std::sync::atomic::AtomicUsize,
     completed_outcomes_wake: tokio::sync::Notify,
+    pub(super) fork_response: std::sync::Mutex<super::control::OriginalForkResponse>,
+    #[cfg(test)]
+    pub(super) fork_emit_gate: std::sync::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+    #[cfg(test)]
+    pub(super) fork_emitted: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl ConnectionState {
@@ -599,6 +609,14 @@ pub(super) async fn run_connection_task<W, R>(
     let connection = builder.connect_with(
         transport,
         move |connection: ConnectionTo<Agent>| async move {
+            let foreground = async move {
+                let session = establish::establish(connection, establish_ctx).await?;
+                match session {
+                    Some(session) => session.run().await,
+                    None => Ok(()),
+                }
+            };
+            tokio::pin!(foreground);
             let mut result = tokio::select! {
                 biased;
                 _ = foreground_shutdown.cancelled() => Ok(()),
@@ -608,19 +626,22 @@ pub(super) async fn run_connection_task<W, R>(
                         AcpConnectionSource::Sdk,
                         AcpConnectionCause::ProtocolEnded,
                     );
-                    // Ingress has already failed closed and discarded its
-                    // pending replay. This locally detected protocol boundary
-                    // cannot wait for SDK close, which waits for this foreground.
+                    // Preserve already received correlated outcomes before
+                    // protocol loss drops their foreground application. This
+                    // never waits for an unresolved native request.
+                    if foreground_state.completed_outcomes.load(Ordering::Acquire) != 0 {
+                        tokio::select! {
+                            biased;
+                            _ = foreground_shutdown.cancelled() => {},
+                            _ = foreground_cancellation.cancelled() => {},
+                            _ = foreground_state.wait_completed_outcomes() => {},
+                            _ = &mut foreground => {},
+                        }
+                    }
                     foreground_state.mark_ordered_loss();
                     Err(error)
                 },
-                result = async move {
-                    let session = establish::establish(connection, establish_ctx).await?;
-                    match session {
-                        Some(session) => session.run().await,
-                        None => Ok(()),
-                    }
-                } => result,
+                result = &mut foreground => result,
             };
             if result.is_err()
                 && !foreground_shutdown.is_cancelled()

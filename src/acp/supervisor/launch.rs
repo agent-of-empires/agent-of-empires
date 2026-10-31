@@ -372,6 +372,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         lease.set_admission(req.launch_admission.clone());
         admit_durable_launch(req.launch_admission.as_ref(), &req.session_id).await?;
         self.consume_resume_stop(&mut reservation).await?;
+        super::fork_rejection::prepare_fork_seed(&lease, req.fork_from.as_deref()).await?;
         let session_id = req.session_id.as_str();
         let warmup_guard = self.warmup_guard(&req.agent).await;
         let (mut config, context_reset) = self.spawn_config(&req, lease.epoch()).await?;
@@ -1195,7 +1196,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
 
         // A cached registry ID is routing metadata, not an establishment receipt.
-        // The v4 runner supplies its genuine current session (or native loss).
+        // The runner supplies its genuine current session (or native loss).
         let stored_acp_session_id = record.stored_acp_session_id.clone().unwrap_or_default();
         let sandbox_resources = match sandbox.as_ref() {
             Some(info) => {
@@ -1259,12 +1260,19 @@ impl<S: BroadcastSink> Supervisor<S> {
         revalidate_attach_record(&record, reservation.registry_deadline).await?;
         self.consume_resume_stop(&mut reservation).await?;
 
+        let sink = Arc::clone(&self.sink);
+        let outcome_id = session_id.clone();
+        let unsuccessful_main =
+            tokio::task::spawn_blocking(move || sink.unsuccessful_main(&outcome_id))
+                .await
+                .map_err(|_| SupervisorError::NativeStoreUnavailable)?;
         let client = AcpClient::attach(
             record.socket_path.clone(),
             cwd,
             additional_dirs,
             stored_acp_session_id,
             in_flight_turn,
+            unsuccessful_main,
             AcpSessionId(session_id.clone()),
             sandbox_resources,
             agent_key,
@@ -3102,6 +3110,7 @@ mod tests {
         session_id: &str,
         output_file: &str,
         open_task: Option<&str>,
+        failed_main: bool,
     ) -> AttachBackgroundAgentFixture {
         use crate::acp::state::BackgroundAgentStatus;
 
@@ -3182,15 +3191,41 @@ mod tests {
                 },
             );
         }
+        if failed_main {
+            for event in [
+                crate::acp::state::test_support::prompt("original failed main"),
+                Event::PromptRuntimeError {
+                    message: "original failed main".into(),
+                    evidence: None,
+                    native_subject: None,
+                },
+                Event::Stopped {
+                    reason: "prompt_failed".into(),
+                },
+            ] {
+                sink.publish(session_id, store.highest_seq(session_id) + 1, &event);
+            }
+        }
 
-        let mut runner = HeldAttachRunner::ready(
-            session_id,
-            tmp.path(),
-            17,
-            open_task.map(|_| "default"),
-            Some("acp-sid"),
-        )
-        .await;
+        let mut runner = if failed_main {
+            HeldAttachRunner::failed_main_replay(
+                session_id,
+                tmp.path(),
+                17,
+                Some("default"),
+                "acp-sid",
+            )
+            .await
+        } else {
+            HeldAttachRunner::ready(
+                session_id,
+                tmp.path(),
+                17,
+                open_task.map(|_| "default"),
+                Some("acp-sid"),
+            )
+            .await
+        };
         runner.record.scope = worker_registry::ScopeOwnership::Unscoped;
         worker_registry::save(&runner.record).unwrap();
 
@@ -3219,6 +3254,105 @@ mod tests {
         .expect("attach must not hang")
         .expect("attach must succeed against the fake runner");
         fixture
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reattached_failed_main_keeps_its_terminal_through_ambient_accounting_and_background_work(
+    ) {
+        let transcript = tempfile::NamedTempFile::new().unwrap();
+        let id = "retained-failed-background";
+        let mut fixture = attach_with_orphaned_background_agent(
+            id,
+            &transcript.path().to_string_lossy(),
+            Some("surviving-task"),
+            true,
+        )
+        .await;
+        let original_owner = fixture._runner.identity;
+        let original_lease = fixture.supervisor.running_lease(id).unwrap();
+        assert_eq!(fixture._runner.resumed_session().await, "acp-sid");
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let frame = fixture.rx.recv().await.unwrap();
+                if matches!(frame.event.as_ref(), Event::AgentStartupError { .. }) {
+                    panic!(
+                        "the retained observer must remain usable: {:?}",
+                        frame.event
+                    );
+                }
+                if matches!(frame.event.as_ref(), Event::UsageUpdated { .. }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("actual ambient accounting reaches the SDK callback");
+        let extra_terminal = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let frame = fixture.rx.recv().await.unwrap();
+                if let Event::Stopped { reason } = frame.event.as_ref() {
+                    return reason.clone();
+                }
+                assert!(!matches!(
+                    frame.event.as_ref(),
+                    Event::AgentStartupError { .. }
+                ));
+            }
+        })
+        .await;
+        assert!(
+            extra_terminal.is_err(),
+            "ambient activity must not manufacture another main terminal: {extra_terminal:?}"
+        );
+        let mut folded = crate::acp::state::AcpState::new(
+            crate::acp::state::AcpSessionId(id.into()),
+            crate::acp::state::AgentName("claude".into()),
+            None,
+        );
+        for (seq, event) in fixture.store.replay_from(id, 0) {
+            folded.apply_event(seq, event).unwrap();
+        }
+        assert_eq!(
+            folded.sidebar_phase,
+            crate::acp::state::SidebarPhase::PromptFailed
+        );
+        assert!(!folded.turn_active && folded.has_active_background_agent());
+        assert_eq!(
+            fixture
+                .store
+                .replay_from(id, 0)
+                .iter()
+                .filter(|(_, event)| matches!(event, Event::Stopped { .. }))
+                .count(),
+            1
+        );
+        fixture
+            .supervisor
+            .publish_user_prompt(id, "next explicit input".into())
+            .await;
+        fixture
+            .supervisor
+            .send_prompt(id, "next explicit input", &[])
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let frame = fixture.rx.recv().await.unwrap();
+                if matches!(frame.event.as_ref(), Event::Stopped { reason } if reason == "prompt_complete") { break; }
+                assert!(!matches!(frame.event.as_ref(), Event::AgentStartupError { .. }));
+            }
+        }).await.expect("the next explicit prompt completes through the same attached actor");
+        assert!(fixture.supervisor.running_lease(id) == Some(original_lease));
+        assert_eq!(
+            RunnerIdentity::from_record(&worker_registry::load(id).unwrap().unwrap()),
+            original_owner
+        );
+        assert!(worker_registry::is_record_live(&fixture._runner.record));
+        let handle = fixture.supervisor.workers.lock().await.remove(id).unwrap();
+        handle.drain_task.abort();
+        handle.client.shutdown().await.unwrap();
+        lock_recover(&fixture.supervisor.lifecycle).release_running(&handle.lease);
     }
 
     async fn await_background_agent_resolved(
@@ -3279,6 +3413,7 @@ mod tests {
             "s-attach-survivor",
             &transcript.path().to_string_lossy(),
             None,
+            false,
         )
         .await;
         let state = await_background_agent_resolved(
@@ -3309,7 +3444,7 @@ mod tests {
         use crate::acp::state::BackgroundAgentStatus;
 
         let mut fixture =
-            attach_with_orphaned_background_agent("s-attach-untrackable", "", None).await;
+            attach_with_orphaned_background_agent("s-attach-untrackable", "", None, false).await;
         let state = await_background_agent_resolved(
             &mut fixture,
             "s-attach-untrackable",
@@ -3332,7 +3467,7 @@ mod tests {
     async fn attach_resumes_tailing_a_background_task_that_ended_during_the_restart() {
         let session_id = "s-attach-task";
         let mut fixture =
-            attach_with_orphaned_background_agent(session_id, "", Some("task-1")).await;
+            attach_with_orphaned_background_agent(session_id, "", Some("task-1"), false).await;
         assert_eq!(
             fixture.store.unresolved_background_task_ids(session_id),
             ["task-1".to_string()],

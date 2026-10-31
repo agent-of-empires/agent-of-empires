@@ -54,7 +54,7 @@ vi.mock("../../../hooks/useAcpSession", () => ({
   useAcpSession: () => ({
     state: { ...emptyAcpState(), activity: session.activity },
     sendPrompt,
-    cancelPrompt: async () => {},
+    cancelPrompt: async () => true,
     forceEndTurn: async () => {},
   }),
 }));

@@ -24,7 +24,7 @@ const TEARDOWN_ORPHAN_GRACE: Duration = Duration::from_secs(15);
 
 type RetiringDrain = Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>;
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct StopFence<'a> {
     observed: Option<&'a Lease>,
     activity_seq: Option<u64>,
@@ -129,6 +129,7 @@ pub(crate) struct RetirementResources {
     binding: std::sync::Mutex<Option<Arc<QualifiedBindingReceipt>>>,
     binding_checkpoint: std::sync::Mutex<Option<NativeBindingCheckpoint>>,
     binding_checkpoint_delegated: std::sync::atomic::AtomicBool,
+    fork: std::sync::Mutex<super::fork_rejection::ForkCustody>,
     emit_events: std::sync::atomic::AtomicBool,
     deferred: std::sync::Mutex<Option<super::DeferredConstruction>>,
     deferred_claimed: std::sync::atomic::AtomicBool,
@@ -145,6 +146,7 @@ impl Default for RetirementResources {
             binding: std::sync::Mutex::new(None),
             binding_checkpoint: std::sync::Mutex::new(None),
             binding_checkpoint_delegated: std::sync::atomic::AtomicBool::new(false),
+            fork: std::sync::Mutex::default(),
             emit_events: std::sync::atomic::AtomicBool::new(true),
             deferred: std::sync::Mutex::new(None),
             deferred_claimed: std::sync::atomic::AtomicBool::new(false),
@@ -265,6 +267,36 @@ impl RetirementResources {
         let mut slot = lock_recover(&self.deferred);
         assert!(slot.is_none(), "one pending construction driver");
         *slot = Some(pending);
+    }
+
+    pub(super) fn prepare_fork_seed(&self, seed: Arc<super::fork_rejection::ForkSeed>) {
+        lock_recover(&self.fork).prepare(seed);
+    }
+
+    pub(super) fn receive_fork_rejection(
+        &self,
+        lease: &Lease,
+        proof: &Arc<crate::acp::state::NativeForkRejection>,
+    ) -> Option<Arc<super::fork_rejection::QualifiedForkRejection>> {
+        lock_recover(&self.fork).receive(lease, proof)
+    }
+
+    pub(super) fn fork_rejection(
+        &self,
+    ) -> Option<Arc<super::fork_rejection::QualifiedForkRejection>> {
+        lock_recover(&self.fork).receipt()
+    }
+
+    pub(super) fn retains_original_client(&self, owner: RunnerIdentity) -> bool {
+        lock_recover(&self.clients)
+            .iter()
+            .flatten()
+            .any(|owned| owned.client.connected_runner() == Some(owner))
+    }
+
+    pub(crate) fn fork_rejection_pending(&self) -> bool {
+        self.fork_rejection()
+            .is_some_and(|receipt| receipt.pending())
     }
 
     /// Prepare under native exclusion; installation follows a committed row.
@@ -407,7 +439,7 @@ pub(super) async fn quiesce_retained_drain(lease: &Lease) {
     settle_retained_drain(lease, true).await;
 }
 
-async fn settle_retained_drain(lease: &Lease, abort: bool) {
+pub(super) async fn settle_retained_drain(lease: &Lease, abort: bool) {
     let drain = lock_recover(&lease.retirement().drain).clone();
     if let Some(drain) = drain {
         let mut slot = drain.lock().await;
@@ -437,6 +469,16 @@ async fn retire_registered_clients_locked(
     service_adapter_delete_debt(lifecycle, lease).await;
     let clients = lock_recover(&lease.retirement().clients).clone();
     for owned in clients.into_iter().flatten() {
+        // Seal only the original reply already received by this authenticated
+        // client. A request or a fork seed alone never creates retirement debt.
+        if let Some(proof) = owned.client.seal_original_fork_rejection() {
+            let table = lock_recover(lifecycle);
+            if table.current_lease(lease.session_id()).as_ref() == Some(lease)
+                && owned.client.connected_runner() == Some(proof.owner)
+            {
+                lease.retirement().receive_fork_rejection(lease, &proof);
+            }
+        }
         if owned.close_requested.load(Ordering::Acquire)
             && !owned.close_done.load(Ordering::Acquire)
         {
@@ -1015,6 +1057,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         expected: Option<&RetirementTarget>,
         fence: StopFence<'_>,
     ) -> Result<(), SupervisorError> {
+        let constructor = lock_recover(&self.lifecycle).current_lease(session_id);
         let record_before = if expected.is_none() {
             worker_registry::load_strict(session_id).map_err(super::launch::registry_error)?
         } else {
@@ -1067,6 +1110,29 @@ impl<S: BroadcastSink> Supervisor<S> {
             notified.as_mut().enable();
             if !still_owned() {
                 break;
+            }
+            if let Some(lease) = constructor
+                .as_ref()
+                .filter(|lease| lease.constructor_finished())
+            {
+                let original = RetirementTarget {
+                    lease: Some(lease.clone()),
+                    identity: lease.spawned_runner(),
+                    scopes: lease.scopes(),
+                    prime: lease.prime(),
+                    journalled: false,
+                };
+                self.shutdown_with_reason(
+                    session_id,
+                    "user_stopped",
+                    delete_adapter_state,
+                    Some(expected.unwrap_or(&original)),
+                    fence,
+                )
+                .await?;
+                if !still_owned() {
+                    break;
+                }
             }
             if tokio::time::timeout_at(deadline, notified).await.is_err() && still_owned() {
                 return Err(SupervisorError::TeardownPending(session_id.into()));
@@ -2012,7 +2078,7 @@ pub(super) struct StopPublication<'a, S> {
 /// Scope retirement precedes Proven; a failed stop preserves cleanup debt and authority.
 pub(super) async fn settle_sweeping_if_owed<S: BroadcastSink>(
     control: &Arc<dyn ProcessControl>,
-    lifecycle: &std::sync::Mutex<LifecycleTable>,
+    lifecycle: &Arc<std::sync::Mutex<LifecycleTable>>,
     notify: &tokio::sync::Notify,
     publication: StopPublication<'_, S>,
     lease: &Lease,
@@ -2039,6 +2105,18 @@ pub(super) async fn settle_sweeping_if_owed<S: BroadcastSink>(
     retire_registered_clients_locked(lifecycle, lease).await;
     if matches!(publisher, CompletionPublisher::JoinDrain) {
         quiesce_retained_drain(lease).await;
+    }
+    if let Some(receipt) = lease
+        .retirement()
+        .fork_rejection()
+        .filter(|receipt| receipt.pending())
+    {
+        let lifecycle = lifecycle.clone();
+        let original = lease.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            super::fork_rejection::try_checkpoint(&lifecycle, &original, &receipt)
+        })
+        .await;
     }
     // Share admission's workers gate; call the sink without the lifecycle mutex.
     let workers_gate = workers.lock().await;
@@ -2112,7 +2190,8 @@ pub(super) async fn settle_sweeping_if_owed<S: BroadcastSink>(
     } else {
         Settlement::Unproven(unproven_runner.or_else(|| lease.spawned_runner()))
     };
-    if lease.retirement().binding_receipt().is_some() {
+    if lease.retirement().binding_receipt().is_some() || lease.retirement().fork_rejection_pending()
+    {
         if !table.retirement_ack_required(lease) {
             lease.retirement().delegate_binding_checkpoint(true);
         }

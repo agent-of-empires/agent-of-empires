@@ -267,6 +267,7 @@ impl Shared {
             }
             PendingIngress::PromptCompleted(adopted) => {
                 if let Some(control) = self.control.as_ref() {
+                    let turn = adopted.turn;
                     if publish_adopted_completion(
                         *adopted,
                         &self.event_tx,
@@ -277,6 +278,8 @@ impl Shared {
                     .await
                     {
                         self.adopted_turn_active.store(false, Ordering::Release);
+                        self.between_prompt
+                            .deactivate_unsuccessful_turn(&self.terminal_claim, turn);
                     }
                 }
             }

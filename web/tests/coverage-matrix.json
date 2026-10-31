@@ -46,6 +46,20 @@
       "notes": "Browser regressions specify socket/history refusal, a current healthy receipt without historical readiness, stale covered raw loss, same-seq healthy/lost/Unknown refreshes, preserved request diagnostics and explicit next-request delivery. A separate current-governor case permits an existing managed queue intent without enabling native model/config controls. Fixtures emit explicit daemon snapshots instead of granting readiness from socket-open; historical context remains visible across authority withdrawal."
     },
     {
+      "id": "acp.native-input-commit",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/hooks/useAcpSession.test.ts", "src/components/acp/__tests__/CommittedStop.test.tsx"],
+      "components": [
+        "web/src/hooks/useAcpSession.ts",
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/components/acp/Composer.tsx",
+        "web/src/components/acp/ComposerControls.tsx",
+        "web/src/components/acp/useCancelEscalation.ts"
+      ],
+      "notes": "Real hooks establish an active prompt and echo, then a Host layout consumes same-frontier Unknown-to-Ready and Ready-to-Unknown snapshots before passive effects; exact cancel HTTP and force-after-acceptance follow the committed authority. A separate real Runtime/Composer/StopButton/installed-SDK consumer clicks once from an outer Profiler after layouts but before SDK passive publication, then verifies that the previous turn callback issues neither cancel nor force against the new turn. Only transport and browser APIs are faked; SDK, admission, reducer and cancellation identities remain real."
+    },
+    {
       "id": "settings.dialog-escape",
       "kind": "mocked-playwright",
       "risk": "high",
@@ -3152,8 +3166,20 @@
       "id": "acp.stop-button-escalation",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/components/acp/__tests__/useCancelEscalation.test.tsx"],
-      "components": ["web/src/components/acp/AcpRuntime.tsx", "web/src/components/acp/useCancelEscalation.ts"]
+      "specs": [
+        "src/components/acp/__tests__/useCancelEscalation.test.tsx",
+        "src/components/acp/Composer.test.tsx",
+        "src/hooks/useAcpSession.test.ts"
+      ],
+      "components": [
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/components/acp/useCancelEscalation.ts",
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/Composer.tsx",
+        "web/src/components/acp/ComposerControls.tsx",
+        "web/src/hooks/useAcpSession.ts"
+      ],
+      "notes": "Graceful Stop requires current native readiness even when managed prompt intent may queue. Server-confirmed cancellation or an accepted current-identity cancel enables explicit local force after readiness withdraws, including server confirmation before the first HTTP response settles. Only unconfirmed pending gestures coalesce. Refusal never arms escalation; distinct committed identities prevent late A-to-B-to-A results or stale callbacks from granting or erasing newer eligibility. Composer tests exercise disabled Unknown, restored Ready, accepted cancellation followed by Unknown, and server-confirmed cancellation while Unknown. The existing live Stop story retains one deliberate click and the native cancelled outcome."
     },
     {
       "id": "acp.spinner-tool-precedence",
@@ -4478,7 +4504,8 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/acp-stories/composer-controls.spec.ts"],
-      "components": ["web/src/components/acp/Composer.tsx", "web/src/components/acp/ToolCards.tsx"]
+      "components": ["web/src/components/acp/Composer.tsx", "web/src/components/acp/ToolCards.tsx"],
+      "notes": "The four-phase cancellation story checks enabled and activates Stop in one browser task, once only; it observes while disabled and never retries an admitted or refused click. Cancellation count, idle, hidden Stop and absent tail output remain required. This story does not certify physical pointer down/up; the other Stop stories retain real pointer clicks."
     },
     {
       "id": "acp.story.composer-queue-follow-up",

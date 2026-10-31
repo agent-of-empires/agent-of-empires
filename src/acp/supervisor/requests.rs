@@ -116,19 +116,9 @@ impl<S: BroadcastSink> Supervisor<S> {
     ) -> Option<crate::acp::state::CurrentNativeAvailability> {
         let workers = self.workers.lock().await;
         let handle = workers.get(session_id)?;
-        let lifecycle = lock_recover(&self.lifecycle);
-        if lifecycle.current_lease(session_id).as_ref() != Some(&handle.lease)
-            || lifecycle.phase(session_id) != WorkerPhase::Running
-        {
-            return None;
-        }
         let scope = handle.lease.native_scope().ok()??;
-        let _native_lifecycle = scope.fence.try_lock_observation_matching(|_| true).ok()??;
         let unavailable = handle.client.connection_unavailable();
         let ready = handle.client.connection_ready();
-        if !ready && unavailable.is_none() {
-            return None;
-        }
         Some(crate::acp::state::CurrentNativeAvailability {
             context: scope.context,
             owner: handle.client.connected_runner(),
@@ -136,7 +126,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             ready,
             client: Arc::clone(&handle.client),
             lifecycle: Arc::clone(&self.lifecycle),
-            epoch: handle.lease.epoch(),
+            lease: handle.lease.clone(),
         })
     }
 

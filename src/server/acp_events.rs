@@ -1350,7 +1350,7 @@ async fn persist_identity_observation(
             .current_native_availability(&id)
             .await
             .filter(|current| {
-                Some(current.epoch) == epoch
+                Some(current.lease.epoch()) == epoch
                     && subject.is_some_and(|subject| {
                         current.context == subject.context && current.owner == subject.owner
                     })
@@ -1866,6 +1866,7 @@ pub(super) fn apply_acp_session_change(
                 return Some(inst.source_profile.clone());
             }
         }
+        AcpSessionChange::Reset(reason) if reason.starts_with("fork_") => return None,
         AcpSessionChange::Reset(reason) => {
             tracing::info!(
                 target: "acp.event_listener",
@@ -1874,11 +1875,6 @@ pub(super) fn apply_acp_session_change(
                 "clearing stored ACP session id after a context reset (session/load or session/fork failure)"
             );
             inst.acp_session_id = None;
-            // A structured fork that failed (or was refused by a resume-only agent) reaches
-            // here via SessionContextReset.
-            if inst.fork_pending.take().is_some() {
-                inst.import_pending = None;
-            }
         }
         AcpSessionChange::Cleared => {
             tracing::info!(
@@ -3150,13 +3146,8 @@ mod tests {
         );
     }
 
-    // A SessionContextReset from a FAILED structured fork must clear the
-    // one-shot fork marker (and its paired import marker) so neither the
-    // reconciler nor the supervisor re-issues the same failing session/fork on
-    // the next reattach. This is the reducer side of the fork-failure retry-loop
-    // fix; the reset carries no new id, so acp_session_id is cleared too.
     #[test]
-    fn reset_clears_fork_pending_and_import_pending() {
+    fn message_only_fork_reset_cannot_consume_original_seed() {
         let mut inst = Instance::new("seed", "/tmp/seed");
         inst.view = crate::session::View::Structured;
         inst.acp_session_id = Some("stale-parent-id".into());
@@ -3170,16 +3161,10 @@ mod tests {
             false,
         );
 
-        assert_eq!(inst.acp_session_id, None, "reset clears the stored id");
-        assert_eq!(
-            inst.fork_pending, None,
-            "a failed fork's one-shot marker must clear so it is not retried"
-        );
-        assert_eq!(
-            inst.import_pending, None,
-            "import_pending is consumed alongside fork_pending on reset"
-        );
-        assert!(profile.is_some(), "the reset must persist");
+        assert_eq!(inst.acp_session_id.as_deref(), Some("stale-parent-id"));
+        assert_eq!(inst.fork_pending.as_deref(), Some("parent-acp-id"));
+        assert_eq!(inst.import_pending, Some(true));
+        assert!(profile.is_none());
     }
 
     // A SessionContextReset from a plain session/load failure (no fork pending)
@@ -3368,6 +3353,7 @@ mod tests {
         use crate::acp::Event;
         let ev = Event::SessionContextReset {
             reason: "session/load failed: bad id".into(),
+            fork_rejection: None,
         };
         assert_eq!(
             derive_acp_session_change(&ev),

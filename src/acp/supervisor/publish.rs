@@ -174,11 +174,16 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: &str,
         resets_at: chrono::DateTime<chrono::Utc>,
         manual: bool,
-    ) -> u64 {
-        self.publish_next(
-            session_id,
-            &Event::RateLimitAutoResumed { resets_at, manual },
-        )
+    ) -> Result<u64, super::SupervisorError> {
+        let seq = next_seq(&self.next_seqs, session_id);
+        self.sink
+            .publish_persisted(
+                session_id,
+                seq,
+                &Event::RateLimitAutoResumed { resets_at, manual },
+            )
+            .then_some(seq)
+            .ok_or(super::SupervisorError::NativeStoreUnavailable)
     }
 
     /// Close a turn that was in flight when the previous daemon died.
@@ -459,7 +464,8 @@ mod tests {
         sup.publish_user_prompt("s-1", "first prompt".into()).await;
         let resets_at = chrono::Utc::now();
         assert_eq!(
-            sup.publish_rate_limit_auto_resumed("s-1", resets_at, false),
+            sup.publish_rate_limit_auto_resumed("s-1", resets_at, false)
+                .unwrap(),
             3
         );
         assert_eq!(
