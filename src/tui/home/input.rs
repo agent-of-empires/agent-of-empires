@@ -4163,7 +4163,7 @@ impl HomeView {
             sort_order: self.sort_order,
             has_search: !self.search_matches.is_empty(),
             project_group_selected: self.project_group_at_cursor().is_some(),
-            live_send,
+            preview_scroll: live_send || (self.selected_is_trashed() && !self.system_health_open),
         }
     }
 

@@ -1570,6 +1570,16 @@ fn retained_tool_lines(
         } else if completion.output.is_empty() {
             lines.extend(styled_output_lines(&completion.text));
         } else {
+            let has_text = completion.output.iter().any(|block| match block {
+                ToolOutputBlock::Text { text }
+                | ToolOutputBlock::Resource {
+                    text: Some(text), ..
+                } => !text.is_empty(),
+                _ => false,
+            });
+            if !has_text && !completion.text.is_empty() {
+                lines.extend(styled_output_lines(&completion.text));
+            }
             lines.extend(styled_output_lines(&summarize_output_blocks(
                 &completion.output,
             )));

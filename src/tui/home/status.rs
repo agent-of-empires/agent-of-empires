@@ -86,6 +86,8 @@ impl HomeView {
         self.system_health_scroll = 0;
         self.diff_view = None;
         self.live_send = None;
+        self.retained_focus = None;
+        self.clear_preview_selection();
         self.request_metrics_refresh();
     }
 

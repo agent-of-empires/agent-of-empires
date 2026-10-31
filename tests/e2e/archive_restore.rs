@@ -680,7 +680,7 @@ fn trash_retained_transcript_is_read_only() {
     require_tmux!();
     let mut h = TuiTestHarness::new("trash_retained");
     h.stop_daemon_on_drop();
-    h.append_config("[session]\nlive_send_on_view_switch = true");
+    h.append_config("[session]\nlive_send_on_view_switch = true\nshow_diagnostics_pane = true");
     let project = h.project_path();
     let mut retained = Instance::new("TrashRetained", project.to_str().unwrap());
     retained.trashed_at = Some(chrono::Utc::now());
@@ -781,6 +781,34 @@ fn trash_retained_transcript_is_read_only() {
             )
             .unwrap();
     }
+    store
+        .record(
+            &id,
+            1020,
+            &Event::ToolCallContent {
+                tool_call_id: "media-tool".into(),
+                content: "MEDIA-RETAINED-TEXT".into(),
+            },
+        )
+        .unwrap();
+    store
+        .record(
+            &id,
+            1021,
+            &Event::ToolCallCompleted {
+                tool_call_id: "media-tool".into(),
+                is_error: false,
+                content: String::new(),
+                output: vec![agent_of_empires::acp::state::ToolOutputBlock::Image {
+                    mime_type: "image/png".into(),
+                    data: None,
+                    uri: None,
+                }],
+                completed_at: chrono::Utc::now(),
+                async_subagent: false,
+            },
+        )
+        .unwrap();
     for seq in [1, 3] {
         store
             .record(
@@ -829,7 +857,37 @@ fn trash_retained_transcript_is_read_only() {
         .unwrap() as u16
         + 1;
     h.send_mouse_click(0, 7, row);
+    h.wait_for("UNFINISHED-OUTPUT-END");
+    h.send_keys("S-PageUp");
+    h.wait_for_absent("UNFINISHED-OUTPUT-END", Duration::from_secs(5));
+    h.assert_screen_contains("Trash · read-only");
+    h.send_keys("S-PageDown");
+    h.wait_for("UNFINISHED-OUTPUT-END");
+    let screen = h.capture_screen();
+    let (y, line) = screen
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains("Earlier"))
+        .unwrap();
+    let x =
+        unicode_width::UnicodeWidthStr::width(&line[..line.find("Earlier").unwrap()]) as u16 + 1;
+    h.send_mouse_click(0, x, y as u16 + 1);
+    h.wait_for_absent("UNFINISHED-OUTPUT-END", Duration::from_secs(5));
+    h.assert_screen_contains("Trash · read-only");
+    h.send_keys("S-PageDown");
+    h.wait_for("UNFINISHED-OUTPUT-END");
     h.send_keys("Enter");
+    h.wait_for("Esc: sessions");
+    let screen = h.capture_screen();
+    let row = screen
+        .lines()
+        .position(|line| line.contains("CPU ") && line.contains("Mem "))
+        .unwrap() as u16
+        + 1;
+    h.send_mouse_click(0, 5, row);
+    h.wait_for("System Health");
+    h.send_keys("Enter");
+    h.wait_for("UNFINISHED-OUTPUT-END");
     h.wait_for("ERROR-OUTPUT-END");
     h.assert_screen_contains("history is incomplete");
     h.assert_screen_contains("Trash · read-only");
@@ -837,21 +895,25 @@ fn trash_retained_transcript_is_read_only() {
     h.wait_for("♥️x");
     h.assert_screen_contains("completion unavailable");
     h.assert_screen_not_contains("superseded unfinished output");
-    let screen = h.capture_screen();
-    let (y, line) = screen
-        .lines()
-        .enumerate()
-        .find(|(_, line)| line.contains("♥️x"))
-        .unwrap();
-    let byte = line.find("♥️x").unwrap();
-    let x = unicode_width::UnicodeWidthStr::width(&line[..byte]) as u16 + 1;
-    h.send_mouse_drag((x, y as u16 + 1), (x + 3, y as u16 + 1));
-    wait_until(Duration::from_secs(5), Duration::from_millis(10), || {
-        let copied = std::fs::read_to_string(&clipboard).unwrap_or_default();
-        (copied == "♥️x")
-            .then_some(())
-            .ok_or_else(|| format!("expected complete grapheme in clipboard, got {copied:?}"))
-    });
+    for marker in ["♥️x", "MEDIA-RETAINED-TEXT"] {
+        h.wait_for(marker);
+        let screen = h.capture_screen();
+        let (y, line) = screen
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains(marker))
+            .unwrap();
+        let x =
+            unicode_width::UnicodeWidthStr::width(&line[..line.find(marker).unwrap()]) as u16 + 1;
+        let width = unicode_width::UnicodeWidthStr::width(marker) as u16;
+        h.send_mouse_drag((x, y as u16 + 1), (x + width, y as u16 + 1));
+        wait_until(Duration::from_secs(5), Duration::from_millis(10), || {
+            let copied = std::fs::read_to_string(&clipboard).unwrap_or_default();
+            (copied == marker)
+                .then_some(())
+                .ok_or_else(|| format!("expected {marker:?} in clipboard, got {copied:?}"))
+        });
+    }
     if std::env::var_os("RECORD_E2E").is_some() {
         let directory = std::path::Path::new("target/e2e-recordings");
         std::fs::create_dir_all(directory).unwrap();

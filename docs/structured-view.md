@@ -155,14 +155,20 @@ regardless of the session's current view or click preference.
 
 ![Read-only Trash inspection with retained ACP history and a text selection](assets/structured-view/trash-readonly.png)
 
-Scroll with the mouse wheel, or press **Enter** to focus the reader and use
+Scroll with the mouse wheel. Without reader focus, use **Earlier/Later** in the
+footer or **Shift+PageUp/PageDown**. Press **Enter** to focus the reader and use
 **Up/Down**, **PageUp/PageDown**, and **Home/End**. Drag over text to copy it.
 **Esc** returns to the session list. Restore and permanent deletion remain
 separate management actions shown in the footer.
 
+Opening **System Health** releases reader keyboard focus. Press **Enter** to
+return to the selected Trash transcript.
+
 Tool arguments, structured changes, and retained text output are shown without
 the active view's preview limits, including successful calls. Scroll and drag to
 copy their full retained text. Media stays represented by descriptive placeholders.
+Text retained before a media-only completion remains readable beside those
+placeholders.
 Unfinished text snapshots remain readable even when their start or completion
 event is unavailable. They are labeled **completion unavailable**, not marked
 successful or stopped. Wrapping and copy preserve painted Unicode graphemes.

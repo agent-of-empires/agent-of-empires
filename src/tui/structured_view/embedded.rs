@@ -616,6 +616,133 @@ mod retained_tests {
         }
     }
 
+    #[test]
+    fn retained_media_completion_preserves_text_fallback() {
+        use crate::acp::state::{Event, ToolOutputBlock};
+        let image = ToolOutputBlock::Image {
+            mime_type: "image/png".into(),
+            data: Some("BINARY-HIDDEN".into()),
+            uri: None,
+        };
+        let resource = |text: Option<&str>| ToolOutputBlock::Resource {
+            uri: "fixture-resource".into(),
+            mime_type: None,
+            text: text.map(str::to_owned),
+            data: Some("BINARY-HIDDEN".into()),
+        };
+        let cases = [
+            (vec![image.clone()], "", "BUFFER-TEXT"),
+            (
+                vec![
+                    image.clone(),
+                    ToolOutputBlock::Text {
+                        text: String::new(),
+                    },
+                ],
+                "",
+                "BUFFER-TEXT",
+            ),
+            (vec![resource(Some(""))], "", "BUFFER-TEXT"),
+            (
+                vec![
+                    resource(None),
+                    ToolOutputBlock::Audio {
+                        mime_type: "audio/wav".into(),
+                        data: Some("BINARY-HIDDEN".into()),
+                    },
+                    ToolOutputBlock::ResourceLink {
+                        uri: "fixture-link".into(),
+                        name: "link".into(),
+                        mime_type: None,
+                    },
+                ],
+                "",
+                "BUFFER-TEXT",
+            ),
+            (vec![image.clone()], "EXPLICIT-TEXT", "EXPLICIT-TEXT"),
+            (
+                vec![
+                    image,
+                    ToolOutputBlock::Text {
+                        text: "FINAL-TEXT".into(),
+                    },
+                ],
+                "FINAL-TEXT",
+                "FINAL-TEXT",
+            ),
+            (vec![resource(Some("RESOURCE-TEXT"))], "", "RESOURCE-TEXT"),
+        ];
+        for (blocks, final_text, expected) in cases {
+            for failed in [false, true] {
+                let inst = crate::session::Instance::new("retained media", "/tmp");
+                let endpoint = DaemonEndpoint::new(
+                    "http://127.0.0.1:1".into(),
+                    None,
+                    crate::acp::client::discovery::Source::Env,
+                );
+                let http = crate::acp::client::HttpClient::new(endpoint.clone()).unwrap();
+                let mut state = StructuredViewState::new(inst.id.clone(), endpoint, http, None);
+                let mut model = crate::acp::transcript::TranscriptModel::new();
+                model.apply_event(
+                    1,
+                    &Event::ToolCallContent {
+                        tool_call_id: "media".into(),
+                        content: "BUFFER-TEXT".into(),
+                    },
+                );
+                model.apply_event(
+                    2,
+                    &Event::ToolCallCompleted {
+                        tool_call_id: "media".into(),
+                        is_error: failed,
+                        content: final_text.into(),
+                        output: blocks.clone(),
+                        completed_at: chrono::Utc::now(),
+                        async_subagent: false,
+                    },
+                );
+                state.transcript.server_rows = model.into_rows();
+                let mut view = RetainedView::new(None, &inst);
+                view.state = Some(state);
+                for width in [32, 80] {
+                    let copied = view.selection_text(width).to_string();
+                    let mut terminal =
+                        ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 20))
+                            .unwrap();
+                    terminal
+                        .draw(|frame| {
+                            view.render(frame, frame.area(), &Theme::default(), 0, true);
+                        })
+                        .unwrap();
+                    let painted: String = terminal
+                        .backend()
+                        .buffer()
+                        .content()
+                        .iter()
+                        .map(|cell| cell.symbol())
+                        .collect();
+                    for text in [&copied, &painted] {
+                        assert_eq!(
+                            text.matches(expected).count(),
+                            1,
+                            "failed={failed}, width={width}: {text}"
+                        );
+                        if expected != "BUFFER-TEXT" {
+                            assert!(!text.contains("BUFFER-TEXT"));
+                        }
+                        assert!(!text.contains("BINARY-HIDDEN"));
+                        if blocks
+                            .iter()
+                            .any(|block| matches!(block, ToolOutputBlock::Image { .. }))
+                        {
+                            assert_eq!(text.matches("[image image/png]").count(), 1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn retained_empty_history_does_not_hide_known_loss() {
         for empty in [false, true] {

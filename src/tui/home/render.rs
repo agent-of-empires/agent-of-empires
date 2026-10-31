@@ -4414,26 +4414,28 @@ impl HomeView {
                 let (click, key) = bound(ActionId::Delete);
                 groups.push((1, click, mk(&key, "Delete permanently")));
             }
-            let (up, down) = if focused {
-                (
+            if !self.system_health_open {
+                let (up, down) = if focused {
                     (
-                        Some(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
-                        "PgUp".into(),
-                    ),
+                        (
+                            Some(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+                            "PgUp".into(),
+                        ),
+                        (
+                            Some(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+                            "PgDn".into(),
+                        ),
+                    )
+                } else {
                     (
-                        Some(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
-                        "PgDn".into(),
-                    ),
-                )
-            } else {
-                (
-                    bound(ActionId::PreviewScrollUp),
-                    bound(ActionId::PreviewScrollDown),
-                )
-            };
-            groups.push((1, up.0, mk(&up.1, "Earlier")));
-            groups.push((1, down.0, mk(&down.1, "Later")));
-            groups.push((2, None, mk("Drag", "Copy")));
+                        bound(ActionId::PreviewScrollUp),
+                        bound(ActionId::PreviewScrollDown),
+                    )
+                };
+                groups.push((1, up.0, mk(&up.1, "Earlier")));
+                groups.push((1, down.0, mk(&down.1, "Later")));
+                groups.push((2, None, mk("Drag", "Copy")));
+            }
         }
 
         let badge_bg = if self.tips_badge_hovered {

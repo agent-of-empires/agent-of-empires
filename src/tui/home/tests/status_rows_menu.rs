@@ -371,6 +371,30 @@ fn system_health_survives_refresh_but_closes_on_selection_change() {
     }
 }
 
+#[test]
+#[serial]
+fn trash_system_health_releases_reader_keyboard() {
+    let mut env = create_test_env_with_sessions(2);
+    let id = env.view.instance_at(0).id.clone();
+    env.view
+        .mutate_instance(&id, |inst| inst.trashed_at = Some(chrono::Utc::now()));
+    env.view.trashed_section_collapsed = false;
+    env.view.rebuild_flat_items();
+    env.view.select_session_by_id(&id);
+    env.view.handle_key(key(KeyCode::Enter), None);
+    assert!(env.view.retained_reader_focused());
+    env.view.diagnostics_area = ratatui::layout::Rect::new(0, 0, 20, 1);
+    assert!(env.view.handle_diagnostics_click(5, 0));
+    assert!(env.view.system_health_open);
+    env.view.handle_key(key(KeyCode::Enter), None);
+    assert!(
+        !env.view.system_health_open,
+        "Enter must return from Health without an extra Escape"
+    );
+    env.view.handle_key(key(KeyCode::Home), None);
+    assert_eq!(env.view.selected_session.as_deref(), Some(id.as_str()));
+}
+
 /// Footer discoverability hints track where each key actually does something.
 /// Archive/Snooze are Attention-only. Fav follows its keybind's own gate
 /// (`Context::FavoritesUsable`): usable in Attention, or in any sort order
