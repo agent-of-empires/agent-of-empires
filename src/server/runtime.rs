@@ -483,7 +483,10 @@ pub(crate) async fn session_mutation_response<T: serde::Serialize>(
     }
     let snapshot = match state.runtime.publish(state).await {
         Ok(snapshot) => snapshot,
-        Err(_) => return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(error) => {
+            tracing::debug!(target: "server.runtime", %error, "runtime publish failed");
+            return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
     };
     let Some(row) = snapshot
         .value
@@ -588,7 +591,8 @@ async fn follow_runtime(mut socket: WebSocket, state: Arc<AppState>, local: Opti
         state.runtime.terminal_wake.notify_one();
     }
     state.runtime.request_publish();
-    if state.runtime.publish(&state).await.is_err() {
+    if let Err(error) = state.runtime.publish(&state).await {
+        tracing::debug!(target: "server.runtime", %error, "runtime publish failed");
         return;
     }
     let Some(initial) = snapshots.borrow_and_update().clone() else {

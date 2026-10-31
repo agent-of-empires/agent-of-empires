@@ -71,6 +71,7 @@ fn structured_success() -> String {
             "acp_can_fork": true,
             "keeps_context": true,
             "clear_aliases": ["/clear"],
+            "compact_aliases": ["/compact"],
             "claude_fullscreen": false,
             "workspace_repos": [{
                 "name": "project",
@@ -251,6 +252,7 @@ async fn daemon_client_http_contract() {
     assert!(session.acp_can_fork);
     assert!(session.keeps_context);
     assert_eq!(session.clear_aliases, ["/clear"]);
+    assert_eq!(session.compact_aliases, ["/compact"]);
     let round_trip = serde_json::to_value(&envelope).unwrap();
     for key in [
         "view",
@@ -262,6 +264,7 @@ async fn daemon_client_http_contract() {
         "acp_can_fork",
         "keeps_context",
         "clear_aliases",
+        "compact_aliases",
     ] {
         assert!(
             round_trip["sessions"][0].get(key).is_some(),

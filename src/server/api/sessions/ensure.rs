@@ -595,13 +595,16 @@ pub async fn kill_terminal(
     )
     .await
     {
-        Ok(cursor) => crate::server::runtime::mutation_response(
-            &cursor,
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({"status": "killed"})),
-            ),
-        ),
+        Ok(cursor) => {
+            tracing::info!(target: "session.lifecycle", session = %id, index, "terminal killed");
+            crate::server::runtime::mutation_response(
+                &cursor,
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({"status": "killed"})),
+                ),
+            )
+        }
         Err(error) => {
             if let Some(response) = lifecycle_rejection(&state, &error) {
                 return response;

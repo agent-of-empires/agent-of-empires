@@ -753,6 +753,16 @@ pub(crate) async fn spawn_structured_session(
 
     match result {
         Ok(Ok((instance, warnings, agent_effort, native, creation_profile, acp_reservation))) => {
+            tracing::info!(
+                target: "session.create",
+                session = %instance.id,
+                title = %instance.title,
+                tool = %instance.tool,
+                view = if instance.is_structured() { "structured" } else { "terminal" },
+                project_path = %instance.project_path,
+                branch = ?instance.worktree_info.as_ref().map(|w| &w.branch),
+                "session created"
+            );
             let native = Arc::new(native);
             let acp_spawn_target = if instance.is_structured() && acp_reservation.is_some() {
                 Some((

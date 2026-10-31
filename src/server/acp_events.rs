@@ -8,9 +8,125 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 
 use super::state::{instance_lock_in, AppState};
+use crate::acp::state::Event;
 use crate::server::{acp_ws, api};
 
 /// Applies live status, unread and session-id observations.
+/// One line per lifecycle frame. Approval lines carry the call id, never the
+/// title: for Bash-style tools the title is the full command.
+/// `Failed` carries the one-shot's last output line, which the one-shot already logged at debug;
+/// the warning names only the outcome so child text never reaches the default level.
+fn log_smart_rename_outcome(
+    session: &str,
+    result: &Result<(), crate::session::smart_rename::SmartRenameError>,
+) {
+    use crate::session::smart_rename::SmartRenameError;
+    match result {
+        Ok(()) => {}
+        Err(SmartRenameError::Skipped(reason)) => {
+            tracing::debug!(target: "smart_rename", session = %session, reason = %reason, "smart rename skipped")
+        }
+        Err(SmartRenameError::TimedOut) => {
+            tracing::warn!(target: "smart_rename", session = %session, "smart rename timed out")
+        }
+        Err(SmartRenameError::Failed(_)) => {
+            tracing::warn!(target: "smart_rename", session = %session, "smart rename failed")
+        }
+    }
+}
+
+fn log_frame(frame: &crate::acp::protocol::AcpBroadcastFrame) {
+    match frame.event.as_ref() {
+        Event::ApprovalRequested { approval } => tracing::info!(
+            target: "acp.event_listener",
+            session = %frame.session_id,
+            call = %approval.tool_call.id,
+            kind = %approval.tool_call.kind,
+            destructive = approval.destructive,
+            nonce = %approval.nonce.0,
+            "approval requested"
+        ),
+        Event::ApprovalResolved { nonce, decision } => tracing::info!(
+            target: "acp.event_listener",
+            session = %frame.session_id,
+            nonce = %nonce.0,
+            ?decision,
+            "approval resolved"
+        ),
+        Event::ElicitationRequested { elicitation } => tracing::info!(
+            target: "acp.event_listener",
+            session = %frame.session_id,
+            nonce = %elicitation.nonce.0,
+            questions = elicitation.questions.len(),
+            "question asked"
+        ),
+        Event::ElicitationResolved { nonce, outcome, .. } => tracing::info!(
+            target: "acp.event_listener",
+            session = %frame.session_id,
+            nonce = %nonce.0,
+            ?outcome,
+            "question answered"
+        ),
+        Event::ConversationCompactionStarted => tracing::info!(
+            target: "acp.event_listener",
+            session = %frame.session_id,
+            "compaction started"
+        ),
+        Event::ConversationCompacted => tracing::info!(
+            target: "acp.event_listener",
+            session = %frame.session_id,
+            "compaction completed"
+        ),
+        Event::ConversationCompactionFailed => tracing::warn!(
+            target: "acp.event_listener",
+            session = %frame.session_id,
+            "compaction failed"
+        ),
+        Event::ConversationCompactionSummary {
+            compaction_id,
+            text,
+        } => tracing::debug!(
+            target: "acp.event_listener",
+            session = %frame.session_id,
+            compaction_id,
+            summary_len = text.len(),
+            "compaction summary recorded"
+        ),
+        Event::PromptRejected { reason, .. } => tracing::warn!(
+            target: "acp.event_listener",
+            session = %frame.session_id,
+            reason,
+            "prompt rejected"
+        ),
+        Event::CancelRequested { escalates_at } => tracing::debug!(
+            target: "acp.event_listener",
+            session = %frame.session_id,
+            escalates_at = %escalates_at,
+            "turn cancel requested"
+        ),
+        Event::ModeSwitchFailed { mode_id, reason } => tracing::warn!(
+            target: "acp.event_listener",
+            session = %frame.session_id,
+            mode_id,
+            reason,
+            "mode switch failed"
+        ),
+        Event::ConfigOptionSwitchFailed {
+            config_id,
+            value,
+            reason,
+        } => tracing::warn!(
+            target: "acp.event_listener",
+            session = %frame.session_id,
+            config_id,
+            value,
+            reason,
+            "config option switch failed"
+        ),
+        _ => {}
+    }
+}
+
 pub(super) async fn acp_event_listener(state: Arc<AppState>) {
     let mut rx = state.acp_events_tx.subscribe();
     loop {
@@ -54,6 +170,8 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                 return;
             }
         };
+
+        log_frame(&frame);
 
         // Detect wake-fire.
         if matches!(
@@ -249,9 +367,9 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                     .runtime
                     .work
                     .spawn("server.acp_event_effect", async move {
-                        let _ = crate::session::smart_rename::try_smart_rename(
+                        let result = crate::session::smart_rename::try_smart_rename(
                             state_for_rename,
-                            session_id,
+                            session_id.clone(),
                             crate::session::smart_rename::SmartRenameInput {
                                 first_user_prompt,
                                 context,
@@ -259,6 +377,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                             false,
                         )
                         .await;
+                        log_smart_rename_outcome(&session_id, &result);
                     });
             } else {
                 // The first prompt must be durable before its turn completes.
@@ -1406,6 +1525,7 @@ mod tests {
                         model: "claude-opus-4-8".into(),
                         output_file: "/tmp/bg-1.output".into(),
                         started_at: chrono::Utc::now(),
+                        workflow: None,
                     },
                     stopped(),
                 ],
@@ -2035,6 +2155,7 @@ mod tests {
                     model: "claude-opus-4-8".into(),
                     output_file: "/tmp/bg-1.output".into(),
                     started_at: chrono::Utc::now(),
+                    workflow: None,
                 },
                 live_frame.clone(),
             ];
@@ -2467,6 +2588,7 @@ mod tests {
             (
                 Event::BackgroundTaskFinished {
                     task_id: "t".into(),
+                    ended_at: None,
                 },
                 Some(Background),
             ),
@@ -2695,6 +2817,7 @@ mod tests {
                     task_id: "task-1".into(),
                     tool_call_id: Some("toolu_1".into()),
                     description: "sleep".into(),
+                    workflow: None,
                 },
             ];
             if !main_running {
@@ -2719,6 +2842,7 @@ mod tests {
                     events.len() as u64 + 1,
                     &crate::acp::Event::BackgroundTaskFinished {
                         task_id: "task-1".into(),
+                        ended_at: None,
                     },
                 )
                 .unwrap();
@@ -2856,5 +2980,71 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
         panic!("{why}");
+    }
+
+    /// A tool title is agent-authored text (Claude's Bash reporter uses the
+    /// full command), so an inline credential must never reach the log.
+    #[test]
+    fn approval_request_log_carries_the_call_id_and_never_the_title() {
+        let frame = AcpBroadcastFrame {
+            session_id: "sess1".into(),
+            seq: 1,
+            event: Arc::new(crate::acp::Event::ApprovalRequested {
+                approval: crate::acp::approvals::Approval {
+                    nonce: crate::acp::approvals::Nonce("n1".into()),
+                    tool_call: crate::acp::state::ToolCall {
+                        id: "call-7".into(),
+                        name: "curl -H 'Authorization: Bearer SECRET_SENTINEL_9f3'".into(),
+                        kind: "execute".into(),
+                        args_preview: String::new(),
+                        started_at: chrono::Utc::now(),
+                        parent_tool_call_id: None,
+                        memory_recall: None,
+                        diffs: Vec::new(),
+                    },
+                    destructive: false,
+                    options: Vec::new(),
+                    choice: false,
+                    plan: None,
+                    requested_at: chrono::Utc::now(),
+                    resolved: None,
+                },
+            }),
+            worker_generation: None,
+            sidebar_status: None,
+        };
+        let out = test_support::capture_log(|| log_frame(&frame));
+        assert!(out.contains("approval requested"), "{out}");
+        assert!(out.contains("call=call-7"), "{out}");
+        assert!(out.contains("kind=execute"), "{out}");
+        assert!(!out.contains("SECRET_SENTINEL_9f3"), "{out}");
+    }
+
+    /// A failed one-shot's message is its last stderr/stdout line, which can echo
+    /// prompt text or credentials; the warning must name the outcome only.
+    #[test]
+    fn smart_rename_failure_log_never_carries_child_output() {
+        use crate::session::smart_rename::SmartRenameError;
+        let cases = [
+            (
+                Err(SmartRenameError::Failed(
+                    "`claude` failed: token=SECRET_SENTINEL_c41".into(),
+                )),
+                "smart rename failed",
+            ),
+            (Err(SmartRenameError::TimedOut), "smart rename timed out"),
+            (
+                Err(SmartRenameError::Skipped("Session not found".into())),
+                "smart rename skipped",
+            ),
+        ];
+        for (result, expected) in cases {
+            let out = test_support::capture_log(|| log_smart_rename_outcome("sess1", &result));
+            assert!(out.contains(expected), "{out}");
+            assert!(out.contains("session=sess1"), "{out}");
+            assert!(!out.contains("SECRET_SENTINEL_c41"), "{out}");
+        }
+        let out = test_support::capture_log(|| log_smart_rename_outcome("sess1", &Ok(())));
+        assert!(out.is_empty(), "{out}");
     }
 }
