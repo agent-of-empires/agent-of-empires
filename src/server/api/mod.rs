@@ -20,6 +20,8 @@ mod sandbox_image;
 pub(crate) mod sessions;
 mod skills;
 mod suggestions;
+#[cfg(test)]
+mod suggestions_tests;
 pub(crate) mod system;
 mod telemetry;
 
