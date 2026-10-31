@@ -119,22 +119,41 @@ fn resolve_host_creation(
     }
     if !original_repos.is_empty() {
         original_repos.extend(body.extra_repo_paths.iter().map(std::path::PathBuf::from));
-        let pairs: Vec<_> = std::mem::take(&mut body.repo_bases)
+        let mut pairs: Vec<_> = std::mem::take(&mut body.repo_bases)
             .into_iter()
             .map(|pair| (pair.repo, pair.base_branch))
             .collect();
+        let mono_repo = body.extra_repo_paths.is_empty();
+        if mono_repo {
+            let main = crate::git::GitWorktree::find_main_repo(std::path::Path::new(&body.path))?
+                .canonicalize()
+                .context("Failed to resolve the principal repository on the Daemon host")?;
+            let alias = &original_repos[0];
+            for (selector, _) in &mut pairs {
+                let selected = selector.trim();
+                if alias.as_os_str() == selected
+                    || alias
+                        .file_name()
+                        .is_some_and(|name| name == std::ffi::OsStr::new(selected))
+                {
+                    *selector = main.to_string_lossy().into_owned();
+                }
+            }
+            original_repos[0] = main;
+        }
         body.repo_bases =
             crate::session::builder::resolve_repo_base_selectors(&original_repos, &pairs)?
                 .into_iter()
                 .map(|(path, base_branch)| {
+                    let path = if mono_repo {
+                        path
+                    } else {
+                        path.canonicalize().context(
+                            "Failed to resolve a repository base selector on the Daemon host",
+                        )?
+                    };
                     Ok(crate::daemon::RepoBaseInput {
-                        repo: path
-                            .canonicalize()
-                            .context(
-                                "Failed to resolve a repository base selector on the Daemon host",
-                            )?
-                            .to_string_lossy()
-                            .into_owned(),
+                        repo: path.to_string_lossy().into_owned(),
                         base_branch,
                     })
                 })

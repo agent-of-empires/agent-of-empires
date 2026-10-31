@@ -1802,8 +1802,8 @@ struct GatedCli {
 
 impl Drop for GatedCli {
     fn drop(&mut self) {
+        let _ = std::fs::write(&self.release, "release");
         if let Some(child) = self.child.as_mut() {
-            let _ = std::fs::write(&self.release, "release");
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -2027,5 +2027,168 @@ fn cli_repo_base_uses_original_symlink_names_without_hiding_ambiguity() {
     assert!(git2::Repository::open(&other)
         .unwrap()
         .find_branch("ambiguous", git2::BranchType::Local)
+        .is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[parallel]
+fn cli_review_boundary_sigint_during_launch_preserves_the_created_session() {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+    require_tmux!();
+    let h = TuiTestHarness::new("cli_interrupt_launch");
+    let created = h.home_path().join("create-count");
+    let entered = h.home_path().join("launch-entered");
+    let release = h.home_path().join("launch-release");
+    let finished = h.home_path().join("launch-finished");
+    let agent = h.home_path().join("held-agent");
+    write_executable(&agent, "#!/bin/sh\nexec sleep 600\n");
+    h.append_config(&format!(
+        "[session]\ndefault_tool = \"held-agent\"\ncustom_agents = {{ held-agent = {} }}",
+        serde_json::to_string(agent.to_str().unwrap()).unwrap()
+    ));
+    let project = h.project_path();
+    std::fs::create_dir(project.join(".agent-of-empires")).unwrap();
+    std::fs::write(
+        project.join(".agent-of-empires/config.toml"),
+        format!(
+            "[hooks]\non_create = [{}]\non_launch = [{}]",
+            serde_json::to_string(&format!(
+                "printf x >> {}",
+                shell_words::quote(created.to_str().unwrap())
+            ))
+            .unwrap(),
+            serde_json::to_string(&format!(
+                "printf x >> {}; while [ ! -e {} ]; do sleep .02; done; printf x >> {}",
+                shell_words::quote(entered.to_str().unwrap()),
+                shell_words::quote(release.to_str().unwrap()),
+                shell_words::quote(finished.to_str().unwrap())
+            ))
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    let mut pending = GatedCli {
+        child: Some(h.spawn_cli(&[
+            "add",
+            project.to_str().unwrap(),
+            "-t",
+            "interrupted-launch",
+            "--trust-hooks",
+            "--launch",
+        ])),
+        release,
+    };
+    wait_until(Duration::from_secs(20), Duration::from_millis(20), || {
+        entered
+            .exists()
+            .then_some(())
+            .ok_or_else(|| "launch hook not entered".to_owned())
+    });
+    let pid = pending.child.as_ref().unwrap().id();
+    wait_until(Duration::from_secs(5), Duration::from_millis(20), || {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        let caught = status
+            .lines()
+            .find_map(|line| line.strip_prefix("SigCgt:"))
+            .unwrap();
+        let mask = u64::from_str_radix(caught.trim(), 16).unwrap();
+        (mask & (1 << (libc::SIGINT - 1)) != 0)
+            .then_some(())
+            .ok_or_else(|| "SIGINT handler not installed".to_owned())
+    });
+    kill(Pid::from_raw(i32::try_from(pid).unwrap()), Signal::SIGINT).unwrap();
+    wait_until(Duration::from_secs(3), Duration::from_millis(20), || {
+        pending
+            .child
+            .as_mut()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .ok_or_else(|| "CLI ignored SIGINT while launch remained blocked".to_owned())
+    });
+    let output = pending.child.take().unwrap().wait_with_output().unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let rows = h.read_sessions();
+    let row = crate::harness::session_by_title(&rows, "interrupted-launch");
+    assert!(String::from_utf8_lossy(&output.stderr).contains(row["id"].as_str().unwrap()));
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+    assert_eq!(std::fs::read_to_string(&created).unwrap(), "x");
+    assert_eq!(std::fs::read_to_string(&entered).unwrap(), "x");
+    h.run_cli_ok(&["serve", "--status"]);
+    std::fs::write(&pending.release, "release").unwrap();
+    wait_until(Duration::from_secs(10), Duration::from_millis(20), || {
+        finished
+            .exists()
+            .then_some(())
+            .ok_or_else(|| "launch hook did not finish".to_owned())
+    });
+    assert_eq!(std::fs::read_to_string(created).unwrap(), "x");
+    assert_eq!(std::fs::read_to_string(entered).unwrap(), "x");
+}
+
+#[test]
+#[parallel]
+fn cli_review_boundary_repo_base_from_a_linked_worktree() {
+    let h = TuiTestHarness::new("cli_linked_repo_base");
+    let primary = h.home_path().join("principal");
+    init_git_repo(&primary);
+    let repo = git2::Repository::open(&primary).unwrap();
+    let parent = repo.head().unwrap().peel_to_commit().unwrap();
+    let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+    let expected = repo
+        .commit(
+            Some("refs/heads/develop"),
+            &signature,
+            &signature,
+            "develop",
+            &parent.tree().unwrap(),
+            &[&parent],
+        )
+        .unwrap();
+    let linked = h.home_path().join("old-worktree");
+    repo.worktree("old-worktree", &linked, None).unwrap();
+    let selectors = [
+        "principal".to_owned(),
+        primary.to_str().unwrap().to_owned(),
+        "old-worktree".to_owned(),
+        linked.to_str().unwrap().to_owned(),
+    ];
+    for (index, selector) in selectors.iter().enumerate() {
+        let title = format!("linked-base-{index}");
+        let branch = format!("from-linked-{index}");
+        h.add_session(&[
+            linked.to_str().unwrap(),
+            "-t",
+            &title,
+            "-w",
+            &branch,
+            "-b",
+            "--repo-base",
+            &format!("{selector}=develop"),
+        ]);
+        let rows = h.read_sessions();
+        let row = crate::harness::session_by_title(&rows, &title);
+        let checkout = git2::Repository::open(row["project_path"].as_str().unwrap()).unwrap();
+        assert_eq!(checkout.head().unwrap().target(), Some(expected));
+    }
+    let before = h.read_sessions();
+    h.run_cli_err(&[
+        "add",
+        linked.to_str().unwrap(),
+        "-t",
+        "duplicate-base",
+        "-w",
+        "duplicate-base",
+        "-b",
+        "--repo-base",
+        "principal=develop",
+        "--repo-base",
+        "old-worktree=develop",
+    ]);
+    assert_eq!(h.read_sessions(), before);
+    assert!(repo
+        .find_branch("duplicate-base", git2::BranchType::Local)
         .is_err());
 }

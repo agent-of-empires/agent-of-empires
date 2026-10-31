@@ -6,8 +6,10 @@ use crate::daemon::{
 };
 use anyhow::{bail, Context, Result};
 use clap::Args;
+use std::future::Future;
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::pin::Pin;
 
 fn parse_repo_base(raw: &str) -> Result<(String, String), String> {
     let (repo, branch) = raw
@@ -376,7 +378,9 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             worktree_path_id: review.worktree_path_id,
         }),
     };
-    let row = create_and_observe(&client, &body, &epoch, &key).await?;
+    let signal = tokio::signal::ctrl_c();
+    tokio::pin!(signal);
+    let row = create_and_observe(&client, &body, &epoch, &key, signal.as_mut()).await?;
     for warning in &row.warnings {
         eprintln!("Warning: {warning}");
     }
@@ -411,12 +415,18 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         }
     }
     let launch = if args.launch && row.view == crate::session::View::Terminal {
-        Some(client.ensure_agent(&row.id, &crate::daemon::StartSessionBody {
-            size: crate::terminal::get_size().and_then(|(cols, rows)| Some(crate::daemon::TerminalSize {
-                cols: std::num::NonZeroU16::new(cols)?,
-                rows: std::num::NonZeroU16::new(rows)?,
-            })),
-        }, &epoch).await.with_context(|| format!(
+        let request = crate::daemon::StartSessionBody {
+            size: crate::terminal::get_size().and_then(|(cols, rows)| {
+                Some(crate::daemon::TerminalSize {
+                    cols: std::num::NonZeroU16::new(cols)?,
+                    rows: std::num::NonZeroU16::new(rows)?,
+                })
+            }),
+        };
+        Some(await_launch(
+            async { Ok(client.ensure_agent(&row.id, &request, &epoch).await?) },
+            signal.as_mut(),
+        ).await.with_context(|| format!(
             "Session {} was created, but launch was not confirmed; inspect it before retrying", row.id
         ))?)
     } else {
@@ -548,16 +558,30 @@ fn explicit_hook_env(entries: &[String]) -> Vec<String> {
         .collect()
 }
 
+async fn await_launch<T>(
+    launch: impl Future<Output = Result<T>>,
+    signal: Pin<&mut impl Future<Output = std::io::Result<()>>>,
+) -> Result<T> {
+    // A queued interrupt must prevent submitting the next lifecycle mutation.
+    tokio::select! {
+        biased;
+        result = signal => {
+            result.context("Failed to listen for launch interruption")?;
+            bail!("Launch interrupted");
+        }
+        result = launch => result,
+    }
+}
+
 async fn create_and_observe(
     client: &DaemonClient,
     body: &CreateSessionBody,
     epoch: &str,
     key: &str,
+    mut signal: Pin<&mut impl Future<Output = std::io::Result<()>>>,
 ) -> Result<SessionResponse> {
     let create = client.create_session(body, epoch);
     tokio::pin!(create);
-    let signal = tokio::signal::ctrl_c();
-    tokio::pin!(signal);
     let (state, changes) = tokio::sync::watch::channel((false, false));
     let observation = observe_creation(client, body, epoch, key, changes);
     tokio::pin!(observation);
@@ -673,6 +697,29 @@ fn definitive(error: &DaemonClientError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn queued_interruption_does_not_submit_launch() {
+        let submitted = std::cell::Cell::new(false);
+        let (interrupt, received) = tokio::sync::oneshot::channel();
+        let signal = async move {
+            received.await.unwrap();
+            Ok(())
+        };
+        tokio::pin!(signal);
+        assert!(futures_util::poll!(signal.as_mut()).is_pending());
+        interrupt.send(()).unwrap();
+        let result = await_launch(
+            async {
+                submitted.set(true);
+                Ok(())
+            },
+            signal.as_mut(),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(!submitted.get());
+    }
 
     #[test]
     fn reconciliation_excludes_launch_and_rollback_in_progress() {

@@ -407,9 +407,13 @@ allows up to 30 minutes for creation and launch, including host hooks. Requests 
 `cli` keep the existing lifecycle. `GET /api/runtime` advertises `cli_creation: true`;
 clients must require it before sending CLI intent to avoid an older Daemon ignoring it.
 Concurrent CLI requests with the same title and working directory cannot create duplicates.
+Interrupting the CLI while launch is pending leaves the created session intact;
+inspect Daemon state before retrying launch.
 
 CLI forks use the latest durable parent binding, including a completed
 `aoe session set-session-id`, without waiting for the filesystem watcher.
+For a single repository, base selectors accept its principal identity and the
+input worktree's path or name. Both aliases target the same repository.
 
 With CLI intent, `extra_args` uses shell-style word grouping, then each argument
 is quoted for literal delivery. Quotes group text; shell operators and substitutions
