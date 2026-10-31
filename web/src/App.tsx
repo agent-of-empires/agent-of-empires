@@ -2758,6 +2758,15 @@ function AppContent({
                 onPluginSortChange={setPluginSortRef}
                 axis={sidebarAxis}
                 onAxisChange={setSidebarAxis}
+                suggestions={{
+                  onPrepare: (prefill) => {
+                    setWizardPrefill(prefill);
+                    setShowSessionWizard(true);
+                  },
+                  onStarted: handleSuggestionStarted,
+                  onViewAll: () => requestNavigate("/suggestions"),
+                  onOpenSession: (id) => requestNavigate(`/session/${encodeURIComponent(id)}`),
+                }}
               />
             )}
 

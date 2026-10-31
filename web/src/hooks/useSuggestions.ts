@@ -9,6 +9,7 @@ import {
   type SuggestionResult,
 } from "../lib/api";
 import { useServerDown } from "../lib/connectionState";
+import { onSuggestionsChanged } from "../lib/suggestionEvents";
 import {
   newIdempotencyKey,
   peekPendingCreate,
@@ -84,6 +85,8 @@ export function useSuggestions(
       mounted.current = false;
     };
   }, [load]);
+
+  useEffect(() => onSuggestionsChanged(() => void load()), [load]);
 
   // A fetch that failed while disconnected is retried on reconnect.
   useEffect(() => {
