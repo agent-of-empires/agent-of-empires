@@ -1510,7 +1510,7 @@ mod tests {
             tool: "session-helper".into(),
             command: Some("x\u{202e}tail".into()),
         };
-        let disclosed = disclosure_integrations(&[raw.clone()]);
+        let disclosed = disclosure_integrations(std::slice::from_ref(&raw));
         // The consent that the CLI/TUI/web serialize carries the escaped form.
         assert_eq!(disclosed[0].command.as_deref(), Some("x\\u{202e}tail"));
         // The manifest / launch command stays raw.
