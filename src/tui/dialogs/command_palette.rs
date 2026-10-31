@@ -61,6 +61,8 @@ pub enum PaletteAction {
     /// Move the cursor to a position in `flat_items`.
     JumpToCursor(usize),
     ToolSession(String),
+    /// Open this http(s) link in the browser.
+    OpenLink(String),
     /// The query matched an Age of Empires cheat code; toast its message.
     Cheat(String),
 }
