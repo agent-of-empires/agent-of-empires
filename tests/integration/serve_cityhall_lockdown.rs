@@ -416,6 +416,7 @@ async fn suggestion_reads_stay_reachable_in_cityhall() {
             .await
             .unwrap();
         let status = resp.status();
+        assert_ne!(status, StatusCode::FORBIDDEN, "{uri}");
         let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
             .await
             .unwrap();

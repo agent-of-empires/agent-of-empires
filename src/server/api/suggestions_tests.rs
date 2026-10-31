@@ -230,7 +230,7 @@ async fn dismiss_and_undismiss() {
             "{uri}"
         );
         let (status, _, _) = f.call(Method::POST, uri, json!({ "id": "a" })).await;
-        assert!(status.is_client_error(), "{uri}: {status}");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{uri}");
     }
 }
 
@@ -367,6 +367,19 @@ async fn templates_round_trip_and_validation() {
         (StatusCode::BAD_REQUEST, "validation_failed")
     );
 
+    let (status, code, _) = f
+        .call(
+            Method::PUT,
+            "/api/suggestions/templates",
+            json!({ "provider_id": PROVIDER, "criterion": "assigned",
+                    "template": "x".repeat(65 * 1024) }),
+        )
+        .await;
+    assert_eq!(
+        (status, code.as_str()),
+        (StatusCode::BAD_REQUEST, "validation_failed")
+    );
+
     for _ in 0..2 {
         let (status, _, body) = f
             .call(Method::DELETE, "/api/suggestions/templates", key.clone())
@@ -478,6 +491,16 @@ async fn mappings_validate_list_and_delete_by_query() {
             StatusCode::BAD_REQUEST,
             "validation_failed",
         ),
+        (
+            put(PROVIDER, "acme/web", json!(vec![repo.clone(); 17])),
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+        ),
+        (
+            put(PROVIDER, "acme/web", json!([repo, repo])),
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+        ),
     ] {
         let (got, got_code, _) = f
             .call(Method::PUT, "/api/suggestions/mappings", body.clone())
@@ -553,7 +576,7 @@ async fn mappings_validate_list_and_delete_by_query() {
             Value::Null,
         )
         .await;
-    assert!(status.is_client_error(), "{status}");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     let (_, _, listed) = f
         .call(Method::GET, "/api/suggestions/mappings", Value::Null)
         .await;
