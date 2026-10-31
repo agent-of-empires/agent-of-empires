@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import type { SessionResponse } from "../lib/types";
 import { getStatusTextClass, isSessionActive } from "../lib/session";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
@@ -6,6 +6,7 @@ import { useIsWideViewport } from "../hooks/useIsWideViewport";
 import { AOE_BRAND_MARK_COLORS, AOE_BRAND_MARK_TEXT_SHADOW } from "../lib/brandMark";
 import { TOUR_ANCHORS, type TourAnchorId } from "../lib/tourSteps";
 import { DashboardSuggestions } from "./DashboardSuggestions";
+import { SuggestionsSetupHint } from "./SuggestionsSetupHint";
 import type { WizardPrefill } from "./session-wizard/SessionWizard";
 import { PluginCards, PluginHomePanes } from "./plugin/PluginSlots";
 import { StatusGlyph } from "./StatusGlyph";
@@ -25,6 +26,10 @@ interface Props {
   onPrepareSuggestion?: (prefill: WizardPrefill) => void;
   onSuggestionStarted?: (session: SessionResponse) => void;
   onViewAllSuggestions?: () => void;
+  /** The onboarding tour is running; the first-run hint stays out of it. */
+  tourActive?: boolean;
+  /** Opens Settings > Plugins > Marketplace filtered to Suggestions; the first-run hint shows only when set. */
+  onOpenSuggestionsMarketplace?: () => void;
 }
 
 export function Dashboard({
@@ -38,7 +43,11 @@ export function Dashboard({
   onPrepareSuggestion,
   onSuggestionStarted,
   onViewAllSuggestions,
+  onOpenSuggestionsMarketplace,
+  tourActive = false,
 }: Props) {
+  // Bumped when the setup sheet finishes so the Suggested section refetches.
+  const [suggestionsEpoch, setSuggestionsEpoch] = useState(0);
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const isWideViewport = useIsWideViewport();
   const stats = useMemo(() => {
@@ -151,6 +160,7 @@ export function Dashboard({
 
       {onPrepareSuggestion && onViewAllSuggestions && (
         <DashboardSuggestions
+          key={suggestionsEpoch}
           readOnly={readOnly}
           onPrepare={onPrepareSuggestion}
           onStarted={onSuggestionStarted}
@@ -246,6 +256,13 @@ export function Dashboard({
             icon="book"
           />
         </div>
+      )}
+
+      {!readOnly && canManageProjects && !tourActive && onOpenSuggestionsMarketplace && (
+        <SuggestionsSetupHint
+          onOpenMarketplace={onOpenSuggestionsMarketplace}
+          onFinished={() => setSuggestionsEpoch((n) => n + 1)}
+        />
       )}
 
       {/* Plugin-contributed dashboard cards (#2366). Renders nothing (and adds

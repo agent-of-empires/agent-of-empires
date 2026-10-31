@@ -562,6 +562,15 @@ export interface SuggestionSource {
   variables: string[];
 }
 
+/** One setup check a provider reports. `detail` and `fix` are provider text and untrusted. */
+export interface SuggestionSetupCheck {
+  id: string;
+  label: string;
+  status: "ok" | "warn" | "fail";
+  detail: string;
+  fix: string;
+}
+
 export interface SuggestionProvider {
   id: string;
   name: string;
@@ -571,6 +580,7 @@ export interface SuggestionProvider {
   /** Unix seconds of the last report; absent before the first one. */
   updated_at?: number;
   sources: SuggestionSource[];
+  checks?: SuggestionSetupCheck[];
 }
 
 export interface SuggestionPrefs {
