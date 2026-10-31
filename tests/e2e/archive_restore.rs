@@ -674,7 +674,10 @@ fn test_archived_waiting_row_reads_idle_and_migrates_once() {
 fn trash_retained_transcript_is_read_only() {
     use crate::harness::{app_dir_in, wait_until};
     use agent_of_empires::{
-        acp::{event_store::EventStore, state::Event},
+        acp::{
+            event_store::EventStore,
+            state::{Event, ToolCall},
+        },
         session::{Instance, Status},
     };
     require_tmux!();
@@ -705,6 +708,24 @@ fn trash_retained_transcript_is_read_only() {
             1,
             &Event::AvailableCommandsUpdated {
                 commands: Vec::new(),
+            },
+        )
+        .unwrap();
+    store
+        .record(
+            &id,
+            8,
+            &Event::ToolCallStarted {
+                tool_call: ToolCall {
+                    id: "unfinished-tool".into(),
+                    name: "RetainedPendingTool".into(),
+                    kind: "execute".into(),
+                    args_preview: "{}".into(),
+                    started_at: chrono::Utc::now(),
+                    parent_tool_call_id: None,
+                    memory_recall: None,
+                    diffs: Vec::new(),
+                },
             },
         )
         .unwrap();
@@ -925,6 +946,103 @@ fn trash_retained_transcript_is_read_only() {
         std::fs::write(directory.join("trash-unfinished.txt"), h.capture_screen()).unwrap();
     }
     let before = h.read_sessions();
+    let events = EventStore::open(&app_dir.join("acp_events.db"), 0).unwrap();
+    events
+        .record(
+            &id,
+            1022,
+            &Event::AgentMessageChunk {
+                text: "LATE-RETAINED-OUTPUT\n\n".into(),
+                message_id: Some("late".into()),
+            },
+        )
+        .unwrap();
+    drop(events);
+    h.wait_for("LATE-RETAINED-OUTPUT");
+    h.assert_screen_contains("Esc: sessions");
+    let screen = h.capture_screen();
+    let (y, line) = screen
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains("LATE-RETAINED-OUTPUT"))
+        .unwrap();
+    let x =
+        unicode_width::UnicodeWidthStr::width(&line[..line.find("LATE-RETAINED-OUTPUT").unwrap()])
+            as u16
+            + 1;
+    h.send_mouse_drag((x, y as u16 + 1), (x + 19, y as u16 + 1));
+    wait_until(Duration::from_secs(5), Duration::from_millis(10), || {
+        let copied = std::fs::read_to_string(&clipboard).unwrap_or_default();
+        (copied == "LATE-RETAINED-OUTPUT")
+            .then_some(())
+            .ok_or_else(|| format!("expected fresh retained output, got {copied:?}"))
+    });
+    if std::env::var_os("RECORD_E2E").is_some() {
+        let directory = std::path::Path::new("target/e2e-recordings");
+        std::fs::write(
+            directory.join("trash-late-output.ansi"),
+            h.capture_screen_styled(),
+        )
+        .unwrap();
+        std::fs::write(directory.join("trash-late-output.txt"), h.capture_screen()).unwrap();
+    }
+    let events = EventStore::open(&app_dir.join("acp_events.db"), 0).unwrap();
+    events
+        .record(
+            &id,
+            1024,
+            &Event::ConversationSummary {
+                text: "CONCURRENT-TEARDOWN-SUMMARY".into(),
+                summarized_until_seq: 1022,
+            },
+        )
+        .unwrap();
+    h.wait_for("CONCURRENT-TEARDOWN-SUMMARY");
+    h.assert_screen_not_contains("◼");
+    events
+        .record(
+            &id,
+            1023,
+            &Event::Stopped {
+                reason: "user_stopped".into(),
+            },
+        )
+        .unwrap();
+    drop(events);
+    h.wait_for_absent("completion unavailable", Duration::from_secs(45));
+    h.assert_screen_contains("CONCURRENT-TEARDOWN-SUMMARY");
+    h.assert_screen_contains("Esc: sessions");
+    h.send_keys("Home");
+    h.wait_for("◼");
+    let marker = "UNFINISHED-OUTPUT-END";
+    let screen = h.capture_screen();
+    let (y, line) = screen
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains(marker))
+        .unwrap();
+    let x = unicode_width::UnicodeWidthStr::width(&line[..line.find(marker).unwrap()]) as u16 + 1;
+    h.send_mouse_drag(
+        (x, y as u16 + 1),
+        (x + marker.len() as u16 - 1, y as u16 + 1),
+    );
+    wait_until(Duration::from_secs(5), Duration::from_millis(10), || {
+        let copied = std::fs::read_to_string(&clipboard).unwrap_or_default();
+        (copied == marker)
+            .then_some(())
+            .ok_or_else(|| format!("expected stopped retained output, got {copied:?}"))
+    });
+    if std::env::var_os("RECORD_E2E").is_some() {
+        let directory = std::path::Path::new("target/e2e-recordings");
+        std::fs::write(
+            directory.join("trash-late-stop.ansi"),
+            h.capture_screen_styled(),
+        )
+        .unwrap();
+        std::fs::write(directory.join("trash-late-stop.txt"), h.capture_screen()).unwrap();
+    }
+    h.send_keys("End");
+    h.wait_for("CONCURRENT-TEARDOWN-SUMMARY");
     for _ in 0..10 {
         let previous = h.capture_screen();
         if previous.contains("SUCCESS-OUTPUT-END") {
@@ -1037,10 +1155,10 @@ fn trash_retained_transcript_is_read_only() {
         .unwrap() as u16
         + 1;
     h.send_mouse_click(0, 7, row);
-    h.wait_for("UNFINISHED-OUTPUT-END");
+    h.wait_for("CONCURRENT-TEARDOWN-SUMMARY");
     h.run_cli_ok(&["rm", &id, "--purge"]);
     h.wait_for_absent("TrashRetained", Duration::from_secs(5));
-    h.wait_for_absent("UNFINISHED-OUTPUT-END", Duration::from_secs(5));
+    h.wait_for_absent("CONCURRENT-TEARDOWN-SUMMARY", Duration::from_secs(5));
     assert!(
         !launch_marker.exists(),
         "restore or purge restarted an agent"

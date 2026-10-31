@@ -2524,12 +2524,15 @@ impl App {
             self.home.enforce_trash_read_only();
             self.clear_preview_mount_pending();
             self.close_embedded_structured();
-            return self
+            let changed = self
                 .home
                 .retained_preview
                 .as_mut()
-                .is_some_and(|v| v.tick())
-                || !matches;
+                .is_some_and(|view| view.tick());
+            if changed {
+                self.home.clear_preview_selection();
+            }
+            return changed || !matches;
         }
         let removed_retained = self.home.retained_preview.take().is_some();
         if removed_retained {
@@ -3752,6 +3755,167 @@ mod tests {
             (SigHandler::Handler(f1), SigHandler::Handler(f2)) => f1 as usize == f2 as usize,
             _ => false,
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn retained_refresh_discards_captured_selection_without_resetting_reader() {
+        use crate::acp::state::Event as AcpEvent;
+        use axum::{routing::get, Router};
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        crate::session::get_profile_dir("test").unwrap();
+        let mut inst = crate::session::Instance::new("retained selection", "/tmp");
+        inst.trash();
+        inst.source_profile = "test".into();
+        crate::session::Storage::new_unwatched("test")
+            .unwrap()
+            .update(|rows, groups| {
+                *rows = vec![inst.clone()];
+                *groups = crate::session::GroupTree::new_with_groups(rows, &[]).get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+        state
+            .acp_event_store
+            .record(
+                &id,
+                1,
+                &AcpEvent::AgentMessageChunk {
+                    text: "OLD-RETAINED\n\n".repeat(80),
+                    message_id: None,
+                },
+            )
+            .unwrap();
+        let router = Router::new()
+            .route(
+                "/api/sessions/{id}/acp/replay",
+                get(crate::server::api::acp_replay),
+            )
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = crate::acp::client::DaemonEndpoint::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            None,
+            crate::acp::client::discovery::Source::Env,
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let mut app = App::new(
+            "test",
+            AvailableTools::with_tools(&["claude"]),
+            true,
+            false,
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let snapshot = state.runtime.publish(&state).await.unwrap().value.clone();
+        app.home.session_feed.publish_for_test(
+            crate::tui::session_feed::SessionFeedResult::Snapshot(std::sync::Arc::new(snapshot)),
+        );
+        app.home.apply_session_feed();
+        app.home.selected_session = Some(id.clone());
+        app.home.retained_preview = Some(crate::tui::structured_view::embedded::RetainedView::new(
+            Some(endpoint),
+            &inst,
+        ));
+        let mut ticker = tokio::time::interval(Duration::from_millis(10));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                ticker.tick().await;
+                app.reconcile_structured_preview().await;
+                if app
+                    .home
+                    .retained_preview
+                    .as_ref()
+                    .unwrap()
+                    .selection_text(80)
+                    .to_string()
+                    .contains("OLD-RETAINED")
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        app.home.retained_focus = Some((id.clone(), inst.lifecycle_generation));
+        app.home.retained_scroll_offset = 7;
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(200, 40)).unwrap();
+        let theme = crate::tui::styles::Theme::default();
+        terminal
+            .draw(|frame| {
+                app.home
+                    .render(frame, frame.area(), &theme, None, None, None);
+            })
+            .unwrap();
+        let pane = app.home.preview_text_view.pane;
+        let (x, y) = (pane.y..pane.bottom())
+            .find_map(|y| {
+                let line: String = (pane.x..pane.right())
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect();
+                line.find("OLD-RETAINED").map(|byte| {
+                    (
+                        pane.x + unicode_width::UnicodeWidthStr::width(&line[..byte]) as u16,
+                        y,
+                    )
+                })
+            })
+            .expect("retained text must be painted before selecting it");
+        assert!(app.home.handle_drag_start(x, y));
+        assert!(app.home.handle_drag_move(x + 8, y));
+        app.home.handle_drag_end();
+        terminal
+            .draw(|frame| {
+                app.home
+                    .render(frame, frame.area(), &theme, None, None, None);
+            })
+            .unwrap();
+        assert!(app
+            .home
+            .preview_copy_text
+            .as_ref()
+            .is_some_and(|text| text.contains("OLD")));
+        state
+            .acp_event_store
+            .record(
+                &id,
+                2,
+                &AcpEvent::AgentMessageChunk {
+                    text: "NEW-RETAINED".into(),
+                    message_id: Some("next".into()),
+                },
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                ticker.tick().await;
+                app.reconcile_structured_preview().await;
+                if app
+                    .home
+                    .retained_preview
+                    .as_ref()
+                    .unwrap()
+                    .selection_text(80)
+                    .to_string()
+                    .contains("NEW-RETAINED")
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(app.home.preview_selection.is_none());
+        assert!(!app.home.preview_copy_pending);
+        assert!(app.home.take_preview_copy_text().is_none());
+        assert!(app.home.retained_reader_focused());
+        assert_eq!(app.home.retained_scroll_offset, 7);
+        server.abort();
+        let _ = server.await;
     }
 
     /// A failed replacement must not consume the previous view's draft.

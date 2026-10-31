@@ -176,6 +176,14 @@ Unfinished text snapshots remain readable even when their start or completion
 event is unavailable. They are labeled **completion unavailable**, not marked
 successful or stopped. Wrapping and copy preserve painted Unicode graphemes.
 
+While selected, the reader checks the highest persisted ACP sequence every two
+seconds and reloads when it changes. It also rereads incomplete histories to
+acquire events committed out of order. An identical incomplete replay backs off
+further full reads for 30 seconds. An identical reread leaves text selections
+intact. Changed snapshots preserve reader focus and scroll offset, and
+clear old selections. Read failures keep the last loaded content visible with
+an error. For in-place event edits, reopen the reader.
+
 Rename and workdir dialogs, quick permission replies, and pending Trash
 confirmations close if their session changes lifecycle or disappears. A pending
 dialog cannot retarget another session when the list updates.

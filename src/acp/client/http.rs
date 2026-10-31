@@ -47,6 +47,16 @@ enum ReplayKind {
     Retained,
 }
 
+#[derive(Debug)]
+pub(crate) struct RetainedReplay {
+    pub transcript: crate::acp::transcript::RetainedTranscript,
+    /// The first page's cap, not a later page's maximum.
+    pub highest_seq: u64,
+    /// Inclusive ranges of successfully folded sequence numbers.
+    pub coverage: Vec<(u64, u64)>,
+    pub incomplete: bool,
+}
+
 #[derive(serde::Deserialize)]
 struct PluginCommandsEnvelope {
     commands: Vec<PluginCommandView>,
@@ -286,11 +296,12 @@ impl HttpClient {
         session_id: &str,
         since: u64,
         page_size: u64,
-    ) -> Result<(crate::acp::transcript::RetainedTranscript, bool), HttpError> {
+    ) -> Result<RetainedReplay, HttpError> {
         let mut model = crate::acp::transcript::TranscriptModel::new();
         let mut last_seen = since;
         let mut snapshot_highest = since;
         let mut incomplete = false;
+        let mut coverage: Vec<(u64, u64)> = Vec::new();
         let (_, _, reported_lost) = self
             .replay_pages(
                 session_id,
@@ -305,13 +316,24 @@ impl HttpClient {
                         }
                         incomplete |= frame.seq != last_seen.saturating_add(1);
                         last_seen = frame.seq;
+                        match coverage.last_mut() {
+                            Some((_, end)) if end.checked_add(1) == Some(frame.seq) => {
+                                *end = frame.seq;
+                            }
+                            _ => coverage.push((frame.seq, frame.seq)),
+                        }
                         model.apply_event(frame.seq, &frame.event);
                     }
                 },
             )
             .await?;
         incomplete |= reported_lost || last_seen < snapshot_highest;
-        Ok((model.into_retained(), incomplete))
+        Ok(RetainedReplay {
+            transcript: model.into_retained(),
+            highest_seq: snapshot_highest,
+            coverage,
+            incomplete,
+        })
     }
 
     /// `GET /api/sessions/{id}/acp/files`. Workspace file list for
@@ -1412,9 +1434,9 @@ mod tests {
         .unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         for size in [1, 2, 8] {
-            let (snapshot, incomplete) = client.replay_retained_paged(&id, 0, size).await.unwrap();
-            let rows = snapshot.rows;
-            assert!(!incomplete);
+            let snapshot = client.replay_retained_paged(&id, 0, size).await.unwrap();
+            let rows = snapshot.transcript.rows;
+            assert!(!snapshot.incomplete);
             let messages: Vec<_> = rows
                 .iter()
                 .filter(|row| row.kind == TranscriptRowKind::Message)
@@ -1441,6 +1463,7 @@ mod tests {
                 .any(|row| row.tool_call_id.as_deref() == Some("question")));
             assert_eq!(
                 snapshot
+                    .transcript
                     .unfinished_outputs
                     .iter()
                     .map(|output| (output.tool_call_id.as_str(), output.text.as_str()))
@@ -1448,6 +1471,97 @@ mod tests {
                 [("orphan", "latest orphan output")]
             );
         }
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn retained_replay_caches_only_the_folded_snapshot_cap() {
+        use crate::acp::{protocol::ReplayQuery, state::Event};
+        use axum::{
+            extract::{Path, Query, State},
+            routing::get,
+            Router,
+        };
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let inst = crate::session::Instance::new("concurrent retained output", "/tmp");
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        for seq in 1..=3 {
+            state
+                .acp_event_store
+                .record(
+                    &id,
+                    seq,
+                    &Event::AgentMessageChunk {
+                        text: format!("retained-{seq}\n\n"),
+                        message_id: None,
+                    },
+                )
+                .unwrap();
+        }
+        let appended = Arc::new(AtomicBool::new(false));
+        let app = Router::new()
+            .route(
+                "/api/sessions/{id}/acp/replay",
+                get({
+                    let appended = appended.clone();
+                    move |State(state): State<Arc<crate::server::AppState>>,
+                          Path(id): Path<String>,
+                          Query(q): Query<ReplayQuery>| {
+                        let appended = appended.clone();
+                        async move {
+                            if q.since == 2 && !appended.swap(true, Ordering::SeqCst) {
+                                state
+                                    .acp_event_store
+                                    .record(
+                                        &id,
+                                        4,
+                                        &Event::AgentMessageChunk {
+                                            text: "retained-4".into(),
+                                            message_id: None,
+                                        },
+                                    )
+                                    .unwrap();
+                            }
+                            crate::server::api::acp_replay(State(state), Path(id), Query(q)).await
+                        }
+                    }
+                }),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = HttpClient::new(endpoint(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            None,
+        ))
+        .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let first = client.replay_retained_paged(&id, 0, 2).await.unwrap();
+        assert!(appended.load(Ordering::SeqCst));
+        assert_eq!(first.highest_seq, 3);
+        assert!(!first.incomplete);
+        assert!(first
+            .transcript
+            .rows
+            .iter()
+            .any(|row| row.text.contains("retained-3")));
+        assert!(!first
+            .transcript
+            .rows
+            .iter()
+            .any(|row| row.text.contains("retained-4")));
+        assert_eq!(client.replay(&id, u64::MAX).await.unwrap().highest_seq, 4);
+        let next = client.replay_retained_paged(&id, 0, 2).await.unwrap();
+        assert_eq!(next.highest_seq, 4);
+        assert!(next
+            .transcript
+            .rows
+            .iter()
+            .any(|row| row.text.contains("retained-4")));
         server.abort();
         let _ = server.await;
     }
@@ -1513,9 +1627,9 @@ mod tests {
         .unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         for size in [1, 2, 10] {
-            let (rows, incomplete) = client.replay_retained_paged(&id, 0, size).await.unwrap();
-            let rows = rows.rows;
-            assert!(incomplete, "page size {size}");
+            let replay = client.replay_retained_paged(&id, 0, size).await.unwrap();
+            let rows = replay.transcript.rows;
+            assert!(replay.incomplete, "page size {size}");
             assert_eq!(
                 rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(),
                 ["message-18", "message-19", "message-20"]

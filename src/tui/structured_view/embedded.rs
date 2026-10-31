@@ -37,6 +37,9 @@ pub enum EmbeddedEvent {
     SessionInfo(super::ViewSideInfo),
 }
 
+const RETAINED_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+const RETAINED_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Retained transcript reader. No WebSocket, composer dispatcher, or worker setup.
 pub struct RetainedView {
     session_id: String,
@@ -46,14 +49,20 @@ pub struct RetainedView {
     unfinished_outputs: Vec<crate::acp::transcript::UnfinishedToolOutput>,
     load: Option<tokio::task::JoinHandle<()>>,
     result: tokio::sync::oneshot::Receiver<
-        Result<(crate::acp::transcript::RetainedTranscript, bool), String>,
+        Result<Option<crate::acp::client::http::RetainedReplay>, String>,
     >,
+    known_highest: Option<u64>,
+    known_coverage: Vec<(u64, u64)>,
+    known_incomplete: bool,
+    next_read: Instant,
+    next_recheck: Instant,
     message: String,
 }
 
 impl RetainedView {
     pub fn new(endpoint: Option<DaemonEndpoint>, inst: &crate::session::Instance) -> Self {
-        let (tx, result) = tokio::sync::oneshot::channel();
+        let (_, result) = tokio::sync::oneshot::channel();
+        let now = Instant::now();
         let mut view = Self {
             session_id: inst.id.clone(),
             source_profile: inst.source_profile.clone(),
@@ -62,6 +71,11 @@ impl RetainedView {
             unfinished_outputs: Vec::new(),
             load: None,
             result,
+            known_highest: None,
+            known_coverage: Vec::new(),
+            known_incomplete: false,
+            next_read: now,
+            next_recheck: now,
             message: "Daemon unavailable; retained transcript could not be read.".into(),
         };
         let Some(endpoint) = endpoint else {
@@ -74,19 +88,40 @@ impl RetainedView {
                 return view;
             }
         };
-        let mut state = StructuredViewState::new(inst.id.clone(), endpoint, http.clone(), None);
+        let mut state = StructuredViewState::new(inst.id.clone(), endpoint, http, None);
         state.transcript.session_title = Some(inst.title.clone());
         view.state = Some(state);
         view.message = "Loading retained ACP transcript…".into();
-        let id = inst.id.clone();
-        view.load = Some(tokio::spawn(async move {
-            let rows = http
-                .replay_retained_paged(&id, 0, 1000)
-                .await
-                .map_err(|e| e.to_string());
-            let _ = tx.send(rows);
-        }));
+        view.start_read();
         view
+    }
+
+    fn start_read(&mut self) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        let http = state.http.clone();
+        let id = self.session_id.clone();
+        let known_highest = if self.known_incomplete && Instant::now() >= self.next_recheck {
+            None
+        } else {
+            self.known_highest
+        };
+        let (tx, result) = tokio::sync::oneshot::channel();
+        self.result = result;
+        self.load = Some(tokio::spawn(async move {
+            let read = async {
+                if let Some(highest) = known_highest {
+                    if http.replay(&id, u64::MAX).await?.highest_seq == highest {
+                        return Ok(None);
+                    }
+                }
+                http.replay_retained_paged(&id, 0, 1000).await.map(Some)
+            }
+            .await
+            .map_err(|error: crate::acp::client::HttpError| error.to_string());
+            let _ = tx.send(read);
+        }));
     }
 
     pub fn matches(&self, inst: &crate::session::Instance) -> bool {
@@ -98,6 +133,9 @@ impl RetainedView {
 
     pub fn tick(&mut self) -> bool {
         if self.load.is_none() {
+            if self.state.is_some() && Instant::now() >= self.next_read {
+                self.start_read();
+            }
             return false;
         }
         let result = match self.result.try_recv() {
@@ -106,8 +144,27 @@ impl RetainedView {
             Err(error) => Err(error.to_string()),
         };
         self.load = None;
+        let now = Instant::now();
+        self.next_read = now + RETAINED_REFRESH_INTERVAL;
         match result {
-            Ok((snapshot, lost)) => {
+            Ok(Some(replay)) => {
+                let changed = self.known_highest != Some(replay.highest_seq)
+                    || self.known_coverage != replay.coverage
+                    || self.known_incomplete != replay.incomplete;
+                self.known_highest = Some(replay.highest_seq);
+                self.known_coverage = replay.coverage;
+                self.known_incomplete = replay.incomplete;
+                self.next_recheck = now
+                    + if changed {
+                        RETAINED_REFRESH_INTERVAL
+                    } else {
+                        RETAINED_RECHECK_INTERVAL
+                    };
+                if !changed {
+                    return false;
+                }
+                let snapshot = replay.transcript;
+                let lost = replay.incomplete;
                 self.message = if snapshot.rows.is_empty() && snapshot.unfinished_outputs.is_empty()
                 {
                     "No readable retained ACP content. Native history is not available through this reader; destroyed tmux scrollback cannot be recovered.".into()
@@ -125,7 +182,14 @@ impl RetainedView {
                 }
                 self.unfinished_outputs = snapshot.unfinished_outputs;
             }
-            Err(error) => self.message = format!("Transcript read failed: {error}"),
+            Ok(None) => return false,
+            Err(error) => {
+                self.known_highest = None;
+                let message = format!("Transcript read failed: {error}");
+                let changed = self.message != message;
+                self.message = message;
+                return changed;
+            }
         }
         true
     }
@@ -762,7 +826,18 @@ mod retained_tests {
                 let mut view = RetainedView::new(None, &inst);
                 view.result = rx;
                 view.load = Some(tokio::spawn(async {}));
-                tx.send(Ok((model.into_retained(), incomplete))).unwrap();
+                let highest_seq = model.last_seq();
+                tx.send(Ok(Some(crate::acp::client::http::RetainedReplay {
+                    transcript: model.into_retained(),
+                    highest_seq,
+                    coverage: if highest_seq == 0 {
+                        Vec::new()
+                    } else {
+                        vec![(1, highest_seq)]
+                    },
+                    incomplete,
+                })))
+                .unwrap();
                 assert!(view.tick());
                 for width in [32, 100] {
                     let mut terminal =
@@ -888,24 +963,329 @@ mod retained_tests {
     }
 
     #[tokio::test]
-    async fn obsolete_read_is_cancelled_and_failure_does_not_become_empty_history() {
-        let started = Arc::new(tokio::sync::Notify::new());
-        let app =
-            Router::new()
+    async fn retained_reader_acquires_late_stop_without_remount() {
+        use crate::acp::state::{Event, ToolCall};
+        for summary_races in [false, true] {
+            let mut inst = crate::session::Instance::new("late retained output", "/tmp");
+            inst.trash();
+            let id = inst.id.clone();
+            let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+            state
+                .acp_event_store
+                .record(
+                    &id,
+                    1,
+                    &Event::ToolCallStarted {
+                        tool_call: ToolCall {
+                            id: "pending".into(),
+                            name: "PendingTool".into(),
+                            kind: "execute".into(),
+                            args_preview: "{}".into(),
+                            started_at: chrono::Utc::now(),
+                            parent_tool_call_id: None,
+                            memory_recall: None,
+                            diffs: Vec::new(),
+                        },
+                    },
+                )
+                .unwrap();
+            state
+                .acp_event_store
+                .record(
+                    &id,
+                    2,
+                    &Event::ToolCallContent {
+                        tool_call_id: "pending".into(),
+                        content: "BEFORE-TEARDOWN".into(),
+                    },
+                )
+                .unwrap();
+            if summary_races {
+                state
+                    .acp_event_store
+                    .record(
+                        &id,
+                        4,
+                        &Event::ConversationSummary {
+                            text: "CONCURRENT-SUMMARY".into(),
+                            summarized_until_seq: 2,
+                        },
+                    )
+                    .unwrap();
+            }
+            let app = Router::new()
                 .route(
                     "/api/sessions/{id}/acp/replay",
-                    get(
-                        |Path(id): Path<String>,
-                         State(started): State<Arc<tokio::sync::Notify>>| async move {
-                            if id == "obsolete" {
-                                started.notify_one();
-                                std::future::pending::<()>().await;
-                            }
-                            StatusCode::SERVICE_UNAVAILABLE
-                        },
-                    ),
+                    get(crate::server::api::acp_replay),
                 )
-                .with_state(started.clone());
+                .with_state(state.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = DaemonEndpoint::new(
+                format!("http://{}", listener.local_addr().unwrap()),
+                None,
+                crate::acp::client::discovery::Source::Env,
+            );
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let mut view = RetainedView::new(Some(endpoint), &inst);
+            tokio::time::timeout(Duration::from_secs(5), view.load.as_mut().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(view.tick());
+            let before = view.selection_text(80).to_string();
+            assert!(before.contains("BEFORE-TEARDOWN"));
+            assert!(before.contains("completion unavailable"));
+            if !summary_races {
+                state
+                    .acp_event_store
+                    .record(
+                        &id,
+                        3,
+                        &Event::ToolCallContent {
+                            tool_call_id: "pending".into(),
+                            content: "AFTER-TEARDOWN".into(),
+                        },
+                    )
+                    .unwrap();
+            }
+            state
+                .acp_event_store
+                .record(
+                    &id,
+                    if summary_races { 3 } else { 4 },
+                    &Event::Stopped {
+                        reason: "teardown complete".into(),
+                    },
+                )
+                .unwrap();
+            let mut ticker = tokio::time::interval(Duration::from_millis(10));
+            tokio::time::timeout(Duration::from_secs(8), async {
+                loop {
+                    ticker.tick().await;
+                    view.tick();
+                    if view.selection_text(80).to_string().contains('◼') {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("mounted reader must acquire persisted final output without reselection");
+            let copied = view.selection_text(80).to_string();
+            let expected = if summary_races {
+                "BEFORE-TEARDOWN"
+            } else {
+                "AFTER-TEARDOWN"
+            };
+            assert!(copied.contains(expected));
+            if summary_races {
+                assert!(copied.contains("CONCURRENT-SUMMARY"));
+                assert!(!view.message.contains("incomplete"));
+            }
+            assert!(!copied.contains("completion unavailable"));
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+            terminal
+                .draw(|frame| {
+                    view.render(frame, frame.area(), &Theme::default(), 0, true);
+                })
+                .unwrap();
+            let painted: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(painted.contains(expected));
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_refresh_preserves_content_on_failure_and_replaces_reset_history() {
+        use crate::acp::state::Event;
+        use axum::{middleware, response::IntoResponse};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let inst = crate::session::Instance::new("refresh transitions", "/tmp");
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+        for seq in 1..=2 {
+            state
+                .acp_event_store
+                .record(
+                    &id,
+                    seq,
+                    &Event::AgentMessageChunk {
+                        text: "KEEP-ON-ERROR\n\n".into(),
+                        message_id: None,
+                    },
+                )
+                .unwrap();
+        }
+        let failing = Arc::new(AtomicBool::new(false));
+        let app = Router::new()
+            .route(
+                "/api/sessions/{id}/acp/replay",
+                get(crate::server::api::acp_replay),
+            )
+            .with_state(state.clone())
+            .layer(middleware::from_fn_with_state(
+                failing.clone(),
+                |State(failing): State<Arc<AtomicBool>>,
+                 request: axum::extract::Request,
+                 next: middleware::Next| async move {
+                    if failing.load(Ordering::SeqCst) {
+                        StatusCode::SERVICE_UNAVAILABLE.into_response()
+                    } else {
+                        next.run(request).await
+                    }
+                },
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = DaemonEndpoint::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            None,
+            crate::acp::client::discovery::Source::Env,
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut view = RetainedView::new(Some(endpoint), &inst);
+        async fn finish(view: &mut RetainedView) -> bool {
+            tokio::time::timeout(Duration::from_secs(5), view.load.as_mut().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            view.tick()
+        }
+        async fn refresh(view: &mut RetainedView) -> bool {
+            view.next_read = Instant::now();
+            assert!(
+                !view.tick(),
+                "starting a read must not invalidate selection"
+            );
+            finish(view).await
+        }
+        assert!(finish(&mut view).await);
+        assert!(view
+            .selection_text(80)
+            .to_string()
+            .contains("KEEP-ON-ERROR"));
+        assert!(!view.tick(), "not due");
+        assert!(
+            !refresh(&mut view).await,
+            "unchanged metadata must not invalidate selection"
+        );
+        failing.store(true, Ordering::SeqCst);
+        assert!(refresh(&mut view).await);
+        assert!(view.message.contains("503"));
+        assert!(view
+            .selection_text(80)
+            .to_string()
+            .contains("KEEP-ON-ERROR"));
+        assert!(
+            !refresh(&mut view).await,
+            "identical failure must not redraw"
+        );
+        failing.store(false, Ordering::SeqCst);
+        assert!(
+            refresh(&mut view).await,
+            "recovery at unchanged watermark must reload"
+        );
+        assert!(!view.message.contains("failed"));
+        assert!(view
+            .selection_text(80)
+            .to_string()
+            .contains("KEEP-ON-ERROR"));
+        state.acp_event_store.delete_session(&id);
+        assert!(refresh(&mut view).await);
+        assert!(view.selection_text(80).lines.is_empty());
+        assert!(view.message.contains("No readable retained ACP content"));
+        state
+            .acp_event_store
+            .record(
+                &id,
+                1,
+                &Event::AgentMessageChunk {
+                    text: "RESET-RETAINED".into(),
+                    message_id: None,
+                },
+            )
+            .unwrap();
+        assert!(refresh(&mut view).await);
+        let text = view.selection_text(80).to_string();
+        assert!(text.contains("RESET-RETAINED"));
+        assert!(!text.contains("KEEP-ON-ERROR"));
+        state
+            .acp_event_store
+            .record(
+                &id,
+                3,
+                &Event::AgentMessageChunk {
+                    text: "AFTER-GAP".into(),
+                    message_id: Some("after-gap".into()),
+                },
+            )
+            .unwrap();
+        assert!(refresh(&mut view).await);
+        assert!(view.message.contains("incomplete"));
+        let rechecked_at = Instant::now();
+        view.next_recheck = rechecked_at;
+        assert!(
+            !refresh(&mut view).await,
+            "unchanged authoritative replay must preserve selection"
+        );
+        assert!(
+            view.next_recheck >= rechecked_at + RETAINED_RECHECK_INTERVAL,
+            "stable gaps must not cause full replays at every metadata poll"
+        );
+        state
+            .acp_event_store
+            .record(
+                &id,
+                2,
+                &Event::AgentMessageChunk {
+                    text: "BACKFILLED".into(),
+                    message_id: Some("backfill".into()),
+                },
+            )
+            .unwrap();
+        view.next_recheck = Instant::now();
+        assert!(refresh(&mut view).await);
+        assert!(view.selection_text(80).to_string().contains("BACKFILLED"));
+        assert!(!view.message.contains("incomplete"));
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn obsolete_read_is_cancelled_and_failure_does_not_become_empty_history() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let app = Router::new()
+            .route(
+                "/api/sessions/{id}/acp/replay",
+                get(
+                    |Path(id): Path<String>,
+                     axum::extract::Query(query): axum::extract::Query<
+                        crate::acp::protocol::ReplayQuery,
+                    >,
+                     State(started): State<Arc<tokio::sync::Notify>>| async move {
+                        use axum::response::IntoResponse;
+                        if id == "obsolete" || (id == "refresh" && query.since == u64::MAX) {
+                            started.notify_one();
+                            std::future::pending::<()>().await;
+                        }
+                        if id == "refresh" {
+                            return axum::Json(serde_json::json!({
+                                "frames": [], "lost": false, "highest_seq": 0,
+                                "lowest_seq": null, "next_cursor": null, "has_more": false,
+                            }))
+                            .into_response();
+                        }
+                        StatusCode::SERVICE_UNAVAILABLE.into_response()
+                    },
+                ),
+            )
+            .with_state(started.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = DaemonEndpoint::new(
             format!("http://{}", listener.local_addr().unwrap()),
@@ -914,21 +1294,35 @@ mod retained_tests {
         );
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let mut inst = crate::session::Instance::new("retained", "/tmp");
-        inst.id = "obsolete".into();
         inst.trashed_at = Some(chrono::Utc::now());
-        let obsolete = RetainedView::new(Some(endpoint.clone()), &inst);
-        tokio::time::timeout(Duration::from_secs(5), started.notified())
+        for id in ["obsolete", "refresh"] {
+            inst.id = id.into();
+            let mut obsolete = RetainedView::new(Some(endpoint.clone()), &inst);
+            if id == "refresh" {
+                tokio::time::timeout(Duration::from_secs(5), obsolete.load.as_mut().unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(obsolete.tick());
+                obsolete.next_read = Instant::now();
+                assert!(!obsolete.tick());
+            }
+            tokio::time::timeout(Duration::from_secs(5), started.notified())
+                .await
+                .unwrap();
+            let task = obsolete.load.as_ref().unwrap().abort_handle();
+            for _ in 0..10 {
+                assert!(!obsolete.tick());
+            }
+            drop(obsolete);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !task.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
             .await
             .unwrap();
-        let task = obsolete.load.as_ref().unwrap().abort_handle();
-        drop(obsolete);
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !task.is_finished() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        }
         inst.id = "failed".into();
         let mut failed = RetainedView::new(Some(endpoint), &inst);
         tokio::time::timeout(Duration::from_secs(5), failed.load.as_mut().unwrap())
