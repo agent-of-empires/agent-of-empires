@@ -32,6 +32,7 @@ export function SuggestionsView({ readOnly = false, initialDismissed = false, on
     !readOnly && onOpenMarketplace ? (
       <SuggestionsSetupHint
         ignoreDismissed
+        noProvider
         onOpenMarketplace={onOpenMarketplace}
         onFinished={() => void load()}
         fallback="No plugin provides suggestions."

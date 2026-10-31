@@ -1,15 +1,14 @@
-import { useCallback, useEffect, useState, type ReactNode } from "react";
-import { discoverPlugins, fetchSuggestions, type PluginDiscoveryResult } from "../lib/api";
+import { useEffect, useState, type ReactNode } from "react";
+import { fetchSuggestions } from "../lib/api";
+import { loadFeaturedSuggestionSources, sourceLabel, type FeaturedSources } from "../lib/featuredSuggestionSources";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
+import { isWebUiStateHydrated, onWebUiStateHydrated } from "../lib/webUiHydration";
 import { SuggestionsSetupSheet } from "./SuggestionsSetupSheet";
 
 /** Synced to the server (see webUiSync), so one dismissal covers every device. */
 const DISMISSED_KEY = "aoe-suggestions-hint-dismissed";
 
-type Featured =
-  | { status: "loading" }
-  | { status: "ok"; sources: PluginDiscoveryResult[] }
-  | { status: "error"; message: string };
+type Featured = { status: "loading" } | FeaturedSources;
 
 interface Props {
   /** Open Settings › Plugins › Marketplace with the Suggestions filter on. */
@@ -18,6 +17,8 @@ interface Props {
   onFinished?: () => void;
   /** The suggestions view shows the sentence even after the homepage hint was dismissed. */
   ignoreDismissed?: boolean;
+  /** The caller already knows no provider is installed, so the hint skips its own snapshot fetch. */
+  noProvider?: boolean;
   /** Rendered instead of the hint when there is nothing to offer. */
   fallback?: ReactNode;
 }
@@ -27,45 +28,52 @@ export function SuggestionsSetupHint({
   onOpenMarketplace,
   onFinished,
   ignoreDismissed = false,
+  noProvider: noProviderProp,
   fallback = null,
 }: Props) {
-  const [dismissed, setDismissed] = useState(() => safeGetItem(DISMISSED_KEY) === "1");
+  const [dismissed, setDismissed] = useState(false);
   const [noProvider, setNoProvider] = useState(false);
   const [featured, setFeatured] = useState<Featured>({ status: "loading" });
   const [sheetOpen, setSheetOpen] = useState(false);
   const hidden = dismissed && !ignoreDismissed;
 
-  const lookUp = useCallback(async () => {
-    const res = await discoverPlugins("");
-    return res.kind === "ok"
-      ? ({
-          status: "ok",
-          sources: res.results.filter((r) => r.badge === "featured" && r.suggestions),
-        } as const)
-      : ({ status: "error", message: res.message } as const);
-  }, []);
-
-  // Discovery runs only when the hint can show, so dismissed or provider-equipped homepages never hit GitHub.
+  // Waits for web UI state hydration so a dismissal made on another Device is seen before any lookup.
+  // Once on mount: later dismissals only hide what was already looked up.
   useEffect(() => {
     let alive = true;
-    void (async () => {
-      const snapshot = await fetchSuggestions();
-      if (!alive || !snapshot || snapshot.providers.length > 0) return;
+    const run = async () => {
+      if (safeGetItem(DISMISSED_KEY) === "1" && !ignoreDismissed) {
+        setDismissed(true);
+        return;
+      }
+      if (noProviderProp === false) return;
+      if (noProviderProp === undefined) {
+        const snapshot = await fetchSuggestions();
+        if (!alive || !snapshot || snapshot.providers.length > 0 || !snapshot.prefs.homepage) return;
+      }
       setNoProvider(true);
-      if (hidden) return;
-      const next = await lookUp();
+      const next = await loadFeaturedSuggestionSources();
       if (alive) setFeatured(next);
-    })();
+    };
+    let off = () => {};
+    if (isWebUiStateHydrated()) {
+      void run();
+    } else {
+      off = onWebUiStateHydrated(() => {
+        off();
+        void run();
+      });
+    }
     return () => {
       alive = false;
+      off();
     };
-    // Once on mount: later dismissals only hide what was already looked up.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const retry = async () => {
     setFeatured({ status: "loading" });
-    setFeatured(await lookUp());
+    setFeatured(await loadFeaturedSuggestionSources());
   };
 
   const dismiss = () => {
@@ -96,6 +104,7 @@ export function SuggestionsSetupHint({
     );
   }
   if (featured.sources.length === 0) return fallback;
+  const names = joinNames(featured.sources.map((r) => sourceLabel(r.slug)));
 
   return (
     <>
@@ -103,7 +112,7 @@ export function SuggestionsSetupHint({
         className="mt-3.5 flex flex-wrap items-center justify-center gap-x-2 text-center text-xs text-text-dim"
         data-testid="suggestions-hint"
       >
-        <span>Want AoE to suggest what to work on next, from your issues and PRs?</span>
+        <span>Want AoE to suggest what to work on next, from your {names} issues and PRs?</span>
         <button
           type="button"
           className="min-h-8 cursor-pointer font-medium text-brand-500 hover:underline"
@@ -147,3 +156,6 @@ function DismissButton({ onClick }: { onClick: () => void }) {
     </button>
   );
 }
+
+const joinNames = (names: string[]) =>
+  names.length < 2 ? (names[0] ?? "") : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;

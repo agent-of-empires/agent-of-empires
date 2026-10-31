@@ -25,6 +25,8 @@ interface Props {
   /** Both required to show the Suggested sessions section. */
   onPrepareSuggestion?: (prefill: WizardPrefill) => void;
   onViewAllSuggestions?: () => void;
+  /** The onboarding tour is running; the first-run hint stays out of it. */
+  tourActive?: boolean;
   /** Opens Settings > Plugins > Marketplace filtered to Suggestions; the first-run hint shows only when set. */
   onOpenSuggestionsMarketplace?: () => void;
 }
@@ -40,6 +42,7 @@ export function Dashboard({
   onPrepareSuggestion,
   onViewAllSuggestions,
   onOpenSuggestionsMarketplace,
+  tourActive = false,
 }: Props) {
   // Bumped when the setup sheet finishes so the Suggested section refetches.
   const [suggestionsEpoch, setSuggestionsEpoch] = useState(0);
@@ -252,7 +255,7 @@ export function Dashboard({
         </div>
       )}
 
-      {!readOnly && canManageProjects && onOpenSuggestionsMarketplace && (
+      {!readOnly && canManageProjects && !tourActive && onOpenSuggestionsMarketplace && (
         <SuggestionsSetupHint
           onOpenMarketplace={onOpenSuggestionsMarketplace}
           onFinished={() => setSuggestionsEpoch((n) => n + 1)}

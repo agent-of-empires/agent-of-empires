@@ -855,9 +855,13 @@
     },
     {
       "id": "suggestions.first-run-setup",
-      "kind": "vitest",
+      "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["src/components/__tests__/SuggestionsSetup.test.tsx"],
+      "specs": [
+        "tests/suggestions-first-run.spec.ts",
+        "src/components/__tests__/SuggestionsSetup.test.tsx",
+        "src/components/__tests__/DashboardSetupHint.test.tsx"
+      ],
       "components": ["web/src/components/SuggestionsSetupHint.tsx", "web/src/components/SuggestionsSetupSheet.tsx"]
     },
     {

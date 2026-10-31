@@ -2260,6 +2260,7 @@ function AppContent({
           }}
           onViewAllSuggestions={() => requestNavigate("/suggestions")}
           onOpenSuggestionsMarketplace={() => requestNavigate("/settings/plugins?marketplace=suggestions")}
+          tourActive={tour.isTourActive}
         />
       );
     }

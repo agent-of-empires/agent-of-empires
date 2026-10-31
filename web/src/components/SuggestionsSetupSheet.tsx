@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
-import { fetchSuggestions, runSuggestionChecks, type PluginDiscoveryResult } from "../lib/api";
-import type { SuggestionsSnapshot } from "../lib/types";
+import { fetchSuggestions, refreshSuggestions, runSuggestionChecks, type PluginDiscoveryResult } from "../lib/api";
+import { sourceLabel } from "../lib/featuredSuggestionSources";
+import type { SuggestionSetupCheck, SuggestionsSnapshot } from "../lib/types";
 import { PluginInstallConsentModal } from "./settings/PluginInstallConsentModal";
 import { PluginJobProgressModal } from "./settings/PluginJobProgressModal";
 import { sourceFromCommand, usePluginMarketplace, type PluginJobRef } from "./settings/pluginFlows";
@@ -32,27 +33,31 @@ export function SuggestionsSetupSheet({ sources, onClose, onFinished, onOpenMark
   const installing = queue.length > 0;
   const toDone = useCallback(() => setStep("done"), []);
 
+  // Once a plugin is installed, closing finishes the sheet so the hint does not offer the same install again.
+  const close = step === "pick" ? onClose : onFinished;
+
   useEffect(() => {
     if (step === "done") return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !installing) onClose();
+      if (e.key === "Escape" && !installing) close();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [step, installing, onClose]);
+  }, [step, installing, close]);
 
   const startInstall = () => {
     const picked = sources.filter((s) => checked.has(s.slug)).map((s) => sourceFromCommand(s.install_command));
-    if (picked.length === 0) return;
+    const [head] = picked;
+    if (!head) return;
     setQueue(picked);
-    void market.install(picked[0]);
+    void market.install(head);
   };
 
   const jobClosed = () => {
-    const rest = queue.slice(1);
+    const [, next, ...after] = queue;
     setJob(null);
-    setQueue(rest);
-    if (rest.length > 0) void market.install(rest[0]);
+    setQueue(next ? [next, ...after] : []);
+    if (next) void market.install(next);
     else setStep("checks");
   };
 
@@ -61,7 +66,6 @@ export function SuggestionsSetupSheet({ sources, onClose, onFinished, onOpenMark
     setQueue([]);
   };
 
-  const finish = step === "done" ? onFinished : onClose;
   const title = step === "done" ? "Suggestions are on" : "Set up suggestions";
 
   return (
@@ -81,7 +85,7 @@ export function SuggestionsSetupSheet({ sources, onClose, onFinished, onOpenMark
               title="Close"
               aria-label="Close"
               disabled={installing}
-              onClick={onClose}
+              onClick={close}
               className="size-8 rounded-md text-text-dim hover:bg-surface-800 disabled:opacity-50"
               data-testid="suggestions-setup-close"
             >
@@ -108,7 +112,7 @@ export function SuggestionsSetupSheet({ sources, onClose, onFinished, onOpenMark
               You'll see up to 3 on your homepage. Choose a suggestion and start it to keep the work going.
             </p>
             <Footer note="Turn them off any time in Settings › Suggestions.">
-              <button type="button" className={PRIMARY} onClick={finish} data-testid="suggestions-setup-show">
+              <button type="button" className={PRIMARY} onClick={onFinished} data-testid="suggestions-setup-show">
                 Show suggestions
               </button>
             </Footer>
@@ -181,7 +185,7 @@ function PickStep(p: {
               className="mt-0.5 size-[18px] accent-brand-500"
             />
             <span className="min-w-0">
-              <span className="block text-sm text-text-primary">{s.slug}</span>
+              <span className="block text-sm text-text-primary">{sourceLabel(s.slug)}</span>
               {s.description && <span className="block text-xs text-text-muted">{s.description}</span>}
             </span>
           </label>
@@ -231,20 +235,19 @@ function PickStep(p: {
 
 function ChecksStep({ onDone, onFinishLater }: { onDone: () => void; onFinishLater: () => void }) {
   const [snapshot, setSnapshot] = useState<SuggestionsSnapshot | null>(null);
+  const [polling, setPolling] = useState(true);
   const [rechecking, setRechecking] = useState(false);
 
-  const load = useCallback(async () => {
-    const next = await fetchSuggestions();
-    if (next) setSnapshot(next);
-    return next;
-  }, []);
-
+  // Polls until the first suggestions land or a check fails; Check again restarts it.
   useEffect(() => {
+    if (!polling) return;
     let alive = true;
     const tick = async () => {
-      const next = await load();
+      const next = await fetchSuggestions();
       if (!alive) return;
+      if (next) setSnapshot(next);
       if (next && isReady(next)) onDone();
+      else if (next && checkRows(next).some((c) => c.status === "fail")) setPolling(false);
       else timer = setTimeout(() => void tick(), POLL_MS);
     };
     let timer = setTimeout(() => void tick(), 0);
@@ -252,17 +255,18 @@ function ChecksStep({ onDone, onFinishLater }: { onDone: () => void; onFinishLat
       alive = false;
       clearTimeout(timer);
     };
-  }, [load, onDone]);
+  }, [polling, onDone]);
 
-  const checks = snapshot?.providers.flatMap((p) => p.checks ?? []) ?? [];
+  const checks = snapshot ? checkRows(snapshot) : [];
   const firstFail = checks.findIndex((c) => c.status === "fail");
   const failed = firstFail !== -1;
 
   const recheck = async () => {
     setRechecking(true);
     await runSuggestionChecks();
-    await load();
+    if (snapshot?.providers.some((p) => p.status === "error")) await refreshSuggestions();
     setRechecking(false);
+    setPolling(true);
   };
 
   return (
@@ -324,12 +328,30 @@ function ChecksStep({ onDone, onFinishLater }: { onDone: () => void; onFinishLat
   );
 }
 
-/** Done once a provider is loaded, none is still waiting on its first fetch, and no check failed. */
+/** Every provider's reported checks, plus a failed row for a provider whose first fetch errored. */
+function checkRows(s: SuggestionsSnapshot): SuggestionSetupCheck[] {
+  return s.providers.flatMap((p) => [
+    ...(p.checks ?? []),
+    ...(p.status === "error"
+      ? [
+          {
+            id: `${p.id}-fetch`,
+            label: "Couldn't get your first suggestions",
+            status: "fail" as const,
+            detail: "",
+            fix: p.error ?? "",
+          },
+        ]
+      : []),
+  ]);
+}
+
+/** Done once a provider is loaded, every one has fetched successfully, and no check failed. */
 function isReady(s: SuggestionsSnapshot): boolean {
   return (
     s.providers.length > 0 &&
-    s.providers.every((p) => p.status !== "pending") &&
-    !s.providers.some((p) => p.checks?.some((c) => c.status === "fail"))
+    s.providers.every((p) => p.status === "ok") &&
+    !checkRows(s).some((c) => c.status === "fail")
   );
 }
 
