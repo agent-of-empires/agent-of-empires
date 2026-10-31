@@ -838,6 +838,59 @@
       ]
     },
     {
+      "id": "suggestions.review-and-start",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/suggestions-review.spec.ts",
+        "tests/dashboard-suggestions.spec.ts",
+        "tests/suggestions-filter-mapping.spec.ts",
+        "src/components/__tests__/SuggestionsView.test.tsx",
+        "src/components/__tests__/DashboardSuggestions.test.tsx",
+        "src/components/__tests__/SuggestionMappingWizard.test.tsx"
+      ],
+      "components": [
+        "web/src/components/SuggestionsView.tsx",
+        "web/src/components/SuggestionRow.tsx",
+        "web/src/components/DashboardSuggestions.tsx",
+        "web/src/components/SuggestionMappingWizard.tsx"
+      ]
+    },
+    {
+      "id": "sidebar.suggested",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/SidebarSuggestions.test.tsx"],
+      "components": ["web/src/components/sidebar/SidebarSuggestions.tsx", "web/src/components/WorkspaceSidebar.tsx"],
+      "notes": "The Suggested Group shows only while prefs.sidebar is on, and appears without a remount when the pref changes in Settings."
+    },
+    {
+      "id": "suggestions.first-run-setup",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/suggestions-first-run.spec.ts",
+        "src/components/__tests__/SuggestionsSetup.test.tsx",
+        "src/components/__tests__/DashboardSetupHint.test.tsx"
+      ],
+      "components": ["web/src/components/SuggestionsSetupHint.tsx", "web/src/components/SuggestionsSetupSheet.tsx"]
+    },
+    {
+      "id": "settings.suggestions",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/settings-suggestions.spec.ts", "src/components/settings/__tests__/SuggestionsSettings.test.tsx"],
+      "components": [
+        "web/src/components/settings/SuggestionsSettings.tsx",
+        "web/src/components/settings/PluginSettingsSections.tsx",
+        "web/src/components/settings/SuggestionTemplates.tsx",
+        "web/src/components/settings/TemplateEditor.tsx",
+        "web/src/components/settings/suggestionsShared.tsx",
+        "web/src/components/settings/useSuggestionsSnapshot.ts",
+        "web/src/lib/suggestionTemplate.ts"
+      ]
+    },
+    {
       "id": "settings.advanced-fold",
       "kind": "vitest",
       "risk": "medium",
@@ -5118,6 +5171,7 @@
         "web/src/components/settings/PluginIdentityIcon.tsx",
         "web/src/components/settings/PluginCard.tsx",
         "web/src/components/settings/PluginMarketplace.tsx",
+        "web/src/components/settings/pluginFlows.ts",
         "web/src/components/settings/PluginModal.tsx"
       ]
     },

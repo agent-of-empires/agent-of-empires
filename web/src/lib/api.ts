@@ -20,9 +20,16 @@ import type {
   CreationTrustFingerprint,
   ImportableSession,
   SettingsFieldDescriptor,
+  SuggestionMapping,
+  SuggestionProject,
+  SuggestionPrefs,
+  SuggestionPrepared,
+  SuggestionTemplate,
+  SuggestionsSnapshot,
 } from "./types";
 import type { ConfigOptionDescriptor } from "./acpTypes";
 import { clearDeviceBindingSecret, getOrCreateDeviceBindingSecret } from "./deviceBinding";
+import { notifySuggestionsChanged } from "./suggestionEvents";
 
 type Payload = Record<string, unknown>;
 
@@ -667,6 +674,8 @@ export interface PluginDiscoveryResult {
   description: string | null;
   stars: number;
   badge: "installed" | "featured" | "unvetted";
+  /** The featured index marks the manifest as declaring `[suggestions]`. */
+  suggestions: boolean;
   install_command: string;
   /** The repo owner's GitHub avatar; a source-identity affordance, NOT the
    *  plugin's own icon (unknown until a manifest fetch, which discovery
@@ -3215,3 +3224,97 @@ export async function syncSkills(options?: {
     };
   }
 }
+
+// --- Suggested sessions ---
+
+export type SuggestionResult<T = undefined> = { ok: true; data: T } | { ok: false; error: string; stale: boolean };
+
+export function fetchSuggestions(): Promise<SuggestionsSnapshot | null> {
+  return fetchJson<SuggestionsSnapshot>("/api/suggestions");
+}
+
+async function suggestionRequest<T>(url: string, method: string, body?: unknown): Promise<SuggestionResult<T>> {
+  try {
+    const res = await fetch(url, jsonInit(method, body));
+    const text = await res.text();
+    if (!res.ok) return { ok: false, error: parseApiErrorText(text, res.status), stale: res.status === 409 };
+    return { ok: true, data: (text ? JSON.parse(text) : undefined) as T };
+  } catch (error) {
+    return {
+      ok: false,
+      error: `Network error: ${error instanceof Error ? error.message : "connection failed"}`,
+      stale: false,
+    };
+  }
+}
+
+/** A change other mounted suggestion views must reload for, such as the sidebar section. */
+async function suggestionMutation(url: string, method: string, body?: unknown): Promise<SuggestionResult<unknown>> {
+  const result = await suggestionRequest(url, method, body);
+  if (result.ok) notifySuggestionsChanged();
+  return result;
+}
+
+export const refreshSuggestions = () => suggestionRequest("/api/suggestions/refresh", "POST");
+
+export const runSuggestionFix = (providerId: string) =>
+  suggestionRequest("/api/suggestions/fix", "POST", { provider_id: providerId });
+
+/** Asks every provider to re-run its setup checks; results arrive on the next snapshot. */
+export const runSuggestionChecks = () => suggestionRequest("/api/suggestions/checks/run", "POST");
+
+export const dismissSuggestion = (providerId: string, id: string, dismissed: boolean) =>
+  suggestionMutation(`/api/suggestions/${dismissed ? "dismiss" : "undismiss"}`, "POST", {
+    provider_id: providerId,
+    id,
+  });
+
+export const updateSuggestionSource = (providerId: string, criterion: string, enabled: boolean) =>
+  suggestionMutation("/api/suggestions/sources", "PATCH", { provider_id: providerId, criterion, enabled });
+
+/** Resolves the wizard prefill. Creates nothing. */
+export const prepareSuggestion = (providerId: string, id: string) =>
+  suggestionRequest<SuggestionPrepared>("/api/suggestions/prepare", "POST", { provider_id: providerId, id });
+
+export type SuggestionPrefsPatch = Partial<Omit<SuggestionPrefs, "provider_order">> & {
+  provider_order?: string[];
+  provider_enabled?: Record<string, boolean>;
+};
+
+export const updateSuggestionPrefs = (patch: SuggestionPrefsPatch) =>
+  suggestionMutation("/api/suggestions/prefs", "PATCH", patch);
+
+export async function fetchSuggestionTemplates(): Promise<SuggestionTemplate[] | null> {
+  const body = await fetchJson<{ templates: SuggestionTemplate[] }>("/api/suggestions/templates");
+  return body?.templates ?? null;
+}
+
+export const putSuggestionTemplate = (providerId: string, criterion: string, template: string) =>
+  suggestionRequest("/api/suggestions/templates", "PUT", { provider_id: providerId, criterion, template });
+
+/** Drops the override, so the provider's own prompt applies again. */
+export const resetSuggestionTemplate = (providerId: string, criterion: string) =>
+  suggestionRequest("/api/suggestions/templates", "DELETE", { provider_id: providerId, criterion });
+
+export async function fetchSuggestionMappings(): Promise<SuggestionMapping[] | null> {
+  const body = await fetchJson<{ mappings: SuggestionMapping[] }>("/api/suggestions/mappings");
+  return body?.mappings ?? null;
+}
+
+export const putSuggestionMapping = (providerId: string, mappingKey: string, projects: string[]) =>
+  suggestionRequest("/api/suggestions/mappings", "PUT", {
+    provider_id: providerId,
+    mapping_key: mappingKey,
+    projects,
+  });
+
+export async function fetchSuggestionProjects(): Promise<SuggestionProject[] | null> {
+  const body = await fetchJson<{ projects: SuggestionProject[] }>("/api/suggestions/projects");
+  return body?.projects ?? null;
+}
+
+export const deleteSuggestionMapping = (providerId: string, mappingKey: string) =>
+  suggestionRequest(
+    `/api/suggestions/mappings?${new URLSearchParams({ provider_id: providerId, mapping_key: mappingKey })}`,
+    "DELETE",
+  );

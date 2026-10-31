@@ -1,0 +1,413 @@
+import { useState } from "react";
+import { FolderGit2, RefreshCw, Search, Settings, X } from "lucide-react";
+import { OFFLINE_TITLE } from "../lib/connectionState";
+import { agoLabel } from "../lib/suggestionTime";
+import { chipId, filterSuggestions, keyChipGroups, type KeyChip } from "../lib/suggestionFilter";
+import type { SuggestionItem, SuggestionProvider } from "../lib/types";
+import { suggestionKey, useDismissUndo, useSuggestions } from "../hooks/useSuggestions";
+import { SuggestionMappingWizard } from "./SuggestionMappingWizard";
+import { SuggestionsSetupHint } from "./SuggestionsSetupHint";
+import {
+  SUGGESTION_NOTE_CLASS,
+  SuggestionActions,
+  SuggestionRow,
+  SuggestionStatusNotes,
+  UndoBar,
+} from "./SuggestionRow";
+import type { SessionResponse } from "../lib/types";
+import type { WizardPrefill } from "./session-wizard/SessionWizard";
+
+interface Props {
+  readOnly?: boolean;
+  /** Opens on the Dismissed filter. */
+  initialDismissed?: boolean;
+  onPrepare: (prefill: WizardPrefill) => void;
+  onOpenSession: (sessionId: string) => void;
+  onOpenSettings?: () => void;
+  /** Called when "Start without review" created the session directly. */
+  onStarted?: (session: SessionResponse) => void;
+  /** Set when the first-run hint can open the Marketplace (not read-only or CityHall). */
+  onOpenMarketplace?: () => void;
+}
+
+type Filter = "all" | "dismissed" | { provider: string };
+
+const CHIP = "inline-flex h-8 flex-none items-center gap-1.5 rounded-full border px-3 text-xs";
+
+function providerStatus(provider: SuggestionProvider, itemCount: number) {
+  if (provider.refreshing) return { text: `⠙ ${provider.name}: refreshing…`, tone: "text-text-muted" };
+  if (provider.status === "pending")
+    return { text: `${provider.name}: waiting for first results`, tone: "text-text-muted" };
+  if (provider.status === "error")
+    return {
+      text: `${provider.name}: couldn't refresh, ${provider.error ?? "provider error"}`,
+      tone: "text-status-error",
+    };
+  if (itemCount === 0) return { text: `${provider.name}: nothing new`, tone: "text-text-dim" };
+  const updated = provider.updated_at ? `updated ${agoLabel(provider.updated_at * 1000)}` : "updated";
+  return { text: `${provider.name}: ${updated}`, tone: "text-text-secondary" };
+}
+
+/** Items by the Project they resolve to, in first-seen order with unresolved last. */
+function groupByProject(items: SuggestionItem[]) {
+  const groups = new Map<string, { name: string; items: SuggestionItem[] }>();
+  for (const item of items) {
+    const key = item.resolved_project?.path ?? "";
+    const group = groups.get(key) ?? { name: item.resolved_project?.name ?? "No project", items: [] };
+    group.items.push(item);
+    groups.set(key, group);
+  }
+  return [...groups.entries()]
+    .sort(([a], [b]) => Number(a === "") - Number(b === ""))
+    .map(([key, group]) => ({ key, ...group }));
+}
+
+export function SuggestionsView({
+  readOnly = false,
+  initialDismissed = false,
+  onPrepare,
+  onOpenSession,
+  onOpenSettings,
+  onStarted,
+  onOpenMarketplace,
+}: Props) {
+  const { snapshot, loading, loadFailed, refreshing, busy, notice, failures, offline, act, refresh, start, load } =
+    useSuggestions(onPrepare, onStarted);
+  const { undo, dismiss } = useDismissUndo(act);
+  const [filter, setFilter] = useState<Filter>(initialDismissed ? "dismissed" : "all");
+  const [query, setQuery] = useState("");
+  const [keyChips, setKeyChips] = useState<KeyChip[]>([]);
+  const [mapping, setMapping] = useState(false);
+
+  const disabled = readOnly || offline;
+  const unavailableTitle = readOnly ? "Read-only dashboard" : offline ? OFFLINE_TITLE : undefined;
+
+  const items = snapshot?.items ?? [];
+  const active = items.filter((item) => !item.dismissed);
+  const dismissedCount = items.length - active.length;
+  const showDismissed = filter === "dismissed";
+  const listed =
+    filter === "all"
+      ? active
+      : showDismissed
+        ? items.filter((i) => i.dismissed)
+        : active.filter((i) => i.provider_id === filter.provider);
+  const chipGroups = keyChipGroups(listed);
+  const narrowed = query.trim() !== "" || keyChips.length > 0;
+  const visible = filterSuggestions(listed, query, keyChips);
+  const toggleChip = (chip: KeyChip) =>
+    setKeyChips((current) =>
+      current.some((c) => chipId(c) === chipId(chip))
+        ? current.filter((c) => chipId(c) !== chipId(chip))
+        : [...current, chip],
+    );
+  const chipSelected = (chip: KeyChip) => keyChips.some((c) => chipId(c) === chipId(chip));
+  const providers = snapshot?.providers.filter((p) => p.enabled) ?? [];
+  const anyRefreshing = refreshing || providers.some((p) => p.refreshing);
+  const groups = groupByProject(visible);
+  const headed = groups.some((g) => g.key !== "");
+  const chip = (selected: boolean) =>
+    `${CHIP} ${selected ? "border-brand-500 bg-brand-500/10 text-text-primary" : "border-surface-700 text-text-secondary hover:bg-surface-800"}`;
+
+  const noProviderNote =
+    !readOnly && onOpenMarketplace ? (
+      <SuggestionsSetupHint
+        ignoreDismissed
+        noProvider
+        onOpenMarketplace={onOpenMarketplace}
+        onFinished={() => void load()}
+        fallback="No plugin provides suggestions."
+      />
+    ) : (
+      "No plugin provides suggestions."
+    );
+
+  return (
+    <main className="flex-1 min-h-0 overflow-y-auto bg-surface-900 text-text-primary">
+      <div className="mx-auto max-w-4xl p-4 md:p-8">
+        <header className="flex items-start justify-between gap-4">
+          <div>
+            <h1 className="text-lg font-semibold">Suggested sessions</h1>
+            <p className="mt-2 max-w-2xl text-sm text-text-secondary">
+              Start opens the new session wizard with the draft prompt. Nothing runs until you press Launch.
+            </p>
+          </div>
+          <div className="flex flex-none items-center gap-1">
+            {items.some((i) => i.mapping_key) && (
+              <button
+                type="button"
+                aria-label="Map projects"
+                onClick={() => setMapping(true)}
+                disabled={disabled}
+                title={unavailableTitle ?? "Map sources to Projects"}
+                className="inline-flex h-8 items-center gap-2 rounded-md border border-surface-700 px-2.5 text-sm text-text-secondary hover:bg-surface-800 disabled:opacity-50 md:px-3"
+              >
+                <FolderGit2 className="h-4 w-4" />
+                <span className="hidden md:inline">Map projects</span>
+              </button>
+            )}
+            <button
+              type="button"
+              aria-label="Refresh"
+              onClick={() => void refresh()}
+              disabled={anyRefreshing || disabled}
+              title={unavailableTitle}
+              className="inline-flex h-8 items-center gap-2 rounded-md border border-surface-700 px-2.5 text-sm text-text-secondary hover:bg-surface-800 disabled:opacity-50 md:px-3"
+            >
+              <RefreshCw className={`h-4 w-4 ${anyRefreshing ? "animate-spin" : ""}`} />
+              <span className="hidden md:inline">{anyRefreshing ? "Refreshing…" : "Refresh"}</span>
+            </button>
+            {onOpenSettings && (
+              <button
+                type="button"
+                aria-label="Settings › Suggestions"
+                title="Settings › Suggestions"
+                onClick={onOpenSettings}
+                className="inline-flex h-8 w-8 items-center justify-center rounded-md text-text-secondary hover:bg-surface-800"
+              >
+                <Settings className="h-4 w-4" />
+              </button>
+            )}
+          </div>
+        </header>
+
+        {(notice || loadFailed) && (
+          <div
+            role="alert"
+            className="mt-4 rounded-md border border-status-error/40 bg-status-error/10 p-3 text-sm text-status-error"
+          >
+            {notice ?? "Could not load suggestions."}
+          </div>
+        )}
+
+        {snapshot && (
+          <>
+            <div className="mt-4 flex gap-2 overflow-x-auto" role="group" aria-label="Filter suggestions">
+              <button
+                type="button"
+                aria-pressed={filter === "all"}
+                onClick={() => setFilter("all")}
+                className={chip(filter === "all")}
+              >
+                All <span className="text-text-dim">{active.length}</span>
+              </button>
+              {providers.map((p) => {
+                const selected = typeof filter === "object" && filter.provider === p.id;
+                return (
+                  <button
+                    key={p.id}
+                    type="button"
+                    aria-pressed={selected}
+                    onClick={() => setFilter({ provider: p.id })}
+                    className={chip(selected)}
+                  >
+                    {p.name}{" "}
+                    <span className="text-text-dim">{active.filter((i) => i.provider_id === p.id).length}</span>
+                  </button>
+                );
+              })}
+              {(dismissedCount > 0 || showDismissed) && (
+                <button
+                  type="button"
+                  aria-pressed={showDismissed}
+                  onClick={() => setFilter("dismissed")}
+                  className={chip(showDismissed)}
+                >
+                  Dismissed <span className="text-text-dim">{dismissedCount}</span>
+                </button>
+              )}
+            </div>
+            {listed.length > 0 && (
+              <div className="mt-3 flex flex-col gap-2">
+                <div className="flex items-center gap-2">
+                  <label className="relative flex-1">
+                    <Search className="pointer-events-none absolute left-2.5 top-2 h-4 w-4 text-text-dim" />
+                    <input
+                      type="search"
+                      aria-label="Search suggestions"
+                      placeholder="Search title, reference, reason or source"
+                      value={query}
+                      onChange={(e) => setQuery(e.target.value)}
+                      className="h-8 w-full rounded-md border border-surface-700 bg-surface-800 pl-8 pr-2 text-sm text-text-primary placeholder:text-text-dim"
+                    />
+                  </label>
+                  {narrowed && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setQuery("");
+                        setKeyChips([]);
+                      }}
+                      className="inline-flex h-8 flex-none items-center gap-1 rounded-md px-2.5 text-xs text-text-secondary hover:bg-surface-800"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                      Clear filters
+                    </button>
+                  )}
+                </div>
+                {chipGroups.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5" role="group" aria-label="Filter by source">
+                    {chipGroups.flatMap((group) => {
+                      const keyChipsOf = group.keys.map(({ key, label, count }) => (
+                        <button
+                          key={`key:${key}`}
+                          type="button"
+                          aria-pressed={chipSelected({ key })}
+                          title={key}
+                          onClick={() => toggleChip({ key })}
+                          className={chip(chipSelected({ key }))}
+                        >
+                          <span className="font-mono">{label}</span> <span className="text-text-dim">{count}</span>
+                        </button>
+                      ));
+                      if (group.org === null) return keyChipsOf;
+                      const org = { org: group.org };
+                      return [
+                        <button
+                          key={`org:${group.org}`}
+                          type="button"
+                          aria-pressed={chipSelected(org)}
+                          title={`Everything under ${group.org}/`}
+                          onClick={() => toggleChip(org)}
+                          className={chip(chipSelected(org))}
+                        >
+                          <span className="font-mono">{group.org}/</span>{" "}
+                          <span className="text-text-dim">{group.count}</span>
+                        </button>,
+                        ...keyChipsOf,
+                      ];
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+            <ul
+              aria-label="Provider status"
+              className="mt-3 flex flex-col gap-1 font-mono text-xs md:flex-row md:flex-wrap md:gap-x-[18px]"
+            >
+              {snapshot.providers
+                .filter((p) => p.enabled)
+                .map((provider) => {
+                  const { text, tone } = providerStatus(
+                    provider,
+                    items.filter((i) => i.provider_id === provider.id).length,
+                  );
+                  return (
+                    <li key={provider.id} className={tone}>
+                      {text}
+                    </li>
+                  );
+                })}
+            </ul>
+          </>
+        )}
+
+        {loading && !snapshot && (
+          <p role="status" className="py-10 text-center text-sm text-text-dim">
+            Loading suggestions…
+          </p>
+        )}
+        {snapshot && (
+          <>
+            {groups.map((group) => (
+              <section key={group.key} aria-label={headed ? `Project ${group.name}` : undefined}>
+                {headed && (
+                  <h2 className="mx-1 mb-1.5 mt-4 font-mono text-xs text-text-secondary">
+                    {group.name} <span className="text-text-dim">{group.items.length}</span>
+                  </h2>
+                )}
+                <ul
+                  className={`overflow-hidden rounded-lg border border-surface-700/40 bg-surface-900 ${headed ? "" : "mt-4"}`}
+                >
+                  {group.items.map((item) => {
+                    const key = suggestionKey(item);
+                    const providerName =
+                      snapshot.providers.find((p) => p.id === item.provider_id)?.name ?? item.provider_id;
+                    return (
+                      <SuggestionRow
+                        key={key}
+                        title={item.title}
+                        source={providerName}
+                        sourceRef={snapshot.prefs.show_source_ref ? item.source_ref : undefined}
+                        reason={item.reason}
+                        project={item.resolved_project?.name ?? item.project}
+                        session={item.started_session}
+                        stale={item.stale}
+                        failure={failures[key]?.message}
+                        actions={
+                          <SuggestionActions
+                            dismissed={item.dismissed}
+                            readOnly={readOnly}
+                            offline={offline}
+                            busy={busy !== null}
+                            onStart={() => void start(item, failures[key]?.another)}
+                            stale={item.stale}
+                            failed={key in failures}
+                            started={
+                              item.started_session && {
+                                onOpen: () => onOpenSession(item.started_session!.id),
+                                onStartAnother: () => void start(item, true),
+                                providerName,
+                                sourceUrl: item.source_url,
+                              }
+                            }
+                            onToggleDismiss={() => void dismiss(item, !item.dismissed)}
+                          />
+                        }
+                      />
+                    );
+                  })}
+                </ul>
+              </section>
+            ))}
+            <ul className="mt-4 overflow-hidden rounded-lg border border-surface-700/40 bg-surface-900 empty:hidden">
+              {visible.length === 0 && (
+                <li className={SUGGESTION_NOTE_CLASS}>
+                  {narrowed && listed.length > 0
+                    ? "No suggestions match the filters."
+                    : showDismissed
+                      ? "No dismissed suggestions."
+                      : snapshot.providers.length === 0
+                        ? noProviderNote
+                        : "Nothing to suggest right now."}
+                </li>
+              )}
+              {snapshot.providers
+                .filter((p) => !p.enabled)
+                .map((p) => (
+                  <li key={p.id} className={SUGGESTION_NOTE_CLASS}>
+                    {p.name} suggestions are hidden because {p.name} is off in Settings › Suggestions.{" "}
+                    {onOpenSettings && (
+                      <button
+                        type="button"
+                        onClick={onOpenSettings}
+                        className="cursor-pointer text-brand-500 hover:underline"
+                      >
+                        Turn it on
+                      </button>
+                    )}
+                  </li>
+                ))}
+              <SuggestionStatusNotes readOnly={readOnly} offline={offline} />
+            </ul>
+            {undo && (
+              <UndoBar
+                title={undo.title}
+                disabled={busy !== null || disabled}
+                onUndo={() => void dismiss(undo, false)}
+              />
+            )}
+          </>
+        )}
+      </div>
+      {mapping && snapshot && (
+        <SuggestionMappingWizard
+          items={items}
+          providers={snapshot.providers}
+          disabled={disabled}
+          onClose={() => setMapping(false)}
+        />
+      )}
+    </main>
+  );
+}

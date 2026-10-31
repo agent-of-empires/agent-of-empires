@@ -20,7 +20,7 @@ Every plugin declares identity, what it contributes, and, with a worker, how to 
 id = "dev.example.my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = 19
+api_version = 20
 aoe_version = ">=1.11.0, <2.0.0"
 description = "What the plugin does."
 
