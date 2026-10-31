@@ -27,7 +27,7 @@ export function DashboardSuggestions({ readOnly = false, onPrepare, onStarted, o
   );
   const { undo, dismiss, clearUndo } = useDismissUndo(act);
 
-  if (!snapshot || snapshot.providers.length === 0) return null;
+  if (!snapshot || snapshot.providers.length === 0 || !snapshot.prefs.homepage) return null;
 
   const active = snapshot.items.filter((item) => !item.dismissed);
   const rows = active.slice(0, wide ? 3 : 2);

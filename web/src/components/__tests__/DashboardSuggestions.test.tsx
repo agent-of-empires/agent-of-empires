@@ -38,9 +38,17 @@ const mk = (n: number, over: Partial<SuggestionItem> = {}): SuggestionItem => ({
   dismissed: false,
   ...over,
 });
+const PREFS: SuggestionsSnapshot["prefs"] = {
+  homepage: true,
+  sidebar: false,
+  refresh_minutes: 15,
+  start_without_review: false,
+  provider_order: [],
+};
 const snap = (items: SuggestionItem[], status: "ok" | "pending" = "ok"): SuggestionsSnapshot => ({
   items,
   providers: [{ id: "github", name: "GitHub", status, sources: [] }],
+  prefs: PREFS,
 });
 const ok = { ok: true, data: undefined };
 
@@ -72,7 +80,15 @@ describe("DashboardSuggestions", () => {
   });
 
   it("renders nothing without a provider", async () => {
-    fetchSuggestions.mockResolvedValue({ items: [], providers: [] });
+    fetchSuggestions.mockResolvedValue({ items: [], providers: [], prefs: PREFS });
+    const { container } = renderIt();
+    await waitFor(() => expect(fetchSuggestions).toHaveBeenCalled());
+    await act(async () => {});
+    expect(container.innerHTML).toBe("");
+  });
+
+  it("renders nothing when the homepage setting is off", async () => {
+    fetchSuggestions.mockResolvedValue({ ...snap([mk(1)]), prefs: { ...PREFS, homepage: false } });
     const { container } = renderIt();
     await waitFor(() => expect(fetchSuggestions).toHaveBeenCalled());
     await act(async () => {});
@@ -118,6 +134,7 @@ describe("DashboardSuggestions", () => {
   it("Stop suggesting turns the item's kind off and closes the bar", async () => {
     const withKind = (items: SuggestionItem[]): SuggestionsSnapshot => ({
       items,
+      prefs: PREFS,
       providers: [
         {
           id: "github",
