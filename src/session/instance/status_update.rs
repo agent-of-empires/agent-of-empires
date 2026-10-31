@@ -1511,7 +1511,7 @@ HISTORY_READY",
             &format!("cat {}; exec sleep 300", shell_quote(&pane_file)),
         );
         assert!(wait_for_pane(&session_name, "HISTORY_READY"));
-        let cache = crate::tmux::SessionCacheGuard::capture();
+        let cache = crate::tmux::SessionCacheGuard::capture_restore_only();
         cache.force_present(&[session_name.as_str()]);
         let mut metadata = agent_pane_metadata("omp", None);
         metadata.pane_title = Some(String::new());
@@ -1534,6 +1534,7 @@ HISTORY_READY",
         inst.status = Status::Running;
         inst.last_error = None;
         metadata.pane_current_command = Some("bash".to_owned());
+        cache.force_stale();
         inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
         inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
         assert_eq!(
