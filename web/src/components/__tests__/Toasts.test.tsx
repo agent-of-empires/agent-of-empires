@@ -122,6 +122,15 @@ describe("click-to-open (ui.open_url) toast", () => {
     expect(screen.queryByText("Open link")).toBeNull();
     open.mockRestore();
   });
+
+  it("keeps the error styling of a clickable toast", () => {
+    renderProvider();
+    act(() => toastBus.handler?.openLink("Approve?", "/plugins/acme.kit/approvals?link=ab12", "error"));
+
+    const toast = screen.getByText("Approve?").closest("div");
+    expect(toast?.getAttribute("role")).toBe("alert");
+    expect(toast?.className).toContain("cursor-pointer");
+  });
 });
 
 describe("ToastBusBridge", () => {

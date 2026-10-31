@@ -242,7 +242,7 @@ test.describe("Plugin pages (#4460)", () => {
       {
         aoeBridge: 1,
         event: "context",
-        data: { readOnly: false, cityhall: false, pluginId: "acme.kit", pageId: "board", bridgeVersion: 1 },
+        data: { readOnly: false, cityhall: false, pluginId: "acme.kit", pageId: "board", bridgeVersion: 1, link: null },
       },
       { aoeBridge: 1, event: "theme", data: { appearance: "light", cssVars: { "--color-surface-900": "#ffffff" } } },
     ]);
@@ -429,5 +429,79 @@ test.describe("Plugin pages (#4460)", () => {
       [],
     );
     expect(actions).toEqual([]);
+  });
+
+  // Reports every `link` the host hands the page: the context push and later link pushes.
+  const LINK_FIXTURE = `<!doctype html><p>link fixture</p><script>
+const { port1, port2 } = new MessageChannel();
+port1.onmessage = (e) => {
+  const m = e.data;
+  if (m.event === "context" || m.event === "link") parent.postMessage({ kind: "link", event: m.event, link: m.data.link }, "*");
+};
+parent.postMessage({ aoeBridge: 1, id: 1, method: "ready", params: { nonce: location.hash.slice(1) } }, "*", [port2]);
+</script>`;
+
+  const linkReports = (page: Page) =>
+    page.evaluate(() =>
+      (
+        window as typeof window & { __frameReports: { kind?: string; event?: string; link?: string | null }[] }
+      ).__frameReports
+        .filter((m) => m?.kind === "link")
+        .map(({ event, link }) => `${event}:${link}`),
+    );
+
+  test("a deep-linked page gets the URL's link over the bridge only when it opted in and the value is safe", async ({
+    page,
+  }) => {
+    const cases = [
+      { deepLink: true, query: "ab12-CD_3.~", want: "context:ab12-CD_3.~" },
+      { deepLink: true, query: "a%20b", want: "context:null" },
+      { deepLink: false, query: "ab12", want: "context:null" },
+    ];
+    for (const { deepLink, query, want } of cases) {
+      await mockApis(page, [{ ...PAGE, deep_link: deepLink }]);
+      await page.route(`**${PAGE.url}`, (r) =>
+        r.fulfill({ contentType: "text/html", headers: { "content-security-policy": PAGE_CSP }, body: LINK_FIXTURE }),
+      );
+      await page.goto(`/plugins/acme.kit/board?link=${query}`);
+      await expect(page.getByTestId("plugin-page-frame")).toHaveAttribute(
+        "src",
+        new RegExp(`^${PAGE.url}#[0-9a-f]{32}$`),
+      );
+      await expect.poll(() => linkReports(page)).toEqual([want]);
+      await page.evaluate(() => ((window as typeof window & { __frameReports: unknown[] }).__frameReports.length = 0));
+    }
+  });
+
+  test("a notification toast with a link keeps its tone and opens the page on that item", async ({ page }) => {
+    const seed = { seq: 1, plugin_id: "acme.kit", tone: "info", title: "seed" };
+    const alert = {
+      seq: 2,
+      plugin_id: "acme.kit",
+      tone: "danger",
+      title: "Approve?",
+      link: "/plugins/acme.kit/board?link=ab12",
+    };
+    let polls = 0;
+    await mockApis(page, [{ ...PAGE, deep_link: true }]);
+    await page.route("**/api/plugins/ui-state", (r) =>
+      r.fulfill({
+        json: {
+          entries: [],
+          notifications: polls++ === 0 ? [seed] : [seed, alert],
+          pages: [{ ...PAGE, deep_link: true }],
+        },
+      }),
+    );
+    await page.route(`**${PAGE.url}`, (r) =>
+      r.fulfill({ contentType: "text/html", headers: { "content-security-policy": PAGE_CSP }, body: LINK_FIXTURE }),
+    );
+
+    await page.goto("/session/sess-a");
+    const toast = page.getByRole("alert").filter({ hasText: "Approve?" });
+    await expect(toast).toBeVisible({ timeout: 10_000 });
+    await toast.click();
+    await expect(page).toHaveURL("/plugins/acme.kit/board?link=ab12");
+    await expect.poll(() => linkReports(page)).toEqual(["context:ab12"]);
   });
 });

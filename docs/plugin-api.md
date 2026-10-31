@@ -328,6 +328,7 @@ id = "my_pane"
 | `title` | string | page only | Page name shown in the dashboard. Required on a `page`. |
 | `icon` | string | no | Page only. A [lucide](https://lucide.dev/icons/) kebab-case icon name. |
 | `entry` | string | page only | Plugin-relative path to the page's `.html` file. Required on a `page`. See [Pages](#pages). |
+| `deep_link` | bool | no | Page only. Opts the page in to receive the `?link=` value of its dashboard URL. See [Deep links](#deep-links). |
 
 | Slot | Scope | Renders |
 |---|---|---|
@@ -385,9 +386,10 @@ Error codes: `unknown_method`, `invalid_params` (also an `id` that `sessions.lis
 
 The dashboard pushes `{ "aoeBridge": 1, "event", "data" }` messages, with no `id`:
 
-- `context`, once after `ready`: `{ "readOnly", "cityhall", "pluginId", "pageId", "bridgeVersion" }`.
+- `context`, once after `ready`: `{ "readOnly", "cityhall", "pluginId", "pageId", "bridgeVersion", "link" }`. `link` is the page's [deep link](#deep-links) value, or `null`; hosts without deep links omit it.
 - `theme`, after `ready` and on every theme change: `{ "appearance": "dark" | "light", "cssVars": { "--name": "value" } }`, the dashboard's resolved CSS variables.
 - `selection`, after `ready` and whenever it changes: `{ "sessionId" }`, the session split view shows below the page, or `null`.
+- `link`, whenever the deep link changes while the page is open: `{ "link" }`, the new value or `null`.
 
 When the frame loads a second document, because the page reloaded or navigated itself, the dashboard removes the frame and offers to reopen it. A minimal client:
 
@@ -422,6 +424,14 @@ request({ method: "ready", params: { nonce: location.hash.slice(1) } }, (m) => p
   .then(() => call<{ id: string }[]>("sessions.list"))
   .then((sessions) => console.log(sessions));
 ```
+
+#### Deep links
+
+A page with `deep_link = true` can be opened on one item: `/plugins/{id}/{page_id}?link={value}`. The dashboard, not the page URL, takes the value: the frame URL still refuses a query string, and the value reaches the page only as `context.link` after `ready` and as later `link` pushes. `value` is 1 to 128 characters of `A-Z a-z 0-9 - _ . ~`, so it never needs escaping; anything else, or a page without `deep_link`, yields `null`.
+
+The value is opaque to the host and chosen by the plugin, for example an item id. Treat it as untrusted input: look the item up yourself, and show the plain page for an unknown value. It never grants anything, and the dashboard's login is unchanged: a user who is not signed in sees the sign-in screen at the same URL, then the page.
+
+`ui.notify` takes an optional `link: { "page", "value" }` naming one of the plugin's own pages with `deep_link = true`; the host builds the URL above, so clicking the toast in the web dashboard opens the page on that item. The toast keeps its `tone`, and the TUI shows it without a link. A page that is undeclared or lacks `deep_link`, or a malformed value, is rejected with `invalid_params`. For a message sent outside aoe, use the absolute URL on the dashboard's own origin.
 
 ### Badge payload
 

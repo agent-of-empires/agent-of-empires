@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 
 use crate::events::{self, Order, Schema, SeqBound};
 use crate::plugin::protocol::codes;
-use crate::plugin::ui_state::{Tone, UiError, UiSnapshot, UiStore};
+use crate::plugin::ui_state::{NotifyTarget, Tone, UiError, UiSnapshot, UiStore};
 use crate::session::Storage;
 
 const CAP_WORKER: &str = "runtime.worker";
@@ -113,6 +113,8 @@ pub struct PluginRpcContext {
     pub plugin_id: String,
     pub granted_capabilities: Vec<String>,
     pub ui_contributions: HashSet<(UiSlot, String)>,
+    /// Ids of the plugin's pages that declare `deep_link`.
+    pub deep_link_pages: HashSet<String>,
     pub ui_generation: u64,
 }
 
@@ -830,11 +832,39 @@ fn ui_notify(
         Some(v) => serde_json::from_value::<Tone>(v.clone())
             .map_err(|_| DispatchError::invalid_params(format!("unknown tone {v}")))?,
     };
+    let link = notify_link_path(ctx, params.get("link"))?.map(NotifyTarget::Link);
     let seq = state
         .ui
-        .notify(&ctx.plugin_id, tone, title, body, session_id, None)
+        .notify(&ctx.plugin_id, tone, title, body, session_id, link)
         .map_err(ui_dispatch_error)?;
     Ok(json!({ "seq": seq }))
+}
+
+/// The dashboard path for a notification `link` `{ page, value }`: an opted-in page of the plugin.
+fn notify_link_path(
+    ctx: &PluginRpcContext,
+    link: Option<&Value>,
+) -> Result<Option<String>, DispatchError> {
+    let link = match link {
+        None | Some(Value::Null) => return Ok(None),
+        Some(link) => link,
+    };
+    let page = str_param(link, "page")?;
+    let value = str_param(link, "value")?;
+    if !ctx.deep_link_pages.contains(page) {
+        return Err(DispatchError::invalid_params(format!(
+            "link page {page:?} is not a page of this plugin with deep_link = true"
+        )));
+    }
+    if !aoe_plugin_api::deep_link_value_ok(value) {
+        return Err(DispatchError::invalid_params(
+            "link value must be 1 to 128 characters of letters, digits, - _ . ~",
+        ));
+    }
+    Ok(Some(format!(
+        "/plugins/{}/{page}?link={value}",
+        ctx.plugin_id
+    )))
 }
 
 fn ui_open_url(
@@ -855,7 +885,7 @@ fn ui_open_url(
             title,
             None,
             session_id,
-            Some(url),
+            Some(NotifyTarget::Href(url)),
         )
         .map_err(ui_dispatch_error)?;
     Ok(json!({ "seq": seq }))
@@ -883,6 +913,7 @@ mod tests {
             plugin_id: "acme.worker".to_string(),
             granted_capabilities: caps.iter().map(|c| c.to_string()).collect(),
             ui_contributions: HashSet::new(),
+            deep_link_pages: Default::default(),
             ui_generation: 0,
         }
     }
@@ -919,6 +950,7 @@ mod tests {
             plugin_id: plugin_id.to_string(),
             granted_capabilities: caps.iter().map(|c| c.to_string()).collect(),
             ui_contributions: HashSet::new(),
+            deep_link_pages: Default::default(),
             ui_generation: 0,
         }
     }
@@ -1310,6 +1342,7 @@ mod tests {
             plugin_id: "other.plugin".to_string(),
             granted_capabilities: vec![CAP_WORKER.to_string()],
             ui_contributions: HashSet::new(),
+            deep_link_pages: Default::default(),
             ui_generation: 0,
         };
         assert_eq!(
@@ -1329,6 +1362,7 @@ mod tests {
             plugin_id: "acme.worker".to_string(),
             granted_capabilities: caps.iter().map(|c| c.to_string()).collect(),
             ui_contributions: contributions,
+            deep_link_pages: Default::default(),
             ui_generation: state.begin_ui_generation("acme.worker"),
         }
     }
@@ -1411,6 +1445,45 @@ mod tests {
         let notifs = state.ui_snapshot().notifications;
         assert_eq!(notifs.len(), 2);
         assert_eq!(notifs[1].href.as_deref(), Some("https://example.com/pr/1"));
+    }
+
+    #[test]
+    fn ui_notify_link_builds_a_dashboard_path_for_an_opted_in_page() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        let mut c = ui_ctx(&state, &[CAP_NOTIFICATIONS], UiSlot::Page, "approvals");
+        c.ui_contributions
+            .insert((UiSlot::Page, "plain".to_string()));
+        c.deep_link_pages.insert("approvals".to_string());
+        let notify = |link: Value| {
+            dispatch(
+                &state,
+                &c,
+                "ui.notify",
+                &json!({"title": "Approve?", "tone": "danger", "link": link}),
+            )
+        };
+
+        notify(json!({"page": "approvals", "value": "ab12-CD_3.~"})).unwrap();
+        let notifs = state.ui_snapshot().notifications;
+        assert_eq!(
+            notifs[0].link.as_deref(),
+            Some("/plugins/acme.worker/approvals?link=ab12-CD_3.~")
+        );
+        assert_eq!(notifs[0].href, None);
+
+        for bad in [
+            json!({"page": "other", "value": "a"}),
+            json!({"page": "plain", "value": "a"}),
+            json!({"page": "approvals", "value": "a b"}),
+            json!({"page": "approvals", "value": ""}),
+            json!({"page": "approvals"}),
+            json!("approvals"),
+        ] {
+            let err = notify(bad.clone()).unwrap_err();
+            assert_eq!(err.code, codes::INVALID_PARAMS, "{bad}");
+        }
+        assert_eq!(state.ui_snapshot().notifications.len(), 1);
     }
 
     #[test]

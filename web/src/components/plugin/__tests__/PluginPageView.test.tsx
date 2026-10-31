@@ -43,7 +43,7 @@ const board: PluginPage = {
 };
 
 /** The dashboard's side: it keeps the split pane's selection, as App does in `?session=`. */
-function Host({ readOnly = false }: { readOnly?: boolean }) {
+function Host({ readOnly = false, link = null }: { readOnly?: boolean; link?: string | null }) {
   const [selected, setSelected] = useState<string | null>(null);
   return (
     <PluginPageView
@@ -53,6 +53,7 @@ function Host({ readOnly = false }: { readOnly?: boolean }) {
       readOnly={readOnly}
       cityhall={false}
       theme={null}
+      link={link}
       selectedSessionId={selected}
       onSelectSession={setSelected}
       renderSession={() => h.renderSession(selected!)}
@@ -184,6 +185,58 @@ describe("PluginPageView", () => {
     expect(port.onmessage).not.toBeNull();
   });
 
+  it("hands the URL's link only to a deep_link page and only when the value is safe", async () => {
+    const open = async (link: string | null) => {
+      const utils = render(<Host link={link} />);
+      const frame = (await screen.findByTestId("plugin-page-frame")) as HTMLIFrameElement;
+      const { port } = fakePort();
+      const event = new MessageEvent("message", {
+        data: { aoeBridge: 1, id: "r", method: "ready", params: { nonce: new URL(frame.src).hash.slice(1) } },
+        source: frame.contentWindow,
+        origin: "null",
+      });
+      Object.defineProperty(event, "ports", { value: [port] });
+      act(() => window.dispatchEvent(event));
+      return { ...utils, frame, port };
+    };
+    h.mint.mockResolvedValue(true);
+    const cases = [
+      { deepLink: true, link: "ab12-CD_3.~", want: "ab12-CD_3.~" },
+      { deepLink: true, link: "a b", want: null },
+      { deepLink: true, link: "a/../b", want: null },
+      { deepLink: true, link: "a".repeat(129), want: null },
+      { deepLink: false, link: "ab12", want: null },
+    ];
+    for (const { deepLink, link, want } of cases) {
+      h.pages = [{ ...board, deep_link: deepLink }];
+      const { port, frame, unmount } = await open(link);
+      expect(pushes(port, "context")[0].link, `${deepLink} ${link}`).toBe(want);
+      expect(frame.src).not.toContain("link");
+      unmount();
+    }
+  });
+
+  it("pushes a changed link to an open page without reloading it", async () => {
+    h.pages = [{ ...board, deep_link: true }];
+    h.mint.mockResolvedValue(true);
+    const { rerender } = render(<Host link="one" />);
+    const frame = (await screen.findByTestId("plugin-page-frame")) as HTMLIFrameElement;
+    const { port } = fakePort();
+    const event = new MessageEvent("message", {
+      data: { aoeBridge: 1, id: "r", method: "ready", params: { nonce: new URL(frame.src).hash.slice(1) } },
+      source: frame.contentWindow,
+      origin: "null",
+    });
+    Object.defineProperty(event, "ports", { value: [port] });
+    act(() => window.dispatchEvent(event));
+    expect(pushes(port, "context")[0].link).toBe("one");
+
+    rerender(<Host link="two" />);
+    rerender(<Host link={null} />);
+    expect(pushes(port, "link")).toEqual([{ link: "two" }, { link: null }]);
+    expect(screen.getByTestId("plugin-page-frame")).toBe(frame);
+  });
+
   it("pushes context and theme after ready, and every later theme change", async () => {
     const { send, nonce } = await openFrame();
     const { port } = fakePort();
@@ -191,7 +244,7 @@ describe("PluginPageView", () => {
     expect(port.postMessage).toHaveBeenCalledWith({
       aoeBridge: 1,
       event: "context",
-      data: { readOnly: false, cityhall: false, pluginId: "acme.kit", pageId: "board", bridgeVersion: 1 },
+      data: { readOnly: false, cityhall: false, pluginId: "acme.kit", pageId: "board", bridgeVersion: 1, link: null },
     });
     act(() => window.dispatchEvent(new CustomEvent(THEME_CHANGED_EVENT, { detail: darkTheme })));
     expect(port.postMessage).toHaveBeenLastCalledWith({

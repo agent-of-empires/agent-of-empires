@@ -46,9 +46,9 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   // A click-to-open toast (worker `ui.open_url`): a browser blocks `window.open`
   // from an async push, so opening waits for the tap.
   const pushWithHref = useCallback(
-    (message: string, href: string) => {
+    (message: string, href: string, kind: ToastKind = "info") => {
       const id = nextId.current++;
-      setToasts((t) => [...t, { id, kind: "info", message, href }]);
+      setToasts((t) => [...t, { id, kind, message, href }]);
       setTimeout(() => dismiss(id), TOAST_LIFETIME_MS);
     },
     [dismiss],
