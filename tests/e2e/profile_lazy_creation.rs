@@ -13,7 +13,8 @@ use crate::harness::{app_dir_in, TuiTestHarness};
 #[test]
 #[parallel]
 fn test_unknown_profile_is_refused_without_creating_dir() {
-    let h = TuiTestHarness::new("profile_lazy_unknown");
+    let mut h = TuiTestHarness::new_in_tmp("profile_lazy_unknown");
+    h.stop_daemon_on_drop();
     let ghost_dir = app_dir_in(h.home_path())
         .join("profiles")
         .join("ghost-profile");

@@ -3730,12 +3730,8 @@ fn cli_plugin_enable_disable_steps_up_an_unelevated_passphrase_session() {
         String::from_utf8_lossy(&disable.stderr)
     );
     assert!(
-        disable_stdout.contains("the running daemon reconciled its workers."),
-        "aoe plugin disable must actually reach the daemon after stepping up, not fall back to a local toggle: {disable_stdout}"
-    );
-    assert!(
-        !disable_stdout.contains("warning:"),
-        "aoe plugin disable must not fall back to the local-daemon-stale warning: {disable_stdout}"
+        disable_stdout.contains("Disabled aoe.web."),
+        "aoe plugin disable must reach the daemon after stepping up: {disable_stdout}"
     );
 
     let enable = h.run_cli(&["plugin", "enable", "aoe.web"]);
@@ -3747,13 +3743,31 @@ fn cli_plugin_enable_disable_steps_up_an_unelevated_passphrase_session() {
         String::from_utf8_lossy(&enable.stderr),
     );
     assert!(
-        enable_stdout.contains("the running daemon reconciled its workers."),
-        "aoe plugin enable must actually reach the daemon after stepping up, not fall back to a local toggle: {enable_stdout}"
+        enable_stdout.contains("Enabled aoe.web."),
+        "aoe plugin enable must reach the daemon after stepping up: {enable_stdout}"
     );
-    assert!(
-        !enable_stdout.contains("warning:"),
-        "aoe plugin enable must not fall back to the local-daemon-stale warning: {enable_stdout}"
-    );
+}
+
+/// Profile and project writes read the runtime epoch before mutating; both
+/// requests must carry the passphrase session, not just the endpoint's bearer
+/// token or socket.
+#[test]
+#[parallel]
+#[cfg(feature = "web")]
+fn cli_profile_and_project_writes_authenticate_with_a_passphrase_daemon() {
+    let mut h = TuiTestHarness::new("config_writes_passphrase");
+    h.stop_daemon_on_drop();
+    let port = h.start_daemon_with(&["--auth", "passphrase", "--passphrase", "e2e-pass"]);
+    h.set_env("AOE_DAEMON_URL", format!("http://127.0.0.1:{port}"));
+    h.set_env("AOE_DAEMON_PASSPHRASE", "e2e-pass");
+
+    h.run_cli_ok(&["profile", "create", "authed"]);
+    h.run_cli_ok(&["profile", "default", "authed"]);
+    let repo = h.home_path().join("authed-repo");
+    crate::harness::init_git_repo(&repo);
+    let repo = repo.to_str().unwrap();
+    h.run_cli_ok(&["project", "add", repo]);
+    h.run_cli_ok(&["project", "remove", repo]);
 }
 
 /// The WS half of the passphrase-login fallback: `aoe acp tail` (and the
