@@ -2838,27 +2838,30 @@ fn home_dir() -> Option<String> {
     std::env::var_os("HOME").and_then(|home| home.into_string().ok())
 }
 
-/// Expand the supported `$HOME`/`${HOME}` and leading `~` in a discovery
-/// command so the probe agrees with the launch shell. Quote context is
-/// preserved: single-quoted `$HOME` stays literal (the launch does not expand
-/// it), while unquoted and double-quoted forms expand. Unsupported constructs
-/// are left verbatim here and rejected later only when they sit in the probed
-/// assignments or executable (never in trailing agent arguments).
-fn expand_home_in_command(command: &str) -> String {
+/// Split a discovery command into shell words while expanding the supported
+/// `$HOME`/`${HOME}` and leading `~`, so the probe agrees with the launch
+/// shell. Splitting happens on the command's own unquoted whitespace, so an
+/// expansion that itself contains whitespace (a `$HOME` path with a space)
+/// stays inside one word, exactly as the shell assignment treats it. Quote
+/// context is preserved: single-quoted `$HOME` stays literal (the launch does
+/// not expand it) and tilde never expands inside quotes. Unsupported
+/// constructs are left verbatim and rejected later only when they sit in the
+/// probed assignments or executable (never in trailing agent arguments).
+fn probe_command_words(command: &str) -> Option<(Vec<String>, usize)> {
     let home = home_dir();
-    let mut out = String::with_capacity(command.len() + 16);
-    let mut chars = command.chars().peekable();
+    let mut words = Vec::new();
+    let mut current = String::new();
     let mut in_single = false;
     let mut in_double = false;
+    let mut chars = command.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            '\'' if !in_double => {
-                in_single = !in_single;
-                out.push(c);
-            }
-            '"' if !in_single => {
-                in_double = !in_double;
-                out.push(c);
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            c if c.is_whitespace() && !in_single && !in_double => {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
             }
             '$' if !in_single => {
                 if chars.peek() == Some(&'{') {
@@ -2872,15 +2875,15 @@ fn expand_home_in_command(command: &str) -> String {
                     }
                     if name == "HOME" {
                         match &home {
-                            Some(home) => out.push_str(home),
                             // HOME is unavailable: keep the form literal so it is
                             // rejected by the probed-word scan, never blanked.
-                            None => out.push_str("${HOME}"),
+                            Some(home) => current.push_str(home),
+                            None => current.push_str("${HOME}"),
                         }
                     } else {
-                        out.push_str("${");
-                        out.push_str(&name);
-                        out.push('}');
+                        current.push_str("${");
+                        current.push_str(&name);
+                        current.push('}');
                     }
                 } else {
                     let mut token = String::new();
@@ -2894,37 +2897,32 @@ fn expand_home_in_command(command: &str) -> String {
                     }
                     if token == "HOME" {
                         match &home {
-                            Some(home) => out.push_str(home),
-                            None => out.push_str("$HOME"),
+                            Some(home) => current.push_str(home),
+                            None => current.push_str("$HOME"),
                         }
                     } else {
-                        out.push('$');
-                        out.push_str(&token);
+                        current.push('$');
+                        current.push_str(&token);
                     }
                 }
             }
-            // Tilde expansion happens only outside quotes, exactly as the
-            // launch shell treats it.
+            // Tilde expands only outside quotes at a word or assignment-value
+            // start, exactly as the launch shell treats it.
             '~' if !in_single
                 && !in_double
-                && matches!(
-                    out.chars().last(),
-                    None | Some(' ') | Some('\t') | Some('=') | Some(':')
-                ) =>
+                && (current.is_empty() || current.ends_with('=') || current.ends_with(':')) =>
             {
                 match (&home, chars.peek()) {
-                    (Some(home), Some('/') | None) => out.push_str(home),
-                    _ => out.push('~'),
+                    (Some(home), Some('/') | None) => current.push_str(home),
+                    _ => current.push('~'),
                 }
             }
-            _ => out.push(c),
+            _ => current.push(c),
         }
     }
-    out
-}
-
-fn plugin_command_parts(command: &str) -> Option<(Vec<String>, usize)> {
-    let words = shell_words::split(&expand_home_in_command(command)).ok()?;
+    if !current.is_empty() {
+        words.push(current);
+    }
     let assignments = words
         .iter()
         .take_while(|word| {
@@ -2932,6 +2930,11 @@ fn plugin_command_parts(command: &str) -> Option<(Vec<String>, usize)> {
                 .is_some_and(|(key, _)| crate::session::environment::is_valid_env_key(key))
         })
         .count();
+    (words.get(assignments).is_some()).then_some((words, assignments))
+}
+
+fn plugin_command_parts(command: &str) -> Option<(Vec<String>, usize)> {
+    let (words, assignments) = probe_command_words(command)?;
     if words.len() <= assignments {
         return None;
     }
@@ -4020,40 +4023,55 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn expand_home_in_command_expands_home_and_keeps_quote_context() {
+    fn probe_command_words_expands_home_and_keeps_quote_context() {
         let home = tempfile::tempdir().unwrap();
-        let _env = crate::session::test_support::EnvGuard::set(&[("HOME", home.path())]);
-        let h = home.path().to_string_lossy().into_owned();
+        // A HOME whose path contains a space must stay one word after expansion.
+        let spaced = home.path().join("my home");
+        std::fs::create_dir(&spaced).unwrap();
+        let _env = crate::session::test_support::EnvGuard::set(&[("HOME", &spaced)]);
+        let h = spaced.to_string_lossy().into_owned();
         assert_eq!(
-            expand_home_in_command("PATH=$HOME/.local/bin acmebot"),
-            format!("PATH={h}/.local/bin acmebot")
+            probe_command_words("PATH=$HOME/.local/bin acmebot"),
+            Some((
+                vec![format!("PATH={h}/.local/bin"), "acmebot".to_string()],
+                1
+            ))
         );
         assert_eq!(
-            expand_home_in_command("PATH=\"$HOME/.local bin\" acmebot"),
-            format!("PATH=\"{h}/.local bin\" acmebot")
+            probe_command_words("PATH=\"$HOME/my tools\" spaced-agent"),
+            Some((
+                vec![format!("PATH={h}/my tools"), "spaced-agent".to_string()],
+                1
+            ))
         );
         assert_eq!(
-            expand_home_in_command("PATH=${HOME}/bin acmebot"),
-            format!("PATH={h}/bin acmebot")
+            probe_command_words("PATH=${HOME}/bin acmebot"),
+            Some((vec![format!("PATH={h}/bin"), "acmebot".to_string()], 1))
         );
         assert_eq!(
-            expand_home_in_command("PATH=~/bin acmebot"),
-            format!("PATH={h}/bin acmebot")
+            probe_command_words("PATH=~/bin acmebot"),
+            Some((vec![format!("PATH={h}/bin"), "acmebot".to_string()], 1))
         );
         // Single quotes preserve a literal `$HOME`, exactly as the launch shell.
         assert_eq!(
-            expand_home_in_command("PATH='$HOME/.local/bin' acmebot"),
-            "PATH='$HOME/.local/bin' acmebot"
+            probe_command_words("PATH='$HOME/.local/bin' acmebot"),
+            Some((
+                vec!["PATH=$HOME/.local/bin".to_string(), "acmebot".to_string()],
+                1
+            ))
         );
         // Tilde does not expand inside double quotes, exactly as the shell.
         assert_eq!(
-            expand_home_in_command("PATH=\"~/bin\" acmebot"),
-            "PATH=\"~/bin\" acmebot"
+            probe_command_words("PATH=\"~/bin\" acmebot"),
+            Some((vec!["PATH=~/bin".to_string(), "acmebot".to_string()], 1))
         );
         // `~user` is another user's home and stays literal.
         assert_eq!(
-            expand_home_in_command("PATH=~alice/bin acmebot"),
-            "PATH=~alice/bin acmebot"
+            probe_command_words("PATH=~alice/bin acmebot"),
+            Some((
+                vec!["PATH=~alice/bin".to_string(), "acmebot".to_string()],
+                1
+            ))
         );
     }
 
@@ -4077,6 +4095,22 @@ mod tests {
         assert!(plugin_command_parts("PATH='$HOME/bin' acmebot").is_none());
         // Unsupported constructs in trailing arguments are not probed.
         assert!(plugin_command_parts("acmebot \"$(printf x)\"").is_some());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn probe_with_home_unset_keeps_ordinary_commands_and_refuses_home_forms() {
+        let _env = crate::session::test_support::EnvGuard::unset(&["HOME"]);
+        // Ordinary commands need no expansion and stay discoverable.
+        let (words, assignments) = plugin_command_parts("plain-agent --flag").unwrap();
+        assert_eq!(words, vec!["plain-agent".to_string(), "--flag".to_string()]);
+        assert_eq!(assignments, 0);
+        assert_eq!(
+            plugin_command_parts("TOKEN=local plain-agent").unwrap().0[0],
+            "TOKEN=local"
+        );
+        // A `$HOME`-dependent probe cannot be verified without HOME and is refused.
+        assert!(plugin_command_parts("PATH=$HOME/bin plain-agent").is_none());
     }
 
     #[test]
