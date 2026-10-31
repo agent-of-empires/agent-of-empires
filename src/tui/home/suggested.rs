@@ -200,10 +200,14 @@ impl HomeView {
                     lines.push(Line::from("  …"));
                 }
                 lines.push(Line::from(""));
+                let dismiss = super::bindings::label(
+                    super::bindings::ActionId::ToggleArchive,
+                    self.strict_hotkeys,
+                );
                 let keys = if frame.area().width >= WIDE_KEY_LINE_COLS {
-                    format!("↵ start  z dismiss  ^K open in {}", entry.provider)
+                    format!("↵ start  {dismiss} dismiss  ^K open in {}", entry.provider)
                 } else {
-                    "↵ start  z dismiss  ^K more".to_string()
+                    format!("↵ start  {dismiss} dismiss  ^K more")
                 };
                 lines.push(Line::from(Span::styled(keys, dim)));
                 ("Suggestion".to_string(), lines)
