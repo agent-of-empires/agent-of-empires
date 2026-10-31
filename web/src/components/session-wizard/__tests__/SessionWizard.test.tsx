@@ -1067,6 +1067,15 @@ describe("SessionWizard initial prompt", () => {
   });
 });
 
+describe("SessionWizard suggestion link", () => {
+  it("sends the suggestion reference, and nothing when the prefill has none", async () => {
+    renderWizard({ path: "/tmp/proj", tool: "claude", suggestion: { provider_id: "github", id: "issue-1" } });
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload()).toMatchObject({ suggestion: { provider_id: "github", id: "issue-1" } });
+  });
+});
+
 describe("SessionWizard suggestion source", () => {
   const source = { label: "GitHub", title: "Fix lifecycle", url: "https://example.test/issues/1" };
 

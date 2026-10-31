@@ -165,6 +165,7 @@ export function Dashboard({
           onPrepare={onPrepareSuggestion}
           onStarted={onSuggestionStarted}
           onViewAll={onViewAllSuggestions}
+          onOpenSession={onSelectSession}
         />
       )}
 

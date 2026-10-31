@@ -1,7 +1,8 @@
 //! The capability-gated host API a plugin worker calls over the worker
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use aoe_plugin_api::{SuggestionsSpec, UiSlot};
@@ -35,7 +36,13 @@ pub struct HostApiState {
     profile: String,
     ui: UiStore,
     settings_revision: std::sync::atomic::AtomicU64,
+    /// Providers asked to refresh, by request time (monotonic, and unix seconds to compare
+    /// with a provider's `updated_at`).
+    refreshing: Mutex<HashMap<String, (Instant, i64)>>,
 }
+
+/// A worker that never answers stops counting as refreshing after this long.
+const REFRESH_TTL: Duration = Duration::from_secs(120);
 
 impl HostApiState {
     pub fn open(
@@ -63,7 +70,36 @@ impl HostApiState {
             profile: profile.to_string(),
             ui: UiStore::new(),
             settings_revision: std::sync::atomic::AtomicU64::new(0),
+            refreshing: Mutex::new(HashMap::new()),
         })
+    }
+
+    pub(crate) fn mark_refreshing(&self, provider_id: &str) {
+        self.refreshing
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(
+                provider_id.to_string(),
+                (Instant::now(), chrono::Utc::now().timestamp()),
+            );
+    }
+
+    pub(crate) fn clear_refreshing(&self, provider_id: &str) {
+        self.refreshing
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(provider_id);
+    }
+
+    /// Unix seconds each provider was last asked to refresh, within [`REFRESH_TTL`]. A provider
+    /// is still refreshing only if its `updated_at` is older than that.
+    pub(crate) fn refreshing_providers(&self) -> HashMap<String, i64> {
+        let mut pending = self.refreshing.lock().unwrap_or_else(|p| p.into_inner());
+        pending.retain(|_, (at, _)| at.elapsed() < REFRESH_TTL);
+        pending
+            .iter()
+            .map(|(id, (_, unix))| (id.clone(), *unix))
+            .collect()
     }
 
     fn storage(&self) -> anyhow::Result<Storage> {
@@ -216,9 +252,12 @@ pub fn dispatch(
         "suggestions.checks.set" => {
             ctx.require(CAP_WORKER)?;
             suggestions_spec(ctx)?;
-            state.with_suggestions_db(|conn, profile| {
+            let stored = state.with_suggestions_db(|conn, profile| {
                 suggestions::set_checks(conn, profile, &ctx.plugin_id, params)
-            })
+            });
+            // A worker may answer a refresh with checks alone, which leaves `updated_at` as it was.
+            state.clear_refreshing(&ctx.plugin_id);
+            stored
         }
         "suggestions.sources" => {
             ctx.require(CAP_WORKER)?;
@@ -960,6 +999,30 @@ mod tests {
 
     fn state(dir: &std::path::Path) -> HostApiState {
         HostApiState::open(&dir.join("plugin_events.db"), "default", 100).unwrap()
+    }
+
+    #[test]
+    fn a_refresh_counts_until_reported_or_expired() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        state.mark_refreshing("a");
+        state.mark_refreshing("b");
+        state.clear_refreshing("a");
+        let pending = state.refreshing_providers();
+        assert_eq!(pending.keys().collect::<Vec<_>>(), ["b"]);
+        assert!(pending["b"] >= chrono::Utc::now().timestamp() - 5);
+        let stale = Instant::now().checked_sub(REFRESH_TTL + Duration::from_secs(1));
+        if let Some(stale) = stale {
+            state
+                .refreshing
+                .lock()
+                .unwrap()
+                .insert("b".into(), (stale, 0));
+            assert!(
+                state.refreshing_providers().is_empty(),
+                "a silent worker expires"
+            );
+        }
     }
 
     #[test]

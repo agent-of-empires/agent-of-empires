@@ -104,6 +104,7 @@ fn github_origin() -> super::PromptOrigin {
         source_ref: "#4562".to_string(),
         reason: "review requested from you".to_string(),
         source_text: Some("PR body: please review the \u{1b}[1mRFC\u{1b}[0m".to_string()),
+        suggestion: None,
     }
 }
 

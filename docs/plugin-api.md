@@ -342,7 +342,7 @@ At least one source is required. Criteria are unique, non-empty and at most 256 
 
 Call `suggestions.sources` before discovering and skip every criterion that is not enabled. A source is enabled when the user's stored switch says so, else when its `default_enabled` (default `true`) does. The host sends the `suggestions.refresh` notification (`{}`); on it, discover again and call `suggestions.set` or `suggestions.error`.
 
-An item is `{ id, title, reason, source_url, source_ref, preview, project?, mapping_key?, criterion, variables, draft: { title, prompt } }`. `variables` holds exactly the names the item's source declares. Treat `preview`, `variables` and `draft` as untrusted source content. `projects.list` returns the registered projects so a provider can map its own keys to a `project` name or path. A user's [mapping](#project-mappings) for `mapping_key` takes precedence over `project`.
+An item is `{ id, title, reason, source_url, source_ref, preview, project?, mapping_key?, criterion, stale?, variables, draft: { title, prompt } }`. `variables` holds exactly the names the item's source declares. Treat `preview`, `variables` and `draft` as untrusted source content. `projects.list` returns the registered projects so a provider can map its own keys to a `project` name or path. A user's [mapping](#project-mappings) for `mapping_key` takes precedence over `project`.
 
 `suggestions.set` fails with invalid-params, and publishes nothing, when:
 
@@ -351,7 +351,7 @@ An item is `{ id, title, reason, source_url, source_ref, preview, project?, mapp
 - `id`, `title` or `source_ref` is empty, `mapping_key` is present but empty, or an `id` repeats;
 - there are more than 500 items, or a string exceeds its bound (`id` and `mapping_key` 256 bytes, `title` and `draft.title` 512, `reason`, `source_url`, `source_ref` and each variable value 2 KiB, `preview` 16 KiB, `draft.prompt` 64 KiB, `project` 4 KiB).
 
-After validation, items of a source that is not enabled are dropped and counted in `dropped`. `suggestions.error` messages are limited to 4096 bytes.
+After validation, items of a source that is not enabled are dropped and counted in `dropped`. `stale: true` marks an item whose source closed or changed; clients dim it and offer only Dismiss, and put the explanation in `reason`. Core drops a stale item, counted in `dropped`, at the first publish more than 24 hours after the one that first marked it stale, and keeps dropping it while the provider publishes it stale. Publishing it without `stale` starts it over. `suggestions.error` messages are limited to 4096 bytes.
 
 Each `suggestions.set` replaces the provider's whole set, so an empty `items` clears it and an item left out disappears. `suggestions.error` records the failure on the provider and keeps the last published items; the next successful `suggestions.set` clears it. A user's dismissal is stored by provider and item `id`, survives republishing and never changes the source, so reuse an `id` only for the same suggestion.
 
@@ -367,7 +367,7 @@ Suggestions are stored per profile. The routes below list and act on them; none 
 
 | Route | Body | Result |
 |---|---|---|
-| `GET /api/suggestions` | none | `{ providers: [{ id, name, enabled, status, error?, updated_at?, sources: [{ criterion, label, description, variables, enabled }], checks: [{ id, label, status, detail, fix }] }], items, prefs: { homepage, sidebar, refresh_minutes, start_without_review, provider_order } }` |
+| `GET /api/suggestions` | none | `{ providers: [{ id, name, enabled, status, error?, updated_at?, refreshing, sources: [{ criterion, label, description, variables, enabled }], checks: [{ id, label, status, detail, fix }] }], items, prefs: { homepage, sidebar, refresh_minutes, start_without_review, provider_order } }` |
 | `POST /api/suggestions/refresh` | none | `{ ok, notified }` |
 | `POST /api/suggestions/checks/run` | none | `{ ok, notified }` |
 | `POST /api/suggestions/dismiss` | `{ provider_id, id }` | `{ ok }` |
@@ -385,6 +385,10 @@ Suggestions are stored per profile. The routes below list and act on them; none 
 Providers are listed in the user's `provider_order`; a provider never ordered follows, sorted by id. `prefs` defaults to `{ homepage: true, sidebar: false, refresh_minutes: 15, start_without_review: false, provider_order: [] }` and is per profile. `start_without_review` lets the web Start button create the session from the prepared draft instead of opening the wizard; clients only do so when `prepare` returns `templated: true` and a `project`. `PATCH /api/suggestions/prefs` is partial: `refresh_minutes` is one of 5, 15, 30, 60 or 120, `provider_order` must list every provider exactly once, and `provider_enabled` maps provider ids to booleans. Other values fail with 400 `validation_failed`, and nothing is stored. `refresh_minutes` is a hint for plugins; core does not schedule refreshes yet. The route is denied in read-only (403 `read_only`) and CityHall mode.
 
 A provider's `status` is `pending` before its first publish, `ok`, or `error`. Uninstalling a plugin, or updating it to a build whose `[suggestions]` block differs, clears its items, checks and status so it is `pending` again until its next publish; source switches, dismissals, templates and mappings are kept. Each item is the published item plus `provider_id` and `dismissed`; dismissed items are still returned. Items of a disabled source or provider are hidden, and `refresh` skips a disabled provider. `updated_at` is Unix seconds of the provider's last report. `refresh` and a `sources` change send `suggestions.refresh` to the affected workers.
+
+`refreshing` is true while a refresh the host requested is unanswered, for at most two minutes, and is not stored. Each item has `resolved_project: { name, path }`, or `null`, the registered project a [mapping](#project-mappings) or the unambiguous `project` hint resolves to; group by `path`, never by the provider's `project` text.
+
+`POST /api/sessions` accepts an optional `suggestion: { provider_id, id }`, stored on the session. An item carries `started_session: { id, title, status, archived, created_at }` for the oldest non-trashed session in the profile that names it; trashing that session drops the link, and archiving keeps it. Clients omit `suggestion` to start another session without linking it.
 
 `prepare` resolves settings through the normal repo and profile config. `project` is `{ name, path }` or `null`, resolved in this order: the user's mapping for the item's `mapping_key`, then the item's `project` hint (exactly one registered project by name or exact path), else `null`; an item is never given a scratch project.
 
