@@ -173,7 +173,7 @@
             aoe-test = craneLib.cargoTest (commonArgs // {
               inherit cargoArtifacts;
               cargoTestExtraArgs = "--package agent-of-empires";
-              nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.git ];
+              nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.git pkgs.curl ];
             });
           };
 

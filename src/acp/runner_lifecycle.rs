@@ -1090,6 +1090,28 @@ impl LifecycleTable {
         }
     }
 
+    /// Cancel an admitted constructor before the caller waits for its request
+    /// guards. Keep the phase and retirement ownership intact until the caller
+    /// captures and commits the stop.
+    pub(crate) fn request_stop(&mut self, session_id: &str, reason: &str) -> bool {
+        let Some(lease) = self.current_lease(session_id) else {
+            return false;
+        };
+        let Some(entry) = self.current(&lease) else {
+            return false;
+        };
+        let cancel = match &mut entry.phase {
+            Phase::Starting { cancel, .. } | Phase::Respawning { cancel, .. } => cancel,
+            _ => return false,
+        };
+        cancel.get_or_insert_with(|| reason.to_owned());
+        lease.claim_runner_ownership();
+        lease.owe_stop_completion(Some(reason));
+        lease.owe_previous_retirement();
+        lease.cancellation().cancel();
+        true
+    }
+
     pub(crate) fn require_retirement_ack(&mut self, lease: &Lease) -> bool {
         if let Some(entry) = self.entries.get_mut(lease.session_id()) {
             if entry.epoch != lease.epoch()
@@ -1162,8 +1184,9 @@ impl LifecycleTable {
         let Some(entry) = self.current(lease) else {
             return;
         };
-        let Phase::Stopping { attempts, .. } = entry.phase else {
-            return;
+        let attempts = match entry.phase {
+            Phase::Stopping { attempts, .. } | Phase::TeardownRetry { attempts, .. } => attempts,
+            _ => return,
         };
         match settlement {
             Settlement::Proven => {
