@@ -3621,6 +3621,7 @@ mod tests {
     /// A ready agent is typed once even when the create-path and reconciler
     /// drains race, and the turn is cleared in memory and on disk.
     #[tokio::test]
+    #[serial_test::serial]
     async fn terminal_initial_turn_is_typed_once_when_the_agent_is_ready() {
         if !crate::tmux::is_tmux_available() {
             return;
@@ -3662,6 +3663,7 @@ mod tests {
     /// Stable output is not readiness: a bare shell or a dead pane is never
     /// typed into, the reason is recorded, and later drains do not retry.
     #[tokio::test]
+    #[serial_test::serial]
     async fn terminal_initial_turn_is_not_typed_into_a_shell_or_dead_pane() {
         if !crate::tmux::is_tmux_available() {
             return;
