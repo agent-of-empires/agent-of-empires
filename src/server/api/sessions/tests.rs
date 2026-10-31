@@ -8550,7 +8550,7 @@ async fn create_rejects_hook_env_without_sandbox() {
 }
 
 #[tokio::test]
-async fn create_rejects_blank_initial_prompt() {
+async fn create_rejects_blank_or_oversized_initial_prompt() {
     let _home = crate::session::test_support::isolate_app_dir();
     let state = crate::server::test_support::build_test_app_state_impl(
         Vec::new(),
@@ -8561,17 +8561,20 @@ async fn create_rejects_blank_initial_prompt() {
         |_| {},
         |supervisor| supervisor,
     );
-    let (status, body) = post_create(
-        &state,
-        serde_json::json!({
-            "title": "blank-prompt", "path": "", "tool": "claude",
-            "scratch": true, "view": "structured", "initial_prompt": "  \n",
-        }),
-    )
-    .await;
-    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["error"], "validation_failed");
-    assert!(state.instances.read().await.is_empty());
+    let oversized = "x".repeat(crate::plugin::suggestions::MAX_PROMPT_BYTES + 1);
+    for prompt in ["  \n", oversized.as_str()] {
+        let (status, body) = post_create(
+            &state,
+            serde_json::json!({
+                "title": "bad-prompt", "path": "", "tool": "claude",
+                "scratch": true, "view": "structured", "initial_prompt": prompt,
+            }),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "validation_failed");
+        assert!(state.instances.read().await.is_empty());
+    }
 }
 
 #[tokio::test]
