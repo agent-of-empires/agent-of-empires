@@ -417,6 +417,10 @@ input worktree's path or name. Both aliases target the same repository.
 
 CLI sandbox image selections trim surrounding whitespace. A blank configured
 `sandbox.default_image` selects the container runtime's default image.
+Deferred CLI terminal creation requires an installed sandbox runtime, but not a
+running engine, when no effective `on_create` hooks need a container. Container
+creation hooks and later launch still require the engine. Non-CLI creation
+retains its existing readiness checks.
 
 With CLI intent, `extra_args` uses shell-style word grouping, then each argument
 is quoted for literal delivery. Quotes group text; shell operators and substitutions

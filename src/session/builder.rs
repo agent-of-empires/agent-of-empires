@@ -637,22 +637,28 @@ pub fn build_instance(
     existing_branches: &[&str],
     profile: &str,
 ) -> Result<BuildResult> {
-    plan_instance(params, existing_titles, existing_branches, profile)?
-        .provision()
-        .map_err(|failure| {
-            let protection = CleanupProtection::default();
-            if let Some(worktree) = &failure.result.created_worktree {
-                cleanup_created_worktree(worktree, "worktree", &protection);
-            }
-            if let Some(workspace) = &failure.result.instance.workspace_info {
-                cleanup_workspace(
-                    workspace,
-                    &failure.result.created_workspace_worktrees,
-                    &protection,
-                );
-            }
-            failure.error
-        })
+    plan_instance(
+        params,
+        SandboxReadiness::RequireRunning,
+        existing_titles,
+        existing_branches,
+        profile,
+    )?
+    .provision()
+    .map_err(|failure| {
+        let protection = CleanupProtection::default();
+        if let Some(worktree) = &failure.result.created_worktree {
+            cleanup_created_worktree(worktree, "worktree", &protection);
+        }
+        if let Some(workspace) = &failure.result.instance.workspace_info {
+            cleanup_workspace(
+                workspace,
+                &failure.result.created_workspace_worktrees,
+                &protection,
+            );
+        }
+        failure.error
+    })
 }
 
 /// A checkout marked for purging is about to be removed, so no new session may take it.
@@ -698,8 +704,14 @@ pub(crate) fn generated_worktree_title(
     })
 }
 
+pub(crate) enum SandboxReadiness {
+    RequireRunning,
+    InstalledOnly,
+}
+
 pub(crate) fn plan_instance(
     params: InstanceParams,
+    sandbox_readiness: SandboxReadiness,
     existing_titles: &[&str],
     existing_branches: &[&str],
     profile: &str,
@@ -730,7 +742,9 @@ pub(crate) fn plan_instance(
         if !runtime.is_available() {
             bail!("Container runtime is not installed. Please install a supported runtime to use sandbox mode.");
         }
-        if !runtime.is_daemon_running() {
+        if matches!(sandbox_readiness, SandboxReadiness::RequireRunning)
+            && !runtime.is_daemon_running()
+        {
             bail!("Container runtime daemon is not running. Please start a supported runtime to use sandbox mode.");
         }
     }

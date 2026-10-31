@@ -2228,3 +2228,86 @@ fn cli_sandbox_images_preserve_normalization_and_default_fallback() {
         assert_eq!(row["sandbox_info"]["image"], expected);
     }
 }
+
+#[cfg(unix)]
+#[test]
+#[parallel]
+fn cli_deferred_sandbox_preserves_offline_creation_and_runtime_guards() {
+    for (default_sandbox, create_hook) in [(false, false), (true, false), (false, true)] {
+        let mut h = TuiTestHarness::new_in_tmp("cli_deferred_sandbox");
+        h.stop_daemon_on_drop();
+        let engine_down = h.home_path().join("engine-down");
+        let container_effect = h.home_path().join("container-effect");
+        let create_effect = h.home_path().join("create-effect");
+        let launch_effect = h.home_path().join("launch-effect");
+        let bin = h.install_path_command("docker");
+        write_executable(
+            &bin.join("docker"),
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in\n\
+                 --version) exit 0;;\n\
+                 info) test ! -f {}; exit $?;;\n\
+                 create|run) : > {}; exit 1;;\n\
+                 container|inspect) echo 'Error: No such container: fixture' >&2; exit 1;;\n\
+                 esac\nexit 1\n",
+                shell_words::quote(engine_down.to_str().unwrap()),
+                shell_words::quote(container_effect.to_str().unwrap()),
+            ),
+        );
+        let on_create = if create_hook {
+            vec![format!(
+                "touch {}",
+                shell_words::quote(create_effect.to_str().unwrap())
+            )]
+        } else {
+            Vec::new()
+        };
+        h.append_config(&format!(
+            "[sandbox]\ncontainer_runtime = \"docker\"\nenabled_by_default = {default_sandbox}\n\
+             [hooks]\non_create = {on_create:?}\non_launch = [{:?}]\n",
+            format!(
+                "touch {}",
+                shell_words::quote(launch_effect.to_str().unwrap())
+            ),
+        ));
+        h.run_cli_ok(&["serve", "--core-only", "--daemon"]);
+        std::fs::write(&engine_down, "").unwrap();
+        let project = h.project_path();
+        let mut args = vec![
+            "--no-autostart",
+            "add",
+            project.to_str().unwrap(),
+            "-t",
+            "deferred-sandbox",
+        ];
+        if !default_sandbox {
+            args.push("--sandbox");
+        }
+        if create_hook {
+            h.run_cli_err(&args);
+            if h.sessions_path().exists() {
+                assert_eq!(h.read_sessions(), json!([]));
+            }
+        } else {
+            h.run_cli_ok(&args);
+            let rows = h.read_sessions();
+            let row = crate::harness::session_by_title(&rows, "deferred-sandbox");
+            assert_eq!(row["status"], "stopped");
+            assert_eq!(row["sandbox_info"]["enabled"], true);
+            assert!(row["sandbox_info"]["container_id"].is_null());
+            h.run_cli_err(&[
+                "--no-autostart",
+                "session",
+                "start",
+                row["id"].as_str().unwrap(),
+            ]);
+            let after = h.read_sessions();
+            let retained = crate::harness::session_by_title(&after, "deferred-sandbox");
+            assert_eq!(retained["id"], row["id"]);
+            assert_eq!(retained["sandbox_info"]["enabled"], true);
+        }
+        assert!(!create_effect.exists());
+        assert!(!launch_effect.exists());
+        assert!(!container_effect.exists());
+    }
+}

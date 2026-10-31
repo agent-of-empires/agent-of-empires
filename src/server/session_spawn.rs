@@ -196,6 +196,14 @@ pub(crate) async fn spawn_structured_session(
             .map(|b| b.trim().to_string())
             .filter(|b| !b.is_empty());
 
+        let sandbox_readiness = if cli.is_some()
+            && view == crate::session::View::Terminal
+            && hook_plan.on_create().is_empty()
+        {
+            builder::SandboxReadiness::InstalledOnly
+        } else {
+            builder::SandboxReadiness::RequireRunning
+        };
         let params = InstanceParams {
             title,
             title_typed,
@@ -257,7 +265,13 @@ pub(crate) async fn spawn_structured_session(
         };
         let title_refs: Vec<&str> = existing_titles.iter().map(String::as_str).collect();
         let branch_refs: Vec<&str> = existing_branches.iter().map(String::as_str).collect();
-        let mut plan = builder::plan_instance(params, &title_refs, &branch_refs, &profile)?;
+        let mut plan = builder::plan_instance(
+            params,
+            sandbox_readiness,
+            &title_refs,
+            &branch_refs,
+            &profile,
+        )?;
         let instance = &mut plan.result.instance;
         instance.source_profile = profile.clone();
         if let Some(parent) = cli.as_ref().and_then(|options| options.parent.as_deref()) {
