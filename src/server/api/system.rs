@@ -16,7 +16,7 @@ use super::api_error;
 use super::validate_profile_name;
 use super::AppState;
 use crate::server::auth::AuthenticatedTokenHash;
-use crate::server::auth::{handler_elevated, AuthenticatedSession};
+use crate::server::auth::{handler_elevated, AuthenticatedBrowserSession};
 use crate::server::principal::{authorize, Capability, Principal};
 use crate::session::config::settings_schema::{
     clear_path, rewrite_plugin_sections, runtime_schema, strip_local_only, validate_patch,
@@ -494,7 +494,7 @@ pub async fn update_settings(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<SettingsQuery>,
     headers: HeaderMap,
-    session: Option<Extension<AuthenticatedSession>>,
+    session: Option<Extension<AuthenticatedBrowserSession>>,
     loopback: Option<Extension<Principal>>,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> axum::response::Response {
@@ -550,7 +550,7 @@ async fn save_settings_patch(
     profile: Option<String>,
     mut machine: serde_json::Value,
     mut profile_patch: serde_json::Value,
-    session: Option<Extension<AuthenticatedSession>>,
+    session: Option<Extension<AuthenticatedBrowserSession>>,
     loopback: Option<Extension<Principal>>,
     stamp: Option<WriteStamp>,
 ) -> axum::response::Response {
@@ -2598,7 +2598,7 @@ pub async fn update_profile_settings(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(name): axum::extract::Path<String>,
     headers: HeaderMap,
-    session: Option<axum::Extension<AuthenticatedSession>>,
+    session: Option<axum::Extension<AuthenticatedBrowserSession>>,
     loopback: Option<axum::Extension<Principal>>,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
@@ -2948,6 +2948,66 @@ mod tests {
         assert_eq!(state.instances.read().await[0].source_profile, "renamed");
         state.runtime.work.drain().await;
         Ok(())
+    }
+
+    /// End to end through the handler with login on: without a recent
+    /// passphrase a machine-wide leaf is refused, a plain profile leaf saves,
+    /// and a save mixing both writes neither.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn settings_save_elevates_only_machine_wide_leaves() {
+        use serde_json::json;
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let state =
+            crate::server::test_support::build_test_app_state_configured(Vec::new(), |state| {
+                state.login_manager = Arc::new(crate::server::login::LoginManager::new(Some("pw")));
+            });
+        let session = state
+            .login_manager
+            .create_session(b"bind", "127.0.0.1", "t")
+            .await;
+        let save = |body: serde_json::Value| {
+            let state = state.clone();
+            let session = session.clone();
+            async move {
+                update_settings(
+                    State(state),
+                    axum::extract::Query(SettingsQuery {
+                        profile: None,
+                        layer: None,
+                    }),
+                    HeaderMap::new(),
+                    Some(axum::Extension(AuthenticatedBrowserSession(session))),
+                    None,
+                    Ok(Json(body)),
+                )
+                .await
+                .into_response()
+                .status()
+            }
+        };
+        let machine_tool = || crate::session::Config::load().unwrap().session.default_tool;
+        let profile_tool = || {
+            let config = crate::session::load_profile_config("test").unwrap();
+            serde_json::to_value(config).unwrap()["session"]["default_tool"]
+                .as_str()
+                .map(str::to_owned)
+        };
+
+        let mixed = json!({"session": {"default_tool": "codex", "sidebar_position": "right"}});
+        assert_eq!(save(mixed).await, StatusCode::FORBIDDEN);
+        assert_eq!(profile_tool(), None, "a refused save writes neither layer");
+        let machine = json!({"session": {"sidebar_position": "right"}});
+        assert_eq!(save(machine.clone()).await, StatusCode::FORBIDDEN);
+
+        let profile = json!({"session": {"default_tool": "codex"}});
+        assert_eq!(save(profile).await, StatusCode::OK);
+        assert_eq!(profile_tool().as_deref(), Some("codex"));
+        assert_eq!(machine_tool(), None);
+
+        state.login_manager.elevate_session(&session).await;
+        assert_eq!(save(machine).await, StatusCode::OK);
     }
 
     #[tokio::test]

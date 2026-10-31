@@ -487,6 +487,33 @@ pub(crate) async fn start_server(
         None
     };
 
+    // Session-scoped `/mcp` credential secret. Only generated when `/mcp` is actually
+    // mounted, so a daemon that never enables it never gets this file on disk.
+    let mcp_session_secret = if config.web.mcp_enabled {
+        match crate::session::get_app_dir() {
+            Ok(dir) => {
+                match crate::server::session_credential::McpSessionSecret::load_or_generate(
+                    &dir.join("mcp_session_secret"),
+                ) {
+                    Ok(secret) => Some(Arc::new(secret)),
+                    Err(e) => {
+                        tracing::warn!(target: "http.middleware",
+                            "/mcp session credentials disabled: failed to load secret: {}",
+                            e
+                        );
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(target: "http.middleware", "/mcp session credentials disabled: app_dir unavailable: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let acp_events_tx = broadcast::channel(ACP_CHANNEL_CAPACITY).0;
     let acp_event_store = {
         let app_dir = crate::session::get_app_dir().context("acp event store: resolve app dir")?;
@@ -880,6 +907,7 @@ pub(crate) async fn start_server(
         session_service,
         token_manager: Arc::clone(&token_manager),
         login_manager: Arc::clone(&login_manager),
+        mcp_session_secret,
         passkey_manager,
         rate_limiter: Arc::clone(&rate_limiter),
         behind_tunnel: remote || behind_proxy,
