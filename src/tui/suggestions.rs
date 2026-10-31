@@ -14,6 +14,7 @@ use ratatui::Frame;
 use serde::Deserialize;
 
 use crate::acp::client::{locate_daemon, HttpClient};
+use crate::tui::session_feed::MutationBlock;
 use crate::tui::styles::Theme;
 use crate::tui::worker::Worker;
 
@@ -67,6 +68,9 @@ struct Item {
     started_session: Option<Started>,
     #[serde(default)]
     resolved_project: Option<ResolvedProject>,
+    /// The source closed or changed; the item cannot start.
+    #[serde(default)]
+    stale: bool,
 }
 
 /// The live Session an item was started as.
@@ -228,6 +232,20 @@ fn plain(s: &str) -> String {
         .collect()
 }
 
+/// The note for a daemon that refuses mutations, in the web dashboard's words.
+fn block_note(block: MutationBlock) -> &'static str {
+    match block {
+        MutationBlock::ReadOnly => {
+            "This dashboard is read-only. Start, Dismiss and Refresh are off."
+        }
+        MutationBlock::Offline => {
+            "Disconnected. Suggestions show from the last fetch; reconnect to start one."
+        }
+    }
+}
+
+const STALE_NOTE: &str = "No longer open at the source. Dismiss it, or wait for the next refresh.";
+
 /// One status line per provider: when it last updated, or why it did not.
 fn provider_status(provider: &Provider, any_items: bool, theme: &Theme) -> (String, Color) {
     let name = &provider.name;
@@ -321,6 +339,8 @@ pub(super) struct SuggestionsView {
     busy: bool,
     /// The item a dismiss request is in flight for.
     dismissing: Option<ItemKey>,
+    /// The last start that failed, shown on its row; Enter tries again.
+    failed: Option<(ItemKey, String)>,
     /// Items dismissed in the last [`UNDO_WINDOW`], kept in the list so `x` undoes them.
     recent: Vec<(ItemKey, std::time::Instant)>,
     worker: Worker<Req, Res>,
@@ -349,6 +369,7 @@ impl SuggestionsView {
             show_dismissed: false,
             busy: false,
             dismissing: None,
+            failed: None,
             recent: Vec::new(),
             worker,
         }
@@ -452,12 +473,13 @@ impl SuggestionsView {
         self.detail_scroll = 0;
     }
 
-    /// `mutations_allowed` is false for a read-only or disconnected daemon.
+    /// `block` says why the daemon refuses mutations, or `None` when it allows them.
     pub(super) fn handle_key(
         &mut self,
         key: KeyEvent,
-        mutations_allowed: bool,
+        block: Option<MutationBlock>,
     ) -> SuggestionsAction {
+        let mutations_allowed = block.is_none();
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => return SuggestionsAction::Close,
             KeyCode::Up | KeyCode::Char('k') => self.select(self.selected.saturating_sub(1)),
@@ -488,20 +510,29 @@ impl SuggestionsView {
                 }
             }
             KeyCode::Char('r' | 'x') => {
-                self.error = Some("The daemon is read-only or unavailable".into());
+                self.error = block.map(|b| block_note(b).to_string());
             }
             KeyCode::Enter | KeyCode::Char('N') => {
                 let another = key.code == KeyCode::Char('N');
                 let Some(key) = self.selected_key() else {
                     return SuggestionsAction::Continue;
                 };
-                if let Some(started) = self
-                    .item_at(self.selected)
+                let item = self.item_at(self.selected);
+                if let Some(started) = item
                     .and_then(|i| i.started_session.as_ref())
                     .filter(|_| !another)
                 {
                     return SuggestionsAction::OpenSession(started.id.clone());
                 }
+                if let Some(block) = block {
+                    self.error = Some(block_note(block).to_string());
+                    return SuggestionsAction::Continue;
+                }
+                if item.is_some_and(|i| i.stale) {
+                    self.notice = Some(STALE_NOTE.to_string());
+                    return SuggestionsAction::Continue;
+                }
+                self.failed = None;
                 if self.prepare_another == another
                     && self.prepared.as_ref().is_some_and(|(k, _)| *k == key)
                 {
@@ -550,15 +581,20 @@ impl SuggestionsView {
             Res::Refreshed(Ok(())) => {
                 self.notice = Some("Refresh requested. Press l to reload the list.".into());
             }
-            Res::Snapshot(Err(e)) | Res::Refreshed(Err(e)) | Res::Prepared(Err(e)) => {
+            Res::Prepared(Err(e)) => match self.prepare_key.take() {
+                Some(key) => self.failed = Some((key, e)),
+                None => self.error = Some(e),
+            },
+            Res::Snapshot(Err(e)) | Res::Refreshed(Err(e)) => {
                 self.error = Some(e);
             }
             Res::Prepared(Ok(prepared)) => {
                 let key = self.prepare_key.take();
                 match (prepared.project.is_some(), key) {
-                    (false, _) => {
-                        self.error = Some(NO_PROJECT.into());
-                    }
+                    (false, key) => match key {
+                        Some(key) => self.failed = Some((key, NO_PROJECT.into())),
+                        None => self.error = Some(NO_PROJECT.into()),
+                    },
                     (true, Some(key)) => {
                         let mut start = start_for(self.snapshot.as_ref(), &key, prepared);
                         if self.prepare_another {
@@ -577,7 +613,13 @@ impl SuggestionsView {
         true
     }
 
-    pub(super) fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    pub(super) fn render(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        theme: &Theme,
+        mutation_block: Option<MutationBlock>,
+    ) {
         frame.render_widget(Clear, area);
         let block = Block::default()
             .title(" Suggested sessions ")
@@ -599,6 +641,26 @@ impl SuggestionsView {
             footer.push(Line::from(Span::styled(
                 notice.as_str(),
                 Style::default().fg(theme.hint),
+            )));
+        }
+        if let Some(blocked) = mutation_block {
+            footer.push(Line::from(Span::styled(
+                block_note(blocked),
+                Style::default().fg(theme.waiting),
+            )));
+        }
+        for provider in self
+            .snapshot
+            .iter()
+            .flat_map(|s| &s.providers)
+            .filter(|p| !p.enabled)
+        {
+            footer.push(Line::from(Span::styled(
+                plain(&format!(
+                    "{0} suggestions are hidden because {0} is off in Settings › Suggestions.",
+                    provider.name
+                )),
+                Style::default().fg(theme.dimmed),
             )));
         }
         for provider in self
@@ -690,7 +752,7 @@ impl SuggestionsView {
                 (true, true) => " [dismissed, x to undo]",
                 (true, false) => " [dismissed]",
             };
-            let title_style = if item.dismissed {
+            let title_style = if item.dismissed || item.stale {
                 Style::default().fg(theme.dimmed)
             } else if current {
                 Style::default()
@@ -709,6 +771,19 @@ impl SuggestionsView {
                 ),
                 Span::styled(plain(&format!("{}{state}", item.title)), title_style),
             ]));
+            let failure = self
+                .failed
+                .as_ref()
+                .filter(|(key, _)| key.0 == item.provider_id && key.1 == item.id);
+            if let Some((_, message)) = failure {
+                lines.push(Line::from(Span::styled(
+                    plain(&format!(
+                        "    Couldn't start: {message} · Enter tries again"
+                    )),
+                    Style::default().fg(theme.error),
+                )));
+                continue;
+            }
             lines.push(Line::from(Span::styled(
                 plain(&format!(
                     "    {} · {}{}",
@@ -1089,6 +1164,7 @@ mod tests {
             },
             started_session: None,
             resolved_project: None,
+            stale: false,
         }
     }
 
@@ -1121,14 +1197,26 @@ mod tests {
     }
 
     fn press(view: &mut SuggestionsView, code: KeyCode, mutations: bool) -> SuggestionsAction {
-        view.handle_key(KeyEvent::new(code, KeyModifiers::NONE), mutations)
+        press_blocked(view, code, (!mutations).then_some(MutationBlock::ReadOnly))
+    }
+
+    fn press_blocked(
+        view: &mut SuggestionsView,
+        code: KeyCode,
+        block: Option<MutationBlock>,
+    ) -> SuggestionsAction {
+        view.handle_key(KeyEvent::new(code, KeyModifiers::NONE), block)
     }
 
     fn render_text(view: &SuggestionsView) -> String {
+        render_text_blocked(view, None)
+    }
+
+    fn render_text_blocked(view: &SuggestionsView, block: Option<MutationBlock>) -> String {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
         terminal
-            .draw(|frame| view.render(frame, frame.area(), &Theme::default()))
+            .draw(|frame| view.render(frame, frame.area(), &Theme::default(), block))
             .unwrap();
         terminal
             .backend()
@@ -1352,17 +1440,111 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_item_cannot_start_and_says_why() {
+        let mut stale = item("a", None, false);
+        stale.stale = true;
+        let mut view = view_with(vec![stale], idle_worker());
+        assert!(matches!(
+            press(&mut view, KeyCode::Enter, true),
+            SuggestionsAction::Continue
+        ));
+        assert!(!view.busy, "no prepare was sent");
+        assert!(render_text(&view).contains("No longer open at the source"));
+    }
+
+    #[test]
+    fn a_failed_start_stays_on_its_row_and_enter_tries_again() {
+        let worker =
+            Worker::seeded_for_test("t", Res::Prepared(Err("branch already exists".into())));
+        let mut view = view_with(vec![item("a", Some("repo"), false)], worker);
+        press(&mut view, KeyCode::Enter, true);
+        assert!(poll_until_settled(&mut view));
+        assert!(
+            view.error.is_none(),
+            "the failure is on the row, not the footer"
+        );
+        assert!(render_text(&view).contains("Couldn't start: branch already exists"));
+        view.worker = Worker::seeded_for_test("t", Res::Prepared(Ok(prepared(Some("/repo")))));
+        press(&mut view, KeyCode::Enter, true);
+        assert!(view.failed.is_none());
+        assert!(poll_until_settled(&mut view));
+        assert!(!render_text(&view).contains("Couldn't start"));
+    }
+
+    #[test]
+    fn read_only_and_offline_explain_themselves_and_still_allow_open() {
+        let mut started = item("a", None, false);
+        started.started_session = Some(Started {
+            id: "sess-1".into(),
+            status: "Idle".into(),
+            archived: false,
+        });
+        let mut view = view_with(vec![item("b", None, false), started], idle_worker());
+        for (block, note) in [
+            (
+                MutationBlock::ReadOnly,
+                "This dashboard is read-only. Start, Dismiss and Refresh are off.",
+            ),
+            (
+                MutationBlock::Offline,
+                "Disconnected. Suggestions show from the last fetch; reconnect to start one.",
+            ),
+        ] {
+            assert!(render_text_blocked(&view, Some(block)).contains(note));
+            let SuggestionsAction::Continue = press_blocked(&mut view, KeyCode::Enter, Some(block))
+            else {
+                panic!("Start must be refused");
+            };
+            assert_eq!(view.error.as_deref(), Some(note));
+            assert!(!view.busy);
+        }
+        press(&mut view, KeyCode::Char('j'), true);
+        let SuggestionsAction::OpenSession(id) =
+            press_blocked(&mut view, KeyCode::Enter, Some(MutationBlock::Offline))
+        else {
+            panic!("a linked session still opens");
+        };
+        assert_eq!(id, "sess-1");
+    }
+
+    #[test]
+    fn a_disabled_provider_is_explained() {
+        let mut view = view_with(vec![], idle_worker());
+        view.snapshot.as_mut().unwrap().providers[0].enabled = false;
+        let text = render_text(&view);
+        assert!(text.contains("GitHub suggestions are hidden because GitHub is off in Settings"));
+        assert!(
+            !text.contains("GitHub: nothing new"),
+            "no status line for a disabled provider"
+        );
+    }
+
+    #[test]
+    fn provider_text_is_plain_in_every_row_and_line() {
+        let hostile = "\u{1b}[31mred\u{1b}[0m\u{202e}live\u{7}";
+        let mut bad = item("a", Some("repo"), false);
+        bad.title = format!("T {hostile}");
+        bad.reason = format!("R {hostile}");
+        bad.project = Some(format!("P {hostile}"));
+        let mut view = view_with(vec![bad], idle_worker());
+        let provider = &mut view.snapshot.as_mut().unwrap().providers[0];
+        provider.name = format!("N {hostile}");
+        provider.error = Some(format!("E {hostile}"));
+        let text = render_text(&view);
+        assert!(text.contains("T \u{fffd}[31mred"), "{text}");
+        for bad in ['\u{1b}', '\u{202e}', '\u{7}'] {
+            assert!(!text.contains(bad), "{bad:?} reached the terminal: {text}");
+        }
+    }
+
+    #[test]
     fn prepare_without_a_registered_project_cannot_start() {
         let worker = Worker::seeded_for_test("t", Res::Prepared(Ok(prepared(None))));
         let mut view = view_with(vec![item("a", None, false)], worker);
         press(&mut view, KeyCode::Enter, true);
         assert!(poll_until_settled(&mut view));
         assert!(view.prepared.is_none());
-        assert!(view
-            .error
-            .as_deref()
-            .unwrap()
-            .contains("No registered project"));
+        assert!(render_text(&view).contains("Couldn't start: No registered project"));
     }
 
     #[test]

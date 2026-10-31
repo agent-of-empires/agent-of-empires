@@ -1904,8 +1904,8 @@ impl HomeView {
         }
 
         if let Some(view) = &mut self.suggestions_view {
-            let mutations_allowed = self.session_feed.mutations_available();
-            match view.handle_key(key, mutations_allowed) {
+            let block = self.session_feed.mutation_block();
+            match view.handle_key(key, block) {
                 SuggestionsAction::Continue => {}
                 SuggestionsAction::Close => {
                     self.suggestions_view = None;
