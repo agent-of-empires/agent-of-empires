@@ -266,12 +266,26 @@ fn resolve_host_creation(
     body.yolo_mode |= config.session.yolo_mode_default;
     body.sandbox |= config.sandbox.enabled_by_default
         && crate::containers::get_container_runtime().is_available();
-    if body.sandbox && body.sandbox_image.is_none() {
-        let runtime = crate::containers::get_container_runtime();
-        body.sandbox_image = Some(if config.sandbox.default_image.is_empty() {
-            runtime.default_sandbox_image().to_owned()
-        } else {
-            config.sandbox.default_image.clone()
+    if body.sandbox {
+        body.sandbox_image = Some(match body.sandbox_image.take() {
+            Some(mut image) => {
+                image.truncate(image.trim_end().len());
+                let leading = image.len() - image.trim_start().len();
+                if leading != 0 {
+                    image.drain(..leading);
+                }
+                image
+            }
+            None => {
+                let configured = config.sandbox.default_image.trim();
+                if configured.is_empty() {
+                    crate::containers::get_container_runtime()
+                        .default_sandbox_image()
+                        .to_owned()
+                } else {
+                    configured.to_owned()
+                }
+            }
         });
     }
     if body.view == crate::session::View::Structured {

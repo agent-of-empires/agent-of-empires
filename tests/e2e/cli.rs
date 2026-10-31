@@ -2192,3 +2192,39 @@ fn cli_review_boundary_repo_base_from_a_linked_worktree() {
         .find_branch("duplicate-base", git2::BranchType::Local)
         .is_err());
 }
+
+#[cfg(unix)]
+#[test]
+#[parallel]
+fn cli_sandbox_images_preserve_normalization_and_default_fallback() {
+    for (flag, configured, expected) in [
+        (Some(" ubuntu:latest "), "ignored:latest", "ubuntu:latest"),
+        (None, " ubuntu:latest ", "ubuntu:latest"),
+        (None, "   ", "ghcr.io/agent-of-empires/aoe-sandbox:latest"),
+    ] {
+        let mut h = TuiTestHarness::new("cli_sandbox_image");
+        let bin = h.install_path_command("docker");
+        write_executable(
+            &bin.join("docker"),
+            "#!/bin/sh\ncase \"$1\" in\n--version|version|info) exit 0;;\nesac\nexit 1\n",
+        );
+        h.append_config(&format!(
+            "[sandbox]\ncontainer_runtime = \"docker\"\ndefault_image = {configured:?}\n"
+        ));
+        let project = h.project_path();
+        let mut args = vec![
+            "add",
+            project.to_str().unwrap(),
+            "-t",
+            "image-normalization",
+            "--sandbox",
+        ];
+        if let Some(image) = flag {
+            args.extend(["--sandbox-image", image]);
+        }
+        h.run_cli_ok(&args);
+        let rows = h.read_sessions();
+        let row = crate::harness::session_by_title(&rows, "image-normalization");
+        assert_eq!(row["sandbox_info"]["image"], expected);
+    }
+}

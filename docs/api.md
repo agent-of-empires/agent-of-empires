@@ -415,6 +415,9 @@ CLI forks use the latest durable parent binding, including a completed
 For a single repository, base selectors accept its principal identity and the
 input worktree's path or name. Both aliases target the same repository.
 
+CLI sandbox image selections trim surrounding whitespace. A blank configured
+`sandbox.default_image` selects the container runtime's default image.
+
 With CLI intent, `extra_args` uses shell-style word grouping, then each argument
 is quoted for literal delivery. Quotes group text; shell operators and substitutions
 are arguments, not scripts. Other API callers retain their existing input validation.
