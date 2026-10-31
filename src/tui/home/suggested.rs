@@ -172,6 +172,9 @@ impl HomeView {
                     return false;
                 };
                 let mut source = vec![entry.provider.clone()];
+                if !entry.source_ref.is_empty() {
+                    source.push(entry.source_ref.clone());
+                }
                 source.extend(entry.project.clone());
                 source.push(entry.reason.clone());
                 let mut lines = vec![

@@ -23,6 +23,22 @@ use crate::tui::worker::Worker;
 struct Snapshot {
     providers: Vec<Provider>,
     items: Vec<Item>,
+    #[serde(default)]
+    prefs: Prefs,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+struct Prefs {
+    show_source_ref: bool,
+}
+
+impl Default for Prefs {
+    fn default() -> Self {
+        Self {
+            show_source_ref: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -782,8 +798,12 @@ impl SuggestionsView {
             lines.push(Line::from(vec![
                 Span::styled(
                     plain(&format!(
-                        "{marker}{} ",
-                        store.provider_name(&item.provider_id)
+                        "{marker}{} {}",
+                        store.provider_name(&item.provider_id),
+                        store
+                            .source_ref(item)
+                            .map(|r| format!("{r} "))
+                            .unwrap_or_default()
                     )),
                     Style::default().fg(theme.dimmed),
                 ),
@@ -839,12 +859,10 @@ impl SuggestionsView {
                 plain(&item.title),
                 Style::default().add_modifier(Modifier::BOLD),
             )));
-            detail.push(Line::from(plain(&format!(
-                "{} · {} · {}",
-                store.provider_name(&item.provider_id),
-                item.source_ref,
-                item.source_url
-            ))));
+            let mut source = vec![store.provider_name(&item.provider_id)];
+            source.extend(store.source_ref(item));
+            source.push(&item.source_url);
+            detail.push(Line::from(plain(&source.join(" · "))));
             detail.extend(
                 plain(&item.preview)
                     .lines()
@@ -999,6 +1017,15 @@ impl SuggestionsFeed {
             .find(|i| i.provider_id == key.0 && i.id == key.1)
     }
 
+    /// The item's `source_ref`, unless it is blank or the user hid references.
+    fn source_ref<'a>(&self, item: &'a Item) -> Option<&'a str> {
+        let shown = self
+            .snapshot
+            .as_ref()
+            .is_none_or(|s| s.prefs.show_source_ref);
+        (shown && !item.source_ref.is_empty()).then_some(item.source_ref.as_str())
+    }
+
     fn provider_name<'a>(&'a self, id: &'a str) -> &'a str {
         self.snapshot
             .iter()
@@ -1049,7 +1076,7 @@ impl SuggestionsFeed {
             .collect();
         Some(Entry {
             label,
-            source_ref: plain(&item.source_ref),
+            source_ref: self.source_ref(item).map(plain).unwrap_or_default(),
             title: plain(&item.title),
             reason: plain(&item.reason),
             provider: plain(&provider.name),
@@ -1255,6 +1282,7 @@ mod tests {
                 refreshing: false,
             }],
             items,
+            prefs: Prefs::default(),
         });
         let view = SuggestionsView::new(&mut store);
         Rig { view, store }
@@ -1347,6 +1375,7 @@ mod tests {
                 refreshing: false,
             }],
             items: vec![it],
+            prefs: Prefs::default(),
         };
         let mut prep = prepared(Some("/repo"));
         prep.title = hostile("a\nb");
@@ -1395,6 +1424,7 @@ mod tests {
                 item("a", Some("p1"), false),
                 item("b", Some("p2"), false),
             ],
+            prefs: Prefs::default(),
         });
         rig.view.sync(&rig.store);
         assert_eq!(rig.view.selected_key().unwrap().1, "b");
@@ -1518,6 +1548,7 @@ mod tests {
         rig.store.snapshot = Some(Snapshot {
             providers: vec![],
             items: vec![item("a", None, dismissed)],
+            prefs: Prefs::default(),
         });
     }
 
@@ -1889,7 +1920,7 @@ mod tests {
         let rig = view_with(vec![hostile], idle_worker());
         let text = render_text(&rig);
         for expected in [
-            "GitHub a",
+            "GitHub ref-a a",
             "reason · repo",
             "GitHub · ref-a · https://example.test/x",
             "preview text",
@@ -1899,5 +1930,22 @@ mod tests {
             assert!(text.contains(expected), "missing {expected:?}");
         }
         assert!(!text.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn the_source_reference_follows_the_pref() {
+        for (shown, row, detail, entry_ref) in [
+            (true, "GitHub ref-a a", "GitHub · ref-a · https://", "ref-a"),
+            (false, "GitHub a", "GitHub · https://", ""),
+        ] {
+            let mut rig = view_with(vec![item("a", None, false)], idle_worker());
+            rig.store.snapshot.as_mut().unwrap().prefs.show_source_ref = shown;
+            let text = render_text(&rig);
+            assert!(text.contains(row), "{shown}: {text}");
+            assert!(text.contains(detail), "{shown}: {text}");
+            assert_eq!(text.contains("ref-a"), shown, "{text}");
+            let key = ("p".to_string(), "a".to_string());
+            assert_eq!(rig.store.entry(&key).unwrap().source_ref, entry_ref);
+        }
     }
 }
