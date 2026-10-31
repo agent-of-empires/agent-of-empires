@@ -123,3 +123,45 @@ test("the Start without review switch persists through the prefs PATCH", async (
   await sw.click();
   await expect.poll(() => bodies).toContainEqual({ start_without_review: true });
 });
+
+test("a provider's suggestion_ plugin settings save through the settings PATCH", async ({ page }) => {
+  await setup(page);
+  const descriptor = (field: string, label: string) => ({
+    section: "plugin:github",
+    field,
+    category: "Plugins",
+    label,
+    description: "",
+    widget: { kind: "text" },
+    web_write: { policy: "allow" },
+    profile_overridable: false,
+    validation: { rule: "none" },
+    advanced: true,
+    default: "",
+  });
+  const schema = [
+    descriptor("suggestion_ignore", "Ignored GitHub suggestion sources"),
+    descriptor("token_path", "Token path"),
+  ];
+  const patches: unknown[] = [];
+  await page.route(
+    (url) => url.pathname === "/api/settings/schema",
+    (r) => r.fulfill({ json: schema }),
+  );
+  await page.route(
+    (url) => url.pathname === "/api/settings",
+    (r) => {
+      if (r.request().method() === "PATCH") patches.push(r.request().postDataJSON());
+      return r.fulfill({ json: { plugins: { github: { settings: {} } } } });
+    },
+  );
+  await page.goto("/settings/suggestions");
+
+  const section = page.getByRole("region", { name: "GitHub source settings" });
+  await expect(section.getByText("Ignored GitHub suggestion sources")).toBeVisible();
+  await expect(section.getByText("Token path")).toHaveCount(0);
+  const input = section.getByRole("textbox");
+  await input.fill("acme, acme/widgets");
+  await input.blur();
+  await expect.poll(() => patches).toContainEqual({ "plugin:github": { suggestion_ignore: "acme, acme/widgets" } });
+});
