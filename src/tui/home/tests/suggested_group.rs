@@ -374,3 +374,18 @@ fn the_preview_key_line_names_the_source_from_120_columns() {
         assert!(text.contains(expected), "{width} cols: {expected:?}");
     }
 }
+
+#[test]
+#[serial]
+fn the_full_view_says_so_when_the_selected_suggestion_has_no_link() {
+    let (mut env, _requests) = expanded_env(1);
+    let mut hostile = snapshot(1, &[]);
+    hostile["items"][0]["source_url"] = "javascript:alert(1)".into();
+    env.view.suggestions_feed.set_snapshot_for_test(hostile);
+    env.view.open_suggestions_view();
+
+    env.view.handle_key(ctrl_k(), None);
+    assert!(env.view.command_palette.is_none());
+    let error = env.view.suggestions_view.as_ref().unwrap().error.as_deref();
+    assert_eq!(error, Some("This suggestion has no link to open"));
+}

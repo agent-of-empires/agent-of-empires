@@ -98,7 +98,8 @@ enum Req {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PrepareTarget {
     Home,
-    View,
+    /// The view with this epoch; a closed view's answer matches no later view.
+    View(u64),
 }
 
 enum Res {
@@ -257,14 +258,17 @@ pub(super) struct SuggestionsView {
     notice: Option<String>,
     /// The resolved prefill, shown before the second Enter confirms it.
     prepared: Option<(ItemKey, Start)>,
+    epoch: u64,
     selected: usize,
     detail_scroll: u16,
     show_dismissed: bool,
 }
 
 impl SuggestionsView {
-    pub(super) fn new(store: &SuggestionsFeed) -> Self {
+    pub(super) fn new(store: &mut SuggestionsFeed) -> Self {
+        store.view_epoch += 1;
         let mut view = Self::empty();
+        view.epoch = store.view_epoch;
         view.reorder(store, None);
         view
     }
@@ -275,6 +279,7 @@ impl SuggestionsView {
             error: None,
             notice: None,
             prepared: None,
+            epoch: 0,
             selected: 0,
             detail_scroll: 0,
             show_dismissed: false,
@@ -343,7 +348,6 @@ impl SuggestionsView {
                 self.show_dismissed = !self.show_dismissed;
                 self.reorder(store, key);
             }
-            _ if store.busy => {}
             KeyCode::Char('l') => {
                 self.begin();
                 store.reload();
@@ -373,7 +377,7 @@ impl SuggestionsView {
                     }
                 }
                 self.begin();
-                store.prepare_in_view(key);
+                store.prepare_in_view(key, self.epoch);
             }
             _ => {}
         }
@@ -395,7 +399,7 @@ impl SuggestionsView {
             self.error = Some(error);
             changed = true;
         }
-        if matches!(polled.start, Some((_, _, PrepareTarget::View))) {
+        if matches!(polled.start, Some((_, _, PrepareTarget::View(e))) if e == self.epoch) {
             if let Some((key, start, _)) = polled.start.take() {
                 self.notice = Some("Review the prompt below, then press Enter to start.".into());
                 self.prepared = Some((key, start));
@@ -609,6 +613,8 @@ pub(super) struct SuggestionsFeed {
     snapshot: Option<Snapshot>,
     prepare_key: Option<ItemKey>,
     prepare_target: PrepareTarget,
+    /// Epoch of the most recently opened full view.
+    view_epoch: u64,
     /// The in-flight request came from the user (prepare or dismiss), so its
     /// failure is worth showing.
     in_flight_user: bool,
@@ -637,6 +643,7 @@ impl SuggestionsFeed {
             snapshot: None,
             prepare_key: None,
             prepare_target: PrepareTarget::Home,
+            view_epoch: 0,
             in_flight_user: false,
             busy: false,
             queued: std::collections::VecDeque::new(),
@@ -823,8 +830,8 @@ impl SuggestionsFeed {
         self.submit_prepare(key, PrepareTarget::Home);
     }
 
-    fn prepare_in_view(&mut self, key: ItemKey) {
-        self.submit_prepare(key, PrepareTarget::View);
+    fn prepare_in_view(&mut self, key: ItemKey, epoch: u64) {
+        self.submit_prepare(key, PrepareTarget::View(epoch));
     }
 
     fn submit_prepare(&mut self, key: ItemKey, target: PrepareTarget) {
@@ -923,7 +930,7 @@ mod tests {
             }],
             items,
         });
-        let view = SuggestionsView::new(&store);
+        let view = SuggestionsView::new(&mut store);
         Rig { view, store }
     }
 
@@ -1148,7 +1155,7 @@ mod tests {
                 "preview": "", "draft": { "prompt": "x" }
             }],
         }));
-        let mut view = SuggestionsView::new(&store);
+        let mut view = SuggestionsView::new(&mut store);
         assert_eq!(store.keys().len(), 1);
         view.handle_key(
             KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
@@ -1187,8 +1194,43 @@ mod tests {
         }
         assert!(matches!(
             view_closed.start,
-            Some((_, _, PrepareTarget::View))
+            Some((_, _, PrepareTarget::View(_)))
         ));
+    }
+
+    #[test]
+    fn a_view_prepare_does_not_land_in_a_reopened_view() {
+        let worker = Worker::seeded_for_test("t", Res::Prepared(Ok(prepared(Some("/repo")))));
+        let mut rig = view_with(vec![item("a", Some("repo"), false)], worker);
+        press(&mut rig, KeyCode::Enter, true);
+        rig.view = SuggestionsView::new(&mut rig.store);
+        let mut polled = rig.store.poll();
+        for _ in 0..200 {
+            if polled.start.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            polled = rig.store.poll();
+        }
+        assert!(polled.start.is_some());
+        rig.view.apply(&rig.store, &mut polled);
+        assert!(rig.view.prepared.is_none());
+    }
+
+    #[test]
+    fn keys_are_not_swallowed_while_a_background_load_is_in_flight() {
+        let mut rig = view_with(vec![item("a", Some("repo"), false)], idle_worker());
+        rig.store.busy = true;
+        let key = ("p".to_string(), "a".to_string());
+        let start = start_for(rig.store.snapshot.as_ref(), &key, prepared(Some("/repo")));
+        rig.view.prepared = Some((key, start.unwrap()));
+        assert!(matches!(
+            press(&mut rig, KeyCode::Enter, true),
+            SuggestionsAction::Start(_)
+        ));
+
+        press(&mut rig, KeyCode::Char('l'), true);
+        assert_eq!(rig.store.queued.len(), 1, "the reload waits its turn");
     }
 
     #[test]

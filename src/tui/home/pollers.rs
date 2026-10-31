@@ -81,7 +81,7 @@ impl HomeView {
     }
 
     pub(super) fn open_suggestions_view(&mut self) {
-        self.suggestions_view = Some(SuggestionsView::new(&self.suggestions_feed));
+        self.suggestions_view = Some(SuggestionsView::new(&mut self.suggestions_feed));
     }
 
     /// Replaces the view with the regular new-session dialog, prefilled; when

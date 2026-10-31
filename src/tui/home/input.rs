@@ -1903,15 +1903,20 @@ impl HomeView {
             }
         }
 
-        if let (Some(view), None) = (&self.suggestions_view, &self.command_palette) {
-            if key.modifiers.contains(KeyModifiers::CONTROL)
-                && matches!(key.code, KeyCode::Char('k' | 'K'))
-            {
-                let command = view
-                    .selected_key()
-                    .and_then(|key| self.open_source_command(&key));
-                if let Some(command) = command {
-                    self.command_palette = Some(CommandPaletteDialog::new(vec![command]));
+        if self.command_palette.is_none()
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('k' | 'K'))
+        {
+            if let Some(selected) = self.suggestions_view.as_ref().map(|v| v.selected_key()) {
+                match selected.and_then(|key| self.open_source_command(&key)) {
+                    Some(command) => {
+                        self.command_palette = Some(CommandPaletteDialog::new(vec![command]));
+                    }
+                    None => {
+                        if let Some(view) = &mut self.suggestions_view {
+                            view.set_error("This suggestion has no link to open");
+                        }
+                    }
                 }
                 return None;
             }
