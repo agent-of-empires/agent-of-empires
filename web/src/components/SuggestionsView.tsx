@@ -236,6 +236,7 @@ export function SuggestionsView({
                         key={key}
                         title={item.title}
                         source={providerName}
+                        sourceRef={snapshot.prefs.show_source_ref ? item.source_ref : undefined}
                         reason={item.reason}
                         project={item.resolved_project?.name ?? item.project}
                         session={item.started_session}

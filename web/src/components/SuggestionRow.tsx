@@ -39,6 +39,8 @@ function StartedReason({ session }: { session: StartedSession }) {
 interface RowProps {
   title: string;
   source: string;
+  /** Shown after the source when non-empty. */
+  sourceRef?: string;
   reason: string;
   project?: string | null;
   /** Replaces the reason with the started Session's state. */
@@ -50,7 +52,17 @@ interface RowProps {
   actions: ReactNode;
 }
 
-export function SuggestionRow({ title, source, reason, project, session, stale, failure, actions }: RowProps) {
+export function SuggestionRow({
+  title,
+  source,
+  sourceRef,
+  reason,
+  project,
+  session,
+  stale,
+  failure,
+  actions,
+}: RowProps) {
   return (
     <li
       className={`flex items-center gap-3 border-t border-surface-700/40 px-3 py-2.5 first:border-t-0 ${
@@ -61,6 +73,12 @@ export function SuggestionRow({ title, source, reason, project, session, stale, 
         <p className={`truncate text-sm text-text-primary ${stale ? "opacity-[0.55]" : ""}`}>{title}</p>
         <p className={`mt-0.5 truncate text-xs ${stale ? "text-text-dim" : "text-text-muted"}`}>
           <span className={`font-mono font-medium text-text-secondary ${stale ? "opacity-[0.55]" : ""}`}>{source}</span>
+          {sourceRef && (
+            <>
+              {" · "}
+              <span className="inline-block max-w-[40%] truncate align-bottom font-mono">{sourceRef}</span>
+            </>
+          )}
           {" · "}
           {session ? <StartedReason session={session} /> : reason}
           {project && (

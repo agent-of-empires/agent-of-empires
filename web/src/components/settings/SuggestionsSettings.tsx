@@ -267,6 +267,14 @@ export function SuggestionsSettings({ snapshot, failed, reload, readOnly, onOpen
             onChange={(v) => void patch({ sidebar: v })}
           />
         </Row>
+        <Row title="Show source reference" description="Show where each suggestion comes from, such as owner/repo#123.">
+          <SuggestionSwitch
+            checked={prefs.show_source_ref}
+            disabled={disabled}
+            label="Show source reference"
+            onChange={(v) => void patch({ show_source_ref: v })}
+          />
+        </Row>
       </div>
 
       <section>

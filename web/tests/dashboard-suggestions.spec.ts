@@ -26,6 +26,7 @@ const prefs = {
   sidebar: false,
   refresh_minutes: 15,
   start_without_review: false,
+  show_source_ref: true,
   provider_order: ["github"],
 };
 const CURSOR = { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" };
@@ -42,7 +43,7 @@ test("homepage shows 3 suggestions and View all opens the full view", async ({ p
   await mockHome(page);
   await page.goto("/");
   await expect(page.getByRole("button", { name: "Start" })).toHaveCount(3);
-  await expect(page.getByText("GitHub · Review requested from you · agent-of-empires")).toBeVisible();
+  await expect(page.getByText("GitHub · example/1 · Review requested from you · agent-of-empires")).toBeVisible();
   await page.getByRole("link", { name: "View all (4)" }).click();
   await expect(page).toHaveURL(/\/suggestions$/);
 });

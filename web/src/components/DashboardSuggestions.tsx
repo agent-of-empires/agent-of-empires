@@ -67,6 +67,7 @@ export function DashboardSuggestions({ readOnly = false, onPrepare, onStarted, o
             key={suggestionKey(item)}
             title={item.title}
             source={nameOf(item.provider_id)}
+            sourceRef={snapshot.prefs.show_source_ref ? item.source_ref : undefined}
             reason={item.reason}
             project={item.resolved_project?.name ?? item.project}
             session={item.started_session}

@@ -43,6 +43,7 @@ const PREFS: SuggestionsSnapshot["prefs"] = {
   sidebar: false,
   refresh_minutes: 15,
   start_without_review: false,
+  show_source_ref: true,
   provider_order: [],
 };
 const snap = (items: SuggestionItem[], status: "ok" | "pending" = "ok"): SuggestionsSnapshot => ({
@@ -93,6 +94,22 @@ describe("DashboardSuggestions", () => {
     await waitFor(() => expect(fetchSuggestions).toHaveBeenCalled());
     await act(async () => {});
     expect(container.innerHTML).toBe("");
+  });
+
+  it("shows the source reference in the meta line unless it is blank or hidden", async () => {
+    for (const [shown, ref, meta] of [
+      [true, "ex/1", "GitHub · ex/1 · Assigned to you · aoe"],
+      [true, "", "GitHub · Assigned to you · aoe"],
+      [false, "ex/1", "GitHub · Assigned to you · aoe"],
+    ] as const) {
+      fetchSuggestions.mockResolvedValue({
+        ...snap([mk(1, { source_ref: ref })]),
+        prefs: { ...PREFS, show_source_ref: shown },
+      });
+      const { unmount } = renderIt();
+      expect((await screen.findByText("GitHub")).parentElement?.textContent).toBe(meta);
+      unmount();
+    }
   });
 
   it("Start prepares and opens the wizard prefill without creating anything", async () => {
