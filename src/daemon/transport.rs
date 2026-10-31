@@ -89,15 +89,29 @@ fn runtime_path_refusal(
     message
 }
 
+enum PermissionRepair {
+    Private,
+    RemoveGroupOtherWrite,
+}
+
 fn permission_refusal(
     path: &Path,
     mode: u32,
-    cause: &'static str,
-    template: &'static str,
-    manual: &'static str,
-    unsafe_ancestry_advice: &'static str,
+    repair: PermissionRepair,
     owner: u32,
 ) -> anyhow::Error {
+    let (cause, template, manual) = match repair {
+        PermissionRepair::Private => (
+            "not private to its owner",
+            "chmod -- 0700 {path}",
+            "Set this directory to mode 0700",
+        ),
+        PermissionRepair::RemoveGroupOtherWrite => (
+            "writable by its group or by others",
+            "chmod -- go-w {path}",
+            "Remove group/other write permission from this directory",
+        ),
+    };
     let upper_ancestors_are_trusted = path.ancestors().skip(1).all(|ancestor| {
         std::fs::symlink_metadata(ancestor)
             .is_ok_and(|metadata| trusted_directory(&metadata, owner))
@@ -105,7 +119,9 @@ fn permission_refusal(
     let remedy = if upper_ancestors_are_trusted {
         RuntimePathRemedy::Command { template, manual }
     } else {
-        RuntimePathRemedy::Advice(unsafe_ancestry_advice)
+        RuntimePathRemedy::Advice(
+            "Repair or replace the unsafe parent directories first, starting with the highest unsafe ancestor, or select a location with trusted ancestors. Then retry before changing this directory.",
+        )
     };
     anyhow::anyhow!(runtime_path_refusal(path, mode, cause, remedy))
 }
@@ -166,10 +182,7 @@ pub(crate) fn prepare_runtime_directory(parent: &Path) -> anyhow::Result<()> {
         return Err(permission_refusal(
             parent,
             directory.mode(),
-            "not private to its owner",
-            "chmod -- 0700 {path}",
-            "Set this directory to mode 0700",
-            "Set this directory to mode 0700 manually, then retry. No copyable shell command is available because its parent chain is unsafe.",
+            PermissionRepair::Private,
             owner,
         ));
     }
@@ -184,30 +197,12 @@ fn check_ancestor(ancestor: &Path, parent: &Path, owner: u32) -> anyhow::Result<
         && meta.mode() & 0o022 != 0
         && !trusted_ancestor(meta.uid(), meta.mode(), owner)
     {
-        let (cause, template, manual, unsafe_ancestry_advice) = if ancestor == parent {
-            (
-                "not private to its owner",
-                "chmod -- 0700 {path}",
-                "Set this directory to mode 0700",
-                "Set this directory to mode 0700 manually, then retry. No copyable shell command is available because its parent chain is unsafe.",
-            )
+        let repair = if ancestor == parent {
+            PermissionRepair::Private
         } else {
-            (
-                "writable by its group or by others",
-                "chmod -- go-w {path}",
-                "Remove group/other write permission from this directory",
-                "Remove group/other write permission manually, then retry. No copyable shell command is available because this directory's parent chain is unsafe.",
-            )
+            PermissionRepair::RemoveGroupOtherWrite
         };
-        return Err(permission_refusal(
-            ancestor,
-            meta.mode(),
-            cause,
-            template,
-            manual,
-            unsafe_ancestry_advice,
-            owner,
-        ));
+        return Err(permission_refusal(ancestor, meta.mode(), repair, owner));
     }
     anyhow::ensure!(
         trusted_directory(&meta, owner),
@@ -739,7 +734,15 @@ mod tests {
             "{ancestor_diagnostic}"
         );
         assert!(
-            ancestor_diagnostic.contains("parent chain is unsafe"),
+            ancestor_diagnostic.contains("writable by its group or by others"),
+            "{ancestor_diagnostic}"
+        );
+        assert!(
+            ancestor_diagnostic.contains("starting with the highest unsafe ancestor"),
+            "{ancestor_diagnostic}"
+        );
+        assert!(
+            ancestor_diagnostic.contains("retry before changing this directory"),
             "{ancestor_diagnostic}"
         );
 
@@ -752,7 +755,15 @@ mod tests {
         );
         assert!(!socket_diagnostic.contains("`chmod"), "{socket_diagnostic}");
         assert!(
-            socket_diagnostic.contains("parent chain is unsafe"),
+            socket_diagnostic.contains("not private to its owner"),
+            "{socket_diagnostic}"
+        );
+        assert!(
+            socket_diagnostic.contains("starting with the highest unsafe ancestor"),
+            "{socket_diagnostic}"
+        );
+        assert!(
+            socket_diagnostic.contains("retry before changing this directory"),
             "{socket_diagnostic}"
         );
     }
