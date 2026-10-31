@@ -854,6 +854,17 @@
       ]
     },
     {
+      "id": "suggestions.first-run-setup",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/suggestions-first-run.spec.ts",
+        "src/components/__tests__/SuggestionsSetup.test.tsx",
+        "src/components/__tests__/DashboardSetupHint.test.tsx"
+      ],
+      "components": ["web/src/components/SuggestionsSetupHint.tsx", "web/src/components/SuggestionsSetupSheet.tsx"]
+    },
+    {
       "id": "settings.suggestions",
       "kind": "mocked-playwright",
       "risk": "medium",

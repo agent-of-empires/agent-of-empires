@@ -564,6 +564,15 @@ export interface SuggestionSource {
   variables: string[];
 }
 
+/** One setup check a provider reports. `detail` and `fix` are provider text and untrusted. */
+export interface SuggestionSetupCheck {
+  id: string;
+  label: string;
+  status: "ok" | "warn" | "fail";
+  detail: string;
+  fix: string;
+}
+
 export interface SuggestionProvider {
   id: string;
   name: string;
@@ -575,6 +584,7 @@ export interface SuggestionProvider {
   /** A refresh the host requested is unanswered. */
   refreshing?: boolean;
   sources: SuggestionSource[];
+  checks?: SuggestionSetupCheck[];
 }
 
 /** The oldest live Session started from a suggestion. */

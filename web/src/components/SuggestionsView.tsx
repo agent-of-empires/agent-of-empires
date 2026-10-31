@@ -4,6 +4,7 @@ import { OFFLINE_TITLE } from "../lib/connectionState";
 import { agoLabel } from "../lib/suggestionTime";
 import type { SuggestionItem, SuggestionProvider } from "../lib/types";
 import { suggestionKey, useDismissUndo, useSuggestions } from "../hooks/useSuggestions";
+import { SuggestionsSetupHint } from "./SuggestionsSetupHint";
 import {
   SUGGESTION_NOTE_CLASS,
   SuggestionActions,
@@ -20,6 +21,8 @@ interface Props {
   onPrepare: (prefill: WizardPrefill) => void;
   onOpenSession: (sessionId: string) => void;
   onOpenSettings?: () => void;
+  /** Set when the first-run hint can open the Marketplace (not read-only or CityHall). */
+  onOpenMarketplace?: () => void;
 }
 
 type Filter = "all" | "dismissed" | { provider: string };
@@ -60,8 +63,9 @@ export function SuggestionsView({
   onPrepare,
   onOpenSession,
   onOpenSettings,
+  onOpenMarketplace,
 }: Props) {
-  const { snapshot, loading, loadFailed, refreshing, busy, notice, failures, offline, act, refresh, start } =
+  const { snapshot, loading, loadFailed, refreshing, busy, notice, failures, offline, act, refresh, start, load } =
     useSuggestions(onPrepare);
   const { undo, dismiss } = useDismissUndo(act);
   const [filter, setFilter] = useState<Filter>(initialDismissed ? "dismissed" : "all");
@@ -85,6 +89,19 @@ export function SuggestionsView({
   const headed = groups.some((g) => g.key !== "");
   const chip = (selected: boolean) =>
     `${CHIP} ${selected ? "border-brand-500 bg-brand-500/10 text-text-primary" : "border-surface-700 text-text-secondary hover:bg-surface-800"}`;
+
+  const noProviderNote =
+    !readOnly && onOpenMarketplace ? (
+      <SuggestionsSetupHint
+        ignoreDismissed
+        noProvider
+        onOpenMarketplace={onOpenMarketplace}
+        onFinished={() => void load()}
+        fallback="No plugin provides suggestions."
+      />
+    ) : (
+      "No plugin provides suggestions."
+    );
 
   return (
     <main className="flex-1 min-h-0 overflow-y-auto bg-surface-900 text-text-primary">
@@ -252,7 +269,7 @@ export function SuggestionsView({
                   {showDismissed
                     ? "No dismissed suggestions."
                     : snapshot.providers.length === 0
-                      ? "No plugin provides suggestions."
+                      ? noProviderNote
                       : "Nothing to suggest right now."}
                 </li>
               )}
