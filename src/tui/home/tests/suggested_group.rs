@@ -390,3 +390,30 @@ fn the_full_view_says_so_when_the_selected_suggestion_has_no_link() {
     let error = env.view.suggestions_view.as_ref().unwrap().error.as_deref();
     assert_eq!(error, Some("This suggestion has no link to open"));
 }
+
+#[test]
+#[serial]
+fn clicking_a_suggestion_row_leaves_live_send() {
+    use crate::tui::home::live_send::{LiveSendState, LiveSendTarget};
+    let (mut env, _requests) = expanded_env(1);
+    env.view.list_inner_area = ratatui::layout::Rect::new(1, 1, 28, 5);
+    env.view.shelf_inner_area = ratatui::layout::Rect::new(1, 7, 28, 5);
+    let (click_row, idx) = (1..12)
+        .find_map(|r| {
+            let idx = env.view.resolve_row_to_index(5, r)?;
+            matches!(env.view.flat_items[idx], Item::Suggestion { .. }).then_some((r, idx))
+        })
+        .expect("a suggestion row on screen");
+    env.view.live_send = Some(LiveSendState {
+        session_id: "live".to_string(),
+        title: "live".to_string(),
+        tmux_name: "aoe_test_suggestion_click".to_string(),
+        target: LiveSendTarget::Agent,
+        exit_chords: Vec::new(),
+        leader: None,
+    });
+
+    env.view.handle_click(5, click_row);
+    assert_eq!(env.view.cursor, idx);
+    assert!(env.view.live_send.is_none());
+}
