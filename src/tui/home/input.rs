@@ -502,7 +502,47 @@ impl HomeView {
         ));
     }
 
+    fn trash_confirmation_is_current(&self, target: &super::SessionDialogTarget) -> bool {
+        self.get_instance(&target.session_id)
+            .is_some_and(|instance| {
+                instance.source_profile == target.source_profile
+                    && instance.lifecycle_generation == target.lifecycle_generation
+                    && !instance.is_trashed()
+            })
+            && self
+                .session_feed
+                .applied_session(&target.session_id)
+                .is_some_and(|row| {
+                    row.profile == target.source_profile
+                        && row.lifecycle_generation == target.lifecycle_generation
+                        && row.trashed_at.is_none()
+                })
+    }
+
+    fn reconcile_trash_confirmation(&mut self) {
+        if self
+            .pending_trash_session
+            .as_ref()
+            .is_none_or(|target| self.trash_confirmation_is_current(target))
+        {
+            return;
+        }
+        self.pending_trash_session = None;
+        if self
+            .confirm_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.action() == "trash_session")
+        {
+            self.confirm_dialog = None;
+            self.info_dialog = Some(InfoDialog::new(
+                "Session Changed",
+                "The session changed. The pending trash operation was cancelled.",
+            ));
+        }
+    }
+
     pub(in crate::tui) fn enforce_trash_read_only(&mut self) {
+        self.reconcile_trash_confirmation();
         self.reconcile_session_dialog();
         if !self.selected_is_trashed() {
             return;
@@ -1347,8 +1387,11 @@ impl HomeView {
                 None
             }
             "trash_session" => {
-                if let Some(session_id) = self.pending_trash_session.take() {
-                    self.trash_session_by_id(&session_id);
+                self.reconcile_trash_confirmation();
+                if let Some(target) = self.pending_trash_session.take() {
+                    if self.trash_confirmation_is_current(&target) {
+                        self.trash_session_by_id(&target.session_id);
+                    }
                 }
                 None
             }
@@ -5883,11 +5926,11 @@ impl HomeView {
                     // trash_session_by_id.
                     if session_cfg.confirm_delete {
                         let message = format!("Move '{}' to the trash?", inst.title);
-                        self.pending_trash_session = Some(sid);
-                        // Offer the same in-dialog opt-out the quit confirm has: the
-                        // guard is on by default, so a user who wants one-keystroke trash
-                        // back shouldn't have to find the setting. Ticking it persists
-                        // confirm_delete = false.
+                        self.pending_trash_session = Some(super::SessionDialogTarget {
+                            session_id: sid,
+                            source_profile: inst.source_profile.clone(),
+                            lifecycle_generation: inst.lifecycle_generation,
+                        });
                         let dialog = self
                             .confirm_by_repeating(
                                 ActionId::Delete,

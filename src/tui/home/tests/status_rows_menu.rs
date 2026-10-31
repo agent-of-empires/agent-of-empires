@@ -1724,12 +1724,14 @@ async fn d_then_d_confirms_the_trash_and_persists_the_marker() {
         !env.view.get_instance(&id).unwrap().is_trashed(),
         "the first d must only open the dialog"
     );
+    let generation = env.view.get_instance(&id).unwrap().lifecycle_generation;
     super::pickers_groups_sort::settle_row_command(
         &state,
         &mut env.view,
         &id,
         crate::tui::session_feed::SessionRequest::Trash(crate::daemon::TrashSessionBody {
             kill_pane: true,
+            expected_generation: Some(generation),
         }),
         |view| {
             view.handle_key(key(KeyCode::Char('d')), None);
@@ -1775,12 +1777,14 @@ async fn d_with_confirm_delete_off_trashes_on_the_keystroke() {
     disable_confirm_delete();
     let id = env.view.selected_session.clone().unwrap();
 
+    let generation = env.view.get_instance(&id).unwrap().lifecycle_generation;
     super::pickers_groups_sort::settle_row_command(
         &state,
         &mut env.view,
         &id,
         crate::tui::session_feed::SessionRequest::Trash(crate::daemon::TrashSessionBody {
             kill_pane: true,
+            expected_generation: Some(generation),
         }),
         |view| {
             view.handle_key(key(KeyCode::Char('d')), None);
@@ -1815,12 +1819,14 @@ async fn confirm_delete_dont_ask_again_persists_the_opt_out() {
     // Down focuses the checkbox, Space ticks it, the second `d` accepts.
     env.view.handle_key(key(KeyCode::Down), None);
     env.view.handle_key(key(KeyCode::Char(' ')), None);
+    let generation = env.view.get_instance(&id).unwrap().lifecycle_generation;
     super::pickers_groups_sort::settle_row_command(
         &state,
         &mut env.view,
         &id,
         crate::tui::session_feed::SessionRequest::Trash(crate::daemon::TrashSessionBody {
             kill_pane: true,
+            expected_generation: Some(generation),
         }),
         |view| {
             view.handle_key(key(KeyCode::Char('d')), None);
@@ -1867,7 +1873,10 @@ async fn d_with_confirm_delete_prompts_before_trashing() {
         .expect("confirm_delete on must open a confirmation dialog");
     assert_eq!(dialog.action(), "trash_session");
     assert_eq!(
-        env.view.pending_trash_session.as_deref(),
+        env.view
+            .pending_trash_session
+            .as_ref()
+            .map(|target| target.session_id.as_str()),
         Some(id.as_str()),
         "the pending trash target must be the selected session"
     );
@@ -1876,12 +1885,14 @@ async fn d_with_confirm_delete_prompts_before_trashing() {
     assert!(screen.contains("Press d again to confirm"), "{screen}");
 
     // A second `d` accepts, trashing via the same trash_session_by_id path.
+    let generation = env.view.get_instance(&id).unwrap().lifecycle_generation;
     super::pickers_groups_sort::settle_row_command(
         &state,
         &mut env.view,
         &id,
         crate::tui::session_feed::SessionRequest::Trash(crate::daemon::TrashSessionBody {
             kill_pane: true,
+            expected_generation: Some(generation),
         }),
         |view| {
             view.handle_key(key(KeyCode::Char('d')), None);

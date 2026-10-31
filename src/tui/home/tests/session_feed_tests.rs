@@ -2877,6 +2877,75 @@ fn trash_transition_cancels_auxiliary_stop_confirmation_and_late_submit() {
 
 #[test]
 #[serial]
+fn trash_confirmation_rejects_a_changed_original_target() {
+    for change in ["trash", "generation", "purge", "selection"] {
+        for late_submit in [false, true] {
+            let mut env = create_test_env_with_sessions(2);
+            let id = env.view.selected_session.clone().unwrap();
+            env.view
+                .session_feed
+                .publish_for_test(daemon_snapshot(&env.view, &id, "Stopped"));
+            env.view.apply_session_feed();
+            let mut requests = env.view.session_feed.request_driver_for_test();
+            env.view
+                .handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE), None);
+            assert!(env.view.pending_trash_session.is_some());
+            let SessionFeedResult::Snapshot(mut snapshot) =
+                daemon_snapshot(&env.view, &id, "Stopped")
+            else {
+                unreachable!()
+            };
+            let next = Arc::make_mut(&mut snapshot);
+            match change {
+                "trash" => {
+                    next.contents.sessions[0].trashed_at = Some(chrono::Utc::now().to_rfc3339());
+                    next.contents.sessions[0].lifecycle_generation += 1;
+                }
+                "generation" => next.contents.sessions[0].lifecycle_generation += 1,
+                "purge" => next.contents.sessions.retain(|row| row.id != id),
+                "selection" => {}
+                _ => unreachable!(),
+            }
+            env.view
+                .session_feed
+                .publish_for_test(SessionFeedResult::Snapshot(snapshot));
+            env.view.apply_session_feed();
+            let other = env
+                .view
+                .instances()
+                .find(|row| row.id != id)
+                .unwrap()
+                .id
+                .clone();
+            env.view.select_session_by_id(&other);
+            if late_submit {
+                env.view.dispatch_confirm_submit("trash_session");
+            } else {
+                env.view.enforce_trash_read_only();
+                assert_eq!(
+                    env.view.confirm_dialog.is_some(),
+                    change == "selection",
+                    "{change}"
+                );
+                if change == "selection" {
+                    env.view.dispatch_confirm_submit("trash_session");
+                }
+            }
+            assert!(env.view.pending_trash_session.is_none(), "{change}");
+            let request = requests(Err("trash request observed".into()));
+            if change == "selection" {
+                assert!(
+                    matches!(request, Some((target, crate::tui::session_feed::SessionRequest::Trash(_))) if target == id)
+                );
+            } else {
+                assert!(request.is_none(), "{change}");
+            }
+        }
+    }
+}
+
+#[test]
+#[serial]
 fn diff_save_uses_its_own_receipt_and_surfaces_rejection_or_unknown_in_takeover() {
     use crate::tui::dialogs::test_render::{draw, find};
     for outcome in ["saved", "rejected", "unknown"] {

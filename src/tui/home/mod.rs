@@ -357,7 +357,7 @@ pub struct HomeView {
     pub(super) structured_transcript_painted: bool,
     /// Exact canonical purge owner captured when Force Remove confirmation opens.
     pub(super) pending_force_remove_session: Option<(String, std::num::NonZeroU64)>,
-    pub(super) pending_trash_session: Option<String>,
+    pub(super) pending_trash_session: Option<SessionDialogTarget>,
     pub(super) pending_dialog_click_action: Option<crate::tui::app::Action>,
     pub(super) search_active: bool,
     pub(super) search_query: Input,
