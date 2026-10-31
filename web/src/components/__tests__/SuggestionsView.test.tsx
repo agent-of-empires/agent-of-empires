@@ -40,7 +40,6 @@ const snapshot = (over: Partial<SuggestionsSnapshot> = {}): SuggestionsSnapshot 
       name: "GitHub",
       status: "ok",
       enabled: true,
-      enabled: true,
       sources: [
         { criterion: "assigned", label: "Assigned issues", description: "", enabled: true, variables: [] },
         { criterion: "ci", label: "Failing checks", description: "", enabled: false, variables: [] },
@@ -194,6 +193,65 @@ describe("SuggestionsView", () => {
       expect(screen.getByRole("button", { name: "Dismiss" })).toBeTruthy();
     });
 
+    it("a stale started item cannot start another Session", async () => {
+      await open(
+        snapshot({
+          items: [
+            {
+              ...item,
+              stale: true,
+              started_session: {
+                id: "sess-1",
+                title: "Review",
+                status: "Idle",
+                archived: false,
+                created_at: new Date().toISOString(),
+              },
+            },
+          ],
+        }),
+      );
+      fireEvent.click(await screen.findByRole("button", { name: "More" }));
+      expect((screen.getByRole("menuitem", { name: "Start another Session…" }) as HTMLButtonElement).disabled).toBe(
+        true,
+      );
+      expect(screen.getByRole("button", { name: "Open" })).toBeTruthy();
+    });
+
+    it("Start another failing keeps Open, and the retry is unlinked too", async () => {
+      const started = {
+        id: "sess-1",
+        title: "Review",
+        status: "Running" as const,
+        archived: false,
+        created_at: new Date().toISOString(),
+      };
+      prepareSuggestion.mockResolvedValueOnce({ ok: false, error: "no agent", stale: false });
+      const onPrepare = await open(snapshot({ items: [{ ...item, started_session: started }] }));
+      fireEvent.click(await screen.findByRole("button", { name: "More" }));
+      fireEvent.click(screen.getByRole("menuitem", { name: "Start another Session…" }));
+      expect(await screen.findByText(/Couldn't start: no agent/)).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Open" })).toBeTruthy();
+
+      prepareSuggestion.mockResolvedValueOnce({
+        ok: true,
+        data: {
+          title: "Fix lifecycle",
+          initial_prompt: "p",
+          source_ref: "example/1",
+          project: { name: "aoe", path: "/work/aoe" },
+          tool: "claude",
+          yolo: false,
+          sandbox: false,
+          worktree: true,
+        },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "More" }));
+      fireEvent.click(screen.getByRole("menuitem", { name: "Start another Session…" }));
+      await waitFor(() => expect(onPrepare).toHaveBeenCalledTimes(1));
+      expect(onPrepare.mock.calls[0]![0].suggestion).toBeUndefined();
+    });
+
     it("a failed start stays on its row with Open wizard as the only way to retry", async () => {
       prepareSuggestion.mockResolvedValueOnce({ ok: false, error: "worktree branch already exists", stale: false });
       const onPrepare = await open(snapshot());
@@ -341,14 +399,16 @@ describe("SuggestionsView", () => {
       const base = two();
       fetchSuggestions
         .mockResolvedValueOnce({ ...base, providers: [{ ...base.providers[0]!, refreshing: true }, linear] })
+        .mockResolvedValueOnce(null)
         .mockResolvedValue(base);
       render(<SuggestionsView onPrepare={vi.fn()} onOpenSession={vi.fn()} />);
       expect((await screen.findByRole("list", { name: "Provider status" })).textContent).toContain("refreshing…");
-      await waitFor(() => expect(fetchSuggestions).toHaveBeenCalledTimes(2), { timeout: 5000 });
+      // The second fetch fails; the poll still comes back for a third.
+      await waitFor(() => expect(fetchSuggestions).toHaveBeenCalledTimes(3), { timeout: 8000 });
       await waitFor(() =>
         expect(screen.getByRole("list", { name: "Provider status" }).textContent).not.toContain("refreshing…"),
       );
-    });
+    }, 15_000);
 
     it("a dismiss offers Undo here too", async () => {
       dismissSuggestion.mockResolvedValue(ok);

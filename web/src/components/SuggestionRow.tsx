@@ -97,12 +97,14 @@ const MENU_ITEM_CLASS =
 
 function MoreMenu({
   started,
+  stale,
   disabled,
   readOnly,
   offline,
   onDismiss,
 }: {
   started: NonNullable<ActionsProps["started"]>;
+  stale: boolean;
   disabled: boolean;
   readOnly: boolean;
   offline: boolean;
@@ -133,8 +135,8 @@ function MoreMenu({
           <button
             type="button"
             role="menuitem"
-            disabled={disabled}
-            title={unavailable}
+            disabled={disabled || stale}
+            title={stale ? "No longer open at the source" : unavailable}
             className={MENU_ITEM_CLASS}
             onClick={() => {
               setOpen(false);
@@ -192,7 +194,7 @@ export function SuggestionActions({
 }: ActionsProps) {
   const disabled = busy || readOnly || offline;
   const label = dismissed ? "Restore" : "Dismiss";
-  if (started && !dismissed && !failed) {
+  if (started && !dismissed) {
     return (
       <>
         <button
@@ -204,6 +206,7 @@ export function SuggestionActions({
         </button>
         <MoreMenu
           started={started}
+          stale={stale}
           disabled={disabled}
           readOnly={readOnly}
           offline={offline}

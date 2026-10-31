@@ -151,3 +151,90 @@ test("an empty list says there is nothing to suggest", async ({ page }) => {
 
   await expect(page.getByText("Nothing to suggest right now.")).toBeVisible();
 });
+
+test("a started suggestion offers Open, and Start another sends no suggestion reference", async ({ page }) => {
+  await mockTerminalApis(page);
+  const posts: unknown[] = [];
+  await page.route("**/api/sessions", (route) => {
+    if (route.request().method() === "POST") {
+      posts.push(route.request().postDataJSON());
+      return route.fulfill({ status: 400, json: { message: "Boundary create refusal" } });
+    }
+    return route.fulfill({ headers: CURSOR, json: { sessions: [], workspace_ordering: [] } });
+  });
+  const started = {
+    ...item,
+    started_session: {
+      id: "sess-1",
+      title: "Review RFC 4562",
+      status: "Running",
+      archived: false,
+      created_at: new Date(Date.now() - 3 * 60_000).toISOString(),
+    },
+  };
+  await page.route("**/api/suggestions", (route) =>
+    route.fulfill({ json: { providers: [provider], items: [started] } }),
+  );
+  await page.route("**/api/suggestions/prepare", (route) =>
+    route.fulfill({
+      json: {
+        title: item.draft.title,
+        initial_prompt: item.draft.prompt,
+        source_ref: item.source_ref,
+        project: { name: "aoe", path: "/work/aoe" },
+        tool: "claude",
+        yolo: false,
+        sandbox: false,
+        worktree: false,
+      },
+    }),
+  );
+  await page.route("**/api/settings**", (route) => route.fulfill({ json: {} }));
+  await page.route("**/api/projects**", (route) => route.fulfill({ json: [] }));
+  await page.route("**/api/git/is-repo**", (route) => route.fulfill({ json: { is_git_repo: true } }));
+  await page.goto("/suggestions");
+
+  await expect(page.getByRole("button", { name: "Start", exact: true })).toHaveCount(0);
+  await expect(page.getByText(/Session running · Review RFC 4562 · started 3 min ago/)).toBeVisible();
+
+  await page.getByRole("button", { name: "More", exact: true }).click();
+  await page.getByRole("menuitem", { name: "Start another Session…" }).click();
+  await expect(page.getByLabel("Prompt", { exact: true })).toHaveValue(item.draft.prompt);
+  const create = page.waitForRequest((r) => r.url().endsWith("/api/sessions") && r.method() === "POST");
+  await page.getByRole("button", { name: /Launch/ }).click();
+  const body = (await create).postDataJSON();
+  expect(body).toMatchObject({ initial_prompt: item.draft.prompt, path: "/work/aoe" });
+  expect(body).not.toHaveProperty("suggestion");
+
+  await page.goto("/suggestions");
+  await page.getByRole("button", { name: "Open", exact: true }).click();
+  await expect(page).toHaveURL(/\/session\/sess-1$/);
+});
+
+test("a dismiss on the full view shows Undo, and Undo restores the row", async ({ page }) => {
+  await mockTerminalApis(page);
+  await page.route("**/api/sessions", (route) =>
+    route.fulfill({ headers: CURSOR, json: { sessions: [], workspace_ordering: [] } }),
+  );
+  const live = { providers: [provider], items: [{ ...item }] };
+  await page.route("**/api/suggestions", (route) => route.fulfill({ json: live }));
+  await page.route("**/api/suggestions/dismiss", (route) => {
+    live.items[0].dismissed = true;
+    return route.fulfill({ json: { ok: true } });
+  });
+  const undismiss = page.waitForRequest((r) => r.url().endsWith("/api/suggestions/undismiss"));
+  await page.route("**/api/suggestions/undismiss", (route) => {
+    live.items[0].dismissed = false;
+    return route.fulfill({ json: { ok: true } });
+  });
+  await page.goto("/suggestions");
+
+  await page.getByRole("button", { name: "Dismiss", exact: true }).click();
+  await expect(page.getByText(`Dismissed “${item.title}”.`)).toBeVisible();
+  await expect(page.getByText(item.title, { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /Stop suggesting/ })).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Undo" }).click();
+  expect((await undismiss).postDataJSON()).toEqual({ provider_id: "github", id: "issue-1" });
+  await expect(page.getByText(item.title, { exact: true })).toBeVisible();
+});

@@ -216,17 +216,17 @@ export function SuggestionsView({
                         title={item.title}
                         source={providerName}
                         reason={item.reason}
-                        project={item.project}
+                        project={item.resolved_project?.name ?? item.project}
                         session={item.started_session}
                         stale={item.stale}
-                        failure={failures[key]}
+                        failure={failures[key]?.message}
                         actions={
                           <SuggestionActions
                             dismissed={item.dismissed}
                             readOnly={readOnly}
                             offline={offline}
                             busy={busy !== null}
-                            onStart={() => void start(item)}
+                            onStart={() => void start(item, failures[key]?.another)}
                             stale={item.stale}
                             failed={key in failures}
                             started={

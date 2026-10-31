@@ -64,16 +64,16 @@ export function DashboardSuggestions({ readOnly = false, onPrepare, onViewAll, o
             title={item.title}
             source={nameOf(item.provider_id)}
             reason={item.reason}
-            project={item.project}
+            project={item.resolved_project?.name ?? item.project}
             session={item.started_session}
             stale={item.stale}
-            failure={failures[suggestionKey(item)]}
+            failure={failures[suggestionKey(item)]?.message}
             actions={
               <SuggestionActions
                 readOnly={readOnly}
                 offline={offline}
                 busy={busy !== null}
-                onStart={() => void start(item)}
+                onStart={() => void start(item, failures[suggestionKey(item)]?.another)}
                 stale={item.stale}
                 failed={suggestionKey(item) in failures}
                 onToggleDismiss={() => void dismiss(item, true)}

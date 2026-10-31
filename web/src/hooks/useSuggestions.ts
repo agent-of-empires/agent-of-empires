@@ -11,6 +11,12 @@ import { STALE_NOTICE, toWizardPrefill } from "../lib/suggestionPrefill";
 import type { SuggestionItem, SuggestionsSnapshot } from "../lib/types";
 import type { WizardPrefill } from "../components/session-wizard/SessionWizard";
 
+/** A start that failed, kept on its row so a retry repeats the same kind of start. */
+export interface StartFailure {
+  message: string;
+  another: boolean;
+}
+
 const REFRESH_POLL_MS = 2000;
 const UNDO_MS = 10_000;
 
@@ -25,7 +31,9 @@ export function useSuggestions(onPrepare: (prefill: WizardPrefill) => void) {
   const [refreshing, setRefreshing] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [failures, setFailures] = useState<Record<string, string>>({});
+  const [failures, setFailures] = useState<Record<string, StartFailure>>({});
+  // Bumped after every load, success or not, so the refresh poll re-arms itself.
+  const [loadTick, setLoadTick] = useState(0);
   const mounted = useRef(true);
   const loadSeq = useRef(0);
   const failed = useRef(false);
@@ -41,6 +49,7 @@ export function useSuggestions(onPrepare: (prefill: WizardPrefill) => void) {
   const load = useCallback(async () => {
     const seq = ++loadSeq.current;
     apply(await fetchSuggestions(), seq);
+    if (mounted.current) setLoadTick((t) => t + 1);
   }, [apply]);
 
   // While a provider refreshes, follow it until it answers.
@@ -49,7 +58,7 @@ export function useSuggestions(onPrepare: (prefill: WizardPrefill) => void) {
     if (!refreshingProvider) return;
     const timer = setTimeout(() => void load(), REFRESH_POLL_MS);
     return () => clearTimeout(timer);
-  }, [refreshingProvider, snapshot, load]);
+  }, [refreshingProvider, loadTick, load]);
 
   useEffect(() => {
     mounted.current = true;
@@ -108,7 +117,7 @@ export function useSuggestions(onPrepare: (prefill: WizardPrefill) => void) {
     }
     // A stale item is explained by the reload; any other failure stays on its row.
     if (result.stale) setNotice(STALE_NOTICE);
-    else setFailures((f) => ({ ...f, [key]: result.error }));
+    else setFailures((f) => ({ ...f, [key]: { message: result.error, another } }));
     await load();
     if (mounted.current) setBusy(null);
   };
