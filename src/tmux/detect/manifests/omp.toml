@@ -44,6 +44,13 @@ region = "evidence(working_title)"
 visible = true
 regex = ['\S']
 
+[[rules]]
+id = "local_prompt_history"
+priority = 650
+region = "evidence(local_history)"
+skip_state_update = true
+regex = ['\S']
+
 # The spinner-free Processing footer also carries a live interrupt token.
 [[rules]]
 id = "active_interrupt_hint"

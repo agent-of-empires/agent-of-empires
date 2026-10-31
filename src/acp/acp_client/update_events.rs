@@ -760,6 +760,27 @@ mod tests {
         }
     }
 
+    /// EnterPlanMode is a `switch_mode` tool with no plan: a tool card only.
+    #[test]
+    fn switch_mode_emits_a_plan_only_when_the_input_carries_one() {
+        for (raw_input, want) in [
+            (
+                serde_json::json!({ "mode": "plan" }),
+                vec!["tool_call_started"],
+            ),
+            (
+                serde_json::json!({ "plan": "- a\n- b" }),
+                vec!["tool_call_started", "plan_updated"],
+            ),
+        ] {
+            let mut tc = AcpToolCall::new("tc-plan", "EnterPlanMode");
+            tc.kind = agent_client_protocol::schema::v1::ToolKind::SwitchMode;
+            tc.raw_input = Some(raw_input.clone());
+            let events = claude(SessionUpdate::ToolCall(tc));
+            assert_eq!(kinds(&events), want, "{raw_input}");
+        }
+    }
+
     #[test]
     fn dedup_cases() {
         let restated = "Concrete repro. Let me inspect the events around lgtm and the \"Plan approved\" message in that session.";

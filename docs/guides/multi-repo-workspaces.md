@@ -84,9 +84,9 @@ Saved repo paths the pickers draw from, in two scopes:
 
 See [File Locations](configuration.md#file-locations) for `<app_dir>`. `aoe project add` defaults to global, or to the selected profile with `-p <profile>`; `--scope global` or `--scope profile` overrides that choice. A path already registered in another scope is refused unless `--allow-override` lets a profile entry shadow the global one.
 
-Saved projects appear in pickers even without sessions. **Pinning** keeps a project header visible when empty; unpinning leaves the registration intact. Only **Remove** or `aoe project remove` deletes the entry.
+Registered Projects appear in pickers even without sessions. **Pinning** keeps a project header visible when empty; unpinning leaves the registration intact. Only **Remove** or `aoe project remove` deletes the entry.
 
-Pin from the TUI project view (`g`, Project grouping, then `p` on a header or its context menu), or the web project header's actions menu. Pinning registers an unsaved repo globally and marks it with `◆`. Empty pinned web projects sort below active repositories and retain their **New session** action. Pins live in the registry and appear on the other surface when refreshed.
+Pin from the TUI project view (`g`, Project grouping, then `p` on a header or its context menu), or the web project header's actions menu. Pinning registers an unregistered repo globally and marks it with `◆`. Empty pinned web projects sort below active repositories and retain their **New session** action. Pins live in the registry and appear on the other surface when refreshed.
 
 ## CLI
 
@@ -100,11 +100,11 @@ From the home view, press `b` (or `B` with strict hotkeys) to open a filterable 
 
 ## Web Dashboard
 
-Use the sidebar's **Projects** section to add a saved project, edit its default base branch, or remove its registration. Unpin a project first if it is displayed as a persistent repository header. Changing a registration's name, path, or scope requires removing and adding it again. Read-only servers hide mutation controls.
+Use the sidebar's **Projects, no sessions** section to add a Project, edit its default base branch, or remove its registration. Unpin a project first if it is displayed as a persistent repository header. Changing a registration's name, path, or scope requires removing and adding it again. Read-only servers hide mutation controls.
 
 Remove targets the registrations represented by that project row, using the profile captured when the action starts. It does not request deletion from unrelated profiles. Global registrations are shared, so removing one changes every profile's merged view.
 
-Saved-project suggestions in the new-session wizard follow the selected profile. An open project form keeps its original profile even if the daemon's default profile changes. The picker for adding a repository to an existing session uses that session's profile. Unregistered paths can still be entered directly.
+Registered Project suggestions in the new-session wizard follow the selected profile. An open project form keeps its original profile even if the daemon's default profile changes. The picker for adding a repository to an existing session uses that session's profile. Unregistered paths can still be entered directly.
 
 Multi-repo sessions are bucketed into a single **Multi-repo** group at the bottom of the sidebar, regardless of which repo was chosen as the primary. Each session row shows a chip per repo under the title.
 

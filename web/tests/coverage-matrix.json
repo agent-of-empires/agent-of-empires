@@ -1657,15 +1657,20 @@
       "id": "sidebar.compact-mode",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/sidebar-chrome.spec.ts"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+      "specs": ["tests/sidebar-chrome.spec.ts", "tests/sidebar-legend.spec.ts"],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/SidebarToolbar.tsx",
+        "web/src/components/sidebar/SidebarLegend.tsx"
+      ]
     },
     {
       "id": "sidebar.drawer-swipe",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/hooks/useDrawerSwipe.test.ts"],
-      "components": ["web/src/hooks/useDrawerSwipe.ts"]
+      "specs": ["src/hooks/useDrawerSwipe.test.ts", "tests/mobile-panes.spec.ts"],
+      "components": ["web/src/hooks/useDrawerSwipe.ts"],
+      "notes": "Active chat text selection blocks both drawer swipe directions, including selection beginning mid-gesture. Cancellation lasts through touchend; a fresh swipe works after selection clears. Browser coverage preserves a DOM selection in the mobile chat while both drawers stay closed."
     },
     {
       "id": "sidebar.context-resume",
@@ -2061,8 +2066,12 @@
       "kind": "vitest",
       "risk": "low",
       "specs": ["src/components/__tests__/SessionRowTriage.test.tsx"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/SessionRow.tsx"],
-      "reason": "Favorite markers remain distinct from pin in normal and compact rows, including favorite-to-nonfavorite updates."
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/lib/sidebarMarks.ts"
+      ],
+      "reason": "Favorite markers remain distinct from pin in normal and compact rows, including favorite-to-nonfavorite updates, and explain themselves with a Tooltip rather than title."
     },
     {
       "id": "sidebar.unread-indicator",
@@ -2073,7 +2082,44 @@
         "src/lib/api.test.ts",
         "src/lib/__tests__/sidebarOptimistic.test.ts"
       ],
-      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/lib/sidebarMarks.ts"
+      ]
+    },
+    {
+      "id": "sidebar.status-legend",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/sidebar-legend.spec.ts"],
+      "components": [
+        "web/src/components/sidebar/SidebarLegend.tsx",
+        "web/src/components/sidebar/SidebarToolbar.tsx",
+        "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/components/sidebar/SidebarGroupHeader.tsx",
+        "web/src/components/Tooltip.tsx"
+      ],
+      "reason": "The ? legend opens as a popover on desktop and a sheet at 375px with touch; a keyboard-focused row is described by its glyph's tooltip; a tap opens the Session without a tooltip."
+    },
+    {
+      "id": "sidebar.status-legend-unit",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/lib/__tests__/statusLegend.test.ts",
+        "src/components/__tests__/SidebarLegend.test.tsx",
+        "src/components/__tests__/Tooltip.test.tsx",
+        "src/components/__tests__/SessionRowTriage.test.tsx"
+      ],
+      "components": [
+        "web/src/lib/statusLegend.ts",
+        "web/src/lib/sidebarMarks.ts",
+        "web/src/components/StatusGlyph.tsx",
+        "web/src/components/Tooltip.tsx",
+        "web/src/components/sidebar/SidebarLegend.tsx"
+      ],
+      "reason": "Every SessionStatus has a legend row; animated glyphs hold still under reduced motion; Tooltip describes its trigger; row marks carry no title."
     },
     {
       "id": "sidebar.row-tag",
@@ -2849,7 +2895,24 @@
         "web/src/components/DashboardUpdateBanner.tsx",
         "web/src/components/PushHealthBanner.tsx",
         "web/src/hooks/useConnectionBanner.ts",
-        "web/src/hooks/useUpdateBanner.ts"
+        "web/src/hooks/useUpdateBanner.ts",
+        "web/src/components/SandboxImageBanner.tsx"
+      ]
+    },
+    {
+      "id": "connectivity.sandbox-image-banner",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/__tests__/SandboxImageBanner.test.tsx",
+        "src/components/__tests__/BannerStack.test.tsx",
+        "src/components/acp/__tests__/StartupErrorScreen.test.tsx",
+        "src/lib/api.test.ts"
+      ],
+      "components": [
+        "web/src/components/SandboxImageBanner.tsx",
+        "web/src/hooks/useSandboxImageBanner.ts",
+        "web/src/components/acp/StartupErrorScreen.tsx"
       ]
     },
     {
@@ -3234,9 +3297,11 @@
       "specs": [
         "src/lib/acpTypes.test.ts",
         "src/hooks/useRespawnSession.test.tsx",
-        "src/components/acp/SystemNotices.test.tsx",
+        "src/components/acp/UsageLimitBanner.test.tsx",
         "src/components/acp/SwitchAgentModal.test.tsx",
-        "src/hooks/useAcpSession.test.ts"
+        "src/hooks/useAcpSession.test.ts",
+        "src/lib/__tests__/autoResumeSettingsHref.test.ts",
+        "tests/acp-usage-limit.spec.ts"
       ],
       "components": [
         "src/server/api/acp.rs",
@@ -3245,7 +3310,8 @@
         "web/src/hooks/useAcpSession.ts",
         "web/src/hooks/useRespawnSession.ts",
         "web/src/lib/acpTypes.ts",
-        "web/src/components/acp/SystemNotices.tsx"
+        "web/src/components/acp/UsageLimitBanner.tsx",
+        "web/src/lib/autoResumeSettingsHref.ts"
       ]
     },
     {
@@ -3540,6 +3606,14 @@
       "notes": "#4475: notice_timeout_secs is capped at 2147483 so its millisecond delay fits a browser setTimeout, and PromptStrips clamps the delay for older configs above the cap. SessionNoticesStrip.test.tsx covers the boundary: a timeout past the timer limit does not dismiss at once and fires only after the clamped delay."
     },
     {
+      "id": "acp.queued-strip-tooltip",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": ["tests/acp-queued-tooltip.spec.ts", "src/components/acp/QueuedPromptsStrip.test.tsx"],
+      "components": ["web/src/components/acp/PromptStrips.tsx", "web/src/components/acp/StructuredView.tsx"],
+      "reason": "The queued-messages header is a keyboard-reachable Tooltip trigger, not a title, and says the Daemon holds the queue; a strip with an unconfirmed row says it isn't sent yet."
+    },
+    {
       "id": "acp.queue-send-now",
       "kind": "vitest",
       "risk": "medium",
@@ -3699,15 +3773,32 @@
         "web/src/components/acp/PromptStrips.tsx",
         "web/src/components/acp/ComposerControls.tsx"
       ],
-      "notes": "A new Session shows one startup line naming the Agent with an elapsed count, switching to a neutral line at 15s with no duration or delivery promise; the queued strip and Send button say what they wait for. Reduced motion holds one breathe frame. First-dial backoff keeps the startup line; exhausted retries stop it and expose Reconnect even before the first successful connection. The disconnected new-Session Send and Queue follow-up labels and titles use Pending until the Agent is ready; connected Send and resumed-Session copy remain unchanged."
+      "notes": "A new Session shows one startup line naming the Agent with an elapsed count, switching to a neutral line at 15s with no duration or delivery promise; the queued strip and Send button say what they wait for. Reduced motion holds one breathe frame. First-dial backoff keeps the startup line; exhausted retries stop it and expose Reconnect even before the first successful connection. The disconnected new-Session Send and Queue follow-up labels and titles use Pending until the Agent is ready; connected Send and resumed-Session copy remain unchanged. A Session that already has an acp_session_id (an older one) never shows the startup line, including before its replay loads; an import still pending its history does show it. A running Worker never shows it while the first connection or replay loads; its disconnected Send, follow-up and queue strip copy say \"while disconnected\" instead of \"until session resumes\", and its queue strip says \"Queued\" unless a row is unconfirmed."
+    },
+    {
+      "id": "acp.queued-strip-reason",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/acp/queuedReason.test.ts",
+        "src/components/acp/QueuedPromptsStrip.test.tsx",
+        "tests/acp-startup-wait.spec.ts",
+        "tests/acp-queued-stop-and-run.spec.ts"
+      ],
+      "components": [
+        "web/src/components/acp/queuedReason.ts",
+        "web/src/components/acp/PromptStrips.tsx",
+        "web/src/components/acp/StructuredView.tsx"
+      ],
+      "notes": "The queued strip header says why the queue waits (Agent starting, rate limit, compacting, cancelling, a running turn, a solo command, or offline with an unconfirmed row as Not sent (n)) at text-text-subtle, and each row's action matches: Send now, Stop and send, Stop and run, Start and send, an aria-disabled waiting button with its reason, or none. Stop and run on a solo command behind a steerable turn posts a real cancel, while message rows still steer. Rate-limit copy promises delivery only while auto-resume is armed. Enabled action labels use text-text-primary. A row that can't send yet shows the queue's reason on a focusable aria-disabled button. At 375px a long reason wraps inside the strip without horizontal scroll or overlapping Clear all."
     },
     {
       "id": "acp.startup-error-screen",
       "kind": "vitest",
       "risk": "high",
-      "notes": "Changed descriptive text uses text-text-subtle, with no text-text-secondary or text-text-dim classes, asserted across installable, install-off and sandboxed states.",
-      "specs": ["src/components/acp/__tests__/StartupErrorScreen.test.tsx"],
-      "components": ["web/src/components/acp/StartupErrorScreen.tsx", "web/src/components/acp/RecoveryActionRow.tsx"]
+      "specs": ["src/components/acp/__tests__/StartupErrorScreen.test.tsx", "tests/acp-startup-error-screen.spec.ts"],
+      "components": ["web/src/components/acp/StartupErrorScreen.tsx", "web/src/components/acp/RecoveryActionRow.tsx"],
+      "notes": "Steps follow install-info: installs allowed, read-only or CityHall, sandboxed, a stopped container, npm-installable. Re-reads it on focus so a setting turned on in the TUI unlocks Update; the in-container command comes from the Daemon. Descriptive text uses text-text-subtle, with no text-text-secondary or text-text-dim classes, asserted across install-off, allowed, sandboxed, non-npm and protocol states."
     },
     {
       "id": "acp.startup-error-banner",
@@ -3969,7 +4060,8 @@
         "web/src/components/sidebar/SidebarGroupHeader.tsx",
         "web/src/components/sidebar/GroupLists.tsx",
         "web/src/components/sidebar/keyboardNav.ts"
-      ]
+      ],
+      "notes": "Arrow keys over headers and rows on every axis, including nested and org lists; Left on a collapsed nested header goes to its parent; the Snoozed & archived toggle is a header for its rows; Archive all that empties a Group moves focus to the nearest remaining Group header, never the toggle, and not after focus moved elsewhere."
     },
     {
       "id": "story.sidebar-plan-progress",
@@ -4550,6 +4642,19 @@
       ]
     },
     {
+      "id": "wizard.project-default-agent",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/wizard-project.spec.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/ProjectsSection.tsx",
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/profileDefaults.ts"
+      ],
+      "notes": "A saved project with no sessions opens the wizard on the profile default_tool (#5008)."
+    },
+    {
       "id": "story.wizard-browse-disk",
       "kind": "mocked-playwright",
       "risk": "low",
@@ -4663,7 +4768,8 @@
         "web/src/lib/registeredProjects.ts",
         "web/src/lib/sidebarGroups.ts",
         "web/src/hooks/useRepoGroups.ts",
-        "web/src/hooks/useProjects.ts"
+        "web/src/hooks/useProjects.ts",
+        "web/src/components/sidebar/SidebarGroupHeader.tsx"
       ]
     },
     {
@@ -4671,7 +4777,12 @@
       "kind": "mocked-playwright",
       "risk": "high",
       "specs": ["tests/sidebar-project-pin.spec.ts"],
-      "components": ["web/src/App.tsx", "web/src/lib/api.ts", "web/src/hooks/useProjects.ts"]
+      "components": [
+        "web/src/App.tsx",
+        "web/src/lib/api.ts",
+        "web/src/hooks/useProjects.ts",
+        "web/src/components/ProjectsSection.tsx"
+      ]
     },
     {
       "id": "sidebar.active-project-settings",

@@ -1,7 +1,7 @@
 //! Reusable client and shared wire contract for the daemon REST API.
 
 mod error;
-pub use error::{ApiErrorCode, ERROR_CODE_HEADER};
+pub use error::{ApiErrorCode, ERROR_CODE_HEADER, MANAGED_RESUME_CAUSE_HEADER};
 
 pub(crate) mod lifecycle;
 mod runtime;
@@ -35,19 +35,21 @@ pub use wire::{
     ContextResumeUnavailableReason, CreateProfileBody, CreateProjectBody, CreateSessionBody,
     CreationTrustFingerprint, CreationTrustRequest, CreationTrustReview, DefaultProfileBody,
     DeleteGroupBody, DeleteGroupMode, DeleteGroupOutcome, DeleteProfileQuery, DeleteSessionBody,
-    EnsureToolBody, GroupLocation, GroupSessionFailure, GroupSessionFailureCode,
-    GroupSessionOutcome, ListSessionsQuery, MoveDirection, MoveGroupBody, PendingApproval,
-    PlanSummary, PromptAttachmentKind, PromptAttachmentRef, PurgeOutcome, QueuedPromptEntry,
-    RenameOutcome, RenameProfileBody, RenameSessionBody, ReorderBody, ReorderOutcome,
-    RepoBaseInput, RestartOutcome, RestartSessionBody, RestoreOutcome, SessionResponse,
-    SessionsEnvelope, SetWorktreeNameBody, StartSessionBody, StopAuxiliaryBody, TerminalSize,
-    TerminalTarget, TerminalTargetStatus, TrashOutcome, TrashRelocationOutcome, TrashSessionBody,
-    Tristate, UpdateArchiveBody, UpdateColorBody, UpdateDiffBaseBody, UpdateFavoriteBody,
-    UpdateGroupBody, UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody, UpdateUnreadBody,
-    WorkspaceRepoSummary, WorktreeEditOutcome,
+    EmptyTrashBody, EmptyTrashOutcome, EnsureToolBody, GroupLocation, GroupSessionFailure,
+    GroupSessionFailureCode, GroupSessionOutcome, ListSessionsQuery, MoveDirection, MoveGroupBody,
+    PendingApproval, PlanSummary, PromptAttachmentKind, PromptAttachmentRef, PurgeOutcome,
+    QueuedPromptEntry, RenameOutcome, RenameProfileBody, RenameSessionBody, ReorderBody,
+    ReorderOutcome, RepoBaseInput, RestartOutcome, RestartSessionBody, RestoreOutcome,
+    SessionResponse, SessionsEnvelope, SetWorktreeNameBody, StartSessionBody, StopAuxiliaryBody,
+    TerminalSize, TerminalTarget, TerminalTargetStatus, TrashOutcome, TrashRelocationOutcome,
+    TrashSessionBody, Tristate, UpdateArchiveBody, UpdateColorBody, UpdateDiffBaseBody,
+    UpdateFavoriteBody, UpdateGroupBody, UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody,
+    UpdateUnreadBody, WorkspaceRepoSummary, WorktreeEditOutcome,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
+/// A destroy hook may run for minutes per row, so the bulk purge outlives `DEFAULT_TIMEOUT`.
+const EMPTY_TRASH_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
 const MAX_SUCCESS_BODY_BYTES: usize = 16 * 1024 * 1024;
 
@@ -141,6 +143,7 @@ pub(crate) enum LocalRuntimeError {
 
 fn committed_failure_message(code: ApiErrorCode) -> &'static str {
     match code {
+        ApiErrorCode::ManagedResumeRefused(cause) => cause.message(),
         ApiErrorCode::PurgeFailed => "Purge failed; apply its committed state before retrying",
         ApiErrorCode::ResumeFailed => {
             "Resume failed after start committed; the conversation is preserved for explicit retry"
@@ -151,6 +154,7 @@ fn committed_failure_message(code: ApiErrorCode) -> &'static str {
 
 fn daemon_status_message(status: StatusCode, code: Option<ApiErrorCode>, body: &str) -> String {
     match code {
+        Some(ApiErrorCode::ManagedResumeRefused(cause)) => cause.message().into(),
         Some(ApiErrorCode::SmartRenameSkipped) => {
             "Auto-name is unavailable for this session; check its repository and tool configuration"
                 .into()
@@ -615,13 +619,26 @@ impl DaemonClient {
         body: &DeleteSessionBody,
         epoch: &str,
     ) -> Result<MutationReceipt<PurgeOutcome>, DaemonClientError> {
+        self.request_mutation_with_outcome(self.purge_request(session_id, body)?, epoch)
+            .await
+    }
+
+    /// Purge runs user hooks, so it outlives the default RPC deadline.
+    fn purge_request(
+        &self,
+        session_id: &str,
+        body: &DeleteSessionBody,
+    ) -> Result<reqwest::RequestBuilder, DaemonClientError> {
         let url = format!(
             "{}/{}",
             self.sessions_url,
             transport::path_segment(session_id)?
         );
-        self.request_mutation_with_outcome(self.http.delete(url).json(body), epoch)
-            .await
+        Ok(self
+            .http
+            .delete(url)
+            .json(body)
+            .timeout(crate::session::deletion::PURGE_DEADLINE + DEFAULT_TIMEOUT))
     }
 
     pub async fn mutate_project(
@@ -735,6 +752,26 @@ impl DaemonClient {
             .join("groups")
             .map_err(|_| DaemonClientError::Transport)?;
         self.request_mutation_with_outcome(self.http.delete(url).json(body), epoch)
+            .await
+    }
+
+    pub async fn empty_trash(
+        &self,
+        body: &EmptyTrashBody,
+        epoch: &str,
+    ) -> Result<MutationReceipt<EmptyTrashOutcome>, DaemonClientError> {
+        self.empty_trash_within(body, epoch, EMPTY_TRASH_TIMEOUT)
+            .await
+    }
+
+    async fn empty_trash_within(
+        &self,
+        body: &EmptyTrashBody,
+        epoch: &str,
+        timeout: Duration,
+    ) -> Result<MutationReceipt<EmptyTrashOutcome>, DaemonClientError> {
+        let url = format!("{}/empty-trash", self.sessions_url);
+        self.request_mutation_with_outcome(self.http.post(url).json(body).timeout(timeout), epoch)
             .await
     }
 
@@ -855,6 +892,7 @@ impl DaemonClient {
                 Some(
                     ApiErrorCode::StartFailed
                         | ApiErrorCode::ResumeFailed
+                        | ApiErrorCode::ManagedResumeRefused(_)
                         | ApiErrorCode::PurgeFailed
                 )
             ) {
@@ -876,12 +914,14 @@ impl DaemonClient {
                     return Err(DaemonClientError::InvalidMutationReceipt);
                 }
             }
-            // D1: 409 lifecycle_locked maps from status plus the single finite
-            // server-owned header without reading the body. 401 maps from status
-            // alone; neither retains a body or token in the error.
+            // Finite rejections and 401 never retain a response body.
             if matches!(
                 code,
-                Some(ApiErrorCode::LifecycleLocked | ApiErrorCode::LifecycleSuperseded)
+                Some(
+                    ApiErrorCode::LifecycleLocked
+                        | ApiErrorCode::LifecycleSuperseded
+                        | ApiErrorCode::ManagedResumeRefused(_)
+                )
             ) || status == StatusCode::UNAUTHORIZED
             {
                 return Err(DaemonClientError::Status {
@@ -1438,6 +1478,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_trash_posts_profile_to_the_sessions_route() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let base = serve_mutation_once(
+            "/api/sessions/empty-trash",
+            200,
+            vec![
+                (RUNTIME_EPOCH_HEADER, "epoch-1"),
+                (RUNTIME_REVISION_HEADER, "3"),
+            ],
+            r#"{"sessions":[],"failures":[]}"#,
+            tx,
+        )
+        .await;
+        let client = DaemonClient::new(&base, None).expect("test client");
+        let receipt = client
+            .empty_trash(
+                &EmptyTrashBody {
+                    profile: "work".into(),
+                },
+                "epoch-1",
+            )
+            .await
+            .expect("empty trash");
+        assert!(receipt.outcome.sessions.is_empty());
+        let captured = next_request(rx).await;
+        assert_eq!(captured.method, "POST");
+        assert_eq!(captured.path, "/api/sessions/empty-trash");
+        assert_eq!(captured.epoch.as_deref(), Some("epoch-1"));
+        let body: serde_json::Value = serde_json::from_slice(&captured.body).unwrap();
+        assert_eq!(body["profile"], "work");
+    }
+
+    #[tokio::test]
+    async fn empty_trash_waits_for_a_slow_batch_within_its_own_deadline() {
+        let app = axum::Router::new().route(
+            "/api/sessions/empty-trash",
+            axum::routing::post(|| async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                (
+                    [
+                        (RUNTIME_EPOCH_HEADER, "epoch-1"),
+                        (RUNTIME_REVISION_HEADER, "3"),
+                    ],
+                    r#"{"sessions":[],"failures":[]}"#,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind slow test server");
+        let base = format!("http://{}", listener.local_addr().expect("server addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve slow test");
+        });
+        let client = DaemonClient::new(&base, None).expect("test client");
+        let body = EmptyTrashBody {
+            profile: "work".into(),
+        };
+        let early = client
+            .empty_trash_within(&body, "epoch-1", Duration::from_millis(50))
+            .await;
+        assert!(
+            matches!(early, Err(DaemonClientError::Timeout)),
+            "{early:?}"
+        );
+        client
+            .empty_trash_within(&body, "epoch-1", Duration::from_secs(10))
+            .await
+            .expect("a slow bulk purge returns its receipt inside the request's own deadline");
+    }
+
+    #[tokio::test]
     async fn start_mutation_posts_json_body_to_start_route() {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let base = serve_mutation_once(
@@ -1653,12 +1765,65 @@ mod tests {
         }
     }
 
+    #[test]
+    fn purge_waits_past_the_default_timeout_for_hooks() {
+        let client = DaemonClient::new("http://127.0.0.1:1", None).unwrap();
+        let request = client
+            .purge_request("sess-1", &DeleteSessionBody::default())
+            .unwrap()
+            .build()
+            .unwrap();
+        let timeout = request.timeout().copied().unwrap();
+        assert_eq!(
+            timeout,
+            crate::session::deletion::PURGE_DEADLINE + DEFAULT_TIMEOUT
+        );
+        assert!(timeout > DEFAULT_TIMEOUT);
+    }
+
     #[tokio::test]
     async fn committed_mutation_errors_require_finite_code_and_matching_cursor() {
         for (status, code, epoch, revision, committed, invalid) in [
             (500, "start_failed", "epoch-1", "3", true, false),
             (409, "resume_failed", "epoch-1", "3", true, false),
             (409, "purge_failed", "epoch-1", "3", true, false),
+            (409, "managed_resume_refused", "epoch-1", "3", true, false),
+            (409, "managed_resume_refused", "foreign", "3", false, true),
+            (409, "managed_resume_refused", "epoch-1", "0", false, true),
+            (
+                409,
+                "managed_resume_refused",
+                "absent",
+                "absent",
+                false,
+                false,
+            ),
+            (
+                409,
+                "managed_resume_refused",
+                "epoch-1",
+                "absent",
+                false,
+                true,
+            ),
+            (
+                409,
+                "managed_resume_refused",
+                "epoch-1",
+                "3, 4",
+                false,
+                true,
+            ),
+            (500, "managed_resume_refused", "epoch-1", "3", false, false),
+            (
+                409,
+                "managed_resume_refused, resume_failed",
+                "epoch-1",
+                "3",
+                false,
+                false,
+            ),
+            (409, "MANAGED_RESUME_REFUSED", "epoch-1", "3", false, false),
             (409, "purge_failed", "foreign", "3", false, true),
             (409, "purge_failed", "epoch-1", "0", false, true),
             (409, "purge_failed", "absent", "absent", false, true),
@@ -1745,6 +1910,102 @@ mod tests {
             matches!(error, DaemonClientError::Status { .. }),
             "a non-mutation request cannot adopt an error ACK"
         );
+    }
+
+    #[tokio::test]
+    async fn managed_resume_refusal_recovers_without_reflecting_private_bodies() {
+        use axum::response::IntoResponse;
+        for (unix, authenticated, cause) in [
+            (false, false, "wrapper_contract_required"),
+            (false, true, "wrapper_contract_required"),
+            (true, false, "wrapper_contract_required"),
+            (false, false, "secret-token"),
+        ] {
+            let expected = if cause == "wrapper_contract_required" {
+                crate::session::ManagedResumeCause::WrapperContractRequired
+            } else {
+                crate::session::ManagedResumeCause::ExecutionContextUnattested
+            };
+            let root = tempfile::tempdir().unwrap();
+            let socket = root.path().join("api.sock");
+            let app = axum::Router::new().route(
+                "/api/sessions/{id}/start",
+                axum::routing::post(move || async move {
+                    (
+                        axum::http::StatusCode::CONFLICT,
+                        [
+                            (ERROR_CODE_HEADER, "managed_resume_refused"),
+                            (MANAGED_RESUME_CAUSE_HEADER, cause),
+                            (RUNTIME_EPOCH_HEADER, "epoch-1"),
+                            (RUNTIME_REVISION_HEADER, "3"),
+                        ],
+                        "private-path=/secret/store native-id=secret-id credential=secret-token",
+                    )
+                        .into_response()
+                }),
+            );
+            let (client, server, url) = if unix {
+                let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                (
+                    DaemonClient::new_unix(socket).unwrap(),
+                    server,
+                    "http://localhost".into(),
+                )
+            } else {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                let client =
+                    DaemonClient::new(&url, authenticated.then_some("secret-token")).unwrap();
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                (client, server, url)
+            };
+            for committed in [false, true] {
+                let error = if committed {
+                    client
+                        .mutate_session(
+                            "sess-1",
+                            &SessionMutation::Start(StartSessionBody::default()),
+                            "epoch-1",
+                        )
+                        .await
+                        .unwrap_err()
+                } else {
+                    client
+                        .request_response(
+                            client.http.post(format!("{url}/api/sessions/sess-1/start")),
+                        )
+                        .await
+                        .unwrap_err()
+                };
+                let message = error.to_string();
+                assert!(!format!("{error:?}").contains("secret"));
+                assert!(message.contains("aoe session set-session-id"), "{message}");
+                assert!(message.contains("--store"), "{message}");
+                assert!(!message.contains("secret"), "{message}");
+                if expected == crate::session::ManagedResumeCause::WrapperContractRequired {
+                    assert!(message.contains("session.agent_execution_as"), "{message}");
+                    assert!(message.contains("session.agent_config_dir"), "{message}");
+                }
+                assert!(
+                    message.contains("aoe session set-session-id <session> \"\""),
+                    "{message}"
+                );
+                if committed {
+                    assert!(
+                        matches!(error, DaemonClientError::Committed { cursor, code }
+                        if cursor.revision == 3 && code == ApiErrorCode::ManagedResumeRefused(expected))
+                    );
+                } else {
+                    assert!(
+                        matches!(error, DaemonClientError::Status { code: Some(code), body, .. }
+                        if code == ApiErrorCode::ManagedResumeRefused(expected) && body.is_empty())
+                    );
+                }
+            }
+            server.abort();
+            let _ = server.await;
+        }
     }
 
     #[test]

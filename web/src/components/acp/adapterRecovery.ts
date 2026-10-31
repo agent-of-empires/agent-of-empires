@@ -18,16 +18,19 @@ function installFailureMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-/** Runs `install-agent` for the Session's adapter, then `respawn` once it succeeds. */
+/** Runs `install-agent` for the Session's adapter, then `respawn` once it succeeds.
+ *  `install` resolves to the refusal code when the server refuses. */
 export function useAdapterInstall(sessionId: string, respawn: () => Promise<boolean>) {
   const [state, setState] = useState<"idle" | "installing" | "failed">("idle");
   const [error, setError] = useState<string | null>(null);
+  const [errorCode, setErrorCode] = useState<string | null>(null);
   const [output, setOutput] = useState<string | null>(null);
   const [recovered, setRecovered] = useState(0);
 
-  const install = async () => {
+  const install = async (): Promise<string | null> => {
     setState("installing");
     setError(null);
+    setErrorCode(null);
     setOutput(null);
     try {
       const res = await installAcpAgent(sessionId);
@@ -35,18 +38,22 @@ export function useAdapterInstall(sessionId: string, respawn: () => Promise<bool
       if (!res.success) {
         setState("failed");
         setError(`Install exited with code ${res.exit_code ?? "unknown"}.`);
-        return;
+        return null;
       }
       setRecovered(res.recovered_sessions);
       setState("idle");
       await respawn();
+      return null;
     } catch (e) {
+      const code = e instanceof InstallAgentError ? (e.code ?? null) : null;
       setState("failed");
       setError(installFailureMessage(e));
+      setErrorCode(code);
+      return code;
     }
   };
 
-  return { state, error, output, recovered, install };
+  return { state, error, errorCode, output, recovered, install };
 }
 
 // The event names the agent ("Failed to start structured view agent \"x\": ...");

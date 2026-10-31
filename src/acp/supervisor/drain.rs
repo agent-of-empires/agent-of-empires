@@ -11,8 +11,8 @@ use tracing::{debug, info, warn};
 
 use super::agents::log_wrapper_substitution;
 use super::launch::{
-    admit_stored_row, apply_claude_store_pin, before_session_env, overlay_env, publish_rejection,
-    refresh_spawn_model_effort, resolve_mcp_servers,
+    admit_stored_row, apply_claude_store_pin, apply_declared_config_dir, before_session_env,
+    overlay_env, publish_rejection, refresh_spawn_model_effort, resolve_mcp_servers,
 };
 use super::teardown::{settle_sweeping_if_owed, tear_down_runner, wait_for_exit};
 use super::{
@@ -701,15 +701,12 @@ impl<S: BroadcastSink> Drain<S> {
         let agent = config.agent_key.clone();
         let profile = config.source_profile.clone().unwrap_or_default();
         let cwd = config.cwd.clone();
-        let defaults = tokio::task::spawn_blocking(move || {
+        let resolved = tokio::task::spawn_blocking(move || {
             crate::session::config::repo_config::resolve_config_with_repo_or_warn(&profile, &cwd)
-                .acp
-                .acp_defaults_for(&agent)
-                .cloned()
         })
         .await;
-        match defaults {
-            Ok(defaults) => refresh_spawn_model_effort(config, defaults.as_ref()),
+        match &resolved {
+            Ok(cfg) => refresh_spawn_model_effort(config, cfg.acp.acp_defaults_for(&agent)),
             Err(e) => warn!(
                 target: "acp.supervisor",
                 session = %session_id,
@@ -750,7 +747,21 @@ impl<S: BroadcastSink> Drain<S> {
                 }
             }
             claude_config_dir =
-                apply_claude_store_pin(&mut host_environment, config.claude_store_pin.as_ref());
+                apply_claude_store_pin(&mut host_environment, config.claude_store_pin.as_ref())
+                    .or_else(|| {
+                        let cfg = resolved.as_ref().ok()?;
+                        let (target, native) = config.wrapper_substitution.as_ref().map_or(
+                            (config.agent_key.as_str(), config.agent_key.as_str()),
+                            |(wrapper, base)| (wrapper.as_str(), base.as_str()),
+                        );
+                        apply_declared_config_dir(
+                            &mut host_environment,
+                            cfg,
+                            &config.tool,
+                            target,
+                            native,
+                        )
+                    });
             config.host_environment = host_environment;
         }
 
@@ -2229,6 +2240,87 @@ mod tests {
             .contains(&("HOOK_VALUE".into(), "kept".into())));
 
         sup.shutdown_idle("s-store", None).await.expect("shutdown");
+        held_senders.lock().unwrap().clear();
+        tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .expect("drain should stop")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn respawn_reapplies_declared_config_dir_over_a_hook_value() {
+        let (_home, temp) = isolate_home();
+        let declared = temp.path().join("declared");
+        std::fs::create_dir_all(&declared).unwrap();
+        let app_dir = crate::session::get_app_dir().unwrap();
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("config.toml"),
+            format!(
+                "[host_hooks]\nbefore_session = \"printf 'CLAUDE_CONFIG_DIR={}\\n'\"\n\
+                 [session.agent_config_dir]\nclaude = \"{}\"\n",
+                temp.path().join("hook").display(),
+                declared.display()
+            ),
+        )
+        .unwrap();
+
+        let control =
+            Arc::new(crate::acp::runner_lifecycle::test_support::FakeProcessControl::default());
+        control.alive(4242).alive(4343);
+        let (config_tx, mut config_rx) = mpsc::unbounded_channel();
+        let held_senders: Arc<std::sync::Mutex<Vec<mpsc::Sender<Event>>>> = Default::default();
+        let launcher_senders = Arc::clone(&held_senders);
+        let launcher: Launcher = Arc::new(move |config, session_id| {
+            let config_tx = config_tx.clone();
+            let senders = Arc::clone(&launcher_senders);
+            Box::pin(async move {
+                save_record(&session_id.0, 4343, config.generation);
+                config_tx.send(config).unwrap();
+                let (client, tx) = crate::acp::acp_client::AcpClient::fake_for_test(session_id);
+                senders.lock().unwrap().push(tx);
+                Ok(client.with_runner_pid(4343))
+            })
+        });
+        let sup = Arc::new(
+            Supervisor::new(VecSink::new())
+                .with_process_control(control)
+                .with_launcher(launcher),
+        );
+        save_record("s-declared", 4242, 0);
+        let socket = worker_registry::socket_path_for("s-declared").unwrap();
+        let mut config = runner_config(socket);
+        config.agent_key = "claude".into();
+        config.tool = "claude".into();
+        config.base_host_environment = vec![("HOME".into(), temp.path().display().to_string())];
+        let lease = sup
+            .test_install_runner(
+                "s-declared",
+                config,
+                Some(RunnerIdentity::unattested(4242, 0)),
+            )
+            .await;
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
+        let drain = sup.start_drain_task("s-declared".into(), lease, inbound_rx, None);
+        drop(inbound_tx);
+
+        let launched = tokio::time::timeout(Duration::from_secs(5), config_rx.recv())
+            .await
+            .expect("respawn should launch")
+            .expect("launcher should capture config");
+        assert_eq!(
+            launched
+                .host_environment
+                .iter()
+                .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
+                .map(|(_, value)| value.as_str()),
+            declared.to_str()
+        );
+
+        sup.shutdown_idle("s-declared", None)
+            .await
+            .expect("shutdown");
         held_senders.lock().unwrap().clear();
         tokio::time::timeout(Duration::from_secs(5), drain)
             .await

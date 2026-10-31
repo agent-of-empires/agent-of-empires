@@ -381,13 +381,13 @@ impl HomeView {
         if let Some((id, message)) = self.pending_indeterminate_queue.first().cloned() {
             self.open_indeterminate_dialog(&id, &message);
             if errors.len() > 1 {
-                self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                self.info_dialog = Some(crate::tui::dialogs::InfoDialog::sized_to_fit(
                     "Runtime change",
                     &diagnostics,
                 ));
             }
         } else {
-            self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+            self.info_dialog = Some(crate::tui::dialogs::InfoDialog::sized_to_fit(
                 "Runtime change",
                 &diagnostics,
             ));
@@ -1087,6 +1087,9 @@ impl HomeView {
                 SessionCommandOutcome::Trashed(receipt) => match receipt.outcome.relocation {
                     crate::daemon::TrashRelocationOutcome::Failed { reason } => {
                         self.record_runtime_message(format!("{id}: Session is in Trash, but its worktree relocation is incomplete: {reason}"));
+                    }
+                    crate::daemon::TrashRelocationOutcome::TeardownFailed { reason } => {
+                        self.record_runtime_message(format!("{id}: Session is in Trash, but its tmux sessions could not be stopped: {reason}"));
                     }
                     crate::daemon::TrashRelocationOutcome::Relocated {
                         warning: Some(warning),

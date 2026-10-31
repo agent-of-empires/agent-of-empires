@@ -55,6 +55,8 @@ export interface AcpContext {
   resolveApproval: (nonce: string, decision: ApprovalDecision, optionId?: string) => Promise<void>;
   resolveElicitation: (nonce: string, resolution: ElicitationResolution) => Promise<void>;
   sendPrompt: (text: string, attachments?: PromptAttachmentInput[]) => Promise<void>;
+  /** The composer's Stop, escalating a cancel the Agent ignores. */
+  stopTurn: () => void;
   /** Staged for the next send; owned here so assistant-ui's `onNew` can send them. */
   pendingAttachments: PromptAttachmentInput[];
   setPendingAttachments: React.Dispatch<React.SetStateAction<PromptAttachmentInput[]>>;
@@ -237,6 +239,7 @@ export function AcpRuntime({
         resolveApproval: acp.resolveApproval,
         resolveElicitation: acp.resolveElicitation,
         sendPrompt: acp.sendPrompt,
+        stopTurn: () => void onCancel(),
         pendingAttachments,
         setPendingAttachments,
         forceEndTurn: acp.forceEndTurn,

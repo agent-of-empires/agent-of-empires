@@ -1529,6 +1529,47 @@ export async function dismissUpdate(version: string): Promise<boolean> {
   }
 }
 
+// --- Sandbox image ---
+
+/** The Daemon's last pull of an image, kept until the next one starts. */
+export type SandboxImagePull = { state: "idle" | "running" | "done" } | { state: "failed"; error: string };
+
+export type SandboxImageState =
+  | { state: "available"; remote_digest: string }
+  | { state: "current" }
+  /** `pinned`, `not_pulled`, `no_local_digest`, `runtime_unavailable`, `unparseable` or `checks_off`: the Daemon can't tell. */
+  | { state: "unknown"; reason: string }
+  | { state: "check_failed"; error: string };
+
+export type SandboxImageStatus = SandboxImageState & {
+  image: string;
+  dismissed: boolean;
+  checks_enabled: boolean;
+  sandbox_in_use: boolean;
+  pull: SandboxImagePull;
+  /** Why the dashboard can't pull; `pull_command` is then what to run instead. */
+  pull_blocked: "read_only" | "cityhall" | "disabled" | null;
+  pull_command: string;
+  runtime: string;
+};
+
+/** The status, `{ error }` when the Daemon refuses (`config_unreadable`, for one), or null offline. */
+export async function fetchSandboxImageStatus(): Promise<SandboxImageStatus | { error: string } | null> {
+  const reply = await send("/api/sandbox/image-status").catch(() => null);
+  if (!reply) return null;
+  if (reply.ok) return reply.payload as SandboxImageStatus | null;
+  return { error: stringField(reply.payload, "error") ?? `http_${reply.status}` };
+}
+
+/** `message` explains a refusal: the gate is off, read-only, or the configuration is unreadable. */
+export function pullSandboxImage(): Promise<{ ok: boolean; message?: string }> {
+  return okWithMessage("/api/sandbox/image-pull", { method: "POST" });
+}
+
+export function dismissSandboxImage(digest: string): Promise<boolean> {
+  return fetchOk("/api/sandbox/image-dismiss", jsonInit("POST", { digest }));
+}
+
 // --- Branches ---
 
 export interface BranchInfo {
@@ -1851,7 +1892,11 @@ export interface AgentInstallInfo {
   npm_installable: boolean;
   /** Whether `install-agent` would accept a request now. */
   install_allowed: boolean;
+  /** Why it wouldn't: read-only and CityHall dashboards also can't respawn. */
+  install_blocked: "read_only" | "cityhall" | "setting_off" | "container_not_running" | null;
   sandboxed: boolean;
+  /** `<runtime> exec <container> npm install -g <pkg>` for a sandboxed npm adapter. */
+  container_install_command: string | null;
 }
 
 export function fetchAgentInstallInfo(sessionId: string): Promise<AgentInstallInfo | null> {

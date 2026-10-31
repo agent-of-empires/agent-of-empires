@@ -299,7 +299,7 @@ impl HomeView {
             PaneIntent::LiveSend(_) => "Live send failed",
             PaneIntent::Send { .. } => "Send Failed",
         };
-        self.info_dialog = Some(InfoDialog::new(title, &error));
+        self.info_dialog = Some(InfoDialog::sized_to_fit(title, &error));
         None
     }
 

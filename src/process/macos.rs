@@ -93,8 +93,20 @@ pub(super) fn rename_exclusive(
     result.map_err(std::io::Error::from)
 }
 
+/// tokio reads the peer through `LOCAL_PEERCRED`, the macOS counterpart of Linux `SO_PEERCRED`.
 pub(crate) fn unix_peer_uid(stream: &tokio::net::UnixStream) -> std::io::Result<u32> {
     Ok(stream.peer_cred()?.uid())
+}
+
+#[cfg(test)]
+mod peer_uid_tests {
+    #[tokio::test]
+    async fn connected_pair_reports_the_process_uid() {
+        let (a, b) = tokio::net::UnixStream::pair().unwrap();
+        let uid = nix::unistd::geteuid().as_raw();
+        assert_eq!(super::unix_peer_uid(&a).unwrap(), uid);
+        assert_eq!(super::unix_peer_uid(&b).unwrap(), uid);
+    }
 }
 /// Run the child at background priority so a mass file delete does not saturate
 /// `fseventsd` and stall the rest of the machine.
@@ -357,7 +369,8 @@ impl ProcessHandle {
             .context("incarnation-bound signalling unavailable on this macOS version")?;
         let mut token = self.0;
         let result = unsafe { function(&mut token, signal) };
-        if result != 0 && result != libc::ESRCH {
+        // The kernel reports EPERM when the target starts exiting during the call.
+        if result != 0 && result != libc::ESRCH && !(result == libc::EPERM && self.exited()?) {
             return Err(std::io::Error::from_raw_os_error(result))
                 .context("signalling owned audit token");
         }
@@ -1302,5 +1315,52 @@ mod tests {
         let remaining = prime_processes(&marker, &socket, std::slice::from_ref(&owned)).unwrap();
         assert!(!remaining.contains(&owned));
         assert!(child.0.wait().unwrap().success());
+    }
+
+    #[test]
+    fn attested_runner_root_is_retained_once_across_refreshes() {
+        use std::os::unix::process::CommandExt as _;
+        struct Leader(std::process::Child);
+        impl Drop for Leader {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let leader = Leader(
+            Command::new("sleep")
+                .arg("60")
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        );
+        let pid = leader.0.id();
+        let birth = super::super::runner_birth_identity(pid)
+            .unwrap()
+            .expect("live leader has a birth identity");
+        let root = super::super::PrimeProcessIdentity {
+            pid,
+            start_id: birth.start_id.clone(),
+        };
+        assert!(
+            runner_group_identities(pid).unwrap().contains(&root),
+            "enumeration must include the live leader"
+        );
+
+        let guard =
+            super::super::RunnerProcessGuard::capture(pid, Some(birth.fingerprint())).unwrap();
+        let roots = |guard: &super::super::RunnerProcessGuard| {
+            guard
+                .members
+                .lock()
+                .iter()
+                .filter(|(identity, _)| identity.pid == pid)
+                .count()
+        };
+        assert_eq!(roots(&guard), 1, "root duplicated by capture");
+        for _ in 0..3 {
+            guard.refresh(&mut guard.members.lock()).unwrap();
+            assert_eq!(roots(&guard), 1, "root duplicated by refresh");
+        }
     }
 }
