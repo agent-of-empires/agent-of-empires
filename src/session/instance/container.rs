@@ -218,19 +218,6 @@ impl Instance {
             .transpose()?;
         self.warn_legacy_agent_config_mounts(profile_config);
         let mut transition_lock = self.container_transition_lock()?;
-        let mut scoped_hook = |instance: &mut Self, config: &crate::session::LaunchConfig| {
-            drop(transition_lock.take());
-            drop(launch_locks.take());
-            let result = run_hook(instance, config);
-            launch_locks = launch_generation
-                .map(|generation| {
-                    instance.reacquire_launch_locks_after_hooks(store, generation, Ok(()))
-                })
-                .transpose()?;
-            transition_lock = instance.container_transition_lock()?;
-            store.check_available()?;
-            result
-        };
         // A container built for another agent mounts that agent's config.
         // Decide on the disk row and a resolved profile: a stale in-memory copy
         // or a defaulted config would remove a valid container. A failed reload
@@ -259,10 +246,28 @@ impl Instance {
         }
         // After every reload above, which may have replaced the tool.
         let command = self.get_tool_command().to_owned();
-        // Admit the reconciled tool before refreshing or starting its native
-        // store, and keep the content-transition fence through the launch.
-        let _content_admission =
-            crate::migrations::v033_isolate_sandbox_content::admit_fresh_instance(self)?;
+        // Fence native content around runtime effects, not reentrant hooks.
+        let mut content_admission =
+            Some(crate::migrations::v033_isolate_sandbox_content::admit_fresh_instance(self)?);
+        let mut scoped_hook = |instance: &mut Self, config: &crate::session::LaunchConfig| {
+            drop(content_admission.take());
+            drop(transition_lock.take());
+            drop(launch_locks.take());
+            let result = run_hook(instance, config);
+            launch_locks = launch_generation
+                .map(|generation| {
+                    instance.reacquire_launch_locks_after_hooks(store, generation, Ok(()))
+                })
+                .transpose()?;
+            result?;
+            checkpoint()?;
+            content_admission = Some(
+                crate::migrations::v033_isolate_sandbox_content::admit_fresh_instance(instance)?,
+            );
+            transition_lock = instance.container_transition_lock()?;
+            store.check_available()?;
+            Ok(())
+        };
 
         if container.is_running()? {
             if self.sandbox_store_generation >= container_config::CURRENT_SANDBOX_STORE_GENERATION
@@ -704,6 +709,151 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn before_start_releases_content_admission_and_rechecks_roots() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        #[derive(Debug, thiserror::Error)]
+        #[error("controlled hook refusal")]
+        struct HookRefusal;
+
+        #[derive(Clone, Copy, Debug)]
+        enum HookOutcome {
+            Pass,
+            Refuse,
+            ReplaceRoot,
+        }
+
+        let root = tempfile::tempdir()?;
+        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _env = crate::session::test_support::EnvGuard::unset(&["DOCKER_CONTEXT"])
+            .and_set("DOCKER_HOST", "unix:///var/run/docker.sock");
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })?;
+        crate::session::config::update_config(|config| {
+            config.systemd.enabled = false;
+            config.sandbox.container_runtime = crate::session::ContainerRuntimeName::Docker;
+            config.host_hooks.before_start = vec!["true".into()];
+        })?;
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin)?;
+        let effect = root.path().join("container-started");
+        let script = format!(
+            "#!/bin/sh\ncase \"$*\" in\n\
+             'image inspect'*) exit 0;;\n\
+             *inspect*) echo 'Error: No such container (container not found)' >&2; exit 1;;\n\
+             run\\ *|create\\ *|start\\ *) touch '{}'; echo 'permission denied' >&2; exit 1;;\n\
+             esac\nexit 0\n",
+            effect.display()
+        );
+        for runtime in ["docker", "podman", "container"] {
+            let path = bin.join(runtime);
+            std::fs::write(&path, &script)?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+        }
+        let _path = crate::session::test_support::path_prepended(&bin);
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let app = crate::session::get_app_dir()?;
+        let store = Storage::new_unwatched("default")?;
+        for reserved in [false, true] {
+            for outcome in [
+                HookOutcome::Pass,
+                HookOutcome::Refuse,
+                HookOutcome::ReplaceRoot,
+            ] {
+                if effect.exists() {
+                    std::fs::remove_file(&effect)?;
+                }
+                let mut instance = Instance::new("hook admission", project.to_str().unwrap());
+                instance.tool = "codex".into();
+                instance.command = "codex".into();
+                instance.source_profile = store.profile().into();
+                instance.sandbox_info = Some(super::super::test_helpers::test_sandbox(
+                    "hook-admission",
+                    None,
+                ));
+                super::super::test_helpers::admit_sandbox_fixture(&instance);
+                let generation = if reserved {
+                    Some(instance.try_acquire_lifecycle_reservation(
+                        LifecycleOperation::Launch,
+                        Instance::LIFECYCLE_RESERVATION_TTL,
+                        Utc::now(),
+                    )?)
+                } else {
+                    None
+                };
+                store.update(|rows, _| {
+                    *rows = vec![instance.clone()];
+                    Ok(())
+                })?;
+                let content_root =
+                    crate::migrations::v033_isolate_sandbox_content::instance_roots(&instance)?
+                        .remove(0)
+                        .path;
+                let retained_root = root.path().join(format!("retained-{}", instance.id));
+                let sentinel = content_root.join("unproven.jsonl");
+                let mut entered = false;
+                let mut exclusive_available = false;
+                let error = instance
+                    .ensure_container_with_hook_in(
+                        &store,
+                        &tokio_util::sync::CancellationToken::new(),
+                        generation,
+                        |_, _| {
+                            entered = true;
+                            let exclusive = crate::session::try_acquire_storage_flock(
+                                &app,
+                                crate::migrations::v027_isolate_sandbox_stores::LOCK,
+                            )?;
+                            exclusive_available = exclusive.is_some();
+                            drop(exclusive);
+                            match outcome {
+                                HookOutcome::Pass => Ok(()),
+                                HookOutcome::Refuse => Err(HookRefusal.into()),
+                                HookOutcome::ReplaceRoot => {
+                                    std::fs::rename(&content_root, &retained_root)?;
+                                    std::fs::create_dir(&content_root)?;
+                                    std::fs::write(&sentinel, b"unproven conversation")?;
+                                    Ok(())
+                                }
+                            }
+                        },
+                    )
+                    .err()
+                    .context("fake runtime must refuse bring-up")?;
+                let case = format!("reserved={reserved}, {outcome:?}: {error:#}");
+                assert!(entered, "{case}");
+                assert!(
+                    exclusive_available,
+                    "before_start retained content exclusion: {case}"
+                );
+                match outcome {
+                    HookOutcome::Pass => assert!(effect.exists(), "{case}"),
+                    HookOutcome::Refuse => {
+                        assert!(error.is::<HookRefusal>(), "{case}");
+                        assert!(!effect.exists(), "{case}");
+                    }
+                    HookOutcome::ReplaceRoot => {
+                        assert!(
+                            matches!(
+                                error.downcast_ref::<crate::migrations::SandboxMigrationError>(),
+                                Some(crate::migrations::SandboxMigrationError::Deferred)
+                            ),
+                            "{case}"
+                        );
+                        assert!(!effect.exists(), "{case}");
+                        assert_eq!(std::fs::read(&sentinel)?, b"unproven conversation");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     #[serial_test::serial]
