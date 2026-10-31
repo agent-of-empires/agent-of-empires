@@ -1583,7 +1583,7 @@ pub(crate) async fn resume_structured_stop(
         .acp_supervisor
         .capture_retirement(&expected.id)
         .map_err(|error| structured_lifecycle_error(state, error.into()))?;
-    state.acp_supervisor.shutdown_captured_and_wait(
+    state.acp_supervisor.retire_captured_for_resume_and_wait(
         &expected.id,
         &target,
         std::time::Duration::from_secs(5),

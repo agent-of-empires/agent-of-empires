@@ -41,7 +41,7 @@ function editWorkdir(name: string, renameBranch = false) {
   fireEvent.click(screen.getByTestId("workdir-modal-save"));
 }
 
-describe("sidebar Edit workdir name", () => {
+describe("sidebar Rename workdir", () => {
   it.each([
     ["a managed, idle worktree", {}, true],
     ["a non-managed worktree", { has_managed_worktree: false }, false],

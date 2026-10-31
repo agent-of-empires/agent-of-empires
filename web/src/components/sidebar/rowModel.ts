@@ -94,6 +94,7 @@ export function deriveRowModel(
     runningSession,
     navigationSession: runningSession ?? firstSession,
     actionTargets: resolveActionTargets(sessions, optimistic),
+    sessionCount: sessions.length,
     sessionId: firstSession?.id,
     sessionTitle,
     branchLabel,
