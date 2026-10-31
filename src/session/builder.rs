@@ -96,6 +96,10 @@ pub struct InstanceParams {
     /// One-shot fork seed. When `Some`, the freshly-built instance is set up
     /// to fork its parent on first launch instead of starting fresh.
     pub fork_seed: Option<crate::session::ForkSeed>,
+    pub generated_name: bool,
+    pub no_submodules: bool,
+    pub tie_workdir_to_name: bool,
+    pub worktree_path_id: Option<String>,
 }
 
 /// Result of building an instance, tracking what was created for cleanup purposes.
@@ -659,6 +663,41 @@ pub(crate) fn ensure_not_purging(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn generated_worktree_title(
+    path: &Path,
+    branch: &str,
+    create_new_branch: bool,
+    config: &super::Config,
+    existing_titles: &[&str],
+    path_id: &str,
+) -> Result<String> {
+    let git = GitWorktree::find_main_repo(path).and_then(GitWorktree::new)?;
+    let branch = git_sanitize_branch_name(branch);
+    let attaching = !create_new_branch
+        && git
+            .list_worktrees()?
+            .iter()
+            .any(|entry| entry.branch.as_deref() == Some(branch.as_str()));
+    let template = if GitWorktree::is_bare_repo(&git.repo_path) {
+        &config.worktree.bare_repo_path_template
+    } else {
+        &config.worktree.path_template
+    };
+    civilizations::generate_random_title_filtered(existing_titles, |candidate| {
+        !attaching
+            && git
+                .compute_path(
+                    &super::worktree_edit::worktree_leaf_from_title(candidate),
+                    template,
+                    path_id,
+                )
+                .is_ok_and(|path| path.exists())
+    })
+    .ok_or_else(|| {
+        anyhow::anyhow!("Could not generate a unique worktree name; pass --title instead")
+    })
+}
+
 pub(crate) fn plan_instance(
     params: InstanceParams,
     existing_titles: &[&str],
@@ -702,7 +741,10 @@ pub(crate) fn plan_instance(
     } else {
         std::path::PathBuf::from(&params.path)
     };
-    let config = super::config::repo_config::resolve_config_with_repo(profile, &config_path)?;
+    let mut config = super::config::repo_config::resolve_config_with_repo(profile, &config_path)?;
+    if params.no_submodules {
+        config.worktree.init_submodules = false;
+    }
 
     let mut final_path = if params.scratch {
         // Scratch paths depend on the instance ID.
@@ -726,13 +768,40 @@ pub(crate) fn plan_instance(
         params.create_new_branch,
         params.scratch,
     );
-    let final_title = resolve_title(
-        &params.title,
-        params.worktree_branch.as_deref(),
-        params.worktree_enabled,
-        existing_titles,
-        &taken_branches,
-    )?;
+    anyhow::ensure!(
+        !params.generated_name || params.worktree_enabled,
+        "Generated names require a worktree branch"
+    );
+    let worktree_path_id = if params.worktree_enabled {
+        let id = params
+            .worktree_path_id
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        anyhow::ensure!(
+            uuid::Uuid::parse_str(&id).is_ok(),
+            "Invalid worktree path identity"
+        );
+        id
+    } else {
+        String::new()
+    };
+    let final_title = if params.generated_name && params.title.trim().is_empty() {
+        generated_worktree_title(
+            Path::new(&params.path),
+            params.worktree_branch.as_deref().unwrap_or_default(),
+            params.create_new_branch,
+            &config,
+            existing_titles,
+            &worktree_path_id[..8],
+        )?
+    } else {
+        resolve_title(
+            &params.title,
+            params.worktree_branch.as_deref(),
+            params.worktree_enabled,
+            existing_titles,
+            &taken_branches,
+        )?
+    };
     let branch_source = resolve_worktree_branch(
         params.worktree_enabled,
         params.worktree_branch.as_deref(),
@@ -844,8 +913,18 @@ pub(crate) fn plan_instance(
                         base_branch: None,
                     });
                 } else {
-                    let session_id = uuid::Uuid::new_v4().to_string();
-                    let worktree_path = git_wt.compute_path(branch, template, &session_id[..8])?;
+                    let leaf = if params.generated_name
+                        || (params.tie_workdir_to_name && config.session.tie_workdir_to_name)
+                    {
+                        super::worktree_edit::worktree_leaf_from_title(&final_title)
+                    } else {
+                        branch.clone()
+                    };
+                    let worktree_path =
+                        git_wt.compute_path(&leaf, template, &worktree_path_id[..8])?;
+                    if worktree_path.exists() {
+                        return Err(GitError::WorktreeAlreadyExists(worktree_path).into());
+                    }
 
                     provisioning = Provisioning::Worktree {
                         create_new_branch: false,
@@ -862,8 +941,14 @@ pub(crate) fn plan_instance(
                     });
                 }
             } else {
-                let session_id = uuid::Uuid::new_v4().to_string();
-                let worktree_path = git_wt.compute_path(branch, template, &session_id[..8])?;
+                let leaf = if params.generated_name
+                    || (params.tie_workdir_to_name && config.session.tie_workdir_to_name)
+                {
+                    super::worktree_edit::worktree_leaf_from_title(&final_title)
+                } else {
+                    branch.clone()
+                };
+                let worktree_path = git_wt.compute_path(&leaf, template, &worktree_path_id[..8])?;
 
                 if worktree_path.exists() {
                     return Err(GitError::WorktreeAlreadyExists(worktree_path.clone()).into());
@@ -938,8 +1023,7 @@ pub(crate) fn plan_instance(
     if let Some(notice) =
         crate::agents::get_agent(&params.tool).and_then(crate::agents::AgentDef::lifecycle_notice)
     {
-        // Non-blocking: deprecated agents still launch; every support path
-        // is unchanged. The warning only informs.
+        warnings.push(format!("{} is {notice}", params.tool));
         tracing::warn!(target: "session.builder", "agent '{}' is {notice}", params.tool);
     }
     instance.worktree_info = worktree_info;
@@ -2979,6 +3063,10 @@ mod tests {
             repo_base_branches: Vec::new(),
             scratch: false,
             fork_seed: None,
+            generated_name: false,
+            no_submodules: false,
+            tie_workdir_to_name: false,
+            worktree_path_id: None,
         }
     }
 
@@ -3251,6 +3339,10 @@ mod tests {
             fork_seed: Some(ForkSeed::Structured {
                 parent_acp_session_id: "parent-acp-id".into(),
             }),
+            generated_name: false,
+            no_submodules: false,
+            tie_workdir_to_name: false,
+            worktree_path_id: None,
         };
         let inst = build_instance(params, &[], &[], "default")
             .unwrap()
@@ -3326,6 +3418,10 @@ mod tests {
                 child_session_id: "child-conversation".into(),
                 unattributed_parent_agent: None,
             }),
+            generated_name: false,
+            no_submodules: false,
+            tie_workdir_to_name: false,
+            worktree_path_id: None,
         };
         let inst = build_instance(params, &[], &[], "default")
             .unwrap()

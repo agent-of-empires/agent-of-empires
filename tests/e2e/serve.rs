@@ -784,6 +784,8 @@ if grep -Fq 'hooks_hash = "{hash}"' {trust:?}; then printf approved > {trust_see
                 path: owner.project_path.clone(),
                 profile: Some("default".into()),
                 scratch: false,
+                generated_worktree_branch: None,
+                create_new_branch: false,
             };
             let review = sdk.review_creation_trust(&request, &epoch).await.unwrap();
             let wire = serde_json::to_string(&review).unwrap();

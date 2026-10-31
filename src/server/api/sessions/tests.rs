@@ -10365,3 +10365,361 @@ async fn empty_trash_keeps_a_row_retrashed_after_selection() -> anyhow::Result<(
     assert!(kept.is_trashed());
     Ok(())
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cli_deferred_creation_runs_create_hooks_once_without_launching() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let state = support::build_test_app_state(Vec::new());
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let marker = tempfile::tempdir().unwrap();
+    let created = marker.path().join("created");
+    let launched = marker.path().join("launched");
+    let project = project_with_on_create_hooks(&[]);
+    std::fs::write(
+        project.path().join(".agent-of-empires/config.toml"),
+        format!(
+            "[hooks]\non_create = [{:?}]\non_launch = [{:?}]\n",
+            format!("echo created >> '{}'", created.display()),
+            format!("touch '{}'; false", launched.display()),
+        ),
+    )
+    .unwrap();
+    let review = reviewed_creation_trust("test", project.path());
+    let body = serde_json::json!({
+        "title": "deferred", "path": project.path(), "tool": "",
+        "profile": "test", "view": "terminal", "cli": {},
+        "trust_hooks": true, "trust_review": review, "idempotency_key": "deferred",
+    });
+    let (status, first) = post_create(&state, body.clone()).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{first}");
+    let (status, replay) = post_create(&state, body).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{replay}");
+    assert_eq!(first["id"], replay["id"]);
+    assert_eq!(std::fs::read_to_string(created).unwrap(), "created\n");
+    assert!(!launched.exists());
+    let rows = state.instances.read().await;
+    let row = rows
+        .iter()
+        .find(|row| row.id == first["id"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(row.status, Status::Stopped);
+    assert!(row.lifecycle_reservation.is_none());
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cli_parent_selection_preserves_prefixes_and_refuses_grandchildren() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let project = tempfile::tempdir().unwrap();
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let state = support::build_test_app_state(Vec::new());
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let body = |title: &str, parent: Option<&str>| {
+        serde_json::json!({
+            "title": title, "path": project.path(), "tool": "", "profile": "test",
+            "group": "aoe", "cli": {"parent": parent},
+        })
+    };
+    let (status, parent) = post_create(&state, body("parent", None)).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{parent}");
+    let id = parent["id"].as_str().unwrap();
+    let (status, child) = post_create(&state, body("child", Some(&id[..8]))).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{child}");
+    assert_eq!(child["parent_session_id"], parent["id"]);
+    assert_eq!(child["group_path"], "aoe");
+    let (status, rejected) = post_create(&state, body("grandchild", child["id"].as_str())).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{rejected}");
+    assert!(!state
+        .instances
+        .read()
+        .await
+        .iter()
+        .any(|row| row.title == "grandchild"));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cli_generated_worktree_avoids_existing_directories_without_renaming_branch() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let (project, repo) = crate::git::test_support::init_repo();
+    let root = tempfile::tempdir().unwrap();
+    crate::session::config::update_config(|config| {
+        config.worktree.path_template = root.path().join("{branch}").to_string_lossy().into_owned();
+    })
+    .unwrap();
+    for title in crate::session::civilizations::CIVILIZATIONS {
+        let path = root.path().join(title.to_lowercase());
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("owned-by-user"), b"preserve").unwrap();
+    }
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let state = support::build_test_app_state(Vec::new());
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let response = review_creation_trust(
+        State(state.clone()),
+        Ok(Json(
+            serde_json::from_value(serde_json::json!({
+                "path": project.path(), "profile": "test",
+                "generated_worktree_branch": "feature/4466", "create_new_branch": true,
+            }))
+            .unwrap(),
+        )),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let preview: crate::daemon::CreationTrustReview = serde_json::from_slice(&bytes).unwrap();
+    assert!(repo.find_reference("refs/heads/feature/4466").is_err());
+    let (status, row) = post_create(&state, serde_json::json!({
+        "path": project.path(), "tool": "", "profile": "test",
+        "title": preview.suggested_title, "title_typed": true,
+        "worktree_branch": "feature/4466", "create_new_branch": true,
+        "base_branch": repo.head().unwrap().shorthand().unwrap(),
+        "cli": {"generated_name": true, "no_submodules": true, "worktree_path_id": preview.worktree_path_id},
+    })).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{row}");
+    let title = row["title"].as_str().unwrap();
+    assert!(!crate::session::civilizations::CIVILIZATIONS.contains(&title));
+    let path = std::path::Path::new(row["project_path"].as_str().unwrap());
+    assert!(path.join(".git").is_file());
+    assert_eq!(
+        crate::git::test_support::run_git(path, &["branch", "--show-current"]).trim(),
+        "feature/4466"
+    );
+    assert_eq!(
+        repo.find_reference("refs/heads/feature/4466")
+            .unwrap()
+            .target(),
+        repo.head().unwrap().target()
+    );
+    for title in crate::session::civilizations::CIVILIZATIONS {
+        assert_eq!(
+            std::fs::read(root.path().join(title.to_lowercase()).join("owned-by-user")).unwrap(),
+            b"preserve"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cli_concurrent_duplicate_creation_runs_hooks_only_for_the_winner() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let state = support::build_test_app_state(Vec::new());
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let marker = tempfile::tempdir().unwrap();
+    let calls = marker.path().join("calls");
+    let command = format!("echo created >> '{}'", calls.display());
+    let project = project_with_on_create_hooks(&[&command]);
+    let review = reviewed_creation_trust("test", project.path());
+    let request = |key| {
+        serde_json::json!({
+            "title": "one owner", "path": project.path(), "tool": "", "profile": "test",
+            "cli": {}, "trust_hooks": true, "trust_review": review, "idempotency_key": key,
+        })
+    };
+    let (first, second) = tokio::join!(
+        post_create(&state, request("first")),
+        post_create(&state, request("second")),
+    );
+    let mut statuses = [first.0.as_u16(), second.0.as_u16()];
+    statuses.sort();
+    assert_eq!(statuses, [201, 400], "{first:?}, {second:?}");
+    assert_eq!(std::fs::read_to_string(calls).unwrap(), "created\n");
+    let rows = state.instances.read().await;
+    let owner = rows.iter().find(|row| row.title == "one owner").unwrap();
+    assert_eq!(owner.status, crate::session::Status::Stopped);
+    assert!(owner.lifecycle_reservation.is_none());
+    assert_eq!(
+        rows.iter().filter(|row| row.title == "one owner").count(),
+        1
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cli_canonical_fork_uses_the_pinned_binding_across_agent_accounts() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let binding = qualified_parent_binding();
+    let mut source = Instance::new("source", "/tmp");
+    source.source_profile = "test".into();
+    source.tool = "claude".into();
+    source.agent_session_id = Some("superseded-conversation".into());
+    source.resume_intent = crate::session::ResumeIntent::Use(binding.session_id.clone());
+    source.resume_binding = Some(binding.clone());
+    let state = crate::server::test_support::build_test_app_state(vec![source.clone()]);
+    for tool in ["claude", "claude-b"] {
+        let body = create_body_from_json(serde_json::json!({
+            "path": "/tmp", "profile": "test", "tool": tool, "cli": {},
+        }));
+        let seed = create::resolve_canonical_fork_seed(&state, &body, &source.id)
+            .await
+            .unwrap();
+        let crate::session::ForkSeed::Terminal { parent, .. } = seed else {
+            panic!("terminal creation must fork the native conversation");
+        };
+        assert_eq!(*parent, binding);
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cli_cancellation_at_final_commit_removes_provisioned_scratch() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let app = crate::session::get_app_dir().unwrap();
+    crate::session::purge_owners::initialize(&app).unwrap();
+    crate::tmux::tool_retirement::initialize(&app).unwrap();
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let state = support::build_test_app_state(Vec::new());
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let mut commits = state.session_service.arm_creation_commit();
+    let create =
+        tokio::spawn({
+            let state = state.clone();
+            async move {
+                post_create_raw(&state, serde_json::json!({
+            "path": "", "tool": "", "profile": "test", "scratch": true,
+            "title": "cancel-at-commit", "cli": {}, "idempotency_key": "cancel-at-commit",
+        })).await
+            }
+        });
+    let (id, release) = tokio::time::timeout(std::time::Duration::from_secs(10), commits.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let path = {
+        let rows = state.instances.read().await;
+        let row = rows.iter().find(|row| row.id == id).unwrap();
+        assert_eq!(row.status, Status::Creating);
+        std::path::PathBuf::from(&row.project_path)
+    };
+    assert!(path.is_dir());
+    assert!(state.session_service.cancel_creation(&id));
+    release.send(()).unwrap();
+    let (status, code, body) = create.await.unwrap();
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(code.as_deref(), Some("creation_cancelled"));
+    assert!(!path.exists());
+    assert!(!state.instances.read().await.iter().any(|row| row.id == id));
+    assert!(!Storage::open_unwatched("test")
+        .unwrap()
+        .load()
+        .unwrap()
+        .iter()
+        .any(|row| row.id == id));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial]
+async fn cli_custom_default_and_quoted_arguments_reach_the_shell_as_literals() {
+    use crate::server::test_support as support;
+    use std::os::unix::fs::PermissionsExt;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let root = tempfile::tempdir().unwrap();
+    let script = root.path().join("agent");
+    let observed = root.path().join("arguments");
+    let injected = root.path().join("must-not-run");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
+            shell_words::quote(observed.to_str().unwrap())
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::session::config::update_config(|config| {
+        config.session.default_tool = Some("lenovo-claude".into());
+        config.session.custom_agents.insert(
+            "lenovo-claude".into(),
+            script.to_string_lossy().into_owned(),
+        );
+    })
+    .unwrap();
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let state = support::build_test_app_state(Vec::new());
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let literal = format!("$(touch {})", injected.display());
+    let args = format!(
+        "--append-system-prompt \"hello world\" --model opus[1m] '{}'",
+        literal
+    );
+    for (index, tool) in ["", " lenovo-claude "].into_iter().enumerate() {
+        let (status, result) = post_create(
+            &state,
+            serde_json::json!({
+                "path": root.path(), "tool": tool, "profile": "test",
+                "title": format!("literal arguments {index}"),
+                "extra_args": args, "cli": {},
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{result}");
+        let row = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == result["id"].as_str().unwrap())
+            .unwrap()
+            .clone();
+        assert_eq!(row.tool, "lenovo-claude");
+        let launched = std::process::Command::new("/bin/sh")
+            .args(["-c", &format!("{} {}", row.command, row.extra_args)])
+            .status()
+            .unwrap();
+        assert!(launched.success());
+        assert_eq!(
+            std::fs::read_to_string(&observed).unwrap(),
+            format!("--append-system-prompt\nhello world\n--model\nopus[1m]\n{literal}\n")
+        );
+        assert!(!injected.exists());
+    }
+    for cli in [serde_json::Value::Null, serde_json::json!({})] {
+        let (status, _) = post_create(
+            &state,
+            serde_json::json!({
+                "path": root.path(), "tool": "", "profile": "test", "extra_args": "'unterminated",
+                "cli": cli,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cli_fork_inherits_a_custom_identity_instead_of_its_builtin_token() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let project = tempfile::tempdir().unwrap();
+    crate::session::config::update_config(|config| {
+        config.session.default_tool = Some("claude".into());
+        config
+            .session
+            .custom_agents
+            .insert("claude-personal".into(), "claude".into());
+    })
+    .unwrap();
+    let mut source = Instance::new("source", project.path().to_str().unwrap());
+    source.source_profile = "test".into();
+    source.tool = "claude-personal".into();
+    let state = crate::server::test_support::build_test_app_state(vec![source.clone()]);
+    let mut body = create_body_from_json(serde_json::json!({
+        "path": project.path(), "tool": "", "profile": "test", "cli": {"fork_source": source.id},
+    }));
+    super::cli_create::resolve_cli_creation(&state, &mut body, "test")
+        .await
+        .unwrap();
+    assert_eq!(body.tool, "claude-personal");
+}
