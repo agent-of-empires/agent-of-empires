@@ -150,6 +150,7 @@ pub(super) async fn resolve_cli_creation(
                     "Unknown agent_detect_as for custom agent '{name}'"
                 );
             }
+            body.tool = name.to_owned();
         } else {
             body.tool = crate::agents::resolve_tool_name(name)
                 .with_context(|| format!("Unknown tool: {name}"))?

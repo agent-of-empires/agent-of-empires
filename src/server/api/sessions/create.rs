@@ -916,7 +916,7 @@ pub async fn create_session(
     } else {
         shell_checks.push((body.extra_args.as_str(), "extra_args"));
     }
-    if !body.scratch {
+    if !body.scratch && body.cli.is_none() {
         shell_checks.push((body.path.as_str(), "path"));
     }
     if let Err(msg) = super::validate_shell_fields(&shell_checks) {

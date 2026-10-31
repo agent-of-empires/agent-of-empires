@@ -238,3 +238,113 @@ fn aoe_add_lifecycle_warning_covers_all_resolution_paths() {
         );
     }
 }
+
+#[test]
+#[serial_test::parallel]
+fn cli_builtin_launch_keeps_prompt_and_project_path_literal() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    if !Command::new("tmux")
+        .arg("-V")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        return;
+    }
+    let (_tmp, home, xdg) = isolated_dirs();
+    let (_stub_tmp, stub) = stub_dir(&["claude"]);
+    struct LaunchCleanup<'a>(&'a Path, &'a Path, &'a Path);
+    impl Drop for LaunchCleanup<'_> {
+        fn drop(&mut self) {
+            let _ = run_aoe(self.0, self.1, self.2, &["serve", "--stop"]);
+            let _ = Command::new("tmux")
+                .arg("-S")
+                .arg(self.0.join("tmux.sock"))
+                .arg("kill-server")
+                .output();
+        }
+    }
+    let _cleanup = LaunchCleanup(&home, &xdg, &stub);
+    write_config(
+        &xdg,
+        "default_tool = \"claude\"\n[systemd]\nenabled = false",
+    );
+    let profile = run_aoe(&home, &xdg, &stub, &["profile", "create", "default"]);
+    assert!(profile.status.success(), "{profile:?}");
+    let approved = run_aoe(&home, &xdg, &stub, &["hooks", "approve", "-p", "default"]);
+    assert!(approved.status.success(), "{approved:?}");
+    let observed = home.join("arguments");
+    let cwd = home.join("cwd");
+    let ready = home.join("ready");
+    let injected = home.join("must-not-run");
+    let script = stub.join("claude");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n--help) printf '%s\\n' '--session-id --resume --fork-session --name'; exit 0;;\n--version) echo '2.1.0'; exit 0;;\nesac\nprintf '%s\\0' \"$@\" > {}\npwd > {}\n: > {}\nexec sleep 60\n",
+            shell_words::quote(observed.to_str().unwrap()),
+            shell_words::quote(cwd.to_str().unwrap()),
+            shell_words::quote(ready.to_str().unwrap()),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let prompt = format!(
+        "Use --model $(:>{}) now",
+        shell_words::quote(injected.to_str().unwrap())
+    );
+    let extra_args = format!("--append-system-prompt {}", shell_words::quote(&prompt));
+    for (index, name) in ["plain-project", "repo[1]-Bob's-$(false)"]
+        .into_iter()
+        .enumerate()
+    {
+        let project = home.join(name);
+        std::fs::create_dir_all(&project).unwrap();
+        let output = run_aoe(
+            &home,
+            &xdg,
+            &stub,
+            &[
+                "add",
+                project.to_str().unwrap(),
+                "-p",
+                "default",
+                "-t",
+                &format!("literal-launch-{index}"),
+                "--extra-args",
+                &extra_args,
+                "--launch",
+            ],
+        );
+        assert!(output.status.success(), "{output:?}");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "agent never published argv: {output:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let bytes = std::fs::read(&observed).unwrap();
+        let argv: Vec<_> = bytes
+            .split(|byte| *byte == 0)
+            .filter(|word| !word.is_empty())
+            .map(|word| std::str::from_utf8(word).unwrap())
+            .collect();
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair == ["--append-system-prompt", prompt.as_str()]),
+            "{argv:?}"
+        );
+        assert!(
+            !injected.exists(),
+            "literal prompt executed a shell substitution"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&cwd).unwrap().trim_end(),
+            project.canonicalize().unwrap().to_str().unwrap()
+        );
+        std::fs::remove_file(&ready).unwrap();
+    }
+}

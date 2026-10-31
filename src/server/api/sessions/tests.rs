@@ -10633,34 +10633,37 @@ async fn cli_custom_default_and_quoted_arguments_reach_the_shell_as_literals() {
         "--append-system-prompt \"hello world\" --model opus[1m] '{}'",
         literal
     );
-    let (status, result) = post_create(
-        &state,
-        serde_json::json!({
-            "path": root.path(), "tool": "", "profile": "test", "title": "literal arguments",
-            "extra_args": args, "cli": {},
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED, "{result}");
-    let row = state
-        .instances
-        .read()
-        .await
-        .iter()
-        .find(|row| row.id == result["id"].as_str().unwrap())
-        .unwrap()
-        .clone();
-    assert_eq!(row.tool, "lenovo-claude");
-    let launched = std::process::Command::new("/bin/sh")
-        .args(["-c", &format!("{} {}", row.command, row.extra_args)])
-        .status()
-        .unwrap();
-    assert!(launched.success());
-    assert_eq!(
-        std::fs::read_to_string(observed).unwrap(),
-        format!("--append-system-prompt\nhello world\n--model\nopus[1m]\n{literal}\n")
-    );
-    assert!(!injected.exists());
+    for (index, tool) in ["", " lenovo-claude "].into_iter().enumerate() {
+        let (status, result) = post_create(
+            &state,
+            serde_json::json!({
+                "path": root.path(), "tool": tool, "profile": "test",
+                "title": format!("literal arguments {index}"),
+                "extra_args": args, "cli": {},
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{result}");
+        let row = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == result["id"].as_str().unwrap())
+            .unwrap()
+            .clone();
+        assert_eq!(row.tool, "lenovo-claude");
+        let launched = std::process::Command::new("/bin/sh")
+            .args(["-c", &format!("{} {}", row.command, row.extra_args)])
+            .status()
+            .unwrap();
+        assert!(launched.success());
+        assert_eq!(
+            std::fs::read_to_string(&observed).unwrap(),
+            format!("--append-system-prompt\nhello world\n--model\nopus[1m]\n{literal}\n")
+        );
+        assert!(!injected.exists());
+    }
     for cli in [serde_json::Value::Null, serde_json::json!({})] {
         let (status, _) = post_create(
             &state,
