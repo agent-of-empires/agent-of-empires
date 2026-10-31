@@ -1899,10 +1899,10 @@ mod tests {
             (json!({ "refresh_minutes": 60 }), false),
             (json!({ "homepage": false }), false),
         ] {
-            assert_eq!(apply(patch.clone()).unwrap(), Ok(changed), "{patch}");
+            assert_eq!(apply(patch.clone()), Ok(changed), "{patch}");
         }
-        apply(json!({ "homepage": true })).unwrap().unwrap();
-        apply(json!({ "sidebar": true })).unwrap().unwrap();
+        apply(json!({ "homepage": true })).unwrap();
+        apply(json!({ "sidebar": true })).unwrap();
         apply(json!({ "refresh_minutes": 60, "provider_order": ["acme.linear", "acme.github"] }))
             .unwrap();
         let prefs = snap("p")["prefs"].clone();
