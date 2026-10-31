@@ -660,6 +660,18 @@ const requestCases: RequestCase[] = [
     () => api.dismissPluginUpdate("p", "fp"),
     { body: { fingerprint: "fp" }, result: { kind: "ok" } },
   ],
+  ["POST /api/sandbox/image-pull", () => api.pullSandboxImage(), { result: { ok: true } }],
+  // A refusal carries the Daemon's reason for the banner to show.
+  [
+    "POST /api/sandbox/image-pull",
+    () => api.pullSandboxImage(),
+    { respond: json({ message: "pulls are off" }, 403), result: { ok: false, message: "pulls are off" } },
+  ],
+  [
+    "POST /api/sandbox/image-dismiss",
+    () => api.dismissSandboxImage("sha256:new"),
+    { body: { digest: "sha256:new" }, result: true },
+  ],
 ];
 
 describe("request shapes", () => {
@@ -768,6 +780,8 @@ const failureCases: [string, () => Promise<unknown>, unknown][] = [
   ["invokePluginAction", () => api.invokePluginAction("p", "m"), null],
   ["resolvePluginOptions", () => api.resolvePluginOptions("p", "s", []), []],
   ["fetchSoundBlob", () => api.fetchSoundBlob("x.wav"), null],
+  ["pullSandboxImage", () => api.pullSandboxImage(), { ok: false }],
+  ["dismissSandboxImage", () => api.dismissSandboxImage("sha256:new"), false],
 ];
 
 describe("failure fallbacks", () => {

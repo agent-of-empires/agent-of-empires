@@ -43,6 +43,13 @@ impl SessionResponse {
             None => (false, None),
         };
         let row = SessionProjection::new(inst, &inst.source_profile);
+        // Same agent resolution as `acp_agent`.
+        let agent_profile = crate::acp::agent_profiles::resolve(
+            inst.agent_name
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(inst.tool.as_str()),
+        );
         let timestamp = |value: Option<DateTime<Utc>>| value.map(|t| t.to_rfc3339());
         let status = if inst
             .lifecycle_reservation
@@ -150,6 +157,7 @@ impl SessionResponse {
                 builtin_acp_registry().get(resolved).is_some()
             },
             acp_session_id: inst.acp_session_id.clone(),
+            import_pending: inst.import_pending == Some(true),
             // Resolved like `acp_capable`: `agent_name` when non-empty, else
             // `tool`. This is the ACP registry key, so it matches the
             // `/api/acp/agents` names the switch-agent modal filters on (#2803).
@@ -178,19 +186,19 @@ impl SessionResponse {
                     .filter(|s| !s.is_empty())
                     .unwrap_or(inst.tool.as_str()),
             ),
-            // Same agent resolution as `acp_agent`; the composer palette and
-            // queued-prompt clear-boundary hint read these instead of a
-            // client-side per-agent mirror.
-            clear_aliases: crate::acp::agent_profiles::resolve(
-                inst.agent_name
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(inst.tool.as_str()),
-            )
-            .clear_aliases
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
+            // The composer palette, the queued-prompt clear-boundary hint and
+            // the queued strip's reason read these instead of a client-side
+            // per-agent mirror.
+            clear_aliases: agent_profile
+                .clear_aliases
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            compact_aliases: agent_profile
+                .compact_aliases
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             claude_fullscreen: claude_fullscreen && inst.tool == "claude",
             // A session converted by `attach_project` (#3103) has a real
             // `workspace_info`, so both repos list here with no special case.

@@ -274,7 +274,7 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
         .list_sessions_resolver_misses
         .load(std::sync::atomic::Ordering::Relaxed)
         .saturating_sub(misses_before);
-    tracing::debug!(
+    tracing::trace!(
         target: "http.api.sessions",
         rows = sessions.len(),
         resolver_misses,
@@ -469,7 +469,10 @@ pub async fn list_sessions(
     .await
     {
         Ok(view) => view,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(error) => {
+            tracing::debug!(target: "server.runtime", %error, "runtime snapshot failed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
     };
     crate::server::runtime::mutation_response(&view.snapshot.value.cursor, Json(&view))
 }
@@ -738,11 +741,13 @@ mod workspace_ordering_tests {
             rate_limit_auto_resume: None,
             acp_capable: false,
             acp_session_id: None,
+            import_pending: false,
             acp_agent: None,
             acp_can_fork: false,
             structured_view_off: false,
             keeps_context: false,
             clear_aliases: Vec::new(),
+            compact_aliases: Vec::new(),
             claude_fullscreen: false,
             workspace_repos: Vec::new(),
             workspace_dir: None,

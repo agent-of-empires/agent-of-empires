@@ -80,6 +80,8 @@ export interface SessionResponse {
   acp_capable?: boolean;
   /** Captured ACP session id; required for a structured fork. */
   acp_session_id?: string;
+  /** An import whose history arrives once its Agent loads it; its `acp_session_id` is set from creation. */
+  import_pending?: boolean;
   /** Resolved ACP registry key, used as the current agent before any `AgentSwitched`. */
   acp_agent?: string;
   /** Pinned LLM backend ("api" | "bedrock" | "vertex"); absent means the host decides. */
@@ -88,6 +90,8 @@ export interface SessionResponse {
   keeps_context?: boolean;
   /** Slash commands that reset the conversation for this agent. */
   clear_aliases?: string[];
+  /** Slash commands that compact the conversation for this agent. */
+  compact_aliases?: string[];
   /** The agent implements ACP `session/fork` (resume-only agents do not). */
   acp_can_fork?: boolean;
   /** The agent binary was replaced after launch and a restart is safe to offer now. */
@@ -397,6 +401,8 @@ export interface CreateSessionRequest {
   extra_args?: string;
   sandbox_image?: string;
   extra_env?: string[];
+  /** Host-only env for `host_hooks.before_start`; sandbox only, never enters the container. */
+  hook_env?: string[];
   extra_repo_paths?: string[];
   /** Per-repo base (`repo` is a directory name or path); outranks `base_branch`. */
   repo_bases?: { repo: string; base_branch: string }[];

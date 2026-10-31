@@ -1418,6 +1418,15 @@ impl SessionService {
                 }
                 existing.text = text.clone();
                 existing.attachments = attachments.clone();
+                tracing::info!(
+                    target: "acp.queue",
+                    session = %inst.id,
+                    prompt_id = %existing.id,
+                    seq = existing.seq,
+                    origin_plugin = ?existing.origin_plugin,
+                    repost = true,
+                    "prompt enqueued"
+                );
                 return existing.clone();
             }
             let seq = inst.queued_prompt_next_seq;
@@ -1434,6 +1443,15 @@ impl SessionService {
                 origin_device: origin_device.clone(),
                 origin_plugin: origin_plugin.clone(),
             };
+            tracing::info!(
+                target: "acp.queue",
+                session = %inst.id,
+                prompt_id = %entry.id,
+                seq,
+                origin_plugin = ?entry.origin_plugin,
+                repost = false,
+                "prompt enqueued"
+            );
             inst.queued_prompts.push(entry.clone());
             entry
         })
@@ -1471,6 +1489,13 @@ impl SessionService {
                 Some(q) => {
                     q.text = text.clone();
                     q.origin_plugin = None;
+                    tracing::debug!(
+                        target: "acp.queue",
+                        session = %inst.id,
+                        prompt_id = %q.id,
+                        text_len = q.text.len(),
+                        "queued prompt edited"
+                    );
                     EditQueuedOutcome::Updated
                 }
                 None => EditQueuedOutcome::NotFound,
@@ -1499,7 +1524,18 @@ impl SessionService {
         let Some(_submission) = self.prompt_submission_for_session(id).await else {
             return false;
         };
-        self.take_queued_prompt(id, prompt_id).await.is_some()
+        let removed = self
+            .take_queued_prompt(id, prompt_id.clone())
+            .await
+            .is_some();
+        tracing::debug!(
+            target: "acp.queue",
+            session = %id,
+            prompt_id = %prompt_id,
+            removed,
+            "queued prompt removed"
+        );
+        removed
     }
 
     /// Remove a queued prompt and its buffered attachments, returning the row. The caller
@@ -1543,6 +1579,12 @@ impl SessionService {
             })
             .await
             .unwrap_or_default();
+        tracing::debug!(
+            target: "acp.queue",
+            session = %id,
+            rows = cleared_ids.len(),
+            "queued prompts cleared"
+        );
         for prompt_id in cleared_ids {
             self.acp_event_store
                 .delete_pending_attachments_for_ref(id, &prompt_id);
@@ -1783,6 +1825,12 @@ impl SessionService {
             tracing::warn!(target: "acp.queue", session = %id, "queue drain delivery failed; will retry: {e}");
             return;
         }
+        tracing::info!(
+            target: "acp.queue",
+            session = %id,
+            rows = sent_ids.len(),
+            "queued prompts delivered"
+        );
         // Retire only the delivered rows; prompts enqueued during the send
         // survive into the next drain.
         self.retire_drained_rows(id, sent_ids).await;
@@ -2500,6 +2548,7 @@ mod tests {
             sandbox_image: None,
             yolo_mode: false,
             extra_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: Vec::new(),

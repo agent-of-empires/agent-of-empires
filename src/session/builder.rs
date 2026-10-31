@@ -74,6 +74,8 @@ pub struct InstanceParams {
     /// Additional environment entries for the container.
     /// `KEY` = pass through from host, `KEY=VALUE` = set explicitly.
     pub extra_env: Vec<String>,
+    /// Host-only env for `host_hooks.before_start`; never enters the container.
+    pub before_start_hook_env: Vec<String>,
     /// Extra arguments to append after the agent binary
     pub extra_args: String,
     /// Command override for the agent binary (replaces the default binary)
@@ -308,7 +310,9 @@ pub(crate) fn resolve_repo_base_selectors(
 /// per-project layer of `resolve_repo_base_branch` for the launch repo and any
 /// extra repos when building a session.
 pub(crate) fn project_base_branches(profile: &str) -> std::collections::HashMap<String, String> {
-    crate::session::projects::load_merged(profile)
+    use crate::session::projects::{load_global, load_profile};
+    let (global, scoped) = load_global()
+        .and_then(|g| Ok((g, load_profile(profile)?)))
         .unwrap_or_else(|e| {
             // Don't fork worktrees from the wrong base in silence: if the registry can't be read,
             // log it so the missing per-project defaults are explainable instead of mysterious.
@@ -317,19 +321,47 @@ pub(crate) fn project_base_branches(profile: &str) -> std::collections::HashMap<
                 "Failed to load project registry for base-branch defaults; \
                  repos fall back to the global default: {e}"
             );
-            Vec::new()
-        })
-        .into_iter()
-        .filter_map(|p| {
-            let base = p.default_base_branch?;
-            let base = base.trim().to_string();
-            if base.is_empty() {
-                None
-            } else {
-                Some((crate::session::projects::canonical_key(&p.path), base))
-            }
-        })
-        .collect()
+            Default::default()
+        });
+    merge_base_branches(global, scoped)
+}
+
+/// Defaults keyed by repo root. A profile row shadows a global row at the same path first; unset
+/// rows are then dropped, and rows collapsing to one root rank profile over global, then a
+/// registration at the root itself over a linked-worktree alias.
+fn merge_base_branches(
+    global: Vec<crate::session::projects::Project>,
+    scoped: Vec<crate::session::projects::Project>,
+) -> std::collections::HashMap<String, String> {
+    use crate::session::projects::{canonical_key, merge_project_scopes, ProjectScope};
+    let mut best = std::collections::HashMap::<String, ((bool, bool), String)>::new();
+    for p in merge_project_scopes(global, scoped, |p| canonical_key(&p.path)) {
+        let Some(base) = p
+            .default_base_branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+        else {
+            continue;
+        };
+        let key = project_root_key(&p.path);
+        let rank = (
+            p.scope == ProjectScope::Profile,
+            canonical_key(&p.path) == key,
+        );
+        if best.get(&key).is_none_or(|(r, _)| rank > *r) {
+            best.insert(key, (rank, base.to_string()));
+        }
+    }
+    best.into_iter().map(|(k, (_, base))| (k, base)).collect()
+}
+
+/// Registry key for a project: its repo root, so a project registered at
+/// `<proj>/.git` matches the `find_main_repo` lookup in `resolve_repo_base_branch`.
+fn project_root_key(path: &str) -> String {
+    let root = GitWorktree::find_main_repo(std::path::Path::new(path))
+        .unwrap_or_else(|_| PathBuf::from(path));
+    crate::session::projects::canonical_key(root.to_string_lossy())
 }
 
 /// One repository in a multi-repo workspace, paired with the base branch its
@@ -619,6 +651,14 @@ pub fn build_instance(
         })
 }
 
+/// A checkout marked for purging is about to be removed, so no new session may take it.
+pub(crate) fn ensure_not_purging(path: &std::path::Path) -> Result<()> {
+    if crate::git::GitWorktree::is_within_purging(path) {
+        bail!("Project path is being purged: {}", path.display());
+    }
+    Ok(())
+}
+
 pub(crate) fn plan_instance(
     params: InstanceParams,
     existing_titles: &[&str],
@@ -872,6 +912,7 @@ pub(crate) fn plan_instance(
         if !final_path_buf.is_dir() {
             bail!("Project path is not a directory: {}", final_path);
         }
+        ensure_not_purging(&final_path_buf)?;
     }
 
     let mut instance = Instance::new(&final_title, &final_path);
@@ -925,6 +966,11 @@ pub(crate) fn plan_instance(
             &params.extra_env
         };
         warnings.extend(crate::session::validate_env_entries(effective_env));
+        warnings.extend(
+            crate::session::validate_env_entries(&params.before_start_hook_env)
+                .into_iter()
+                .map(|w| w.replace("empty in the container", "skipped by the host hook")),
+        );
 
         instance.sandbox_info = Some(SandboxInfo {
             enabled: true,
@@ -938,7 +984,7 @@ pub(crate) fn plan_instance(
             },
             custom_instruction: config.sandbox.custom_instruction.clone(),
             before_start_env: Vec::new(),
-            before_start_hook_env: Vec::new(),
+            before_start_hook_env: params.before_start_hook_env.clone(),
             provider: None,
             container_workdir: None,
         });
@@ -2540,6 +2586,96 @@ mod tests {
         );
     }
 
+    #[test]
+    fn project_root_key_matches_lookup_for_dot_git_registration() {
+        let dir = tempfile::Builder::new()
+            .prefix("aoe-test-")
+            .tempdir()
+            .unwrap();
+        let bare = dir.path().join(".git");
+        let repo = git2::Repository::init_bare(&bare).unwrap();
+        crate::git::test_support::commit(&repo, Some("HEAD"), &[], &[], None);
+        let wt = dir.path().join("main");
+        crate::git::test_support::run_git(
+            &bare,
+            &["worktree", "add", wt.to_str().unwrap(), "HEAD"],
+        );
+
+        let mut bases = std::collections::HashMap::new();
+        bases.insert(
+            project_root_key(&bare.to_string_lossy()),
+            "develop".to_string(),
+        );
+        for start in [dir.path(), wt.as_path()] {
+            assert_eq!(
+                resolve_repo_base_branch(start, None, &bases, Some("global")),
+                Some("develop".to_string()),
+                "{}",
+                start.display()
+            );
+        }
+    }
+
+    #[test]
+    fn merge_base_branches_prefers_profile_and_root_over_aliases() {
+        use crate::session::projects::{Project, ProjectScope};
+        let (parent, _tip) = init_repo_with_branch("repo", "release");
+        let root = parent.path().join("repo");
+        let wt = parent.path().join("repo-wt");
+        GitWorktree::new(root.clone())
+            .unwrap()
+            .create_worktree("wt-branch", &wt, true, None)
+            .unwrap();
+        let proj = |path: &std::path::Path, base: &str, scope| {
+            let mut p = Project::new("p", path.to_string_lossy(), scope);
+            p.default_base_branch = Some(base.to_string()).filter(|b| !b.is_empty());
+            p
+        };
+        let key = project_root_key(&root.to_string_lossy());
+        let g = ProjectScope::Global;
+        let pr = ProjectScope::Profile;
+
+        // Profile root default beats a global worktree alias, in either insertion order.
+        for global in [
+            vec![proj(&root, "main", g), proj(&wt, "release", g)],
+            vec![proj(&wt, "release", g), proj(&root, "main", g)],
+        ] {
+            let bases = merge_base_branches(global.clone(), vec![proj(&root, "develop", pr)]);
+            assert_eq!(bases.get(&key).map(String::as_str), Some("develop"));
+            // Without a profile entry, the global root wins over the alias.
+            let bases = merge_base_branches(global, vec![]);
+            assert_eq!(bases.get(&key).map(String::as_str), Some("main"));
+        }
+
+        // An unset worktree alias never replaces or hides a configured base.
+        let bases = merge_base_branches(vec![proj(&root, "release", g)], vec![proj(&wt, "", pr)]);
+        assert_eq!(bases.get(&key).map(String::as_str), Some("release"));
+        // An unset root row does not hide a configured worktree alias.
+        let bases = merge_base_branches(vec![proj(&root, "", g), proj(&wt, "release", g)], vec![]);
+        assert_eq!(bases.get(&key).map(String::as_str), Some("release"));
+    }
+
+    #[test]
+    fn merge_base_branches_lets_unset_profile_shadow_same_path_global() {
+        use crate::session::projects::{Project, ProjectScope};
+        let dir = tempfile::Builder::new()
+            .prefix("aoe-test-")
+            .tempdir()
+            .unwrap();
+        let bare = dir.path().join(".git");
+        git2::Repository::init_bare(&bare).unwrap();
+        let proj = |base: Option<&str>, scope| {
+            let mut p = Project::new("p", bare.to_string_lossy(), scope);
+            p.default_base_branch = base.map(str::to_string);
+            p
+        };
+        let bases = merge_base_branches(
+            vec![proj(Some("release"), ProjectScope::Global)],
+            vec![proj(None, ProjectScope::Profile)],
+        );
+        assert!(bases.is_empty());
+    }
+
     /// Create a repo with `main` plus a second branch holding a distinct
     /// commit. Returns the parent TempDir and the second branch's tip oid so a
     /// test can assert a worktree forked from it instead of `main`.
@@ -2836,6 +2972,7 @@ mod tests {
             sandbox_image: "ubuntu:latest".to_string(),
             yolo_mode: false,
             extra_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: Vec::new(),
@@ -2843,6 +2980,30 @@ mod tests {
             scratch: false,
             fork_seed: None,
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_instance_keeps_hook_env_off_the_container_env() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
+        let runtime = containers::get_container_runtime();
+        if !runtime.is_available() || !runtime.is_daemon_running() {
+            return;
+        }
+        let project = tempfile::tempdir().unwrap();
+        let mut params = custom_agent_params(project.path(), "claude");
+        params.sandbox = true;
+        params.extra_env = vec!["A=1".into()];
+        params.before_start_hook_env = vec!["TOKEN".into(), "H=2".into()];
+
+        let sandbox = build_instance(params, &[], &[], "default")
+            .unwrap()
+            .instance
+            .sandbox_info
+            .unwrap();
+        assert_eq!(sandbox.before_start_hook_env, ["TOKEN", "H=2"]);
+        assert_eq!(sandbox.extra_env, Some(vec!["A=1".to_string()]));
     }
 
     #[test]
@@ -3081,6 +3242,7 @@ mod tests {
             sandbox_image: String::new(),
             yolo_mode: false,
             extra_env: vec![],
+            before_start_hook_env: vec![],
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: vec![],
@@ -3153,6 +3315,7 @@ mod tests {
             sandbox_image: String::new(),
             yolo_mode: false,
             extra_env: vec![],
+            before_start_hook_env: vec![],
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: vec![],

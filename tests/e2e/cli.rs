@@ -1195,6 +1195,66 @@ exec sleep 60\n",
     assert_eq!(json["status"], "waiting");
 }
 
+#[test]
+#[parallel]
+fn cli_session_capture_preserves_persisted_omp_history_status() {
+    require_tmux!();
+    let mut h = TuiTestHarness::new("cli_omp_history_status");
+    h.set_env("AOE_NO_AUTOSTART", "1");
+    let bin = h.install_path_command("omp");
+    let agent = bin.join("omp");
+    write_executable(
+        &agent,
+        "#!/bin/sh\nprintf '\\033]0;history-probe\\007'\ncat <<'PANEL'\n\
+╭─ History ──────────────────────╮
+│                                │
+│ >                              │
+│                                │
+│ ❯ previous prompt              │
+│                                │
+│ ↑/↓ navigate · ⏎ select · ⎋ cancel │
+│                                │
+╰────────────────────────────────╯
+PANEL
+exec sleep 60\n",
+    );
+    let project = h.project_path();
+    let session_id = h.add_session(&[
+        project.to_str().unwrap(),
+        "-t",
+        "OmpHistory",
+        "--tool",
+        "omp",
+        "--cmd-override",
+        agent.to_str().unwrap(),
+    ]);
+    h.run_cli_ok(&["session", "start", &session_id]);
+    wait_until(Duration::from_secs(10), Duration::from_millis(200), || {
+        let json = json_out(&h, &["session", "capture", &session_id, "--json"]);
+        let content = json["content"].as_str().unwrap_or_default();
+        if content.contains("previous prompt")
+            && content.contains("╰────────────────────────────────╯")
+        {
+            Ok(())
+        } else {
+            Err(format!("history panel not painted: {json}"))
+        }
+    });
+    for status in ["waiting", "running", "error"] {
+        let mut sessions = h.read_sessions();
+        let row = sessions
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|row| row["id"] == session_id)
+            .unwrap();
+        row["status"] = Value::String(status.to_owned());
+        std::fs::write(h.sessions_path(), serde_json::to_vec(&sessions).unwrap()).unwrap();
+        let captured = json_out(&h, &["session", "capture", &session_id, "--json"]);
+        assert_eq!(captured["status"], status, "{captured}");
+    }
+}
+
 /// Renaming renames the agent's tmux session (#431) and removing kills it.
 #[test]
 #[parallel]

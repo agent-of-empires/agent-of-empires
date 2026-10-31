@@ -160,27 +160,32 @@ pub(super) fn test_token_grace_override() -> Option<Duration> {
     None
 }
 
-/// Write a file with owner-only permissions (0600) to protect secrets.
-#[cfg(unix)]
+/// Write a file with owner-only permissions (0600) to protect secrets. A failed
+/// write is logged here so every caller's secret file stays best-effort.
 pub(super) async fn write_secret_file(path: &std::path::Path, contents: &str) {
+    if let Err(error) = try_write_secret_file(path, contents).await {
+        tracing::error!(target: "auth.token", path = %path.display(), %error, "failed to write secret file");
+    }
+}
+
+#[cfg(unix)]
+async fn try_write_secret_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
-    let opts = tokio::fs::OpenOptions::new()
+    let mut file = tokio::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
         .open(path)
-        .await;
-    if let Ok(mut file) = opts {
-        let _ = file.write_all(contents.as_bytes()).await;
-        // write_all can return while the blocking write is still queued.
-        let _ = file.flush().await;
-    }
+        .await?;
+    file.write_all(contents.as_bytes()).await?;
+    // write_all can return while the blocking write is still queued.
+    file.flush().await
 }
 
 #[cfg(not(unix))]
-pub(super) async fn write_secret_file(path: &std::path::Path, contents: &str) {
-    let _ = tokio::fs::write(path, contents).await;
+async fn try_write_secret_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    tokio::fs::write(path, contents).await
 }
 
 /// Generate a cryptographically random 64-character hex token (256 bits of entropy).

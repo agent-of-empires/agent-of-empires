@@ -44,9 +44,12 @@ impl ImageState {
             Ok(ImageCheck::Unknown(reason)) => ImageState::Unknown {
                 reason: reason.code(),
             },
-            Err(error) => ImageState::CheckFailed {
-                error: format!("{error:#}"),
-            },
+            Err(error) => {
+                tracing::warn!(target: "http.api.sandbox_image", "image check failed: {error:#}");
+                ImageState::CheckFailed {
+                    error: image_update::error_code(&error).to_string(),
+                }
+            }
         }
     }
 }
@@ -148,8 +151,11 @@ where
         state
     })
     .await
-    .unwrap_or_else(|e| ImageState::CheckFailed {
-        error: format!("image check task failed: {e}"),
+    .unwrap_or_else(|e| {
+        tracing::error!(target: "http.api.sandbox_image", "image check task failed: {e}");
+        ImageState::CheckFailed {
+            error: "registry_bad_response".into(),
+        }
     })
 }
 
@@ -410,6 +416,7 @@ pub async fn sandbox_image_pull(
         let runtime = configured.runtime;
         tokio::spawn(async move {
             let pulled = key.image.clone();
+            let started = std::time::Instant::now();
             let result = tokio::task::spawn_blocking(move || {
                 ContainerRuntime::from(runtime).pull_image(&pulled)
             })
@@ -423,6 +430,15 @@ pub async fn sandbox_image_pull(
                     error: format!("pull task failed: {e}"),
                 },
             };
+            let duration_ms = started.elapsed().as_millis();
+            match &outcome {
+                PullState::Failed { error } => {
+                    tracing::warn!(target: "containers.image", image = %key.image, ok = false, duration_ms, %error, "image pull finished")
+                }
+                _ => {
+                    tracing::info!(target: "containers.image", image = %key.image, ok = true, duration_ms, "image pull finished")
+                }
+            }
             STATUS
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -477,7 +493,10 @@ pub async fn sandbox_image_dismiss(
     })
     .await;
     match result {
-        Ok(Ok(())) => Json(serde_json::json!({ "dismissed_image_digest": digest })).into_response(),
+        Ok(Ok(())) => {
+            tracing::debug!(target: "containers.image", %digest, "image update dismissed");
+            Json(serde_json::json!({ "dismissed_image_digest": digest })).into_response()
+        }
         Ok(Err(e)) => {
             tracing::warn!(target: "http.api.sandbox_image", "dismissing image update failed: {e}");
             api_error(
@@ -539,10 +558,10 @@ mod tests {
                 Ok(ImageCheck::Unknown(UnknownReason::RuntimeUnavailable)),
                 serde_json::json!({"state": "unknown", "reason": "runtime_unavailable"}),
             ),
-            // A registry or network error is never reported as current.
+            // A registry or network error is never reported as current, and the chain stays out.
             (
-                Err(anyhow::anyhow!("registry timed out")),
-                serde_json::json!({"state": "check_failed", "error": "registry timed out"}),
+                Err(anyhow::anyhow!("registry timed out at 10.0.0.5")),
+                serde_json::json!({"state": "check_failed", "error": "registry_bad_response"}),
             ),
         ];
         for (result, expected) in cases {

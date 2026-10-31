@@ -6,6 +6,8 @@ import { parseJsonObject, todoItemsFromArgs } from "../../lib/acpArgs";
 import type { ActivityRow, ToolCall } from "../../lib/acpTypes";
 import { useAgentProfile } from "../../lib/agentProfileContext";
 import type { AgentProfile } from "../../lib/agentProfiles";
+import { checklistMarkdown, type ChecklistStatus } from "../../lib/checklistMarkdown";
+import { CopyMarkdownButton } from "./CopyMarkdownButton";
 import {
   CardChrome,
   spanTimes,
@@ -84,6 +86,16 @@ function Breakdown({ todos }: { todos: TodoItem[] }) {
   return breakdown.length > 0 && <span className="ml-2 text-text-dim">· {breakdown.join(" · ")}</span>;
 }
 
+const CHECKLIST_STATUS: Record<TodoStatus, ChecklistStatus> = {
+  pending: "pending",
+  in_progress: "in_progress",
+  completed: "done",
+  cancelled: "cancelled",
+};
+
+const todosMarkdown = (todos: TodoItem[]) =>
+  checklistMarkdown(todos.map((t) => ({ text: t.content, status: CHECKLIST_STATUS[t.status] })));
+
 function TodoList({ todos }: { todos: TodoItem[] }) {
   if (todos.length === 0) {
     return (
@@ -94,6 +106,9 @@ function TodoList({ todos }: { todos: TodoItem[] }) {
   }
   return (
     <div className="border-t border-surface-800 bg-surface-950 px-3 py-2">
+      <div className="-mt-1 mb-0.5 flex justify-end">
+        <CopyMarkdownButton compact source={todosMarkdown(todos)} label="Copy todos" />
+      </div>
       <ul className="flex flex-col gap-1 font-mono text-xs">
         {todos.map((t, i) => (
           <li key={`${i}-${t.content}`} className={`flex items-start gap-2 ${TODO_STYLE[t.status][1]}`}>

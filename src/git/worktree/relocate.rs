@@ -201,12 +201,12 @@ fn observe_worktree_move(repo_path: &Path, from: &Path, to: &Path) -> TimedMutat
 }
 
 impl GitWorktree {
-    fn relock(&self, to: &Path) {
-        if let Err(e) = self.lock_worktree(to) {
+    fn relock(&self, path: &Path) {
+        if let Err(e) = self.lock_worktree(path) {
             tracing::warn!(target: "git.worktree",
-                to = %to.display(),
+                path = %path.display(),
                 error = %e,
-                "move_worktree: could not re-lock worktree at new path"
+                "move_worktree: could not re-lock worktree"
             );
         }
     }
@@ -221,12 +221,12 @@ impl GitWorktree {
         if to.exists() {
             return Err(GitError::WorktreeAlreadyExists(to.to_path_buf()));
         }
+        let (from_str, to_str) = (path_str(from)?, path_str(to)?);
         if worktree_has_submodule_admin_state(from) {
             return self.relocate_worktree_with_submodules(from, to);
         }
         let observation_from = canonicalize_move_endpoint(from);
         let observation_to = canonicalize_move_endpoint(to);
-        let (from_str, to_str) = (path_str(from)?, path_str(to)?);
 
         tracing::info!(target: "git.worktree",
             from = %from.display(),
@@ -254,7 +254,11 @@ impl GitWorktree {
         });
         let restore_pointer = || {
             if let Some(original) = &original_pointer {
-                let _ = std::fs::write(from.join(".git"), original);
+                if let Err(error) = std::fs::write(from.join(".git"), original) {
+                    tracing::warn!(target: "git.worktree", path = %from.display(), %error,
+                        "could not restore original .git pointer"
+                    );
+                }
             }
         };
         let moved = run_git_with_timeout(
@@ -275,14 +279,14 @@ impl GitWorktree {
                         && matches!(to.try_exists(), Ok(false)) =>
                 {
                     restore_pointer();
-                    let _ = self.lock_worktree(from);
+                    self.relock(from);
                     return Err(GitError::WorktreeCommandFailed(format!(
                         "`git worktree move` timed out after {secs}s without moving"
                     )));
                 }
                 TimedMutationOutcome::Unchanged | TimedMutationOutcome::Indeterminate => {
-                    let _ = self.lock_worktree(from);
-                    let _ = self.lock_worktree(to);
+                    self.relock(from);
+                    self.relock(to);
                     return Err(GitError::WorktreeCommandFailed(format!(
                         "`git worktree move` timed out after {secs}s and its final location is indeterminate"
                     )));
@@ -298,7 +302,7 @@ impl GitWorktree {
                 }
             }
             restore_pointer();
-            let _ = self.lock_worktree(from);
+            self.relock(from);
             return Err(error);
         }
         self.relock(to);
@@ -322,14 +326,14 @@ impl GitWorktree {
             Ok(checkouts) => checkouts,
             Err(e) => {
                 // `move_worktree`'s backstop has already unlocked the source.
-                let _ = self.lock_worktree(from);
+                self.relock(from);
                 return Err(e);
             }
         };
         self.unlock_worktree(from);
 
         if let Err(e) = std::fs::rename(from, to) {
-            let _ = self.lock_worktree(from);
+            self.relock(from);
             return Err(e.into());
         }
         let mut problems = Vec::new();
@@ -342,12 +346,16 @@ impl GitWorktree {
                 );
                 problems.push(format!(
                     "`git worktree repair` failed ({e}) and moving back failed ({rollback}); \
-                     run `git worktree repair {}` from the main repository",
-                    to.display()
+                     run `{}` from the main repository",
+                    repair_command(to)
                 ));
             } else {
-                let _ = self.repair_worktree(from);
-                let _ = self.lock_worktree(from);
+                if let Err(error) = self.repair_worktree(from) {
+                    tracing::warn!(target: "git.worktree", from = %from.display(), %error,
+                        "move_worktree: could not repair worktree after rollback"
+                    );
+                }
+                self.relock(from);
                 return Err(e);
             }
         }
@@ -355,8 +363,8 @@ impl GitWorktree {
         if let Err(e) = Self::convert_git_file_to_relative(to) {
             problems.push(format!(
                 "could not restore the relative .git pointer ({e}); \
-                 run `git worktree repair {}` from the main repository",
-                to.display()
+                 run `{}` from the main repository",
+                repair_command(to)
             ));
         }
         let mut submodule_failed = false;
@@ -390,7 +398,7 @@ impl GitWorktree {
 
     /// `git worktree repair`, which fixes both the checkout's `.git` pointer and
     /// the admin `gitdir` file, even when a relative pointer broke in the move.
-    fn repair_worktree(&self, path: &Path) -> Result<()> {
+    pub(crate) fn repair_worktree(&self, path: &Path) -> Result<()> {
         run_bounded(
             &self.repo_path,
             ["worktree", "repair", path_str(path)?],
@@ -475,11 +483,36 @@ impl GitWorktree {
     }
 }
 
+/// A copyable repair command whose destination stays one shell word.
+fn repair_command(to: &Path) -> String {
+    format!(
+        "git worktree repair {}",
+        shell_words::quote(&to.to_string_lossy())
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::git::test_support::{init_repo, repo_with_nested_submodules, run_git};
     use tempfile::TempDir;
+
+    #[test]
+    fn repair_command_keeps_the_destination_one_argument() {
+        for path in [
+            "/repo/new",
+            "/home/alice/My Projects/new",
+            "/home/o'connor/projects/new",
+            "/home/o'connor/My Projects/new",
+        ] {
+            let words = shell_words::split(&repair_command(Path::new(path))).unwrap();
+            assert_eq!(words, ["git", "worktree", "repair", path]);
+        }
+        assert_eq!(
+            repair_command(Path::new("/repo/new")),
+            "git worktree repair /repo/new"
+        );
+    }
 
     #[test]
     fn timed_mutation_classification_fails_closed() {

@@ -104,6 +104,15 @@ impl Instance {
         Ok(true)
     }
 
+    /// The name is the stable handle; a stored ID goes stale when the
+    /// container is recreated outside this session's launch path.
+    fn refresh_container_id(&mut self, container: &containers::DockerContainer) -> Result<()> {
+        if let Some(sandbox) = self.sandbox_info.as_mut() {
+            sandbox.container_id = Some(container.id()?);
+        }
+        Ok(())
+    }
+
     fn finish_container_reuse(
         &mut self,
         container: &containers::DockerContainer,
@@ -115,10 +124,13 @@ impl Instance {
             && identity_publisher_mount_matches(container, config)?
             && identity_publisher_dependencies_available(container)
             && self.hook_session_publisher_allowed_by_argv();
-        if let Some(sandbox) = self.sandbox_info.as_mut() {
-            if sandbox.container_id.is_none() {
-                sandbox.container_id = Some(container.id()?);
-            }
+        self.refresh_container_id(container)?;
+        let id = self
+            .sandbox_info
+            .as_ref()
+            .and_then(|s| s.container_id.clone());
+        if let Some(id) = id {
+            self.sandbox_pin = container.pin(&id, self.sandbox_pin.as_ref(), None);
         }
         self.reconcile_container_workdir(container);
         container_config::ensure_folder_trust_config_for_active_agent(
@@ -263,6 +275,7 @@ impl Instance {
             // fresh process attached to a running container with no values yet.
             self.ensure_before_start_env(false, &launch_config, &mut scoped_hook)?;
             if self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION {
+                self.refresh_container_id(&container)?;
                 self.reconcile_container_workdir(&container);
                 return Ok((container, false));
             }
@@ -355,7 +368,10 @@ impl Instance {
         if !recreate {
             self.ensure_before_start_env(true, &launch_config, &mut scoped_hook)?;
         }
-        let config = self.build_container_config(&launch_config)?;
+        let mut config = self.build_container_config(&launch_config)?;
+        // The profile `spawn_prepared_launch` gives `scope_prefix_for`, so the
+        // container lands in its session's slice.
+        config.cgroup_parent = crate::process::systemd::slice_for(store.storage().profile());
         // Still the workdir the *previous* container was created with; the pin below
         // is what moves it forward.
         let stranded = container_config::stranded_named_ignore_volumes(
@@ -374,6 +390,7 @@ impl Instance {
             && identity_publisher_dependencies_available(&container)
             && self.hook_session_publisher_allowed_by_argv();
 
+        self.sandbox_pin = container.pin(&container_id, None, Some(&config));
         if let Some(ref mut sandbox) = self.sandbox_info {
             sandbox.container_id = Some(container_id);
             // Pin the workdir to exactly what the container was built with, so

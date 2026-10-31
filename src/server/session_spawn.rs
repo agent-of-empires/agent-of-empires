@@ -24,6 +24,8 @@ pub(crate) struct StructuredSessionSpec {
     pub sandbox_image: Option<String>,
     pub yolo_mode: bool,
     pub extra_env: Vec<String>,
+    /// Host-only env for `host_hooks.before_start`; never enters the container.
+    pub before_start_hook_env: Vec<String>,
     pub extra_args: String,
     pub command_override: String,
     pub extra_repo_paths: Vec<String>,
@@ -126,6 +128,7 @@ pub(crate) async fn spawn_structured_session(
             sandbox_image,
             yolo_mode,
             extra_env,
+            before_start_hook_env,
             extra_args,
             command_override,
             extra_repo_paths,
@@ -208,6 +211,10 @@ pub(crate) async fn spawn_structured_session(
             sandbox_image,
             yolo_mode,
             extra_env,
+            before_start_hook_env: before_start_hook_env
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .collect(),
             extra_args,
             command_override,
             extra_repo_paths,
@@ -658,6 +665,16 @@ pub(crate) async fn spawn_structured_session(
         }
 
         crate::tips::record_session_creations(1);
+        tracing::info!(
+            target: "session.create",
+            session = %instance.id,
+            title = %instance.title,
+            tool = %instance.tool,
+            view = if instance.is_structured() { "structured" } else { "terminal" },
+            project_path = %instance.project_path,
+            branch = ?instance.worktree_info.as_ref().map(|w| &w.branch),
+            "session created"
+        );
         Ok::<_, anyhow::Error>((
             instance,
             build_warnings,
@@ -1024,6 +1041,7 @@ mod tests {
             sandbox_image: None,
             yolo_mode: false,
             extra_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: Vec::new(),

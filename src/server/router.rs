@@ -86,6 +86,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             put(api::edit_skill).delete(api::delete_skill),
         )
         .route(
+            "/api/sessions/empty-trash",
+            post(api::empty_trash).layer(read_only.clone()),
+        )
+        .route(
             "/api/sessions/{id}",
             patch(api::rename_session)
                 .delete(api::delete_session)
@@ -178,6 +182,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/sessions/{id}/restart",
             post(api::restart_session).layer(read_only.clone()),
+        )
+        .route(
+            "/api/sessions/{id}/recreate-container",
+            post(api::recreate_container).layer(read_only.clone()),
         )
         .route(
             "/api/sessions/{id}/restart-for-update",

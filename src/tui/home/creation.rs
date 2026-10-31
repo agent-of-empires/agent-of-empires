@@ -563,6 +563,7 @@ fn wizard_create_body(
         extra_args: data.extra_args.clone(),
         sandbox_image: (!data.sandbox_image.is_empty()).then(|| data.sandbox_image.clone()),
         extra_env: data.extra_env.clone(),
+        hook_env: data.hook_env.clone(),
         extra_repo_paths: data.extra_repo_paths.clone(),
         // The dialog collects one base for the whole session; per-repo bases
         // are a CLI and web-wizard input for now (#3329).

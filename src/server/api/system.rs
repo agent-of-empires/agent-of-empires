@@ -623,6 +623,7 @@ async fn save_settings_patch(
     }
 
     let mut machine_config = None;
+    let mut logging_changed = false;
     if !is_empty_patch(&machine) {
         // Capture which plugins this patch touches (top-level `plugin:<id>`
         // sections and their changed field keys) BEFORE the rewrite folds them
@@ -647,7 +648,8 @@ async fn save_settings_patch(
         let mut written = machine.clone();
         rewrite_plugin_sections(&mut written);
         match tokio::task::spawn_blocking(move || apply_machine_patch(&written)).await {
-            Ok(Ok((config, logging_changed))) => {
+            Ok(Ok((config, changed))) => {
+                logging_changed = changed;
                 // No-op and restart-only edits preserve temporary runtime filters.
                 if logging_changed {
                     if let Ok(app_dir) = crate::session::get_app_dir() {
@@ -688,6 +690,14 @@ async fn save_settings_patch(
         }
     }
     drop(applied);
+    tracing::info!(
+        target: "http.api.system",
+        ?profile,
+        machine_keys = ?patch_leaves(&machine),
+        profile_keys = ?patch_leaves(&profile_patch),
+        logging_changed,
+        "settings saved"
+    );
 
     // Answer with the same layer the caller addressed, so a save and the read
     // that follows it never disagree.
@@ -1037,6 +1047,7 @@ pub async fn update_theme(
             patch.color_mode = None;
         }
     }
+    let (name, mode) = (patch.name.clone(), patch.color_mode.clone());
     let result = tokio::task::spawn_blocking(move || {
         // `update_config` re-loads via `Config::load()`, so a corrupt
         // config.toml errors out instead of being replaced with defaults.
@@ -1059,7 +1070,10 @@ pub async fn update_theme(
 
     match result {
         Ok(Ok(resolved)) => match serde_json::to_value(&resolved) {
-            Ok(val) => (StatusCode::OK, Json(val)).into_response(),
+            Ok(val) => {
+                tracing::info!(target: "http.api.system", ?name, ?mode, "theme set");
+                (StatusCode::OK, Json(val)).into_response()
+            }
             Err(e) => {
                 tracing::error!(target: "http.api.system", "theme serialization failed: {}", e);
                 api_error(
@@ -1598,7 +1612,10 @@ impl AsRef<str> for ProfileInfo<'_> {
 pub async fn list_profiles(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let snapshot = match state.runtime.snapshot(&state).await {
         Ok(snapshot) => snapshot,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(error) => {
+            tracing::debug!(target: "server.runtime", %error, "runtime snapshot failed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
     };
     let mut profiles: Vec<_> = snapshot
         .value
@@ -2422,7 +2439,10 @@ async fn commit_profile_owned(
     drop(catalogue);
     let snapshot = match state.runtime.publish(&state).await {
         Ok(snapshot) => snapshot,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(error) => {
+            tracing::debug!(target: "server.runtime", %error, "runtime publish failed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
     };
     if let Err(error) = result {
         if error.is::<crate::session::purge_owners::ProfileHasPendingPurges>() {
@@ -2433,13 +2453,28 @@ async fn commit_profile_owned(
             )
                 .into_response();
         }
-        let code = match mutation {
+        let code = match &mutation {
             ProfileMutation::Create(_) => "create_failed",
             ProfileMutation::Rename { .. } => "rename_failed",
             ProfileMutation::Delete { .. } => "delete_failed",
             ProfileMutation::SetDefault(_) => "update_failed",
         };
+        tracing::warn!(target: "http.api.system", op = code, %error, "profile mutation failed");
         return api_error(StatusCode::BAD_REQUEST, code, error.to_string());
+    }
+    match &mutation {
+        ProfileMutation::Create(body) => {
+            tracing::info!(target: "http.api.system", name = %body.name, "profile created")
+        }
+        ProfileMutation::Rename { name, body } => {
+            tracing::info!(target: "http.api.system", %name, new_name = %body.new_name, "profile renamed")
+        }
+        ProfileMutation::Delete { name, query } => {
+            tracing::info!(target: "http.api.system", %name, replacement_default = ?query.replacement_default, "profile deleted")
+        }
+        ProfileMutation::SetDefault(body) => {
+            tracing::info!(target: "http.api.system", name = %body.name, "default profile set")
+        }
     }
     let status = if matches!(mutation, ProfileMutation::Create(_)) {
         StatusCode::CREATED
@@ -2667,15 +2702,26 @@ pub async fn update_profile_settings(
     drop(applied);
 
     match result {
-        Ok(Ok(config)) => match serde_json::to_value(&config) {
-            Ok(val) => (StatusCode::OK, Json(val)).into_response(),
-            Err(e) => api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "serialize_failed",
-                e.to_string(),
-            ),
-        },
-        Ok(Err(e)) => api_error(StatusCode::BAD_REQUEST, "update_failed", e.to_string()),
+        Ok(Ok(config)) => {
+            tracing::info!(
+                target: "http.api.system",
+                profile = %scope,
+                profile_keys = ?patch_leaves(&body),
+                "settings saved"
+            );
+            match serde_json::to_value(&config) {
+                Ok(val) => (StatusCode::OK, Json(val)).into_response(),
+                Err(e) => api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "serialize_failed",
+                    e.to_string(),
+                ),
+            }
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(target: "http.api.system", profile = %scope, error = %e, "profile settings update failed");
+            api_error(StatusCode::BAD_REQUEST, "update_failed", e.to_string())
+        }
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     }
 }

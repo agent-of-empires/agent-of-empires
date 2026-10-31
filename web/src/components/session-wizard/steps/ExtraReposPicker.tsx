@@ -212,7 +212,7 @@ export function ExtraReposPicker({
             "No other projects to add — the primary repo is the only one registered or recent."
           ) : (
             <>
-              No registered projects yet. Add one with{" "}
+              No registered Projects yet. Add one with{" "}
               <code className="text-text-secondary">aoe project add &lt;path&gt;</code> or via the Projects page.
             </>
           )}

@@ -1058,10 +1058,13 @@ impl RunnerProcessGuard {
         }
         let mut identities = runner_group_identities(self.pid)?;
         if let Some(birth) = before.as_ref().filter(|_| root_attested) {
-            identities.push(PrimeProcessIdentity {
+            let root = PrimeProcessIdentity {
                 pid: self.pid,
                 start_id: birth.start_id.clone(),
-            });
+            };
+            if !identities.contains(&root) {
+                identities.push(root);
+            }
         }
         let mut added = Vec::new();
         for identity in identities {

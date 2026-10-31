@@ -70,6 +70,10 @@ init_submodules = true
 
 Template variables are `{repo-name}` (repository folder name), `{branch}` (slashes become hyphens), and `{session-id}` (the first 8 characters of the session UUID), so `../wt/{branch}-{session-id}` or `./worktrees/{branch}` both work. Use `[session] row_tag = "branch"` to show branch tags in the TUI list.
 
+`path_template`, `bare_repo_path_template` and `workspace_path_template` also expand a leading `~` and `$VAR` / `${VAR}` before anything else, so `$XDG_CACHE_HOME/aoe-worktrees/{repo-name}/{branch}` is an absolute path. An unset or empty variable fails session creation with an error naming it, except `$XDG_CACHE_HOME`, `$XDG_CONFIG_HOME`, `$XDG_DATA_HOME` and `$XDG_STATE_HOME`, which fall back to their XDG defaults under your home directory when unset, empty or relative. Write `$$` for a literal `$`. Only these three settings expand variables, and repo-level config cannot set them.
+
+Variables are read from the process that creates the worktree. For sessions created in the web dashboard that is the `aoe serve` daemon, whose environment under systemd or launchd often differs from your shell, so a template can work from the TUI and fail on the web.
+
 ### Bare repos
 
 Bare repos are auto-detected and use `bare_repo_path_template` instead, so worktrees land as siblings inside the project directory. A sandboxed session needs this layout to reach the repo's git directory from the container.
@@ -92,6 +96,8 @@ Restore moves the worktree back to its original path. If that path is occupied, 
 Without Force, purge preserves a dirty worktree and retains its session for retry. A workspace purge also stops when a sibling was restored, preserving the owner and its shared worktree.
 
 Native daemon clients can abandon a stuck purge using its current reservation generation. Abandon removes the session record and schedules runtime cleanup; it does not cancel a hook or cleanup already underway, and does not start another worktree or branch removal.
+
+**Purging first moves the worktree** to a sibling `.aoe-purge-<session-id>`, marked by an `aoe-purge` file in its git admin directory, which `git worktree list` still shows but aoe hides from sessions, then removes it. A failed removal moves it back. A purge interrupted by a crash is finished on the next purge attempt while its session still exists; otherwise (web deletes remove the session first) `aoe worktree cleanup` lists the `.aoe-purge-<session-id>` checkout as orphaned once no process is still purging it, and can remove it.
 
 **The default branch's checkout is never removed.** A bare-repo layout keeps
 that checkout available to other tooling. AoE refuses to remove it or delete

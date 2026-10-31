@@ -57,17 +57,17 @@ pub use projects::{create_project, delete_project, list_projects, update_project
 pub use sandbox_image::{sandbox_image_dismiss, sandbox_image_pull, sandbox_image_status};
 pub use sessions::{
     abandon_purge, attach_session_project, cancel_creation, create_session,
-    create_session_progress, delete_session, delete_workspace, ensure_container_terminal,
-    ensure_session, ensure_terminal, ensure_tool, force_smart_rename, get_recent_projects,
-    kill_terminal, list_sessions, paste_image, preview_volume_ignores_globs, read_output,
-    rename_session, restart_for_update, restart_session, restore_session, review_creation_trust,
-    search_sessions, send_message, serve_session_artifact, session_diff_file,
-    session_diff_file_raw, session_diff_files, session_file, session_file_raw, set_worktree_name,
-    start_session, stop_auxiliary, stop_session, summarize_session, touch_session_access,
-    trash_session, update_session_archive, update_session_color, update_session_diff_base,
-    update_session_favorite, update_session_group, update_session_notifications,
-    update_session_pin, update_session_snooze, update_session_unread, update_workspace_ordering,
-    OutputQuery, SendMessageRequest,
+    create_session_progress, delete_session, delete_workspace, empty_trash,
+    ensure_container_terminal, ensure_session, ensure_terminal, ensure_tool, force_smart_rename,
+    get_recent_projects, kill_terminal, list_sessions, paste_image, preview_volume_ignores_globs,
+    read_output, recreate_container, rename_session, restart_for_update, restart_session,
+    restore_session, review_creation_trust, search_sessions, send_message, serve_session_artifact,
+    session_diff_file, session_diff_file_raw, session_diff_files, session_file, session_file_raw,
+    set_worktree_name, start_session, stop_auxiliary, stop_session, summarize_session,
+    touch_session_access, trash_session, update_session_archive, update_session_color,
+    update_session_diff_base, update_session_favorite, update_session_group,
+    update_session_notifications, update_session_pin, update_session_snooze, update_session_unread,
+    update_workspace_ordering, OutputQuery, SendMessageRequest,
 };
 pub(crate) use sessions::{
     lifecycle_rejection, persist_session_update, purge_expired_trash, reconcile_trashed_worktrees,
@@ -407,7 +407,12 @@ mod tests {
         (
             "sessions/delete.rs",
             include_str!("sessions/delete.rs"),
-            &["abandon_purge", "delete_session", "delete_workspace"],
+            &[
+                "abandon_purge",
+                "delete_session",
+                "delete_workspace",
+                "empty_trash",
+            ],
         ),
         (
             "sessions/rename.rs",
@@ -449,6 +454,7 @@ mod tests {
             include_str!("sessions/lifecycle.rs"),
             &[
                 "force_smart_rename",
+                "recreate_container",
                 "restart_for_update",
                 "restart_session",
                 "restore_session",
@@ -1726,6 +1732,7 @@ mod tests {
             (Method::DELETE, "/api/sessions/missing"),
             (Method::POST, "/api/sessions/missing/trash"),
             (Method::POST, "/api/plugins/commands/missing/invoke"),
+            (Method::POST, "/api/sessions/empty-trash"),
             (Method::POST, "/api/groups"),
             (Method::PATCH, "/api/groups"),
             (Method::DELETE, "/api/groups"),

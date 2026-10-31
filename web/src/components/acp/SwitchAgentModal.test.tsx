@@ -11,7 +11,7 @@
 //   - cancel / Escape do NOT touch switchAcpAgent;
 //   - the recap and unprocessed_prompt slots show up in the prefill in
 //     the expected positions;
-//   - the manual trigger swaps the copy and drops the codex preference.
+//   - the manual trigger swaps the copy.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -19,6 +19,17 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { SwitchAgentModal } from "./SwitchAgentModal";
 
 vi.mock("../../lib/api", () => ({
+  // The server's display names, which the modal's copy uses.
+  fetchAgents: vi.fn(() =>
+    Promise.resolve(
+      [
+        ["claude", "Claude Code"],
+        ["codex", "Codex"],
+        ["opencode", "OpenCode"],
+        ["gemini", "Gemini CLI"],
+      ].map(([name, display_name]) => ({ name, display_name })),
+    ),
+  ),
   fetchAcpAgents: vi.fn(),
   switchAcpAgent: vi.fn(),
   fetchContextPrimer: vi.fn(),
@@ -91,9 +102,9 @@ function mount(props?: Partial<React.ComponentProps<typeof SwitchAgentModal>>) {
 describe("SwitchAgentModal (rate_limit)", () => {
   it("shows the current agent grayed out and disabled, preselecting a switchable target", async () => {
     const { container, findByText } = mount();
-    await findByText(/Continue in codex/);
+    await findByText(/Continue in Codex/);
     // The current agent stays visible for context, marked and disabled.
-    await findByText("(current)");
+    await findByText("current · limit reached");
     const radios = Array.from(container.querySelectorAll<HTMLInputElement>("input[name=acp-agent-target]"));
     const byValue = Object.fromEntries(radios.map((r) => [r.value, r] as const));
     expect(Object.keys(byValue)).toEqual(expect.arrayContaining(["claude", "codex", "opencode"]));
@@ -106,22 +117,28 @@ describe("SwitchAgentModal (rate_limit)", () => {
   });
 
   it.each([
-    ["rate_limit", "Continue in opencode"],
-    // Manual has no codex bias: opencode is listed first, so it wins.
-    ["manual", "Switch to opencode"],
-  ] as const)("%s preselects the first remaining agent when codex is not preferred", async (trigger, label) => {
+    ["rate_limit", "Continue in OpenCode"],
+    ["manual", "Switch to OpenCode"],
+  ] as const)("%s preselects the first listed other agent", async (trigger, label) => {
     mockFetchAgents.mockResolvedValue([
       { name: "claude", description: "Claude", command: "claude-agent-acp" },
       { name: "opencode", description: "OpenCode", command: "opencode-acp" },
-      ...(trigger === "manual" ? [{ name: "codex", description: "OpenAI Codex", command: "codex-acp" }] : []),
+      { name: "codex", description: "OpenAI Codex", command: "codex-acp" },
     ]);
     const { findByText } = mount({ trigger });
     await findByText(label);
   });
 
+  it("offers only eligible agents besides the current one", async () => {
+    const { container, findByText } = mount({ eligible: ["gemini", "legacy"] });
+    await findByText("Continue in Gemini CLI");
+    const radios = Array.from(container.querySelectorAll<HTMLInputElement>("input[name=acp-agent-target]"));
+    expect(radios.map((r) => r.value)).toEqual(["claude", "gemini", "legacy"]);
+  });
+
   it("hands off via switchAcpAgent + fetchContextPrimer and prefills", async () => {
     const { findByText, onPrefill, onClose } = mount();
-    const confirm = await findByText(/Continue in codex/);
+    const confirm = await findByText(/Continue in Codex/);
     fireEvent.click(confirm);
     await waitFor(() => expect(mockSwitch).toHaveBeenCalledTimes(1));
     // reason "rate_limited" so the transcript divider reads correctly.
@@ -146,7 +163,7 @@ describe("SwitchAgentModal (rate_limit)", () => {
 
   it("closes on Cancel or Escape without dispatching a switch", async () => {
     const { findByText, onClose } = mount();
-    await findByText(/Continue in codex/);
+    await findByText(/Continue in Codex/);
     fireEvent.click(await findByText("Cancel"));
     fireEvent.keyDown(document, { key: "Escape" });
     expect(onClose).toHaveBeenCalledTimes(2);
@@ -161,7 +178,7 @@ describe("SwitchAgentModal (rate_limit)", () => {
   ])("surfaces a switch failure (%s) and keeps the modal open", async (_label, arrange, message) => {
     arrange();
     const { findByText, onPrefill, onClose } = mount();
-    fireEvent.click(await findByText(/Continue in codex/));
+    fireEvent.click(await findByText(/Continue in Codex/));
     await findByText(message);
     expect(mockPrimer).not.toHaveBeenCalled();
     expect(onPrefill).not.toHaveBeenCalled();
@@ -181,7 +198,7 @@ describe("SwitchAgentModal (rate_limit)", () => {
     mockFetchAgents.mockResolvedValue([{ name: "claude", description: "claude", command: "claude-agent-acp" }]);
     const { container, findByText } = mount();
     // Current agent still renders (disabled) even with no switch targets.
-    await findByText("(current)");
+    await findByText("current · limit reached");
     await findByText(/No other structured view agents are registered/i);
     const claude = container.querySelector<HTMLInputElement>("input[name=acp-agent-target][value=claude]");
     expect(claude?.disabled).toBe(true);
@@ -198,15 +215,13 @@ describe("SwitchAgentModal (rate_limit)", () => {
     // deprecated backend.
     const { findByTestId } = mount();
     const geminiBadge = await findByTestId("switch-agent-deprecated-gemini");
-    expect(geminiBadge.parentElement?.textContent).toContain("gemini");
-    expect(geminiBadge.parentElement?.nextElementSibling?.textContent).toBe("Gemini CLI");
+    expect(geminiBadge.parentElement?.textContent).toContain("Gemini CLI");
     expect(await findByTestId("switch-agent-deprecated-legacy")).not.toBeNull();
     expect(screen.queryByTestId("switch-agent-deprecated-claude")).toBeNull();
     expect(screen.queryByTestId("switch-agent-deprecated-codex")).toBeNull();
     expect(screen.queryByTestId("switch-agent-deprecated-opencode")).toBeNull();
-    // The deprecation label is additive: every row keeps its description.
-    const descriptions = ["Claude (Sonnet)", "OpenAI Codex", "OpenCode", "Gemini CLI", "Legacy backend"];
-    for (const text of descriptions) {
+    // The deprecation label is additive; a description that only repeats the name is dropped.
+    for (const text of ["Claude (Sonnet)", "OpenAI Codex", "Legacy backend", "OpenCode"]) {
       expect(screen.getByText(text)).not.toBeNull();
     }
   });
@@ -215,7 +230,7 @@ describe("SwitchAgentModal (rate_limit)", () => {
 describe("SwitchAgentModal (manual)", () => {
   it("uses 'Switch to' copy, records reason 'manual', and frames the recap as a plain switch", async () => {
     const { findByText, queryByText, onPrefill } = mount({ trigger: "manual" });
-    const confirm = await findByText(/Switch to codex/);
+    const confirm = await findByText(/Switch to Codex/);
     expect(queryByText(/Continue in/)).toBeNull();
     fireEvent.click(confirm);
     await waitFor(() => expect(mockSwitch).toHaveBeenCalledTimes(1));
