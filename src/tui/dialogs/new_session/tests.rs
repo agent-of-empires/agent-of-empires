@@ -162,6 +162,22 @@ fn a_typed_prompt_is_submitted_without_a_suggestion_and_has_no_source() {
 }
 
 #[test]
+fn pasting_into_the_prompt_keeps_newlines_but_other_fields_stay_single_line() {
+    let mut dialog = single_tool_dialog();
+    dialog.focused_field = dialog.field_indices().prompt;
+    dialog.handle_paste("line one\nline two\r\nline three\rline four");
+    assert_eq!(
+        submitted(dialog.handle_key(key(KeyCode::Enter))).initial_prompt,
+        Some("line one\nline two\nline three\nline four".to_string())
+    );
+
+    let mut dialog = single_tool_dialog();
+    dialog.focused_field = dialog.field_indices().title;
+    dialog.handle_paste("one\ntwo");
+    assert_eq!(dialog.title.value(), "onetwo");
+}
+
+#[test]
 fn hostile_suggestion_text_is_neutralised_and_a_blank_one_is_omitted() {
     let mut dialog = single_tool_dialog();
     dialog.set_suggestion("run \u{1b}[31mnow\nthen stop".to_string(), github_origin());

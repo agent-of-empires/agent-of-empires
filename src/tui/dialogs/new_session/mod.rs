@@ -2236,6 +2236,12 @@ impl NewSessionDialog {
             &mut self.worktree_branch
         } else if self.sandbox_config_mode && self.sandbox_focused_field == 0 {
             &mut self.sandbox_image
+        } else if self.focused_field == self.field_indices().prompt {
+            // The prompt is the one multi-line input: keep newlines.
+            for ch in text.replace("\r\n", "\n").replace('\r', "\n").chars() {
+                self.prompt.handle(tui_input::InputRequest::InsertChar(ch));
+            }
+            return;
         } else {
             self.current_input_mut()
         };
