@@ -224,7 +224,7 @@ pub struct GroupSessionOutcome {
     pub outcome: PurgeOutcome,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GroupSessionFailureCode {
     LifecycleBusy,
@@ -237,6 +237,17 @@ pub struct GroupSessionFailure {
     pub id: String,
     pub code: GroupSessionFailureCode,
     pub message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EmptyTrashBody {
+    pub profile: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EmptyTrashOutcome {
+    pub sessions: Vec<GroupSessionOutcome>,
+    pub failures: Vec<GroupSessionFailure>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1132,6 +1143,11 @@ pub struct SessionResponse {
     /// Omitted for agents with no clear alias.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub clear_aliases: Vec<String>,
+    /// Slash-command aliases that compact the conversation (claude `/compact`). With the clear
+    /// aliases they're the commands that run as their own turn, which the queued strip names.
+    /// Omitted for agents with no compact alias.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compact_aliases: Vec<String>,
     /// True when the session is a Claude Code session AND the user has
     /// enabled Claude's fullscreen renderer (`tui: "fullscreen"` in
     /// `~/.claude/settings.json`). The web client uses this to skip

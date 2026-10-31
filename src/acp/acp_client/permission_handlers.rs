@@ -22,6 +22,7 @@ use super::pending::{
     ApprovalResolutionMessage, ElicitationResolutionMessage, PendingResolver, PendingResponder,
     PendingResponders,
 };
+use super::plan::approval_plan_text;
 use super::tool_context::{permission_raw_input_with_context, ToolContextCache};
 use super::tool_output::{preview_optional_args, tool_kind_str};
 
@@ -203,7 +204,12 @@ pub(super) async fn handle_permission_request(
     // generic client rendered no labels and sent no option id, so by-kind
     // selection would answer the agent's first option for the user (#3741).
     let choice_list = is_choice_list(&offered);
-    let approval = build_approval(tool_call, offered);
+    let mut approval = build_approval(tool_call, offered);
+    // A destructive approval keeps the card's hold-to-allow, which the plan
+    // modal's Allow would bypass.
+    if !approval.destructive {
+        approval.plan = approval_plan_text(profile, enriched_raw_input.as_ref());
+    }
     let nonce = approval.nonce.clone();
 
     let (resolve_tx, resolve_rx) = oneshot::channel::<ApprovalResolutionMessage>();
@@ -541,6 +547,66 @@ mod tests {
                 assert_eq!(decision, ApprovalDecision::Cancelled);
                 break;
             }
+        }
+    }
+    /// The plan modal's Allow is a single click, so a destructive approval must
+    /// not carry a plan even when its input has a `plan` field.
+    #[tokio::test]
+    async fn plan_is_only_attached_to_non_destructive_approvals() {
+        use agent_client_protocol::schema::v1::{
+            RequestPermissionRequest, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        for (title, raw_input, want_plan) in [
+            (
+                "Ready to code?",
+                serde_json::json!({ "plan": "# Plan\nprose" }),
+                true,
+            ),
+            (
+                "Bash",
+                serde_json::json!({ "command": "rm -rf /tmp/x", "plan": "# Plan" }),
+                false,
+            ),
+        ] {
+            let (event_tx, mut event_rx) = mpsc::channel(16);
+            let pending: PendingResponders = Arc::new(Mutex::new(HashMap::new()));
+            let request = RequestPermissionRequest::new(
+                "s-plan",
+                ToolCallUpdate::new(
+                    ToolCallId::new("t1"),
+                    ToolCallUpdateFields::new()
+                        .title(title)
+                        .raw_input(raw_input),
+                ),
+                vec![
+                    option("allow", "Allow", PermissionOptionKind::AllowOnce),
+                    option("reject", "Reject", PermissionOptionKind::RejectOnce),
+                ],
+            );
+            let cache: crate::acp::acp_client::tool_context::ToolContextCache =
+                Arc::new(std::sync::Mutex::new(
+                    crate::acp::acp_client::tool_context::ToolCallContextCache::default(),
+                ));
+            let handle = tokio::spawn(handle_permission_request(
+                request,
+                event_tx,
+                pending,
+                &crate::acp::agent_profiles::CLAUDE,
+                cache,
+            ));
+            let approval = loop {
+                if let Event::ApprovalRequested { approval } =
+                    event_rx.recv().await.expect("events")
+                {
+                    break approval;
+                }
+            };
+            handle.abort();
+            assert_eq!(approval.plan.is_some(), want_plan, "{title}");
         }
     }
 }

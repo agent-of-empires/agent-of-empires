@@ -36,7 +36,9 @@ export function isNewSessionStarting(
   )
     return false;
   const { status, hasEverOpened, reconnecting } = connection;
+  // A running Worker is already up, so a cold connection to it is not a startup.
   return (
-    acpWorkerState === "resuming" || (!hasEverOpened && (reconnecting || status === "connecting" || status === "error"))
+    acpWorkerState === "resuming" ||
+    (acpWorkerState !== "running" && !hasEverOpened && (reconnecting || status === "connecting" || status === "error"))
   );
 }

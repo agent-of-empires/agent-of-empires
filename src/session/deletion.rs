@@ -902,13 +902,6 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
             }
         }
     }
-    pub fn complete_with(
-        self,
-        after_teardown: impl FnOnce(&Instance) -> std::result::Result<(), String>,
-    ) -> DeletionResult {
-        self.complete_inner(|instance, _| after_teardown(instance))
-    }
-
     pub fn complete(self) -> DeletionResult {
         self.complete_inner(|_, _| Ok(()))
     }
@@ -1339,6 +1332,12 @@ pub(crate) fn paths_in_use_except(except_ids: &[&str]) -> PathsInUse {
 thread_local! {
     static AFTER_PATHS_IN_USE_SCAN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    static BEFORE_DEFERRED_REMOVAL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static BEFORE_MOVE_ASIDE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static FAIL_HIDE_FOR_PURGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_MOVE_AFTER_MOVING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Run `f` with the paths other sessions use while every profile's storage lock is held, so no
@@ -1548,7 +1547,7 @@ fn perform_deletion_core(
             &mut messages,
         )
     };
-    let container_gone = if lifecycle_locked && removes_managed_worktree {
+    let (container_gone, deferred) = if lifecycle_locked && removes_managed_worktree {
         with_paths_in_use_locked(&request.session_id, stage)
     } else {
         stage(&PathsInUse::Known(Vec::new()))
@@ -1568,6 +1567,14 @@ fn perform_deletion_core(
             retained_instance: None,
             busy_holder: None,
         };
+    }
+    // The claim keeps cleanup off the moved checkout until its removal is decided.
+    if let Some((moved, _claim)) = deferred {
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_DEFERRED_REMOVAL.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
+        remove_moved_worktree(request, &moved, protection, &mut errors, &mut messages);
     }
 
     stage_cleanup_scratch(request, protection, &mut errors, &mut messages);
@@ -1589,7 +1596,8 @@ fn perform_deletion_core(
 }
 
 /// Container and worktree teardown, which destroys checkout contents and so must run inside the
-/// same [`PathsInUse`] check that decides what to keep. Returns whether the container is gone.
+/// same [`PathsInUse`] check that decides what to keep. Returns whether the container is gone and
+/// any worktree moved aside for removal with its purge claim.
 #[expect(
     clippy::too_many_arguments,
     reason = "teardown stages workspace paths, protection and runtime results under one lock"
@@ -1603,7 +1611,22 @@ fn stage_teardown_worktrees(
     teardown: impl FnOnce(&str) -> crate::containers::Teardown,
     errors: &mut Vec<String>,
     messages: &mut Vec<String>,
-) -> bool {
+) -> (bool, Option<(DeletionRequest, crate::git::PurgeClaim)>) {
+    // A retry after an interrupted removal. A checkout another session adopted before it was
+    // hidden is judged where it is; otherwise restore the path every guard below checks.
+    let adopted = adopted_aside(request, paths_in_use);
+    let request = match &adopted {
+        Some(adopted) => adopted,
+        None => {
+            if let Err(error) = move_back_from_aside(request) {
+                errors.push(format!(
+                    "Worktree: could not recover moved-aside checkout: {error}"
+                ));
+                return (false, None);
+            }
+            request
+        }
+    };
     let preserved_worktree_paths = stage_collect_preserved_worktrees(
         request,
         repos,
@@ -1660,7 +1683,7 @@ fn stage_teardown_worktrees(
                     errors.push(reason);
                 }
             }
-            return false;
+            return (false, None);
         }
     }
 
@@ -1672,11 +1695,16 @@ fn stage_teardown_worktrees(
         container_gone = !failed;
         deletion_messages_for(outcome, messages, errors);
         if failed {
-            return false;
+            return (false, None);
         }
     }
 
     if !worktrees_removed_early {
+        if root_cleanup_allowed && !preclean_blocked {
+            if let Some(moved) = move_worktree_aside(request, &preserved_worktree_paths) {
+                return (container_gone, Some(moved));
+            }
+        }
         stage_remove_worktrees_and_branches(
             request,
             repos,
@@ -1686,6 +1714,12 @@ fn stage_teardown_worktrees(
             errors,
             messages,
         );
+        // A worktree marked before a failed move was removed where it was; unhide what survived.
+        if let Some((from, _)) = aside_paths(request) {
+            if from.exists() {
+                unhide(request, &from);
+            }
+        }
     }
     if !errors.is_empty() {
         if let Some(crate::git::cleanup::SandboxCleanup::Blocked(reason)) = preclean {
@@ -1694,7 +1728,207 @@ fn stage_teardown_worktrees(
             }
         }
     }
-    container_gone
+    (container_gone, None)
+}
+
+/// The original and moved-aside paths of a single managed worktree.
+fn aside_paths(request: &DeletionRequest) -> Option<(PathBuf, PathBuf)> {
+    let wt_info = request.instance.worktree_info.as_ref()?;
+    if !request.delete_worktree
+        || !wt_info.managed_by_aoe
+        || request.instance.workspace_info.is_some()
+    {
+        return None;
+    }
+    let from = PathBuf::from(&request.instance.project_path);
+    let aside = from
+        .parent()?
+        .join(format!(".aoe-purge-{}", request.session_id));
+    Some((from, aside))
+}
+
+fn main_repo_git(request: &DeletionRequest) -> crate::git::error::Result<GitWorktree> {
+    let wt_info = request.instance.worktree_info.as_ref();
+    GitWorktree::new(PathBuf::from(
+        wt_info.map_or("", |wt| wt.main_repo_path.as_str()),
+    ))
+}
+
+/// Moves the worktree out of reach so its slow removal can run after the store locks are released.
+/// It is marked first, in the admin directory the move keeps, so the aside is never listed.
+fn move_worktree_aside(
+    request: &DeletionRequest,
+    preserved_worktree_paths: &std::collections::HashSet<PathBuf>,
+) -> Option<(DeletionRequest, crate::git::PurgeClaim)> {
+    let (from, aside) = aside_paths(request)?;
+    if preserved_worktree_paths.contains(&from) {
+        return None;
+    }
+    let claim = mark_for_purge(request, &from)?;
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_MOVE_ASIDE.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
+    let moved = main_repo_git(request).and_then(|git| git.move_worktree(&from, &aside));
+    #[cfg(test)]
+    let moved =
+        moved.and_then(
+            |outcome| match FAIL_MOVE_AFTER_MOVING.with(|fail| fail.replace(false)) {
+                true => Err(crate::git::error::GitError::WorktreeCommandFailed(
+                    "injected".into(),
+                )),
+                false => Ok(outcome),
+            },
+        );
+    if let Err(error) = moved {
+        // A timed-out or partly failed move can still have moved the checkout.
+        if from.exists() || !aside.exists() {
+            tracing::warn!(target: "session.delete",
+                session_id = %request.session_id,
+                path = %from.display(),
+                %error,
+                "perform_deletion: could not move worktree aside; removing it under the store locks"
+            );
+            return None;
+        }
+    }
+    let mut moved = request.clone();
+    moved.instance.project_path = aside.to_string_lossy().into_owned();
+    Some((moved, claim))
+}
+
+fn adopted_aside(request: &DeletionRequest, paths_in_use: &PathsInUse) -> Option<DeletionRequest> {
+    let (from, aside) = aside_paths(request)?;
+    if from.exists() || !aside.exists() || !paths_in_use.covers(&aside) {
+        return None;
+    }
+    // A kept checkout must not stay hidden, or later purges and reaping would treat it as theirs.
+    if let Err(error) = GitWorktree::unmark_purging(&aside) {
+        tracing::warn!(target: "session.delete",
+            session_id = %request.session_id,
+            %error,
+            "perform_deletion: could not unhide an adopted worktree"
+        );
+    }
+    let mut adopted = request.clone();
+    adopted.instance.project_path = aside.to_string_lossy().into_owned();
+    Some(adopted)
+}
+
+/// Removes a moved-aside worktree, moving it back on failure since the retained row still records
+/// the original path.
+fn remove_moved_worktree(
+    request: &DeletionRequest,
+    moved: &DeletionRequest,
+    protection: &[&CleanupProtection],
+    errors: &mut Vec<String>,
+    messages: &mut Vec<String>,
+) {
+    let errors_before = errors.len();
+    stage_remove_worktrees_and_branches(
+        moved,
+        &[],
+        &std::collections::HashSet::new(),
+        true,
+        protection,
+        errors,
+        messages,
+    );
+    if errors.len() > errors_before {
+        if let Err(error) = move_back_from_aside(request) {
+            errors.push(format!(
+                "Worktree: could not move the checkout back after a failed removal: {error}"
+            ));
+        }
+    }
+}
+
+fn unhide(request: &DeletionRequest, path: &Path) {
+    if let Err(error) = GitWorktree::unmark_purging(path) {
+        tracing::warn!(target: "session.delete",
+            session_id = %request.session_id,
+            path = %path.display(),
+            %error,
+            "perform_deletion: could not unhide the surviving worktree"
+        );
+    }
+}
+
+fn mark_for_purge(request: &DeletionRequest, path: &Path) -> Option<crate::git::PurgeClaim> {
+    #[cfg(test)]
+    if FAIL_HIDE_FOR_PURGE.with(|fail| fail.replace(false)) {
+        return None;
+    }
+    let marked = GitWorktree::mark_purging(path);
+    if let Err(error) = &marked {
+        tracing::warn!(target: "session.delete",
+            session_id = %request.session_id,
+            %error,
+            "perform_deletion: could not hide the worktree; removing it under the store locks"
+        );
+    }
+    marked.ok()
+}
+
+fn move_back_from_aside(request: &DeletionRequest) -> crate::git::error::Result<()> {
+    let Some((from, aside)) = aside_paths(request) else {
+        return Ok(());
+    };
+    if !aside.exists() {
+        // A restore that moved the checkout back but could not unhide it.
+        if from.exists() {
+            unhide(request, &from);
+        }
+        return Ok(());
+    }
+    if from.exists() {
+        return Err(crate::git::error::GitError::WorktreeCommandFailed(format!(
+            "{} is occupied; the checkout remains at {}",
+            from.display(),
+            aside.display()
+        )));
+    }
+    let has_admin = crate::git::cleanup::read_linked_worktree_gitdir(&aside)
+        .is_some_and(|admin| admin.is_dir());
+    let branch = request
+        .instance
+        .worktree_info
+        .as_ref()
+        .map(|wt| wt.branch.as_str());
+    // A partly removed checkout may have no readable branch; only another branch disowns it.
+    let other_branch = GitWorktree::get_current_branch(&aside)
+        .ok()
+        .filter(|found| Some(found.as_str()) != branch);
+    if let Some(other_branch) = other_branch {
+        return Err(crate::git::error::GitError::WorktreeCommandFailed(format!(
+            "{} is on {other_branch}, not this session's branch",
+            aside.display()
+        )));
+    }
+    let git = main_repo_git(request)?;
+    if git.move_worktree(&aside, &from).is_ok() {
+        return GitWorktree::unmark_purging(&from);
+    }
+    // A partial removal can leave no admin entry for git to move; without one, unlocking lets
+    // prune reap the entry, and with one, repair points it at the new path.
+    git.unlock_worktree(&aside);
+    if let Err(error) = std::fs::rename(&aside, &from) {
+        if let Err(lock_error) = git.lock_worktree(&aside) {
+            tracing::warn!(target: "session.delete",
+                session_id = %request.session_id,
+                path = %aside.display(),
+                error = %lock_error,
+                "could not relock the purge aside after failing to move it back"
+            );
+        }
+        return Err(error.into());
+    }
+    if has_admin {
+        git.repair_worktree(&from)?;
+        GitWorktree::unmark_purging(&from)?;
+        git.lock_worktree(&from)?;
+    }
+    Ok(())
 }
 
 fn stage_collect_preserved_worktrees(
@@ -2266,7 +2500,11 @@ fn run_on_destroy_hooks(instance: &Instance, detach: bool, configured_hooks: &[S
                 }
             }
         }
-        Err(_) => {}
+        Err(error) => {
+            tracing::warn!(target: "session.delete", session = %instance.id, %error,
+                "could not check repo trust; skipping repo on_destroy hooks"
+            );
+        }
     }
 
     if resolved_on_destroy.is_empty() {
@@ -3107,7 +3345,7 @@ mod tests {
                         }
                     });
                     if change == "group after teardown" {
-                        transaction.complete_with(|_| {
+                        transaction.complete_inner(|_, _| {
                             storage
                                 .update(|rows, _| {
                                     rows[0].group_path = "peer-group".into();
@@ -4519,6 +4757,273 @@ mod tests {
 
         let written = std::fs::read_to_string(temp.path().join("marker")).unwrap();
         assert_eq!(written, instance.id);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn purge_removes_the_worktree_without_holding_store_locks() {
+        use std::os::unix::fs::PermissionsExt;
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Case {
+            Clean,
+            Resumed,
+            MoveErrorAfterMoving,
+            AdoptedBeforeHide,
+            AdoptedAfterHide,
+            UnreadableProfileAfterHide,
+            RemovalFails,
+            DirtiedAfterCheck,
+            StatusUnreadable,
+            OriginalReoccupied,
+            HideFails,
+        }
+        let read_only = |dir: &Path, mode| {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        for case in [
+            Case::Clean,
+            Case::Resumed,
+            Case::MoveErrorAfterMoving,
+            Case::AdoptedBeforeHide,
+            Case::AdoptedAfterHide,
+            Case::UnreadableProfileAfterHide,
+            Case::RemovalFails,
+            Case::DirtiedAfterCheck,
+            Case::StatusUnreadable,
+            Case::OriginalReoccupied,
+            Case::HideFails,
+        ] {
+            let kept_aside = matches!(
+                case,
+                Case::AdoptedBeforeHide | Case::AdoptedAfterHide | Case::UnreadableProfileAfterHide
+            );
+            let after_hide = matches!(
+                case,
+                Case::AdoptedAfterHide | Case::UnreadableProfileAfterHide
+            );
+            let (tmp, main_repo, worktree, mut owner) = test_worktree_fixture("feature/slow");
+            let _home = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("home"));
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
+            crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
+            let profile = "slow-purge";
+            let storage = Storage::new_unwatched(profile).unwrap();
+            owner.source_profile = profile.to_string();
+            let aside = worktree
+                .parent()
+                .unwrap()
+                .join(format!(".aoe-purge-{}", owner.id));
+            let mut rows = vec![owner.clone()];
+            if case == Case::Resumed || kept_aside {
+                let (from, to) = (worktree.to_str().unwrap(), aside.to_str().unwrap());
+                test_git_in(&main_repo, &["worktree", "move", from, to]);
+            }
+            if after_hide {
+                drop(GitWorktree::mark_purging(&aside).unwrap());
+            }
+            if case == Case::UnreadableProfileAfterHide {
+                let other = Storage::new_unwatched("other").unwrap();
+                std::fs::write(other.sessions_path(), "not json").unwrap();
+            }
+            if matches!(case, Case::AdoptedBeforeHide | Case::AdoptedAfterHide) {
+                let mut adopter = Instance::new("Adopter", aside.to_str().unwrap());
+                adopter.source_profile = profile.to_string();
+                rows.push(adopter);
+            }
+            storage
+                .update(|instances, _groups| {
+                    instances.extend(rows);
+                    Ok(())
+                })
+                .unwrap();
+            if case == Case::HideFails {
+                std::fs::create_dir(worktree.join("stuck")).unwrap();
+                std::fs::write(worktree.join("stuck/file"), "").unwrap();
+                read_only(&worktree.join("stuck"), 0o555);
+                FAIL_HIDE_FOR_PURGE.with(|fail| fail.set(true));
+            }
+            if case == Case::MoveErrorAfterMoving {
+                FAIL_MOVE_AFTER_MOVING.with(|fail| fail.set(true));
+            }
+
+            let (before_move_tx, before_move_rx) = std::sync::mpsc::channel();
+            let repo_before_move = main_repo.clone();
+            BEFORE_MOVE_ASIDE.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    let listed = GitWorktree::new(repo_before_move)
+                        .unwrap()
+                        .list_worktrees()
+                        .unwrap()
+                        .iter()
+                        .any(|entry| entry.branch.as_deref() == Some("feature/slow"));
+                    before_move_tx.send(listed).unwrap();
+                }));
+            });
+            let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+            let probe = Storage::open_unwatched(profile).unwrap();
+            let (worktree_probe, aside_probe, repo_probe) =
+                (worktree.clone(), aside.clone(), main_repo.clone());
+            BEFORE_DEFERRED_REMOVAL.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    let listed = GitWorktree::new(repo_probe.clone())
+                        .unwrap()
+                        .list_worktrees()
+                        .unwrap()
+                        .iter()
+                        .any(|entry| entry.branch.as_deref() == Some("feature/slow"));
+                    let placed = (worktree_probe.exists(), aside_probe.exists());
+                    // A purge paused here is live: cleanup must not take its row or checkout.
+                    let rows = Storage::open_unwatched(profile).unwrap().load().unwrap();
+                    let git = GitWorktree::new(repo_probe.clone()).unwrap();
+                    let (orphans, _) =
+                        crate::cli::worktree::find_orphaned_worktrees(&rows, &git).unwrap();
+                    let cleanup_sees = !crate::cli::worktree::find_orphaned_sessions(&rows)
+                        .is_empty()
+                        || orphans
+                            .iter()
+                            .any(|entry| entry.branch.as_deref() == Some("feature/slow"))
+                        || GitWorktree::claim_abandoned_purge(&aside_probe).is_some();
+                    assert!(!cleanup_sees, "{case:?}: cleanup could take a live purge");
+                    match case {
+                        Case::RemovalFails | Case::OriginalReoccupied => {
+                            if case == Case::OriginalReoccupied {
+                                std::fs::create_dir(&worktree_probe).unwrap();
+                            }
+                            std::fs::create_dir(aside_probe.join("stuck")).unwrap();
+                            std::fs::write(aside_probe.join("stuck/file"), "").unwrap();
+                            read_only(&aside_probe.join("stuck"), 0o555);
+                        }
+                        Case::DirtiedAfterCheck => {
+                            std::fs::write(aside_probe.join("late-edit"), "").unwrap();
+                        }
+                        Case::StatusUnreadable => {
+                            let admin =
+                                crate::git::cleanup::read_linked_worktree_gitdir(&aside_probe)
+                                    .unwrap();
+                            std::fs::write(admin.join("index"), "not an index").unwrap();
+                        }
+                        _ => {}
+                    }
+                    seen_tx
+                        .send((
+                            probe.save_locks_are_free_for_test(),
+                            placed.0,
+                            placed.1,
+                            listed,
+                        ))
+                        .unwrap();
+                }));
+            });
+
+            let transaction = match PurgeTransaction::reserve(
+                storage,
+                DeletionRequest {
+                    delete_worktree: true,
+                    delete_branch: true,
+                    force_delete: matches!(
+                        case,
+                        Case::RemovalFails | Case::OriginalReoccupied | Case::HideFails
+                    ),
+                    ..test_request(owner)
+                },
+                None,
+            )
+            .unwrap()
+            {
+                Ok(transaction) => transaction,
+                Err(_) => panic!("purge reservation was refused"),
+            };
+            let result = transaction.complete();
+            BEFORE_DEFERRED_REMOVAL.with(|slot| slot.borrow_mut().take());
+            BEFORE_MOVE_ASIDE.with(|slot| slot.borrow_mut().take());
+
+            let deferred = seen_rx.try_recv().ok();
+            let label = format!("{case:?}: {:?}", result.errors);
+            if kept_aside || case == Case::HideFails {
+                assert!(deferred.is_none(), "{label}: removal was deferred");
+            } else {
+                let (locks_free, original_present, aside_present, listed) =
+                    deferred.expect("the removal was not deferred");
+                assert!(locks_free, "{label}: store locks held during removal");
+                assert!(
+                    !original_present && aside_present,
+                    "{label}: not moved aside"
+                );
+                assert!(!listed, "{label}: a session could adopt the moved worktree");
+                assert_eq!(
+                    before_move_rx.try_recv(),
+                    Ok(false),
+                    "{label}: the worktree was listed when it moved"
+                );
+            }
+
+            let rows = Storage::open_unwatched(profile).unwrap().load().unwrap();
+            let listed = || {
+                GitWorktree::new(main_repo.clone())
+                    .unwrap()
+                    .list_worktrees()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry.branch.as_deref() == Some("feature/slow"))
+            };
+            match case {
+                Case::Clean | Case::Resumed | Case::MoveErrorAfterMoving => {
+                    assert_eq!(result.disposition, DeletionDisposition::Removed, "{label}");
+                    assert!(!aside.exists() && !worktree.exists(), "{label}");
+                    assert!(!test_branch_exists(&main_repo, "feature/slow"), "{label}");
+                }
+                Case::AdoptedBeforeHide | Case::AdoptedAfterHide => {
+                    assert_eq!(result.disposition, DeletionDisposition::Removed, "{label}");
+                    assert!(aside.exists(), "{label}: kept checkout was removed");
+                    assert!(test_branch_exists(&main_repo, "feature/slow"), "{label}");
+                    assert!(listed(), "{label}: kept checkout is still hidden");
+                    assert_eq!(rows.len(), 1, "{label}");
+                    assert_eq!(rows[0].project_path, aside.to_str().unwrap(), "{label}");
+                }
+                // Unreadable owners refuse the purge before teardown; the row retries it.
+                Case::UnreadableProfileAfterHide => {
+                    assert_ne!(result.disposition, DeletionDisposition::Removed, "{label}");
+                    assert!(aside.exists(), "{label}: kept checkout was removed");
+                    assert!(test_branch_exists(&main_repo, "feature/slow"), "{label}");
+                    assert_eq!(rows[0].project_path, worktree.to_str().unwrap(), "{label}");
+                }
+                Case::RemovalFails
+                | Case::DirtiedAfterCheck
+                | Case::StatusUnreadable
+                | Case::HideFails => {
+                    match case {
+                        Case::DirtiedAfterCheck => {
+                            assert!(worktree.join("late-edit").exists(), "{label}: edit lost");
+                        }
+                        Case::StatusUnreadable => {}
+                        _ => read_only(&worktree.join("stuck"), 0o755),
+                    }
+                    assert_ne!(result.disposition, DeletionDisposition::Removed, "{label}");
+                    assert!(
+                        worktree.exists() && !aside.exists(),
+                        "{label}: not moved back"
+                    );
+                    assert!(test_branch_exists(&main_repo, "feature/slow"), "{label}");
+                    // A forced removal that failed partway has already dropped the admin entry.
+                    if matches!(case, Case::DirtiedAfterCheck | Case::StatusUnreadable) {
+                        assert!(listed(), "{label}: restored checkout is still hidden");
+                    }
+                    assert_eq!(rows[0].project_path, worktree.to_str().unwrap(), "{label}");
+                }
+                Case::OriginalReoccupied => {
+                    read_only(&aside.join("stuck"), 0o755);
+                    assert_ne!(result.disposition, DeletionDisposition::Removed, "{label}");
+                    assert!(aside.exists(), "{label}: kept checkout was removed");
+                    let aside_named = aside.to_string_lossy();
+                    assert!(
+                        result.errors.iter().any(|e| e.contains(&*aside_named)),
+                        "{label}: no error names the kept checkout"
+                    );
+                    assert_eq!(rows[0].project_path, worktree.to_str().unwrap(), "{label}");
+                }
+            }
+        }
     }
 
     /// #4107: a purge keeps a shared worktree when another profile cannot be read, and a session

@@ -538,7 +538,12 @@ pub async fn lock_for_startup(profile: &str, args: &mut ServeArgs) -> Result<Opt
             validate_launch_args(profile, args).await?;
             let passphrase = recall_serve_passphrase(&launch)?;
             retain_rollback_launch(&transaction, &launch, passphrase.as_deref())?;
-            stop_daemon_locked(&transaction).await?;
+            tracing::info!(
+                target: "serve.lifecycle",
+                old_pid = pid,
+                "replacing core-only daemon with full daemon"
+            );
+            stop_daemon_locked(&transaction, true).await?;
         }
         DaemonStatus::Unverified => {
             bail!("Cannot verify the existing daemon; refusing replacement")
@@ -790,12 +795,13 @@ async fn rollback_daemon() -> Result<()> {
     match daemon_status() {
         DaemonStatus::Verified(pid) => {
             managed_launch(pid)?;
-            stop_daemon_locked(&transaction).await?;
+            stop_daemon_locked(&transaction, true).await?;
         }
         DaemonStatus::Unverified => bail!("Cannot verify the existing daemon; refusing rollback"),
         DaemonStatus::Absent => {}
     }
     let transaction = migrate_managed_launch(transaction, true).await?;
+    tracing::info!(target: "serve.lifecycle", "rolling back to retained launch");
     complete_rollback_after(start_daemon(&launch.profile, &args, &transaction, true).await)
 }
 
@@ -1844,7 +1850,14 @@ async fn start_daemon(
         crate::daemon::transport::local_socket_path()?,
     );
     let client = endpoint.daemon_client()?;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    // A remote child stops itself at the tunnel deadline with the reason in the log, so wait
+    // past it rather than killing it first with nothing to say.
+    let readiness = if args.remote {
+        crate::server::startup::TUNNEL_STARTUP_DEADLINE + std::time::Duration::from_secs(15)
+    } else {
+        std::time::Duration::from_secs(60)
+    };
+    let deadline = tokio::time::Instant::now() + readiness;
     let ready = tokio::time::timeout_at(deadline, async {
         loop {
             if let Some(status) = child.try_wait()? {
@@ -1943,27 +1956,34 @@ pub(crate) async fn restart_daemon_with_receipt(
     if announce {
         println!("Restarting aoe serve daemon (PID {pid})…");
     }
-    stop_daemon_locked(&transaction).await?;
+    tracing::info!(target: "serve.lifecycle", old_pid = pid, "restarting daemon");
+    stop_daemon_locked(&transaction, announce).await?;
     let transaction = migrate_managed_launch(transaction, true).await?;
     complete_rollback_after(start_daemon(&launch.profile, &args, &transaction, announce).await)?;
-    managed_launch(daemon_pid().context("Restart successor is unavailable")?)
+    let new_pid = daemon_pid().context("Restart successor is unavailable")?;
+    tracing::info!(target: "serve.lifecycle", old_pid = pid, new_pid, "daemon restarted");
+    managed_launch(new_pid)
 }
 
-fn report_stale_cleanup(pid: i32) {
-    if clear_serve_state(pid) {
-        println!("Daemon was not running (stale PID file cleaned up)");
+fn stale_cleanup_notice(pid: i32, announce: bool) -> Option<&'static str> {
+    let cleared = clear_serve_state(pid);
+    announce.then_some(if cleared {
+        "Daemon was not running (stale PID file cleaned up)"
     } else {
-        println!("Daemon was not running; serve state changed meanwhile and was preserved");
-    }
+        "Daemon was not running; serve state changed meanwhile and was preserved"
+    })
 }
 
 #[tracing::instrument(target = "serve.shutdown", skip_all)]
 pub(crate) async fn stop_daemon() -> Result<()> {
     let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
-    stop_daemon_locked(&transaction).await
+    stop_daemon_locked(&transaction, true).await
 }
 
-async fn stop_daemon_locked(transaction: &crate::daemon::lifecycle::Transaction) -> Result<()> {
+async fn stop_daemon_locked(
+    transaction: &crate::daemon::lifecycle::Transaction,
+    announce: bool,
+) -> Result<()> {
     let path = pid_file_path()?;
 
     if !path.exists() {
@@ -1984,7 +2004,9 @@ async fn stop_daemon_locked(transaction: &crate::daemon::lifecycle::Transaction)
         )),
         DaemonProbeDisposition::Stale
     ) {
-        report_stale_cleanup(pid);
+        if let Some(notice) = stale_cleanup_notice(pid, announce) {
+            println!("{notice}");
+        }
         return Ok(());
     }
 
@@ -2054,7 +2076,9 @@ async fn stop_daemon_locked(transaction: &crate::daemon::lifecycle::Transaction)
         );
     }
     clear_serve_state(pid);
-    println!("Stopped aoe serve daemon (PID {})", pid);
+    if announce {
+        println!("Stopped aoe serve daemon (PID {})", pid);
+    }
     Ok(())
 }
 
@@ -2924,6 +2948,24 @@ mod tests {
             assert!(cleared);
             worker.join().unwrap();
             drop(lifetime);
+        }
+
+        #[test]
+        #[serial]
+        fn stale_cleanup_is_silent_unless_announced() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let dir = crate::session::get_app_dir().unwrap();
+
+            publish(&dir, 4242);
+            assert_eq!(stale_cleanup_notice(4242, false), None);
+            assert!(!dir.join("serve.pid").exists());
+
+            publish(&dir, 4242);
+            assert_eq!(
+                stale_cleanup_notice(4242, true),
+                Some("Daemon was not running (stale PID file cleaned up)")
+            );
+            assert!(!dir.join("serve.pid").exists());
         }
 
         #[test]

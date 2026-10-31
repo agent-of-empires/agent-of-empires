@@ -429,13 +429,18 @@ impl Instance {
         &self,
         mut resolved_on_launch: Vec<String>,
     ) -> Option<Vec<String>> {
-        if let Ok(trust) =
-            crate::session::config::repo_config::check_repo_trust(Path::new(&self.project_path))
-        {
-            if let Some(hooks) = trust.hooks.trusted() {
-                if !hooks.on_launch.is_empty() {
-                    resolved_on_launch = hooks.on_launch;
+        match crate::session::config::repo_config::check_repo_trust(Path::new(&self.project_path)) {
+            Ok(trust) => {
+                if let Some(hooks) = trust.hooks.trusted() {
+                    if !hooks.on_launch.is_empty() {
+                        resolved_on_launch = hooks.on_launch;
+                    }
                 }
+            }
+            Err(error) => {
+                tracing::warn!(target: "hooks.guard", session = %self.id, %error,
+                    "repo trust check failed; using global on_launch hooks"
+                );
             }
         }
 

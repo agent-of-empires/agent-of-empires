@@ -1328,6 +1328,7 @@ mod tests {
                 model: "claude".into(),
                 output_file: "/tmp/nonexistent-4029.jsonl".into(),
                 started_at: chrono::Utc::now(),
+                workflow: None,
             },
         );
         let sup = Supervisor::new(sink);

@@ -114,7 +114,7 @@ pub async fn check_for_update(current_version: &str, force: bool) -> Result<Upda
             let current_is_newer = is_newer_version(current_version, &cache.latest_version);
 
             if age < max_age && !current_is_newer {
-                tracing::info!(
+                tracing::debug!(
                     target: "update.cache",
                     age_hours = age.num_hours(),
                     latest = %cache.latest_version,

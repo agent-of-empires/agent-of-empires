@@ -99,6 +99,7 @@ import {
   fetchPlugins,
 } from "./lib/api";
 import type { DeleteSessionOptions, RuntimeCursor, ServerAbout, SettingsResponse } from "./lib/api";
+import { autoResumeSettingsHref } from "./lib/autoResumeSettingsHref";
 import { getClientCapabilities } from "./lib/clientCapabilities";
 import { normalizeProjectPathKey } from "./lib/registeredProjects";
 import { IdleDecayWindowContext, parseIdleDecayWindowMs } from "./lib/idleDecay";
@@ -2001,11 +2002,14 @@ function AppContent({
                             sessionId={session.id}
                             acpWorkerState={session.acp_worker_state ?? "absent"}
                             rateLimitAutoResume={session.rate_limit_auto_resume}
+                            settingsHref={autoResumeSettingsHref(session.profile, serverAbout)}
                             tool={session.tool}
                             acpAgent={session.acp_agent ?? null}
                             startedBefore={hasStartedBefore(session)}
                             acpProvider={session.acp_provider ?? null}
                             clearAliases={session.clear_aliases}
+                            compactAliases={session.compact_aliases}
+                            onStartSession={() => void handleStartSession(session.id)}
                             archivedAt={session.archived_at ?? null}
                             snoozedUntil={session.snoozed_until ?? null}
                             trashedAt={session.trashed_at ?? null}
@@ -2230,6 +2234,7 @@ function AppContent({
     if (singlePane) {
       return (
         <MobileMainPane
+          onStartSession={(id) => void handleStartSession(id)}
           readOnly={!!serverAbout?.read_only}
           view={rightPanelView}
           pluginPanes={pluginPanes}
@@ -2262,6 +2267,7 @@ function AppContent({
           onOpenSendDialog={() => setSendDialogOpen(true)}
           onCloseSendDialog={() => setSendDialogOpen(false)}
           onClearSelectedFile={() => setSelectedFile(null)}
+          serverAbout={serverAbout}
         />
       );
     }

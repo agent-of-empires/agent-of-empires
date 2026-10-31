@@ -106,7 +106,7 @@ async fn failure(state: &AppState, error: anyhow::Error) -> Response {
         )
             .into_response();
     }
-    tracing::warn!(target: "http.api.groups", %error, "group move failed");
+    tracing::warn!(target: "http.api.groups", %error, "group operation failed");
     if *state.canonical_health.read().await != RuntimeHealth::Healthy {
         StatusCode::SERVICE_UNAVAILABLE.into_response()
     } else {
@@ -185,6 +185,8 @@ pub async fn move_group(
         Ok(Err(error)) => return failure(&state, error).await,
         Err(error) => return failure(&state, error.into()).await,
     };
+    let (profile, target_profile) = (body.source.profile.clone(), body.target.profile.clone());
+    let (from, to) = (body.source.path.clone(), body.target.path.clone());
     let mut submission_guards = Vec::with_capacity(ids.len());
     for id in &ids {
         if let Some(guard) = state
@@ -280,13 +282,16 @@ pub async fn move_group(
     drop(submission_guards);
     drop(namespace);
     match committed {
-        Ok(Ok(())) => match state.runtime.publish(&state).await {
-            Ok(snapshot) => crate::server::runtime::mutation_response(
-                &snapshot.value.cursor,
-                Json(serde_json::json!({"ok": true})),
-            ),
-            Err(error) => failure(&state, error).await,
-        },
+        Ok(Ok(())) => {
+            tracing::info!(target: "session.sync", %profile, %target_profile, %from, %to, "group moved");
+            match state.runtime.publish(&state).await {
+                Ok(snapshot) => crate::server::runtime::mutation_response(
+                    &snapshot.value.cursor,
+                    Json(serde_json::json!({"ok": true})),
+                ),
+                Err(error) => failure(&state, error).await,
+            }
+        }
         Ok(Err(error)) => failure(&state, error).await,
         Err(error) => failure(&state, error.into()).await,
     }
@@ -340,10 +345,11 @@ async fn commit_group_metadata(
         )
             .into_response();
     }
-    let status = match &change {
-        GroupMetadataChange::Create => StatusCode::CREATED,
-        GroupMetadataChange::Collapse(_) => StatusCode::OK,
+    let (status, op) = match &change {
+        GroupMetadataChange::Create => (StatusCode::CREATED, "group created"),
+        GroupMetadataChange::Collapse(_) => (StatusCode::OK, "group collapsed"),
     };
+    let (profile, path) = (group.profile.clone(), group.path.clone());
     let worker_state = state.clone();
     let committed = tokio::task::spawn_blocking(move || -> Result<()> {
         let store = NativeSessionStore::open(worker_state.clone(), &group.profile, None)?;
@@ -380,13 +386,16 @@ async fn commit_group_metadata(
     .await;
     drop(namespace);
     match committed {
-        Ok(Ok(())) => match state.runtime.publish(&state).await {
-            Ok(snapshot) => crate::server::runtime::mutation_response(
-                &snapshot.value.cursor,
-                (status, Json(serde_json::json!({"ok": true}))),
-            ),
-            Err(error) => failure(&state, error).await,
-        },
+        Ok(Ok(())) => {
+            tracing::info!(target: "session.sync", %profile, group = %path, "{op}");
+            match state.runtime.publish(&state).await {
+                Ok(snapshot) => crate::server::runtime::mutation_response(
+                    &snapshot.value.cursor,
+                    (status, Json(serde_json::json!({"ok": true}))),
+                ),
+                Err(error) => failure(&state, error).await,
+            }
+        }
         Ok(Err(error)) => failure(&state, error).await,
         Err(error) => failure(&state, error.into()).await,
     }
@@ -664,6 +673,18 @@ async fn delete_group_owned(
     drop(instance_guards);
     drop(submission_guards);
     drop(namespace);
+    tracing::info!(
+        target: "session.sync",
+        group = ?body.group,
+        mode = ?body.mode,
+        purged = outcome
+            .sessions
+            .iter()
+            .filter(|session| matches!(session.outcome, PurgeOutcome::Deleted { .. }))
+            .count(),
+        failed = outcome.failures.len(),
+        "group deleted"
+    );
     match state.runtime.publish(&state).await {
         Ok(snapshot) => {
             crate::server::runtime::mutation_response(&snapshot.value.cursor, Json(outcome))
@@ -736,6 +757,14 @@ async fn reorder_owned(state: Arc<AppState>, body: crate::daemon::ReorderBody) -
         .profiles
         .iter()
         .any(|entry| &entry.name == profile);
+    let reordered_group = match &body {
+        ReorderBody::Group { group, direction } => Some((
+            group.profile.clone(),
+            group.path.clone(),
+            format!("{direction:?}"),
+        )),
+        ReorderBody::Session { .. } => None,
+    };
     let result = if !exists {
         Ok(ReorderOutcome::Stale)
     } else {
@@ -765,12 +794,17 @@ async fn reorder_owned(state: Arc<AppState>, body: crate::daemon::ReorderBody) -
     };
     drop(namespace);
     match result {
-        Ok(outcome) => match state.runtime.publish(&state).await {
-            Ok(snapshot) => {
-                crate::server::runtime::mutation_response(&snapshot.value.cursor, Json(outcome))
+        Ok(outcome) => {
+            if let Some((profile, group, direction)) = &reordered_group {
+                tracing::info!(target: "session.sync", %profile, %group, %direction, ?outcome, "group reordered");
             }
-            Err(error) => failure(&state, error).await,
-        },
+            match state.runtime.publish(&state).await {
+                Ok(snapshot) => {
+                    crate::server::runtime::mutation_response(&snapshot.value.cursor, Json(outcome))
+                }
+                Err(error) => failure(&state, error).await,
+            }
+        }
         Err(error) => failure(&state, error).await,
     }
 }

@@ -290,6 +290,7 @@ pub struct HomeView {
     pub(super) serve_view: Option<ServeView>,
     pub(super) connections_view: Option<super::dialogs::ConnectionsView>,
     pub(super) pending_dashboard_launch: Option<super::dialogs::ServeLaunchRequest>,
+    pub(super) dashboard_launch: Option<super::dialogs::DashboardLaunch>,
     pub(super) update_confirm_dialog: Option<UpdateConfirmDialog>,
     pub(super) telemetry_consent_dialog: Option<super::dialogs::TelemetryConsentDialog>,
     pub(super) tips_dialog: Option<super::dialogs::TipsDialog>,
@@ -354,6 +355,7 @@ pub struct HomeView {
 
     pub(super) available_tools: AvailableTools,
 
+    pub(super) plugin_ui: crate::tui::plugin_ui_poller::PluginUiState,
     pub(super) show_diagnostics: bool,
     pub(super) show_shortcut_bar: bool,
     pub(super) preview_link_prefixes: Vec<String>,

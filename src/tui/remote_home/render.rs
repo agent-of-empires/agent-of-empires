@@ -48,7 +48,7 @@ fn row_column_cells(state: &RemoteHomeState, session_id: &str) -> MeasuredCells 
     let mut budget = ROW_COLUMN_MAX_WIDTH;
     let mut width = 0;
     let mut cells = Vec::new();
-    for (text, tone) in plugin_ui::row_column_cells(&state.plugin_ui, session_id) {
+    for (text, tone) in plugin_ui::session_row_statuses(&state.plugin_ui, session_id) {
         let gap = if cells.is_empty() {
             0
         } else {
@@ -59,7 +59,7 @@ fn row_column_cells(state: &RemoteHomeState, session_id: &str) -> MeasuredCells 
         if budget <= gap {
             break;
         }
-        let text = truncate_to_width(&text, budget - gap);
+        let text = truncate_to_width(text, budget - gap);
         // Clamp rather than trust the helper: if it ever hands back more cells
         // than it was given, `budget -= gap + len` would underflow (panic in a
         // debug build) or wrap the budget wide open, voiding the cap this loop
@@ -327,6 +327,11 @@ mod tests {
                "session_id": session_id, "payload": {"text": text}})
     }
 
+    fn row_badge(session_id: &str, payload: serde_json::Value) -> serde_json::Value {
+        json!({"plugin_id": "gh", "slot": "row-badge", "id": "b",
+               "session_id": session_id, "payload": payload})
+    }
+
     /// Screen column where `needle` starts on the first row carrying it. Indexes
     /// the per-cell strings from `rows`, one character per painted cell, so it is
     /// a real column: a byte offset would be skewed by the multi-byte `▸ `
@@ -406,6 +411,64 @@ mod tests {
         let (cells, width) = row_column_cells(&state, "s1");
         assert_eq!(cells.len(), 1);
         assert_eq!(width, ROW_COLUMN_MAX_WIDTH);
+    }
+
+    #[test]
+    fn row_badges_render_items_and_tooltip_fallback() {
+        let state = state_with(
+            &["s1"],
+            json!([
+                row_badge(
+                    "s1",
+                    json!({"items": [
+                        {"text": "CI", "tone": "danger"},
+                        {"tooltip": "ico"}
+                    ]}),
+                ),
+                row_badge("s1", json!({"tooltip": "wip"})),
+            ]),
+        );
+        let (cells, width) = row_column_cells(&state, "s1");
+        assert!(width <= ROW_COLUMN_MAX_WIDTH, "{width} cells");
+        let texts: Vec<&str> = cells.iter().map(|(t, _)| t.as_str()).collect();
+        // Itemized badge: each item's text (tooltip when text is absent).
+        assert_eq!(&texts[..2], &["CI", "ico"], "{texts:?}");
+        // Badge without an items list: the top-level tooltip is the fallback.
+        assert_eq!(texts[2], "wip", "{texts:?}");
+        let painted = rows(&state);
+        assert!(painted.iter().any(|l| l.contains("CI")), "{painted:?}");
+    }
+
+    #[test]
+    fn row_badges_are_budgeted_and_keep_path_aligned() {
+        // A long itemized badge is truncated to the budget, not overflowing it.
+        let long_badge = state_with(
+            &["s1"],
+            json!([row_badge(
+                "s1",
+                json!({"items": [
+                    {"text": "x".repeat(ROW_COLUMN_MAX_WIDTH + 20), "tone": "danger"}
+                ]})
+            )]),
+        );
+        let (cells, width) = row_column_cells(&long_badge, "s1");
+        assert_eq!(width, ROW_COLUMN_MAX_WIDTH);
+        assert!(cells[0].0.ends_with('…'), "{:?}", cells[0].0);
+
+        // A badge on one row must not shift the path column vs a row without one.
+        let both = state_with(
+            &["s1", "s2"],
+            json!([row_badge("s1", json!({"items": [{"text": "CI failed"}]}))]),
+        );
+        let painted = rows(&both);
+        assert!(
+            painted.iter().any(|l| l.contains("CI failed")),
+            "{painted:?}"
+        );
+        assert_eq!(
+            column_of(&painted, "/tmp/s1"),
+            column_of(&painted, "/tmp/s2")
+        );
     }
 
     #[test]

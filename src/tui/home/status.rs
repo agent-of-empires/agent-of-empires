@@ -9,6 +9,14 @@ impl HomeView {
         self.instances.values().cloned().collect()
     }
 
+    pub fn request_plugin_ui_refresh(&mut self) {
+        self.plugin_ui.request_refresh(!self.instances.is_empty());
+    }
+
+    pub fn apply_plugin_ui_updates(&mut self) -> bool {
+        self.plugin_ui.apply_pending()
+    }
+
     /// Request a system-health sample in the background while either health
     /// surface is visible. Call `apply_metrics_updates` to pick up the result.
     pub fn request_metrics_refresh(&mut self) {
@@ -381,13 +389,13 @@ impl HomeView {
         if let Some((id, message)) = self.pending_indeterminate_queue.first().cloned() {
             self.open_indeterminate_dialog(&id, &message);
             if errors.len() > 1 {
-                self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                self.info_dialog = Some(crate::tui::dialogs::InfoDialog::sized_to_fit(
                     "Runtime change",
                     &diagnostics,
                 ));
             }
         } else {
-            self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+            self.info_dialog = Some(crate::tui::dialogs::InfoDialog::sized_to_fit(
                 "Runtime change",
                 &diagnostics,
             ));

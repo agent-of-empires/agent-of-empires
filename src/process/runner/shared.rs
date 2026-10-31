@@ -844,7 +844,9 @@ impl RunnerShared {
             "method": "session/cancel",
             "params": { "sessionId": acp_session_id },
         });
-        let _ = self.write_agent_line(agent_stdin, &note).await;
+        if !self.write_agent_line(agent_stdin, &note).await {
+            warn!(target: "acp.runner", acp_session_id, "failed to deliver session/cancel to agent");
+        }
     }
 
     pub(super) async fn run_or_replay_initialize(

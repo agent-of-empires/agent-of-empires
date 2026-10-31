@@ -354,6 +354,14 @@ impl PluginHost {
     /// Takes the registry rather than `&self` so the level classification is
     /// unit-testable without standing up a host.
     fn log_start_observability(registry: &PluginRegistry) {
+        let all = registry.all();
+        tracing::info!(target: "plugin.host",
+            total = all.len(),
+            active = all.iter().filter(|p| p.active()).count(),
+            enabled = all.iter().filter(|p| p.enabled).count(),
+            ids = ?all.iter().map(|p| p.id()).collect::<Vec<_>>(),
+            "plugin registry loaded"
+        );
         for err in registry.load_errors() {
             tracing::warn!(
                 target: "plugin.host",
@@ -700,6 +708,7 @@ impl PluginHost {
             worker_logs::KEEP_PER_PLUGIN,
         );
         let pid = child.id().unwrap_or(0);
+        let started = Instant::now();
 
         let stdin = child.stdin.take().context("worker stdin missing")?;
         let stdout = child.stdout.take().context("worker stdout missing")?;
@@ -814,7 +823,18 @@ impl PluginHost {
         if pid != 0 {
             worker::reap_group_escalating(pid, REAP_GRACE).await;
         }
-        let _ = child.wait().await;
+        let uptime_s = started.elapsed().as_secs();
+        match child.wait().await {
+            Ok(status) if status.success() => {
+                tracing::info!(target: "plugin.host", plugin = %plugin_id, pid, ?status, uptime_s, "plugin worker exited");
+            }
+            Ok(status) => {
+                tracing::warn!(target: "plugin.host", plugin = %plugin_id, pid, ?status, uptime_s, "plugin worker exited");
+            }
+            Err(error) => {
+                tracing::warn!(target: "plugin.host", plugin = %plugin_id, pid, %error, uptime_s, "plugin worker exit status unavailable");
+            }
+        }
         Ok(())
     }
 
@@ -968,7 +988,7 @@ async fn serve_connection(
             ),
         };
         match &outcome {
-            Ok(_) => tracing::debug!(
+            Ok(_) => tracing::trace!(
                 target: "plugin.host", plugin = %ctx.plugin_id, method = %method_log,
                 "worker rpc ok"
             ),

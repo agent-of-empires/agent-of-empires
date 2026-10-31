@@ -1,19 +1,19 @@
 // Structured view conversation surface. assistant-ui renders the thread shell;
 // state lives in AcpRuntime and is only fed to assistant-ui, never owned by it.
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { ThreadPrimitive } from "@assistant-ui/react";
 import { ChevronDown } from "lucide-react";
 
 import { useIsWideViewport } from "../../hooks/useIsWideViewport";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
-import { useRespawnSession } from "../../hooks/useRespawnSession";
 import { useWebSettings } from "../../hooks/useWebSettings";
 import { lastClearIndex } from "../../lib/acpHistoryWindow";
 import { visibleSessionNotices } from "../../lib/acpTypes";
 import { useAgentDisplayNames } from "../../lib/agentDisplayName";
 import { isNewSessionStarting } from "./startupWait";
-import { AgentProfileProvider } from "../../lib/agentProfileContext";
+import { AgentProfileProvider, useClearAliases, useCompactAliases } from "../../lib/agentProfileContext";
+import { queuedReason } from "./queuedReason";
 import { conversationFontSizeRem } from "../../lib/conversationFontSize";
 import type { FileRef, FileRefSession } from "../../lib/fileRef";
 import { ChromeCollapseHandle, CollapsibleRegion } from "../CollapsibleChrome";
@@ -31,8 +31,9 @@ import { ModeSwitchFailedNotice, QueuedPromptsStrip, RejectedPromptsStrip, Sessi
 import { SessionBanners } from "./SessionBanners";
 import { ConfigOptionSwitchFailedNotice } from "./SessionConfigControls";
 import { StartupErrorScreen } from "./StartupErrorScreen";
-import { RateLimitRecoverySection, SystemNotices } from "./SystemNotices";
+import { SystemNotices } from "./SystemNotices";
 import { AssistantMessage, UserMessage } from "./ThreadMessages";
+import { UsageLimitSection } from "./UsageLimitBanner";
 import { ToolExpansionProvider } from "./ToolExpansion";
 import { ToolDensityToggle, ToolDisplayModeProvider, useToolDensityPref } from "./ToolDisplayMode";
 import { useTranscriptScroll } from "./useTranscriptScroll";
@@ -50,6 +51,8 @@ interface Props {
   acpWorkerState: WorkerState;
   /** Whether rate-limit auto-resume is on for this session's profile. */
   rateLimitAutoResume?: boolean;
+  /** The profile's Structured view settings; null where Settings can't be edited. */
+  settingsHref?: string | null;
   /** Session `tool` registry key; selects the AgentProfile. */
   tool: string | null | undefined;
   /** Resolved ACP agent key; the switch-agent modal's fallback before any `AgentSwitched`. */
@@ -59,6 +62,9 @@ interface Props {
   acpProvider: string | null;
   /** Server-owned conversation-reset slash aliases (`/clear`, `/new`). */
   clearAliases?: readonly string[];
+  compactAliases?: readonly string[];
+  /** Start this Session, for a queued row's "Start and send". */
+  onStartSession?: () => void;
   archivedAt: string | null;
   snoozedUntil: string | null;
   /** Trashed sessions are read-only: no composer or queue strips. */
@@ -80,13 +86,22 @@ const STARTER_PROMPTS = [
 ];
 
 export function StructuredView(props: Props) {
-  const { sessionId, acpWorkerState, tool, clearAliases, archivedAt, snoozedUntil, onOpenFileRef, fileRefSession } =
-    props;
+  const {
+    sessionId,
+    acpWorkerState,
+    tool,
+    clearAliases,
+    compactAliases,
+    archivedAt,
+    snoozedUntil,
+    onOpenFileRef,
+    fileRefSession,
+  } = props;
   const [showClearedTurns, setShowClearedTurns] = useState(false);
   const [toolDensity, toggleToolDensity] = useToolDensityPref();
   return (
     <AcpFileRefContext.Provider value={{ onOpenFileRef, fileRefSession }}>
-      <AgentProfileProvider toolKey={tool} clearAliases={clearAliases}>
+      <AgentProfileProvider toolKey={tool} clearAliases={clearAliases} compactAliases={compactAliases}>
         <ToolDisplayModeProvider density={toolDensity}>
           <ToolExpansionProvider>
             <AcpRuntime
@@ -98,7 +113,12 @@ export function StructuredView(props: Props) {
             >
               {(ctx) => (
                 <BackgroundAgentsContext.Provider
-                  value={{ agents: ctx.state.backgroundAgents, openPane: props.onOpenAgentsPane }}
+                  value={{
+                    agents: ctx.state.backgroundAgents,
+                    workflowRuns: ctx.state.workflowRuns,
+                    backgroundTasks: ctx.state.backgroundTasks,
+                    openPane: props.onOpenAgentsPane,
+                  }}
                 >
                   <AcpChrome
                     view={props}
@@ -176,11 +196,8 @@ function AcpChrome({
   // Rows before the latest `/clear` divider are the hidden history.
   const hiddenCount = lastClearIndex(state.activity);
   const [primerPrefill, setPrimerPrefill] = useState<Prefill>(null);
-  // A rate limit with no reported reset still needs a key to scope resume status by.
-  const rateLimitResume = useRespawnSession(
-    sessionId,
-    state.rateLimit ? (state.rateLimit.resets_at ?? "unknown") : null,
-  );
+  // The usage-limit banner covers a cap park while the limit is still known.
+  const exhaustedWithoutLimit = state.rateLimitRetriesExhausted && !state.rateLimit;
   // Phone-width only: fold the composer away for reading.
   const composerCollapsible = !useIsWideViewport();
   const [composerCollapsed, setComposerCollapsed] = useState(false);
@@ -222,39 +239,21 @@ function AcpChrome({
       )}
       <PlanStrip plan={state.plan} />
 
-      <RateLimitRecoverySection
-        sessionId={sessionId}
-        currentAgent={state.agent ?? acpAgent}
-        onPrefill={(text) => setPrimerPrefill({ id: `rate-limit-recovery-${Date.now()}`, text })}
-      >
-        {({ onSwitchAgent }) =>
-          status !== "open" ||
-          state.lagged ||
-          state.rateLimit ||
-          state.rateLimitRetriesExhausted ||
-          ctx.reconnecting ? (
-            <SystemNotices
-              status={status}
-              lagged={state.lagged}
-              rateLimit={state.rateLimit}
-              rateLimitAutoResume={view.rateLimitAutoResume}
-              rateLimitRetriesExhausted={state.rateLimitRetriesExhausted}
-              hasEverOpened={ctx.hasEverOpened}
-              replayedWhileDown={ctx.replayedWhileDown}
-              reconnecting={ctx.reconnecting}
-              retryCount={ctx.retryCount}
-              retryCountdown={ctx.retryCountdown}
-              maxRetries={ctx.maxRetries}
-              manualReconnect={ctx.manualReconnect}
-              onSwitchAgent={onSwitchAgent}
-              onResumeRateLimit={() => void rateLimitResume.respawn()}
-              rateLimitResumeState={rateLimitResume.state}
-              rateLimitResumeError={rateLimitResume.error}
-              newSessionStarting={startingAgent !== null}
-            />
-          ) : null
-        }
-      </RateLimitRecoverySection>
+      {(status !== "open" || state.lagged || exhaustedWithoutLimit || ctx.reconnecting) && (
+        <SystemNotices
+          status={status}
+          lagged={state.lagged}
+          rateLimitRetriesExhausted={exhaustedWithoutLimit}
+          hasEverOpened={ctx.hasEverOpened}
+          replayedWhileDown={ctx.replayedWhileDown}
+          reconnecting={ctx.reconnecting}
+          retryCount={ctx.retryCount}
+          retryCountdown={ctx.retryCountdown}
+          maxRetries={ctx.maxRetries}
+          manualReconnect={ctx.manualReconnect}
+          newSessionStarting={startingAgent !== null}
+        />
+      )}
 
       <SessionBanners
         sessionId={sessionId}
@@ -412,8 +411,24 @@ function ComposerDock({
 }) {
   const { sessionId, acpWorkerState, acpAgent, acpProvider } = view;
   const { state, status } = ctx;
+  const connecting =
+    acpWorkerState === "running" && status !== "open" && !state.workerStopped && !state.workerRestarting;
+  const clearAliases = useClearAliases();
+  const compactAliases = useCompactAliases();
+  // The Daemon's solo commands: they run as their own turn, never steered into one.
+  const soloAliases = useMemo(() => [...clearAliases, ...compactAliases], [clearAliases, compactAliases]);
   return (
     <>
+      <UsageLimitSection
+        sessionId={sessionId}
+        agent={state.agent ?? acpAgent}
+        rateLimit={state.rateLimit}
+        autoResume={view.rateLimitAutoResume}
+        retriesExhausted={state.rateLimitRetriesExhausted}
+        settingsHref={view.settingsHref ?? null}
+        onPrefill={(text) => setPrimerPrefill({ id: `rate-limit-recovery-${Date.now()}`, text })}
+      />
+
       <QueuedPromptsStrip
         queued={state.queuedPrompts}
         onRemove={ctx.removeQueuedPrompt}
@@ -421,11 +436,28 @@ function ComposerDock({
         onClear={ctx.clearQueue}
         onSendNow={ctx.sendQueuedNow}
         canSendNow={ctx.canSendQueuedNow}
-        sendNowInterrupts={ctx.sendNowInterruptsTurn}
-        pendingResume={
-          status !== "open" || acpWorkerState !== "running" || state.workerStopped || state.workerRestarting
-        }
-        waitingFor={startingAgent}
+        reason={queuedReason({
+          agent,
+          online: status === "open",
+          anyPending: state.queuedPrompts.some((q) => q.pending),
+          waitingFor: startingAgent,
+          rateLimitParked: state.rateLimitParked,
+          rateLimit: state.rateLimit,
+          rateLimitAutoResume: view.rateLimitAutoResume,
+          // Idle-dormant and rate-limit-parked Workers wake on a send, so they aren't down.
+          workerDown:
+            (state.workerStopped || acpWorkerState === "absent") && !state.workerRestarting && !state.workerIdleStopped,
+          workerStarting: state.workerRestarting || acpWorkerState === "resuming",
+          cancelling: state.cancelling,
+          compacting: state.compacting,
+          turnActive: state.turnActive,
+          steerable: !ctx.sendNowInterruptsTurn,
+          firstText: state.queuedPrompts[0]?.text,
+          soloAliases,
+        })}
+        onStartAndSend={view.onStartSession}
+        onStopTurn={ctx.stopTurn}
+        soloAliases={soloAliases}
         agent={agent}
       />
 
@@ -480,6 +512,7 @@ function ComposerDock({
           currentAgent={state.agent ?? acpAgent}
           currentProvider={acpProvider}
           waitingFor={startingAgent}
+          connecting={connecting}
           availableModes={state.availableModes}
           currentModeId={state.currentModeId}
           legacyMode={state.mode}

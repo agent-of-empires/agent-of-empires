@@ -7,6 +7,7 @@ import { SidebarSortPicker } from "../SidebarSortPicker";
 import { Tooltip } from "../Tooltip";
 import { DISABLED_ICON_BUTTON, TOOLBAR_BUTTON, TOOLBAR_TINT } from "./styles";
 import { StrokeIcon } from "../icons";
+import { SidebarLegend } from "./SidebarLegend";
 
 type PluginSortRef = { pluginId: string; entryId: string };
 
@@ -145,6 +146,7 @@ export function SidebarToolbar({
           </Tooltip>
         </>
       )}
+      <SidebarLegend />
       <Tooltip text={compact ? "Expand sidebar" : "Compact sidebar"}>
         <button
           onClick={onToggleCompact}
