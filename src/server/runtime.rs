@@ -1039,11 +1039,36 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn sandbox_copy_reports_before_completion_and_retires_only_its_own_progress(
+    async fn sandbox_copy_stream_preserves_owner_privacy_and_long_launch_ownership(
     ) -> anyhow::Result<()> {
+        use crate::daemon::{RuntimeConnection, RuntimeEvent};
         use crate::session::{Instance, Storage};
+        use anyhow::Context;
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message as WireMessage};
+
+        async fn read_progress(
+            connection: &mut RuntimeConnection,
+            ready: impl Fn(&[crate::daemon::SandboxProgress]) -> bool,
+        ) -> anyhow::Result<Vec<crate::daemon::SandboxProgress>> {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let RuntimeEvent::Sandbox(progress) = connection.next_event().await? {
+                        if ready(&progress) {
+                            return Ok(progress);
+                        }
+                    }
+                }
+            })
+            .await
+            .context("sandbox progress did not reach the owner stream")?
+        }
+
         let _home = crate::session::test_support::isolate_app_dir();
         let home = dirs::home_dir().unwrap();
+        let tmux_socket = home.join("private-tmux.sock");
+        let _env = crate::session::test_support::EnvGuard::unset(&["TMUX", "TMUX_PANE"])
+            .and_set("AOE_TMUX_SOCKET", &tmux_socket);
         let project = home.join("project");
         std::fs::create_dir_all(&project)?;
         std::fs::create_dir_all(home.join(".gemini/sandbox/history"))?;
@@ -1056,14 +1081,57 @@ mod tests {
         raw["sandbox_info"] = serde_json::json!({
             "enabled": true, "image": "test-image", "container_name": "legacy"
         });
-        let row: Instance = serde_json::from_value(raw)?;
+        let mut row: Instance = serde_json::from_value(raw)?;
+        row.status = crate::session::Status::Starting;
+        let generation = row.try_acquire_lifecycle_reservation(
+            crate::session::LifecycleOperation::Launch,
+            Instance::LIFECYCLE_RESERVATION_TTL,
+            chrono::Utc::now() - chrono::Duration::minutes(11),
+        )?;
         storage.update(|rows, _| {
             rows.push(row.clone());
             Ok(())
         })?;
-        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        let original = crate::server::test_support::build_test_app_state_with_policy(
+            vec![row.clone()],
+            vec!["localhost".into(), "127.0.0.1".into()],
+            Vec::new(),
+            Some("sandbox-progress-token".into()),
+        );
+        let app = crate::session::get_app_dir()?.canonicalize()?;
+        let mut owned = Arc::try_unwrap(original)
+            .ok()
+            .expect("fixture has one strong state owner");
+        let work = owned.runtime.work.clone();
+        owned.runtime = NativeRuntime::new(
+            app.to_string_lossy().into_owned(),
+            Some(tmux_socket.to_string_lossy().into_owned()),
+            work,
+        );
+        let state = Arc::new(owned);
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
         let (_other_reporter, other_guard) = sandbox_reporter(state.clone(), "other", "test");
+        let socket = app.join("daemon/api.sock");
+        let router = crate::server::test_support::build_router_for_test(state.clone());
+        let server =
+            crate::server::test_support::serve_owner_router_for_test(&socket, router.clone()).await;
+        let endpoint = crate::acp::client::DaemonEndpoint::local_unix(socket.clone());
+        let mut connection = RuntimeConnection::connect(&endpoint, Some("test")).await?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let tcp_server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let http = reqwest::Client::builder()
+            .unix_socket(socket)
+            .no_proxy()
+            .timeout(Duration::from_secs(10))
+            .build()?;
         let (entered, copying) = tokio::sync::oneshot::channel();
         let (release, released) = std::sync::mpsc::channel();
         let worker_state = state.clone();
@@ -1095,23 +1163,86 @@ mod tests {
             result
         });
         tokio::time::timeout(Duration::from_secs(10), copying).await??;
-        let progress = state.runtime.sandbox_progress.borrow().clone();
+        let source = home.join(".gemini/sandbox").to_string_lossy().into_owned();
+        let progress = read_progress(&mut connection, |progress| {
+            progress
+                .iter()
+                .any(|item| item.session_id == row.id && item.activity.contains(&source))
+        })
+        .await?;
         let current = progress
             .iter()
             .find(|item| item.session_id == row.id)
             .unwrap();
-        assert!(
-            current.activity.contains("copying agent store 1/1"),
-            "{progress:?}"
-        );
+        let operation = current.operation_id.clone();
+        let activity = current.activity.clone();
         assert!(!task.is_finished(), "progress must precede copy completion");
+        let response = http
+            .post(format!("http://localhost/api/sessions/{}/stop", row.id))
+            .header(crate::daemon::RUNTIME_EPOCH_HEADER, &state.runtime.epoch)
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+        assert_eq!(
+            response.json::<serde_json::Value>().await?["error"],
+            "lifecycle_busy"
+        );
+        assert!(storage.load()?[0].lifecycle_reservation_is_owned(
+            crate::session::LifecycleOperation::Launch,
+            generation
+        ));
+
+        let mut request = format!("ws://{address}/api/runtime/ws").into_client_request()?;
+        request.headers_mut().insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer sandbox-progress-token".parse()?,
+        );
+        let (mut remote, _) = tokio_tungstenite::connect_async(request).await?;
+        let nonce = b"sandbox-owner-only".to_vec();
+        remote.send(WireMessage::Ping(nonce.clone().into())).await?;
+        let mut hello_seen = false;
+        let mut snapshot_seen = false;
+        // Initial advisory sends precede the receive loop, so Pong fences their absence.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match remote.next().await.context("non-owner stream closed")?? {
+                    WireMessage::Text(text) => {
+                        assert!(
+                            !text.contains(&activity),
+                            "non-owner received private copy activity"
+                        );
+                        let frame: RuntimeFrame = serde_json::from_str(&text)?;
+                        match frame {
+                            RuntimeFrame::Hello(info) => {
+                                assert!(!info.local_owner);
+                                hello_seen = true;
+                            }
+                            RuntimeFrame::Snapshot(_) => snapshot_seen = true,
+                            RuntimeFrame::Sandbox { .. } => {
+                                anyhow::bail!("non-owner received a sandbox progress frame");
+                            }
+                            _ => {}
+                        }
+                    }
+                    WireMessage::Pong(payload) if payload.as_ref() == nonce.as_slice() => break,
+                    WireMessage::Ping(payload) => remote.send(WireMessage::Pong(payload)).await?,
+                    other => anyhow::bail!("unexpected non-owner frame: {other:?}"),
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("non-owner never passed the initial advisory-send boundary")??;
+        assert!(hello_seen && snapshot_seen);
+        remote.close(None).await?;
         release.send(())?;
         task.await??;
+        let progress = read_progress(&mut connection, |progress| {
+            progress.iter().all(|item| item.operation_id != operation)
+        })
+        .await?;
         assert_eq!(
-            state
-                .runtime
-                .sandbox_progress
-                .borrow()
+            progress
                 .iter()
                 .map(|item| item.session_id.as_str())
                 .collect::<Vec<_>>(),
@@ -1129,6 +1260,12 @@ mod tests {
         );
         drop(other_guard);
         assert!(state.runtime.sandbox_progress.borrow().is_empty());
+        connection.close().await;
+        state.shutdown.cancel();
+        server.abort();
+        let _ = server.await;
+        tcp_server.abort();
+        let _ = tcp_server.await;
         Ok(())
     }
 

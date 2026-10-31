@@ -49,7 +49,8 @@ pub use wire::{
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Sandbox copies, image pulls and launch hooks can take minutes.
-const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const LIFECYCLE_TIMEOUT: Duration =
+    Duration::from_secs(crate::session::Instance::SANDBOX_PREPARATION_WINDOW.num_seconds() as u64);
 /// A destroy hook may run for minutes per row, so the bulk purge outlives `DEFAULT_TIMEOUT`.
 const EMPTY_TRASH_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
@@ -158,10 +159,10 @@ fn committed_failure_message(code: ApiErrorCode) -> &'static str {
 }
 
 fn daemon_status_message(status: StatusCode, code: Option<ApiErrorCode>, body: &str) -> String {
+    if let Some(message) = code.and_then(ApiErrorCode::sandbox_migration_message) {
+        return message.into();
+    }
     match code {
-        Some(code) if code.sandbox_migration_message().is_some() => {
-            code.sandbox_migration_message().unwrap().into()
-        }
         Some(ApiErrorCode::ManagedResumeRefused(cause)) => cause.message().into(),
         Some(ApiErrorCode::SmartRenameSkipped) => {
             "Auto-name is unavailable for this session; check its repository and tool configuration"

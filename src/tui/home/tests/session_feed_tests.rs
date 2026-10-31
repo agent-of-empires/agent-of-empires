@@ -1340,10 +1340,88 @@ fn restart_attachment_waits_for_its_receipt_and_lifecycle_generation() {
     };
     use crate::session::{PaneObservation, PanePresence};
 
-    for (reflected_generation, target_name) in [
-        (5, "restarted-agent"),
-        (6, "restarted-agent"),
-        (5, "renamed-agent"),
+    for (reflected_status, presence, reflected_generation, target_name, receipt_profile, attach) in [
+        (
+            "Starting",
+            PanePresence::Alive,
+            5,
+            Some("restarted-agent"),
+            "test",
+            true,
+        ),
+        (
+            "Running",
+            PanePresence::Alive,
+            5,
+            Some("restarted-agent"),
+            "test",
+            true,
+        ),
+        (
+            "Starting",
+            PanePresence::Alive,
+            6,
+            Some("restarted-agent"),
+            "test",
+            false,
+        ),
+        (
+            "Starting",
+            PanePresence::Alive,
+            5,
+            Some("renamed-agent"),
+            "test",
+            false,
+        ),
+        ("Starting", PanePresence::Alive, 5, None, "test", false),
+        (
+            "Starting",
+            PanePresence::Alive,
+            5,
+            Some("restarted-agent"),
+            "other",
+            false,
+        ),
+        (
+            "Starting",
+            PanePresence::Dead,
+            5,
+            Some("restarted-agent"),
+            "test",
+            false,
+        ),
+        (
+            "Starting",
+            PanePresence::Absent,
+            5,
+            Some("restarted-agent"),
+            "test",
+            false,
+        ),
+        (
+            "Starting",
+            PanePresence::Unknown,
+            5,
+            Some("restarted-agent"),
+            "test",
+            false,
+        ),
+        (
+            "Stopped",
+            PanePresence::Alive,
+            5,
+            Some("restarted-agent"),
+            "test",
+            false,
+        ),
+        (
+            "Error",
+            PanePresence::Alive,
+            5,
+            Some("restarted-agent"),
+            "test",
+            false,
+        ),
     ] {
         let mut env = create_test_env_with_sessions(1);
         let id = env.view.instance_at(0).id.clone();
@@ -1366,7 +1444,7 @@ fn restart_attachment_waits_for_its_receipt_and_lifecycle_generation() {
         let mut respond = env.view.session_feed.restart_driver_for_test();
         env.view.restart_then_attach(&id, None, false);
 
-        // A still-Running snapshot predating the receipt cannot settle a restart.
+        // A pre-receipt frame cannot settle a restart.
         std::sync::Arc::make_mut(&mut snapshot).cursor.revision = 2;
         env.view
             .session_feed
@@ -1383,12 +1461,12 @@ fn restart_attachment_waits_for_its_receipt_and_lifecycle_generation() {
             },
             outcome: RestartOutcome {
                 lifecycle_generation: 5,
-                profile: "test".into(),
+                profile: receipt_profile.into(),
                 target: Some(TerminalTarget {
                     tmux_session: "restarted-agent".into(),
                     status: TerminalTargetStatus::Restarted,
                     lifecycle_generation: 5,
-                    profile: "test".into(),
+                    profile: receipt_profile.into(),
                 }),
             },
         }))
@@ -1401,7 +1479,9 @@ fn restart_attachment_waits_for_its_receipt_and_lifecycle_generation() {
         let committed = std::sync::Arc::make_mut(&mut snapshot);
         committed.cursor.revision = 3;
         committed.contents.sessions[0].lifecycle_generation = reflected_generation;
-        committed.contents.sessions[0].agent_pane.tmux_session = Some(target_name.into());
+        committed.contents.sessions[0].status = reflected_status.into();
+        committed.contents.sessions[0].agent_pane.state = presence;
+        committed.contents.sessions[0].agent_pane.tmux_session = target_name.map(str::to_owned);
         env.view
             .session_feed
             .publish_for_test(SessionFeedResult::Snapshot(snapshot));
@@ -1409,14 +1489,14 @@ fn restart_attachment_waits_for_its_receipt_and_lifecycle_generation() {
         env.view.apply_restart_results();
         assert!(!env.view.restart_in_flight.contains(&id));
         let attachment = env.view.take_native_attachment();
-        if reflected_generation == 5 && target_name == "restarted-agent" {
+        if attach {
             let attachment = attachment.expect("committed restart is attachable");
             assert_eq!(attachment.id, id);
             assert_eq!(attachment.tmux_name, "restarted-agent");
         } else {
             assert!(
                 attachment.is_none(),
-                "another lifecycle change superseded this receipt"
+                "invalid target attached: {reflected_status} {presence:?} {reflected_generation} {target_name:?} {receipt_profile}"
             );
         }
         assert!(env.view.take_native_attachment().is_none());

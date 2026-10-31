@@ -83,14 +83,13 @@ impl Instance {
     fn move_sandbox_store_in(
         &self,
         store: &dyn SessionStore,
-        reporter: Option<crate::migrations::progress::Reporter>,
         container: &DockerContainer,
     ) -> Result<bool> {
         if container.is_running()? {
             return Ok(false);
         }
         store
-            .migrate_sandbox_store(&self.id, reporter, container.runtime())
+            .migrate_sandbox_store(&self.id, container.runtime())
             .map_err(|error| {
                 if error.is::<crate::session::NativeStoreUnavailable>()
                     || error.is::<LifecycleReservationError>()
@@ -204,13 +203,7 @@ impl Instance {
             global_config.sandbox.container_runtime.into(),
         );
         // Migration takes the transition lock exclusively, before the shared guard below.
-        if self.sandbox_store_move_pending()
-            && self.move_sandbox_store_in(
-                store,
-                Some(crate::migrations::progress::tracing_reporter()),
-                &container,
-            )?
-        {
+        if self.sandbox_store_move_pending() && self.move_sandbox_store_in(store, &container)? {
             self.reconcile_from_store(store)?;
         }
         let mut launch_locks = launch_generation
@@ -897,7 +890,7 @@ mod tests {
         let generation = stale.try_acquire_lifecycle_reservation(
             LifecycleOperation::Launch,
             Instance::LIFECYCLE_RESERVATION_TTL,
-            Utc::now() - chrono::Duration::minutes(11),
+            Utc::now() - Instance::SANDBOX_PREPARATION_WINDOW - chrono::Duration::seconds(1),
         )?;
         store.update(|rows, _| {
             rows.push(stale.clone());

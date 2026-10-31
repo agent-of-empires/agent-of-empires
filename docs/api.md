@@ -277,6 +277,40 @@ Wire members declared nullable must still be present. CLI JSON is a separate con
 
 Background daemon maintenance can recover missing native session IDs from validated publications after the agent pane exits. Read requests do not perform these writes.
 
+## GET /api/runtime/ws
+
+The native runtime stream carries canonical snapshots and advisory progress.
+Protocol 4 reports sandbox store migration progress with this frame:
+
+```json
+{
+  "kind": "sandbox",
+  "data": {
+    "epoch": "daemon-epoch",
+    "progress": [
+      {
+        "operation_id": "migration-attempt",
+        "session_id": "session-id",
+        "profile": "default",
+        "activity": "copying an agent store"
+      }
+    ]
+  }
+}
+```
+
+`epoch` must match the connection's `Hello`. Each initial or updated `progress`
+list replaces the previous list, and updates may coalesce. `operation_id`
+identifies one migration attempt; concurrent attempts have separate entries.
+An empty list clears displayed migration progress.
+
+Activity is bounded display text, not a stable machine-readable phase. It may
+contain host paths, so only a Daemon-authorized local-owner stream receives this
+frame. TCP bearer clients, including loopback clients, and remote clients do not.
+Progress is not a canonical revision, completion receipt, or attachment grant.
+Use canonical snapshots and mutation receipts to settle the original operation;
+a disconnect does not cancel admitted work or authorize replay.
+
 ## GET /api/sessions
 
 List sessions. Returns every session by default, including trashed and
@@ -346,7 +380,7 @@ consuming both surfaces must not compare the two directly.
 
 | Value | Meaning |
 | --- | --- |
-| `Starting` | Session was just created or restarted; the agent process is not yet up. |
+| `Starting` | Session was just created or restarted; activity detection may lag an already-live agent pane. |
 | `Running` | Agent is actively working. |
 | `Waiting` | Agent has stopped and is waiting for user input. This is the signal a dispatcher should treat as "needs a prompt". |
 | `Idle` | The agent's turn has finished with no pending question. This is the signal a dispatcher should treat as "task complete". |
@@ -532,6 +566,8 @@ structured sessions). The receipt cursor is carried in `aoe-runtime-epoch` and
 `aoe-runtime-revision` response headers, not in the JSON body. Native clients
 attach only after applying a snapshot at or beyond that receipt in the same
 epoch, with matching lifecycle generation, profile, and live terminal identity.
+A successful terminal restart can still have canonical status `Starting`.
+Clients must not wait for `Idle` as an additional attachment grant.
 
 ## POST /api/sessions/{id}/send
 

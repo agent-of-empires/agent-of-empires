@@ -1759,7 +1759,7 @@ impl SessionFeed {
                                             && row.agent_pane.state == crate::session::PanePresence::Alive
                                             && receipt.outcome.target.as_ref().is_some_and(|target|
                                                 row.agent_pane.tmux_session.as_deref() == Some(target.tmux_session.as_str()))
-                                            && matches!(row.status.as_str(), "Running" | "Waiting" | "Idle"),
+                                            && matches!(row.status.as_str(), "Running" | "Waiting" | "Idle" | "Starting"),
                                         CommandReply::Terminal(receipt) => {
                                             let identity_matches = row.lifecycle_generation
                                                 == receipt.outcome.lifecycle_generation
@@ -2547,6 +2547,79 @@ mod tests {
         set_grant(&feed.grant, true);
         set_grant(&feed.native_grant, true);
         (feed, requests)
+    }
+
+    #[test]
+    fn sandbox_progress_follows_applied_identity_and_pending_canonical_settlement() {
+        let (mut feed, mut requests) = feed_with_native_lane();
+        let mut original = native_identity_snapshot(1);
+        Arc::make_mut(&mut original).contents.sessions[0].title = "original-title".into();
+        feed.publish_for_test(SessionFeedResult::Snapshot(original.clone()));
+        feed.mark_snapshot_applied(original);
+        let mut prepared = feed.ensure_agent("session".into(), None).unwrap();
+        let command = requests.try_recv().unwrap();
+        let progress = |id: &str, profile: &str, activity: &str| crate::daemon::SandboxProgress {
+            operation_id: format!("{id}-{profile}"),
+            session_id: id.into(),
+            profile: profile.into(),
+            activity: activity.into(),
+        };
+        feed.sandbox_progress.send_replace(vec![
+            progress("unrelated", "test", "unrelated-activity"),
+            progress("session", "foreign", "foreign-activity"),
+            progress("session", "test", "owned-activity"),
+        ]);
+        let line = feed.sandbox_status_line().unwrap();
+        assert!(
+            line.contains("original-title") && line.contains("owned-activity"),
+            "{line}"
+        );
+        assert!(!line.contains("foreign-activity") && !line.contains("unrelated-activity"));
+        assert!(feed.has_pending("session"));
+        assert!(prepared.result.try_recv().is_err());
+
+        let mut moved = native_identity_snapshot(2);
+        let row = &mut Arc::make_mut(&mut moved).contents.sessions[0];
+        row.profile = "moved".into();
+        row.title = "moved-title".into();
+        feed.publish_for_test(SessionFeedResult::Snapshot(moved.clone()));
+        let line = feed.sandbox_status_line().unwrap();
+        assert!(line.contains("original-title") && !line.contains("moved-title"));
+        feed.mark_snapshot_applied(moved);
+        assert!(feed.sandbox_status_line().is_none());
+        feed.sandbox_progress
+            .send_replace(vec![progress("session", "moved", "current-activity")]);
+        let line = feed.sandbox_status_line().unwrap();
+        assert!(line.contains("moved-title") && line.contains("current-activity"));
+
+        command
+            .result
+            .send(Ok(CommandReply::CommittedFailure {
+                cursor: RuntimeCursor {
+                    epoch: "test".into(),
+                    revision: 3,
+                },
+                failure: CommandFailure::Rejected("migration deferred".into()),
+            }))
+            .unwrap();
+        assert!(feed.drain_command_errors().is_empty());
+        assert!(feed.sandbox_status_line().is_some());
+        assert!(prepared.result.try_recv().is_err());
+        let mut committed = native_identity_snapshot(3);
+        Arc::make_mut(&mut committed).contents.sessions[0].profile = "moved".into();
+        feed.publish_for_test(SessionFeedResult::Snapshot(committed.clone()));
+        feed.mark_snapshot_applied(committed);
+        assert!(feed.drain_command_errors().is_empty());
+        assert!(!feed.has_pending("session"));
+        assert!(feed.can_submit("session"));
+        assert!(feed.sandbox_status_line().is_none());
+        assert!(prepared.result.try_recv().unwrap().is_err());
+
+        let _next = feed.ensure_agent("session".into(), None).unwrap();
+        let _next_command = requests.try_recv().unwrap();
+        assert!(feed.sandbox_status_line().is_some());
+        set_grant(&feed.native_grant, false);
+        assert!(feed.sandbox_status_line().is_none());
     }
 
     fn native_identity_snapshot(revision: u64) -> Arc<RuntimeSnapshot> {

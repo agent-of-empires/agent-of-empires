@@ -432,6 +432,8 @@ A launch runs exactly one of `before_start` (sandboxed) and `before_session` (ho
 
 Sandbox preparation retains its durable lifecycle reservation while host hooks run, but releases title, lifecycle and store-transition flocks, including native-content admission. Native HTTP and WebSocket entrypoints release their API locks too, so hooks can call the Daemon. Competing lifecycle operations receive a conflict. Before runtime effects, AoE reacquires locks, revalidates the reservation and session, and re-admits native content.
 
+Sandbox launch reservations use a minimum 30-minute recovery window, shared with native preparation request deadlines. Ordinary lifecycle reservations retain their 10-minute window. This finite lease does not cancel filesystem I/O or admitted Daemon work; after expiry a newer generation can take ownership and fence late results.
+
 `before_session` runs before every host agent launch, including restart and a view switch that respawns it. It uses the same stdout and failure contract as `before_start`, and persists no values between launches.
 
 Minted pairs override the static `environment` list in both views. Structured view uses process environment; terminal view uses `tmux new-session -e` and drops conflicting shell-assignment prefixes.

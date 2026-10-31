@@ -3061,7 +3061,7 @@ pub(super) async fn sandbox_migration_response(
     error: &anyhow::Error,
 ) -> Option<axum::response::Response> {
     let failure = error.downcast_ref::<crate::migrations::SandboxMigrationError>()?;
-    tracing::warn!(target: "http.api.sessions", session = %id, error = %format_args!("{error:#}"), "sandbox migration refused");
+    tracing::warn!(target: "http.api.sessions", session = %id, error = %format_args!("{error:#}"), "sandbox migration did not complete");
     let code = failure.api_code();
     let response = crate::server::api::api_error_with_code_header(
         code,
